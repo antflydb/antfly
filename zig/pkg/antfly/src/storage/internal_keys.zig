@@ -52,6 +52,7 @@ pub const artifact_repair_summary_progress_kind: u8 = 0x29;
 pub const artifact_repair_summary_rebuild_kind: u8 = 0x2a;
 pub const managed_index_admission_kind: u8 = 0x2b;
 pub const index_artifact_cleanup_kind: u8 = 0x2c;
+pub const range_document_count_key = [_]u8{ replay_namespace, 0xff, 0x2d };
 pub const embedding_artifact_repair_issue_kind: u8 = artifact_repair_issue_kind;
 pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
@@ -457,6 +458,23 @@ pub fn derivedCoverageOutcomeKeyAlloc(alloc: Allocator, index_name: []const u8, 
     try list.append(alloc, derived_coverage_outcome_marker_kind);
     try appendEncodedComponent(&list, alloc, doc_key);
     return try list.toOwnedSlice(alloc);
+}
+
+pub fn derivedCoverageOutcomeDocKeyAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    generation: u64,
+    key: []const u8,
+) ![]u8 {
+    const prefix = try derivedCoverageOutcomeMarkerPrefixAlloc(alloc, index_name, generation);
+    defer alloc.free(prefix);
+    if (!std.mem.startsWith(u8, key, prefix)) return error.InvalidDerivedCoverageOutcomeKey;
+    const component_start = prefix.len;
+    const component_end = findComponentTerminator(key, component_start) orelse
+        return error.InvalidDerivedCoverageOutcomeKey;
+    if (component_end + 2 != key.len) return error.InvalidDerivedCoverageOutcomeKey;
+    return decodeBodyAlloc(alloc, key[component_start..component_end]) catch
+        return error.InvalidDerivedCoverageOutcomeKey;
 }
 
 pub fn derivedCoverageOutcomeCountKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64, outcome: []const u8) ![]u8 {

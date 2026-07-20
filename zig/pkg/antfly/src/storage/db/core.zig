@@ -20,6 +20,7 @@ const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const apply_state = @import("derived/apply_state.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const doc_identity = @import("doc_identity.zig");
+const range_cardinality = @import("range_cardinality.zig");
 const internal_keys = @import("../internal_keys.zig");
 const docstore_mod = @import("../docstore.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -465,9 +466,17 @@ pub const DBCore = struct {
     }
 
     pub fn updateRange(self: *DBCore, byte_range: types.ByteRange) !void {
-        try self.shard_manager.setByteRange(byte_range);
+        const start = try self.alloc.dupe(u8, byte_range.start);
+        errdefer self.alloc.free(start);
+        const end = try self.alloc.dupe(u8, byte_range.end);
+        errdefer self.alloc.free(end);
+        try range_state_mod.saveRange(self.store, .{ .start = start, .end = end });
+        self.adoptRangeInMemoryOwned(start, end);
+    }
+
+    pub fn adoptRangeInMemoryOwned(self: *DBCore, start: []u8, end: []u8) void {
+        self.shard_manager.replaceByteRangeOwned(start, end);
         self.refreshIndexRange();
-        try range_state_mod.saveRange(self.store, self.shard_manager.getByteRange());
     }
 
     pub fn adoptPersistedRangeOwned(self: *DBCore, start: []u8, end: []u8) void {
@@ -1345,6 +1354,7 @@ fn buildTransactionRecoveryIdentityExtraBatch(
         for (identity_visibility_deletes.items) |key| alloc.free(key);
         identity_visibility_deletes.deinit(alloc);
     }
+    const identity_live_before = (try doc_identity.fastStatsFromStore(identity_ctx.store)).live_ordinals;
     try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
         alloc,
         identity_ctx.store,
@@ -1355,6 +1365,21 @@ fn buildTransactionRecoveryIdentityExtraBatch(
         identity_upserts.items,
         identity_deletes.items,
     );
+    if (try doc_identity.visibilitySummaryFromWrites(identity_writes.items)) |summary| {
+        const byte_range = try range_state_mod.loadRange(alloc, identity_ctx.store);
+        defer {
+            alloc.free(@constCast(byte_range.start));
+            alloc.free(@constCast(byte_range.end));
+        }
+        try range_cardinality.appendIdentityTransitionAlloc(
+            alloc,
+            identity_ctx.store,
+            byte_range,
+            identity_live_before,
+            summary.live_ordinals,
+            &identity_writes,
+        );
+    }
     if (identity_writes.items.len == 0 and identity_visibility_deletes.items.len == 0) return .{};
     const owned_writes = try identity_writes.toOwnedSlice(alloc);
     errdefer {

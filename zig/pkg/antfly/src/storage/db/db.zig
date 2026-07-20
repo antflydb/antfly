@@ -33,6 +33,7 @@ const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
 const doc_identity = @import("doc_identity.zig");
+const range_cardinality = @import("range_cardinality.zig");
 pub const DocIdentityNamespace = doc_identity.Namespace;
 const doc_set = @import("doc_set.zig");
 const shard_mod = @import("../shard.zig");
@@ -676,6 +677,8 @@ const AsyncContext = struct {
     active_dense_catch_up_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     active_external_dense_bulk_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     waiting_external_dense_bulk_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    dense_projection_finalizing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    dense_projection_finalization_requested: bool = false,
     pending_dense_projection_finalizations: std.StringHashMapUnmanaged(u64) = .empty,
     deferred_external_bulk_notify_sequence: AtomicU64 = AtomicU64.init(0),
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
@@ -4118,6 +4121,8 @@ pub const DB = struct {
     }
 
     pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
+        lockApply(self);
+        defer self.core.unlockApply();
         return try self.core.runTransactionRecoveryOnce(self.alloc, config);
     }
 
@@ -5713,6 +5718,10 @@ pub const DB = struct {
         defer if (materialized_derived_batch) |*materialized_batch| derived_types.deinitDerivedBatch(self.alloc, materialized_batch);
         const sequence = self.core.reserveDerivedAppendSequence();
         const identity_metadata_start_ns = monotonicTimeNs();
+        const identity_live_before = if (identity_upsert_keys.items.len != 0 or effective_req.deletes.len != 0)
+            (try doc_identity.fastStatsFromStore(self.core.store)).live_ordinals
+        else
+            0;
         var used_trusted_identity_path = false;
         if (effective_req.deletes.len != 0) {
             self.clearBulkIngestIdentityAllNewLocked();
@@ -5750,6 +5759,16 @@ pub const DB = struct {
             active_profile.identity_metadata_writes += @intCast(identity_writes.items.len);
         }
         const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
+        if (pending_identity_visibility_summary) |summary| {
+            try range_cardinality.appendIdentityTransitionAlloc(
+                self.alloc,
+                self.core.store,
+                self.core.byteRange(),
+                identity_live_before,
+                summary.live_ordinals,
+                &identity_writes,
+            );
+        }
         try store_writes.appendSlice(self.alloc, identity_writes.items);
         try appendDocumentChildRangeOutboxWrites(
             self.alloc,
@@ -11850,7 +11869,21 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
-        try self.core.updateRange(byte_range);
+        const start = try self.alloc.dupe(u8, byte_range.start);
+        errdefer self.alloc.free(start);
+        const end = try self.alloc.dupe(u8, byte_range.end);
+        errdefer self.alloc.free(end);
+        const owned_range: types.ByteRange = .{ .start = start, .end = end };
+        var range_buf: [1024]u8 = undefined;
+        const range_write = try range_state_mod.rangeMetadataWrite(owned_range, &range_buf);
+        try rebaseRangeCoverageMetadata(
+            self.alloc,
+            self.core.store,
+            self.core.index_manager,
+            owned_range,
+            &.{range_write},
+        );
+        self.core.adoptRangeInMemoryOwned(start, end);
     }
 
     pub fn getRange(self: *DB) types.ByteRange {
@@ -12910,6 +12943,7 @@ pub const DB = struct {
         }
 
         if (status == .committed) {
+            const identity_live_before = (try doc_identity.fastStatsFromStore(self.core.store)).live_ordinals;
             try self.core.collectTransactionIntentDocumentKeys(self.alloc, txn_id, &raw_identity_upserts, &raw_identity_deletes);
             for (raw_identity_upserts.items) |key| {
                 if (!isMetadataKey(key)) try identity_upserts.append(self.alloc, key);
@@ -12927,6 +12961,16 @@ pub const DB = struct {
                 identity_upserts.items,
                 identity_deletes.items,
             );
+            if (try doc_identity.visibilitySummaryFromWrites(identity_writes.items)) |summary| {
+                try range_cardinality.appendIdentityTransitionAlloc(
+                    self.alloc,
+                    self.core.store,
+                    self.core.byteRange(),
+                    identity_live_before,
+                    summary.live_ordinals,
+                    &identity_writes,
+                );
+            }
         }
 
         const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
@@ -28342,6 +28386,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     defer derived_types.deinitDerivedBatch(ctx.alloc, &derived_batch);
     const sequence = ctx.store.reserveNextReplaySequence(1);
     derived_batch.sequence = sequence;
+    const identity_live_before = (try doc_identity.fastStatsFromStore(ctx.store)).live_ordinals;
     try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
         ctx.alloc,
         ctx.store,
@@ -28352,6 +28397,16 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         &.{},
         keys,
     );
+    if (try doc_identity.visibilitySummaryFromWrites(identity_writes.items)) |summary| {
+        try range_cardinality.appendIdentityTransitionAlloc(
+            ctx.alloc,
+            ctx.store,
+            ctx.index_manager.byte_range,
+            identity_live_before,
+            summary.live_ordinals,
+            &identity_writes,
+        );
+    }
     try store_writes.appendSlice(ctx.alloc, identity_writes.items);
     try appendAssetArtifactSourceIndexMutations(
         ctx.alloc,
@@ -28977,7 +29032,8 @@ fn beginDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) !
     var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
     defer session_lock.unlock();
     if (ctx.active_external_dense_bulk_sessions.load(.acquire) != 0 or
-        ctx.waiting_external_dense_bulk_sessions.load(.acquire) != 0)
+        ctx.waiting_external_dense_bulk_sessions.load(.acquire) != 0 or
+        ctx.dense_projection_finalizing.load(.acquire))
         return error.ReplayDocumentNotVisible;
     ctx.text_merge_deferred.store(true, .release);
     ctx.stats.dense_catch_up.active.store(1, .monotonic);
@@ -29013,7 +29069,8 @@ fn finishDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) 
 fn beginExternalDenseBulkSessionTracked(ctx: *AsyncContext) !void {
     var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
     defer session_lock.unlock();
-    if (ctx.active_dense_catch_up_sessions.load(.acquire) != 0)
+    if (ctx.active_dense_catch_up_sessions.load(.acquire) != 0 or
+        ctx.dense_projection_finalizing.load(.acquire))
         return error.ReplayDocumentNotVisible;
     ctx.text_merge_deferred.store(true, .release);
     _ = ctx.active_external_dense_bulk_sessions.fetchAdd(1, .release);
@@ -29047,7 +29104,9 @@ fn beginExternalDenseBulkSessionTrackedWait(ctx: *AsyncContext, io: ?std.Io) !vo
     var wait_ms: u64 = 1;
     while (true) {
         var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
-        if (ctx.active_dense_catch_up_sessions.load(.acquire) == 0) {
+        if (ctx.active_dense_catch_up_sessions.load(.acquire) == 0 and
+            !ctx.dense_projection_finalizing.load(.acquire))
+        {
             _ = ctx.waiting_external_dense_bulk_sessions.fetchSub(1, .release);
             ctx.text_merge_deferred.store(true, .release);
             _ = ctx.active_external_dense_bulk_sessions.fetchAdd(1, .release);
@@ -29092,10 +29151,12 @@ fn finishDenseCatchUpSessionTrackedAndFinalize(ctx: *AsyncContext, index_name: [
         ctx.apply_mutex.lockShared();
         defer ctx.apply_mutex.unlockShared();
         var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
-        defer session_lock.unlock();
         finished = finishDenseCatchUpSessionLocked(ctx, index_name);
-        if (!finished or asyncContextHasActiveDenseBulkWork(ctx)) break :blk false;
-        break :blk try finalizeCoveredDenseProjectionCheckpointsSessionLocked(ctx);
+        const claimed = finished and tryClaimDenseProjectionFinalizationLocked(ctx);
+        session_lock.unlock();
+        if (!claimed) break :blk false;
+        errdefer finishDenseProjectionFinalization(ctx);
+        break :blk try drainClaimedDenseProjectionFinalizations(ctx);
     };
     if (finished) resumeDeferredBackgroundMaintenanceIfIdle(ctx);
     return completed;
@@ -29108,10 +29169,12 @@ fn finishExternalDenseBulkSessionTrackedAndFinalize(ctx: *AsyncContext) !bool {
         ctx.apply_mutex.lockShared();
         defer ctx.apply_mutex.unlockShared();
         var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
-        defer session_lock.unlock();
         finished = finishExternalDenseBulkSessionLocked(ctx);
-        if (!finished or asyncContextHasActiveDenseBulkWork(ctx)) break :blk false;
-        break :blk try finalizeCoveredDenseProjectionCheckpointsSessionLocked(ctx);
+        const claimed = finished and tryClaimDenseProjectionFinalizationLocked(ctx);
+        session_lock.unlock();
+        if (!claimed) break :blk false;
+        errdefer finishDenseProjectionFinalization(ctx);
+        break :blk try drainClaimedDenseProjectionFinalizations(ctx);
     };
     if (finished) resumeDeferredBackgroundMaintenanceIfIdle(ctx);
     return completed;
@@ -29135,10 +29198,31 @@ fn finishExternalDenseBulkSessionTrackedBestEffort(ctx: *AsyncContext) void {
     if (completed) DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
 }
 
-fn asyncContextHasActiveDenseBulkWork(ctx: *const AsyncContext) bool {
+fn asyncContextHasDenseSessionsOrWaiters(ctx: *const AsyncContext) bool {
     return ctx.active_dense_catch_up_sessions.load(.acquire) != 0 or
         ctx.active_external_dense_bulk_sessions.load(.acquire) != 0 or
         ctx.waiting_external_dense_bulk_sessions.load(.acquire) != 0;
+}
+
+fn asyncContextHasActiveDenseBulkWork(ctx: *const AsyncContext) bool {
+    return asyncContextHasDenseSessionsOrWaiters(ctx) or
+        ctx.dense_projection_finalizing.load(.acquire);
+}
+
+// dense_finish_mutex must be held. The claim is an admission fence, not a
+// storage lock: callers release the mutex before performing durable work.
+fn tryClaimDenseProjectionFinalizationLocked(ctx: *AsyncContext) bool {
+    if (asyncContextHasDenseSessionsOrWaiters(ctx) or
+        ctx.dense_projection_finalizing.load(.acquire)) return false;
+    ctx.dense_projection_finalization_requested = false;
+    ctx.dense_projection_finalizing.store(true, .release);
+    return true;
+}
+
+fn finishDenseProjectionFinalization(ctx: *AsyncContext) void {
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    ctx.dense_projection_finalizing.store(false, .release);
+    session_lock.unlock();
 }
 
 fn asyncContextHasActiveExternalDenseBulkWork(ctx: *const AsyncContext) bool {
@@ -29311,6 +29395,14 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
 
     ctx.dense_bulk_session_scope = .external;
     try std.testing.expect(!denseApplyUsesLocalStreamingSession(&ctx, "vec"));
+
+    var finalization_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    try std.testing.expect(tryClaimDenseProjectionFinalizationLocked(&ctx));
+    finalization_lock.unlock();
+    try std.testing.expect(ctx.dense_finish_mutex.tryLock());
+    ctx.dense_finish_mutex.unlock();
+    try std.testing.expectError(error.ReplayDocumentNotVisible, beginDenseCatchUpSessionTracked(&ctx, "vec"));
+    finishDenseProjectionFinalization(&ctx);
 }
 
 test "external dense bulk waiter owns admission across catch-up handoff" {
@@ -34001,13 +34093,203 @@ fn copyIdentityMetadataToStore(
     try putIdentityMetadataRows(alloc, dest_store, rows);
 }
 
-fn finalizePrimarySplitPreservingIdentity(self: *DB, split_lower: []const u8) !void {
+fn copyDerivedCoverageMetadataToStore(
+    alloc: Allocator,
+    src_store: *docstore_mod.DocStore,
+    dest_store: *docstore_mod.DocStore,
+) !void {
+    const lower = [_]u8{ internal_keys.replay_namespace, 0xff, internal_keys.derived_coverage_kind };
+    const upper = try internal_keys.nextPrefixAlloc(alloc, &lower);
+    defer if (upper) |key| alloc.free(key);
+
+    const CopyState = struct {
+        alloc: Allocator,
+        dest: *docstore_mod.DocStore,
+        writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty,
+        owned: std.ArrayListUnmanaged(docstore_mod.OwnedKVPair) = .empty,
+
+        fn deinit(state: *@This()) void {
+            state.freeOwned();
+            state.writes.deinit(state.alloc);
+            state.owned.deinit(state.alloc);
+        }
+
+        fn freeOwned(state: *@This()) void {
+            for (state.owned.items) |item| {
+                state.alloc.free(item.key);
+                state.alloc.free(item.value);
+            }
+            state.owned.clearRetainingCapacity();
+        }
+
+        fn flush(state: *@This()) !void {
+            if (state.writes.items.len == 0) return;
+            try state.dest.putBatch(state.writes.items, &.{});
+            state.writes.clearRetainingCapacity();
+            state.freeOwned();
+        }
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const owned_key = try state.alloc.dupe(u8, key);
+            const owned_value = state.alloc.dupe(u8, value) catch |err| {
+                state.alloc.free(owned_key);
+                return err;
+            };
+            state.owned.append(state.alloc, .{ .key = owned_key, .value = owned_value }) catch |err| {
+                state.alloc.free(owned_key);
+                state.alloc.free(owned_value);
+                return err;
+            };
+            try state.writes.append(state.alloc, .{ .key = owned_key, .value = owned_value });
+            if (state.writes.items.len >= 8192) try state.flush();
+            return .@"continue";
+        }
+    };
+
+    var state = CopyState{ .alloc = alloc, .dest = dest_store };
+    defer state.deinit();
+    try src_store.scanWithContext(&lower, if (upper) |key| key else "", .{}, &state, CopyState.scanEntry);
+    try state.flush();
+}
+
+fn rebaseRangeCoverageMetadata(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    byte_range: types.ByteRange,
+    extra_writes: []const docstore_mod.KVPair,
+) !void {
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+    var seen_indexes = std.StringHashMapUnmanaged(void).empty;
+    defer seen_indexes.deinit(alloc);
+    try writes.appendSlice(alloc, extra_writes);
+
+    const append_index = struct {
+        fn run(
+            inner_alloc: Allocator,
+            inner_store: *docstore_mod.DocStore,
+            inner_manager: *index_manager_mod.IndexManager,
+            range: types.ByteRange,
+            index_name: []const u8,
+            seen: *std.StringHashMapUnmanaged(void),
+            out: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+            keys: *std.ArrayListUnmanaged([]u8),
+            values: *std.ArrayListUnmanaged([]u8),
+        ) !void {
+            const gop = try seen.getOrPut(inner_alloc, index_name);
+            if (gop.found_existing) return;
+            const generation = inner_manager.coverageGenerationForIndex(index_name) orelse return;
+            const prefix = try internal_keys.derivedCoverageOutcomeMarkerPrefixAlloc(inner_alloc, index_name, generation);
+            defer inner_alloc.free(prefix);
+            const upper = try internal_keys.nextPrefixAlloc(inner_alloc, prefix);
+            defer if (upper) |key| inner_alloc.free(key);
+
+            const ScanState = struct {
+                alloc: Allocator,
+                index_name: []const u8,
+                generation: u64,
+                byte_range: types.ByteRange,
+                counts: [std.meta.tags(DerivedCoverageOutcome).len]u64 =
+                    [_]u64{0} ** std.meta.tags(DerivedCoverageOutcome).len,
+
+                fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                    const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                    const doc_key = try internal_keys.derivedCoverageOutcomeDocKeyAlloc(
+                        state.alloc,
+                        state.index_name,
+                        state.generation,
+                        key,
+                    );
+                    defer state.alloc.free(doc_key);
+                    if (!state.byte_range.contains(doc_key)) return .@"continue";
+                    const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse
+                        return error.InvalidDerivedCoverageOutcome;
+                    const outcome_index = @intFromEnum(outcome);
+                    state.counts[outcome_index] = std.math.add(u64, state.counts[outcome_index], 1) catch
+                        return error.InvalidDerivedCoverageCounter;
+                    return .@"continue";
+                }
+            };
+
+            var state = ScanState{
+                .alloc = inner_alloc,
+                .index_name = index_name,
+                .generation = generation,
+                .byte_range = range,
+            };
+            try inner_store.scanWithContext(prefix, if (upper) |key| key else "", .{}, &state, ScanState.scanEntry);
+
+            inline for (std.meta.tags(DerivedCoverageOutcome), 0..) |outcome, i| {
+                const key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(inner_alloc, index_name, generation, @tagName(outcome));
+                keys.append(inner_alloc, key) catch |err| {
+                    inner_alloc.free(key);
+                    return err;
+                };
+                const value = try inner_alloc.alloc(u8, 8);
+                std.mem.writeInt(u64, value[0..8], state.counts[i], .little);
+                values.append(inner_alloc, value) catch |err| {
+                    inner_alloc.free(value);
+                    return err;
+                };
+                try out.append(inner_alloc, .{ .key = key, .value = value });
+            }
+        }
+    }.run;
+
+    for (index_manager.dense_indexes.items) |entry| {
+        try append_index(alloc, store, index_manager, byte_range, entry.config.name, &seen_indexes, &writes, &owned_keys, &owned_values);
+    }
+    for (index_manager.sparse_indexes.items) |entry| {
+        try append_index(alloc, store, index_manager, byte_range, entry.config.name, &seen_indexes, &writes, &owned_keys, &owned_values);
+    }
+
+    const document_count = try range_cardinality.countPrimaryDocuments(alloc, store, byte_range);
+    const count_key = try alloc.dupe(u8, &internal_keys.range_document_count_key);
+    owned_keys.append(alloc, count_key) catch |err| {
+        alloc.free(count_key);
+        return err;
+    };
+    const count_value = try alloc.alloc(u8, 8);
+    std.mem.writeInt(u64, count_value[0..8], document_count, .little);
+    owned_values.append(alloc, count_value) catch |err| {
+        alloc.free(count_value);
+        return err;
+    };
+    try writes.append(alloc, .{ .key = count_key, .value = count_value });
+
+    try store.putBatch(writes.items, &.{});
+}
+
+fn finalizePrimarySplitPreservingIdentity(
+    self: *DB,
+    split_lower: []const u8,
+    retained_range: types.ByteRange,
+) !void {
     const range = identityMetadataRange();
     const identity_rows = try self.core.store.scanRange(self.alloc, range.lower[0..], range.upper[0..]);
     defer docstore_mod.DocStore.freeResults(self.alloc, identity_rows);
 
     _ = try tryFinalizePrimarySplitFast(self, split_lower);
     try putIdentityMetadataRows(self.alloc, self.core.store, identity_rows);
+    try rebaseRangeCoverageMetadata(
+        self.alloc,
+        self.core.store,
+        self.core.index_manager,
+        retained_range,
+        &.{},
+    );
 }
 
 fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []const u8) !void {
@@ -34034,6 +34316,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     try clearSplitMetadataFromStore(self.alloc, dest_store);
     try clearSystemMetadataFromSplitDestination(self.alloc, dest_store);
     try copyIdentityMetadataToStore(self.alloc, self.core.store, dest_store);
+    if (!page_split_built) try copyDerivedCoverageMetadataToStore(self.alloc, self.core.store, dest_store);
     const replay_floor = self.core.nextDerivedAppendSequence();
     try ensureReplayFloor(dest_store, replay_floor);
 
@@ -34109,6 +34392,8 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
         dest_store,
         &dest_indexes,
     );
+
+    try rebaseRangeCoverageMetadata(self.alloc, dest_store, &dest_indexes, byte_range, &.{});
 
     try dest_indexes.syncAll(true);
     try dest_store.sync(true);
@@ -34749,7 +35034,7 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
     try markSplitOffDocumentArtifactChildRangesLocked(self, split_state, split_lower);
-    try finalizePrimarySplitPreservingIdentity(self, split_lower);
+    try finalizePrimarySplitPreservingIdentity(self, split_lower, new_range);
     try ensureReplayFloor(self.core.store, replay_floor);
     try self.core.pruneSplitRangeFromPrimaryIndexes(split_state.split_key, split_state.original_range_end);
     try self.rebaseManagedIndexAppliedSequencesIfNeeded();
@@ -35319,25 +35604,34 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
         @as(u2, @intFromBool(terminal_failed != null));
     if (present_count == 0) {
         // A fresh generation on an empty table has no outcome rows to create
-        // the counter tuple. The maintained identity summary is the only
-        // additional proof needed to distinguish that valid zero target from
-        // missing accounting on a non-empty corpus.
-        const identity_stats = try doc_identity.fastStatsFromStore(ctx.store);
-        return if (identity_stats.live_ordinals == 0) 0 else null;
+        // the counter tuple. The range-local primary cardinality distinguishes
+        // that valid zero target from missing accounting on a non-empty range.
+        const source_count = try range_cardinality.loadOrCount(
+            ctx.alloc,
+            ctx.store,
+            ctx.index_manager.byte_range,
+        );
+        return if (source_count == 0) 0 else null;
     }
     if (present_count != 3) return error.InvalidDerivedCoverageCounter;
 
     // Outcome counters are created as a complete tuple by the first processed
     // document, so tuple presence alone is not a completion proof. Keep this
     // O(1) by comparing the maintained generation outcome summary with the
-    // maintained primary identity summary. Publishing is fail-closed until
-    // every live source document has exactly one terminal outcome.
+    // maintained range-local primary summary. Publishing is fail-closed until
+    // every source document owned by this range has exactly one terminal
+    // outcome. The namespace-wide ordinal summary deliberately remains shared
+    // across split descendants so it cannot serve as this ownership proof.
     const accounted_without_failures = std.math.add(u64, produced.?, skipped.?) catch
         return error.InvalidDerivedCoverageCounter;
     const accounted = std.math.add(u64, accounted_without_failures, terminal_failed.?) catch
         return error.InvalidDerivedCoverageCounter;
-    const identity_stats = try doc_identity.fastStatsFromStore(ctx.store);
-    if (accounted != identity_stats.live_ordinals) return null;
+    const source_count = try range_cardinality.loadOrCount(
+        ctx.alloc,
+        ctx.store,
+        ctx.index_manager.byte_range,
+    );
+    if (accounted != source_count) return null;
     return produced.?;
 }
 
@@ -35912,27 +36206,65 @@ fn finalizeCoveredDenseProjectionCheckpoint(
     applied_sequence: u64,
 ) !bool {
     var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
-    defer session_lock.unlock();
-    return finalizeCoveredDenseProjectionCheckpointSessionLocked(ctx, index_name, applied_sequence);
+    const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) orelse {
+        session_lock.unlock();
+        return false;
+    };
+    if (checkpoint.status != .rebuilding) {
+        session_lock.unlock();
+        return false;
+    }
+    if (!tryClaimDenseProjectionFinalizationLocked(ctx)) {
+        queueDenseProjectionFinalizationLocked(ctx, index_name, applied_sequence) catch |err| {
+            session_lock.unlock();
+            return err;
+        };
+        session_lock.unlock();
+        return false;
+    }
+    session_lock.unlock();
+    errdefer finishDenseProjectionFinalization(ctx);
+
+    const finalized = try finalizeCoveredDenseProjectionCheckpointClaimed(ctx, index_name, applied_sequence);
+    if (finalized) clearPendingDenseProjectionFinalization(ctx, index_name);
+    return try drainClaimedDenseProjectionFinalizations(ctx) or finalized;
 }
 
-fn finalizeCoveredDenseProjectionCheckpointSessionLocked(
+fn queueDenseProjectionFinalizationLocked(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    applied_sequence: u64,
+) !void {
+    ctx.dense_projection_finalization_requested = true;
+    if (ctx.pending_dense_projection_finalizations.getPtr(index_name)) |pending_sequence| {
+        pending_sequence.* = @max(pending_sequence.*, applied_sequence);
+        return;
+    }
+    const owned_name = try ctx.alloc.dupe(u8, index_name);
+    errdefer ctx.alloc.free(owned_name);
+    try ctx.pending_dense_projection_finalizations.putNoClobber(ctx.alloc, owned_name, applied_sequence);
+}
+
+fn pendingDenseProjectionFinalizationSequence(ctx: *AsyncContext, index_name: []const u8) u64 {
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    defer session_lock.unlock();
+    return ctx.pending_dense_projection_finalizations.get(index_name) orelse 0;
+}
+
+fn clearPendingDenseProjectionFinalization(ctx: *AsyncContext, index_name: []const u8) void {
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    defer session_lock.unlock();
+    if (ctx.pending_dense_projection_finalizations.fetchRemove(index_name)) |removed|
+        ctx.alloc.free(@constCast(removed.key));
+}
+
+fn finalizeCoveredDenseProjectionCheckpointClaimed(
     ctx: *AsyncContext,
     index_name: []const u8,
     applied_sequence: u64,
 ) !bool {
     const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) orelse return false;
     if (checkpoint.status != .rebuilding) return false;
-    if (asyncContextHasActiveDenseBulkWork(ctx)) {
-        if (ctx.pending_dense_projection_finalizations.getPtr(index_name)) |pending_sequence| {
-            pending_sequence.* = @max(pending_sequence.*, applied_sequence);
-        } else {
-            const owned_name = try ctx.alloc.dupe(u8, index_name);
-            errdefer ctx.alloc.free(owned_name);
-            try ctx.pending_dense_projection_finalizations.putNoClobber(ctx.alloc, owned_name, applied_sequence);
-        }
-        return false;
-    }
 
     const expected_count = (try denseTargetCountForIndexContext(ctx, index_name)) orelse return false;
     const entry = ctx.index_manager.denseIndex(index_name) orelse return false;
@@ -35959,41 +36291,60 @@ fn finalizeCoveredDenseProjectionCheckpointsIfIdle(ctx: *AsyncContext) !bool {
     ctx.apply_mutex.lockShared();
     defer ctx.apply_mutex.unlockShared();
 
-    // Session admission and terminal publication share this boundary. Once
-    // idle is observed here, no new catch-up or external bulk session can
-    // begin until every covered generation has been finalized.
     var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
-    defer session_lock.unlock();
-    if (asyncContextHasActiveDenseBulkWork(ctx)) return false;
+    const claimed = tryClaimDenseProjectionFinalizationLocked(ctx);
+    session_lock.unlock();
+    if (!claimed) return false;
+    errdefer finishDenseProjectionFinalization(ctx);
 
-    return finalizeCoveredDenseProjectionCheckpointsSessionLocked(ctx);
+    return drainClaimedDenseProjectionFinalizations(ctx);
 }
 
-// Requires a shared apply lease followed by dense_finish_mutex. Keeping the
-// counter transition and every covered-generation publication inside this
-// boundary prevents a newly admitted session from stranding rebuilding state.
-fn finalizeCoveredDenseProjectionCheckpointsSessionLocked(ctx: *AsyncContext) !bool {
-    // First discard work for indexes that were removed or completed through a
-    // different publication path. Snapshot the keys because removals free the
-    // map-owned names.
-    if (ctx.pending_dense_projection_finalizations.count() > 0) {
-        const pending_names = try ctx.alloc.alloc([]const u8, ctx.pending_dense_projection_finalizations.count());
-        defer ctx.alloc.free(pending_names);
-        var pending_it = ctx.pending_dense_projection_finalizations.keyIterator();
-        var pending_count: usize = 0;
-        while (pending_it.next()) |name| : (pending_count += 1) pending_names[pending_count] = name.*;
-        for (pending_names[0..pending_count]) |index_name| {
-            const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_name);
-            if (checkpoint == null or checkpoint.?.status != .rebuilding) {
+// The finalization owner keeps admission closed until every request that raced
+// with its preceding scan has received a subsequent scan. Incomplete pending
+// generations do not cause a busy loop: only a new request flips the handoff
+// bit, and future replay/session completion will request another pass.
+fn drainClaimedDenseProjectionFinalizations(ctx: *AsyncContext) !bool {
+    var completed = false;
+    while (true) {
+        completed = try finalizeCoveredDenseProjectionCheckpointsClaimed(ctx) or completed;
+
+        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+        if (!ctx.dense_projection_finalization_requested) {
+            ctx.dense_projection_finalizing.store(false, .release);
+            session_lock.unlock();
+            return completed;
+        }
+        ctx.dense_projection_finalization_requested = false;
+        session_lock.unlock();
+    }
+}
+
+// Requires a shared apply lease and an active finalization claim. Session
+// admission remains fenced by dense_projection_finalizing, but durable writes
+// execute without holding dense_finish_mutex.
+fn finalizeCoveredDenseProjectionCheckpointsClaimed(ctx: *AsyncContext) !bool {
+    // Pending work is only a wake-up optimization. Remove entries whose
+    // catalog generation disappeared or completed through another path so a
+    // long-running process cannot retain obsolete index names indefinitely.
+    {
+        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+        defer session_lock.unlock();
+        if (ctx.pending_dense_projection_finalizations.count() != 0) {
+            const names = try ctx.alloc.alloc([]const u8, ctx.pending_dense_projection_finalizations.count());
+            defer ctx.alloc.free(names);
+            var count: usize = 0;
+            var it = ctx.pending_dense_projection_finalizations.keyIterator();
+            while (it.next()) |name| : (count += 1) names[count] = name.*;
+            for (names[0..count]) |index_name| {
+                const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_name);
+                if (checkpoint != null and checkpoint.?.status == .rebuilding) continue;
                 const removed = ctx.pending_dense_projection_finalizations.fetchRemove(index_name) orelse continue;
                 ctx.alloc.free(@constCast(removed.key));
             }
         }
     }
 
-    // A last-session transition is rare relative to replay writes. Scanning
-    // the dense catalog here guarantees correctness even after reopen, where
-    // the in-memory pending set is intentionally empty.
     var completed = false;
     for (ctx.index_manager.dense_indexes.items) |*entry| {
         const index_name = entry.config.name;
@@ -36001,16 +36352,13 @@ fn finalizeCoveredDenseProjectionCheckpointsSessionLocked(ctx: *AsyncContext) !b
             continue;
         };
         if (checkpoint.status != .rebuilding) continue;
-        const finalized = try finalizeCoveredDenseProjectionCheckpointSessionLocked(
+        const finalized = try finalizeCoveredDenseProjectionCheckpointClaimed(
             ctx,
             index_name,
-            @max(checkpoint.applied_sequence, ctx.pending_dense_projection_finalizations.get(index_name) orelse 0),
+            @max(checkpoint.applied_sequence, pendingDenseProjectionFinalizationSequence(ctx, index_name)),
         );
         completed = finalized or completed;
-        if (finalized) {
-            if (ctx.pending_dense_projection_finalizations.fetchRemove(index_name)) |removed|
-                ctx.alloc.free(@constCast(removed.key));
-        }
+        if (finalized) clearPendingDenseProjectionFinalization(ctx, index_name);
     }
     return completed;
 }
@@ -62637,6 +62985,59 @@ test "db last dense catch-up lease finalizes every covered rebuilding generation
     }
 }
 
+test "db dense finalization owner drains requests queued during publication" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const config: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    };
+    try db.addIndex(config);
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"_embeddings\":{\"dense_idx\":[1,0,0]}}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, config.name);
+    defer alloc.free(counter_key);
+    var counter_value: [8]u8 = undefined;
+    std.mem.writeInt(u64, &counter_value, 1, .little);
+    try db.core.store.put(counter_key, &counter_value);
+    const applied = try db.core.loadAppliedSequence(alloc, config.name);
+    try db.core.saveProjectionCheckpoint(config.name, .{
+        .applied_sequence = applied,
+        .status = .rebuilding,
+        .generation = 17,
+        .config_hash = types.indexConfigHash(config),
+    });
+
+    db.async_context.apply_mutex.lockShared();
+    defer db.async_context.apply_mutex.unlockShared();
+    db.async_context.dense_projection_finalizing.store(true, .release);
+    try std.testing.expect(!try finalizeCoveredDenseProjectionCheckpoint(db.async_context, config.name, applied));
+    try std.testing.expect(db.async_context.dense_projection_finalization_requested);
+    try std.testing.expect(try drainClaimedDenseProjectionFinalizations(db.async_context));
+    try std.testing.expect(!db.async_context.dense_projection_finalizing.load(.acquire));
+
+    const checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expectEqual(@as(u64, 18), checkpoint.generation);
+}
+
 test "db last external dense bulk lease finalizes covered rebuilding generations" {
     const alloc = std.testing.allocator;
 
@@ -62806,6 +63207,47 @@ test "db inline dense generation remains rebuilding until outcomes cover the liv
     checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
     try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 10), checkpoint.generation);
+}
+
+test "db inline dense coverage counters rebase with range ownership" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const config: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
+    };
+    try db.addIndex(config);
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1,0,0]}" },
+            .{ .key = "doc:z", .value = "{\"embedding\":[0,1,0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expectEqual(@as(?u64, 2), try denseTargetCountForIndexContext(db.async_context, config.name));
+    try db.updateRange(.{ .start = "", .end = "doc:m" });
+    try std.testing.expectEqual(@as(?u64, 1), try denseTargetCountForIndexContext(db.async_context, config.name));
+    try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, db.core.store));
+    try std.testing.expectEqual(@as(u64, 2), (try doc_identity.fastStatsFromStore(db.core.store)).live_ordinals);
+
+    // Expanding ownership is the merge-side topology transition. Rebase sees
+    // already-present donor rows and republishes the compact local summaries
+    // in the same durable batch as the new range descriptor.
+    try db.updateRange(.{ .start = "", .end = "" });
+    try std.testing.expectEqual(@as(?u64, 2), try denseTargetCountForIndexContext(db.async_context, config.name));
+    try std.testing.expectEqual(@as(?u64, 2), try range_cardinality.load(alloc, db.core.store));
 }
 
 test "db runtime status overlay refreshes identity totals with coverage counters" {
@@ -69659,6 +70101,7 @@ test "db exposes local transaction lifecycle" {
     try db.commitTransaction(txn_id, commit_ts);
     try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
     try std.testing.expectEqual(commit_ts, try db.getCommitVersion(txn_id));
+    try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, db.core.store));
 
     const raw = (try db.get(alloc, "doc:txn")) orelse return error.TestExpectedEqual;
     defer alloc.free(raw);
@@ -69680,6 +70123,7 @@ test "db exposes local transaction lifecycle" {
     }, &.{});
     try db.commitTransaction(delete_txn, commit_ts + 2);
     try std.testing.expect((try db.get(alloc, "doc:txn")) == null);
+    try std.testing.expectEqual(@as(?u64, 0), try range_cardinality.load(alloc, db.core.store));
 
     {
         const stats = try db.diagnosticStats(alloc);
@@ -71275,6 +71719,7 @@ test "db transaction recovery runtime appends identity rows for committed orphan
     const raw = (try db.get(alloc, "doc:recovered_orphan")) orelse return error.TestExpectedEqual;
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("{\"title\":\"recovered\"}", raw);
+    try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, db.core.store));
 
     const stats = try db.diagnosticStats(alloc);
     defer types.freeDBStats(alloc, stats);
@@ -71601,11 +72046,13 @@ test "db split prepare and finalize produce destination shard and trim parent ra
         },
         .sync_level = .full_index,
     });
+    try std.testing.expectEqual(@as(?u64, 2), try range_cardinality.load(alloc, db.core.store));
     try db.split(db.getRange(), "doc:m", "", std.mem.span(dest), true);
 
     var split_db = try DB.open(alloc, std.mem.span(dest), .{});
     defer split_db.close();
     try std.testing.expectEqualStrings("doc:m", split_db.getRange().start);
+    try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, split_db.core.store));
     try std.testing.expect((try split_db.getSplitState(alloc)) == null);
     {
         const split_stats = try split_db.diagnosticStats(alloc);
@@ -71672,6 +72119,7 @@ test "db split prepare and finalize produce destination shard and trim parent ra
 
     try db.finalizeSplit(.{ .start = "", .end = "doc:m" });
     try std.testing.expectEqualStrings("doc:m", db.getRange().end);
+    try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, db.core.store));
     try std.testing.expect((try db.get(alloc, "doc:z")) == null);
     {
         const parent_stats = try db.diagnosticStats(alloc);
@@ -74993,6 +75441,7 @@ test "db updateRange constrains index backfill" {
     try db.core.store.put(doc_c_key, "{\"title\":\"gamma\"}");
 
     try db.updateRange(.{ .start = "doc:b", .end = "doc:c\xff" });
+    try std.testing.expectEqual(@as(?u64, 2), try range_cardinality.load(alloc, db.core.store));
     try db.addIndex(.{
         .name = "ft_range",
         .kind = .full_text,
@@ -75001,6 +75450,42 @@ test "db updateRange constrains index backfill" {
 
     const text_index = db.core.index_manager.textIndex("ft_range").?;
     try std.testing.expectEqual(@as(u32, 2), text_index.snapshot().global_doc_count);
+}
+
+test "db range cardinality remains exact across mutations and reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.batch(.{ .writes = &.{
+            .{ .key = "doc:a", .value = "{\"value\":1}" },
+            .{ .key = "doc:b", .value = "{\"value\":2}" },
+        } });
+        try std.testing.expectEqual(@as(?u64, 2), try range_cardinality.load(alloc, db.core.store));
+
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"value\":3}" }} });
+        try std.testing.expectEqual(@as(?u64, 2), try range_cardinality.load(alloc, db.core.store));
+
+        try db.batch(.{ .deletes = &.{"doc:b"} });
+        try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, db.core.store));
+        try db.sync(true);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, reopened.core.store));
 }
 
 fn applyStoredSearchPatternFilters(self: *DB, alloc: Allocator, req: types.SearchRequest, result: types.SearchResult) !types.SearchResult {
