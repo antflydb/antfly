@@ -20,6 +20,8 @@ const snapshot_payload_store = @import("snapshot_payload_store.zig");
 const file_snapshot_artifact = @import("file_snapshot_artifact.zig");
 
 const magic: u32 = 0x41524654; // ARFT
+const legacy_inline_snapshot_version: u32 = 2;
+const legacy_external_snapshot_version: u32 = 3;
 // Version 4 stores the Raft log compaction boundary separately from the
 // transferable state snapshot metadata.
 const version: u32 = 4;
@@ -295,14 +297,18 @@ pub const PersistentReplicaState = struct {
         var cursor: usize = 0;
         if (try readInt(u32, bytes, &cursor) != magic) return error.InvalidReplicaState;
         const file_version = try readInt(u32, bytes, &cursor);
-        if (file_version != version) return error.UnsupportedReplicaStateVersion;
+        if (file_version < 1 or file_version > version) return error.UnsupportedReplicaStateVersion;
+        const requires_migration = file_version != version;
 
         self.store.setHardState(.{
             .current_term = try readInt(u64, bytes, &cursor),
             .voted_for = if (try readBool(bytes, &cursor)) try readInt(u64, bytes, &cursor) else null,
             .commit_index = try readInt(u64, bytes, &cursor),
         });
-        self.applied_index = try readInt(u64, bytes, &cursor);
+        self.applied_index = if (file_version >= legacy_inline_snapshot_version)
+            try readInt(u64, bytes, &cursor)
+        else
+            self.store.hard_state.commit_index;
 
         var conf_state = try decodeConfState(self.alloc, bytes, &cursor);
         defer conf_state.deinit(self.alloc);
@@ -315,12 +321,21 @@ pub const PersistentReplicaState = struct {
                 var owned = snapshot;
                 owned.deinit(self.alloc);
             }
-            try self.store.applySnapshot(snapshot);
+            // Versions 1 and 2 embedded the transferable snapshot payload in
+            // state.bin. Publish the sidecar before replacing state.bin so a
+            // crash can only leave the old, self-contained format or the new,
+            // fully durable format.
+            if (file_version <= legacy_inline_snapshot_version and snapshot.metadata.index != 0) {
+                try self.publishSnapshotPayload(snapshot);
+            }
+            try self.store.applySnapshot(metadataOnlySnapshot(snapshot));
         }
 
-        const compacted_index = try readInt(u64, bytes, &cursor);
-        const compacted_term = try readInt(u64, bytes, &cursor);
-        try self.store.restoreCompactionBoundary(compacted_index, compacted_term);
+        if (file_version > legacy_external_snapshot_version) {
+            const compacted_index = try readInt(u64, bytes, &cursor);
+            const compacted_term = try readInt(u64, bytes, &cursor);
+            try self.store.restoreCompactionBoundary(compacted_index, compacted_term);
+        }
 
         const entry_count = try readInt(u32, bytes, &cursor);
         if (entry_count > 0) {
@@ -330,6 +345,16 @@ pub const PersistentReplicaState = struct {
             }
             for (entries) |*entry| entry.* = try decodeEntry(self.alloc, bytes, &cursor);
             try self.store.append(entries);
+        }
+        if (cursor != bytes.len) return error.InvalidReplicaState;
+
+        // Versions through 3 used snapshot.index as the compaction boundary.
+        // applySnapshot above restores that invariant before appending the
+        // retained suffix. Rewrite once into v4 so subsequent opens use the
+        // explicit boundary and metadata-only snapshot representation.
+        if (requires_migration) {
+            try self.validateDurableSnapshotPayload();
+            try self.persist();
         }
     }
 
@@ -500,6 +525,97 @@ pub const PersistentReplicaState = struct {
         };
     }
 };
+
+fn encodeLegacyPersistentStateForTest(
+    alloc: std.mem.Allocator,
+    file_version: u32,
+    snapshot_data: []const u8,
+) ![]u8 {
+    std.debug.assert(file_version >= 1 and file_version <= legacy_external_snapshot_version);
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    errdefer buffer.deinit(alloc);
+
+    try PersistentReplicaState.appendInt(u32, alloc, &buffer, magic);
+    try PersistentReplicaState.appendInt(u32, alloc, &buffer, file_version);
+    try PersistentReplicaState.appendInt(u64, alloc, &buffer, 6);
+    try PersistentReplicaState.appendBool(alloc, &buffer, true);
+    try PersistentReplicaState.appendInt(u64, alloc, &buffer, 2);
+    try PersistentReplicaState.appendInt(u64, alloc, &buffer, 8);
+    if (file_version >= legacy_inline_snapshot_version)
+        try PersistentReplicaState.appendInt(u64, alloc, &buffer, 7);
+    try PersistentReplicaState.encodeConfState(alloc, &buffer, .{ .voters = @constCast((&[_]u64{ 1, 2 })[0..]) });
+    try PersistentReplicaState.appendBool(alloc, &buffer, true);
+    try PersistentReplicaState.encodeSnapshot(alloc, &buffer, .{
+        .metadata = .{
+            .index = 5,
+            .term = 4,
+            .conf_state = .{ .voters = @constCast((&[_]u64{ 1, 2 })[0..]) },
+        },
+        .data = @constCast(snapshot_data),
+    });
+    try PersistentReplicaState.appendInt(u32, alloc, &buffer, 3);
+    for ([_]u64{ 6, 7, 8 }) |entry_index| {
+        try PersistentReplicaState.encodeEntry(alloc, &buffer, .{
+            .term = 6,
+            .index = entry_index,
+            .data = @constCast("legacy-entry"),
+        });
+    }
+    return try buffer.toOwnedSlice(alloc);
+}
+
+test "persistent replica state migrates legacy checkpoints atomically" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    for ([_]u32{ 1, 2, 3 }) |file_version| {
+        const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/legacy-v{d}", .{ tmp.sub_path, file_version });
+        defer std.testing.allocator.free(root);
+        var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 70 + file_version, 3);
+        defer layout.deinit(std.testing.allocator);
+        try fs_paths.createDirPathPortable(std.testing.io, layout.log_dir);
+        try fs_paths.createDirPathPortable(std.testing.io, layout.snapshot_dir);
+
+        const inline_payload = if (file_version <= legacy_inline_snapshot_version) "legacy-snapshot" else "";
+        const encoded = try encodeLegacyPersistentStateForTest(std.testing.allocator, file_version, inline_payload);
+        defer std.testing.allocator.free(encoded);
+        if (file_version == legacy_external_snapshot_version) {
+            try snapshot_payload_store.writeAtomically(
+                std.testing.allocator,
+                std.testing.io,
+                layout.snapshot_dir,
+                5,
+                4,
+                "legacy-snapshot",
+            );
+        }
+        const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/state.bin", .{layout.log_dir});
+        defer std.testing.allocator.free(state_path);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = encoded });
+
+        {
+            var state = try PersistentReplicaState.init(std.testing.allocator, layout);
+            defer state.deinit();
+            try std.testing.expectEqual(if (file_version == 1) @as(u64, 8) else 7, state.appliedIndex());
+            try std.testing.expectEqual(@as(u64, 6), try state.storage().firstIndex());
+            try std.testing.expectEqual(@as(u64, 8), try state.storage().lastIndex());
+            var snapshot = try state.storage().snapshot(std.testing.allocator);
+            defer snapshot.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("legacy-snapshot", snapshot.data);
+
+            const migrated = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, std.testing.allocator, .limited(1 << 20));
+            defer std.testing.allocator.free(migrated);
+            try std.testing.expectEqual(version, std.mem.readInt(u32, migrated[4..8], .little));
+        }
+
+        var reopened = try PersistentReplicaState.init(std.testing.allocator, layout);
+        defer reopened.deinit();
+        try std.testing.expectEqual(@as(u64, 6), try reopened.storage().firstIndex());
+        var snapshot = try reopened.storage().snapshot(std.testing.allocator);
+        defer snapshot.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("legacy-snapshot", snapshot.data);
+    }
+}
 
 test "persistent replica state persists ready updates across reopen" {
     var tmp = std.testing.tmpDir(.{});

@@ -22,10 +22,15 @@ const snapshot_payload_store = @import("snapshot_payload_store.zig");
 const storage_iface = raft_engine.runtime.storage_iface;
 
 const magic: u32 = 0x41524654; // ARFT
+const legacy_inline_snapshot_version: u32 = 2;
+const legacy_external_snapshot_version: u32 = 3;
 // Version 4 checkpoints persist the Raft log compaction boundary separately
 // from the transferable state snapshot metadata.
 const version: u32 = 4;
 const delta_magic: u32 = 0x4152444c; // ARDL
+// Delta versions 1 and 2 embed snapshot payloads. Version 1 predates the
+// optional ready-level ConfState tail; version 3 externalizes payloads.
+const legacy_inline_delta_version: u32 = 2;
 const delta_version: u32 = 3;
 const applied_watermark_magic: u32 = 0x4152574d; // ARWM
 const applied_watermark_version: u32 = 1;
@@ -369,12 +374,31 @@ pub const WalReplicaState = struct {
             if (record_magic == magic) replay_from = i;
         }
 
+        var requires_migration = false;
         for (entries[replay_from..]) |entry| {
+            var header_cursor: usize = @sizeOf(u32);
+            const record_magic = try peekRecordMagic(entry.data);
+            const record_version = try readInt(u32, entry.data, &header_cursor);
+            requires_migration = requires_migration or switch (record_magic) {
+                magic => record_version != version,
+                delta_magic => record_version != delta_version,
+                else => false,
+            };
             try self.decodeWalRecord(entry.data);
         }
         try self.loadAppliedWatermark();
         self.durable_applied_index = self.applied_index;
         try self.refreshLastCompactedIndex();
+        if (requires_migration) {
+            // Validate the sidecar before retiring any self-contained legacy
+            // checkpoint. Inline v1/v2 payloads have already been published by
+            // the decoders; v3 records must already have a durable sidecar.
+            try self.validateDurableSnapshotPayload();
+            try self.persistCheckpoint();
+            self.delta_records_since_checkpoint = 0;
+            self.delta_bytes_since_checkpoint = 0;
+            try self.wal.sync(true);
+        }
     }
 
     fn publishSnapshotPayload(self: *WalReplicaState, snapshot: raft_engine.core.types.Snapshot) !void {
@@ -681,14 +705,17 @@ pub const WalReplicaState = struct {
         var cursor: usize = 0;
         if (try readInt(u32, bytes, &cursor) != magic) return error.InvalidReplicaState;
         const file_version = try readInt(u32, bytes, &cursor);
-        if (file_version != version) return error.UnsupportedReplicaStateVersion;
+        if (file_version < 1 or file_version > version) return error.UnsupportedReplicaStateVersion;
 
         self.store.setHardState(.{
             .current_term = try readInt(u64, bytes, &cursor),
             .voted_for = if (try readBool(bytes, &cursor)) try readInt(u64, bytes, &cursor) else null,
             .commit_index = try readInt(u64, bytes, &cursor),
         });
-        self.applied_index = try readInt(u64, bytes, &cursor);
+        self.applied_index = if (file_version >= legacy_inline_snapshot_version)
+            try readInt(u64, bytes, &cursor)
+        else
+            self.store.hard_state.commit_index;
 
         var conf_state = try decodeConfState(self.alloc, bytes, &cursor);
         defer conf_state.deinit(self.alloc);
@@ -701,12 +728,17 @@ pub const WalReplicaState = struct {
                 var owned = snapshot;
                 owned.deinit(self.alloc);
             }
-            try self.store.applySnapshot(snapshot);
+            if (file_version <= legacy_inline_snapshot_version and snapshot.metadata.index != 0) {
+                try self.publishSnapshotPayload(snapshot);
+            }
+            try self.store.applySnapshot(metadataOnlySnapshot(snapshot));
         }
 
-        const compacted_index = try readInt(u64, bytes, &cursor);
-        const compacted_term = try readInt(u64, bytes, &cursor);
-        try self.store.restoreCompactionBoundary(compacted_index, compacted_term);
+        if (file_version > legacy_external_snapshot_version) {
+            const compacted_index = try readInt(u64, bytes, &cursor);
+            const compacted_term = try readInt(u64, bytes, &cursor);
+            try self.store.restoreCompactionBoundary(compacted_index, compacted_term);
+        }
 
         const entry_count = try readInt(u32, bytes, &cursor);
         if (entry_count > 0) {
@@ -715,6 +747,7 @@ pub const WalReplicaState = struct {
             for (entries) |*entry| entry.* = try decodeEntry(self.alloc, bytes, &cursor);
             try self.store.append(entries);
         }
+        if (cursor != bytes.len) return error.InvalidReplicaState;
     }
 
     fn encodeReadyDelta(self: *WalReplicaState, ready: raft_engine.core.Ready) ![]u8 {
@@ -764,7 +797,8 @@ pub const WalReplicaState = struct {
         var cursor: usize = 0;
         if (try readInt(u32, bytes, &cursor) != delta_magic) return error.InvalidReplicaState;
         const file_version = try readInt(u32, bytes, &cursor);
-        if (file_version != delta_version) return error.UnsupportedReplicaStateVersion;
+        if (file_version < 1 or file_version > delta_version)
+            return error.UnsupportedReplicaStateVersion;
 
         const kind_tag = if (cursor < bytes.len) bytes[cursor] else return error.InvalidReplicaState;
         cursor += 1;
@@ -792,7 +826,11 @@ pub const WalReplicaState = struct {
                         var owned = snapshot;
                         owned.deinit(self.alloc);
                     }
-                    try self.store.applySnapshot(snapshot);
+                    if (file_version <= legacy_inline_delta_version and snapshot.metadata.index != 0) {
+                        try self.publishSnapshotPayload(snapshot);
+                    }
+                    try self.store.applySnapshot(metadataOnlySnapshot(snapshot));
+                    if (snapshot.metadata.index > self.applied_index) self.applied_index = snapshot.metadata.index;
                 }
 
                 const entry_count = try readInt(u32, bytes, &cursor);
@@ -802,7 +840,9 @@ pub const WalReplicaState = struct {
                     for (entries) |*entry| entry.* = try decodeEntry(self.alloc, bytes, &cursor);
                     try self.store.append(entries);
                 }
-                if (try readBool(bytes, &cursor)) {
+                // Delta v1 ended after entries. Delta v2 added this optional
+                // ConfState tail, which remains present in current records.
+                if (file_version >= 2 and try readBool(bytes, &cursor)) {
                     var conf_state = try decodeConfState(self.alloc, bytes, &cursor);
                     defer conf_state.deinit(self.alloc);
                     try self.store.setConfState(conf_state);
@@ -814,6 +854,7 @@ pub const WalReplicaState = struct {
                 try self.store.setConfState(conf_state);
             },
         }
+        if (cursor != bytes.len) return error.InvalidReplicaState;
     }
 
     fn appendInt(comptime T: type, alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: T) !void {
@@ -974,6 +1015,150 @@ pub const WalReplicaState = struct {
         };
     }
 };
+
+fn encodeLegacyWalCheckpointForTest(
+    alloc: std.mem.Allocator,
+    file_version: u32,
+    snapshot_data: []const u8,
+) ![]u8 {
+    std.debug.assert(file_version >= 1 and file_version <= legacy_external_snapshot_version);
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    errdefer buffer.deinit(alloc);
+
+    try WalReplicaState.appendInt(u32, alloc, &buffer, magic);
+    try WalReplicaState.appendInt(u32, alloc, &buffer, file_version);
+    try WalReplicaState.appendInt(u64, alloc, &buffer, 6);
+    try WalReplicaState.appendBool(alloc, &buffer, true);
+    try WalReplicaState.appendInt(u64, alloc, &buffer, 2);
+    try WalReplicaState.appendInt(u64, alloc, &buffer, 6);
+    if (file_version >= legacy_inline_snapshot_version)
+        try WalReplicaState.appendInt(u64, alloc, &buffer, 5);
+    try WalReplicaState.encodeConfState(alloc, &buffer, .{ .voters = @constCast((&[_]u64{ 1, 2 })[0..]) });
+    try WalReplicaState.appendBool(alloc, &buffer, true);
+    try WalReplicaState.encodeSnapshot(alloc, &buffer, .{
+        .metadata = .{
+            .index = 5,
+            .term = 4,
+            .conf_state = .{ .voters = @constCast((&[_]u64{ 1, 2 })[0..]) },
+        },
+        .data = @constCast(snapshot_data),
+    });
+    try WalReplicaState.appendInt(u32, alloc, &buffer, 1);
+    try WalReplicaState.encodeEntry(alloc, &buffer, .{
+        .term = 6,
+        .index = 6,
+        .data = @constCast("checkpoint-entry"),
+    });
+    return try buffer.toOwnedSlice(alloc);
+}
+
+fn encodeLegacyWalReadyDeltaForTest(alloc: std.mem.Allocator, file_version: u32) ![]u8 {
+    std.debug.assert(file_version >= 1 and file_version <= delta_version);
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    errdefer buffer.deinit(alloc);
+
+    try WalReplicaState.appendInt(u32, alloc, &buffer, delta_magic);
+    try WalReplicaState.appendInt(u32, alloc, &buffer, file_version);
+    try buffer.append(alloc, @intFromEnum(DeltaRecordKind.ready));
+    try WalReplicaState.appendBool(alloc, &buffer, true);
+    try WalReplicaState.appendInt(u64, alloc, &buffer, 7);
+    try WalReplicaState.appendBool(alloc, &buffer, true);
+    try WalReplicaState.appendInt(u64, alloc, &buffer, 2);
+    try WalReplicaState.appendInt(u64, alloc, &buffer, 7);
+    try WalReplicaState.appendBool(alloc, &buffer, true);
+    try WalReplicaState.encodeSnapshot(alloc, &buffer, .{
+        .metadata = .{
+            .index = 6,
+            .term = 6,
+            .conf_state = .{ .voters = @constCast((&[_]u64{ 1, 2 })[0..]) },
+        },
+        .data = if (file_version <= legacy_inline_delta_version) @constCast("delta-snapshot") else &.{},
+    });
+    try WalReplicaState.appendInt(u32, alloc, &buffer, 1);
+    try WalReplicaState.encodeEntry(alloc, &buffer, .{
+        .term = 7,
+        .index = 7,
+        .data = @constCast("delta-entry"),
+    });
+    if (file_version >= 2) try WalReplicaState.appendBool(alloc, &buffer, false);
+    return try buffer.toOwnedSlice(alloc);
+}
+
+test "wal replica state migrates legacy checkpoints and delta tails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    for ([_]u32{ 1, 2, 3 }) |file_version| {
+        const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/legacy-wal-v{d}", .{ tmp.sub_path, file_version });
+        defer std.testing.allocator.free(root);
+        var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 170 + file_version, 3);
+        defer layout.deinit(std.testing.allocator);
+        try fs_paths.createDirPathPortable(std.testing.io, layout.log_dir);
+        try fs_paths.createDirPathPortable(std.testing.io, layout.snapshot_dir);
+        const wal_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/state-wal", .{layout.log_dir});
+        defer std.testing.allocator.free(wal_dir);
+        try fs_paths.createDirPathPortable(std.testing.io, wal_dir);
+        const wal_dir_z = try std.testing.allocator.dupeZ(u8, wal_dir);
+        defer std.testing.allocator.free(wal_dir_z);
+
+        const inline_payload = if (file_version <= legacy_inline_snapshot_version) "checkpoint-snapshot" else "";
+        const checkpoint = try encodeLegacyWalCheckpointForTest(std.testing.allocator, file_version, inline_payload);
+        defer std.testing.allocator.free(checkpoint);
+        const delta = try encodeLegacyWalReadyDeltaForTest(std.testing.allocator, file_version);
+        defer std.testing.allocator.free(delta);
+        if (file_version == legacy_external_snapshot_version) {
+            try snapshot_payload_store.writeAtomically(
+                std.testing.allocator,
+                std.testing.io,
+                layout.snapshot_dir,
+                5,
+                4,
+                "checkpoint-snapshot",
+            );
+            try snapshot_payload_store.writeAtomically(
+                std.testing.allocator,
+                std.testing.io,
+                layout.snapshot_dir,
+                6,
+                6,
+                "delta-snapshot",
+            );
+        }
+        {
+            var seed_wal = try wal_mod.WAL.open(wal_dir_z.ptr, .{ .backend = .lsm });
+            defer seed_wal.close();
+            _ = try seed_wal.append(checkpoint);
+            _ = try seed_wal.append(delta);
+            try seed_wal.sync(true);
+        }
+
+        {
+            var state = try WalReplicaState.init(std.testing.allocator, layout, .{});
+            defer state.deinit();
+            try std.testing.expectEqual(@as(u64, 6), state.appliedIndex());
+            try std.testing.expectEqual(@as(u64, 7), try state.storage().firstIndex());
+            try std.testing.expectEqual(@as(u64, 7), try state.storage().lastIndex());
+            var snapshot = try state.storage().snapshot(std.testing.allocator);
+            defer snapshot.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("delta-snapshot", snapshot.data);
+
+            const wal_entries = try state.wal.iterateFrom(std.testing.allocator, 1);
+            defer {
+                for (wal_entries) |entry| std.testing.allocator.free(@constCast(entry.data));
+                std.testing.allocator.free(wal_entries);
+            }
+            try std.testing.expectEqual(@as(usize, 1), wal_entries.len);
+            try std.testing.expectEqual(version, std.mem.readInt(u32, wal_entries[0].data[4..8], .little));
+        }
+
+        var reopened = try WalReplicaState.init(std.testing.allocator, layout, .{});
+        defer reopened.deinit();
+        try std.testing.expectEqual(@as(u64, 7), try reopened.storage().firstIndex());
+        var snapshot = try reopened.storage().snapshot(std.testing.allocator);
+        defer snapshot.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("delta-snapshot", snapshot.data);
+    }
+}
 
 test "wal replica state defaults to lsm backend" {
     try std.testing.expectEqual(wal_mod.StorageBackend.lsm, ((WalReplicaStateConfig{}).wal).resolvedBackend());

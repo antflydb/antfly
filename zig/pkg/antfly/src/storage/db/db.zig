@@ -35326,6 +35326,18 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
         return if (identity_stats.live_ordinals == 0) 0 else null;
     }
     if (present_count != 3) return error.InvalidDerivedCoverageCounter;
+
+    // Outcome counters are created as a complete tuple by the first processed
+    // document, so tuple presence alone is not a completion proof. Keep this
+    // O(1) by comparing the maintained generation outcome summary with the
+    // maintained primary identity summary. Publishing is fail-closed until
+    // every live source document has exactly one terminal outcome.
+    const accounted_without_failures = std.math.add(u64, produced.?, skipped.?) catch
+        return error.InvalidDerivedCoverageCounter;
+    const accounted = std.math.add(u64, accounted_without_failures, terminal_failed.?) catch
+        return error.InvalidDerivedCoverageCounter;
+    const identity_stats = try doc_identity.fastStatsFromStore(ctx.store);
+    if (accounted != identity_stats.live_ordinals) return null;
     return produced.?;
 }
 
@@ -62702,6 +62714,98 @@ test "db empty inline dense generation finalizes without scanning primary docume
     const checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
     try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 4), checkpoint.generation);
+}
+
+test "db inline dense generation remains rebuilding until outcomes cover the live corpus" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const config: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
+    };
+    try db.addIndex(config);
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1,0,0]}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"no vector\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const generation = db.core.index_manager.coverageGenerationForIndex(config.name) orelse
+        return error.TestUnexpectedResult;
+    const CounterFixture = struct {
+        fn write(
+            fixture_alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_name: []const u8,
+            coverage_generation: u64,
+            counts: [3]u64,
+        ) !void {
+            const outcome_names = [_][]const u8{ "produced", "skipped", "terminal_failed" };
+            var keys: [outcome_names.len][]u8 = undefined;
+            var initialized: usize = 0;
+            defer for (keys[0..initialized]) |key| fixture_alloc.free(key);
+            var values: [outcome_names.len][8]u8 = undefined;
+            var writes: [outcome_names.len]docstore_mod.KVPair = undefined;
+            for (outcome_names, counts, 0..) |outcome, count, i| {
+                keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(
+                    fixture_alloc,
+                    index_name,
+                    coverage_generation,
+                    outcome,
+                );
+                initialized += 1;
+                writes[i] = .{
+                    .key = keys[i],
+                    .value = internal_keys.encodeDerivedCoverageOutcomeCount(&values[i], count),
+                };
+            }
+            try store.putBatch(&writes, &.{});
+        }
+    };
+
+    const applied = try db.core.loadAppliedSequence(alloc, config.name);
+    try db.core.saveProjectionCheckpoint(config.name, .{
+        .applied_sequence = applied,
+        .status = .rebuilding,
+        .generation = 9,
+        .config_hash = types.indexConfigHash(config),
+    });
+
+    // One indexed source and one unaccounted source is a normal bounded-replay
+    // intermediate state. It must not be confused with complete coverage.
+    try CounterFixture.write(alloc, db.core.store, config.name, generation, .{ 1, 0, 0 });
+    try std.testing.expect(!try finalizeCoveredDenseProjectionCheckpointsIfIdle(db.async_context));
+    var checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
+    try std.testing.expectEqual(apply_state.ProjectionStatus.rebuilding, checkpoint.status);
+    try std.testing.expectEqual(@as(u64, 9), checkpoint.generation);
+
+    // Corrupt counters fail explicitly instead of wrapping into a false proof.
+    try CounterFixture.write(alloc, db.core.store, config.name, generation, .{ std.math.maxInt(u64), 1, 0 });
+    try std.testing.expectError(
+        error.InvalidDerivedCoverageCounter,
+        denseTargetCountForIndexContext(db.async_context, config.name),
+    );
+
+    // Once every live source has a terminal outcome, the maintained summaries
+    // prove coverage without a primary-document scan.
+    try CounterFixture.write(alloc, db.core.store, config.name, generation, .{ 1, 1, 0 });
+    try std.testing.expect(try finalizeCoveredDenseProjectionCheckpointsIfIdle(db.async_context));
+    checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expectEqual(@as(u64, 10), checkpoint.generation);
 }
 
 test "db runtime status overlay refreshes identity totals with coverage counters" {
