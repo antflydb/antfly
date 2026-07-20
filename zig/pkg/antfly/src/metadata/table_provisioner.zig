@@ -2257,7 +2257,7 @@ test "table provisioner updates full text artifact mapping and cleans removed en
         }, &.{});
     }
 
-    const second_summary = try reconcileReplicaRoot(
+    const retired_summary = try reconcileReplicaRoot(
         alloc,
         path,
         100,
@@ -2274,10 +2274,40 @@ test "table provisioner updates full text artifact mapping and cleans removed en
             .end_key = "doc:z",
         }},
     );
-    try std.testing.expectEqual(@as(usize, 1), second_summary.indexes_added);
-    try std.testing.expectEqual(@as(usize, 1), second_summary.indexes_removed);
-    try std.testing.expectEqual(@as(usize, 2), second_summary.enrichments_added);
-    try std.testing.expectEqual(@as(usize, 2), second_summary.enrichments_removed);
+    try std.testing.expectEqual(@as(usize, 0), retired_summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), retired_summary.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 1), retired_summary.indexes_pending);
+    try std.testing.expectEqual(@as(usize, 2), retired_summary.enrichments_added);
+    try std.testing.expectEqual(@as(usize, 2), retired_summary.enrichments_removed);
+
+    {
+        const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+        defer alloc.free(db_path);
+        var db = try db_mod.DB.open(alloc, db_path, .{});
+        defer db.close();
+        db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    }
+
+    const admitted_summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 14,
+            .name = "docs",
+            .indexes_json = second_indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 14,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 1), admitted_summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 0), admitted_summary.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 0), admitted_summary.indexes_pending);
 
     const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
     defer alloc.free(db_path);

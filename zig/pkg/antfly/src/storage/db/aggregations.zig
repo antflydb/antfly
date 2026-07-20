@@ -27,6 +27,7 @@ const geo_mod = @import("../../search/geo.zig");
 const regex_mod = @import("../../search/regex.zig");
 const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
+const roaring = @import("../../encoding/roaring.zig");
 
 pub const NumericRangeRequest = struct {
     name: []const u8 = "",
@@ -6711,7 +6712,7 @@ fn computeSignificantTermsAggregation(
     else
         0;
 
-    if (request.background_query) |background_query| {
+    if (request.background_query != null) {
         if (distributed_background_stats) |stats| {
             background_doc_count = @intCast(stats.background_doc_count);
             for (stats.term_doc_freqs) |term| {
@@ -6723,40 +6724,7 @@ fn computeSignificantTermsAggregation(
                     bg_entry.value_ptr.* = @intCast(term.doc_freq);
                 }
             }
-        } else {
-            const snap = snapshot orelse return error.UnsupportedAggregation;
-            var background_result = try executeBackgroundQuery(alloc, snap, background_query);
-            defer background_result.deinit();
-            background_doc_count = @intCast(background_result.total_hits);
-            for (background_result.hits) |hit| {
-                const stored = hit.stored_data orelse continue;
-                var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
-                defer parsed.deinit();
-                const value = extractValueAtPath(parsed.value, request.field) orelse continue;
-
-                var seen_terms = std.StringHashMap(void).init(alloc);
-                defer {
-                    var it = seen_terms.keyIterator();
-                    while (it.next()) |key| alloc.free(key.*);
-                    seen_terms.deinit();
-                }
-                try collectSignificantTermsFromValue(alloc, value, &seen_terms);
-
-                var seen_it = seen_terms.keyIterator();
-                while (seen_it.next()) |term_ptr| {
-                    const term = term_ptr.*;
-                    if (request.term_prefix.len > 0 and !std.mem.startsWith(u8, term, request.term_prefix)) continue;
-                    if (request.term_pattern.len > 0 and !(try regexMatches(alloc, request.term_pattern, term))) continue;
-                    const bg_entry = try background_counts.getOrPut(term);
-                    if (bg_entry.found_existing) {
-                        bg_entry.value_ptr.* += 1;
-                    } else {
-                        bg_entry.key_ptr.* = try alloc.dupe(u8, term);
-                        bg_entry.value_ptr.* = 1;
-                    }
-                }
-            }
-        }
+        } else _ = snapshot orelse return error.UnsupportedAggregation;
     }
 
     for (hits) |hit| {
@@ -6790,6 +6758,37 @@ fn computeSignificantTermsAggregation(
             const group_entry = try grouped.getOrPut(count_entry.key_ptr.*);
             if (!group_entry.found_existing) group_entry.value_ptr.* = .empty;
             try group_entry.value_ptr.append(alloc, hit);
+        }
+    }
+
+    if (request.background_query) |background_query| {
+        if (distributed_background_stats == null) {
+            const snap = snapshot orelse return error.UnsupportedAggregation;
+            var background_result = try executeBackgroundQuery(alloc, snap, background_query);
+            defer background_result.deinit();
+            background_doc_count = @intCast(background_result.total_hits);
+
+            var background_docs = roaring.RoaringBitmap.init(alloc);
+            defer background_docs.deinit();
+            for (background_result.hits) |hit| try background_docs.add(hit.doc_id);
+
+            var foreground_it = foreground.keyIterator();
+            while (foreground_it.next()) |term_ptr| {
+                const term = term_ptr.*;
+                const doc_nums = try snap.executeFilter(alloc, .{ .term = .{
+                    .field = request.field,
+                    .term = term,
+                } });
+                defer alloc.free(doc_nums);
+
+                var count: i64 = 0;
+                for (doc_nums) |doc_num| {
+                    if (background_docs.contains(doc_num)) count += 1;
+                }
+                const bg_entry = try background_counts.getOrPut(term);
+                if (!bg_entry.found_existing) bg_entry.key_ptr.* = try alloc.dupe(u8, term);
+                bg_entry.value_ptr.* = count;
+            }
         }
     }
 
@@ -6929,7 +6928,7 @@ fn executeBackgroundQuery(
             } },
         },
         .k = snapshot.global_doc_count,
-        .include_stored = true,
+        .include_stored = false,
     };
     return search_mod.execute(alloc, snapshot, request);
 }
@@ -8043,6 +8042,83 @@ test "significant_terms can use distributed background stats without a local tex
     try std.testing.expect(aggregations[0].metadata_json != null);
     try std.testing.expect(std.mem.indexOf(u8, aggregations[0].metadata_json.?, "\"bg_doc_count\":2") != null);
     try std.testing.expectEqual(@as(i64, 2), aggregations[0].buckets[0].bg_count.?);
+    try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[1].bg_count.?);
+}
+
+test "significant_terms local background stats use postings without stored index source" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const relative_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
+    defer alloc.free(cwd);
+    const path = try std.fs.path.resolve(alloc, &.{ cwd, relative_path });
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try index_manager_mod.IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    }});
+
+    const writes = [_]types.BatchWrite{
+        .{ .key = "doc:a", .value = "{\"body\":\"alpha beta\"}" },
+        .{ .key = "doc:b", .value = "{\"body\":\"alpha\"}" },
+        .{ .key = "doc:c", .value = "{\"body\":\"beta\"}" },
+    };
+    try manager.indexBatch(&store, &writes);
+
+    const snapshot = manager.textIndex("full_text_index_v0").?.snapshot();
+    const stored = (try snapshot.storedDocDecompressed(alloc, 0)).?;
+    defer alloc.free(stored.data);
+    try std.testing.expectEqualStrings("{}", stored.data);
+
+    const hits = try alloc.alloc(types.SearchHit, 2);
+    defer {
+        for (hits) |*hit| hit.deinit(alloc);
+        alloc.free(hits);
+    }
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .stored_data = try alloc.dupe(u8, writes[0].value),
+    };
+    hits[1] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .stored_data = try alloc.dupe(u8, writes[1].value),
+    };
+
+    const requests = [_]SearchAggregationRequest{.{
+        .name = "sig_terms",
+        .type = "significant_terms",
+        .field = "body",
+        .size = 2,
+        .background_query = .{ .match = .{ .field = "body", .text = "alpha" } },
+    }};
+    const aggregations = try computeSearchAggregations(alloc, &requests, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    }, .{
+        .index_manager = &manager,
+        .full_text_index_name = "full_text_index_v0",
+    });
+    defer deinitResults(alloc, aggregations);
+
+    try std.testing.expectEqual(@as(usize, 2), aggregations[0].buckets.len);
+    try std.testing.expectEqualStrings("\"alpha\"", aggregations[0].buckets[0].key_json);
+    try std.testing.expectEqual(@as(i64, 2), aggregations[0].buckets[0].bg_count.?);
+    try std.testing.expectEqualStrings("\"beta\"", aggregations[0].buckets[1].key_json);
     try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[1].bg_count.?);
 }
 

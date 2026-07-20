@@ -1150,10 +1150,46 @@ pub const ResidentDbSource = struct {
     }
 };
 
+const LocalQueryDbOwner = union(enum) {
+    resident: struct {
+        lease: ResidentDbLease,
+        alloc: std.mem.Allocator,
+    },
+    cached: ProvisionedTableReadCache.Lease,
+    owned: db_mod.DB,
+
+    fn db(self: *@This()) *db_mod.DB {
+        return switch (self.*) {
+            .resident => |*resident| resident.lease.db,
+            .cached => |*cached| cached.db,
+            .owned => |*owned| owned,
+        };
+    }
+
+    fn deinit(self: *@This()) void {
+        switch (self.*) {
+            .resident => |*resident| resident.lease.release(resident.alloc),
+            .cached => |*cached| cached.release(),
+            .owned => |*owned| owned.close(),
+        }
+        self.* = undefined;
+    }
+};
+
 const LocalQueryExecution = struct {
     request: db_mod.types.SearchRequest,
     result: db_mod.types.SearchResult,
     dense_profile: ?query_api.QueryResponseMeta.DenseSearchProfile = null,
+    db_owner: ?LocalQueryDbOwner = null,
+
+    fn db(self: *@This()) *db_mod.DB {
+        return self.db_owner.?.db();
+    }
+
+    fn releaseDb(self: *@This()) void {
+        if (self.db_owner) |*owner| owner.deinit();
+        self.db_owner = null;
+    }
 };
 
 const ProfiledDenseQuery = struct {
@@ -3005,7 +3041,8 @@ pub const ProvisionedTableReadSource = struct {
         if (group_ids.len > 1) try distributed_graph.rejectUnstampedResultRefs(req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
-            const execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, consistency);
+            var execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, consistency);
+            defer execution.releaseDb();
             try checkQueryDeadline(execution.request);
             var result = execution.result;
             defer result.deinit();
@@ -3016,7 +3053,8 @@ pub const ProvisionedTableReadSource = struct {
                 .dense_search = execution.dense_profile,
             };
             defer meta.deinit(alloc);
-            try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, consistency);
+            try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), consistency);
+            execution.releaseDb();
             try checkQueryDeadline(response_req);
             try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
@@ -3041,7 +3079,7 @@ pub const ProvisionedTableReadSource = struct {
                 .merged = true,
             };
             defer meta.deinit(alloc);
-            try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, consistency);
+            try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, consistency);
             try checkQueryDeadline(graph_req);
             try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
@@ -3055,7 +3093,7 @@ pub const ProvisionedTableReadSource = struct {
             .merged = group_ids.len > 1,
         };
         defer meta.deinit(alloc);
-        try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
+        try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, null, consistency);
         try checkQueryDeadline(req);
         try applyQueryPostProcessing(alloc, req, &merged, &meta, self.antfly_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
@@ -3192,7 +3230,8 @@ pub const ProvisionedTableReadSource = struct {
         var read_activity = self.beginPreparedRead(table_name, readPreparationKindForQuery(req));
         defer if (read_activity) |*activity| activity.deinit();
         const start_ns = platform_time.monotonicNs();
-        const execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency);
+        var execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency);
+        defer execution.releaseDb();
         var result = execution.result;
         defer result.deinit();
         const response_req = execution.request;
@@ -3202,7 +3241,8 @@ pub const ProvisionedTableReadSource = struct {
             .dense_search = execution.dense_profile,
         };
         defer meta.deinit(alloc);
-        try applyProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, consistency);
+        try applyProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), consistency);
+        execution.releaseDb();
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
     }
@@ -3855,7 +3895,8 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
 
             if (route == .local) {
-                const execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+                var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+                defer execution.releaseDb();
                 try checkQueryDeadline(execution.request);
                 var result = execution.result;
                 defer result.deinit();
@@ -3866,7 +3907,8 @@ pub const HostedProvisionedTableReadSource = struct {
                     .dense_search = execution.dense_profile,
                 };
                 defer meta.deinit(alloc);
-                try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, consistency);
+                try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), consistency);
+                execution.releaseDb();
                 try checkQueryDeadline(response_req);
                 try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
                 return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
@@ -3892,7 +3934,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .merged = true,
             };
             defer meta.deinit(alloc);
-            try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, consistency);
+            try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, consistency);
             try checkQueryDeadline(graph_req);
             try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, null, null);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
@@ -3906,7 +3948,7 @@ pub const HostedProvisionedTableReadSource = struct {
             .merged = group_ids.len > 1,
         };
         defer meta.deinit(alloc);
-        try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
+        try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, null, consistency);
         try checkQueryDeadline(req);
         try applyQueryPostProcessing(alloc, req, &merged, &meta, null, null);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
@@ -4042,7 +4084,8 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const start_ns = platform_time.monotonicNs();
-        const execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+        var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+        defer execution.releaseDb();
         var result = execution.result;
         defer result.deinit();
         const response_req = execution.request;
@@ -4052,7 +4095,8 @@ pub const HostedProvisionedTableReadSource = struct {
             .dense_search = execution.dense_profile,
         };
         defer meta.deinit(alloc);
-        try applyHostedProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, consistency);
+        try applyHostedProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), consistency);
+        execution.releaseDb();
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
         return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
     }
@@ -6103,7 +6147,8 @@ fn queryLocal(
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.SearchResult {
-    const detailed = try queryLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency);
+    var detailed = try queryLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency);
+    defer detailed.releaseDb();
     var result = detailed.result;
     result.identity_read_generation = detailed.request.identity_read_generation;
     return result;
@@ -6260,25 +6305,28 @@ fn queryLocalDetailed(
     // structural maintenance from retiring the DB while search is executing.
     if (resident_db) |source| {
         if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease_value| {
-            var lease = lease_value;
-            defer lease.release(alloc);
-            try validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db);
-            return try queryDbDetailed(requester, alloc, group_id, lease.db, req, consistency);
+            validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease_value.db) catch |err| {
+                var lease = lease_value;
+                lease.release(alloc);
+                return err;
+            };
+            const owner: LocalQueryDbOwner = .{ .resident = .{
+                .lease = lease_value,
+                .alloc = alloc,
+            } };
+            return try queryDbDetailed(requester, alloc, group_id, owner, req, consistency);
         }
     }
 
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);
     if (cache) |cached| {
-        var db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
-        defer db_lease.release();
-        return try queryDbDetailed(requester, alloc, group_id, db_lease.db, req, consistency);
+        const db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
+        return try queryDbDetailed(requester, alloc, group_id, .{ .cached = db_lease }, req, consistency);
     } else {
         const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
-        var db = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, runtime_cfg, identity_namespace);
-        defer db.close();
-
-        return try queryDbDetailed(requester, alloc, group_id, &db, req, consistency);
+        const db = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, runtime_cfg, identity_namespace);
+        return try queryDbDetailed(requester, alloc, group_id, .{ .owned = db }, req, consistency);
     }
 }
 
@@ -6286,10 +6334,13 @@ fn queryDbDetailed(
     requester: raft_mod.ReadableLeaseRequester,
     alloc: std.mem.Allocator,
     group_id: u64,
-    db: *db_mod.DB,
+    db_owner: LocalQueryDbOwner,
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) !LocalQueryExecution {
+    var owner = db_owner;
+    errdefer owner.deinit();
+    const db = owner.db();
     var reads = raft_mod.FeatureDBReads.init(group_id, requester);
     try reads.reads.prepareSearchWithConsistency(group_id, req, consistency);
     const snapshot_req = try db.searchRequestAtCurrentIdentityGeneration(req);
@@ -6299,11 +6350,13 @@ fn queryDbDetailed(
             .request = snapshot_req,
             .result = profiled.result,
             .dense_profile = mapDenseSearchProfile(profiled.profile),
+            .db_owner = owner,
         };
     }
     return .{
         .request = snapshot_req,
         .result = try db.search(alloc, snapshot_req),
+        .db_owner = owner,
     };
 }
 
@@ -6672,7 +6725,8 @@ fn queryHostedLocal(
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.SearchResult {
-    const detailed = try queryHostedLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency);
+    var detailed = try queryHostedLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency);
+    defer detailed.releaseDb();
     return detailed.result;
 }
 
@@ -10025,6 +10079,57 @@ fn applyBoundQueryAggregations(
     return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, self.db), meta);
 }
 
+fn applyCapturedDbQueryAggregations(
+    alloc: std.mem.Allocator,
+    requester: raft_mod.ReadableLeaseRequester,
+    group_id: u64,
+    table_name: []const u8,
+    scope: []const u8,
+    req: db_mod.types.SearchRequest,
+    result: *db_mod.types.SearchResult,
+    meta: *query_api.QueryResponseMeta,
+    db: *db_mod.DB,
+    consistency: raft_mod.ReadConsistency,
+) !void {
+    const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
+    if (aggregationCanUseCurrentResult(req, result.*)) {
+        return try applyAggregationResults(
+            alloc,
+            aggregation_req,
+            result.*,
+            try aggregationContextForCapturedResultDb(alloc, aggregation_req, db),
+            meta,
+        );
+    }
+
+    var reads = raft_mod.FeatureDBReads.init(group_id, requester);
+    const full_req = aggregationFullResultRequest(req, result.*, scope) catch |err| {
+        std.log.warn("local aggregation full-result planning failed table={s} relation={s} total_hits={d} request_generation={?d} result_generation={?d} err={s}", .{
+            table_name,
+            @tagName(result.total_hits_relation),
+            result.total_hits,
+            req.identity_read_generation,
+            result.identity_read_generation,
+            @errorName(err),
+        });
+        return err;
+    };
+    var full_result = reads.searchWithConsistency(alloc, db, full_req, consistency) catch |err| {
+        std.log.warn("local aggregation full-result search failed table={s} generation={?d} err={s}", .{ table_name, full_req.identity_read_generation, @errorName(err) });
+        return err;
+    };
+    defer full_result.deinit();
+    try requireCompleteAggregationFullResult(full_req, full_result, scope);
+    const aggregation_ctx = aggregationContextForDb(alloc, full_req, db) catch |err| {
+        std.log.warn("local aggregation context failed table={s} generation={?d} err={s}", .{ table_name, full_req.identity_read_generation, @errorName(err) });
+        return err;
+    };
+    return applyAggregationResults(alloc, full_req, full_result, aggregation_ctx, meta) catch |err| {
+        std.log.warn("local aggregation execution failed table={s} err={s}", .{ table_name, @errorName(err) });
+        return err;
+    };
+}
+
 fn applyProvisionedQueryAggregations(
     self: *ProvisionedTableReadSource,
     alloc: std.mem.Allocator,
@@ -10033,46 +10138,31 @@ fn applyProvisionedQueryAggregations(
     req: db_mod.types.SearchRequest,
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
+    captured_db: ?*db_mod.DB,
     consistency: raft_mod.ReadConsistency,
 ) !void {
     if (req.aggregations_json.len == 0) return;
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
     if (group_ids.len == 1) {
+        if (captured_db) |db| {
+            return try applyCapturedDbQueryAggregations(
+                alloc,
+                self.requester,
+                group_ids[0],
+                table_name,
+                "provisioned-local",
+                req,
+                result,
+                meta,
+                db,
+                consistency,
+            );
+        }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_ids[0]);
         defer alloc.free(path);
         var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
         defer db.close();
-
-        if (aggregationCanUseCurrentResult(req, result.*)) {
-            return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForCapturedResultDb(alloc, aggregation_req, &db), meta);
-        }
-
-        var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
-        const full_req = aggregationFullResultRequest(req, result.*, "provisioned-local") catch |err| {
-            std.log.warn("local aggregation full-result planning failed table={s} relation={s} total_hits={d} request_generation={?d} result_generation={?d} err={s}", .{
-                table_name,
-                @tagName(result.total_hits_relation),
-                result.total_hits,
-                req.identity_read_generation,
-                result.identity_read_generation,
-                @errorName(err),
-            });
-            return err;
-        };
-        var full_result = reads.searchWithConsistency(alloc, &db, full_req, consistency) catch |err| {
-            std.log.warn("local aggregation full-result search failed table={s} generation={?d} err={s}", .{ table_name, full_req.identity_read_generation, @errorName(err) });
-            return err;
-        };
-        defer full_result.deinit();
-        try requireCompleteAggregationFullResult(full_req, full_result, "provisioned-local");
-        const aggregation_ctx = aggregationContextForDb(alloc, full_req, &db) catch |err| {
-            std.log.warn("local aggregation context failed table={s} generation={?d} err={s}", .{ table_name, full_req.identity_read_generation, @errorName(err) });
-            return err;
-        };
-        return applyAggregationResults(alloc, full_req, full_result, aggregation_ctx, meta) catch |err| {
-            std.log.warn("local aggregation execution failed table={s} err={s}", .{ table_name, @errorName(err) });
-            return err;
-        };
+        return try applyCapturedDbQueryAggregations(alloc, self.requester, group_ids[0], table_name, "provisioned-local", req, result, meta, &db, consistency);
     }
 
     if (try tryApplyProvisionedAlgebraicDistributedAggregations(self, alloc, group_ids, table_name, aggregation_req, meta)) return;
@@ -10238,6 +10328,7 @@ fn applyHostedProvisionedQueryAggregations(
     req: db_mod.types.SearchRequest,
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
+    captured_db: ?*db_mod.DB,
     consistency: raft_mod.ReadConsistency,
 ) !void {
     if (req.aggregations_json.len == 0) return;
@@ -10248,21 +10339,15 @@ fn applyHostedProvisionedQueryAggregations(
 
         switch (route) {
             .local => {
+                if (captured_db) |db| {
+                    return try applyCapturedDbQueryAggregations(alloc, self.requester, group_ids[0], table_name, "hosted-local", req, result, meta, db, consistency);
+                }
                 const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_ids[0]);
                 defer alloc.free(path);
                 var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
                 defer db.close();
 
-                if (aggregationCanUseCurrentResult(req, result.*)) {
-                    return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForCapturedResultDb(alloc, aggregation_req, &db), meta);
-                }
-
-                var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
-                const full_req = try aggregationFullResultRequest(req, result.*, "hosted-local");
-                var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
-                defer full_result.deinit();
-                try requireCompleteAggregationFullResult(full_req, full_result, "hosted-local");
-                return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, &db), meta);
+                return try applyCapturedDbQueryAggregations(alloc, self.requester, group_ids[0], table_name, "hosted-local", req, result, meta, &db, consistency);
             },
             .remote => {},
         }
@@ -15467,6 +15552,7 @@ test "provisioned local query execution returns stamped identity request" {
         .{ .limit = 1 },
         .stale,
     );
+    defer execution.releaseDb();
     defer execution.result.deinit();
 
     try std.testing.expect(execution.request.identity_read_generation != null);
@@ -15542,12 +15628,15 @@ test "provisioned local query reuses resident generation without readonly open" 
         .{ .limit = 1 },
         .stale,
     );
+    defer execution.releaseDb();
     defer execution.result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), resident.leases);
-    try std.testing.expectEqual(@as(usize, 1), resident.releases);
+    try std.testing.expectEqual(@as(usize, 0), resident.releases);
     try std.testing.expectEqual(@as(u32, 1), execution.result.total_hits);
     try std.testing.expectEqualStrings("doc:a", execution.result.hits[0].id);
+    execution.releaseDb();
+    try std.testing.expectEqual(@as(usize, 1), resident.releases);
 }
 
 test "provisioned table read source managed runtime config carries inference url" {

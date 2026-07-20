@@ -1544,16 +1544,22 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     var parsed_indexes_after_drop = try std.json.parseFromSlice([]metadata_openapi.IndexStatus, std.heap.page_allocator, indexes_after_drop.body, .{});
     defer parsed_indexes_after_drop.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed_indexes_after_drop.value.len);
-    try std.testing.expectEqualStrings("full_text_index_v1", parsed_indexes_after_drop.value[0].config.name);
-    try std.testing.expectEqualStrings("embed_idx", parsed_indexes_after_drop.value[1].config.name);
+    try std.testing.expectEqualStrings("full_text_index_v0", parsed_indexes_after_drop.value[0].config.name);
+    try std.testing.expectEqualStrings("full_text_index_v1", parsed_indexes_after_drop.value[1].config.name);
 
     var stable_table_detail = try client.fetchTable(client_base, "docs");
     defer stable_table_detail.deinit(std.heap.page_allocator);
     var parsed_stable_table_detail = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.heap.page_allocator, stable_table_detail.body, .{});
     defer parsed_stable_table_detail.deinit();
-    try std.testing.expect(parsed_stable_table_detail.value.migration == null);
-    try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v0") == null);
+    // A foreground write establishes query visibility on the routed replica;
+    // it does not certify that every replica has completed schema backfill.
+    // Keep both generations until the migration's normal readiness quorum can
+    // safely publish cutover.
+    try std.testing.expect(parsed_stable_table_detail.value.migration != null);
+    try std.testing.expectEqualStrings("rebuilding", parsed_stable_table_detail.value.migration.?.state);
+    try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v0") != null);
     try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("full_text_index_v1") != null);
+    try std.testing.expect(parsed_stable_table_detail.value.indexes.map.get("embed_idx") == null);
 }
 
 test "public api multi-node e2e routes transaction commit from a non-host node" {
