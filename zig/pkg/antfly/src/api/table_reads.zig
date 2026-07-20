@@ -18224,7 +18224,10 @@ test "algebraic partial request fails closed when lifecycle is stale" {
     defer alloc.free(encoded);
     var parsed = try parseAlgebraicPartialsRequest(alloc, encoded);
     defer parsed.deinit(alloc);
-    try std.testing.expectError(error.IdentityReadGenerationChanged, collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed));
+    // Fence the request to the current snapshot so this test isolates the
+    // planner lifecycle gate rather than conflating it with identity drift.
+    parsed.identity_read_generation = try db.currentIdentityReadGenerationForRequest(null);
+    try std.testing.expectError(error.UnsupportedQueryRequest, collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed));
 }
 
 test "algebraic partial request accepts current identity generation and rejects stale" {

@@ -65302,7 +65302,7 @@ test "db named graph input sets carry resolved doc sets" {
         .identity_read_generation = current_generation,
     }, &graph_queries, &paged_input_sets));
 
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.executeNamedGraphQueries(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.executeNamedGraphQueries(alloc, .{
         .identity_read_generation = current_generation -| 1,
     }, &graph_queries, &input_sets));
 }
