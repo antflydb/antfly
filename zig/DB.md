@@ -179,16 +179,27 @@ Queued structural reconciliation closes new write admission before draining
 current writers. This prevents continuous traffic from starving index/catalog
 convergence, while reads remain admitted against the currently published
 generation until the short publication transition begins.
-Each queued request owns one immutable catalog contract captured from a single
-admin snapshot: table identity, desired schema and index definitions, and the
-exact range and document-identity namespace for every group. A dequeue advances
-at most a fixed number of pending groups, removes completed groups in O(1), and
-rotates busy groups rather than replaying successful work. Production catalog
-sources validate each group through the compact linearizable publication
-contract before opening storage. Completion performs one full topology check to
-detect ranges added after capture. A changed contract discards only the stale
-plan and rebuilds it on the next quantum; the write-admission reservation remains
-continuous throughout that handoff.
+Each queued request owns one immutable catalog contract captured tentatively
+from a single admin snapshot: table identity, desired schema and index
+definitions, and the exact range and document-identity namespace for every
+group. Before using that plan and before declaring completion, production
+catalog sources validate a compact whole-table contract after a Raft
+linearizable-read barrier. The contract carries an order-independent SHA-256
+multiset digest and range count over the complete range records, so validation
+is allocation-free against the metadata owner's immutable projection, O(1) on
+the wire, and detects ranges added, removed, or mutated after capture. Its CPU
+cost is one catalog-range scan only at plan admission and completion; per-group
+fences scan the same projection without cloning it.
+
+A dequeue advances at most a fixed number of pending groups, removes completed
+groups in O(1), and rotates busy groups rather than replaying successful work.
+Each group is also validated through its compact linearizable publication
+contract both before opening storage and after maintenance, immediately before
+runtime status publication. Productive quanta return to the queue tail without
+an artificial delay; a short delay applies only when every attempted group is
+blocked. A changed contract discards only the stale plan and rebuilds it on the
+next quantum; the write-admission reservation remains continuous throughout
+that handoff, and stale work cannot publish readiness for a replaced topology.
 Per-table dirty visibility tracking uses owned exact table identities rather
 than collision-prone hashes. Its lifetime is tied to write-cache ownership:
 eviction advances the table's read-cache epoch, and the last cache owner also

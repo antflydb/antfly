@@ -176,11 +176,26 @@ pub const CatalogPublicationContract = struct {
     range: table_manager.RangeRecord,
 
     pub fn matches(self: @This(), snapshot: *const AdminSnapshot) bool {
-        if (snapshot.status.metadata_group_id != self.metadata_group_id) return false;
-        const incarnation = snapshot.status.metadata_incarnation orelse return false;
+        return self.matchesProjection(
+            snapshot.status.metadata_group_id,
+            snapshot.status.metadata_incarnation,
+            snapshot.tables,
+            snapshot.ranges,
+        );
+    }
+
+    pub fn matchesProjection(
+        self: @This(),
+        metadata_group_id: u64,
+        incarnation_value: ?MetadataClusterIncarnation,
+        tables: []const table_manager.TableRecord,
+        ranges: []const table_manager.RangeRecord,
+    ) bool {
+        if (metadata_group_id != self.metadata_group_id) return false;
+        const incarnation = incarnation_value orelse return false;
         if (!std.mem.eql(u8, &incarnation, &self.metadata_incarnation)) return false;
         var table_match = false;
-        for (snapshot.tables) |table| {
+        for (tables) |table| {
             if (table.table_id != self.table_id) continue;
             table_match = std.mem.eql(u8, self.table_name, table.name) and
                 std.mem.eql(u8, self.schema_json, table.schema_json) and
@@ -188,13 +203,172 @@ pub const CatalogPublicationContract = struct {
             break;
         }
         if (!table_match) return false;
-        for (snapshot.ranges) |range| {
+        for (ranges) |range| {
             if (range.group_id != self.range.group_id) continue;
             return range.table_id == self.table_id and table_manager.rangeRecordsEqual(self.range, range);
         }
         return false;
     }
 };
+
+pub const CatalogTableTopology = struct {
+    range_count: u64,
+    digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+};
+
+/// Compact whole-table fence used after a linearizable metadata read. The
+/// digest is an order-independent SHA-256 multiset accumulator over every
+/// range field, so validation does not depend on projection iteration order.
+pub const CatalogTablePublicationContract = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: MetadataClusterIncarnation,
+    table_id: u64,
+    table_name: []const u8,
+    schema_json: []const u8,
+    indexes_json: []const u8,
+    topology: CatalogTableTopology,
+
+    pub fn matches(self: @This(), snapshot: *const AdminSnapshot) bool {
+        return self.matchesProjection(
+            snapshot.status.metadata_group_id,
+            snapshot.status.metadata_incarnation,
+            snapshot.tables,
+            snapshot.ranges,
+        );
+    }
+
+    pub fn matchesProjection(
+        self: @This(),
+        metadata_group_id: u64,
+        incarnation_value: ?MetadataClusterIncarnation,
+        tables: []const table_manager.TableRecord,
+        ranges: []const table_manager.RangeRecord,
+    ) bool {
+        if (metadata_group_id != self.metadata_group_id) return false;
+        const incarnation = incarnation_value orelse return false;
+        if (!std.mem.eql(u8, &incarnation, &self.metadata_incarnation)) return false;
+        var table_match = false;
+        for (tables) |table| {
+            if (table.table_id != self.table_id) continue;
+            table_match = std.mem.eql(u8, self.table_name, table.name) and
+                std.mem.eql(u8, self.schema_json, table.schema_json) and
+                std.mem.eql(u8, self.indexes_json, table.indexes_json);
+            break;
+        }
+        if (!table_match) return false;
+        const actual = catalogTableTopology(self.table_id, ranges);
+        return actual.range_count == self.topology.range_count and
+            std.crypto.timing_safe.eql(@TypeOf(actual.digest), actual.digest, self.topology.digest);
+    }
+};
+
+pub fn catalogTableTopology(table_id: u64, ranges: []const table_manager.RangeRecord) CatalogTableTopology {
+    var accumulator = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+    var range_count: u64 = 0;
+    for (ranges) |range| {
+        if (range.table_id != table_id) continue;
+        range_count += 1;
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hashCatalogTopologyU64(&hasher, range.group_id);
+        hashCatalogTopologyU64(&hasher, range.range_id);
+        hashCatalogTopologyU64(&hasher, range.table_id);
+        hashCatalogTopologyBytes(&hasher, range.start_key);
+        if (range.end_key) |end_key| {
+            hasher.update(&.{1});
+            hashCatalogTopologyBytes(&hasher, end_key);
+        } else {
+            hasher.update(&.{0});
+        }
+        hashCatalogTopologyU64(&hasher, range.doc_identity_shard_id);
+        hashCatalogTopologyU64(&hasher, range.doc_identity_range_id);
+        hashCatalogTopologyU64(&hasher, range.split_attempt_epoch);
+        hashCatalogTopologyBytes(&hasher, range.restore_backup_id);
+        hashCatalogTopologyBytes(&hasher, range.restore_location);
+        hashCatalogTopologyBytes(&hasher, range.restore_snapshot_path);
+        var range_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        hasher.final(&range_digest);
+        addCatalogTopologyDigest(&accumulator, range_digest);
+    }
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-catalog-table-topology-v1");
+    hashCatalogTopologyU64(&hasher, table_id);
+    hashCatalogTopologyU64(&hasher, range_count);
+    hasher.update(&accumulator);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return .{ .range_count = range_count, .digest = digest };
+}
+
+fn hashCatalogTopologyU64(hasher: *std.crypto.hash.sha2.Sha256, value: u64) void {
+    var encoded: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, value, .little);
+    hasher.update(&encoded);
+}
+
+fn hashCatalogTopologyBytes(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    hashCatalogTopologyU64(hasher, @intCast(value.len));
+    hasher.update(value);
+}
+
+fn addCatalogTopologyDigest(
+    accumulator: *[std.crypto.hash.sha2.Sha256.digest_length]u8,
+    digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) void {
+    var carry: u16 = 0;
+    for (0..accumulator.len) |offset| {
+        const index = accumulator.len - 1 - offset;
+        const sum: u16 = @as(u16, accumulator[index]) + @as(u16, digest[index]) + carry;
+        accumulator[index] = @truncate(sum);
+        carry = sum >> 8;
+    }
+}
+
+test "catalog table topology is order independent and detects range mutation" {
+    const incarnation: MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const ranges = [_]table_manager.RangeRecord{
+        .{ .group_id = 11, .range_id = 21, .table_id = 7, .start_key = "", .end_key = "m" },
+        .{ .group_id = 12, .range_id = 22, .table_id = 7, .start_key = "m", .end_key = null },
+        .{ .group_id = 13, .range_id = 23, .table_id = 8, .start_key = "", .end_key = null },
+    };
+    const reordered = [_]table_manager.RangeRecord{ ranges[2], ranges[1], ranges[0] };
+    const expected = catalogTableTopology(7, &ranges);
+    const actual = catalogTableTopology(7, &reordered);
+    try std.testing.expectEqual(expected.range_count, actual.range_count);
+    try std.testing.expectEqualSlices(u8, &expected.digest, &actual.digest);
+
+    var changed = ranges;
+    changed[1].doc_identity_range_id = 99;
+    const changed_topology = catalogTableTopology(7, &changed);
+    try std.testing.expect(!std.mem.eql(u8, &expected.digest, &changed_topology.digest));
+
+    var snapshot = AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metadata_incarnation = incarnation, .metrics = .{} },
+        .tables = @constCast((&[_]table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = "{\"version\":1}",
+            .indexes_json = "{}",
+        }})[0..]),
+        .ranges = @constCast(ranges[0..]),
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const contract = CatalogTablePublicationContract{
+        .metadata_group_id = 1,
+        .metadata_incarnation = incarnation,
+        .table_id = 7,
+        .table_name = "docs",
+        .schema_json = "{\"version\":1}",
+        .indexes_json = "{}",
+        .topology = expected,
+    };
+    try std.testing.expect(contract.matches(&snapshot));
+    snapshot.ranges = @constCast(changed[0..]);
+    try std.testing.expect(!contract.matches(&snapshot));
+}
 
 pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot {
     const SourceType = @TypeOf(source);

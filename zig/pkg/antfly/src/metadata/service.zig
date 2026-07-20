@@ -3437,6 +3437,26 @@ pub const MetadataHttpService = struct {
         return snapshot;
     }
 
+    pub fn validatePublication(self: *MetadataHttpService, contract: metadata_api.CatalogPublicationContract) !bool {
+        try self.ensureLinearizableRead();
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
+        const core = try self.projectedCoreSnapshotLocked();
+        return contract.matchesProjection(self.metadata_group_id, incarnation, core.tables, core.ranges);
+    }
+
+    pub fn validateTablePublication(self: *MetadataHttpService, contract: metadata_api.CatalogTablePublicationContract) !bool {
+        try self.ensureLinearizableRead();
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
+        const core = try self.projectedCoreSnapshotLocked();
+        return contract.matchesProjection(self.metadata_group_id, incarnation, core.tables, core.ranges);
+    }
+
     pub fn freeAdminSnapshot(self: *MetadataHttpService, snapshot: *metadata_api.AdminSnapshot) void {
         metadata_api.freeSnapshot(self.alloc, self, snapshot);
     }

@@ -6406,6 +6406,12 @@ pub const DB = struct {
         // checkpoint and filesystem I/O; other indexes can continue draining.
         ctx.index_artifact_cleanup_mutex.unlock();
         cleanup_locked.* = false;
+        if (builtin.is_test and test_block_generated_artifact_finalization.load(.acquire)) {
+            test_generated_artifact_finalization_entered.store(true, .release);
+            while (!test_release_generated_artifact_finalization.load(.acquire)) {
+                std.Thread.yield() catch {};
+            }
+        }
         try finalizeRetiredIndexCleanupContext(ctx, index_name, cleanup_key);
         return .progressed;
     }
@@ -13406,6 +13412,9 @@ pub const DB = struct {
     var test_fail_managed_index_delete_after_catalog_commit = false;
     var test_fail_managed_index_repair_cleanup_after_catalog_commit = false;
     var test_fail_index_activation_after_catalog_commit = false;
+    var test_block_generated_artifact_finalization: std.atomic.Value(bool) = .init(false);
+    var test_generated_artifact_finalization_entered: std.atomic.Value(bool) = .init(false);
+    var test_release_generated_artifact_finalization: std.atomic.Value(bool) = .init(false);
 
     const IndexAdmissionDisposition = enum(u64) {
         activation_fence = 1,
@@ -61530,22 +61539,58 @@ test "db generated artifact cleanup retries beyond the transient burst" {
     try db.addIndex(cfg);
 }
 
-test "db generated artifact cleanup reports page ownership contention without waiting" {
-    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
-    var ctx = AsyncContext{
-        .alloc = std.testing.allocator,
-        .store = undefined,
-        .index_manager = undefined,
-        .apply_mutex = &apply_mutex,
+test "db generated artifact finalization releases page arbitration and preserves admission fence" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const first: types.IndexConfig = .{
+        .name = "a_full_text",
+        .kind = .full_text,
+        .config_json = "{}",
     };
-    defer ctx.deinit(std.testing.allocator);
+    const second: types.IndexConfig = .{
+        .name = "b_full_text",
+        .kind = .full_text,
+        .config_json = "{}",
+    };
 
-    try std.testing.expect(ctx.index_artifact_cleanup_mutex.tryLock());
-    defer ctx.index_artifact_cleanup_mutex.unlock();
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(first);
+    try db.addIndex(second);
+
+    DB.test_generated_artifact_finalization_entered.store(false, .release);
+    DB.test_release_generated_artifact_finalization.store(false, .release);
+    DB.test_block_generated_artifact_finalization.store(true, .release);
+    defer {
+        DB.test_release_generated_artifact_finalization.store(true, .release);
+        DB.test_block_generated_artifact_finalization.store(false, .release);
+    }
+    try std.testing.expect(try db.deleteIndex(first.name));
+    var wait_attempts: usize = 0;
+    while (!DB.test_generated_artifact_finalization_entered.load(.acquire)) : (wait_attempts += 1) {
+        try std.testing.expect(wait_attempts < 100_000);
+        std.Thread.yield() catch {};
+    }
+
+    try std.testing.expect(db.async_context.index_artifact_cleanup_mutex.tryLock());
+    db.async_context.index_artifact_cleanup_mutex.unlock();
+    try std.testing.expectError(error.IndexArtifactCleanupPending, db.addIndex(first));
+
+    try std.testing.expect(try db.deleteIndex(second.name));
     try std.testing.expectEqual(
-        DB.GeneratedArtifactCleanupAdvanceResult.busy,
-        try DB.advanceGeneratedArtifactCleanupContext(&ctx, null),
+        DB.GeneratedArtifactCleanupAdvanceResult.progressed,
+        try db.advanceGeneratedArtifactCleanupPage(second.name),
     );
+
+    DB.test_release_generated_artifact_finalization.store(true, .release);
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    try db.addIndex(first);
 }
 
 test "db managed admission drain preserves a generation requested during the pass" {

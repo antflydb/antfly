@@ -746,10 +746,7 @@ pub const AdminSource = struct {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         // Followers use Raft's built-in ReadIndex forwarding and wait until
         // the returned committed index is applied locally.
-        try svc.ensureLinearizableRead();
-        var snapshot = try svc.adminSnapshot();
-        defer svc.freeAdminSnapshot(&snapshot);
-        return contract.matches(&snapshot);
+        return try svc.validatePublication(contract);
     }
 
     fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {

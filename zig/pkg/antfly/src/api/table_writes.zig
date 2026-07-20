@@ -4560,6 +4560,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_id: u64,
         indexes_json: []u8,
         schema_json: []u8,
+        topology: metadata_api.CatalogTableTopology,
         groups: []StructuralReconcileGroup,
         pending_group_indexes: std.ArrayListUnmanaged(usize),
         cursor: usize = 0,
@@ -4593,8 +4594,15 @@ pub const ProvisionedTableWriteSource = struct {
 
     const StructuralReconcileOutcome = enum {
         complete,
-        pending,
+        yielded,
+        blocked,
         discarded,
+    };
+
+    const StructuralReconcileGroupOutcome = enum {
+        complete,
+        busy,
+        stale,
     };
 
     const structural_reconcile_retry_min_ms: u64 = 25;
@@ -4608,6 +4616,14 @@ pub const ProvisionedTableWriteSource = struct {
             structural_reconcile_retry_max_ms,
             structural_reconcile_retry_min_ms * (@as(u64, 1) << exponent),
         );
+    }
+
+    fn structuralReconcileRequeueAtMs(outcome: StructuralReconcileOutcome, now_ms: u64) u64 {
+        return switch (outcome) {
+            .yielded => now_ms,
+            .blocked => now_ms +| structural_reconcile_pending_delay_ms,
+            .complete, .discarded => unreachable,
+        };
     }
 
     replica_root_dir: []const u8,
@@ -9594,14 +9610,21 @@ pub const ProvisionedTableWriteSource = struct {
                 self.requeueActiveStructuralReconcile(&request, alloc);
                 continue;
             }
-            if (reconcile_outcome == .pending) {
+            if (reconcile_outcome == .yielded) {
+                request.failure_count = 0;
+                const retry_now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+                request.not_before_ms = structuralReconcileRequeueAtMs(.yielded, retry_now_ms);
+                self.requeueActiveStructuralReconcile(&request, alloc);
+                continue;
+            }
+            if (reconcile_outcome == .blocked) {
                 request.pending_count +|= 1;
                 request.failure_count = 0;
                 const retry_now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
                 // Pending is expected bounded maintenance, and each pass can
                 // advance durable cleanup. A fixed delay preserves queue
                 // fairness without exponentially throttling forward progress.
-                request.not_before_ms = retry_now_ms +| structural_reconcile_pending_delay_ms;
+                request.not_before_ms = structuralReconcileRequeueAtMs(.blocked, retry_now_ms);
                 if (request.pending_count == 1 or std.math.isPowerOfTwo(request.pending_count)) {
                     if (request.index_name) |index_name| {
                         std.log.info("structural reconcile waiting for bounded maintenance table={s} index={s} attempts={d}", .{ request.table_name, index_name, request.attempt_count });
@@ -9687,6 +9710,11 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.restore_repair_shutdown.load(.acquire)) return .discarded;
         if (request.plan == null) {
             request.plan = (try self.captureStructuralReconcilePlan(alloc, request.table_name)) orelse return .discarded;
+            if (!try self.structuralReconcilePlanStillCurrent(request.table_name, &request.plan.?)) {
+                request.plan.?.deinit(alloc);
+                request.plan = null;
+                return .blocked;
+            }
             if (request.plan.?.groups.len == 0) {
                 request.plan.?.deinit(alloc);
                 request.plan = null;
@@ -9695,39 +9723,47 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         var attempted: usize = 0;
+        var made_progress = false;
         while (attempted < structural_reconcile_groups_per_quantum) : (attempted += 1) {
             const plan = &request.plan.?;
             const group = plan.currentGroup() orelse {
                 if (try self.structuralReconcilePlanStillCurrent(request.table_name, plan)) return .complete;
                 plan.deinit(alloc);
                 request.plan = null;
-                return .pending;
+                return .blocked;
             };
             if (!try self.structuralReconcileGroupStillCurrent(request.table_name, plan, group)) {
                 plan.deinit(alloc);
                 request.plan = null;
-                return .pending;
+                return .blocked;
             }
 
-            const busy = try self.reconcileTableGroupStructureWithRuntime(alloc, group.range.group_id, request.table_name, .{
+            const outcome = try self.reconcileTableGroupStructureWithRuntime(alloc, group.range.group_id, request.table_name, .{
                 .indexes_json = plan.indexes_json,
                 .schema_json = plan.schema_json,
                 .identity_namespace = group.identity_namespace,
                 .target_index_name = request.index_name,
-            });
-            if (busy) {
-                plan.markCurrentBusy();
-            } else {
-                plan.markCurrentComplete();
-                if (plan.pending_group_indexes.items.len == 0) {
-                    if (try self.structuralReconcilePlanStillCurrent(request.table_name, plan)) return .complete;
+            }, plan, group);
+            switch (outcome) {
+                .busy => plan.markCurrentBusy(),
+                .stale => {
                     plan.deinit(alloc);
                     request.plan = null;
-                    return .pending;
-                }
+                    return .blocked;
+                },
+                .complete => {
+                    made_progress = true;
+                    plan.markCurrentComplete();
+                    if (plan.pending_group_indexes.items.len == 0) {
+                        if (try self.structuralReconcilePlanStillCurrent(request.table_name, plan)) return .complete;
+                        plan.deinit(alloc);
+                        request.plan = null;
+                        return .blocked;
+                    }
+                },
             }
         }
-        return .pending;
+        return if (made_progress) .yielded else .blocked;
     }
 
     fn captureStructuralReconcilePlan(
@@ -9773,6 +9809,7 @@ pub const ProvisionedTableWriteSource = struct {
             .table_id = table.table_id,
             .indexes_json = indexes_json,
             .schema_json = schema_json,
+            .topology = metadata_api.catalogTableTopology(table.table_id, snapshot.ranges),
             .groups = groups,
             .pending_group_indexes = pending_group_indexes,
         };
@@ -9808,6 +9845,19 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         plan: *const StructuralReconcilePlan,
     ) !bool {
+        if (self.catalog.vtable.validate_table_publication != null) {
+            const incarnation = plan.metadata_incarnation orelse return false;
+            return try self.catalog.validateTablePublication(.{
+                .metadata_group_id = plan.metadata_group_id,
+                .metadata_incarnation = incarnation,
+                .table_id = plan.table_id,
+                .table_name = table_name,
+                .schema_json = plan.schema_json,
+                .indexes_json = plan.indexes_json,
+                .topology = plan.topology,
+            });
+        }
+
         var snapshot = try self.catalog.adminSnapshot();
         defer self.catalog.freeAdminSnapshot(&snapshot);
         if (snapshot.status.metadata_group_id != plan.metadata_group_id or
@@ -9875,11 +9925,13 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
         metadata: StartupCatchUpMetadata,
-    ) !bool {
+        plan: *const StructuralReconcilePlan,
+        group: *const StructuralReconcileGroup,
+    ) !StructuralReconcileGroupOutcome {
         // The target generation is unpublished until catch-up and sync finish.
         // Queries are routed to the retained read generation, so do not turn a
         // corpus-sized backfill into a table-wide read outage.
-        if (!self.tryBeginReadCompatibleGroupOperation(table_name, group_id)) return true;
+        if (!self.tryBeginReadCompatibleGroupOperation(table_name, group_id)) return .busy;
         defer self.endGroupOperation(table_name, group_id);
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -9898,7 +9950,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .schema_json = metadata.schema_json,
                 .identity_namespace = identity_namespace,
             }) catch |err| switch (err) {
-                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return true,
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return .busy,
                 else => return err,
             };
             var cached_active = true;
@@ -9914,7 +9966,7 @@ pub const ProvisionedTableWriteSource = struct {
                 });
                 if (reconcile_summary.indexes_pending != 0) {
                     _ = try cached.db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
-                    return true;
+                    return .busy;
                 }
             }
             if (configured_indexes_storage) |configured_indexes| {
@@ -9936,7 +9988,7 @@ pub const ProvisionedTableWriteSource = struct {
                     };
                     switch (catch_up) {
                         .complete => {},
-                        .retry => return true,
+                        .retry => return .busy,
                         .delegated => self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue),
                     }
                 }
@@ -9953,6 +10005,13 @@ pub const ProvisionedTableWriteSource = struct {
                 configuredIndexesRequireSchemaIdentityProof(configured_indexes)
             else
                 false;
+            if (!try self.structuralReconcileGroupStillCurrent(table_name, plan, group)) {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
+                cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+                cached_active = false;
+                return .stale;
+            }
             publishStructuralRuntimeStatusSnapshot(
                 self,
                 alloc,
@@ -9968,7 +10027,7 @@ pub const ProvisionedTableWriteSource = struct {
                 return err;
             };
             cache.publishCachedLeaseGeneration(&cached, lsm_root_generation);
-            return false;
+            return .complete;
         }
 
         var db = if (metadata.indexes_json) |indexes_json|
@@ -9995,7 +10054,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .ha_async_metadata_mirror = self.ha_async_mirror,
                 },
             ) catch |err| switch (err) {
-                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return true,
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return .busy,
                 else => return err,
             }
         else
@@ -10010,7 +10069,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .ha_async_batch_mirror = self.ha_async_mirror,
                 .ha_async_metadata_mirror = self.ha_async_mirror,
             }) catch |err| switch (err) {
-                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return true,
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => return .busy,
                 else => return err,
             };
         defer db.close();
@@ -10024,7 +10083,7 @@ pub const ProvisionedTableWriteSource = struct {
             });
             if (reconcile_summary.indexes_pending != 0) {
                 _ = try db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
-                return true;
+                return .busy;
             }
         }
         if (configured_indexes_storage) |configured_indexes| {
@@ -10039,7 +10098,7 @@ pub const ProvisionedTableWriteSource = struct {
                     self.local_index_repair_debt_hook != null,
                 )) {
                     .complete => {},
-                    .retry => return true,
+                    .retry => return .busy,
                     .delegated => self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue),
                 }
             }
@@ -10050,6 +10109,7 @@ pub const ProvisionedTableWriteSource = struct {
             configuredIndexesRequireSchemaIdentityProof(configured_indexes)
         else
             false;
+        if (!try self.structuralReconcileGroupStillCurrent(table_name, plan, group)) return .stale;
         try publishStructuralRuntimeStatusSnapshot(
             self,
             alloc,
@@ -10058,7 +10118,7 @@ pub const ProvisionedTableWriteSource = struct {
             &db,
             publish_schema_identity_proof,
         );
-        return false;
+        return .complete;
     }
 
     fn requestTableStructuralReconcile(
@@ -26867,9 +26927,29 @@ const StructuralReconcileTestCatalog = struct {
 
     mode: Mode,
     calls: std.atomic.Value(u32) = .init(0),
+    validation_calls: std.atomic.Value(u32) = .init(0),
 
     fn iface(self: *@This()) table_catalog.CatalogSource {
         return .{ .ptr = self, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
+    }
+
+    fn fencedIface(self: *@This()) table_catalog.CatalogSource {
+        return .{ .ptr = self, .vtable = &.{
+            .admin_snapshot = adminSnapshot,
+            .free_admin_snapshot = freeAdminSnapshot,
+            .validate_table_publication = validateTablePublication,
+        } };
+    }
+
+    fn validateTablePublication(ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        _ = self.validation_calls.fetchAdd(1, .monotonic);
+        var snapshot = switch (self.mode) {
+            .expand_after_capture => expandedSnapshot(),
+            .empty_ranges => emptyRangesSnapshot(),
+            else => populatedSnapshot(),
+        };
+        return contract.matches(&snapshot);
     }
 
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -26890,7 +26970,11 @@ const StructuralReconcileTestCatalog = struct {
 
     fn populatedSnapshot() metadata_api.AdminSnapshot {
         return .{
-            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .status = .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = "11111111111111111111111111111111".*,
+                .metrics = .{},
+            },
             .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                 .table_id = 7,
                 .name = "docs",
@@ -26911,7 +26995,11 @@ const StructuralReconcileTestCatalog = struct {
 
     fn emptySnapshot() metadata_api.AdminSnapshot {
         return .{
-            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .status = .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = "11111111111111111111111111111111".*,
+                .metrics = .{},
+            },
             .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
             .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
             .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
@@ -26971,6 +27059,18 @@ test "structural reconcile retry backoff is bounded" {
     try std.testing.expectEqual(@as(u64, 2_000), ProvisionedTableWriteSource.structuralReconcileRetryDelayMs(std.math.maxInt(u32)));
 }
 
+test "structural reconcile productive quantum yields immediately while blocked work backs off" {
+    const now_ms = std.math.maxInt(u64) - 50;
+    try std.testing.expectEqual(
+        now_ms,
+        ProvisionedTableWriteSource.structuralReconcileRequeueAtMs(.yielded, now_ms),
+    );
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        ProvisionedTableWriteSource.structuralReconcileRequeueAtMs(.blocked, now_ms),
+    );
+}
+
 test "structural reconcile retries a transient worker failure" {
     var catalog = StructuralReconcileTestCatalog{ .mode = .fail_once };
     var source = ProvisionedTableWriteSource.init(
@@ -27001,7 +27101,7 @@ test "structural reconcile returns a bounded pending quantum while a group is bu
     };
     defer request.deinit(alloc);
     try std.testing.expectEqual(
-        ProvisionedTableWriteSource.StructuralReconcileOutcome.pending,
+        ProvisionedTableWriteSource.StructuralReconcileOutcome.blocked,
         try source.reconcileTableStructureStep(alloc, &request),
     );
 }
@@ -27022,6 +27122,7 @@ test "structural reconcile pending set never revisits completed groups" {
         .table_id = 7,
         .indexes_json = undefined,
         .schema_json = undefined,
+        .topology = undefined,
         .groups = &groups,
         .pending_group_indexes = pending,
     };
@@ -27049,6 +27150,21 @@ test "structural reconcile completion rejects ranges added after contract captur
     var plan = (try source.captureStructuralReconcilePlan(alloc, "docs")) orelse return error.TestUnexpectedResult;
     defer plan.deinit(alloc);
     try std.testing.expect(!(try source.structuralReconcilePlanStillCurrent("docs", &plan)));
+}
+
+test "structural reconcile production topology fence rejects ranges added after capture" {
+    const alloc = std.testing.allocator;
+    var catalog = StructuralReconcileTestCatalog{ .mode = .expand_after_capture };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-structural-reconcile-linearizable-topology-fence",
+        catalog.fencedIface(),
+    );
+    defer source.deinit();
+
+    var plan = (try source.captureStructuralReconcilePlan(alloc, "docs")) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(alloc);
+    try std.testing.expect(!(try source.structuralReconcilePlanStillCurrent("docs", &plan)));
+    try std.testing.expectEqual(@as(u32, 1), catalog.validation_calls.load(.monotonic));
 }
 
 test "structural reconcile fences incarnation initialization and discards empty topology" {
