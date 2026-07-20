@@ -7610,7 +7610,11 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.startup_catch_up_backoff_mutex.unlock();
         if (self.startup_catch_up_backoff_epoch.load(.acquire) != expected_epoch) return;
         if (result.busy) return;
-        if (!result.had_debt or result.cleared_debt or result.made_progress) {
+        // Durable generation repair has its own owner, queue, and retry
+        // policy. Once catch-up has handed that debt off, retaining a startup
+        // backoff would make two schedulers compete for the same DB and can
+        // falsely quarantine healthy, progressing repair work.
+        if (!result.had_debt or result.cleared_debt or result.made_progress or result.index_repair_pending) {
             _ = self.startup_catch_up_backoffs.remove(group_id);
             return;
         }
@@ -9576,14 +9580,23 @@ pub const ProvisionedTableWriteSource = struct {
                     if (metadata.target_index_name) |target_index_name| {
                         if (!std.mem.eql(u8, item.name, target_index_name)) continue;
                     }
-                    const repair_pending = catchUpManagedIndexCreate(alloc, cached.db, item.name) catch |err| {
+                    const catch_up = catchUpManagedIndexCreate(
+                        alloc,
+                        cached.db,
+                        item.name,
+                        self.local_index_repair_debt_hook != null,
+                    ) catch |err| {
                         lockAtomic(&self.local_db_mutex);
                         defer self.local_db_mutex.unlock();
                         cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
                         cached_active = false;
                         return err;
                     };
-                    if (repair_pending) return true;
+                    switch (catch_up) {
+                        .complete => {},
+                        .retry => return true,
+                        .delegated => self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue),
+                    }
                 }
             } else {
                 cached.db.runUntilIdle() catch |err| {
@@ -9674,7 +9687,16 @@ pub const ProvisionedTableWriteSource = struct {
                 if (metadata.target_index_name) |target_index_name| {
                     if (!std.mem.eql(u8, item.name, target_index_name)) continue;
                 }
-                if (try catchUpManagedIndexCreate(alloc, &db, item.name)) return true;
+                switch (try catchUpManagedIndexCreate(
+                    alloc,
+                    &db,
+                    item.name,
+                    self.local_index_repair_debt_hook != null,
+                )) {
+                    .complete => {},
+                    .retry => return true,
+                    .delegated => self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue),
+                }
             }
         } else {
             try db.runUntilIdle();
@@ -15122,24 +15144,35 @@ fn replayManagedIndexForTableIfNeeded(
     return managed_visibility_changed;
 }
 
+const ManagedIndexCreateCatchUp = enum {
+    complete,
+    retry,
+    delegated,
+};
+
 fn catchUpManagedIndexCreate(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     index_name: []const u8,
-) !bool {
+    delegate_durable_generation_repair: bool,
+) !ManagedIndexCreateCatchUp {
     // Managed full-text admission persists a generation-repair intent instead
-    // of rebuilding the existing corpus inline with catalog mutation. Advance
-    // one durable, restartable repair step per structural-reconcile turn. The
-    // outer worker retries without deleting the admitted generation, keeping
-    // large rebuilds bounded and allowing crash recovery to resume the same
-    // shadow candidate.
-    var generation_repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+    // of rebuilding the existing corpus inline with catalog mutation. A data
+    // runtime has one dedicated, capacity-fenced repair owner; structural
+    // reconciliation only admits its durable intent and then releases the
+    // group operation. Direct/embedded sources without that owner retain the
+    // synchronous fallback through the same restartable state machine.
+    var generation_repair = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
         .target = .index,
         .index_name = index_name,
         .limit = 1,
+    }, .{
+        .defer_durable_index_repair_execution = delegate_durable_generation_repair,
     });
     defer generation_repair.deinit(alloc);
-    if (generation_repair.debt_remaining) return true;
+    if (generation_repair.debt_remaining) {
+        return if (delegate_durable_generation_repair) .delegated else .retry;
+    }
 
     const requires_enrichment_replay = try db.core.indexRequiresEnrichmentReplay(index_name);
     if (requires_enrichment_replay) {
@@ -15162,7 +15195,50 @@ fn catchUpManagedIndexCreate(
     }
     try drainManagedIndexReplayUntilConverged(alloc, db, index_name);
     try db.core.index_manager.syncAll(true);
-    return false;
+    return .complete;
+}
+
+test "managed structural catch-up delegates durable generation repair without rebuilding inline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/managed-structural-repair-delegation",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    _ = (try db.admitManagedFullTextIndex(.{
+        .name = "full_text_index_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    })) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(
+        ManagedIndexCreateCatchUp.delegated,
+        try catchUpManagedIndexCreate(alloc, &db, "full_text_index_v1", true),
+    );
+
+    const summary = try db.indexRepairIntentSummary(alloc);
+    try std.testing.expectEqual(@as(usize, 1), summary.runnable);
+    const stats = try db.stats(alloc);
+    defer db_mod.types.freeDBStats(alloc, stats);
+    const index = for (stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, "full_text_index_v1")) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), index.doc_count);
 }
 
 const ManagedIndexReplayPosition = struct {
@@ -30502,6 +30578,15 @@ test "managed startup catch-up quarantines repeated zero progress with bounded b
     var progress = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true, .made_progress = true };
     source.updateStartupCatchUpBackoff(7001, 40_001, epoch, &progress);
     try std.testing.expectEqual(@as(?u64, null), source.startupCatchUpRetryAt(7001, 40_001));
+
+    var pending = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
+    source.updateStartupCatchUpBackoff(7004, 45_000, epoch, &pending);
+    var delegated = ProvisionedTableWriteSource.StartupCatchUpResult{
+        .had_debt = true,
+        .index_repair_pending = true,
+    };
+    source.updateStartupCatchUpBackoff(7004, 45_001, epoch, &delegated);
+    try std.testing.expectEqual(@as(?u64, null), source.startupCatchUpRetryAt(7004, 45_001));
 
     var terminal_attempt: usize = 0;
     while (terminal_attempt < startup_catch_up_no_progress_threshold) : (terminal_attempt += 1) {

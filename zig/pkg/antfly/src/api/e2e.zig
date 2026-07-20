@@ -3286,7 +3286,7 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
     var wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
     defer wait_io.deinit();
     var wait_attempts: usize = 0;
-    while (wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort("docs", 0)) : (wait_attempts += 1) {
+    while (wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort("docs", 0)) : (wait_attempts += 1) {
         try svc.runRound();
         wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }

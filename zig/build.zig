@@ -4865,6 +4865,7 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
             "managed startup catch-up allocation failure preserves bounded retry",
+            "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "managed repair visibility edges retire cached readers and runtime status",
             "table runtime snapshot cache invalidation fences a stale observed publisher",
             "runtime status hook orders completed observation without crossing invalidation",

@@ -2534,6 +2534,11 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         error.ProposalDropped,
         error.LeaderTransferInProgress,
         error.StoreRegistrationNotVisible,
+        // Placement projection is multi-row. A store can observe its local
+        // row before every row needed to prove the incumbent voter set is
+        // visible. Refusing to bootstrap from that partial set is required,
+        // but the next metadata snapshot can make it authoritative.
+        error.MissingAuthoritativeBootstrapVoters,
         => true,
         else => false,
     };
@@ -2576,6 +2581,7 @@ test "data runtime treats metadata leadership churn as retryable bootstrap failu
     try std.testing.expect(isRetryableMetadataBootstrapError(error.LeaderTransferInProgress));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRegistrationNotVisible));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.MissingAuthoritativeBootstrapVoters));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidArguments));
 }
 
@@ -3268,6 +3274,17 @@ pub const DataServer = struct {
     fn startupCatchUpNotBeforeMs(stats: ProvisionedStartupCatchUpStats, inspection_complete: bool) u64 {
         if (!inspection_complete or !stats.debt_remaining or stats.unparked_debt_remaining) return 0;
         return stats.earliest_retry_at_ms;
+    }
+
+    fn accountDelegatedIndexRepair(
+        stats: *ProvisionedStartupCatchUpStats,
+        result: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult,
+    ) bool {
+        if (!result.index_repair_pending) return false;
+        // This is observed startup debt, but it is parked on the durable index
+        // repair queue and must not keep the startup scheduler runnable.
+        stats.groups_with_debt += 1;
+        return true;
     }
 
     const StartupCatchUpCompletion = struct {
@@ -8270,6 +8287,12 @@ pub const DataServer = struct {
                         antfly.metadata.table_manager.rangeDocIdentityShardId(range),
                         antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
                     );
+                    // The durable repair queue now owns progress, retries, and
+                    // crash recovery for this debt. Do not keep startup
+                    // catch-up dirty or feed its zero-progress quarantine;
+                    // doing so competes for the same group operation and can
+                    // starve the bounded owner-side repair pass.
+                    if (accountDelegatedIndexRepair(&stats, result)) continue;
                 }
                 if (result.busy) {
                     stats.busy_groups += 1;
@@ -16973,6 +16996,16 @@ test "data runtime startup catch-up parks scheduler when only quarantined debt r
     const stale = DataServer.startupCatchUpCompletion(.{}, true, 7, 8);
     try std.testing.expect(stale.dirty);
     try std.testing.expectEqual(@as(u64, 0), stale.not_before_ms);
+
+    var delegated_stats = DataServer.ProvisionedStartupCatchUpStats{};
+    try std.testing.expect(DataServer.accountDelegatedIndexRepair(&delegated_stats, .{
+        .had_debt = true,
+        .index_repair_pending = true,
+    }));
+    try std.testing.expectEqual(@as(u64, 1), delegated_stats.groups_with_debt);
+    const delegated = DataServer.startupCatchUpCompletion(delegated_stats, true, 7, 7);
+    try std.testing.expect(!delegated.dirty);
+    try std.testing.expectEqual(@as(u64, 0), delegated.not_before_ms);
 }
 
 test "data runtime provisioned startup catch-up clears replay debt for local groups" {
