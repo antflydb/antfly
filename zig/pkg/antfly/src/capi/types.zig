@@ -246,6 +246,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.ValueTooLong,
         error.InvalidQueryRequest,
         error.UnsupportedQueryRequest,
+        error.IdentityReadGenerationChanged,
         error.InvalidAggregation,
         error.UnsupportedAggregation,
         error.ReadOnly,

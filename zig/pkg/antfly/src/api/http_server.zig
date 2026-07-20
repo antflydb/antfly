@@ -6781,6 +6781,7 @@ pub const ApiHttpServer = struct {
         return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.Timeout => return error.ReadUnavailable,
+            error.IdentityReadGenerationChanged => return error.ReadUnavailable,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
@@ -6835,7 +6836,7 @@ pub const ApiHttpServer = struct {
                 authenticated_identity,
                 request_deadline_ns,
             ) catch |err| switch (err) {
-                error.DocIdentityNamespaceMismatch => {
+                error.DocIdentityNamespaceMismatch, error.IdentityReadGenerationChanged => {
                     const now_ns = platform_time.monotonicNs();
                     if (retryDeadlineExpired(request_deadline_ns, now_ns)) return error.Timeout;
                     if (retry_timeout_ns == 0) return err;
@@ -6879,6 +6880,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.TableNotFound => return error.TableNotFound,
+                error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
                 error.ModelNotFound => return error.ModelNotFound,
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
                 error.QueryEmbeddingInputTooLarge,
@@ -6916,6 +6918,7 @@ pub const ApiHttpServer = struct {
             error.EmbedTransientFailure,
             error.EmbedUpstreamFailure,
             => return err,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
@@ -6957,6 +6960,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.TableNotFound => return error.NotFound,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.QueryEmbeddingInputTooLarge,
@@ -7363,7 +7367,12 @@ pub const ApiHttpServer = struct {
                 // picks up a fresh manifest. TableReadChurn: the read cache
                 // gave up opening a table that was being invalidated faster
                 // than an open completes.
-                error.EndOfStream, error.FileNotFound, error.TableReadChurn => {
+                error.EndOfStream,
+                error.FileNotFound,
+                error.TableReadChurn,
+                error.IdentityReadGenerationChanged,
+                => {
+                    if (err == error.IdentityReadGenerationChanged and req.identity_read_generation != null) return err;
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
                     const now_ns = platform_time.monotonicNs();
                     if (retryDeadlineExpired(req.execution_deadline_ns, now_ns)) return error.Timeout;
@@ -8357,6 +8366,7 @@ pub const ApiHttpServer = struct {
             error.InvalidQueryRequest => return try invalidPublicQueryRequestResponse(self.alloc),
             error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
             error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, body),
+            error.IdentityReadGenerationChanged => return try retryableTextResponse(self.alloc, 409, "identity read generation changed"),
             error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
             error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
             error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
@@ -8428,6 +8438,7 @@ pub const ApiHttpServer = struct {
                 error.InvalidQueryRequest => return try invalidPublicQueryRequestResponse(self.alloc),
                 error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
                 error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, line),
+                error.IdentityReadGenerationChanged => return try retryableTextResponse(self.alloc, 409, "identity read generation changed"),
                 error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
                 error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
                 error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
@@ -13671,6 +13682,71 @@ test "api http transient read retry honors expired request deadline before sourc
         .read_index,
     ));
     try std.testing.expectEqual(@as(u32, 0), reads.attempts);
+}
+
+test "api http retries identity generation churn from a fresh query snapshot" {
+    const FakeReads = struct {
+        attempts: u32 = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            if (self.attempts == 1) return error.IdentityReadGenerationChanged;
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
+        }
+    };
+
+    var reads = FakeReads{};
+    var response = (try ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        reads.source(),
+        "docs",
+        .{},
+        .read_index,
+    )).?;
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+    try std.testing.expectEqualStrings("{\"responses\":[]}", response.json);
 }
 
 test "api http plain public query preserves outer absolute request deadline" {

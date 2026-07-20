@@ -5425,7 +5425,7 @@ fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrat
     const ctx = req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest;
     if (!ctx.namespace.eql(db.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
     const generation = try db.currentIdentityReadGenerationForRequest(req.identity_read_generation);
-    if (generation != ctx.identity_read_generation) return error.UnsupportedQueryRequest;
+    if (generation != ctx.identity_read_generation) return error.IdentityReadGenerationChanged;
 }
 
 fn graphHydrateResolvedDocFilterAllows(req: distributed_graph.GraphHydrateRequest, key: []const u8, ordinal: ?doc_set.DocOrdinal) bool {
@@ -7020,7 +7020,7 @@ fn aggregationContextForCapturedResultDb(
         // generation. Stored-row aggregations can still execute exactly; any
         // aggregation that requires index state remains unsupported and can be
         // retried by the caller against one coherent generation.
-        error.UnsupportedQueryRequest => return .{
+        error.IdentityReadGenerationChanged => return .{
             .identity_read_generation = req.identity_read_generation,
         },
         else => return err,
@@ -17787,7 +17787,7 @@ test "explicit text stats requests reject stale identity generation" {
 
     var parsed_explicit = try parseTextStatsRequest(alloc, "docs", explicit_body);
     defer parsed_explicit.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedQueryRequest, collectTextStatsFromDbForRequest(alloc, &db, parsed_explicit));
+    try std.testing.expectError(error.IdentityReadGenerationChanged, collectTextStatsFromDbForRequest(alloc, &db, parsed_explicit));
 
     const background_body = try std.fmt.allocPrint(alloc,
         \\{{"_identity_read_generation":{d},"background_fields":[{{"aggregation_name":"sig","index_name":"text_v1","field":"body","terms":["alpha"],"background_query":{{"match_all":{{}}}}}}]}}
@@ -17796,7 +17796,7 @@ test "explicit text stats requests reject stale identity generation" {
 
     var parsed_background = try parseTextStatsRequest(alloc, "docs", background_body);
     defer parsed_background.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedQueryRequest, collectBackgroundTextStatsFromDbForRequest(alloc, &db, parsed_background));
+    try std.testing.expectError(error.IdentityReadGenerationChanged, collectBackgroundTextStatsFromDbForRequest(alloc, &db, parsed_background));
 }
 
 test "algebraic partial request preserves planner-owned materialization tensor programs" {
@@ -17878,7 +17878,7 @@ test "aggregation context rejects non-current identity generation" {
     const current = db.core.nextDerivedSequence();
     const ctx = try aggregationContextForDb(alloc, .{ .identity_read_generation = current }, &db);
     try std.testing.expectEqual(@as(?u64, current), ctx.identity_read_generation);
-    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationContextForDb(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, aggregationContextForDb(alloc, .{
         .identity_read_generation = current + 1,
     }, &db));
 
@@ -18224,7 +18224,7 @@ test "algebraic partial request fails closed when lifecycle is stale" {
     defer alloc.free(encoded);
     var parsed = try parseAlgebraicPartialsRequest(alloc, encoded);
     defer parsed.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedQueryRequest, collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed));
+    try std.testing.expectError(error.IdentityReadGenerationChanged, collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed));
 }
 
 test "algebraic partial request accepts current identity generation and rejects stale" {
@@ -18279,7 +18279,7 @@ test "algebraic partial request accepts current identity generation and rejects 
     var stale = try parseAlgebraicPartialsRequest(alloc, encoded);
     defer stale.deinit(alloc);
     stale.identity_read_generation = db.core.nextDerivedSequence() + 1;
-    try std.testing.expectError(error.UnsupportedQueryRequest, collectAlgebraicPartialsFromDbForRequest(alloc, &db, stale));
+    try std.testing.expectError(error.IdentityReadGenerationChanged, collectAlgebraicPartialsFromDbForRequest(alloc, &db, stale));
 }
 
 test "algebraic partial request accepts tensor program expression outputs" {
@@ -20377,7 +20377,7 @@ test "graph edge local read rejects stale identity generation" {
     defer req.deinit(alloc);
 
     var catalog_state = CatalogState{};
-    try std.testing.expectError(error.UnsupportedQueryRequest, graphGetEdgesLocal(
+    try std.testing.expectError(error.IdentityReadGenerationChanged, graphGetEdgesLocal(
         alloc,
         root,
         catalog_state.iface(),

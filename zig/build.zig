@@ -4211,7 +4211,13 @@ pub fn build(b: *std.Build) void {
         public_api_parity_tests,
         public_api_parity_runtime_filters,
     );
+    const run_public_api_parity_unit_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        public_api_parity_tests,
+        public_api_parity_runtime_filters,
+    );
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
+    run_public_api_parity_unit_tests.step.dependOn(&openapi_root_check.step);
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
 
@@ -4900,6 +4906,12 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_api_table_writes_production_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
+    const run_api_table_writes_production_regression_unit_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
+    // These stateful suites each open several DB/index runtimes. Keep their
+    // aggregate-gate runs on one lane so bounded CI hosts do not convert
+    // aggregate memory pressure into allocator failures. Focused aliases use
+    // the independent run artifacts above.
+    run_api_table_writes_production_regression_unit_tests.step.dependOn(&run_public_api_parity_unit_tests.step);
     const api_table_writes_production_regression_step = b.step("api-table-writes-production-regression-test", "Run focused restore and writer-cache lifecycle regressions");
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
     const api_table_writes_restore_repeat_step = b.step("api-table-writes-restore-repeat-test", "Run the focused shared-owner native restore regression");
@@ -5508,7 +5520,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
     unit_test_step.dependOn(&run_api_restore_jobs_tests.step);
     unit_test_step.dependOn(&run_portable_backup_tests.step);
-    unit_test_step.dependOn(&run_public_api_parity_tests.step);
+    unit_test_step.dependOn(&run_public_api_parity_unit_tests.step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
     unit_test_step.dependOn(&run_lib_toon_tests.step);
     unit_test_step.dependOn(&run_lib_mcp_tests.step);
@@ -5917,7 +5929,7 @@ pub fn build(b: *std.Build) void {
     // branch. Keep them in the PR/base gate instead of defining orphan steps
     // that run only when invoked manually.
     unit_test_step.dependOn(&run_lib_api_derived_coverage_tests.step);
-    unit_test_step.dependOn(&run_api_table_writes_production_regression_tests.step);
+    unit_test_step.dependOn(&run_api_table_writes_production_regression_unit_tests.step);
 
     const db_enrichment_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -5974,12 +5986,14 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_provisioned_query_visibility_tests = addFilteredTestRunArtifact(b, provisioned_query_visibility_tests);
+    const run_provisioned_query_visibility_unit_tests = addFilteredTestRunArtifact(b, provisioned_query_visibility_tests);
+    run_provisioned_query_visibility_unit_tests.step.dependOn(&run_api_table_writes_production_regression_unit_tests.step);
     const provisioned_query_visibility_step = b.step(
         "provisioned-query-visibility-test",
         "Run the focused managed dense query-visibility cache invalidation regression",
     );
     provisioned_query_visibility_step.dependOn(&run_provisioned_query_visibility_tests.step);
-    unit_test_step.dependOn(&run_provisioned_query_visibility_tests.step);
+    unit_test_step.dependOn(&run_provisioned_query_visibility_unit_tests.step);
 
     const db_embeddings_update_tests = b.addTest(.{
         .root_module = db_test_mod,

@@ -1505,7 +1505,11 @@ test "table provisioner replaces embedding index when metadata incarnation chang
     // Replacement is intentionally a multi-pass desired-state transition:
     // the durable owner retires the old artifact namespace before a later
     // reconcile admits the new coverage incarnation.
-    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    var cleanup_pages: usize = 0;
+    while (try db.advanceGeneratedArtifactCleanupPage("semantic_idx")) {
+        cleanup_pages += 1;
+        try std.testing.expect(cleanup_pages < 32);
+    }
     const admitted = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, second, .{});
     try std.testing.expectEqual(@as(usize, 0), admitted.indexes_removed);
     try std.testing.expectEqual(@as(usize, 1), admitted.indexes_added);

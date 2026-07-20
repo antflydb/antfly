@@ -538,6 +538,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 .read_index,
             ) catch |err| switch (err) {
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
@@ -567,6 +568,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 .read_index,
             ) catch |err| switch (err) {
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
                 else => return err,
@@ -633,6 +635,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 .read_index,
             ) catch |err| switch (err) {
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
                 else => return err,
@@ -685,6 +688,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 .read_index,
             ) catch |err| switch (err) {
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
@@ -708,6 +712,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
                 else => return err,
@@ -741,6 +746,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, @errorName(err)),
                 else => return err,
@@ -778,6 +784,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, @errorName(err)),
                 else => return err,
@@ -821,6 +828,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, @errorName(err)),
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, @errorName(err)),
+                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
@@ -843,6 +851,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 .read_index,
             ) catch |err| switch (err) {
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
                 else => return err,
@@ -866,6 +875,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 .read_index,
             ) catch |err| switch (err) {
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
                 error.InvalidQueryRequest, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, "invalid graph edges request"),
@@ -880,6 +890,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, "invalid text stats request"),
                 error.TableNotFound, error.UnknownGroup => return try http_route_helpers.textResponse(alloc, 404, "not found"),
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 else => return err,
             } orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
@@ -901,6 +912,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, "invalid algebraic partials request"),
                 error.TableNotFound, error.UnknownGroup => return try http_route_helpers.textResponse(alloc, 404, "not found"),
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 else => return err,
             } orelse return try http_route_helpers.textResponse(alloc, 404, "not found");

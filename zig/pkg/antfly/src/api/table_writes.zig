@@ -4482,6 +4482,9 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []u8,
         index_name: ?[]u8 = null,
         failure_count: u32 = 0,
+        pending_count: u32 = 0,
+        attempt_count: u32 = 0,
+        prepared: bool = false,
         not_before_ms: u64 = 0,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -4504,8 +4507,15 @@ pub const ProvisionedTableWriteSource = struct {
         }
     };
 
+    const StructuralReconcileOutcome = enum {
+        complete,
+        pending,
+        discarded,
+    };
+
     const structural_reconcile_retry_min_ms: u64 = 25;
     const structural_reconcile_retry_max_ms: u64 = 2_000;
+    const structural_reconcile_pending_delay_ms: u64 = 100;
 
     fn structuralReconcileRetryDelayMs(failure_count: u32) u64 {
         const exponent: u6 = @intCast(@min(failure_count -| 1, 7));
@@ -7578,9 +7588,17 @@ pub const ProvisionedTableWriteSource = struct {
             try publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db);
         }
         self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &result);
-        preserve_startup_cache = result.had_debt and !result.cleared_debt and
-            !result.terminal_degraded and !result.busy and !result.made_progress;
+        preserve_startup_cache = shouldPreserveStartupWriteCache(result);
         return result;
+    }
+
+    fn shouldPreserveStartupWriteCache(result: StartupCatchUpResult) bool {
+        // A delegated repair is an ownership transfer, not a zero-progress
+        // retry. Retaining this writer would prevent the durable repair owner
+        // and structural reconciler from opening the shard.
+        return result.had_debt and !result.cleared_debt and
+            !result.terminal_degraded and !result.busy and !result.made_progress and
+            !result.index_repair_pending;
     }
 
     fn retireReadersAfterIndexRepairCompletion(
@@ -9469,8 +9487,14 @@ pub const ProvisionedTableWriteSource = struct {
             self.structural_reconcile_mutex.unlock(io);
 
             self.beginReservedStructuralReconcileActivity(request.table_name);
+            request.attempt_count +|= 1;
+            var reconcile_outcome: StructuralReconcileOutcome = .complete;
             const reconcile_error: ?anyerror = blk: {
-                self.reconcileTableStructureUntilIdle(alloc, request.table_name, request.index_name) catch |err| break :blk err;
+                if (!request.prepared) {
+                    self.prepareTableStructuralReconcile(request.table_name, request.index_name) catch |err| break :blk err;
+                    request.prepared = true;
+                }
+                reconcile_outcome = self.reconcileTableStructureStep(alloc, request.table_name, request.index_name) catch |err| break :blk err;
                 break :blk null;
             };
             if (reconcile_error) |err| {
@@ -9482,42 +9506,77 @@ pub const ProvisionedTableWriteSource = struct {
                 } else {
                     std.log.warn("structural reconcile deferred table={s} failures={d} retry_at_monotonic_ms={d} err={s}", .{ request.table_name, request.failure_count, request.not_before_ms, @errorName(err) });
                 }
-
-                // Keep the reservation continuous across retries: a write
-                // admitted between failure and requeue could use stale schema.
-                self.structural_reconcile_mutex.lockUncancelable(io);
-                var covered = false;
-                for (self.structural_reconcile_tables.items) |candidate| {
-                    if (candidate.covers(request.table_name, request.index_name)) {
-                        covered = true;
-                        break;
+                self.requeueActiveStructuralReconcile(&request, alloc);
+                continue;
+            }
+            if (reconcile_outcome == .pending) {
+                request.pending_count +|= 1;
+                request.failure_count = 0;
+                const retry_now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+                // Pending is expected bounded maintenance, and each pass can
+                // advance durable cleanup. A fixed delay preserves queue
+                // fairness without exponentially throttling forward progress.
+                request.not_before_ms = retry_now_ms +| structural_reconcile_pending_delay_ms;
+                if (request.pending_count == 1 or std.math.isPowerOfTwo(request.pending_count)) {
+                    if (request.index_name) |index_name| {
+                        std.log.info("structural reconcile waiting for bounded maintenance table={s} index={s} attempts={d}", .{ request.table_name, index_name, request.attempt_count });
+                    } else {
+                        std.log.info("structural reconcile waiting for bounded maintenance table={s} attempts={d}", .{ request.table_name, request.attempt_count });
                     }
                 }
-                var requeued = false;
-                if (!covered and !self.restore_repair_shutdown.load(.acquire)) {
-                    self.reserveStructuralReconcileActivity(request.table_name);
-                    self.structural_reconcile_tables.appendAssumeCapacity(request);
-                    requeued = true;
-                } else {
-                    self.endStructuralReconcileActivity(request.table_name);
-                    request.deinit(alloc);
-                }
-                if (requeued) self.endStructuralReconcileActivity(request.table_name);
-                self.structural_reconcile_mutex.unlock(io);
+                self.requeueActiveStructuralReconcile(&request, alloc);
                 continue;
+            }
+            if (reconcile_outcome == .discarded) {
+                self.endStructuralReconcileActivity(request.table_name);
+                request.deinit(alloc);
+                continue;
+            }
+            self.notifyLocalChange(request.table_name, .runtime_reconciled);
+            if (request.index_name) |index_name| {
+                std.log.info("structural reconcile complete table={s} index={s} attempts={d}", .{ request.table_name, index_name, request.attempt_count });
+            } else {
+                std.log.info("structural reconcile complete table={s} attempts={d}", .{ request.table_name, request.attempt_count });
             }
             self.endStructuralReconcileActivity(request.table_name);
             request.deinit(alloc);
         }
     }
 
-    fn reconcileTableStructureUntilIdle(
+    fn requeueActiveStructuralReconcile(
         self: *ProvisionedTableWriteSource,
+        request: *StructuralReconcileRequest,
         alloc: std.mem.Allocator,
+    ) void {
+        const io = self.table_activity_threaded.io();
+        // Keep the reservation continuous across retries: a write admitted
+        // between the active pass and requeue could use stale schema.
+        self.structural_reconcile_mutex.lockUncancelable(io);
+        var covered = false;
+        for (self.structural_reconcile_tables.items) |candidate| {
+            if (candidate.covers(request.table_name, request.index_name)) {
+                covered = true;
+                break;
+            }
+        }
+        var requeued = false;
+        if (!covered and !self.restore_repair_shutdown.load(.acquire)) {
+            self.reserveStructuralReconcileActivity(request.table_name);
+            self.structural_reconcile_tables.appendAssumeCapacity(request.*);
+            requeued = true;
+        } else {
+            self.endStructuralReconcileActivity(request.table_name);
+            request.deinit(alloc);
+        }
+        if (requeued) self.endStructuralReconcileActivity(request.table_name);
+        self.structural_reconcile_mutex.unlock(io);
+    }
+
+    fn prepareTableStructuralReconcile(
+        self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         target_index_name: ?[]const u8,
     ) !void {
-        const io = self.table_activity_threaded.io();
         if (target_index_name) |index_name| {
             std.log.info("structural reconcile begin table={s} index={s}", .{ table_name, index_name });
         } else {
@@ -9533,54 +9592,40 @@ pub const ProvisionedTableWriteSource = struct {
         // path is intended to avoid.
         self.local_db_mutex.unlock();
         self.drainWriteCachePendingCloses();
-        var attempts: usize = 0;
-        while (true) {
-            if (self.restore_repair_shutdown.load(.acquire)) return;
-            attempts += 1;
-            var any_busy = false;
-            const group_ids = try table_catalog.resolveGroupsForSpanEventually(
-                alloc,
-                self.catalog,
-                table_name,
-                "",
-                "",
-                5 * std.time.ns_per_s,
-                10,
-            );
-            defer alloc.free(group_ids);
-            if (group_ids.len == 0) return;
-            const metadata = (try loadTableManagedMetadata(alloc, self.catalog, table_name)) orelse return;
-            defer {
-                if (metadata.indexes_json) |value| alloc.free(value);
-                if (metadata.schema_json) |value| alloc.free(value);
-            }
-            for (group_ids) |group_id| {
-                if (try self.reconcileTableGroupStructureWithRuntime(alloc, group_id, table_name, .{
-                    .indexes_json = metadata.indexes_json,
-                    .schema_json = metadata.schema_json,
-                    .target_index_name = target_index_name,
-                })) {
-                    any_busy = true;
-                    continue;
-                }
-            }
-            if (!any_busy) {
-                // The reconciler mutated the current root in place and has
-                // already published a consistent runtime snapshot. Rotating
-                // the visible root generation here would immediately make
-                // that snapshot stale and retire the writer that produced it.
-                self.notifyLocalChange(table_name, .runtime_reconciled);
-                if (target_index_name) |index_name| {
-                    std.log.info("structural reconcile complete table={s} index={s} attempts={d}", .{ table_name, index_name, attempts });
-                } else {
-                    std.log.info("structural reconcile complete table={s} attempts={d}", .{ table_name, attempts });
-                }
-                return;
-            }
-            io.sleep(Io.Duration.fromMilliseconds(100), .awake) catch |err| switch (err) {
-                error.Canceled => return Io.recancel(io),
-            };
+    }
+
+    fn reconcileTableStructureStep(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+    ) !StructuralReconcileOutcome {
+        if (self.restore_repair_shutdown.load(.acquire)) return .discarded;
+        var any_busy = false;
+        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+            alloc,
+            self.catalog,
+            table_name,
+            "",
+            "",
+            5 * std.time.ns_per_s,
+            10,
+        );
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return .discarded;
+        const metadata = (try loadTableManagedMetadata(alloc, self.catalog, table_name)) orelse return .discarded;
+        defer {
+            if (metadata.indexes_json) |value| alloc.free(value);
+            if (metadata.schema_json) |value| alloc.free(value);
         }
+        for (group_ids) |group_id| {
+            if (try self.reconcileTableGroupStructureWithRuntime(alloc, group_id, table_name, .{
+                .indexes_json = metadata.indexes_json,
+                .schema_json = metadata.schema_json,
+                .target_index_name = target_index_name,
+            })) any_busy = true;
+        }
+        return if (any_busy) .pending else .complete;
     }
 
     fn reconcileTableGroupStructureWithRuntime(
@@ -9626,7 +9671,10 @@ pub const ProvisionedTableWriteSource = struct {
                 const reconcile_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                     .drain_resolver_backfill = false,
                 });
-                if (reconcile_summary.indexes_pending != 0) return true;
+                if (reconcile_summary.indexes_pending != 0) {
+                    _ = try cached.db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
+                    return true;
+                }
             }
             if (configured_indexes_storage) |configured_indexes| {
                 for (configured_indexes.items) |item| {
@@ -9733,7 +9781,10 @@ pub const ProvisionedTableWriteSource = struct {
             const reconcile_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
                 .drain_resolver_backfill = false,
             });
-            if (reconcile_summary.indexes_pending != 0) return true;
+            if (reconcile_summary.indexes_pending != 0) {
+                _ = try db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
+                return true;
+            }
         }
         if (configured_indexes_storage) |configured_indexes| {
             for (configured_indexes.items) |item| {
@@ -16732,10 +16783,15 @@ fn publishRuntimeStatusGroupAfterObservation(
     if (!std.meta.eql(publication_fence.table_epoch, completed.table_epoch)) {
         return error.RuntimeStatusPublicationFenced;
     }
-    switch (try snapshot_cache.publishGroup(completed, table_name, status)) {
-        .published => {},
+    try acceptRuntimeStatusPublication(try snapshot_cache.publishGroup(completed, table_name, status));
+}
+
+fn acceptRuntimeStatusPublication(result: runtime_status.TableRuntimeSnapshotCache.PublishResult) !void {
+    // A newer observation already owns publication ordering. It must not
+    // cancel the maintenance operation whose status was superseded.
+    switch (result) {
+        .published, .stale_observation => {},
         .stale_table => return error.RuntimeStatusPublicationFenced,
-        .stale_observation => return error.RuntimeStatusPublicationSuperseded,
     }
 }
 
@@ -26566,7 +26622,7 @@ test "provisioned table write request queues structural reconcile ahead of later
 }
 
 const StructuralReconcileTestCatalog = struct {
-    const Mode = enum { vanish, fail_once };
+    const Mode = enum { vanish, fail_once, stable };
 
     mode: Mode,
     calls: std.atomic.Value(u32) = .init(0),
@@ -26585,6 +26641,7 @@ const StructuralReconcileTestCatalog = struct {
                 1 => error.TransientCatalogFailure,
                 else => emptySnapshot(),
             },
+            .stable => populatedSnapshot(),
         };
     }
 
@@ -26667,6 +26724,22 @@ test "structural reconcile retries a transient worker failure" {
     try source.enqueueTableIndexStructuralReconcile("docs", "semantic_idx");
     source.waitForNoStructuralActivity("docs");
     try std.testing.expect(catalog.calls.load(.monotonic) >= 4);
+}
+
+test "structural reconcile returns a bounded pending quantum while a group is busy" {
+    var catalog = StructuralReconcileTestCatalog{ .mode = .stable };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-structural-reconcile-bounded-pending",
+        catalog.iface(),
+    );
+    defer source.deinit();
+
+    try std.testing.expect(source.tryBeginGroupOperation("docs", 7001));
+    defer source.endGroupOperation("docs", 7001);
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.StructuralReconcileOutcome.pending,
+        try source.reconcileTableStructureStep(std.testing.allocator, "docs", "semantic_idx"),
+    );
 }
 
 test "best effort table request admission does not deadlock behind queued reconcile" {
@@ -27322,7 +27395,9 @@ test "provisioned table write source runtime status does not inspect read cache 
         defer db.close();
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
-            .sync_level = .write,
+            // This fixture exercises read-cache visibility, not asynchronous
+            // indexing. Establish the indexed precondition explicitly.
+            .sync_level = .full_index,
         });
     }
 
@@ -28543,6 +28618,9 @@ test "runtime status hook orders completed observation without crossing invalida
     var published = (try cache.snapshot(alloc, "docs")).?;
     defer published.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), published.items[0].stats.source_doc_count);
+
+    try acceptRuntimeStatusPublication(.stale_observation);
+    try std.testing.expectError(error.RuntimeStatusPublicationFenced, acceptRuntimeStatusPublication(.stale_table));
 
     const stale_epoch = try cache.capturePublicationToken("docs");
     cache.invalidateTable("docs");
@@ -30737,6 +30815,16 @@ test "managed startup catch-up quarantines repeated zero progress with bounded b
     var stale = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
     source.updateStartupCatchUpBackoff(7003, 60_000, epoch, &stale);
     try std.testing.expectEqual(@as(usize, 0), source.startup_catch_up_backoffs.count());
+}
+
+test "managed startup catch-up releases writer ownership when repair is delegated" {
+    try std.testing.expect(ProvisionedTableWriteSource.shouldPreserveStartupWriteCache(.{
+        .had_debt = true,
+    }));
+    try std.testing.expect(!ProvisionedTableWriteSource.shouldPreserveStartupWriteCache(.{
+        .had_debt = true,
+        .index_repair_pending = true,
+    }));
 }
 
 test "managed startup catch-up allocation failure preserves bounded retry" {

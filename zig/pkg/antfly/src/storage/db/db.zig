@@ -6334,6 +6334,41 @@ pub const DB = struct {
         );
     }
 
+    /// Advance one bounded page of retired-index artifact records, followed by
+    /// terminal filesystem finalization when that page completes the job.
+    /// Managed structural reconciliation uses this as a progress guarantee
+    /// when the shared durable-job lane is busy; the same mutex serializes it
+    /// with the autonomous cleanup worker.
+    pub fn advanceGeneratedArtifactCleanupPage(self: *DB, index_name: ?[]const u8) !bool {
+        lockAtomicWithBackoff(&self.async_context.index_artifact_cleanup_mutex);
+        defer self.async_context.index_artifact_cleanup_mutex.unlock();
+
+        if (index_name) |name| {
+            var targeted = try self.core.index_manager.drainGeneratedArtifactCleanupForIndexPage(
+                self.core.store,
+                name,
+            );
+            defer targeted.deinit();
+            if (targeted.found) {
+                if (targeted.completed) try finalizeRetiredIndexCleanupContext(
+                    self.async_context,
+                    targeted.index_name,
+                    targeted.key,
+                );
+                return true;
+            }
+        }
+
+        var result = try self.core.index_manager.drainGeneratedArtifactCleanupOutboxPage(self.core.store);
+        defer result.deinit();
+        if (result.completed) try finalizeRetiredIndexCleanupContext(
+            self.async_context,
+            result.index_name,
+            result.key,
+        );
+        return result.found;
+    }
+
     fn scheduleGeneratedArtifactCleanupContext(
         ctx: *AsyncContext,
         lane: background_runtime_mod.DurableJobLane,
@@ -17964,7 +17999,7 @@ pub const DB = struct {
         if (requested) |generation| {
             if (generation != current_generation) {
                 self.doc_set_planning_stats.recordStaleIdentityGenerationRejection();
-                return error.UnsupportedQueryRequest;
+                return error.IdentityReadGenerationChanged;
             }
             return generation;
         }
@@ -39648,24 +39683,24 @@ test "db search requests default to current identity generation snapshot" {
     const explicit = try db.searchRequestAtCurrentIdentityGeneration(.{ .identity_read_generation = current_generation });
     try std.testing.expectEqual(@as(?u64, current_generation), explicit.identity_read_generation);
 
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.searchRequestAtCurrentIdentityGeneration(.{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.searchRequestAtCurrentIdentityGeneration(.{
         .identity_read_generation = current_generation -| 1,
     }));
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.search(alloc, .{
         .identity_read_generation = current_generation + 1,
     }));
 
     var preflight = try db.preflightSearchRequest(alloc, .{ .identity_read_generation = current_generation }, 0);
     defer preflight.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.preflightSearchRequest(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.preflightSearchRequest(alloc, .{
         .identity_read_generation = current_generation -| 1,
     }, 0));
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.collectPlanningStats(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.collectPlanningStats(alloc, .{
         .identity_read_generation = current_generation + 1,
     }, 0));
     const text_stats = try db.collectSearchRequestTextStats(alloc, .{ .identity_read_generation = current_generation });
     defer alloc.free(text_stats);
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.collectSearchRequestTextStats(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.collectSearchRequestTextStats(alloc, .{
         .identity_read_generation = current_generation + 1,
     }));
 
