@@ -4860,6 +4860,8 @@ pub fn build(b: *std.Build) void {
             "provisioned table transition waiter queues ahead of later readers",
             "provisioned table write request queues structural reconcile ahead of later writes",
             "queued structural reconcile reserves write admission before its worker starts",
+            "structural reconcile retry backoff is bounded",
+            "structural reconcile retries a transient worker failure",
             "provisioned structural reconcile blocks table write admission",
             "provisioned schema reconcile keeps reads and status available",
             "managed startup catch-up marks FileNotFound index open terminal degraded",

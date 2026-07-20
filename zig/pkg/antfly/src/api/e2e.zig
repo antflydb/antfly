@@ -497,9 +497,13 @@ test "public api smoke e2e creates table inserts and queries documents" {
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
     );
-    defer provisioned_write_source.deinit();
     var provisioned_storage = ProvisionedGroupStorage.init(std.testing.allocator);
-    defer provisioned_storage.deinit();
+    defer {
+        // Attached sources borrow storage callbacks. Drain their workers before
+        // destroying the callback owner, matching DataServer's teardown order.
+        provisioned_write_source.deinit();
+        provisioned_storage.deinit();
+    }
     try provisioned_storage.attachSources(&provisioned_read_source, &provisioned_write_source);
     const DirectWriterOwner = struct {
         fn metadataMayOpenReplicaRoots(_: *anyopaque) bool {

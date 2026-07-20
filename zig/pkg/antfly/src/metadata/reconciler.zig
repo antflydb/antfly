@@ -1483,14 +1483,11 @@ const MembershipTransitionIndex = struct {
         const final_peers = state.latched_final_peers orelse return false;
         if (containsU64(final_peers, source.record.local_node_id)) return false;
 
-        if (self.storeForIntent(source)) |store| {
-            if (store.live and std.mem.eql(u8, store.health_class, "healthy")) {
-                if (self.statusForStore(source.record.group_id, store.store_id)) |status| {
-                    if (status.local_voter or status.joint_consensus or status.transition_pending) return false;
-                }
-            }
-        }
-
+        // A removed member is not guaranteed to apply the configuration entry
+        // that removes it: the surviving quorum may commit and stop replication
+        // first. Its stale self-report therefore cannot veto finalization. The
+        // exact final-set reports below are the authoritative proof: every
+        // survivor agrees on the stable voter fingerprint and one is leader.
         var final_leader_proved = false;
         for (final_peers) |node_id| {
             const intent = self.currentIntent(source.record.group_id, node_id) orelse return false;
@@ -3866,7 +3863,7 @@ test "metadata reconciler latches final membership across planner churn" {
     try std.testing.expect(!membership_index.preserveCurrentPlacement(2233, 101));
 }
 
-test "metadata reconciler retires an unavailable source after exact final leader proof" {
+test "metadata reconciler retires a stale source after exact final leader proof" {
     const current = [_]raft_reconciler.PlacementIntent{
         .{
             .record = .{ .group_id = 2234, .replica_id = 1, .local_node_id = 101 },
@@ -3889,7 +3886,22 @@ test "metadata reconciler retires an unavailable source after exact final leader
     };
     const desired = [_]raft_reconciler.PlacementIntent{ current[1], current[2] };
     const final_fingerprint = table_manager.voterSetFingerprint(&.{ 102, 103 }, null);
+    const stale_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 103 }, null);
     const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 101,
+            .node_id = 101,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2234,
+                .local_voter = true,
+                .voter_count = 3,
+                .voter_set_known = true,
+                .voter_set_fingerprint = stale_fingerprint,
+            }})[0..]),
+        },
         .{
             .store_id = 102,
             .node_id = 102,

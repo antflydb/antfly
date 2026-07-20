@@ -4481,6 +4481,8 @@ pub const ProvisionedTableWriteSource = struct {
     const StructuralReconcileRequest = struct {
         table_name: []u8,
         index_name: ?[]u8 = null,
+        failure_count: u32 = 0,
+        not_before_ms: u64 = 0,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
@@ -4501,6 +4503,17 @@ pub const ProvisionedTableWriteSource = struct {
             return std.mem.eql(u8, self.index_name.?, index_name.?);
         }
     };
+
+    const structural_reconcile_retry_min_ms: u64 = 25;
+    const structural_reconcile_retry_max_ms: u64 = 2_000;
+
+    fn structuralReconcileRetryDelayMs(failure_count: u32) u64 {
+        const exponent: u6 = @intCast(@min(failure_count -| 1, 7));
+        return @min(
+            structural_reconcile_retry_max_ms,
+            structural_reconcile_retry_min_ms * (@as(u64, 1) << exponent),
+        );
+    }
 
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
@@ -9404,7 +9417,10 @@ pub const ProvisionedTableWriteSource = struct {
         const owned_index_name = if (index_name) |name| try alloc.dupe(u8, name) else null;
         errdefer if (owned_index_name) |name| alloc.free(name);
         const appended_index = self.structural_reconcile_tables.items.len;
-        try self.structural_reconcile_tables.append(alloc, .{
+        // Keep one spare slot for the active worker to return a failed request
+        // without allocating. This makes transient OOM itself retryable.
+        try self.structural_reconcile_tables.ensureUnusedCapacity(alloc, 2);
+        self.structural_reconcile_tables.appendAssumeCapacity(.{
             .table_name = owned_table_name,
             .index_name = owned_index_name,
         });
@@ -9430,31 +9446,68 @@ pub const ProvisionedTableWriteSource = struct {
                 self.structural_reconcile_mutex.unlock(io);
                 return;
             }
-            var pending = self.structural_reconcile_tables;
-            self.structural_reconcile_tables = .empty;
-            self.structural_reconcile_mutex.unlock(io);
-            var next_request: usize = 0;
-            defer {
-                for (pending.items[next_request..]) |*request| {
-                    self.cancelStructuralReconcileReservation(request.table_name);
-                    request.deinit(alloc);
+            const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+            var ready_index: ?usize = null;
+            var earliest_ms: u64 = std.math.maxInt(u64);
+            for (self.structural_reconcile_tables.items, 0..) |request, index| {
+                if (request.not_before_ms <= now_ms) {
+                    ready_index = index;
+                    break;
                 }
-                pending.deinit(alloc);
+                earliest_ms = @min(earliest_ms, request.not_before_ms);
+            }
+            if (ready_index == null) {
+                self.structural_reconcile_mutex.unlock(io);
+                const wait_ms = @min(@as(u64, 100), earliest_ms -| now_ms);
+                io.sleep(Io.Duration.fromMilliseconds(@max(@as(u64, 1), wait_ms)), .awake) catch |err| switch (err) {
+                    error.Canceled => return Io.recancel(io),
+                };
+                continue;
             }
 
-            while (next_request < pending.items.len) : (next_request += 1) {
-                const request = &pending.items[next_request];
-                self.beginReservedStructuralReconcileActivity(request.table_name);
-                self.reconcileTableStructureUntilIdle(alloc, request.table_name, request.index_name) catch |err| {
-                    if (request.index_name) |index_name| {
-                        std.log.warn("structural reconcile failed table={s} index={s} err={s}", .{ request.table_name, index_name, @errorName(err) });
-                    } else {
-                        std.log.warn("structural reconcile failed table={s} err={s}", .{ request.table_name, @errorName(err) });
+            var request = self.structural_reconcile_tables.orderedRemove(ready_index.?);
+            self.structural_reconcile_mutex.unlock(io);
+
+            self.beginReservedStructuralReconcileActivity(request.table_name);
+            const reconcile_error: ?anyerror = blk: {
+                self.reconcileTableStructureUntilIdle(alloc, request.table_name, request.index_name) catch |err| break :blk err;
+                break :blk null;
+            };
+            if (reconcile_error) |err| {
+                request.failure_count +|= 1;
+                const retry_now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+                request.not_before_ms = retry_now_ms +| structuralReconcileRetryDelayMs(request.failure_count);
+                if (request.index_name) |index_name| {
+                    std.log.warn("structural reconcile deferred table={s} index={s} failures={d} retry_at_monotonic_ms={d} err={s}", .{ request.table_name, index_name, request.failure_count, request.not_before_ms, @errorName(err) });
+                } else {
+                    std.log.warn("structural reconcile deferred table={s} failures={d} retry_at_monotonic_ms={d} err={s}", .{ request.table_name, request.failure_count, request.not_before_ms, @errorName(err) });
+                }
+
+                // Keep the reservation continuous across retries: a write
+                // admitted between failure and requeue could use stale schema.
+                self.structural_reconcile_mutex.lockUncancelable(io);
+                var covered = false;
+                for (self.structural_reconcile_tables.items) |candidate| {
+                    if (candidate.covers(request.table_name, request.index_name)) {
+                        covered = true;
+                        break;
                     }
-                };
-                self.endStructuralReconcileActivity(request.table_name);
-                request.deinit(alloc);
+                }
+                var requeued = false;
+                if (!covered and !self.restore_repair_shutdown.load(.acquire)) {
+                    self.reserveStructuralReconcileActivity(request.table_name);
+                    self.structural_reconcile_tables.appendAssumeCapacity(request);
+                    requeued = true;
+                } else {
+                    self.endStructuralReconcileActivity(request.table_name);
+                    request.deinit(alloc);
+                }
+                if (requeued) self.endStructuralReconcileActivity(request.table_name);
+                self.structural_reconcile_mutex.unlock(io);
+                continue;
             }
+            self.endStructuralReconcileActivity(request.table_name);
+            request.deinit(alloc);
         }
     }
 
@@ -20820,6 +20873,7 @@ test "provisioned read preparation invalidates readers without closing dirty wri
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
     source.write_cache = &write_cache;
+    defer source.deinit();
 
     _ = try source.source().createTable(alloc, "docs", .{});
     _ = try source.source().batch(alloc, "docs", .{
@@ -21466,6 +21520,7 @@ test "managed visibility publish hook updates runtime status cache from live wri
     defer snapshot_cache.deinit();
 
     var source = ProvisionedTableWriteSource.init(path, table_catalog.emptyCatalogSource());
+    defer source.deinit();
     source.runtime_status_cache = &snapshot_cache;
 
     var db = try openManagedDbWithIndexesJson(
@@ -21570,6 +21625,7 @@ test "provisioned read preparation does not block on same-table batch after earl
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
     source.write_cache = &write_cache;
 
     _ = try source.source().createTable(alloc, "docs", .{});
@@ -24344,6 +24400,7 @@ test "provisioned table write source invalidates cached query db after managed d
     defer write_cache.deinit();
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
     source.read_cache = &read_cache;
     source.write_cache = &write_cache;
 
@@ -25302,6 +25359,7 @@ test "provisioned table write source cached runtime status does not fetch catalo
 
     var catalog = CountingCatalog{};
     var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-runtime-status-no-catalog-coverage", catalog.iface());
+    defer source.deinit();
     source.runtime_status_cache = &snapshot_cache;
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
@@ -25375,6 +25433,7 @@ test "provisioned table write source runtime status recovers empty cache from st
     defer snapshot_cache.deinit();
 
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
     source.runtime_status_cache = &snapshot_cache;
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
@@ -26506,20 +26565,71 @@ test "provisioned table write request queues structural reconcile ahead of later
     write_thread.join();
 }
 
+const StructuralReconcileTestCatalog = struct {
+    const Mode = enum { vanish, fail_once };
+
+    mode: Mode,
+    calls: std.atomic.Value(u32) = .init(0),
+
+    fn iface(self: *@This()) table_catalog.CatalogSource {
+        return .{ .ptr = self, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
+    }
+
+    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const call = self.calls.fetchAdd(1, .monotonic);
+        return switch (self.mode) {
+            .vanish => if (call == 0) populatedSnapshot() else emptySnapshot(),
+            .fail_once => switch (call) {
+                0, 2 => populatedSnapshot(),
+                1 => error.TransientCatalogFailure,
+                else => emptySnapshot(),
+            },
+        };
+    }
+
+    fn populatedSnapshot() metadata_api.AdminSnapshot {
+        return .{
+            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                .table_id = 7,
+                .name = "docs",
+                .indexes_json = tables_api.default_indexes_json,
+            }})[0..]),
+            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                .group_id = 7001,
+                .table_id = 7,
+                .start_key = "",
+                .end_key = null,
+            }})[0..]),
+            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        };
+    }
+
+    fn emptySnapshot() metadata_api.AdminSnapshot {
+        return .{
+            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        };
+    }
+
+    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+};
+
 test "queued structural reconcile reserves write admission before its worker starts" {
-    const NoCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return error.UnexpectedCatalogCall;
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-queued-reconcile-admission", NoCatalog.iface());
+    var catalog = StructuralReconcileTestCatalog{ .mode = .vanish };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-queued-reconcile-admission",
+        catalog.iface(),
+    );
     defer source.deinit();
 
     // Keep the worker behind an existing request so this assertion exercises
@@ -26536,6 +26646,27 @@ test "queued structural reconcile reserves write admission before its worker sta
     source.waitForNoStructuralActivity("docs");
     try std.testing.expect(source.tryBeginTableRequest("docs"));
     source.endTableRequest("docs");
+}
+
+test "structural reconcile retry backoff is bounded" {
+    try std.testing.expectEqual(@as(u64, 25), ProvisionedTableWriteSource.structuralReconcileRetryDelayMs(1));
+    try std.testing.expectEqual(@as(u64, 50), ProvisionedTableWriteSource.structuralReconcileRetryDelayMs(2));
+    try std.testing.expectEqual(@as(u64, 1_600), ProvisionedTableWriteSource.structuralReconcileRetryDelayMs(7));
+    try std.testing.expectEqual(@as(u64, 2_000), ProvisionedTableWriteSource.structuralReconcileRetryDelayMs(8));
+    try std.testing.expectEqual(@as(u64, 2_000), ProvisionedTableWriteSource.structuralReconcileRetryDelayMs(std.math.maxInt(u32)));
+}
+
+test "structural reconcile retries a transient worker failure" {
+    var catalog = StructuralReconcileTestCatalog{ .mode = .fail_once };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-structural-reconcile-retry",
+        catalog.iface(),
+    );
+    defer source.deinit();
+
+    try source.enqueueTableIndexStructuralReconcile("docs", "semantic_idx");
+    source.waitForNoStructuralActivity("docs");
+    try std.testing.expect(catalog.calls.load(.monotonic) >= 4);
 }
 
 test "best effort table request admission does not deadlock behind queued reconcile" {
@@ -27229,6 +27360,7 @@ test "provisioned table write source runtime status does not inspect read cache 
     try publishRuntimeStatusRefreshForTest(&snapshot_cache, snapshots);
 
     var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
+    defer source.deinit();
     source.read_cache = &read_cache;
     source.runtime_status_cache = &snapshot_cache;
     source.markWriteCacheDirty("docs");
@@ -27328,6 +27460,7 @@ test "provisioned table write source read cache overlay preserves live replay st
     }
 
     var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
+    defer source.deinit();
     source.read_cache = &read_cache;
 
     var status = runtime_status.LocalTableRuntimeStatus{
@@ -29416,6 +29549,7 @@ test "split transition auto bulk publication retries while a writer lease is act
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
     source.write_cache = &write_cache;
 
     var writer = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
@@ -29480,6 +29614,7 @@ test "read preparation keeps write cache dirty while auto bulk ingest is active"
     defer write_cache.deinit();
 
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
     source.write_cache = &write_cache;
 
     var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
@@ -29547,6 +29682,7 @@ test "runtime status request does not finish expired auto bulk ingest" {
     defer snapshot_cache.deinit();
 
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
 
@@ -31381,6 +31517,7 @@ test "managed startup catch-up defers while shared writer cache owns the table" 
     var startup_write_cache = ProvisionedTableWriteCache.init(alloc);
     defer startup_write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
     source.write_cache = &write_cache;
     source.startup_write_cache = &startup_write_cache;
 
@@ -33043,6 +33180,7 @@ test "managed startup catch-up ignores stale dirty bit after writer cache entry 
     var startup_write_cache = ProvisionedTableWriteCache.init(alloc);
     defer startup_write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
     source.write_cache = &write_cache;
     source.startup_write_cache = &startup_write_cache;
     source.markWriteCacheDirty("docs");
