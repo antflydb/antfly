@@ -4481,6 +4481,7 @@ pub const ProvisionedTableWriteSource = struct {
     const StructuralReconcileRequest = struct {
         table_name: []u8,
         index_name: ?[]u8 = null,
+        plan: ?StructuralReconcilePlan = null,
         failure_count: u32 = 0,
         pending_count: u32 = 0,
         attempt_count: u32 = 0,
@@ -4490,6 +4491,7 @@ pub const ProvisionedTableWriteSource = struct {
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             if (self.index_name) |name| alloc.free(name);
+            if (self.plan) |*plan| plan.deinit(alloc);
             self.* = undefined;
         }
 
@@ -4507,6 +4509,88 @@ pub const ProvisionedTableWriteSource = struct {
         }
     };
 
+    const StructuralReconcileGroup = struct {
+        range: metadata_table_manager.RangeRecord,
+        identity_namespace: doc_identity.Namespace,
+
+        fn clone(alloc: std.mem.Allocator, table_id: u64, range: metadata_table_manager.RangeRecord) !@This() {
+            const start_key = try alloc.dupe(u8, range.start_key);
+            errdefer alloc.free(start_key);
+            const end_key = if (range.end_key) |value| try alloc.dupe(u8, value) else null;
+            errdefer if (end_key) |value| alloc.free(value);
+            const restore_backup_id = try alloc.dupe(u8, range.restore_backup_id);
+            errdefer alloc.free(restore_backup_id);
+            const restore_location = try alloc.dupe(u8, range.restore_location);
+            errdefer alloc.free(restore_location);
+            const restore_snapshot_path = try alloc.dupe(u8, range.restore_snapshot_path);
+            errdefer alloc.free(restore_snapshot_path);
+
+            const owned_range = metadata_table_manager.RangeRecord{
+                .group_id = range.group_id,
+                .range_id = range.range_id,
+                .table_id = table_id,
+                .start_key = start_key,
+                .end_key = end_key,
+                .doc_identity_shard_id = range.doc_identity_shard_id,
+                .doc_identity_range_id = range.doc_identity_range_id,
+                .split_attempt_epoch = range.split_attempt_epoch,
+                .restore_backup_id = restore_backup_id,
+                .restore_location = restore_location,
+                .restore_snapshot_path = restore_snapshot_path,
+            };
+            return .{
+                .range = owned_range,
+                .identity_namespace = tableIdentityNamespaceForRangeId(table_id, range),
+            };
+        }
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.range.start_key);
+            if (self.range.end_key) |value| alloc.free(value);
+            alloc.free(self.range.restore_backup_id);
+            alloc.free(self.range.restore_location);
+            alloc.free(self.range.restore_snapshot_path);
+            self.* = undefined;
+        }
+    };
+
+    const StructuralReconcilePlan = struct {
+        metadata_group_id: u64,
+        metadata_incarnation: ?metadata_api.MetadataClusterIncarnation,
+        table_id: u64,
+        indexes_json: []u8,
+        schema_json: []u8,
+        groups: []StructuralReconcileGroup,
+        pending_group_indexes: std.ArrayListUnmanaged(usize),
+        cursor: usize = 0,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            for (self.groups) |*group| group.deinit(alloc);
+            alloc.free(self.groups);
+            alloc.free(self.indexes_json);
+            alloc.free(self.schema_json);
+            self.pending_group_indexes.deinit(alloc);
+            self.* = undefined;
+        }
+
+        fn currentGroup(self: *@This()) ?*const StructuralReconcileGroup {
+            if (self.pending_group_indexes.items.len == 0) return null;
+            if (self.cursor >= self.pending_group_indexes.items.len) self.cursor = 0;
+            return &self.groups[self.pending_group_indexes.items[self.cursor]];
+        }
+
+        fn markCurrentComplete(self: *@This()) void {
+            std.debug.assert(self.pending_group_indexes.items.len != 0);
+            _ = self.pending_group_indexes.swapRemove(self.cursor);
+            if (self.cursor >= self.pending_group_indexes.items.len) self.cursor = 0;
+        }
+
+        fn markCurrentBusy(self: *@This()) void {
+            if (self.pending_group_indexes.items.len == 0) return;
+            self.cursor = (self.cursor + 1) % self.pending_group_indexes.items.len;
+        }
+    };
+
     const StructuralReconcileOutcome = enum {
         complete,
         pending,
@@ -4516,6 +4600,7 @@ pub const ProvisionedTableWriteSource = struct {
     const structural_reconcile_retry_min_ms: u64 = 25;
     const structural_reconcile_retry_max_ms: u64 = 2_000;
     const structural_reconcile_pending_delay_ms: u64 = 100;
+    const structural_reconcile_groups_per_quantum: usize = 4;
 
     fn structuralReconcileRetryDelayMs(failure_count: u32) u64 {
         const exponent: u6 = @intCast(@min(failure_count -| 1, 7));
@@ -9494,7 +9579,7 @@ pub const ProvisionedTableWriteSource = struct {
                     self.prepareTableStructuralReconcile(request.table_name, request.index_name) catch |err| break :blk err;
                     request.prepared = true;
                 }
-                reconcile_outcome = self.reconcileTableStructureStep(alloc, request.table_name, request.index_name) catch |err| break :blk err;
+                reconcile_outcome = self.reconcileTableStructureStep(alloc, &request) catch |err| break :blk err;
                 break :blk null;
             };
             if (reconcile_error) |err| {
@@ -9597,35 +9682,191 @@ pub const ProvisionedTableWriteSource = struct {
     fn reconcileTableStructureStep(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
-        table_name: []const u8,
-        target_index_name: ?[]const u8,
+        request: *StructuralReconcileRequest,
     ) !StructuralReconcileOutcome {
         if (self.restore_repair_shutdown.load(.acquire)) return .discarded;
-        var any_busy = false;
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
-            alloc,
-            self.catalog,
-            table_name,
-            "",
-            "",
-            5 * std.time.ns_per_s,
-            10,
-        );
-        defer alloc.free(group_ids);
-        if (group_ids.len == 0) return .discarded;
-        const metadata = (try loadTableManagedMetadata(alloc, self.catalog, table_name)) orelse return .discarded;
-        defer {
-            if (metadata.indexes_json) |value| alloc.free(value);
-            if (metadata.schema_json) |value| alloc.free(value);
+        if (request.plan == null) {
+            request.plan = (try self.captureStructuralReconcilePlan(alloc, request.table_name)) orelse return .discarded;
+            if (request.plan.?.groups.len == 0) {
+                request.plan.?.deinit(alloc);
+                request.plan = null;
+                return .discarded;
+            }
         }
-        for (group_ids) |group_id| {
-            if (try self.reconcileTableGroupStructureWithRuntime(alloc, group_id, table_name, .{
-                .indexes_json = metadata.indexes_json,
-                .schema_json = metadata.schema_json,
-                .target_index_name = target_index_name,
-            })) any_busy = true;
+
+        var attempted: usize = 0;
+        while (attempted < structural_reconcile_groups_per_quantum) : (attempted += 1) {
+            const plan = &request.plan.?;
+            const group = plan.currentGroup() orelse {
+                if (try self.structuralReconcilePlanStillCurrent(request.table_name, plan)) return .complete;
+                plan.deinit(alloc);
+                request.plan = null;
+                return .pending;
+            };
+            if (!try self.structuralReconcileGroupStillCurrent(request.table_name, plan, group)) {
+                plan.deinit(alloc);
+                request.plan = null;
+                return .pending;
+            }
+
+            const busy = try self.reconcileTableGroupStructureWithRuntime(alloc, group.range.group_id, request.table_name, .{
+                .indexes_json = plan.indexes_json,
+                .schema_json = plan.schema_json,
+                .identity_namespace = group.identity_namespace,
+                .target_index_name = request.index_name,
+            });
+            if (busy) {
+                plan.markCurrentBusy();
+            } else {
+                plan.markCurrentComplete();
+                if (plan.pending_group_indexes.items.len == 0) {
+                    if (try self.structuralReconcilePlanStillCurrent(request.table_name, plan)) return .complete;
+                    plan.deinit(alloc);
+                    request.plan = null;
+                    return .pending;
+                }
+            }
         }
-        return if (any_busy) .pending else .complete;
+        return .pending;
+    }
+
+    fn captureStructuralReconcilePlan(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?StructuralReconcilePlan {
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+
+        const indexes_json = try alloc.dupe(u8, table.indexes_json);
+        errdefer alloc.free(indexes_json);
+        const schema_json = try alloc.dupe(u8, table.schema_json);
+        errdefer alloc.free(schema_json);
+
+        var group_count: usize = 0;
+        for (snapshot.ranges) |range| {
+            if (range.table_id == table.table_id) group_count += 1;
+        }
+        const groups = try alloc.alloc(StructuralReconcileGroup, group_count);
+        errdefer alloc.free(groups);
+        var initialized: usize = 0;
+        errdefer for (groups[0..initialized]) |*group| group.deinit(alloc);
+        for (snapshot.ranges) |range| {
+            if (range.table_id != table.table_id) continue;
+            groups[initialized] = try StructuralReconcileGroup.clone(alloc, table.table_id, range);
+            initialized += 1;
+        }
+        std.mem.sort(StructuralReconcileGroup, groups, {}, struct {
+            fn lessThan(_: void, lhs: StructuralReconcileGroup, rhs: StructuralReconcileGroup) bool {
+                return lhs.range.group_id < rhs.range.group_id;
+            }
+        }.lessThan);
+
+        var pending_group_indexes = std.ArrayListUnmanaged(usize).empty;
+        errdefer pending_group_indexes.deinit(alloc);
+        try pending_group_indexes.ensureTotalCapacity(alloc, groups.len);
+        for (groups, 0..) |_, index| pending_group_indexes.appendAssumeCapacity(index);
+        return .{
+            .metadata_group_id = snapshot.status.metadata_group_id,
+            .metadata_incarnation = snapshot.status.metadata_incarnation,
+            .table_id = table.table_id,
+            .indexes_json = indexes_json,
+            .schema_json = schema_json,
+            .groups = groups,
+            .pending_group_indexes = pending_group_indexes,
+        };
+    }
+
+    fn structuralReconcileGroupStillCurrent(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        plan: *const StructuralReconcilePlan,
+        group: *const StructuralReconcileGroup,
+    ) !bool {
+        if (plan.metadata_incarnation) |incarnation| {
+            if (self.catalog.vtable.validate_publication != null) {
+                return try self.catalog.validatePublication(.{
+                    .metadata_group_id = plan.metadata_group_id,
+                    .metadata_incarnation = incarnation,
+                    .table_id = plan.table_id,
+                    .table_name = table_name,
+                    .schema_json = plan.schema_json,
+                    .indexes_json = plan.indexes_json,
+                    .range = group.range,
+                });
+            }
+        }
+
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+        return structuralReconcileGroupMatchesSnapshot(table_name, plan, group, &snapshot);
+    }
+
+    fn structuralReconcilePlanStillCurrent(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        plan: *const StructuralReconcilePlan,
+    ) !bool {
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+        if (snapshot.status.metadata_group_id != plan.metadata_group_id or
+            !structuralReconcileIncarnationMatches(plan.metadata_incarnation, snapshot.status.metadata_incarnation)) return false;
+        const table = metadata_mod.findAdminTable(&snapshot, plan.table_id) orelse return false;
+        if (!std.mem.eql(u8, table.name, table_name) or
+            !std.mem.eql(u8, table.indexes_json, plan.indexes_json) or
+            !std.mem.eql(u8, table.schema_json, plan.schema_json)) return false;
+
+        var matching_groups: usize = 0;
+        for (snapshot.ranges) |range| {
+            if (range.table_id != plan.table_id) continue;
+            matching_groups += 1;
+            const group = structuralReconcilePlanGroup(plan, range.group_id) orelse return false;
+            if (!metadata_table_manager.rangeRecordsEqual(group.range, range)) return false;
+        }
+        return matching_groups == plan.groups.len;
+    }
+
+    fn structuralReconcilePlanGroup(plan: *const StructuralReconcilePlan, group_id: u64) ?*const StructuralReconcileGroup {
+        var lo: usize = 0;
+        var hi = plan.groups.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const candidate = &plan.groups[mid];
+            if (candidate.range.group_id < group_id) {
+                lo = mid + 1;
+            } else if (candidate.range.group_id > group_id) {
+                hi = mid;
+            } else {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    fn structuralReconcileGroupMatchesSnapshot(
+        table_name: []const u8,
+        plan: *const StructuralReconcilePlan,
+        group: *const StructuralReconcileGroup,
+        snapshot: *const metadata_api.AdminSnapshot,
+    ) bool {
+        if (snapshot.status.metadata_group_id != plan.metadata_group_id or
+            !structuralReconcileIncarnationMatches(plan.metadata_incarnation, snapshot.status.metadata_incarnation)) return false;
+        const table = metadata_mod.findAdminTable(snapshot, plan.table_id) orelse return false;
+        if (!std.mem.eql(u8, table.name, table_name) or
+            !std.mem.eql(u8, table.indexes_json, plan.indexes_json) or
+            !std.mem.eql(u8, table.schema_json, plan.schema_json)) return false;
+        const range = metadata_mod.findAdminRange(snapshot, group.range.group_id) orelse return false;
+        return metadata_table_manager.rangeRecordsEqual(group.range, range.*);
+    }
+
+    fn structuralReconcileIncarnationMatches(
+        expected: ?metadata_api.MetadataClusterIncarnation,
+        actual: ?metadata_api.MetadataClusterIncarnation,
+    ) bool {
+        const expected_value = expected orelse return actual == null;
+        const actual_value = actual orelse return false;
+        return std.mem.eql(u8, &expected_value, &actual_value);
     }
 
     fn reconcileTableGroupStructureWithRuntime(
@@ -26622,7 +26863,7 @@ test "provisioned table write request queues structural reconcile ahead of later
 }
 
 const StructuralReconcileTestCatalog = struct {
-    const Mode = enum { vanish, fail_once, stable };
+    const Mode = enum { vanish, fail_once, stable, expand_after_capture, empty_ranges };
 
     mode: Mode,
     calls: std.atomic.Value(u32) = .init(0),
@@ -26642,6 +26883,8 @@ const StructuralReconcileTestCatalog = struct {
                 else => emptySnapshot(),
             },
             .stable => populatedSnapshot(),
+            .expand_after_capture => if (call == 0) populatedSnapshot() else expandedSnapshot(),
+            .empty_ranges => emptyRangesSnapshot(),
         };
     }
 
@@ -26676,6 +26919,21 @@ const StructuralReconcileTestCatalog = struct {
             .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
             .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
         };
+    }
+
+    fn expandedSnapshot() metadata_api.AdminSnapshot {
+        var snapshot = populatedSnapshot();
+        snapshot.ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+            .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+        })[0..]);
+        return snapshot;
+    }
+
+    fn emptyRangesSnapshot() metadata_api.AdminSnapshot {
+        var snapshot = populatedSnapshot();
+        snapshot.ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]);
+        return snapshot;
     }
 
     fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
@@ -26727,6 +26985,7 @@ test "structural reconcile retries a transient worker failure" {
 }
 
 test "structural reconcile returns a bounded pending quantum while a group is busy" {
+    const alloc = std.testing.allocator;
     var catalog = StructuralReconcileTestCatalog{ .mode = .stable };
     var source = ProvisionedTableWriteSource.init(
         "/tmp/unused-antfly-structural-reconcile-bounded-pending",
@@ -26736,9 +26995,81 @@ test "structural reconcile returns a bounded pending quantum while a group is bu
 
     try std.testing.expect(source.tryBeginGroupOperation("docs", 7001));
     defer source.endGroupOperation("docs", 7001);
+    var request = ProvisionedTableWriteSource.StructuralReconcileRequest{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .index_name = try alloc.dupe(u8, "semantic_idx"),
+    };
+    defer request.deinit(alloc);
     try std.testing.expectEqual(
         ProvisionedTableWriteSource.StructuralReconcileOutcome.pending,
-        try source.reconcileTableStructureStep(std.testing.allocator, "docs", "semantic_idx"),
+        try source.reconcileTableStructureStep(alloc, &request),
+    );
+}
+
+test "structural reconcile pending set never revisits completed groups" {
+    const alloc = std.testing.allocator;
+    var pending = std.ArrayListUnmanaged(usize).empty;
+    defer pending.deinit(alloc);
+    try pending.appendSlice(alloc, &.{ 0, 1, 2 });
+    var groups = [_]ProvisionedTableWriteSource.StructuralReconcileGroup{
+        undefined,
+        undefined,
+        undefined,
+    };
+    var plan = ProvisionedTableWriteSource.StructuralReconcilePlan{
+        .metadata_group_id = 1,
+        .metadata_incarnation = null,
+        .table_id = 7,
+        .indexes_json = undefined,
+        .schema_json = undefined,
+        .groups = &groups,
+        .pending_group_indexes = pending,
+    };
+    pending = .empty;
+
+    try std.testing.expectEqual(@as(usize, 0), plan.pending_group_indexes.items[plan.cursor]);
+    plan.markCurrentComplete();
+    try std.testing.expectEqual(@as(usize, 2), plan.pending_group_indexes.items[plan.cursor]);
+    plan.markCurrentBusy();
+    try std.testing.expectEqual(@as(usize, 1), plan.pending_group_indexes.items[plan.cursor]);
+    plan.markCurrentComplete();
+    try std.testing.expectEqualSlices(usize, &.{2}, plan.pending_group_indexes.items);
+    plan.pending_group_indexes.deinit(alloc);
+}
+
+test "structural reconcile completion rejects ranges added after contract capture" {
+    const alloc = std.testing.allocator;
+    var catalog = StructuralReconcileTestCatalog{ .mode = .expand_after_capture };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-structural-reconcile-topology-fence",
+        catalog.iface(),
+    );
+    defer source.deinit();
+
+    var plan = (try source.captureStructuralReconcilePlan(alloc, "docs")) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(alloc);
+    try std.testing.expect(!(try source.structuralReconcilePlanStillCurrent("docs", &plan)));
+}
+
+test "structural reconcile fences incarnation initialization and discards empty topology" {
+    const alloc = std.testing.allocator;
+    const incarnation: metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    try std.testing.expect(ProvisionedTableWriteSource.structuralReconcileIncarnationMatches(null, null));
+    try std.testing.expect(!ProvisionedTableWriteSource.structuralReconcileIncarnationMatches(null, incarnation));
+
+    var catalog = StructuralReconcileTestCatalog{ .mode = .empty_ranges };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-structural-reconcile-empty-topology",
+        catalog.iface(),
+    );
+    defer source.deinit();
+    var request = ProvisionedTableWriteSource.StructuralReconcileRequest{
+        .table_name = try alloc.dupe(u8, "docs"),
+    };
+    defer request.deinit(alloc);
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.StructuralReconcileOutcome.discarded,
+        try source.reconcileTableStructureStep(alloc, &request),
     );
 }
 

@@ -4211,13 +4211,13 @@ pub fn build(b: *std.Build) void {
         public_api_parity_tests,
         public_api_parity_runtime_filters,
     );
-    const run_public_api_parity_unit_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+    const run_public_api_parity_aggregate_tests = addFilteredTestRunArtifactWithRuntimeFilters(
         b,
         public_api_parity_tests,
         public_api_parity_runtime_filters,
     );
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
-    run_public_api_parity_unit_tests.step.dependOn(&openapi_root_check.step);
+    run_public_api_parity_aggregate_tests.step.dependOn(&openapi_root_check.step);
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
 
@@ -4868,6 +4868,10 @@ pub fn build(b: *std.Build) void {
             "queued structural reconcile reserves write admission before its worker starts",
             "structural reconcile retry backoff is bounded",
             "structural reconcile retries a transient worker failure",
+            "structural reconcile returns a bounded pending quantum while a group is busy",
+            "structural reconcile pending set never revisits completed groups",
+            "structural reconcile completion rejects ranges added after contract capture",
+            "structural reconcile fences incarnation initialization and discards empty topology",
             "provisioned structural reconcile blocks table write admission",
             "provisioned schema reconcile keeps reads and status available",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
@@ -4911,7 +4915,7 @@ pub fn build(b: *std.Build) void {
     // aggregate-gate runs on one lane so bounded CI hosts do not convert
     // aggregate memory pressure into allocator failures. Focused aliases use
     // the independent run artifacts above.
-    run_api_table_writes_production_regression_unit_tests.step.dependOn(&run_public_api_parity_unit_tests.step);
+    run_api_table_writes_production_regression_unit_tests.step.dependOn(&run_public_api_parity_aggregate_tests.step);
     const api_table_writes_production_regression_step = b.step("api-table-writes-production-regression-test", "Run focused restore and writer-cache lifecycle regressions");
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
     const api_table_writes_restore_repeat_step = b.step("api-table-writes-restore-repeat-test", "Run the focused shared-owner native restore regression");
@@ -5276,7 +5280,9 @@ pub fn build(b: *std.Build) void {
     const integration_test_step = b.step("integration-test", "Run focused real HTTP and public API integration suites");
     integration_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
     integration_test_step.dependOn(&run_lib_metadata_sim_forward_tests.step);
-    integration_test_step.dependOn(&run_public_api_parity_tests.step);
+    // Both aggregates share this run node, so the default test DAG executes
+    // the stateful parity suite once. The focused alias remains independent.
+    integration_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
 
     const chaos_test_step = b.step("chaos-test", "Run bounded generated chaos campaigns with labeled progress");
     var chaos_progress_tail: ?*std.Build.Step = null;
@@ -5520,7 +5526,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
     unit_test_step.dependOn(&run_api_restore_jobs_tests.step);
     unit_test_step.dependOn(&run_portable_backup_tests.step);
-    unit_test_step.dependOn(&run_public_api_parity_unit_tests.step);
+    unit_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
     unit_test_step.dependOn(&run_lib_toon_tests.step);
     unit_test_step.dependOn(&run_lib_mcp_tests.step);

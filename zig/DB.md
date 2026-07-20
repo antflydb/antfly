@@ -179,6 +179,16 @@ Queued structural reconciliation closes new write admission before draining
 current writers. This prevents continuous traffic from starving index/catalog
 convergence, while reads remain admitted against the currently published
 generation until the short publication transition begins.
+Each queued request owns one immutable catalog contract captured from a single
+admin snapshot: table identity, desired schema and index definitions, and the
+exact range and document-identity namespace for every group. A dequeue advances
+at most a fixed number of pending groups, removes completed groups in O(1), and
+rotates busy groups rather than replaying successful work. Production catalog
+sources validate each group through the compact linearizable publication
+contract before opening storage. Completion performs one full topology check to
+detect ranges added after capture. A changed contract discards only the stale
+plan and rebuilds it on the next quantum; the write-admission reservation remains
+continuous throughout that handoff.
 Per-table dirty visibility tracking uses owned exact table identities rather
 than collision-prone hashes. Its lifetime is tied to write-cache ownership:
 eviction advances the table's read-cache epoch, and the last cache owner also
@@ -935,6 +945,16 @@ coverage metadata, and repair sidecars are post-commit cleanup. A crash can
 therefore leave reclaimable files or an orphaned sidecar, but cannot leave a
 query-visible catalog entry without admission proof. Writable startup removes
 sidecar intents whose catalog entry is absent before workers start.
+
+Generated-artifact reclamation separates page arbitration from terminal
+filesystem ownership. Cleanup workers try to claim the short page mutex and
+return `busy` rather than waiting. A completed tombstone then acquires a distinct
+finalization lease, releases page arbitration, and performs checkpoint and
+directory deletion while the durable tombstone continues fencing same-name
+admission. Other indexes can keep draining metadata pages during that I/O. A
+crash or finalization error leaves the tombstone intact for idempotent retry, and
+manual runtimes without a timer leave contention for the next explicit
+maintenance poll instead of recursively resubmitting work.
 
 The in-memory identity summary is an optimization for status and query
 planning, not admission authority. Admission reads the durable O(1) primary

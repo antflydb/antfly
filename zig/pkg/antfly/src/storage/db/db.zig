@@ -685,6 +685,7 @@ const AsyncContext = struct {
     index_repair_replay_pinned: std.atomic.Value(bool) = .init(false),
     index_repair_state_corrupt: std.atomic.Value(bool) = .init(false),
     index_artifact_cleanup_mutex: std.atomic.Mutex = .unlocked,
+    index_artifact_finalization_mutex: std.atomic.Mutex = .unlocked,
     background_closing: std.atomic.Value(bool) = .init(false),
     enrichment_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
@@ -6114,25 +6115,21 @@ pub const DB = struct {
         const retry_initial_ms: i64 = 25;
         const retry_max_ms: i64 = 1000;
 
-        fn drainOnePage(work: *@This()) !bool {
-            lockAtomicWithBackoff(&work.ctx.index_artifact_cleanup_mutex);
-            defer work.ctx.index_artifact_cleanup_mutex.unlock();
-            var result = try work.ctx.index_manager.drainGeneratedArtifactCleanupOutboxPage(work.ctx.store);
-            defer result.deinit();
-            if (result.completed) try finalizeRetiredIndexCleanupContext(work.ctx, result.index_name, result.key);
-            return result.found;
+        fn drainOnePage(work: *@This()) !GeneratedArtifactCleanupAdvanceResult {
+            return try advanceGeneratedArtifactCleanupContext(work.ctx, null);
         }
 
         fn run(ptr: *anyopaque) anyerror!void {
             const work: *@This() = @ptrCast(@alignCast(ptr));
             var pages: usize = 0;
             var retries: usize = 0;
+            var contention_retries: usize = 0;
             while (true) {
                 if (work.ctx.background_closing.load(.acquire)) {
                     work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
                     return;
                 }
-                const found = work.drainOnePage() catch |err| {
+                const advance = work.drainOnePage() catch |err| {
                     retries += 1;
                     if (retries == 1 or std.math.isPowerOfTwo(retries))
                         std.log.warn("generated-artifact cleanup retry attempt={} err={s}", .{ retries, @errorName(err) });
@@ -6160,7 +6157,28 @@ pub const DB = struct {
                 };
                 retries = 0;
 
-                if (!found) {
+                if (advance == .busy) {
+                    // Another caller owns a bounded page or terminal filesystem
+                    // finalization. Yield without turning expected contention
+                    // into an error or spinning on the shared durable-job lane.
+                    const io = work.ctx.io orelse {
+                        work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
+                        return;
+                    };
+                    contention_retries += 1;
+                    if (contention_retries < retries_per_job) {
+                        const shift: u6 = @intCast(@min(contention_retries - 1, 5));
+                        const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
+                        io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
+                        continue;
+                    }
+                    work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
+                    scheduleGeneratedArtifactCleanupContext(work.ctx, work.lane, work.owner_id);
+                    return;
+                }
+                contention_retries = 0;
+
+                if (advance == .idle) {
                     if (work.ctx.index_manager.artifact_cleanup_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
                     if (work.ctx.index_manager.artifact_cleanup_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
                         pages = 0;
@@ -6334,39 +6352,62 @@ pub const DB = struct {
         );
     }
 
-    /// Advance one bounded page of retired-index artifact records, followed by
-    /// terminal filesystem finalization when that page completes the job.
-    /// Managed structural reconciliation uses this as a progress guarantee
-    /// when the shared durable-job lane is busy; the same mutex serializes it
-    /// with the autonomous cleanup worker.
-    pub fn advanceGeneratedArtifactCleanupPage(self: *DB, index_name: ?[]const u8) !bool {
-        lockAtomicWithBackoff(&self.async_context.index_artifact_cleanup_mutex);
-        defer self.async_context.index_artifact_cleanup_mutex.unlock();
+    /// Try to advance one bounded page of retired-index artifact records.
+    /// Terminal filesystem finalization owns a separate lease, so callers never
+    /// wait behind checkpoint or directory deletion performed by another job.
+    pub const GeneratedArtifactCleanupAdvanceResult = enum {
+        idle,
+        progressed,
+        busy,
+    };
+
+    pub fn advanceGeneratedArtifactCleanupPage(self: *DB, index_name: ?[]const u8) !GeneratedArtifactCleanupAdvanceResult {
+        return try advanceGeneratedArtifactCleanupContext(self.async_context, index_name);
+    }
+
+    fn advanceGeneratedArtifactCleanupContext(
+        ctx: *AsyncContext,
+        index_name: ?[]const u8,
+    ) !GeneratedArtifactCleanupAdvanceResult {
+        if (!ctx.index_artifact_cleanup_mutex.tryLock()) return .busy;
+        var cleanup_locked = true;
+        defer if (cleanup_locked) ctx.index_artifact_cleanup_mutex.unlock();
 
         if (index_name) |name| {
-            var targeted = try self.core.index_manager.drainGeneratedArtifactCleanupForIndexPage(
-                self.core.store,
+            var targeted = try ctx.index_manager.drainGeneratedArtifactCleanupForIndexPage(
+                ctx.store,
                 name,
             );
             defer targeted.deinit();
             if (targeted.found) {
-                if (targeted.completed) try finalizeRetiredIndexCleanupContext(
-                    self.async_context,
-                    targeted.index_name,
-                    targeted.key,
-                );
-                return true;
+                if (!targeted.completed) return .progressed;
+                return try finalizeClaimedRetiredIndexCleanup(ctx, &cleanup_locked, targeted.index_name, targeted.key);
             }
         }
 
-        var result = try self.core.index_manager.drainGeneratedArtifactCleanupOutboxPage(self.core.store);
+        var result = try ctx.index_manager.drainGeneratedArtifactCleanupOutboxPage(ctx.store);
         defer result.deinit();
-        if (result.completed) try finalizeRetiredIndexCleanupContext(
-            self.async_context,
-            result.index_name,
-            result.key,
-        );
-        return result.found;
+        if (!result.found) return .idle;
+        if (!result.completed) return .progressed;
+        return try finalizeClaimedRetiredIndexCleanup(ctx, &cleanup_locked, result.index_name, result.key);
+    }
+
+    fn finalizeClaimedRetiredIndexCleanup(
+        ctx: *AsyncContext,
+        cleanup_locked: *bool,
+        index_name: []const u8,
+        cleanup_key: []const u8,
+    ) !GeneratedArtifactCleanupAdvanceResult {
+        if (!ctx.index_artifact_finalization_mutex.tryLock()) return .busy;
+        defer ctx.index_artifact_finalization_mutex.unlock();
+
+        // The durable tombstone remains visible while finalization runs, so
+        // namespace admission stays fenced. Release page arbitration before
+        // checkpoint and filesystem I/O; other indexes can continue draining.
+        ctx.index_artifact_cleanup_mutex.unlock();
+        cleanup_locked.* = false;
+        try finalizeRetiredIndexCleanupContext(ctx, index_name, cleanup_key);
+        return .progressed;
     }
 
     fn scheduleGeneratedArtifactCleanupContext(
@@ -6395,10 +6436,6 @@ pub const DB = struct {
             ctx.index_manager.artifact_cleanup_state.store(0, .release);
             std.log.warn("generated-artifact cleanup was not scheduled err={s}", .{@errorName(err)});
         };
-    }
-
-    fn finalizeRetiredIndexCleanup(self: *DB, index_name: []const u8, cleanup_key: []const u8) !void {
-        return try finalizeRetiredIndexCleanupContext(self.async_context, index_name, cleanup_key);
     }
 
     fn finalizeRetiredIndexCleanupContext(ctx: *AsyncContext, index_name: []const u8, cleanup_key: []const u8) !void {
@@ -61491,6 +61528,24 @@ test "db generated artifact cleanup retries beyond the transient burst" {
         index_manager_mod.test_generated_artifact_cleanup_failures_remaining.load(.acquire),
     );
     try db.addIndex(cfg);
+}
+
+test "db generated artifact cleanup reports page ownership contention without waiting" {
+    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var ctx = AsyncContext{
+        .alloc = std.testing.allocator,
+        .store = undefined,
+        .index_manager = undefined,
+        .apply_mutex = &apply_mutex,
+    };
+    defer ctx.deinit(std.testing.allocator);
+
+    try std.testing.expect(ctx.index_artifact_cleanup_mutex.tryLock());
+    defer ctx.index_artifact_cleanup_mutex.unlock();
+    try std.testing.expectEqual(
+        DB.GeneratedArtifactCleanupAdvanceResult.busy,
+        try DB.advanceGeneratedArtifactCleanupContext(&ctx, null),
+    );
 }
 
 test "db managed admission drain preserves a generation requested during the pass" {
