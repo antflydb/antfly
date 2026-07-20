@@ -3395,6 +3395,8 @@ pub const DataServer = struct {
     }
 
     pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.ha.replication_record.RecordView) !void {
+        if (isWholeInstanceHAControlRecord(record)) return;
+
         var snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
         const route = try resolveHAReplicationRecordRoute(&snapshot, record);
@@ -11121,6 +11123,20 @@ const HAReplicationRecordRoute = struct {
     group_id: u64,
     table_name: []const u8,
 };
+
+fn isWholeInstanceHAControlRecord(record: antfly.ha.replication_record.RecordView) bool {
+    if (record.shard_id != 0 or record.table_id != 0) return false;
+    return switch (record.kind) {
+        .backup_start,
+        .backup_end,
+        .checkpoint,
+        .manifest,
+        .truncate,
+        .timeline_switch,
+        => true,
+        else => false,
+    };
+}
 
 fn resolveHAReplicationRecordRoute(
     snapshot: *const antfly.metadata_api.AdminSnapshot,
@@ -20963,8 +20979,8 @@ test "data server applies routed HA replication records through standby write ga
 
     var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
         .cluster_id = 100,
-        .shard_id = 77,
-        .table_id = 7,
+        .shard_id = 0,
+        .table_id = 0,
         .timeline_id = 1,
         .epoch = 1,
     }, .{});
@@ -21001,6 +21017,37 @@ test "data server applies routed HA replication records through standby write ga
         .previous_lsn = 0,
         .payload = payload,
     });
+
+    try standby.bootstrapCheckpoint(1, "seed-checkpoint");
+    _ = try standby.receive(.{
+        .kind = .backup_end,
+        .payload_codec = .binary,
+        .cluster_id = 100,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 2,
+        .previous_lsn = 1,
+        .payload = "seed-manifest",
+    });
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try standby.applyAvailable(&server, DataServer.applyHAReplicationRecordCallback),
+    );
+    try std.testing.expectEqual(@as(u64, 2), standby.currentProgress().applied_lsn);
+    try std.testing.expectError(error.HAReplicationRecordMissingTableId, server.applyHAReplicationRecord(.{
+        .kind = .batch_mutation,
+        .payload_codec = .json,
+        .cluster_id = 100,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 3,
+        .previous_lsn = 2,
+        .payload = payload,
+    }));
 
     var lookup = (try server.read_source.source().lookupGroupLocal(
         alloc,
