@@ -2007,16 +2007,6 @@ fn appendDynamicInferredTypedField(
     value: std.json.Value,
     text_analysis: introducer_mod.TextAnalysisConfig,
 ) !bool {
-    if (value == .integer) {
-        const typed_value = typed_dv.TypedValue{ .i64_val = value.integer };
-        try typed_fields.append(alloc, .{
-            .field_name = try alloc.dupe(u8, path),
-            .value_type = typedValueType(typed_value),
-            .value = typed_value,
-        });
-        return false;
-    }
-
     const inferred = (try introducer_mod.detectTypedFieldProjectionValue(alloc, path, value, text_analysis)) orelse return false;
     if (inferred.value_type == .f64_val and !std.math.isFinite(inferred.value.f64_val)) return false;
     try typed_fields.append(alloc, inferred);
@@ -4383,6 +4373,7 @@ test "document mapper emits default dynamic schema text fields" {
     const text_analysis = introducer_mod.TextAnalysisConfig{};
     const segment = (try buildTextSegmentFromDocuments(alloc, &.{
         .{ .key = "doc:1", .value = "{\"title\":\"Document One\",\"body\":\"alpha benchmark body\",\"status\":\"active\",\"tenant\":\"tenanta\",\"id\":42,\"active\":true}" },
+        .{ .key = "doc:2", .value = "{\"title\":\"Document Two\",\"body\":\"beta benchmark body\",\"status\":\"active\",\"tenant\":\"tenanta\",\"id\":42.5,\"active\":false}" },
     }, text_analysis, schema)).?;
     defer alloc.free(segment);
 
@@ -4398,13 +4389,15 @@ test "document mapper emits default dynamic schema text fields" {
 
     const id_section = reader.getSection("id", .typed_doc_values) orelse return error.TestExpectedEqual;
     var id_values = try typed_dv.TypedDocValuesReader.init(alloc, id_section);
-    try std.testing.expectEqual(typed_dv.ValueType.i64_val, id_values.value_type);
-    try std.testing.expectEqual(@as(?i64, 42), try id_values.getI64(0));
+    try std.testing.expectEqual(typed_dv.ValueType.f64_val, id_values.value_type);
+    try std.testing.expectEqual(@as(?f64, 42), try id_values.getF64(0));
+    try std.testing.expectEqual(@as(?f64, 42.5), try id_values.getF64(1));
 
     const active_section = reader.getSection("active", .typed_doc_values) orelse return error.TestExpectedEqual;
     var active_values = try typed_dv.TypedDocValuesReader.init(alloc, active_section);
     try std.testing.expectEqual(typed_dv.ValueType.bool_val, active_values.value_type);
     try std.testing.expectEqual(@as(?bool, true), try active_values.getBool(0));
+    try std.testing.expectEqual(@as(?bool, false), try active_values.getBool(1));
 }
 
 test "document mapper extracts dense vector from configured field" {
