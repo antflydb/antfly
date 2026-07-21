@@ -1919,15 +1919,17 @@ fn collectDynamicSchemaTextFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
 ) !void {
+    var dynamic_typed_terminal = false;
     if (path.len > 0 and !containsStringSlice(explicit_paths, path)) {
         if (document_schema) |resolved| {
             if (pathFallsUnderInferTypeDynamicPath(resolved, path) and
                 runtime_schema.resolveFieldTypeForValue(schema, path, value) == null)
             {
-                try appendDynamicInferredTypedField(alloc, typed_fields, path, value);
+                dynamic_typed_terminal = try appendDynamicInferredTypedField(alloc, typed_fields, path, value, text_analysis);
             }
         }
     }
+    if (dynamic_typed_terminal) return;
 
     switch (value) {
         .object => |object| {
@@ -2003,18 +2005,22 @@ fn appendDynamicInferredTypedField(
     typed_fields: *std.ArrayListUnmanaged(introducer_mod.TypedFieldValue),
     path: []const u8,
     value: std.json.Value,
-) !void {
-    const typed_value: typed_dv.TypedValue = switch (value) {
-        .integer => |number| .{ .i64_val = number },
-        .float => |number| if (std.math.isFinite(number)) .{ .f64_val = number } else return,
-        .bool => |boolean| .{ .bool_val = boolean },
-        else => return,
-    };
-    try typed_fields.append(alloc, .{
-        .field_name = try alloc.dupe(u8, path),
-        .value_type = typedValueType(typed_value),
-        .value = typed_value,
-    });
+    text_analysis: introducer_mod.TextAnalysisConfig,
+) !bool {
+    if (value == .integer) {
+        const typed_value = typed_dv.TypedValue{ .i64_val = value.integer };
+        try typed_fields.append(alloc, .{
+            .field_name = try alloc.dupe(u8, path),
+            .value_type = typedValueType(typed_value),
+            .value = typed_value,
+        });
+        return false;
+    }
+
+    const inferred = (try introducer_mod.detectTypedFieldProjectionValue(alloc, path, value, text_analysis)) orelse return false;
+    if (inferred.value_type == .f64_val and !std.math.isFinite(inferred.value.f64_val)) return false;
+    try typed_fields.append(alloc, inferred);
+    return value == .object and inferred.value_type == .geo_point;
 }
 
 fn appendMappedSubfieldTextFields(

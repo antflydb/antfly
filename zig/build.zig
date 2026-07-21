@@ -3597,6 +3597,7 @@ pub fn build(b: *std.Build) void {
         "storage.db.db.test.db sparse ",
         "storage.db.db.test.db graph ",
         "storage.db.db.test.db search ",
+        "storage.db.db.test.db schema-present infer_types opt-in recursively infers nested fields after reopen",
         "storage.db.db.test.db document _edges",
         "storage.db.db.test.db document _embeddings",
         "sort execution plan dimension names are stable for profiles",
