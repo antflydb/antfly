@@ -497,6 +497,28 @@ const LinearizableMetadataReadTracker = struct {
     }
 };
 
+fn projectionSignalChangesCatalog(kind: metadata_storage.raft_apply_store.ProjectionSignalKind) bool {
+    return switch (kind) {
+        .table, .range => true,
+        else => false,
+    };
+}
+
+test "metadata service catalog validation epoch ignores non-catalog projection traffic" {
+    try std.testing.expect(projectionSignalChangesCatalog(.table));
+    try std.testing.expect(projectionSignalChangesCatalog(.range));
+    try std.testing.expect(!projectionSignalChangesCatalog(.store));
+    try std.testing.expect(!projectionSignalChangesCatalog(.reconcile_lease));
+    try std.testing.expect(!projectionSignalChangesCatalog(.shuffle_join_lease));
+    try std.testing.expect(!projectionSignalChangesCatalog(.schema_progress));
+    try std.testing.expect(!projectionSignalChangesCatalog(.restore_progress));
+    try std.testing.expect(!projectionSignalChangesCatalog(.restore_job));
+    try std.testing.expect(!projectionSignalChangesCatalog(.replication_source_status));
+    try std.testing.expect(!projectionSignalChangesCatalog(.placement_intent));
+    try std.testing.expect(!projectionSignalChangesCatalog(.split_transition));
+    try std.testing.expect(!projectionSignalChangesCatalog(.merge_transition));
+}
+
 // Backfill marker discovery does not need sub-second polling when the system is
 // otherwise idle. Keep active-marker refreshes fast, but back off empty-root
 // probes so they do not add filesystem churn on the read hot path.
@@ -597,10 +619,8 @@ const ProjectedCoreSnapshot = struct {
     replication_source_statuses: []metadata_table_manager.ReplicationSourceStatusRecord = &.{},
     split_transitions: []transition_state.SplitTransitionRecord = &.{},
     merge_transitions: []transition_state.MergeTransitionRecord = &.{},
-    catalog_index: metadata_api.CatalogProjectionIndex = .{},
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        self.catalog_index.deinit(alloc);
         for (self.tables) |record| metadata_table_manager.freeTable(alloc, record);
         if (self.tables.len > 0) alloc.free(self.tables);
         for (self.ranges) |record| metadata_table_manager.freeRange(alloc, record);
@@ -708,7 +728,7 @@ const CatalogValidationSnapshot = struct {
 };
 
 const CatalogValidationSnapshotCache = struct {
-    projection_epoch: u64 = 0,
+    catalog_epoch: u64 = 0,
     snapshot: ?CatalogValidationSnapshot = null,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -1111,6 +1131,7 @@ pub const MetadataService = struct {
     observe_local_replica_root: bool,
     store_status_ticks: usize,
     projection_epoch: std.atomic.Value(u64) = .init(1),
+    catalog_epoch: std.atomic.Value(u64) = .init(1),
     placement_epoch: std.atomic.Value(u64) = .init(1),
     reconcile_lease_epoch: std.atomic.Value(u64) = .init(1),
     transition_epoch: std.atomic.Value(u64) = .init(1),
@@ -1153,6 +1174,7 @@ pub const MetadataService = struct {
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
+    linearizable_read_tracker: *LinearizableMetadataReadTracker,
     raft: raft_service.ManagedHostService,
 
     pub fn init(
@@ -1162,6 +1184,19 @@ pub const MetadataService = struct {
         cfg: MetadataServiceConfig,
     ) !MetadataService {
         const metadata_group_id = host_cfg.host.metadata_group_id orelse return error.MissingMetadataGroupId;
+        var host_deps = deps.host;
+        const read_tracker = try alloc.create(LinearizableMetadataReadTracker);
+        var read_tracker_owned = true;
+        read_tracker.* = .{
+            .alloc = alloc,
+            .metadata_group_id = metadata_group_id,
+            .downstream = host_deps.read_state_observer,
+        };
+        errdefer if (read_tracker_owned) {
+            read_tracker.deinit();
+            alloc.destroy(read_tracker);
+        };
+        host_deps.read_state_observer = read_tracker.observer();
         var service = MetadataService{
             .alloc = alloc,
             .metadata_group_id = metadata_group_id,
@@ -1183,8 +1218,10 @@ pub const MetadataService = struct {
             .lifecycle_signal = LifecycleSignal.init(alloc),
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
-            .raft = try raft_service.ManagedHostService.init(alloc, host_cfg, deps.host, cfg.raft, deps.raft),
+            .linearizable_read_tracker = read_tracker,
+            .raft = try raft_service.ManagedHostService.init(alloc, host_cfg, host_deps, cfg.raft, deps.raft),
         };
+        read_tracker_owned = false;
         errdefer service.deinit();
         try foreign_mod.registerDefaultPostgresExecutor(alloc, &service.cdc_backfill_registry);
         return service;
@@ -1198,6 +1235,8 @@ pub const MetadataService = struct {
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
         self.lifecycle_signal.deinit();
+        self.linearizable_read_tracker.deinit();
+        self.alloc.destroy(self.linearizable_read_tracker);
         if (self.replica_root_dir) |replica_root_dir| {
             api_table_writes.closeHostedManagedDbCacheForRoot(replica_root_dir);
         }
@@ -1219,7 +1258,36 @@ pub const MetadataService = struct {
     }
 
     pub fn ensureLinearizableRead(self: *MetadataService) !void {
-        _ = self;
+        const request_id = try self.linearizable_read_tracker.registerRequest();
+        defer self.linearizable_read_tracker.finishRequest(request_id);
+        var request_ctx_buf: [64]u8 = undefined;
+        const request_ctx = try std.fmt.bufPrint(
+            &request_ctx_buf,
+            "{s}{d}",
+            .{ linearizable_metadata_read_prefix, request_id },
+        );
+
+        const deadline_ns = platform_time.monotonicNs() + linearizable_metadata_read_timeout_ns;
+        var next_request_ns: u64 = 0;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            if (self.linearizable_read_tracker.isComplete(request_id)) return;
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= next_request_ns) {
+                self.raft.requestReadableLease(self.metadata_group_id, request_ctx) catch |err| switch (err) {
+                    error.NotLeader => {},
+                    else => return err,
+                };
+                next_request_ns = now_ns + linearizable_metadata_read_retry_ns;
+            }
+            if (self.raft.pending_updates.items.len > 0) {
+                _ = try self.raft.syncPending();
+            } else {
+                try self.raft.runRound();
+            }
+            if (self.linearizable_read_tracker.isComplete(request_id)) return;
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataLinearizableReadTimeout;
     }
 
     pub fn lifecycleSignalCurrent(self: *const MetadataService) u32 {
@@ -1284,6 +1352,9 @@ pub const MetadataService = struct {
 
     fn metadataServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
+        if (projectionSignalChangesCatalog(signal.kind)) {
+            _ = self.catalog_epoch.fetchAdd(1, .release);
+        }
         switch (signal.kind) {
             .table, .range, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
@@ -1722,9 +1793,9 @@ pub const MetadataService = struct {
 
     fn catalogValidationSnapshotLocked(self: *MetadataService) !*const CatalogValidationSnapshot {
         try self.ensureLifecycleListenerRegistered();
-        const current_epoch = self.projection_epoch.load(.acquire);
+        const current_epoch = self.catalog_epoch.load(.acquire);
         if (self.catalog_validation_cache.snapshot != null and
-            self.catalog_validation_cache.projection_epoch == current_epoch)
+            self.catalog_validation_cache.catalog_epoch == current_epoch)
         {
             return &(self.catalog_validation_cache.snapshot orelse unreachable);
         }
@@ -1734,16 +1805,16 @@ pub const MetadataService = struct {
         // and its ranges can never come from different applied revisions.
         var attempts: usize = 0;
         while (attempts < 4) : (attempts += 1) {
-            const before = self.projection_epoch.load(.acquire);
+            const before = self.catalog_epoch.load(.acquire);
             var fresh = try self.captureCatalogValidationSnapshot();
             errdefer fresh.deinit(self.alloc);
-            const after = self.projection_epoch.load(.acquire);
+            const after = self.catalog_epoch.load(.acquire);
             if (before != after) {
                 fresh.deinit(self.alloc);
                 continue;
             }
             if (self.catalog_validation_cache.snapshot) |*snapshot| snapshot.deinit(self.alloc);
-            self.catalog_validation_cache = .{ .projection_epoch = after, .snapshot = fresh };
+            self.catalog_validation_cache = .{ .catalog_epoch = after, .snapshot = fresh };
             return &(self.catalog_validation_cache.snapshot orelse unreachable);
         }
         return error.CatalogProjectionUnstable;
@@ -2443,6 +2514,7 @@ pub const MetadataHttpService = struct {
     observe_local_replica_root: bool,
     store_status_ticks: usize,
     projection_epoch: std.atomic.Value(u64) = .init(1),
+    catalog_epoch: std.atomic.Value(u64) = .init(1),
     placement_epoch: std.atomic.Value(u64) = .init(1),
     reconcile_lease_epoch: std.atomic.Value(u64) = .init(1),
     transition_epoch: std.atomic.Value(u64) = .init(1),
@@ -2469,6 +2541,8 @@ pub const MetadataHttpService = struct {
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
     lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
+    catalog_validation_mutex: std.Io.Mutex = .init,
+    catalog_validation_cache: CatalogValidationSnapshotCache = .{},
     cdc_write_source_override: ?api_table_writes.TableWriteSource = null,
     local_group_status_provider: ?LocalGroupStatusProvider = null,
     local_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
@@ -2514,11 +2588,14 @@ pub const MetadataHttpService = struct {
         http_deps.http.backend_runtime = backend_runtime;
         const read_tracker = try alloc.create(LinearizableMetadataReadTracker);
         var read_tracker_owned = true;
-        errdefer if (read_tracker_owned) alloc.destroy(read_tracker);
         read_tracker.* = .{
             .alloc = alloc,
             .metadata_group_id = metadata_group_id,
             .downstream = http_deps.read_state_observer,
+        };
+        errdefer if (read_tracker_owned) {
+            read_tracker.deinit();
+            alloc.destroy(read_tracker);
         };
         http_deps.read_state_observer = read_tracker.observer();
         var service = MetadataHttpService{
@@ -2557,6 +2634,7 @@ pub const MetadataHttpService = struct {
         // Projection listeners retain `self`; stop and drain their Raft apply
         // producer before releasing any callback-owned service state.
         self.raft.deinit();
+        self.catalog_validation_cache.deinit(self.alloc);
         self.projected_core_snapshot_cache.deinit(self.alloc);
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
@@ -2654,6 +2732,9 @@ pub const MetadataHttpService = struct {
 
     fn metadataHttpServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
+        if (projectionSignalChangesCatalog(signal.kind)) {
+            _ = self.catalog_epoch.fetchAdd(1, .release);
+        }
         switch (signal.kind) {
             .table, .range, .store, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .schema_progress => _ = self.projection_epoch.fetchAdd(1, .monotonic),
@@ -3526,22 +3607,50 @@ pub const MetadataHttpService = struct {
 
     pub fn validatePublication(self: *MetadataHttpService, contract: metadata_api.CatalogPublicationContract) !bool {
         try self.ensureLinearizableRead();
+        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
         self.lockRuntime();
         defer self.unlockRuntime();
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
-        const core = try self.projectedCoreSnapshotLocked();
-        return core.catalog_index.matchesPublication(contract, self.metadata_group_id, incarnation, core.tables, core.ranges);
+        const snapshot = try self.catalogValidationSnapshotLocked();
+        return snapshot.index.matchesPublication(contract, self.metadata_group_id, incarnation, snapshot.tables, snapshot.ranges);
     }
 
     pub fn validateTablePublication(self: *MetadataHttpService, contract: metadata_api.CatalogTablePublicationContract) !bool {
         try self.ensureLinearizableRead();
+        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
         self.lockRuntime();
         defer self.unlockRuntime();
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
-        const core = try self.projectedCoreSnapshotLocked();
-        return core.catalog_index.matchesTablePublication(contract, self.metadata_group_id, incarnation, core.tables);
+        const snapshot = try self.catalogValidationSnapshotLocked();
+        return snapshot.index.matchesTablePublication(contract, self.metadata_group_id, incarnation, snapshot.tables);
+    }
+
+    /// Called with both the catalog-validation mutex and the Raft runtime lock
+    /// held. Only catalog records are cloned, and non-catalog projection
+    /// traffic cannot invalidate this cache.
+    fn catalogValidationSnapshotLocked(self: *MetadataHttpService) !*const CatalogValidationSnapshot {
+        try self.ensureLifecycleListenerRegistered();
+        const current_epoch = self.catalog_epoch.load(.acquire);
+        if (self.catalog_validation_cache.snapshot == null or
+            self.catalog_validation_cache.catalog_epoch != current_epoch)
+        {
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            var fresh: CatalogValidationSnapshot = .{};
+            errdefer fresh.deinit(self.alloc);
+            fresh.tables = try store.listTables(self.alloc, self.metadata_group_id);
+            fresh.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
+            fresh.index = try metadata_api.CatalogProjectionIndex.init(self.alloc, fresh.tables, fresh.ranges);
+            if (self.catalog_validation_cache.snapshot) |*snapshot| snapshot.deinit(self.alloc);
+            self.catalog_validation_cache = .{
+                .catalog_epoch = current_epoch,
+                .snapshot = fresh,
+            };
+        }
+        return &(self.catalog_validation_cache.snapshot orelse unreachable);
     }
 
     pub fn freeAdminSnapshot(self: *MetadataHttpService, snapshot: *metadata_api.AdminSnapshot) void {
@@ -3626,7 +3735,6 @@ pub const MetadataHttpService = struct {
         errdefer snapshot.deinit(self.alloc);
         snapshot.tables = try store.listTables(self.alloc, self.metadata_group_id);
         snapshot.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
-        snapshot.catalog_index = try metadata_api.CatalogProjectionIndex.init(self.alloc, snapshot.tables, snapshot.ranges);
         snapshot.stores = try store.listStores(self.alloc, self.metadata_group_id);
         snapshot.placement_intents = try store.listPlacementIntents(self.alloc, self.metadata_group_id);
         snapshot.shuffle_join_leases = try store.listShuffleJoinLeases(self.alloc, self.metadata_group_id);
@@ -9457,6 +9565,7 @@ test "metadata service admin snapshot captures projected topology and status" {
     });
     try svc.campaignMetadataGroup();
     try svc.runRound();
+    try svc.ensureLinearizableRead();
 
     try svc.upsertStore(.{ .store_id = 41, .node_id = 1, .role = "data", .live = true, .capacity_bytes = 1024, .available_bytes = 900 });
     try svc.upsertStore(.{ .store_id = 42, .node_id = 2, .role = "data", .live = true, .capacity_bytes = 1024, .available_bytes = 850 });

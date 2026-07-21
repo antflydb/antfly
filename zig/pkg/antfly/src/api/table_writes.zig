@@ -4602,7 +4602,16 @@ pub const ProvisionedTableWriteSource = struct {
     const StructuralReconcileGroupOutcome = enum {
         complete,
         busy,
-        stale,
+    };
+
+    const StructuralRuntimeObservation = struct {
+        status: runtime_status.LocalTableRuntimeStatus,
+        opened_root_generation: u64,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            self.status.deinit(alloc);
+            self.* = undefined;
+        }
     };
 
     const structural_reconcile_retry_min_ms: u64 = 25;
@@ -9721,51 +9730,84 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
 
-        // One whole-table ReadIndex fence admits each bounded quantum. The
-        // contract covers every group and replaces redundant pre-checks per
-        // group; each group still receives a post-mutation fence before its
-        // runtime observation can become visible.
+        // One whole-table ReadIndex fence admits each bounded quantum. Runtime
+        // observations remain owned and invisible until a second whole-table
+        // fence accepts every mutation completed by this quantum.
         if (!try self.structuralReconcilePlanStillCurrent(request.table_name, &request.plan.?)) {
             request.plan.?.deinit(alloc);
             request.plan = null;
             return .blocked;
         }
 
+        const publication_fence = if (self.runtime_status_cache) |status_cache|
+            try status_cache.capturePublicationToken(request.table_name)
+        else
+            null;
+        var observations = std.ArrayListUnmanaged(StructuralRuntimeObservation).empty;
+        defer {
+            for (observations.items) |*observation| observation.deinit(alloc);
+            observations.deinit(alloc);
+        }
+        try observations.ensureTotalCapacity(alloc, structural_reconcile_groups_per_quantum);
+
         var attempted: usize = 0;
         var made_progress = false;
         while (attempted < structural_reconcile_groups_per_quantum) : (attempted += 1) {
             const plan = &request.plan.?;
             const group = plan.currentGroup() orelse {
-                if (try self.structuralReconcilePlanStillCurrent(request.table_name, plan)) return .complete;
-                plan.deinit(alloc);
-                request.plan = null;
-                return .blocked;
+                break;
             };
-            const outcome = try self.reconcileTableGroupStructureWithRuntime(alloc, group.range.group_id, request.table_name, .{
+            const outcome = self.reconcileTableGroupStructureWithRuntime(alloc, group.range.group_id, request.table_name, .{
                 .indexes_json = plan.indexes_json,
                 .schema_json = plan.schema_json,
                 .identity_namespace = group.identity_namespace,
                 .target_index_name = request.index_name,
-            }, plan);
+            }, &observations) catch |err| {
+                plan.deinit(alloc);
+                request.plan = null;
+                return err;
+            };
             switch (outcome) {
                 .busy => plan.markCurrentBusy(),
-                .stale => {
+                .complete => {
+                    made_progress = true;
+                    plan.markCurrentComplete();
+                    if (plan.pending_group_indexes.items.len == 0) break;
+                },
+            }
+        }
+
+        if (made_progress) {
+            const plan = &request.plan.?;
+            const plan_current = self.structuralReconcilePlanStillCurrent(request.table_name, plan) catch |err| {
+                plan.deinit(alloc);
+                request.plan = null;
+                return err;
+            };
+            if (!plan_current) {
+                plan.deinit(alloc);
+                request.plan = null;
+                return .blocked;
+            }
+            publishStructuralRuntimeObservations(
+                self,
+                request.table_name,
+                publication_fence,
+                observations.items,
+            ) catch |err| switch (err) {
+                error.RuntimeStatusPublicationFenced => {
                     plan.deinit(alloc);
                     request.plan = null;
                     return .blocked;
                 },
-                .complete => {
-                    made_progress = true;
-                    plan.markCurrentComplete();
-                    if (plan.pending_group_indexes.items.len == 0) {
-                        if (try self.structuralReconcilePlanStillCurrent(request.table_name, plan)) return .complete;
-                        plan.deinit(alloc);
-                        request.plan = null;
-                        return .blocked;
-                    }
+                else => {
+                    plan.deinit(alloc);
+                    request.plan = null;
+                    return err;
                 },
-            }
+            };
         }
+        if (request.plan.?.pending_group_indexes.items.len == 0) return .complete;
         return if (made_progress) .yielded else .blocked;
     }
 
@@ -9892,7 +9934,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
         metadata: StartupCatchUpMetadata,
-        plan: *const StructuralReconcilePlan,
+        observations: *std.ArrayListUnmanaged(StructuralRuntimeObservation),
     ) !StructuralReconcileGroupOutcome {
         // The target generation is unpublished until catch-up and sync finish.
         // Queries are routed to the retained read generation, so do not turn a
@@ -9971,35 +10013,28 @@ pub const ProvisionedTableWriteSource = struct {
                 configuredIndexesRequireSchemaIdentityProof(configured_indexes)
             else
                 false;
-            const publication_fence = if (self.runtime_status_cache) |status_cache|
-                try status_cache.capturePublicationToken(table_name)
-            else
-                null;
-            if (!try self.structuralReconcilePlanStillCurrent(table_name, plan)) {
-                lockAtomic(&self.local_db_mutex);
-                defer self.local_db_mutex.unlock();
-                cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
-                cached_active = false;
-                return .stale;
+            if (self.runtime_status_cache) |snapshot_cache| {
+                const status = captureStructuralRuntimeStatusObservation(
+                    snapshot_cache,
+                    alloc,
+                    table_name,
+                    group_id,
+                    cached.db,
+                    publish_schema_identity_proof,
+                    lsm_root_generation,
+                    if (self.startup_catch_up_active.load(.monotonic)) .startup_catch_up else .idle,
+                ) catch |err| {
+                    lockAtomic(&self.local_db_mutex);
+                    defer self.local_db_mutex.unlock();
+                    cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+                    cached_active = false;
+                    return err;
+                };
+                observations.appendAssumeCapacity(.{
+                    .status = status,
+                    .opened_root_generation = lsm_root_generation,
+                });
             }
-            publishStructuralRuntimeStatusSnapshot(
-                self,
-                alloc,
-                table_name,
-                group_id,
-                cached.db,
-                publish_schema_identity_proof,
-                publication_fence,
-            ) catch |err| {
-                lockAtomic(&self.local_db_mutex);
-                defer self.local_db_mutex.unlock();
-                cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
-                cached_active = false;
-                switch (err) {
-                    error.RuntimeStatusPublicationFenced => return .stale,
-                    else => return err,
-                }
-            };
             cache.publishCachedLeaseGeneration(&cached, lsm_root_generation);
             return .complete;
         }
@@ -10083,23 +10118,22 @@ pub const ProvisionedTableWriteSource = struct {
             configuredIndexesRequireSchemaIdentityProof(configured_indexes)
         else
             false;
-        const publication_fence = if (self.runtime_status_cache) |cache|
-            try cache.capturePublicationToken(table_name)
-        else
-            null;
-        if (!try self.structuralReconcilePlanStillCurrent(table_name, plan)) return .stale;
-        publishStructuralRuntimeStatusSnapshot(
-            self,
-            alloc,
-            table_name,
-            group_id,
-            &db,
-            publish_schema_identity_proof,
-            publication_fence,
-        ) catch |err| switch (err) {
-            error.RuntimeStatusPublicationFenced => return .stale,
-            else => return err,
-        };
+        if (self.runtime_status_cache) |snapshot_cache| {
+            const status = try captureStructuralRuntimeStatusObservation(
+                snapshot_cache,
+                alloc,
+                table_name,
+                group_id,
+                &db,
+                publish_schema_identity_proof,
+                lsm_root_generation,
+                if (self.startup_catch_up_active.load(.monotonic)) .startup_catch_up else .idle,
+            );
+            observations.appendAssumeCapacity(.{
+                .status = status,
+                .opened_root_generation = lsm_root_generation,
+            });
+        }
         return .complete;
     }
 
@@ -16768,32 +16802,71 @@ fn publishRuntimeStatusSnapshotConsistent(
     );
 }
 
-fn publishStructuralRuntimeStatusSnapshot(
-    source: *ProvisionedTableWriteSource,
+fn captureStructuralRuntimeStatusObservation(
+    snapshot_cache: *runtime_status.TableRuntimeSnapshotCache,
     alloc: std.mem.Allocator,
     table_name: []const u8,
     group_id: u64,
     db: *db_mod.DB,
     require_schema_identity_proof: bool,
+    lsm_root_generation: u64,
+    phase: db_mod.types.StartupCatchUpPhase,
+) !runtime_status.LocalTableRuntimeStatus {
+    var disk_bytes: u64 = 0;
+    var created_at_millis: u64 = 0;
+    var cached_startup: db_mod.types.StartupCatchUpStats = .{};
+    if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
+        var cached = cached_status;
+        defer cached.deinit(alloc);
+        disk_bytes = cached.disk_bytes;
+        created_at_millis = cached.created_at_millis;
+        cached_startup = cached.stats.async_indexing.startup;
+    }
+
+    var status = runtime_status.LocalTableRuntimeStatus{
+        .group_id = group_id,
+        .disk_bytes = disk_bytes,
+        .created_at_millis = created_at_millis,
+        .stats = if (require_schema_identity_proof)
+            try db.diagnosticStats(alloc)
+        else
+            try db.runtimeStatusStatsConsistent(alloc),
+    };
+    errdefer status.deinit(alloc);
+
+    var startup = startupCatchUpStatsForPhase(phase, db);
+    if (!startup.wal_retention_known and cached_startup.wal_retention_known) {
+        startup.wal_retention_known = true;
+        startup.wal_retained_segments = cached_startup.wal_retained_segments;
+        startup.wal_retained_bytes = cached_startup.wal_retained_bytes;
+    }
+    applyStartupCatchUpAsyncOverlay(&status, db.snapshotAsyncIndexingStats(), startup);
+    markRuntimeStatusFromDb(&status, phase);
+    status.metadata.lsm_root_generation = lsm_root_generation;
+    return status;
+}
+
+fn publishStructuralRuntimeObservations(
+    source: *ProvisionedTableWriteSource,
+    table_name: []const u8,
     publication_fence: ?runtime_status.TableRuntimeSnapshotCache.PublicationToken,
+    observations: []const ProvisionedTableWriteSource.StructuralRuntimeObservation,
 ) !void {
     const snapshot_cache = source.runtime_status_cache orelse return;
     const token = publication_fence orelse return error.RuntimeStatusPublicationFenced;
-    const visible_root_generation = source.visibleRootGeneration(group_id);
-    const opened_root_generation = db.core.index_manager.lsm_root_generation;
-    if (opened_root_generation != visible_root_generation) return error.RuntimeStatusPublicationFenced;
-    try publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
-        snapshot_cache,
-        alloc,
-        table_name,
-        group_id,
-        opened_root_generation,
-        token,
-        if (source.startup_catch_up_active.load(.monotonic)) .startup_catch_up else .idle,
-        if (require_schema_identity_proof) .diagnostic else .consistent,
-        .runtime,
-        db,
-    );
+    for (observations) |observation| {
+        if (source.visibleRootGeneration(observation.status.group_id) != observation.opened_root_generation) {
+            return error.RuntimeStatusPublicationFenced;
+        }
+    }
+    const completed = try snapshot_cache.capturePublicationToken(table_name);
+    if (!std.meta.eql(token.table_epoch, completed.table_epoch)) {
+        return error.RuntimeStatusPublicationFenced;
+    }
+    std.debug.assert(observations.len <= ProvisionedTableWriteSource.structural_reconcile_groups_per_quantum);
+    var statuses: [ProvisionedTableWriteSource.structural_reconcile_groups_per_quantum]runtime_status.LocalTableRuntimeStatus = undefined;
+    for (observations, 0..) |observation, index| statuses[index] = observation.status;
+    try acceptRuntimeStatusPublication(try snapshot_cache.publishGroups(completed, table_name, statuses[0..observations.len]));
 }
 
 fn publishRuntimeStatusSnapshotConsistentIfAvailable(
@@ -29094,6 +29167,52 @@ test "runtime status hook orders completed observation without crossing invalida
         "docs",
         .{ .group_id = 7001, .stats = .{ .source_doc_count = 2 } },
     ));
+}
+
+test "structural runtime observations publish as one table-epoch batch" {
+    const alloc = std.testing.allocator;
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-structural-status-batch", NoCatalog.iface());
+    defer source.deinit();
+    source.runtime_status_cache = &cache;
+
+    const token = try cache.capturePublicationToken("docs");
+    const observations = [_]ProvisionedTableWriteSource.StructuralRuntimeObservation{
+        .{
+            .status = .{ .group_id = 7001, .stats = .{} },
+            .opened_root_generation = table_reads.backend_current_root_generation,
+        },
+        .{
+            .status = .{ .group_id = 7002, .stats = .{} },
+            .opened_root_generation = table_reads.backend_current_root_generation,
+        },
+    };
+    try publishStructuralRuntimeObservations(&source, "docs", token, &observations);
+
+    var statuses = (try cache.snapshot(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), statuses.items.len);
+    try std.testing.expect(statuses.items[0].cache_observation_generation != 0);
+    try std.testing.expectEqual(
+        statuses.items[0].cache_observation_generation,
+        statuses.items[1].cache_observation_generation,
+    );
 }
 
 test "provisioned runtime status live replay overlay preserves cold dense visibility refresh" {

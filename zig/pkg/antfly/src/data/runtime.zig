@@ -10358,10 +10358,17 @@ const RemoteMetadataSource = struct {
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     cached_snapshot_at_ms: u64 = 0,
+    http_executor: *antfly.raft.transport.std_http_executor.StdHttpExecutor,
     test_faults: TestFaults = .{},
 
     fn init(alloc: std.mem.Allocator, base_uris: []const []const u8) !RemoteMetadataSource {
         if (base_uris.len == 0) return error.MissingMetadataApi;
+        const http_executor = try alloc.create(antfly.raft.transport.std_http_executor.StdHttpExecutor);
+        errdefer alloc.destroy(http_executor);
+        http_executor.* = antfly.raft.transport.std_http_executor.StdHttpExecutor.init(alloc, .{
+            .keep_alive = true,
+        });
+        errdefer http_executor.deinit();
         var owned = try alloc.alloc([]u8, base_uris.len);
         var initialized: usize = 0;
         errdefer {
@@ -10375,10 +10382,15 @@ const RemoteMetadataSource = struct {
         return .{
             .alloc = alloc,
             .base_uris = owned,
+            .http_executor = http_executor,
         };
     }
 
     fn deinit(self: *RemoteMetadataSource) void {
+        // Stop and drain requests before releasing endpoint and cache storage
+        // that in-flight metadata calls may still reference.
+        self.http_executor.deinit();
+        self.alloc.destroy(self.http_executor);
         lockAtomic(&self.cache_mutex);
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         for (self.base_uris) |uri| self.alloc.free(uri);
@@ -10567,9 +10579,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var executor = antfly.raft.transport.std_http_executor.StdHttpExecutor.init(scratch, .{});
-            defer executor.deinit();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, executor.executor());
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.http_executor.executor());
             const head = metadata_client.fetchHead(self.base_uris[index]) catch |err| {
                 last_err = err;
                 continue;
@@ -10596,9 +10606,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var executor = antfly.raft.transport.std_http_executor.StdHttpExecutor.init(scratch, .{});
-            defer executor.deinit();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, executor.executor());
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.http_executor.executor());
             const head = metadata_client.fetchHead(self.base_uris[index]) catch |err| {
                 last_err = err;
                 continue;
@@ -10621,9 +10629,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var executor = antfly.raft.transport.std_http_executor.StdHttpExecutor.init(scratch, .{});
-            defer executor.deinit();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, executor.executor());
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.http_executor.executor());
             const status = metadata_client.fetchStatus(self.base_uris[index]) catch |err| {
                 last_err = err;
                 continue;
@@ -10648,9 +10654,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var executor = antfly.raft.transport.std_http_executor.StdHttpExecutor.init(scratch, .{});
-            defer executor.deinit();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, executor.executor());
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.http_executor.executor());
             var parsed = metadata_client.fetchSnapshot(self.base_uris[index]) catch |err| {
                 last_err = err;
                 continue;
@@ -10700,9 +10704,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var executor = antfly.raft.transport.std_http_executor.StdHttpExecutor.init(scratch, .{});
-            defer executor.deinit();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, executor.executor());
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.http_executor.executor());
             const valid = metadata_client.validateCatalogPublication(self.base_uris[index], contract) catch |err| {
                 last_err = err;
                 continue;
@@ -10724,9 +10726,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var executor = antfly.raft.transport.std_http_executor.StdHttpExecutor.init(scratch, .{});
-            defer executor.deinit();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, executor.executor());
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.http_executor.executor());
             const valid = metadata_client.validateCatalogTablePublication(self.base_uris[index], contract) catch |err| {
                 last_err = err;
                 continue;

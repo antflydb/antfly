@@ -355,6 +355,71 @@ pub const TableRuntimeSnapshotCache = struct {
         return .published;
     }
 
+    /// Publishes a bounded set of owned observations under one table-epoch
+    /// decision and one cache lock. Statuses are cloned before locking so
+    /// allocation and DBStats ownership do not lengthen the critical section.
+    /// A newer observation for one group is preserved without rejecting valid
+    /// observations for the other groups.
+    pub fn publishGroups(
+        self: *@This(),
+        token: PublicationToken,
+        table_name: []const u8,
+        statuses: []const LocalTableRuntimeStatus,
+    ) !PublishResult {
+        for (statuses, 0..) |status, index| {
+            for (statuses[0..index]) |previous| {
+                if (previous.group_id == status.group_id) return error.DuplicateRuntimeStatusGroup;
+            }
+        }
+
+        const owned = try self.alloc.alloc(LocalTableRuntimeStatus, statuses.len);
+        var initialized: usize = 0;
+        var clean_all = true;
+        defer {
+            if (clean_all) {
+                for (owned[0..initialized]) |*status| status.deinit(self.alloc);
+            }
+            self.alloc.free(owned);
+        }
+        for (statuses, 0..) |status, index| {
+            owned[index] = try status.clone(self.alloc);
+            initialized += 1;
+        }
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.tables.getPtr(table_name) orelse return .stale_table;
+        if (!std.meta.eql(state.epoch, token.table_epoch)) return .stale_table;
+
+        var new_groups: usize = 0;
+        for (statuses) |status| {
+            if (!state.groups.contains(status.group_id)) new_groups += 1;
+        }
+        try state.groups.ensureUnusedCapacity(self.alloc, @intCast(new_groups));
+
+        const now_ns = platform_time.monotonicNs();
+        var published = false;
+        clean_all = false;
+        for (owned, statuses) |*next, status| {
+            next.cache_observation_generation = token.observation_generation;
+            next.withMetadataDefaults(.live_writer_publish, now_ns);
+            if (state.groups.getPtr(status.group_id)) |previous| {
+                if (previous.cache_observation_generation > token.observation_generation) {
+                    next.deinit(self.alloc);
+                    continue;
+                }
+                preserveArtifactVisibilityOnReplayRegression(previous.*, next);
+                previous.deinit(self.alloc);
+                previous.* = next.*;
+            } else {
+                state.groups.putAssumeCapacity(status.group_id, next.*);
+            }
+            next.* = undefined;
+            published = true;
+        }
+        return if (published or statuses.len == 0) .published else .stale_observation;
+    }
+
     /// Consumes every snapshot. Epoch-valid tables publish independently;
     /// catalog-wide absence removals occur only when topology stayed stable.
     pub fn publishRefresh(
@@ -2205,6 +2270,60 @@ test "table runtime snapshot cache invalidation fences a stale observed publishe
     defer docs.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 12), docs.items[0].stats.doc_count);
     try std.testing.expectEqual(current_token.observation_generation, docs.items[0].cache_observation_generation);
+}
+
+test "table runtime snapshot cache batch publication is table epoch atomic" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const stale_token = try cache.capturePublicationToken("docs");
+    cache.invalidateTable("docs");
+    const statuses = [_]LocalTableRuntimeStatus{
+        .{ .group_id = 7, .stats = .{ .doc_count = 10 } },
+        .{ .group_id = 8, .stats = .{ .doc_count = 20 } },
+    };
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_table,
+        try cache.publishGroups(stale_token, "docs", &statuses),
+    );
+    try std.testing.expect((try cache.snapshot(alloc, "docs")) == null);
+}
+
+test "table runtime snapshot cache batch preserves newer group observations" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const batch_token = try cache.capturePublicationToken("docs");
+    const newer_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(newer_token, "docs", .{ .group_id = 7, .stats = .{ .doc_count = 12 } }),
+    );
+    const statuses = [_]LocalTableRuntimeStatus{
+        .{ .group_id = 7, .stats = .{ .doc_count = 10 } },
+        .{ .group_id = 8, .stats = .{ .doc_count = 20 } },
+    };
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroups(batch_token, "docs", &statuses),
+    );
+
+    var docs = (try cache.snapshot(alloc, "docs")).?;
+    defer docs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), docs.items.len);
+    for (docs.items) |status| switch (status.group_id) {
+        7 => {
+            try std.testing.expectEqual(@as(u64, 12), status.stats.doc_count);
+            try std.testing.expectEqual(newer_token.observation_generation, status.cache_observation_generation);
+        },
+        8 => {
+            try std.testing.expectEqual(@as(u64, 20), status.stats.doc_count);
+            try std.testing.expectEqual(batch_token.observation_generation, status.cache_observation_generation);
+        },
+        else => return error.UnexpectedRuntimeStatusGroup,
+    };
 }
 
 test "table runtime snapshot cache live publication does not starve structural refresh" {

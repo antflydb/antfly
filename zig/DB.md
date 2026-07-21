@@ -187,19 +187,22 @@ catalog sources validate a compact whole-table contract after a Raft
 linearizable-read barrier. The contract carries an order-independent SHA-256
 multiset digest and range count over the complete range records, so validation
 is allocation-free against the metadata owner's immutable projection, O(1) on
-the wire, and detects ranges added, removed, or mutated after capture. Its CPU
-cost is one catalog-range scan only at plan admission and completion; per-group
-fences scan the same projection without cloning it.
+the wire, and detects ranges added, removed, or mutated after capture. Metadata
+maintains this projection behind a catalog-only epoch: store reports, placement
+progress, and other control-plane traffic cannot evict it. A table or range
+change rebuilds the compact projection once; warm validation is O(1).
 
 A dequeue advances at most a fixed number of pending groups, removes completed
 groups in O(1), and rotates busy groups rather than replaying successful work.
-Each group is also validated through its compact linearizable publication
-contract both before opening storage and after maintenance, immediately before
-runtime status publication. Productive quanta return to the queue tail without
-an artificial delay; a short delay applies only when every attempted group is
-blocked. A changed contract discards only the stale plan and rebuilds it on the
-next quantum; the write-admission reservation remains continuous throughout
-that handoff, and stale work cannot publish readiness for a replaced topology.
+One compact linearizable contract admits the quantum. Completed groups retain
+owned runtime observations until one post-mutation contract check accepts the
+entire quantum, after which the observations publish with the table epoch
+captured before storage work began. Productive quanta return to the queue tail
+without an artificial delay; a short delay applies only when every attempted
+group is blocked. A changed contract discards only the stale plan and rebuilds
+it on the next quantum; the write-admission reservation remains continuous
+throughout that handoff, and stale work cannot publish readiness for a replaced
+topology.
 Per-table dirty visibility tracking uses owned exact table identities rather
 than collision-prone hashes. Its lifetime is tied to write-cache ownership:
 eviction advances the table's read-cache epoch, and the last cache owner also
@@ -524,20 +527,23 @@ no caller requests the committed delta list.
 Structural index/schema reconciliation is admitted by a linearizable,
 whole-table catalog contract containing metadata incarnation, table definition,
 and an order-independent digest of every range record. Metadata services build
-non-owning table/range maps and table topology digests once per stable projection
+non-owning table/range maps and table topology digests once per stable catalog
 epoch; subsequent contract validation is O(1) and does not allocate or scan an
 admin snapshot. Remote data nodes use the same required internal validation
-route and fail closed if either group or whole-table fencing is unavailable.
+route through one long-lived, concurrency-safe HTTP executor and fail closed if
+either group or whole-table fencing is unavailable.
 
 Each bounded reconciliation quantum receives one whole-table admission fence.
-Before a reconciled group publishes runtime status, it captures the table's
-runtime-cache epoch, performs a post-mutation linearizable catalog check, and
-publishes with that original epoch. Enqueueing any structural request first
-invalidates the table epoch, including deduplicated requests. Therefore a
-catalog change, restore/root transition, or newly enqueued structural mutation
-between validation and publication makes the observation stale; an unrelated
-table does not interfere. Per-group mutation remains bounded, while redundant
-pre-group ReadIndex barriers are avoided.
+It captures the table runtime-cache epoch before opening storage, retains owned
+observations for completed groups, performs one post-mutation linearizable
+catalog check, and publishes the accepted batch under one cache lock with that
+original epoch.
+Enqueueing any structural request first invalidates the table epoch, including
+deduplicated requests. Therefore a catalog change, restore/root transition, or
+newly enqueued structural mutation between validation and publication makes
+the observations stale; an unrelated table does not interfere. Per-group
+mutation remains bounded, with exactly two ReadIndex barriers per productive
+quantum rather than barriers per group.
 
 Removing an active split or merge record is intentionally a no-op, not a
 cancellation protocol. Cancellation first commits rollback intent on the same
