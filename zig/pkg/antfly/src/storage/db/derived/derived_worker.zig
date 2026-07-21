@@ -154,6 +154,7 @@ fn logCatchUpError(
     if (err == error.ResourceBudgetExceeded) return;
     if (err == error.ReplayDocumentNotVisible) return;
     if (err == error.ArtifactRepairRequired) return;
+    if (err == error.CatchUpDeadlineExceeded) return;
     if (index_ref.kind == .dense_vector and err == error.NotFound) return;
     std.log.err(
         "derived catch_up failed index={s} kind={s} phase={s} sequence={} scanned_entries={} applied_entries={} err={s}",

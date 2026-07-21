@@ -2545,9 +2545,17 @@ fn localReplicaRootReconcilePermitHook(data_server: *antfly.data.runtime.DataSer
     };
 }
 
-fn runLocalReplicaRootReconcileHook(ptr: *anyopaque) !void {
+fn runLocalReplicaRootReconcileHook(
+    ptr: *anyopaque,
+    request: antfly.metadata_service.LocalReplicaRootReconcileHook.Request,
+) !antfly.metadata.table_provisioner.ProvisionSummary {
     const data_server: *antfly.data.runtime.DataServer = @ptrCast(@alignCast(ptr));
-    try data_server.reconcileVisibleProvisionedReplicaState();
+    return try data_server.reconcileVisibleProvisionedReplicaStateFromSnapshot(
+        request.metadata_group_id,
+        request.group_ids,
+        request.tables,
+        request.ranges,
+    );
 }
 
 fn runLocalReplicaRootReconcilePermitHook(ptr: *anyopaque) bool {

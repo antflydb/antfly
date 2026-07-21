@@ -13582,7 +13582,10 @@ pub const DB = struct {
         const start_result = if (!runtime.isStarted()) startEnrichmentRuntimeForLifecycle(runtime) else {};
         self.async_context.enrichment_lifecycle_mutex.unlock();
         start_result catch |err| {
-            std.log.err("failed to restart enrichment runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+            // The durable restart supervisor owns recovery from this point;
+            // preserve the diagnostic without classifying a retryable outage
+            // as an unrecoverable process failure.
+            std.log.warn("failed to restart enrichment runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
             scheduleEnrichmentRestartContext(
                 self.async_context,
                 self.backend_runtime.durable_jobs,
@@ -13608,7 +13611,9 @@ pub const DB = struct {
     }
 
     fn recoverCommittedIndexAdmission(self: *DB, cfg: types.IndexConfig, activation_err: anyerror) ?u128 {
-        std.log.err("index catalog admission committed with pending activation index={s} err={s}", .{ cfg.name, @errorName(activation_err) });
+        // Admission remains fail-closed until the durable repair marker is
+        // materialized, so this is degraded-but-recoverable state.
+        std.log.warn("index catalog admission committed with pending activation index={s} err={s}", .{ cfg.name, @errorName(activation_err) });
         self.requestManagedAdmissionMaterialization();
         self.drainManagedIndexAdmissions(self.alloc) catch |materialize_err| {
             // The primary-store marker remains authoritative and startup will

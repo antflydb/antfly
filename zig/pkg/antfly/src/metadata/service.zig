@@ -385,12 +385,19 @@ pub const LocalReplicaRootReconcileHook = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    pub const VTable = struct {
-        run: *const fn (ptr: *anyopaque) anyerror!void,
+    pub const Request = struct {
+        metadata_group_id: u64,
+        group_ids: []const u64,
+        tables: []const metadata_table_manager.TableRecord,
+        ranges: []const metadata_table_manager.RangeRecord,
     };
 
-    pub fn run(self: LocalReplicaRootReconcileHook) !void {
-        try self.vtable.run(self.ptr);
+    pub const VTable = struct {
+        run: *const fn (ptr: *anyopaque, request: Request) anyerror!metadata_table_provisioner.ProvisionSummary,
+    };
+
+    pub fn run(self: LocalReplicaRootReconcileHook, request: Request) !metadata_table_provisioner.ProvisionSummary {
+        return try self.vtable.run(self.ptr, request);
     }
 };
 
@@ -2195,8 +2202,12 @@ pub const MetadataService = struct {
             // A configured hook is the local writer owner. Delegating avoids
             // opening a second DB writer and then notifying the owner after
             // the mutation has already happened.
-            try hook.run();
-            break :owner .{};
+            break :owner try hook.run(.{
+                .metadata_group_id = self.metadata_group_id,
+                .group_ids = group_ids,
+                .tables = tables,
+                .ranges = ranges,
+            });
         } else try metadata_table_provisioner.reconcileReplicaRootWithOptions(
             self.alloc,
             replica_root_dir,
@@ -4200,8 +4211,12 @@ pub const MetadataHttpService = struct {
             if (!hook.shouldReconcile()) return .{};
         }
         const summary: metadata_table_provisioner.ProvisionSummary = if (self.local_replica_root_reconcile_hook) |hook| owner: {
-            try hook.run();
-            break :owner .{};
+            break :owner try hook.run(.{
+                .metadata_group_id = self.metadata_group_id,
+                .group_ids = group_ids,
+                .tables = inputs.tables,
+                .ranges = inputs.ranges,
+            });
         } else try metadata_table_provisioner.reconcileReplicaRootWithOptions(
             self.alloc,
             replica_root_dir,
@@ -10317,10 +10332,17 @@ test "metadata service local replica root reconcile permit hook defers reconcile
 
     const HookCapture = struct {
         calls: usize = 0,
+        indexes_pending: usize = 0,
+        last_group_count: usize = 0,
 
-        fn run(ptr: *anyopaque) !void {
+        fn run(
+            ptr: *anyopaque,
+            request: LocalReplicaRootReconcileHook.Request,
+        ) !metadata_table_provisioner.ProvisionSummary {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
+            self.last_group_count = request.group_ids.len;
+            return .{ .indexes_pending = self.indexes_pending };
         }
     };
 
@@ -10395,9 +10417,19 @@ test "metadata service local replica root reconcile permit hook defers reconcile
     try std.testing.expectEqual(@as(usize, 0), capture.calls);
 
     permit.allow = true;
+    capture.indexes_pending = 1;
     svc.local_table_provisioning_epoch = null;
     svc.local_table_provisioning_group_ids_fingerprint = null;
     svc.last_local_table_provisioning_refresh_at_ms = 0;
     try runServiceRounds(&svc, 8);
     try std.testing.expect(capture.calls >= 1);
+    try std.testing.expectEqual(@as(usize, 2), capture.last_group_count);
+    try std.testing.expectEqual(null, svc.local_table_provisioning_fingerprint);
+
+    capture.indexes_pending = 0;
+    svc.local_table_provisioning_epoch = null;
+    svc.local_table_provisioning_group_ids_fingerprint = null;
+    svc.last_local_table_provisioning_refresh_at_ms = 0;
+    try runServiceRounds(&svc, 8);
+    try std.testing.expect(svc.local_table_provisioning_fingerprint != null);
 }

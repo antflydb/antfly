@@ -5383,6 +5383,67 @@ pub const DataServer = struct {
         self.pruneStaleVisibleWriteCaches();
     }
 
+    pub fn reconcileVisibleProvisionedReplicaStateFromSnapshot(
+        self: *DataServer,
+        metadata_group_id: u64,
+        group_ids: []const u64,
+        tables: []const antfly.metadata.table_manager.TableRecord,
+        ranges: []const antfly.metadata.table_manager.RangeRecord,
+    ) !antfly.metadata.table_provisioner.ProvisionSummary {
+        const refresh_write_source = self.liveRuntimeWriteSource();
+        const backend_runtime = try self.ensureBackendRuntime();
+        var summary: antfly.metadata.table_provisioner.ProvisionSummary = .{};
+
+        self.provisioned_storage.pruneGroupVisibleRootGenerations(group_ids);
+        for (group_ids) |group_id| {
+            if (group_id == metadata_group_id) continue;
+            const range = findRangeByGroupId(ranges, group_id) orelse continue;
+            const table = findTableById(tables, range.table_id) orelse continue;
+
+            const group_result = reconcile: {
+                var activity = refresh_write_source.beginGroupRefreshActivity(table.name, group_id);
+                defer activity.deinit();
+
+                var group_id_one = [_]u64{group_id};
+                lockAtomic(refresh_write_source.localDbMutex());
+                defer refresh_write_source.localDbMutex().unlock();
+                break :reconcile refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                    self.alloc,
+                    metadata_group_id,
+                    group_id_one[0..],
+                    tables,
+                    ranges,
+                    backend_runtime,
+                );
+            };
+            const group_summary = group_result catch |err| {
+                self.finishVisibleProvisionedMetadataReconcile();
+                return err;
+            };
+            summary.merge(group_summary);
+        }
+
+        self.finishVisibleProvisionedMetadataReconcile();
+        return summary;
+    }
+
+    fn finishVisibleProvisionedMetadataReconcile(self: *DataServer) void {
+        // This is an in-place catalog reconciliation, not a filesystem-root
+        // publication. Retain the writer generation and retire only readers
+        // and artifact caches that could have observed the previous catalog.
+        self.provisioned_storage.invalidateInPlaceMetadataReconcileCaches();
+        self.pruneStaleVisibleWriteCaches();
+        // The data runtime owns its remote-head bookkeeping. Ask that owner to
+        // observe this publication asynchronously instead of racing its plain
+        // last-provision fields from the metadata service thread.
+        self.provisioned_root_refresh_dirty.store(true, .release);
+        self.clearProvisionedStartupCatchUpBackoffs();
+        self.invalidateLocalGroupStatusCache();
+        self.runtime_status_dirty.store(true, .release);
+        self.provisioned_startup_catch_up_dirty.store(true, .release);
+        self.store_status_dirty.store(true, .release);
+    }
+
     fn pruneStaleVisibleWriteCaches(self: *DataServer) void {
         const apply_sm = self.data_raft_apply orelse {
             lockAtomic(self.write_source.localDbMutex());

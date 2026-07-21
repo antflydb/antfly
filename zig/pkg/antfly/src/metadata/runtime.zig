@@ -2067,9 +2067,14 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
     const HookCtx = struct {
         runs: usize = 0,
 
-        fn run(ptr: *anyopaque) anyerror!void {
+        fn run(
+            ptr: *anyopaque,
+            request: antfly.metadata_service.LocalReplicaRootReconcileHook.Request,
+        ) anyerror!antfly.metadata.table_provisioner.ProvisionSummary {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.runs += 1;
+            _ = request;
+            return .{};
         }
     };
 

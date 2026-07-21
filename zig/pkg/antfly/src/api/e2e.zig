@@ -20,6 +20,7 @@ const metadata_mod = @import("../metadata/mod.zig");
 const metadata_http_client = @import("../metadata/http_client.zig");
 const metadata_http_server = @import("../metadata/http_server.zig");
 const metadata_service = @import("../metadata/service.zig");
+const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const data_runtime = @import("../data/runtime.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_host = @import("../raft/host.zig");
@@ -6904,9 +6905,17 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     svc.setLocalShardDbAdapter(data_server.localShardDbAdapter());
     defer svc.setLocalShardDbAdapter(null);
     const DataWriterOwner = struct {
-        fn reconcile(ptr: *anyopaque) !void {
+        fn reconcile(
+            ptr: *anyopaque,
+            request: metadata_service.LocalReplicaRootReconcileHook.Request,
+        ) !metadata_table_provisioner.ProvisionSummary {
             const owner: *data_runtime.DataServer = @ptrCast(@alignCast(ptr));
-            try owner.reconcileVisibleProvisionedReplicaState();
+            return try owner.reconcileVisibleProvisionedReplicaStateFromSnapshot(
+                request.metadata_group_id,
+                request.group_ids,
+                request.tables,
+                request.ranges,
+            );
         }
 
         fn mayReconcile(ptr: *anyopaque) bool {

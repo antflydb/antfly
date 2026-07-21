@@ -313,7 +313,10 @@ const SegmentFileStore = struct {
         try writer.appendSlice(bytes);
         active = false;
         writer.finish() catch |err| {
-            if (builtin.os.tag != .freestanding) std.log.err("text segment atomic finish failed: {s}", .{@errorName(err)});
+            // The atomic writer preserves the previously published segment on
+            // failure and the caller receives the error for retry/rollback.
+            // This is an operational write failure, not an invariant breach.
+            if (builtin.os.tag != .freestanding) std.log.warn("text segment atomic finish failed: {s}", .{@errorName(err)});
             return err;
         };
 
