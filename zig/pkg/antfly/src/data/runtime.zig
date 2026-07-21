@@ -4321,6 +4321,10 @@ pub const DataServer = struct {
         if (self.ha_admin_server) |*server| server.deinit();
         if (self.ha_promoted_primary) |*primary| primary.close();
         if (self.ha_standby_replication_http_executor) |*executor| executor.deinit();
+        // Stop source-owned work while Raft and the provisioned caches are
+        // still available. Cached DB callbacks are detached only after every
+        // possible writer has reached this quiescent boundary.
+        self.write_source.quiesce();
         if (self.data_raft) |raft| {
             raft.stop();
             raft.deinit();
@@ -4330,6 +4334,8 @@ pub const DataServer = struct {
             factory.deinit();
             self.alloc.destroy(factory);
         }
+        if (self.data_raft_apply) |apply_sm| apply_sm.write_source.quiesce();
+        self.provisioned_storage.detachWriteSourceRuntimeHooks();
         if (self.data_raft_apply) |apply_sm| {
             apply_sm.deinit();
             self.alloc.destroy(apply_sm);
@@ -4350,8 +4356,8 @@ pub const DataServer = struct {
         self.provisioned_index_repair_cancel_groups.deinit(self.alloc);
         self.provisioned_index_repair_routes.deinit(self.alloc);
         self.store_status_heartbeat_cache.clear(self.alloc);
-        self.write_source.deinit();
         self.provisioned_storage.deinit();
+        self.write_source.deinit();
         if (self.remote_metadata) |remote_metadata| {
             remote_metadata.deinit();
             self.alloc.destroy(remote_metadata);

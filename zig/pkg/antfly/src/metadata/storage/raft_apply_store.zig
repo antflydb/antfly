@@ -275,6 +275,29 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
     }
 }
 
+test "metadata raft apply store decodes range values before split attempt epochs" {
+    const encoded = try encodeRangeRecord(std.testing.allocator, .{
+        .group_id = 901,
+        .range_id = 902,
+        .table_id = 903,
+        .start_key = "a",
+        .end_key = "z",
+        .doc_identity_shard_id = 904,
+        .doc_identity_range_id = 905,
+        .split_attempt_epoch = 7,
+    });
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(encoded.len >= @sizeOf(u64));
+
+    const legacy = encoded[0 .. encoded.len - @sizeOf(u64)];
+    const decoded = try decodeRangeRecord(std.testing.allocator, legacy);
+    defer metadata_table_manager.freeRange(std.testing.allocator, decoded);
+    try std.testing.expectEqual(@as(u64, 901), decoded.group_id);
+    try std.testing.expectEqual(@as(u64, 902), decoded.range_id);
+    try std.testing.expectEqual(@as(u64, 903), decoded.table_id);
+    try std.testing.expectEqual(@as(u64, 0), decoded.split_attempt_epoch);
+}
+
 fn validateRestoreJobLogicalKey(key: []const u8) !void {
     if (key.len <= restore_job_logical_prefix.len or key.len > max_restore_job_logical_key_bytes or
         !std.mem.startsWith(u8, key, restore_job_logical_prefix)) return error.InvalidRestoreJobRecord;
@@ -4711,7 +4734,13 @@ fn readRangeRecord(
         try readInt(encoded, pos, u64)
     else
         0;
-    const split_attempt_epoch = try readInt(encoded, pos, u64);
+    // Range values are independently length-delimited by the metadata store.
+    // Older v1 values end after the identity fields, so appended fields must
+    // remain optional for rolling upgrades and snapshot/log replay.
+    const split_attempt_epoch = if (pos.* < encoded.len)
+        try readInt(encoded, pos, u64)
+    else
+        0;
     return .{
         .group_id = group_id,
         .range_id = if (range_id == 0) group_id else range_id,

@@ -58,6 +58,9 @@ pub const DataOperation = union(enum) {
     acknowledge_split: SplitAcknowledgement,
     finalize_split: SplitTransition,
     rollback_split: SplitTransition,
+    /// Internal apply boundary. Split deltas use the committed Raft index as
+    /// their stable cursor, independent of each replica's apply batching.
+    flush_split_delta: u64,
 };
 
 pub const SplitTransition = struct {
@@ -73,6 +76,48 @@ pub const SplitAcknowledgement = struct {
     destination_group_id: u64,
     delta_sequence: u64,
 };
+
+const SplitAcknowledgementIdentity = struct {
+    transition_id: u64,
+    attempt_epoch: u64,
+    destination_group_id: u64,
+};
+
+fn decodeSplitAcknowledgement(raw: []const u8, identity: ?SplitAcknowledgementIdentity) !SplitAcknowledgement {
+    return switch (raw.len) {
+        16 => legacy: {
+            const expected = identity orelse return error.InvalidSplitAcknowledgement;
+            const destination_group_id = std.mem.readInt(u64, raw[0..8], .little);
+            if (destination_group_id != expected.destination_group_id) return error.InvalidSplitAcknowledgement;
+            break :legacy .{
+                .transition_id = expected.transition_id,
+                .attempt_epoch = expected.attempt_epoch,
+                .destination_group_id = destination_group_id,
+                .delta_sequence = std.mem.readInt(u64, raw[8..16], .little),
+            };
+        },
+        24 => legacy: {
+            const expected = identity orelse return error.InvalidSplitAcknowledgement;
+            const transition_id = std.mem.readInt(u64, raw[0..8], .little);
+            const destination_group_id = std.mem.readInt(u64, raw[8..16], .little);
+            if (transition_id != expected.transition_id or destination_group_id != expected.destination_group_id)
+                return error.InvalidSplitAcknowledgement;
+            break :legacy .{
+                .transition_id = transition_id,
+                .attempt_epoch = expected.attempt_epoch,
+                .destination_group_id = destination_group_id,
+                .delta_sequence = std.mem.readInt(u64, raw[16..24], .little),
+            };
+        },
+        32 => .{
+            .transition_id = std.mem.readInt(u64, raw[0..8], .little),
+            .attempt_epoch = std.mem.readInt(u64, raw[8..16], .little),
+            .destination_group_id = std.mem.readInt(u64, raw[16..24], .little),
+            .delta_sequence = std.mem.readInt(u64, raw[24..32], .little),
+        },
+        else => error.InvalidSplitAcknowledgement,
+    };
+}
 
 pub const SplitTerminalOutcome = enum(u8) {
     finalized = 1,
@@ -313,13 +358,21 @@ pub fn currentSplitAcknowledgement(store: *docstore.DocStore, alloc: std.mem.All
         else => return err,
     };
     defer alloc.free(raw);
-    if (raw.len != 32) return error.InvalidSplitAcknowledgement;
-    return .{
-        .transition_id = std.mem.readInt(u64, raw[0..8], .little),
-        .attempt_epoch = std.mem.readInt(u64, raw[8..16], .little),
-        .destination_group_id = std.mem.readInt(u64, raw[16..24], .little),
-        .delta_sequence = std.mem.readInt(u64, raw[24..32], .little),
-    };
+    if (raw.len == 32) return try decodeSplitAcknowledgement(raw, null);
+    const split_state = try currentSplitState(store, alloc, group_id);
+    defer if (split_state) |state| freeSplitState(alloc, state);
+    const terminal = if (split_state == null) try currentSplitTerminal(store, alloc, group_id) else null;
+    defer if (terminal) |state| freeSplitTerminal(alloc, state);
+    const identity: ?SplitAcknowledgementIdentity = if (split_state) |state| .{
+        .transition_id = state.transition_id,
+        .attempt_epoch = state.attempt_epoch,
+        .destination_group_id = state.new_shard_id,
+    } else if (terminal) |state| .{
+        .transition_id = state.transition_id,
+        .attempt_epoch = state.attempt_epoch,
+        .destination_group_id = state.destination_group_id,
+    } else null;
+    return try decodeSplitAcknowledgement(raw, identity);
 }
 
 pub fn currentSplitTerminal(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) !?AppliedSplitTerminal {
@@ -838,7 +891,7 @@ fn validateGroupStateSnapshotEntryBounds(
 
     var state_entry: ?AppliedDataKV = null;
     var sequence: ?u64 = null;
-    var acknowledgement: ?SplitAcknowledgement = null;
+    var acknowledgement_entry: ?AppliedDataKV = null;
     var terminal_entry: ?AppliedDataKV = null;
     var delta_count: u64 = 0;
     var max_delta_sequence: u64 = 0;
@@ -863,12 +916,7 @@ fn validateGroupStateSnapshotEntryBounds(
         switch (kind) {
             .split_state => state_entry = control,
             .delta_sequence => sequence = std.mem.readInt(u64, control.value[0..8], .little),
-            .acknowledgement => acknowledgement = .{
-                .transition_id = std.mem.readInt(u64, control.value[0..8], .little),
-                .attempt_epoch = std.mem.readInt(u64, control.value[8..16], .little),
-                .destination_group_id = std.mem.readInt(u64, control.value[16..24], .little),
-                .delta_sequence = std.mem.readInt(u64, control.value[24..32], .little),
-            },
+            .acknowledgement => acknowledgement_entry = control,
             .terminal => terminal_entry = control,
             .delta => |delta_sequence| {
                 if (delta_sequence == 0 or delta_sequence <= previous_delta_sequence)
@@ -883,7 +931,7 @@ fn validateGroupStateSnapshotEntryBounds(
     const source_sequence = sequence orelse 0;
     if ((delta_count > 0 and sequence == null) or
         max_delta_sequence > source_sequence or
-        (delta_count > 0 and (delta_count != max_delta_sequence or max_delta_sequence != source_sequence)))
+        (delta_count > 0 and max_delta_sequence != source_sequence))
     {
         return error.InvalidGroupStateSnapshot;
     }
@@ -894,6 +942,20 @@ fn validateGroupStateSnapshotEntryBounds(
     var terminal: ?AppliedSplitTerminal = null;
     defer if (terminal) |value| freeSplitTerminal(alloc, value);
     if (terminal_entry) |entry| terminal = decodeSplitTerminalAlloc(alloc, entry.value) catch return error.InvalidGroupStateSnapshot;
+
+    const acknowledgement_identity: ?SplitAcknowledgementIdentity = if (state) |active| .{
+        .transition_id = active.transition_id,
+        .attempt_epoch = active.attempt_epoch,
+        .destination_group_id = active.new_shard_id,
+    } else if (terminal) |completed| .{
+        .transition_id = completed.transition_id,
+        .attempt_epoch = completed.attempt_epoch,
+        .destination_group_id = completed.destination_group_id,
+    } else null;
+    const acknowledgement = if (acknowledgement_entry) |entry|
+        decodeSplitAcknowledgement(entry.value, acknowledgement_identity) catch return error.InvalidGroupStateSnapshot
+    else
+        null;
 
     if (state) |active| {
         if (sequence == null) return error.InvalidGroupStateSnapshot;
@@ -983,15 +1045,8 @@ fn validateGroupControlEntry(alloc: std.mem.Allocator, group_id: u64, entry: App
             }
         },
         .delta_sequence => if (entry.value.len != 8) return error.InvalidGroupStateSnapshot,
-        .acknowledgement => {
-            if (entry.value.len != 32 or
-                std.mem.readInt(u64, entry.value[0..8], .little) == 0 or
-                std.mem.readInt(u64, entry.value[8..16], .little) == 0 or
-                std.mem.readInt(u64, entry.value[16..24], .little) == 0)
-            {
-                return error.InvalidGroupStateSnapshot;
-            }
-        },
+        .acknowledgement => if (entry.value.len != 16 and entry.value.len != 24 and entry.value.len != 32)
+            return error.InvalidGroupStateSnapshot,
         .terminal => {
             const terminal = decodeSplitTerminalAlloc(alloc, entry.value) catch return error.InvalidGroupStateSnapshot;
             defer freeSplitTerminal(alloc, terminal);
@@ -1311,6 +1366,56 @@ fn appendSplitAcknowledgementClear(
     try deletes.append(alloc, try alloc.dupe(u8, key));
 }
 
+fn appendPendingSplitDelta(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    sequence: u64,
+    delta_writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    delta_deletes: *std.ArrayListUnmanaged([]u8),
+    writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    deletes: *std.ArrayListUnmanaged([]u8),
+) !void {
+    if (sequence == 0) return error.InvalidSplitDeltaSequence;
+    if (delta_writes.items.len == 0 and delta_deletes.items.len == 0) return;
+
+    const delta_writes_view = try alloc.alloc(docstore.KVPair, delta_writes.items.len);
+    defer alloc.free(delta_writes_view);
+    for (delta_writes.items, 0..) |write, i| {
+        delta_writes_view[i] = .{ .key = write.key, .value = write.value };
+    }
+    const delta_deletes_view = try alloc.alloc([]const u8, delta_deletes.items.len);
+    defer alloc.free(delta_deletes_view);
+    for (delta_deletes.items, 0..) |key, i| delta_deletes_view[i] = key;
+
+    const encoded_delta = try shard_mod.encodeSplitDeltaAlloc(alloc, 0, delta_writes_view, delta_deletes_view);
+    defer alloc.free(encoded_delta);
+    const delta_key = try groupSplitDeltaKeyAlloc(alloc, group_id, sequence);
+    errdefer alloc.free(delta_key);
+    const delta_value = try alloc.dupe(u8, encoded_delta);
+    errdefer alloc.free(delta_value);
+    removeOwnedWriteByKey(alloc, writes, delta_key);
+    removeDeleteByKey(alloc, deletes, delta_key);
+    try writes.append(alloc, .{ .key = delta_key, .value = delta_value });
+
+    const sequence_key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
+    errdefer alloc.free(sequence_key);
+    removeOwnedWriteByKey(alloc, writes, sequence_key);
+    removeDeleteByKey(alloc, deletes, sequence_key);
+    var sequence_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &sequence_buf, sequence, .little);
+    const sequence_value = try alloc.dupe(u8, &sequence_buf);
+    errdefer alloc.free(sequence_value);
+    try writes.append(alloc, .{ .key = sequence_key, .value = sequence_value });
+
+    for (delta_writes.items) |write| {
+        alloc.free(write.key);
+        alloc.free(write.value);
+    }
+    delta_writes.clearRetainingCapacity();
+    for (delta_deletes.items) |key| alloc.free(key);
+    delta_deletes.clearRetainingCapacity();
+}
+
 pub fn appendOperationEffects(
     store: *docstore.DocStore,
     alloc: std.mem.Allocator,
@@ -1332,7 +1437,10 @@ pub fn appendOperationEffects(
         try currentSplitAcknowledgement(store, alloc, group_id)
     else
         null;
-    const source_delta_sequence = if (needs_split_ack)
+    // Avoid an extra metadata lookup on the overwhelmingly common unsplit
+    // write path. Acknowledgements require an active split and delta capture
+    // only exists while split state is present.
+    var source_delta_sequence = if (split_state != null)
         try currentSplitDeltaSequence(store, alloc, group_id)
     else
         0;
@@ -1671,34 +1779,35 @@ pub fn appendOperationEffects(
             freeSplitState(alloc, split_state.?);
             split_state = null;
         },
+        .flush_split_delta => |raft_index| {
+            if (split_state != null and split_state.?.phase == .splitting and
+                (delta_writes.items.len > 0 or delta_deletes.items.len > 0))
+            {
+                if (raft_index <= source_delta_sequence) return error.InvalidSplitDeltaSequence;
+                try appendPendingSplitDelta(
+                    alloc,
+                    group_id,
+                    raft_index,
+                    &delta_writes,
+                    &delta_deletes,
+                    writes,
+                    deletes,
+                );
+                source_delta_sequence = raft_index;
+            }
+        },
     };
 
     if (split_state != null and split_state.?.phase == .splitting and (delta_writes.items.len > 0 or delta_deletes.items.len > 0)) {
-        const next_seq = (try currentSplitDeltaSequence(store, alloc, group_id)) + 1;
-        const delta_writes_view = try alloc.alloc(docstore.KVPair, delta_writes.items.len);
-        defer alloc.free(delta_writes_view);
-        for (delta_writes.items, 0..) |write, i| {
-            delta_writes_view[i] = .{ .key = write.key, .value = write.value };
-        }
-        const delta_deletes_view = try alloc.alloc([]const u8, delta_deletes.items.len);
-        defer alloc.free(delta_deletes_view);
-        for (delta_deletes.items, 0..) |key, i| delta_deletes_view[i] = key;
-
-        const encoded_delta = try shard_mod.encodeSplitDeltaAlloc(alloc, 0, delta_writes_view, delta_deletes_view);
-        defer alloc.free(encoded_delta);
-        const delta_key = try groupSplitDeltaKeyAlloc(alloc, group_id, next_seq);
-        errdefer alloc.free(delta_key);
-        const delta_value = try alloc.dupe(u8, encoded_delta);
-        errdefer alloc.free(delta_value);
-        try writes.append(alloc, .{ .key = delta_key, .value = delta_value });
-
-        const delta_seq_key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
-        errdefer alloc.free(delta_seq_key);
-        var seq_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &seq_buf, next_seq, .little);
-        const seq_value = try alloc.dupe(u8, &seq_buf);
-        errdefer alloc.free(seq_value);
-        try writes.append(alloc, .{ .key = delta_seq_key, .value = seq_value });
+        try appendPendingSplitDelta(
+            alloc,
+            group_id,
+            std.math.add(u64, source_delta_sequence, 1) catch return error.InvalidSplitDeltaSequence,
+            &delta_writes,
+            &delta_deletes,
+            writes,
+            deletes,
+        );
     }
 }
 
@@ -2321,6 +2430,55 @@ test "shard state store persists split lifecycle and ownership" {
     };
     try appendOperationEffects(&store, std.testing.allocator, 23, &next_prepare, &writes, &deletes);
     try std.testing.expect(writes.items.len > 0);
+}
+
+test "shard state store decodes legacy split acknowledgement layouts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/legacy-split-ack", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(path_z);
+    var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
+    defer store.close();
+
+    var writes = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
+    defer freeOwnedWrites(std.testing.allocator, &writes);
+    var deletes = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (deletes.items) |key| std.testing.allocator.free(key);
+        deletes.deinit(std.testing.allocator);
+    }
+    const setup = [_]DataOperation{
+        .{ .set_range = .{ .start = @constCast("doc:a"), .end = @constCast("doc:z") } },
+        .{ .prepare_split = .{ .transition_id = 71, .attempt_epoch = 3, .new_shard_id = 72, .split_key = @constCast("doc:m") } },
+        .{ .start_split = .{ .transition_id = 71, .attempt_epoch = 3, .new_shard_id = 72, .split_key = @constCast("doc:m") } },
+    };
+    try appendOperationEffects(&store, std.testing.allocator, 71, &setup, &writes, &deletes);
+    try putOwnedBatch(&store, std.testing.allocator, writes.items, deletes.items);
+
+    const acknowledgement_key = try groupSplitAcknowledgementKeyAlloc(std.testing.allocator, 71);
+    defer std.testing.allocator.free(acknowledgement_key);
+    var v1: [16]u8 = undefined;
+    std.mem.writeInt(u64, v1[0..8], 72, .little);
+    std.mem.writeInt(u64, v1[8..16], 0, .little);
+    try store.put(acknowledgement_key, &v1);
+    const decoded_v1 = (try currentSplitAcknowledgement(&store, std.testing.allocator, 71)) orelse
+        return error.MissingSplitAcknowledgement;
+    try std.testing.expectEqual(@as(u64, 71), decoded_v1.transition_id);
+    try std.testing.expectEqual(@as(u64, 3), decoded_v1.attempt_epoch);
+    try std.testing.expectEqual(@as(u64, 72), decoded_v1.destination_group_id);
+
+    var v2: [24]u8 = undefined;
+    std.mem.writeInt(u64, v2[0..8], 71, .little);
+    std.mem.writeInt(u64, v2[8..16], 72, .little);
+    std.mem.writeInt(u64, v2[16..24], 0, .little);
+    try store.put(acknowledgement_key, &v2);
+    const decoded_v2 = (try currentSplitAcknowledgement(&store, std.testing.allocator, 71)) orelse
+        return error.MissingSplitAcknowledgement;
+    try std.testing.expectEqual(@as(u64, 71), decoded_v2.transition_id);
+    try std.testing.expectEqual(@as(u64, 3), decoded_v2.attempt_epoch);
+    try std.testing.expectEqual(@as(u64, 72), decoded_v2.destination_group_id);
 }
 
 test "shard state snapshot round trips split control state" {

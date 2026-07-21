@@ -739,6 +739,11 @@ pub const RaftApplyStore = struct {
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
         self.waitForSnapshotReadersLocked(shard, group_id);
+        // Staging deliberately releases the shard mutex. Another group on the
+        // same shard may consume the earlier reservation, so re-establish the
+        // capacity contract while exclusively holding the map immediately
+        // before the irreversible generation publication.
+        if (shard.batches.getPtr(group_id) == null) try shard.batches.ensureUnusedCapacity(self.alloc, 1);
         if (shard.stores.fetchRemove(group_id)) |removed| removed.value.close();
         var transition = try preparation.promote();
         defer transition.deinit();
@@ -1261,7 +1266,7 @@ pub const RaftApplyStore = struct {
                     self.alloc.free(range.end);
                 },
                 .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| self.alloc.free(transition.split_key),
-                .acknowledge_split => {},
+                .acknowledge_split, .flush_split_delta => {},
             };
             self.alloc.free(metadata.operations);
         }
@@ -1408,7 +1413,7 @@ pub const RaftApplyStore = struct {
                     alloc.free(range.end);
                 },
                 .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
-                .acknowledge_split => {},
+                .acknowledge_split, .flush_split_delta => {},
             };
             operations.deinit(alloc);
         }
@@ -1421,7 +1426,7 @@ pub const RaftApplyStore = struct {
                         .index = entry.index,
                         .data = try alloc.dupe(u8, entry.data),
                     });
-                    try appendDataOperations(alloc, entry.data, &operations);
+                    try appendDataOperations(alloc, entry.index, entry.data, &operations);
                 },
                 .conf_change, .conf_change_v2 => admin_entry_count += 1,
             }
@@ -1561,11 +1566,14 @@ pub const RaftApplyStore = struct {
 
     fn appendDataOperations(
         alloc: std.mem.Allocator,
+        raft_index: u64,
         data: []const u8,
         operations: *std.ArrayListUnmanaged(DataOperation),
     ) !void {
+        const operation_start = operations.items.len;
         if (!data_raft_batch.looksLikeEnvelope(data)) {
             if (try parseDataOperation(alloc, data)) |op| try operations.append(alloc, op);
+            if (operations.items.len != operation_start) try operations.append(alloc, .{ .flush_split_delta = raft_index });
             return;
         }
 
@@ -1635,6 +1643,7 @@ pub const RaftApplyStore = struct {
                 } });
             }
         }
+        if (operations.items.len != operation_start) try operations.append(alloc, .{ .flush_split_delta = raft_index });
     }
 };
 
@@ -2325,6 +2334,86 @@ test "data raft apply store recovers committed split start after projection gene
     try std.testing.expectEqual(@as(u64, 4), batch.last_entry_index);
 }
 
+test "data raft split cursors are stable across apply batching and acknowledge same-batch writes" {
+    var combined_tmp = std.testing.tmpDir(.{});
+    defer combined_tmp.cleanup();
+    var partitioned_tmp = std.testing.tmpDir(.{});
+    defer partitioned_tmp.cleanup();
+    const combined_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/combined", .{combined_tmp.sub_path});
+    defer std.testing.allocator.free(combined_root);
+    const partitioned_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/partitioned", .{partitioned_tmp.sub_path});
+    defer std.testing.allocator.free(partitioned_root);
+
+    const prepare = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_transition = .{
+            .kind = .prepare,
+            .transition_id = 401,
+            .attempt_epoch = 1,
+            .destination_group_id = 402,
+            .split_key = "doc:m",
+        },
+    });
+    defer std.testing.allocator.free(prepare);
+    const start = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_transition = .{
+            .kind = .start,
+            .transition_id = 401,
+            .attempt_epoch = 1,
+            .destination_group_id = 402,
+            .split_key = "doc:m",
+        },
+    });
+    defer std.testing.allocator.free(start);
+    const acknowledgement = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_checkpoint = .{
+            .kind = .source_ack,
+            .transition_id = 401,
+            .attempt_epoch = 1,
+            .source_group_id = 401,
+            .destination_group_id = 402,
+            .delta_sequence = 4,
+        },
+    });
+    defer std.testing.allocator.free(acknowledgement);
+
+    const entries = [_]raft_engine.core.Entry{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = prepare },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = start },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("put:doc:t=right") },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = acknowledgement },
+    };
+
+    var combined = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = combined_root });
+    defer combined.deinit();
+    const combined_batch = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &entries);
+    defer std.testing.allocator.free(combined_batch);
+    try combined.snapshotBuilder().applyBatch(.{ .group_id = 401, .commit_index = 5, .entries_bytes = combined_batch });
+
+    var partitioned = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = partitioned_root });
+    defer partitioned.deinit();
+    const prefix = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, entries[0..3]);
+    defer std.testing.allocator.free(prefix);
+    try partitioned.snapshotBuilder().applyBatch(.{ .group_id = 401, .commit_index = 3, .entries_bytes = prefix });
+    const write_batch = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, entries[3..4]);
+    defer std.testing.allocator.free(write_batch);
+    try partitioned.snapshotBuilder().applyBatch(.{ .group_id = 401, .commit_index = 4, .entries_bytes = write_batch });
+    const acknowledgement_batch = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, entries[4..5]);
+    defer std.testing.allocator.free(acknowledgement_batch);
+    try partitioned.snapshotBuilder().applyBatch(.{ .group_id = 401, .commit_index = 5, .entries_bytes = acknowledgement_batch });
+
+    for ([_]*RaftApplyStore{ &combined, &partitioned }) |store| {
+        try std.testing.expectEqual(@as(u64, 4), try store.currentSplitDeltaSequence(std.testing.allocator, 401));
+        const ack = (try store.currentSplitAcknowledgement(std.testing.allocator, 401)) orelse
+            return error.MissingSplitAcknowledgement;
+        try std.testing.expectEqual(@as(u64, 4), ack.delta_sequence);
+        const deltas = try store.listSplitDeltasAfter(std.testing.allocator, 401, 0);
+        defer shard_mod.freeDeltas(std.testing.allocator, deltas);
+        try std.testing.expectEqual(@as(usize, 1), deltas.len);
+        try std.testing.expectEqual(@as(u64, 4), deltas[0].sequence);
+    }
+}
+
 test "data raft apply store recovers exact split replay after injected projection corruption" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2964,6 +3053,19 @@ test "data raft snapshot staging blocks only the target group" {
     var attempts: usize = 0;
     while (!test_snapshot_staging_started.load(.acquire) and attempts < 100_000) : (attempts += 1) platform.time.yieldBriefly();
     try std.testing.expect(test_snapshot_staging_started.load(.acquire));
+
+    // Consume and repeatedly grow the colliding shard map while installation
+    // has released its mutex. Publication must re-reserve under the lock; a
+    // reservation made before staging is not a valid putAssumeCapacity lease.
+    for (2..40) |ordinal| {
+        try std.testing.expect(try target.seedGroupSnapshotIfAbsent(
+            std.heap.smp_allocator,
+            @intCast(1 + ordinal * batch_shard_count),
+            1,
+            .{ .start = "other:a", .end = "other:z" },
+            &.{.{ .key = "other:a", .value = "capacity" }},
+        ));
+    }
 
     var read_ctx = ReadContext{ .store = &target };
     var read_thread = try std.Thread.spawn(.{}, ReadContext.run, .{&read_ctx});

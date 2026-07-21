@@ -225,6 +225,16 @@ pub const ProvisionedGroupStorage = struct {
         self.* = undefined;
     }
 
+    /// Break every cache-to-source callback edge while both owners are still
+    /// alive. Call this after attached write sources are quiescent and before
+    /// either the sources or this storage are destroyed.
+    pub fn detachWriteSourceRuntimeHooks(self: *ProvisionedGroupStorage) void {
+        self.startup_write_cache.detachRuntimeHooks();
+        self.write_cache.detachRuntimeHooks();
+        self.startup_write_cache.table_eviction_hook = null;
+        self.write_cache.table_eviction_hook = null;
+    }
+
     pub fn attachSources(
         self: *ProvisionedGroupStorage,
         read_source: *table_reads.ProvisionedTableReadSource,

@@ -1333,7 +1333,7 @@ test "db split destination applies handoff and filtered split deltas" {
         .destination_group_id = 90,
         .bootstrap_complete = true,
     });
-    try std.testing.expectEqual(@as(u64, 1), try dst.appliedDeltaSequence(std.testing.allocator));
+    try std.testing.expectEqual(@as(u64, 6), try dst.appliedDeltaSequence(std.testing.allocator));
     try std.testing.expectEqualStrings("doc:m", dst.getRange().start);
     try std.testing.expectEqualStrings("doc:z", dst.getRange().end);
 
@@ -1353,7 +1353,7 @@ test "db split destination applies handoff and filtered split deltas" {
     defer shard_mod.freeDeltas(std.testing.allocator, deltas);
     try dst.applyDeltas(std.testing.allocator, deltas);
 
-    try std.testing.expectEqual(@as(u64, 2), try dst.appliedDeltaSequence(std.testing.allocator));
+    try std.testing.expectEqual(@as(u64, 9), try dst.appliedDeltaSequence(std.testing.allocator));
     try std.testing.expect((try dst.get(std.testing.allocator, "doc:t")) == null);
     const right = (try dst.get(std.testing.allocator, "doc:x")) orelse return error.TestExpectedEqual;
     defer std.testing.allocator.free(right);
@@ -1482,7 +1482,7 @@ test "db split destination persists handoff state across reopen" {
         const deltas = try src.listSplitDeltasAfter(std.testing.allocator, 111, handoff.base_delta_sequence);
         defer shard_mod.freeDeltas(std.testing.allocator, deltas);
         try dst.applyDeltas(std.testing.allocator, deltas);
-        try std.testing.expectEqual(@as(u64, 1), try dst.appliedDeltaSequence(std.testing.allocator));
+        try std.testing.expectEqual(@as(u64, 5), try dst.appliedDeltaSequence(std.testing.allocator));
     }
 
     {
@@ -1490,7 +1490,7 @@ test "db split destination persists handoff state across reopen" {
         defer reopened.deinit();
         try std.testing.expectEqualStrings("doc:m", reopened.getRange().start);
         try std.testing.expectEqualStrings("doc:z", reopened.getRange().end);
-        try std.testing.expectEqual(@as(u64, 1), try reopened.appliedDeltaSequence(std.testing.allocator));
+        try std.testing.expectEqual(@as(u64, 5), try reopened.appliedDeltaSequence(std.testing.allocator));
         const right = (try reopened.get(std.testing.allocator, "doc:x")) orelse return error.TestExpectedEqual;
         defer std.testing.allocator.free(right);
         try std.testing.expectEqualStrings("{\"v\":\"right-1\"}", right);
@@ -1565,7 +1565,7 @@ test "db split sync coordinator resumes catch-up across source and destination r
         try std.testing.expect(result.replay_required);
         try std.testing.expect(result.replay_caught_up);
         try std.testing.expect(result.cutover_ready);
-        try std.testing.expectEqual(@as(u64, 1), try coord.dest.appliedDeltaSequence(std.testing.allocator));
+        try std.testing.expectEqual(@as(u64, 6), try coord.dest.appliedDeltaSequence(std.testing.allocator));
     }
 
     try coord.reopenSource();
@@ -1577,8 +1577,8 @@ test "db split sync coordinator resumes catch-up across source and destination r
         try std.testing.expect(status.replay_required);
         try std.testing.expect(status.replay_caught_up);
         try std.testing.expect(status.cutover_ready);
-        try std.testing.expectEqual(@as(u64, 1), status.source_delta_sequence);
-        try std.testing.expectEqual(@as(u64, 1), status.dest_delta_sequence);
+        try std.testing.expectEqual(@as(u64, 6), status.source_delta_sequence);
+        try std.testing.expectEqual(@as(u64, 6), status.dest_delta_sequence);
     }
 
     const catchup_2 = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
@@ -1596,11 +1596,13 @@ test "db split sync coordinator resumes catch-up across source and destination r
     {
         const result = try coord.syncOnce();
         try std.testing.expect(!result.bootstrapped);
-        try std.testing.expectEqual(@as(usize, 1), result.applied_deltas);
+        // Each committed entry advances the cluster-stable cursor, including
+        // an entry whose document is filtered out by destination ownership.
+        try std.testing.expectEqual(@as(usize, 3), result.applied_deltas);
         try std.testing.expect(result.replay_required);
         try std.testing.expect(result.replay_caught_up);
         try std.testing.expect(result.cutover_ready);
-        try std.testing.expectEqual(@as(u64, 2), try coord.dest.appliedDeltaSequence(std.testing.allocator));
+        try std.testing.expectEqual(@as(u64, 9), try coord.dest.appliedDeltaSequence(std.testing.allocator));
         try std.testing.expect((try coord.dest.get(std.testing.allocator, "doc:t")) == null);
         const u = (try coord.dest.get(std.testing.allocator, "doc:u")) orelse return error.TestExpectedEqual;
         defer std.testing.allocator.free(u);

@@ -822,6 +822,10 @@ pub const ProvisionedTableWriteCache = struct {
         }
 
         fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
+            // Callback contexts are borrowed from the attached write source.
+            // Establish the callback barrier before finish/close can drain any
+            // worker that publishes a final visibility transition.
+            self.detachRuntimeHooks();
             if (self.bulk_ingest_session_open) {
                 if (self.auto_bulk_ingest_session_open) {
                     self.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
@@ -841,7 +845,6 @@ pub const ProvisionedTableWriteCache = struct {
                 self.auto_bulk_ingest_last_ns = 0;
                 self.auto_bulk_ingest_finish_requested = false;
             }
-            self.detachRuntimeHooks();
             // Read-side cache invalidation must not turn the first query after
             // a large weak-sync load into a full derived-index drain. DB.close()
             // tears down async workers and flushes owned storage; callers that
@@ -1199,6 +1202,18 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.active_bulk_ingest_sessions.items) |*session| session.deinit(self.alloc);
         self.active_bulk_ingest_sessions.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    /// Detach every callback whose context is owned by the write source.
+    /// `setQueryVisibilityHook(null)` is a callback barrier, so once this
+    /// returns cached DB workers can be drained after the source is destroyed
+    /// without retaining a pointer into the source.
+    pub fn detachRuntimeHooks(self: *ProvisionedTableWriteCache) void {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        for (self.entries.items) |entry| entry.detachRuntimeHooks();
+        for (self.retired_entries.items) |entry| entry.detachRuntimeHooks();
+        for (self.closing_entries.items) |entry| entry.detachRuntimeHooks();
     }
 
     fn reserveClearCapacityAssumeLifecycleLocked(self: *ProvisionedTableWriteCache) !void {
@@ -4681,6 +4696,7 @@ pub const ProvisionedTableWriteSource = struct {
     startup_catch_up_backoff_mutex: std.atomic.Mutex = .unlocked,
     startup_catch_up_backoff_epoch: std.atomic.Value(u64) = .init(1),
     startup_catch_up_backoff_alloc: std.mem.Allocator = std.heap.page_allocator,
+    quiesced: bool = false,
     startup_catch_up_backoffs: std.AutoHashMapUnmanaged(u64, StartupCatchUpBackoff) = .empty,
     active_table_activities: std.ArrayListUnmanaged(TableActivity) = .empty,
 
@@ -5082,7 +5098,12 @@ pub const ProvisionedTableWriteSource = struct {
         return owner.source();
     }
 
-    pub fn deinit(self: *ProvisionedTableWriteSource) void {
+    /// Stop every source-owned worker before an attached storage owner begins
+    /// closing cached DBs. This is deliberately separate from `deinit`: cache
+    /// pointers are borrowed, so a standalone source must remain safe to
+    /// destroy after its optional cache owner has already gone away.
+    pub fn quiesce(self: *ProvisionedTableWriteSource) void {
+        if (self.quiesced) return;
         self.drainDroppedTableDeletes();
         const io = self.table_activity_threaded.io();
         self.restore_repair_shutdown.store(true, .release);
@@ -5095,11 +5116,6 @@ pub const ProvisionedTableWriteSource = struct {
         self.startup_catch_up_backoffs.deinit(self.startup_catch_up_backoff_alloc);
         self.startup_catch_up_backoffs = .empty;
         self.startup_catch_up_backoff_mutex.unlock();
-        lockAtomic(&self.dirty_write_tables_mutex);
-        self.clearAllDirtyWriteTablesLocked();
-        self.dirty_write_tables.deinit(std.heap.page_allocator);
-        self.dirty_write_tables = .empty;
-        self.dirty_write_tables_mutex.unlock();
         self.table_activity_mutex.lockUncancelable(io);
         for (self.active_table_activities.items) |entry| {
             std.heap.page_allocator.free(entry.table_name);
@@ -5107,6 +5123,16 @@ pub const ProvisionedTableWriteSource = struct {
         self.active_table_activities.deinit(std.heap.page_allocator);
         self.active_table_activities = .empty;
         self.table_activity_mutex.unlock(io);
+        self.quiesced = true;
+    }
+
+    pub fn deinit(self: *ProvisionedTableWriteSource) void {
+        self.quiesce();
+        lockAtomic(&self.dirty_write_tables_mutex);
+        self.clearAllDirtyWriteTablesLocked();
+        self.dirty_write_tables.deinit(std.heap.page_allocator);
+        self.dirty_write_tables = .empty;
+        self.dirty_write_tables_mutex.unlock();
         self.table_activity_threaded.deinit();
         self.* = undefined;
     }
@@ -10299,6 +10325,7 @@ pub const ProvisionedTableWriteSource = struct {
         const EntryLease = struct {
             cached: ProvisionedTableWriteCache.CachedDb,
             auto: bool,
+            finished: bool = false,
         };
         var leases = std.ArrayListUnmanaged(EntryLease).empty;
         var cache_alloc = alloc;
@@ -10336,22 +10363,34 @@ pub const ProvisionedTableWriteSource = struct {
             if (item.auto) {
                 item.cached.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options) catch |err| {
                     if (first_err == null) first_err = err;
+                    continue;
                 };
             } else {
                 item.cached.db.finishBulkIngestSessionWithOptions(options) catch |err| {
                     if (first_err == null) first_err = err;
+                    continue;
                 };
             }
+            item.finished = true;
         }
 
         lockAtomic(&self.local_db_mutex);
         mutex_locked = true;
         for (leases.items) |*item| {
-            if (item.cached.entry) |entry| ProvisionedTableWriteCache.clearEntryBulkIngestState(entry);
+            if (item.finished) {
+                if (item.cached.entry) |entry| ProvisionedTableWriteCache.clearEntryBulkIngestState(entry);
+            }
         }
         if (cache.findActiveBulkIngestSession(table_name)) |active_idx| {
-            var removed = cache.active_bulk_ingest_sessions.orderedRemove(active_idx);
-            removed.deinit(cache.alloc);
+            if (first_err == null) {
+                var removed = cache.active_bulk_ingest_sessions.orderedRemove(active_idx);
+                removed.deinit(cache.alloc);
+            } else {
+                // Retain the session and only the entries whose finish failed.
+                // A retry must re-enter the real DB finish path rather than
+                // falsely succeeding against forgotten publication debt.
+                cache.active_bulk_ingest_sessions.items[active_idx].state = .active;
+            }
         }
         if (first_err) |err| return err;
         return {};

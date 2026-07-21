@@ -500,10 +500,10 @@ test "public api smoke e2e creates table inserts and queries documents" {
     );
     var provisioned_storage = ProvisionedGroupStorage.init(std.testing.allocator);
     defer {
-        // Attached sources borrow storage callbacks. Drain their workers before
-        // destroying the callback owner, matching DataServer's teardown order.
-        provisioned_write_source.deinit();
+        provisioned_write_source.quiesce();
+        provisioned_storage.detachWriteSourceRuntimeHooks();
         provisioned_storage.deinit();
+        provisioned_write_source.deinit();
     }
     try provisioned_storage.attachSources(&provisioned_read_source, &provisioned_write_source);
     const DirectWriterOwner = struct {

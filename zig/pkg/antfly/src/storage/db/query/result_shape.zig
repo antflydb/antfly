@@ -1069,6 +1069,7 @@ pub fn postprocessTextSearchResult(
         .func = processor.is_visible,
         .filter_many = processor.filter_visible_many,
     });
+    errdefer filtered.deinit();
     filtered = try applyStoredSearchPatternFilters(alloc, req, filtered, .{
         .ctx = processor.ctx,
         .load_stored = processor.load_stored,
@@ -1076,7 +1077,6 @@ pub fn postprocessTextSearchResult(
         .resolve_doc_set_doc_ids = processor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = processor.resolve_doc_ids_to_doc_set,
     });
-    errdefer filtered.deinit();
     try dedupeSearchHitsById(alloc, &filtered);
     if (chunk_backed) {
         const reshaped = try reshapeChunkBackedResult(alloc, req, filtered, .{
@@ -1106,6 +1106,7 @@ pub fn postprocessVectorSearchResult(
         .func = processor.is_visible,
         .filter_many = processor.filter_visible_many,
     });
+    errdefer filtered.deinit();
     if (chunk_backed) {
         filtered = try reshapeChunkBackedResult(alloc, req, filtered, .{
             .ctx = processor.ctx,
@@ -1722,6 +1723,39 @@ test "postprocessTextSearchResult forwards batch stored loader to pattern filter
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "search result postprocessing releases owned hits when stored filtering fails" {
+    const alloc = std.testing.allocator;
+    const Failure = struct {
+        fn loadStored(_: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+            return error.TestStoredLoadFailure;
+        }
+    };
+    const processor = SearchResultPostprocessor{
+        .ctx = null,
+        .is_visible = TestPostprocessor.isVisible,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
+        .load_stored = Failure.loadStored,
+    };
+    const request = types.SearchRequest{ .filter_query_json = "{\"term\":{\"title\":\"alpha\"}}" };
+
+    var text_hits = try alloc.alloc(types.SearchHit, 1);
+    text_hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    try std.testing.expectError(error.TestStoredLoadFailure, postprocessTextSearchResult(alloc, request, .{
+        .alloc = alloc,
+        .hits = text_hits,
+        .total_hits = 1,
+    }, false, processor));
+
+    var vector_hits = try alloc.alloc(types.SearchHit, 1);
+    vector_hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    try std.testing.expectError(error.TestStoredLoadFailure, postprocessVectorSearchResult(alloc, request, .{
+        .alloc = alloc,
+        .hits = vector_hits,
+        .total_hits = 1,
+    }, false, processor));
 }
 
 const TestChunkParentShaper = struct {

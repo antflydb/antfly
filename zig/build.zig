@@ -2492,6 +2492,8 @@ pub fn build(b: *std.Build) void {
             "named index repair cancellation restarts its durable traversal after job store recovery",
             "durable cancellation retries transient failures with backoff",
             "durable cancellation scan rotates past a backed off head window",
+            "table repair job recovery quarantines corrupt primary without blocking service",
+            "active repair job recovery quarantines malformed secondary entries",
             "api http client maps remote repair cancel unavailable",
             "api http client encodes table name for repair cancel callback",
             "public api routes compile",
@@ -3577,6 +3579,8 @@ pub fn build(b: *std.Build) void {
     const lib_data_storage_default_filters = [_][]const u8{
         "data storage module tests are reachable",
         "db split destination read-only open does not create missing root",
+        "db split destination applies handoff and filtered split deltas",
+        "db split destination persists handoff state across reopen",
         "db split sync coordinator allocates destination identity namespace",
         "db split status rejects stale destination identity namespace",
         "db split status borrows the live raft apply store without a second writer",
@@ -3598,12 +3602,15 @@ pub fn build(b: *std.Build) void {
         "data raft apply store rejects a regressing source generation during active split",
         "data raft apply store rejects mismatched terminal split identity",
         "data raft apply store persists split destination acknowledgements",
+        "data raft split cursors are stable across apply batching and acknowledge same-batch writes",
         "data raft apply store seeds pre-raft snapshots once at reserved index zero",
         "data raft apply store refuses stale snapshot projection regression",
+        "data raft snapshot staging blocks only the target group",
         "raft batch round trips internal split checkpoint",
         "raft batch round trips internal split replication identity",
         "group state range scan is allocation-failure safe",
         "shard state store persists split lifecycle and ownership",
+        "shard state store decodes legacy split acknowledgement layouts",
         "shard state snapshot round trips split control state",
         "shard state snapshot rejects duplicate and out-of-range documents",
         "shard state store finalize split reclaims right-hand document range",
@@ -3622,36 +3629,26 @@ pub fn build(b: *std.Build) void {
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
     };
+    const lib_data_storage_runtime_filters = selectTestFilters(b, &lib_data_storage_default_filters);
     const lib_data_storage_tests = b.addTest(.{
         .root_module = data_storage_test_mod,
-        .filters = selectTestFilters(b, &lib_data_storage_default_filters),
+        .filters = compileFiltersWithAnchors(
+            b,
+            &.{"data storage module tests are reachable"},
+            lib_data_storage_runtime_filters,
+        ),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lib_data_storage_tests = addFilteredTestRunArtifact(b, lib_data_storage_tests);
+    const run_lib_data_storage_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lib_data_storage_tests,
+        lib_data_storage_runtime_filters,
+    );
     const lib_data_storage_test_step = b.step("lib-data-storage-test", "Run focused data storage tests");
     lib_data_storage_test_step.dependOn(&run_lib_data_storage_tests.step);
-
-    // The focused data-storage root imports the production storage modules, so
-    // its imported tests are already owned by the broad root storage artifact.
-    // Keep only the three contracts declared exclusively by this wrapper in
-    // the aggregate; equivalent coordinator tests live with the production
-    // module and are selected by the broad storage artifact.
-    const unit_data_storage_root_tests = b.addTest(.{
-        .root_module = data_storage_test_mod,
-        .filters = &.{
-            "data storage module tests are reachable",
-            "raft snapshot durability tests are reachable",
-            "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_unit_data_storage_root_tests = addFilteredTestRunArtifact(b, unit_data_storage_root_tests);
 
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -5530,7 +5527,10 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_introducer_tests.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
     unit_test_step.dependOn(&run_lib_data_runtime_tests.step);
-    unit_test_step.dependOn(&run_unit_data_storage_root_tests.step);
+    // Data storage has its own root module, so the root-module `storage.` union
+    // cannot discover these split, snapshot, and replica-state contracts. Share
+    // the focused artifact with the aggregate to run the curated bucket once.
+    unit_test_step.dependOn(&run_lib_data_storage_tests.step);
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
