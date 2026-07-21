@@ -69,6 +69,7 @@ const store_status_heartbeat_interval_ms: u64 = 30 * std.time.ms_per_s;
 const StoreStatusReportKind = enum { none, heartbeat, full };
 const metadata_head_cache_ttl_ms: u64 = std.time.ms_per_s;
 const metadata_snapshot_cache_ttl_ms: u64 = std.time.ms_per_s;
+const remote_metadata_http_executor_pool_size: usize = 4;
 const provision_head_poll_startup_interval_ms: u64 = std.time.ms_per_s;
 const provision_head_poll_interval_ms: u64 = 5 * std.time.ms_per_s;
 const runtime_status_refresh_interval_ms: u64 = std.time.ms_per_s;
@@ -4350,11 +4351,11 @@ pub const DataServer = struct {
         self.store_status_heartbeat_cache.clear(self.alloc);
         self.write_source.deinit();
         self.provisioned_storage.deinit();
-        if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.remote_metadata) |remote_metadata| {
             remote_metadata.deinit();
             self.alloc.destroy(remote_metadata);
         }
+        if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.query_io_impl) |*io_impl| io_impl.deinit();
         self.listener = null;
         self.http_server = null;
@@ -9995,14 +9996,19 @@ pub const DataServer = struct {
         cfg: DataServerConfig,
         metadata_api_urls: []const []const u8,
     ) !DataServer {
-        const remote_metadata = try alloc.create(RemoteMetadataSource);
-        errdefer alloc.destroy(remote_metadata);
-        remote_metadata.* = try RemoteMetadataSource.init(alloc, metadata_api_urls);
-        errdefer remote_metadata.deinit();
-
         var owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null;
         errdefer if (owned_backend_runtime) |*runtime| runtime.deinit();
         var backend_runtime = cfg.backend_runtime;
+        if (backend_runtime == null) {
+            owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+            backend_runtime = owned_backend_runtime.?.ptr();
+        }
+        const api_io_impl = backend_runtime.?.apiIoImpl() orelse return error.HttpRuntimeUnavailable;
+
+        const remote_metadata = try alloc.create(RemoteMetadataSource);
+        errdefer alloc.destroy(remote_metadata);
+        remote_metadata.* = try RemoteMetadataSource.init(alloc, metadata_api_urls, api_io_impl);
+        errdefer remote_metadata.deinit();
 
         var data_raft_store: ?*raft_engine.core.MemoryStorage = null;
         errdefer if (data_raft_store) |store| {
@@ -10027,10 +10033,6 @@ pub const DataServer = struct {
 
         if (cfg.enable_data_raft) {
             if (cfg.store_registration) |registration| {
-                if (backend_runtime == null) {
-                    owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
-                    backend_runtime = owned_backend_runtime.?.ptr();
-                }
                 const raft_backend_runtime = backend_runtime.?;
 
                 data_raft_store = try alloc.create(raft_engine.core.MemoryStorage);
@@ -10358,17 +10360,29 @@ const RemoteMetadataSource = struct {
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     cached_snapshot_at_ms: u64 = 0,
-    http_executor: *antfly.raft.transport.std_http_executor.StdHttpExecutor,
+    http_executors: []antfly.raft.transport.std_http_executor.StdHttpExecutor,
+    next_http_executor: std.atomic.Value(usize) = .init(0),
     test_faults: TestFaults = .{},
 
-    fn init(alloc: std.mem.Allocator, base_uris: []const []const u8) !RemoteMetadataSource {
+    fn init(
+        alloc: std.mem.Allocator,
+        base_uris: []const []const u8,
+        io_impl: *std.Io.Threaded,
+    ) !RemoteMetadataSource {
         if (base_uris.len == 0) return error.MissingMetadataApi;
-        const http_executor = try alloc.create(antfly.raft.transport.std_http_executor.StdHttpExecutor);
-        errdefer alloc.destroy(http_executor);
-        http_executor.* = antfly.raft.transport.std_http_executor.StdHttpExecutor.init(alloc, .{
-            .keep_alive = true,
-        });
-        errdefer http_executor.deinit();
+        const http_executors = try alloc.alloc(
+            antfly.raft.transport.std_http_executor.StdHttpExecutor,
+            remote_metadata_http_executor_pool_size,
+        );
+        var executors_initialized: usize = 0;
+        errdefer {
+            for (http_executors[0..executors_initialized]) |*executor| executor.deinit();
+            alloc.free(http_executors);
+        }
+        for (http_executors) |*executor| {
+            executor.initSharedInPlace(alloc, .{ .keep_alive = true }, io_impl);
+            executors_initialized += 1;
+        }
         var owned = try alloc.alloc([]u8, base_uris.len);
         var initialized: usize = 0;
         errdefer {
@@ -10382,21 +10396,24 @@ const RemoteMetadataSource = struct {
         return .{
             .alloc = alloc,
             .base_uris = owned,
-            .http_executor = http_executor,
+            .http_executors = http_executors,
         };
     }
 
     fn deinit(self: *RemoteMetadataSource) void {
-        // Stop and drain requests before releasing endpoint and cache storage
-        // that in-flight metadata calls may still reference.
-        self.http_executor.deinit();
-        self.alloc.destroy(self.http_executor);
+        for (self.http_executors) |*executor| executor.deinit();
+        self.alloc.free(self.http_executors);
         lockAtomic(&self.cache_mutex);
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         for (self.base_uris) |uri| self.alloc.free(uri);
         self.alloc.free(self.base_uris);
         self.cache_mutex.unlock();
         self.* = undefined;
+    }
+
+    fn httpExecutor(self: *RemoteMetadataSource) antfly.common.http.RequestExecutor {
+        const sequence = self.next_http_executor.fetchAdd(1, .monotonic);
+        return self.http_executors[sequence % self.http_executors.len].executor();
     }
 
     fn metadataApiIndexForAttempt(self: *RemoteMetadataSource, attempt: usize) usize {
@@ -10579,7 +10596,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.http_executor.executor());
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
             const head = metadata_client.fetchHead(self.base_uris[index]) catch |err| {
                 last_err = err;
                 continue;
@@ -10606,7 +10623,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.http_executor.executor());
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
             const head = metadata_client.fetchHead(self.base_uris[index]) catch |err| {
                 last_err = err;
                 continue;
@@ -10629,7 +10646,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.http_executor.executor());
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
             const status = metadata_client.fetchStatus(self.base_uris[index]) catch |err| {
                 last_err = err;
                 continue;
@@ -10654,7 +10671,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.http_executor.executor());
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
             var parsed = metadata_client.fetchSnapshot(self.base_uris[index]) catch |err| {
                 last_err = err;
                 continue;
@@ -10704,7 +10721,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.http_executor.executor());
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
             const valid = metadata_client.validateCatalogPublication(self.base_uris[index], contract) catch |err| {
                 last_err = err;
                 continue;
@@ -10726,7 +10743,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.http_executor.executor());
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
             const valid = metadata_client.validateCatalogTablePublication(self.base_uris[index], contract) catch |err| {
                 last_err = err;
                 continue;
@@ -18324,9 +18341,11 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-active", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
 
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
     const remote_metadata = try alloc.create(RemoteMetadataSource);
     const metadata_api_urls = [_][]const u8{"http://metadata.test"};
-    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls);
+    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls, backend_runtime.ptr().apiIoImpl().?);
 
     var server: DataServer = .{
         .alloc = alloc,
@@ -18350,6 +18369,7 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
         .status_source = undefined,
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
+        .backend_runtime = backend_runtime.ptr(),
         .listener_cfg = undefined,
     };
     defer server.deinit();
@@ -18380,9 +18400,11 @@ test "data runtime runRound backs off retryable provision metadata failures" {
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-metadata-backoff", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
 
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
     const remote_metadata = try alloc.create(RemoteMetadataSource);
     const metadata_api_urls = [_][]const u8{"http://metadata.test"};
-    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls);
+    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls, backend_runtime.ptr().apiIoImpl().?);
     remote_metadata.test_faults.fetch_head_error = error.NotLeader;
 
     var server: DataServer = .{
@@ -18407,6 +18429,7 @@ test "data runtime runRound backs off retryable provision metadata failures" {
         .status_source = undefined,
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
+        .backend_runtime = backend_runtime.ptr(),
         .listener_cfg = undefined,
     };
     defer server.deinit();
@@ -18448,9 +18471,11 @@ test "data runtime provisioned root refresh worker backs off retryable metadata 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-worker-backoff", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
 
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
     const remote_metadata = try alloc.create(RemoteMetadataSource);
     const metadata_api_urls = [_][]const u8{"http://metadata.test"};
-    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls);
+    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls, backend_runtime.ptr().apiIoImpl().?);
     remote_metadata.test_faults.fetch_head_error = error.NotLeader;
 
     var server: DataServer = .{
@@ -18475,6 +18500,7 @@ test "data runtime provisioned root refresh worker backs off retryable metadata 
         .status_source = undefined,
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
+        .backend_runtime = backend_runtime.ptr(),
         .listener_cfg = undefined,
     };
     defer server.deinit();
@@ -22117,7 +22143,13 @@ test "data runtime background maintenance is due for dense posting cadence witho
 test "remote metadata source pins one cluster incarnation across cache invalidation" {
     const first: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
     const foreign: antfly.metadata_api.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
-    var source = try RemoteMetadataSource.init(std.testing.allocator, &.{"http://metadata.invalid"});
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
     defer source.deinit();
 
     try source.acceptMetadataIncarnation(first);
@@ -22129,4 +22161,27 @@ test "remote metadata source pins one cluster incarnation across cache invalidat
         error.InvalidMetadataIncarnation,
         source.acceptMetadataIncarnation(antfly.metadata.incarnation.zero),
     );
+}
+
+test "remote metadata source shares backend runtime io across a bounded executor pool" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    const api_io_impl = backend_runtime.ptr().apiIoImpl().?;
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        api_io_impl,
+    );
+    defer source.deinit();
+
+    try std.testing.expectEqual(remote_metadata_http_executor_pool_size, source.http_executors.len);
+    for (source.http_executors) |*executor| {
+        try std.testing.expect(executor.io_impl == api_io_impl);
+        try std.testing.expectEqual(.shared, executor.io_owner);
+        try std.testing.expect(executor.cfg.keep_alive);
+    }
+    for (source.http_executors) |*expected| {
+        try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(expected)));
+    }
+    try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(&source.http_executors[0])));
 }

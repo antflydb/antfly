@@ -3531,6 +3531,7 @@ pub fn build(b: *std.Build) void {
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
+        "remote metadata source shares backend runtime io across a bounded executor pool",
         "data runtime treats metadata leadership churn as retryable bootstrap failure",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "idle cached runtime status stays fresh only for the published root generation",
@@ -5045,6 +5046,7 @@ pub fn build(b: *std.Build) void {
             "metadata control loop can drive the real metadata service",
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
+            "metadata http service catalog cache is independent from volatile projection traffic",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

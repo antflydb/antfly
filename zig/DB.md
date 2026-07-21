@@ -190,7 +190,11 @@ is allocation-free against the metadata owner's immutable projection, O(1) on
 the wire, and detects ranges added, removed, or mutated after capture. Metadata
 maintains this projection behind a catalog-only epoch: store reports, placement
 progress, and other control-plane traffic cannot evict it. A table or range
-change rebuilds the compact projection once; warm validation is O(1).
+change rebuilds the compact projection once; warm validation is O(1). The
+catalog projection is the sole owner of cloned table and range records. The
+volatile status projection owns only store, progress, placement, and transition
+records and advances on a separate epoch, avoiding duplicate catalog retention
+and cross-domain rebuilds.
 
 A dequeue advances at most a fixed number of pending groups, removes completed
 groups in O(1), and rotates busy groups rather than replaying successful work.
@@ -530,8 +534,11 @@ and an order-independent digest of every range record. Metadata services build
 non-owning table/range maps and table topology digests once per stable catalog
 epoch; subsequent contract validation is O(1) and does not allocate or scan an
 admin snapshot. Remote data nodes use the same required internal validation
-route through one long-lived, concurrency-safe HTTP executor and fail closed if
-either group or whole-table fencing is unavailable.
+route through a bounded pool of keep-alive clients sharing the process
+`BackendRuntime` API I/O lane. This preserves connection reuse and bounded
+concurrency without allocating an I/O runtime per request or serializing all
+control-plane traffic. Nodes fail closed if either group or whole-table fencing
+is unavailable.
 
 Each bounded reconciliation quantum receives one whole-table admission fence.
 It captures the table runtime-cache epoch before opening storage, retains owned

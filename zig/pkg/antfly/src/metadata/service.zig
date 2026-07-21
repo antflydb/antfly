@@ -504,6 +504,13 @@ fn projectionSignalChangesCatalog(kind: metadata_storage.raft_apply_store.Projec
     };
 }
 
+fn projectionSignalChangesProjectedCore(kind: metadata_storage.raft_apply_store.ProjectionSignalKind) bool {
+    return switch (kind) {
+        .store, .shuffle_join_lease, .schema_progress, .restore_progress, .replication_source_status => true,
+        else => false,
+    };
+}
+
 test "metadata service catalog validation epoch ignores non-catalog projection traffic" {
     try std.testing.expect(projectionSignalChangesCatalog(.table));
     try std.testing.expect(projectionSignalChangesCatalog(.range));
@@ -517,6 +524,19 @@ test "metadata service catalog validation epoch ignores non-catalog projection t
     try std.testing.expect(!projectionSignalChangesCatalog(.placement_intent));
     try std.testing.expect(!projectionSignalChangesCatalog(.split_transition));
     try std.testing.expect(!projectionSignalChangesCatalog(.merge_transition));
+
+    try std.testing.expect(!projectionSignalChangesProjectedCore(.table));
+    try std.testing.expect(!projectionSignalChangesProjectedCore(.range));
+    try std.testing.expect(projectionSignalChangesProjectedCore(.store));
+    try std.testing.expect(projectionSignalChangesProjectedCore(.shuffle_join_lease));
+    try std.testing.expect(projectionSignalChangesProjectedCore(.schema_progress));
+    try std.testing.expect(projectionSignalChangesProjectedCore(.restore_progress));
+    try std.testing.expect(projectionSignalChangesProjectedCore(.replication_source_status));
+    try std.testing.expect(!projectionSignalChangesProjectedCore(.placement_intent));
+    try std.testing.expect(!projectionSignalChangesProjectedCore(.reconcile_lease));
+    try std.testing.expect(!projectionSignalChangesProjectedCore(.split_transition));
+    try std.testing.expect(!projectionSignalChangesProjectedCore(.merge_transition));
+    try std.testing.expect(!projectionSignalChangesProjectedCore(.restore_job));
 }
 
 // Backfill marker discovery does not need sub-second polling when the system is
@@ -609,8 +629,6 @@ const LocalProjectionInputs = struct {
 };
 
 const ProjectedCoreSnapshot = struct {
-    tables: []metadata_table_manager.TableRecord = &.{},
-    ranges: []metadata_table_manager.RangeRecord = &.{},
     stores: []metadata_table_manager.StoreRecord = &.{},
     placement_intents: []raft_reconciler.PlacementIntent = &.{},
     shuffle_join_leases: []metadata_table_manager.ShuffleJoinLeaseRecord = &.{},
@@ -621,10 +639,6 @@ const ProjectedCoreSnapshot = struct {
     merge_transitions: []transition_state.MergeTransitionRecord = &.{},
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        for (self.tables) |record| metadata_table_manager.freeTable(alloc, record);
-        if (self.tables.len > 0) alloc.free(self.tables);
-        for (self.ranges) |record| metadata_table_manager.freeRange(alloc, record);
-        if (self.ranges.len > 0) alloc.free(self.ranges);
         for (self.stores) |record| metadata_table_manager.freeStore(alloc, record);
         if (self.stores.len > 0) alloc.free(self.stores);
         for (self.placement_intents) |intent| alloc.free(intent.peer_node_ids);
@@ -645,8 +659,6 @@ const ProjectedCoreSnapshot = struct {
     fn diagnostics(self: *const @This()) ProjectedCoreSnapshotDiagnostics {
         var out = ProjectedCoreSnapshotDiagnostics{
             .cached = true,
-            .tables = self.tables.len,
-            .ranges = self.ranges.len,
             .stores = self.stores.len,
             .store_group_statuses = 0,
             .store_runtime_statuses = 0,
@@ -657,9 +669,7 @@ const ProjectedCoreSnapshot = struct {
             .replication_source_statuses = self.replication_source_statuses.len,
             .split_transitions = self.split_transitions.len,
             .merge_transitions = self.merge_transitions.len,
-            .estimated_bytes = @sizeOf(metadata_table_manager.TableRecord) * self.tables.len +
-                @sizeOf(metadata_table_manager.RangeRecord) * self.ranges.len +
-                @sizeOf(metadata_table_manager.StoreRecord) * self.stores.len +
+            .estimated_bytes = @sizeOf(metadata_table_manager.StoreRecord) * self.stores.len +
                 @sizeOf(raft_reconciler.PlacementIntent) * self.placement_intents.len +
                 @sizeOf(metadata_table_manager.ShuffleJoinLeaseRecord) * self.shuffle_join_leases.len +
                 @sizeOf(metadata_table_manager.SchemaProgressRecord) * self.schema_progresses.len +
@@ -668,15 +678,6 @@ const ProjectedCoreSnapshot = struct {
                 @sizeOf(transition_state.SplitTransitionRecord) * self.split_transitions.len +
                 @sizeOf(transition_state.MergeTransitionRecord) * self.merge_transitions.len,
         };
-        for (self.tables) |record| {
-            out.estimated_bytes += record.name.len + record.description.len + record.schema_json.len +
-                record.read_schema_json.len + record.indexes_json.len + record.replication_sources_json.len +
-                record.placement_role.len + record.restore_backup_id.len + record.restore_location.len;
-        }
-        for (self.ranges) |record| {
-            out.estimated_bytes += record.start_key.len + optionalLen(record.end_key) +
-                record.restore_backup_id.len + record.restore_location.len + record.restore_snapshot_path.len;
-        }
         for (self.stores) |record| {
             out.store_group_statuses += record.group_statuses.len;
             out.store_runtime_statuses += record.runtime_statuses.len;
@@ -725,6 +726,23 @@ const CatalogValidationSnapshot = struct {
         if (self.ranges.len > 0) alloc.free(self.ranges);
         self.* = .{};
     }
+
+    fn addDiagnostics(self: *const @This(), out: *ProjectedCoreSnapshotDiagnostics) void {
+        out.cached = true;
+        out.tables = self.tables.len;
+        out.ranges = self.ranges.len;
+        out.estimated_bytes += @sizeOf(metadata_table_manager.TableRecord) * self.tables.len +
+            @sizeOf(metadata_table_manager.RangeRecord) * self.ranges.len;
+        for (self.tables) |record| {
+            out.estimated_bytes += record.name.len + record.description.len + record.schema_json.len +
+                record.read_schema_json.len + record.indexes_json.len + record.replication_sources_json.len +
+                record.placement_role.len + record.restore_backup_id.len + record.restore_location.len;
+        }
+        for (self.ranges) |record| {
+            out.estimated_bytes += record.start_key.len + optionalLen(record.end_key) +
+                record.restore_backup_id.len + record.restore_location.len + record.restore_snapshot_path.len;
+        }
+    }
 };
 
 const CatalogValidationSnapshotCache = struct {
@@ -738,7 +756,7 @@ const CatalogValidationSnapshotCache = struct {
 };
 
 const ProjectedCoreSnapshotCache = struct {
-    projection_epoch: u64 = 0,
+    core_epoch: u64 = 0,
     placement_epoch: u64 = 0,
     transition_epoch: u64 = 0,
     snapshot: ?ProjectedCoreSnapshot = null,
@@ -853,16 +871,19 @@ fn captureLocalProjectionInputs(self: *MetadataHttpService) !LocalProjectionInpu
     errdefer self.alloc.free(group_ids);
     self.lockRuntime();
     defer self.unlockRuntime();
-    const snapshot = try self.projectedCoreSnapshotLocked();
-    const tables = try cloneProjectedTablesOwned(self.alloc, snapshot.tables);
+    self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+    defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+    const catalog = try self.catalogValidationSnapshotLocked();
+    const core = try self.projectedCoreSnapshotLocked();
+    const tables = try cloneProjectedTablesOwned(self.alloc, catalog.tables);
     errdefer self.freeProjectedTables(self.alloc, tables);
-    const ranges = try cloneProjectedRangesOwned(self.alloc, snapshot.ranges);
+    const ranges = try cloneProjectedRangesOwned(self.alloc, catalog.ranges);
     errdefer self.freeProjectedRanges(self.alloc, ranges);
-    const stores = try cloneProjectedStoresOwned(self.alloc, snapshot.stores);
+    const stores = try cloneProjectedStoresOwned(self.alloc, core.stores);
     errdefer self.freeProjectedStores(self.alloc, stores);
-    const schema_progresses = try cloneProjectedSchemaProgressOwned(self.alloc, snapshot.schema_progresses);
+    const schema_progresses = try cloneProjectedSchemaProgressOwned(self.alloc, core.schema_progresses);
     errdefer self.freeProjectedSchemaProgress(self.alloc, schema_progresses);
-    const restore_progresses = try cloneProjectedRestoreProgressesOwned(self.alloc, snapshot.restore_progresses);
+    const restore_progresses = try cloneProjectedRestoreProgressesOwned(self.alloc, core.restore_progresses);
     errdefer self.freeProjectedRestoreProgress(self.alloc, restore_progresses);
     return .{
         .group_ids = group_ids,
@@ -2515,6 +2536,7 @@ pub const MetadataHttpService = struct {
     store_status_ticks: usize,
     projection_epoch: std.atomic.Value(u64) = .init(1),
     catalog_epoch: std.atomic.Value(u64) = .init(1),
+    projected_core_epoch: std.atomic.Value(u64) = .init(1),
     placement_epoch: std.atomic.Value(u64) = .init(1),
     reconcile_lease_epoch: std.atomic.Value(u64) = .init(1),
     transition_epoch: std.atomic.Value(u64) = .init(1),
@@ -2734,6 +2756,9 @@ pub const MetadataHttpService = struct {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         if (projectionSignalChangesCatalog(signal.kind)) {
             _ = self.catalog_epoch.fetchAdd(1, .release);
+        }
+        if (projectionSignalChangesProjectedCore(signal.kind)) {
+            _ = self.projected_core_epoch.fetchAdd(1, .release);
         }
         switch (signal.kind) {
             .table, .range, .store, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
@@ -3564,25 +3589,29 @@ pub const MetadataHttpService = struct {
         };
         errdefer self.freeAdminSnapshot(&snapshot);
 
-        self.lockRuntime();
-        errdefer self.unlockRuntime();
-        const core = try self.projectedCoreSnapshotLocked();
-        const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        snapshot.tables = try cloneProjectedTablesOwned(self.alloc, core.tables);
-        snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, core.ranges);
-        snapshot.nodes = try store.listNodes(self.alloc, self.metadata_group_id);
-        snapshot.stores = try cloneProjectedStoresOwned(self.alloc, core.stores);
-        snapshot.placement_intents = try cloneProjectedPlacementIntentsOwned(self.alloc, core.placement_intents);
-        snapshot.shuffle_join_leases = try cloneProjectedShuffleJoinLeasesOwned(self.alloc, core.shuffle_join_leases);
-        snapshot.restore_progresses = try cloneProjectedRestoreProgressesOwned(self.alloc, core.restore_progresses);
-        snapshot.replication_source_statuses = try cloneProjectedReplicationSourceStatusesOwned(self.alloc, core.replication_source_statuses);
-        snapshot.split_transitions = try cloneProjectedSplitTransitionsOwned(self.alloc, core.split_transitions);
-        snapshot.merge_transitions = try cloneProjectedMergeTransitionsOwned(self.alloc, core.merge_transitions);
-        snapshot.extension_packages = try store.listExtensionPackages(self.alloc, self.metadata_group_id);
-        snapshot.installed_extensions = try store.listInstalledExtensions(self.alloc, self.metadata_group_id);
-        snapshot.extension_members = try store.listExtensionMembers(self.alloc, self.metadata_group_id);
-        snapshot.extension_dependencies = try store.listExtensionDependencies(self.alloc, self.metadata_group_id);
-        self.unlockRuntime();
+        {
+            self.lockRuntime();
+            defer self.unlockRuntime();
+            self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+            defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+            const catalog = try self.catalogValidationSnapshotLocked();
+            const core = try self.projectedCoreSnapshotLocked();
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            snapshot.tables = try cloneProjectedTablesOwned(self.alloc, catalog.tables);
+            snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, catalog.ranges);
+            snapshot.nodes = try store.listNodes(self.alloc, self.metadata_group_id);
+            snapshot.stores = try cloneProjectedStoresOwned(self.alloc, core.stores);
+            snapshot.placement_intents = try cloneProjectedPlacementIntentsOwned(self.alloc, core.placement_intents);
+            snapshot.shuffle_join_leases = try cloneProjectedShuffleJoinLeasesOwned(self.alloc, core.shuffle_join_leases);
+            snapshot.restore_progresses = try cloneProjectedRestoreProgressesOwned(self.alloc, core.restore_progresses);
+            snapshot.replication_source_statuses = try cloneProjectedReplicationSourceStatusesOwned(self.alloc, core.replication_source_statuses);
+            snapshot.split_transitions = try cloneProjectedSplitTransitionsOwned(self.alloc, core.split_transitions);
+            snapshot.merge_transitions = try cloneProjectedMergeTransitionsOwned(self.alloc, core.merge_transitions);
+            snapshot.extension_packages = try store.listExtensionPackages(self.alloc, self.metadata_group_id);
+            snapshot.installed_extensions = try store.listInstalledExtensions(self.alloc, self.metadata_group_id);
+            snapshot.extension_members = try store.listExtensionMembers(self.alloc, self.metadata_group_id);
+            snapshot.extension_dependencies = try store.listExtensionDependencies(self.alloc, self.metadata_group_id);
+        }
 
         snapshot.local_bootstrap_statuses = try self.listLocalBootstrapStatuses(self.alloc);
         snapshot.replication_source_action_hints = try metadata_api.deriveReplicationSourceActionHints(
@@ -3607,10 +3636,10 @@ pub const MetadataHttpService = struct {
 
     pub fn validatePublication(self: *MetadataHttpService, contract: metadata_api.CatalogPublicationContract) !bool {
         try self.ensureLinearizableRead();
-        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
         self.lockRuntime();
         defer self.unlockRuntime();
+        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
         const snapshot = try self.catalogValidationSnapshotLocked();
@@ -3619,10 +3648,10 @@ pub const MetadataHttpService = struct {
 
     pub fn validateTablePublication(self: *MetadataHttpService, contract: metadata_api.CatalogTablePublicationContract) !bool {
         try self.ensureLinearizableRead();
-        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
         self.lockRuntime();
         defer self.unlockRuntime();
+        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
         const snapshot = try self.catalogValidationSnapshotLocked();
@@ -3733,8 +3762,6 @@ pub const MetadataHttpService = struct {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         var snapshot: ProjectedCoreSnapshot = .{};
         errdefer snapshot.deinit(self.alloc);
-        snapshot.tables = try store.listTables(self.alloc, self.metadata_group_id);
-        snapshot.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
         snapshot.stores = try store.listStores(self.alloc, self.metadata_group_id);
         snapshot.placement_intents = try store.listPlacementIntents(self.alloc, self.metadata_group_id);
         snapshot.shuffle_join_leases = try store.listShuffleJoinLeases(self.alloc, self.metadata_group_id);
@@ -3748,11 +3775,11 @@ pub const MetadataHttpService = struct {
 
     fn projectedCoreSnapshotLocked(self: *MetadataHttpService) !*const ProjectedCoreSnapshot {
         try self.ensureLifecycleListenerRegistered();
-        const projection_epoch = self.projection_epoch.load(.monotonic);
+        const core_epoch = self.projected_core_epoch.load(.acquire);
         const placement_epoch = self.placement_epoch.load(.monotonic);
         const transition_epoch = self.transition_epoch.load(.monotonic);
         if (self.projected_core_snapshot_cache.snapshot == null or
-            self.projected_core_snapshot_cache.projection_epoch != projection_epoch or
+            self.projected_core_snapshot_cache.core_epoch != core_epoch or
             self.projected_core_snapshot_cache.placement_epoch != placement_epoch or
             self.projected_core_snapshot_cache.transition_epoch != transition_epoch)
         {
@@ -3760,7 +3787,7 @@ pub const MetadataHttpService = struct {
             errdefer fresh.deinit(self.alloc);
             if (self.projected_core_snapshot_cache.snapshot) |*snapshot| snapshot.deinit(self.alloc);
             self.projected_core_snapshot_cache = .{
-                .projection_epoch = projection_epoch,
+                .core_epoch = core_epoch,
                 .placement_epoch = placement_epoch,
                 .transition_epoch = transition_epoch,
                 .snapshot = fresh,
@@ -3780,8 +3807,13 @@ pub const MetadataHttpService = struct {
         };
         self.lockRuntime();
         defer self.unlockRuntime();
+        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
         if (self.projected_core_snapshot_cache.snapshot) |*snapshot| {
             out.projected_core_snapshot = snapshot.diagnostics();
+        }
+        if (self.catalog_validation_cache.snapshot) |*snapshot| {
+            snapshot.addDiagnostics(&out.projected_core_snapshot);
         }
         if (self.projectedStore()) |store| {
             out.projected_store_lsm = lsmRetentionDiagnostics(store.snapshotMaintenanceStats());
@@ -3792,7 +3824,9 @@ pub const MetadataHttpService = struct {
     pub fn listProjectedTables(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
         self.lockRuntime();
         defer self.unlockRuntime();
-        const snapshot = try self.projectedCoreSnapshotLocked();
+        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+        const snapshot = try self.catalogValidationSnapshotLocked();
         return try cloneProjectedTablesOwned(alloc, snapshot.tables);
     }
 
@@ -3910,7 +3944,9 @@ pub const MetadataHttpService = struct {
     pub fn listProjectedRanges(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
         self.lockRuntime();
         defer self.unlockRuntime();
-        const snapshot = try self.projectedCoreSnapshotLocked();
+        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+        const snapshot = try self.catalogValidationSnapshotLocked();
         return try cloneProjectedRangesOwned(alloc, snapshot.ranges);
     }
 
@@ -9888,7 +9924,7 @@ test "metadata service keeps restore intent until runtime repair completes" {
     try std.testing.expect(!rangeRestoreIntentComplete(7, 7001, "snap1", "file:///tmp/backups", &placements, &progress));
 }
 
-test "metadata http service projected tables cache invalidates without prior runRound registration" {
+test "metadata http service catalog cache is independent from volatile projection traffic" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -9982,23 +10018,54 @@ test "metadata http service projected tables cache invalidates without prior run
     defer svc.freeProjectedTables(std.testing.allocator, before);
     try std.testing.expectEqual(@as(usize, 0), before.len);
     try std.testing.expectEqual(true, svc.lifecycle_listener_registered);
-    try std.testing.expectEqual(svc.projection_epoch.load(.monotonic), svc.projected_core_snapshot_cache.projection_epoch);
+    const catalog_epoch_before = svc.catalog_epoch.load(.acquire);
+    try std.testing.expectEqual(catalog_epoch_before, svc.catalog_validation_cache.catalog_epoch);
+    try std.testing.expect(svc.projected_core_snapshot_cache.snapshot == null);
 
-    const epoch_before = svc.projection_epoch.load(.monotonic);
+    const stores_before = try svc.listProjectedStores(std.testing.allocator);
+    defer svc.freeProjectedStores(std.testing.allocator, stores_before);
+    const volatile_epoch_before = svc.projection_epoch.load(.monotonic);
+    const core_epoch_before = svc.projected_core_epoch.load(.acquire);
+    try std.testing.expectEqual(core_epoch_before, svc.projected_core_snapshot_cache.core_epoch);
+
+    MetadataHttpService.metadataHttpServiceProjectionSignal(&svc, .{
+        .kind = .store,
+        .metadata_group_id = 2900,
+        .store_id = 41,
+    });
+    const volatile_epoch_after = svc.projection_epoch.load(.monotonic);
+    const core_epoch_after = svc.projected_core_epoch.load(.acquire);
+    try std.testing.expect(volatile_epoch_after > volatile_epoch_before);
+    try std.testing.expect(core_epoch_after > core_epoch_before);
+    try std.testing.expectEqual(catalog_epoch_before, svc.catalog_epoch.load(.acquire));
+    try std.testing.expectEqual(catalog_epoch_before, svc.catalog_validation_cache.catalog_epoch);
+
+    const after_store_signal = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, after_store_signal);
+    try std.testing.expectEqual(@as(usize, 0), after_store_signal.len);
+    try std.testing.expectEqual(catalog_epoch_before, svc.catalog_validation_cache.catalog_epoch);
+    try std.testing.expect(svc.projected_core_snapshot_cache.core_epoch < core_epoch_after);
+
+    const stores_after = try svc.listProjectedStores(std.testing.allocator);
+    defer svc.freeProjectedStores(std.testing.allocator, stores_after);
+    try std.testing.expectEqual(core_epoch_after, svc.projected_core_snapshot_cache.core_epoch);
+
     MetadataHttpService.metadataHttpServiceProjectionSignal(&svc, .{
         .kind = .table,
         .metadata_group_id = 2900,
         .table_name = "docs",
         .table_id = 77,
     });
-    const epoch_after_signal = svc.projection_epoch.load(.monotonic);
-    try std.testing.expect(epoch_after_signal > epoch_before);
-    try std.testing.expect(svc.projected_core_snapshot_cache.projection_epoch < epoch_after_signal);
+    const catalog_epoch_after = svc.catalog_epoch.load(.acquire);
+    try std.testing.expect(catalog_epoch_after > catalog_epoch_before);
+    try std.testing.expect(svc.catalog_validation_cache.catalog_epoch < catalog_epoch_after);
+    try std.testing.expectEqual(core_epoch_after, svc.projected_core_epoch.load(.acquire));
+    try std.testing.expectEqual(core_epoch_after, svc.projected_core_snapshot_cache.core_epoch);
 
     const after = try svc.listProjectedTables(std.testing.allocator);
     defer svc.freeProjectedTables(std.testing.allocator, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
-    try std.testing.expectEqual(epoch_after_signal, svc.projected_core_snapshot_cache.projection_epoch);
+    try std.testing.expectEqual(catalog_epoch_after, svc.catalog_validation_cache.catalog_epoch);
 }
 
 test "metadata http service linearizable read waits for leader discovery" {
