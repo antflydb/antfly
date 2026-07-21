@@ -521,6 +521,24 @@ publication lane, so consumers observe durable projection changes in commit
 order. The normal production apply path does not clone transition records when
 no caller requests the committed delta list.
 
+Structural index/schema reconciliation is admitted by a linearizable,
+whole-table catalog contract containing metadata incarnation, table definition,
+and an order-independent digest of every range record. Metadata services build
+non-owning table/range maps and table topology digests once per stable projection
+epoch; subsequent contract validation is O(1) and does not allocate or scan an
+admin snapshot. Remote data nodes use the same required internal validation
+route and fail closed if either group or whole-table fencing is unavailable.
+
+Each bounded reconciliation quantum receives one whole-table admission fence.
+Before a reconciled group publishes runtime status, it captures the table's
+runtime-cache epoch, performs a post-mutation linearizable catalog check, and
+publishes with that original epoch. Enqueueing any structural request first
+invalidates the table epoch, including deduplicated requests. Therefore a
+catalog change, restore/root transition, or newly enqueued structural mutation
+between validation and publication makes the observation stale; an unrelated
+table does not interfere. Per-group mutation remains bounded, while redundant
+pre-group ReadIndex barriers are avoided.
+
 Removing an active split or merge record is intentionally a no-op, not a
 cancellation protocol. Cancellation first commits rollback intent on the same
 transition identity, lets the transition owner restore source/receiver state,

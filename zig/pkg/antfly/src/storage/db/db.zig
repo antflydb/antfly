@@ -61590,7 +61590,21 @@ test "db generated artifact finalization releases page arbitration and preserves
 
     DB.test_release_generated_artifact_finalization.store(true, .release);
     db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+
+    var second_drained = false;
+    for (0..1_000) |_| {
+        switch (try db.advanceGeneratedArtifactCleanupPage(second.name)) {
+            .idle => {
+                second_drained = true;
+                break;
+            },
+            .progressed => {},
+            .busy => std.Thread.yield() catch {},
+        }
+    }
+    try std.testing.expect(second_drained);
     try db.addIndex(first);
+    try db.addIndex(second);
 }
 
 test "db managed admission drain preserves a generation requested during the pass" {

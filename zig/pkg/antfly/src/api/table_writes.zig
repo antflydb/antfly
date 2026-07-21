@@ -9508,6 +9508,10 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: ?[]const u8,
     ) !void {
         if (self.restore_repair_shutdown.load(.acquire)) return error.BackgroundOwnerClosing;
+        // Enqueue is a structural invalidation boundary even when an existing
+        // request already covers this target. A status observer admitted
+        // before the request must not publish after it.
+        self.invalidateRuntimeStatusCache(table_name);
         const alloc = std.heap.page_allocator;
         const io = self.table_activity_threaded.io();
 
@@ -9710,16 +9714,21 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.restore_repair_shutdown.load(.acquire)) return .discarded;
         if (request.plan == null) {
             request.plan = (try self.captureStructuralReconcilePlan(alloc, request.table_name)) orelse return .discarded;
-            if (!try self.structuralReconcilePlanStillCurrent(request.table_name, &request.plan.?)) {
-                request.plan.?.deinit(alloc);
-                request.plan = null;
-                return .blocked;
-            }
             if (request.plan.?.groups.len == 0) {
                 request.plan.?.deinit(alloc);
                 request.plan = null;
                 return .discarded;
             }
+        }
+
+        // One whole-table ReadIndex fence admits each bounded quantum. The
+        // contract covers every group and replaces redundant pre-checks per
+        // group; each group still receives a post-mutation fence before its
+        // runtime observation can become visible.
+        if (!try self.structuralReconcilePlanStillCurrent(request.table_name, &request.plan.?)) {
+            request.plan.?.deinit(alloc);
+            request.plan = null;
+            return .blocked;
         }
 
         var attempted: usize = 0;
@@ -9732,18 +9741,12 @@ pub const ProvisionedTableWriteSource = struct {
                 request.plan = null;
                 return .blocked;
             };
-            if (!try self.structuralReconcileGroupStillCurrent(request.table_name, plan, group)) {
-                plan.deinit(alloc);
-                request.plan = null;
-                return .blocked;
-            }
-
             const outcome = try self.reconcileTableGroupStructureWithRuntime(alloc, group.range.group_id, request.table_name, .{
                 .indexes_json = plan.indexes_json,
                 .schema_json = plan.schema_json,
                 .identity_namespace = group.identity_namespace,
                 .target_index_name = request.index_name,
-            }, plan, group);
+            }, plan);
             switch (outcome) {
                 .busy => plan.markCurrentBusy(),
                 .stale => {
@@ -9815,36 +9818,16 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
-    fn structuralReconcileGroupStillCurrent(
-        self: *ProvisionedTableWriteSource,
-        table_name: []const u8,
-        plan: *const StructuralReconcilePlan,
-        group: *const StructuralReconcileGroup,
-    ) !bool {
-        if (plan.metadata_incarnation) |incarnation| {
-            if (self.catalog.vtable.validate_publication != null) {
-                return try self.catalog.validatePublication(.{
-                    .metadata_group_id = plan.metadata_group_id,
-                    .metadata_incarnation = incarnation,
-                    .table_id = plan.table_id,
-                    .table_name = table_name,
-                    .schema_json = plan.schema_json,
-                    .indexes_json = plan.indexes_json,
-                    .range = group.range,
-                });
-            }
-        }
-
-        var snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&snapshot);
-        return structuralReconcileGroupMatchesSnapshot(table_name, plan, group, &snapshot);
-    }
-
     fn structuralReconcilePlanStillCurrent(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         plan: *const StructuralReconcilePlan,
     ) !bool {
+        if (self.catalog.vtable.requires_linearizable_publication_fence and
+            self.catalog.vtable.validate_table_publication == null)
+        {
+            return error.CatalogPublicationFenceUnavailable;
+        }
         if (self.catalog.vtable.validate_table_publication != null) {
             const incarnation = plan.metadata_incarnation orelse return false;
             return try self.catalog.validateTablePublication(.{
@@ -9894,22 +9877,6 @@ pub const ProvisionedTableWriteSource = struct {
         return null;
     }
 
-    fn structuralReconcileGroupMatchesSnapshot(
-        table_name: []const u8,
-        plan: *const StructuralReconcilePlan,
-        group: *const StructuralReconcileGroup,
-        snapshot: *const metadata_api.AdminSnapshot,
-    ) bool {
-        if (snapshot.status.metadata_group_id != plan.metadata_group_id or
-            !structuralReconcileIncarnationMatches(plan.metadata_incarnation, snapshot.status.metadata_incarnation)) return false;
-        const table = metadata_mod.findAdminTable(snapshot, plan.table_id) orelse return false;
-        if (!std.mem.eql(u8, table.name, table_name) or
-            !std.mem.eql(u8, table.indexes_json, plan.indexes_json) or
-            !std.mem.eql(u8, table.schema_json, plan.schema_json)) return false;
-        const range = metadata_mod.findAdminRange(snapshot, group.range.group_id) orelse return false;
-        return metadata_table_manager.rangeRecordsEqual(group.range, range.*);
-    }
-
     fn structuralReconcileIncarnationMatches(
         expected: ?metadata_api.MetadataClusterIncarnation,
         actual: ?metadata_api.MetadataClusterIncarnation,
@@ -9926,7 +9893,6 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         metadata: StartupCatchUpMetadata,
         plan: *const StructuralReconcilePlan,
-        group: *const StructuralReconcileGroup,
     ) !StructuralReconcileGroupOutcome {
         // The target generation is unpublished until catch-up and sync finish.
         // Queries are routed to the retained read generation, so do not turn a
@@ -10005,7 +9971,11 @@ pub const ProvisionedTableWriteSource = struct {
                 configuredIndexesRequireSchemaIdentityProof(configured_indexes)
             else
                 false;
-            if (!try self.structuralReconcileGroupStillCurrent(table_name, plan, group)) {
+            const publication_fence = if (self.runtime_status_cache) |status_cache|
+                try status_cache.capturePublicationToken(table_name)
+            else
+                null;
+            if (!try self.structuralReconcilePlanStillCurrent(table_name, plan)) {
                 lockAtomic(&self.local_db_mutex);
                 defer self.local_db_mutex.unlock();
                 cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
@@ -10019,12 +9989,16 @@ pub const ProvisionedTableWriteSource = struct {
                 group_id,
                 cached.db,
                 publish_schema_identity_proof,
+                publication_fence,
             ) catch |err| {
                 lockAtomic(&self.local_db_mutex);
                 defer self.local_db_mutex.unlock();
                 cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
                 cached_active = false;
-                return err;
+                switch (err) {
+                    error.RuntimeStatusPublicationFenced => return .stale,
+                    else => return err,
+                }
             };
             cache.publishCachedLeaseGeneration(&cached, lsm_root_generation);
             return .complete;
@@ -10109,15 +10083,23 @@ pub const ProvisionedTableWriteSource = struct {
             configuredIndexesRequireSchemaIdentityProof(configured_indexes)
         else
             false;
-        if (!try self.structuralReconcileGroupStillCurrent(table_name, plan, group)) return .stale;
-        try publishStructuralRuntimeStatusSnapshot(
+        const publication_fence = if (self.runtime_status_cache) |cache|
+            try cache.capturePublicationToken(table_name)
+        else
+            null;
+        if (!try self.structuralReconcilePlanStillCurrent(table_name, plan)) return .stale;
+        publishStructuralRuntimeStatusSnapshot(
             self,
             alloc,
             table_name,
             group_id,
             &db,
             publish_schema_identity_proof,
-        );
+            publication_fence,
+        ) catch |err| switch (err) {
+            error.RuntimeStatusPublicationFenced => return .stale,
+            else => return err,
+        };
         return .complete;
     }
 
@@ -16793,14 +16775,23 @@ fn publishStructuralRuntimeStatusSnapshot(
     group_id: u64,
     db: *db_mod.DB,
     require_schema_identity_proof: bool,
+    publication_fence: ?runtime_status.TableRuntimeSnapshotCache.PublicationToken,
 ) !void {
-    try publishRuntimeStatusSnapshotWithStartupPhaseMode(
-        source,
+    const snapshot_cache = source.runtime_status_cache orelse return;
+    const token = publication_fence orelse return error.RuntimeStatusPublicationFenced;
+    const visible_root_generation = source.visibleRootGeneration(group_id);
+    const opened_root_generation = db.core.index_manager.lsm_root_generation;
+    if (opened_root_generation != visible_root_generation) return error.RuntimeStatusPublicationFenced;
+    try publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
+        snapshot_cache,
         alloc,
         table_name,
         group_id,
+        opened_root_generation,
+        token,
         if (source.startup_catch_up_active.load(.monotonic)) .startup_catch_up else .idle,
         if (require_schema_identity_proof) .diagnostic else .consistent,
+        .runtime,
         db,
     );
 }
@@ -26937,7 +26928,16 @@ const StructuralReconcileTestCatalog = struct {
         return .{ .ptr = self, .vtable = &.{
             .admin_snapshot = adminSnapshot,
             .free_admin_snapshot = freeAdminSnapshot,
+            .requires_linearizable_publication_fence = true,
             .validate_table_publication = validateTablePublication,
+        } };
+    }
+
+    fn incompleteProductionIface(self: *@This()) table_catalog.CatalogSource {
+        return .{ .ptr = self, .vtable = &.{
+            .admin_snapshot = adminSnapshot,
+            .free_admin_snapshot = freeAdminSnapshot,
+            .requires_linearizable_publication_fence = true,
         } };
     }
 
@@ -27165,6 +27165,23 @@ test "structural reconcile production topology fence rejects ranges added after 
     defer plan.deinit(alloc);
     try std.testing.expect(!(try source.structuralReconcilePlanStillCurrent("docs", &plan)));
     try std.testing.expectEqual(@as(u32, 1), catalog.validation_calls.load(.monotonic));
+}
+
+test "structural reconcile production catalog fails closed without table publication fence" {
+    const alloc = std.testing.allocator;
+    var catalog = StructuralReconcileTestCatalog{ .mode = .stable };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-structural-reconcile-missing-fence",
+        catalog.incompleteProductionIface(),
+    );
+    defer source.deinit();
+
+    var plan = (try source.captureStructuralReconcilePlan(alloc, "docs")) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(alloc);
+    try std.testing.expectError(
+        error.CatalogPublicationFenceUnavailable,
+        source.structuralReconcilePlanStillCurrent("docs", &plan),
+    );
 }
 
 test "structural reconcile fences incarnation initialization and discards empty topology" {

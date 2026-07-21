@@ -10518,7 +10518,9 @@ const RemoteMetadataSource = struct {
             .vtable = &.{
                 .admin_snapshot = remoteAdminSnapshot,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
+                .requires_linearizable_publication_fence = true,
                 .validate_publication = remoteValidateCatalogPublication,
+                .validate_table_publication = remoteValidateCatalogTablePublication,
             },
         };
     }
@@ -10702,6 +10704,30 @@ const RemoteMetadataSource = struct {
             defer executor.deinit();
             var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, executor.executor());
             const valid = metadata_client.validateCatalogPublication(self.base_uris[index], contract) catch |err| {
+                last_err = err;
+                continue;
+            };
+            self.noteMetadataApiSuccess(index);
+            return valid;
+        }
+        return last_err;
+    }
+
+    fn remoteValidateCatalogTablePublication(
+        ptr: *anyopaque,
+        contract: antfly.metadata_api.CatalogTablePublicationContract,
+    ) !bool {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var last_err: anyerror = error.NotLeader;
+        for (0..self.base_uris.len) |attempt| {
+            const index = self.metadataApiIndexForAttempt(attempt);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var executor = antfly.raft.transport.std_http_executor.StdHttpExecutor.init(scratch, .{});
+            defer executor.deinit();
+            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, executor.executor());
+            const valid = metadata_client.validateCatalogTablePublication(self.base_uris[index], contract) catch |err| {
                 last_err = err;
                 continue;
             };

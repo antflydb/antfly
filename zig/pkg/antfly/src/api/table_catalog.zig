@@ -32,6 +32,9 @@ pub const CatalogSource = struct {
     pub const VTable = struct {
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        /// Production sources must fail closed when either linearizable
+        /// publication validator is unavailable.
+        requires_linearizable_publication_fence: bool = false,
         /// Compares a compact contract after a Raft linearizable-read barrier.
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
         validate_table_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) anyerror!bool = null,
@@ -61,6 +64,7 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
+                .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataServiceValidatePublication,
                 .validate_table_publication = metadataServiceValidateTablePublication,
             },
@@ -73,6 +77,7 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
+                .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataHttpServiceValidatePublication,
                 .validate_table_publication = metadataHttpServiceValidateTablePublication,
             },
@@ -85,6 +90,7 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataServerAdminSnapshot,
                 .free_admin_snapshot = metadataServerFreeAdminSnapshot,
+                .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataServerValidatePublication,
                 .validate_table_publication = metadataServerValidateTablePublication,
             },
@@ -347,18 +353,12 @@ fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Adm
 
 fn metadataServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-    try svc.ensureLinearizableRead();
-    var snapshot = try svc.adminSnapshot();
-    defer svc.freeAdminSnapshot(&snapshot);
-    return contract.matches(&snapshot);
+    return try svc.validatePublication(contract);
 }
 
 fn metadataServiceValidateTablePublication(ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) !bool {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-    try svc.ensureLinearizableRead();
-    var snapshot = try svc.adminSnapshot();
-    defer svc.freeAdminSnapshot(&snapshot);
-    return contract.matches(&snapshot);
+    return try svc.validateTablePublication(contract);
 }
 
 fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {

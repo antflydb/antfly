@@ -597,8 +597,10 @@ const ProjectedCoreSnapshot = struct {
     replication_source_statuses: []metadata_table_manager.ReplicationSourceStatusRecord = &.{},
     split_transitions: []transition_state.SplitTransitionRecord = &.{},
     merge_transitions: []transition_state.MergeTransitionRecord = &.{},
+    catalog_index: metadata_api.CatalogProjectionIndex = .{},
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.catalog_index.deinit(alloc);
         for (self.tables) |record| metadata_table_manager.freeTable(alloc, record);
         if (self.tables.len > 0) alloc.free(self.tables);
         for (self.ranges) |record| metadata_table_manager.freeRange(alloc, record);
@@ -687,6 +689,31 @@ const ProjectedCoreSnapshot = struct {
         }
         for (self.merge_transitions) |record| out.estimated_bytes += optionalLen(record.rollback_reason);
         return out;
+    }
+};
+
+const CatalogValidationSnapshot = struct {
+    tables: []metadata_table_manager.TableRecord = &.{},
+    ranges: []metadata_table_manager.RangeRecord = &.{},
+    index: metadata_api.CatalogProjectionIndex = .{},
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.index.deinit(alloc);
+        for (self.tables) |record| metadata_table_manager.freeTable(alloc, record);
+        if (self.tables.len > 0) alloc.free(self.tables);
+        for (self.ranges) |record| metadata_table_manager.freeRange(alloc, record);
+        if (self.ranges.len > 0) alloc.free(self.ranges);
+        self.* = .{};
+    }
+};
+
+const CatalogValidationSnapshotCache = struct {
+    projection_epoch: u64 = 0,
+    snapshot: ?CatalogValidationSnapshot = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
+        self.* = .{};
     }
 };
 
@@ -1109,6 +1136,8 @@ pub const MetadataService = struct {
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
     lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
+    catalog_validation_mutex: std.Io.Mutex = .init,
+    catalog_validation_cache: CatalogValidationSnapshotCache = .{},
     local_group_status_provider: ?LocalGroupStatusProvider = null,
     local_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     routed_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
@@ -1165,6 +1194,7 @@ pub const MetadataService = struct {
         // Projection listeners retain `self`; stop and drain their Raft apply
         // producer before releasing any callback-owned service state.
         self.raft.deinit();
+        self.catalog_validation_cache.deinit(self.alloc);
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
         self.lifecycle_signal.deinit();
@@ -1660,6 +1690,63 @@ pub const MetadataService = struct {
 
     pub fn adminSnapshot(self: *MetadataService) !metadata_api.AdminSnapshot {
         return try metadata_api.captureSnapshot(self.alloc, self);
+    }
+
+    pub fn validatePublication(self: *MetadataService, contract: metadata_api.CatalogPublicationContract) !bool {
+        try self.ensureLinearizableRead();
+        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+        const incarnation = try self.metadataIncarnation();
+        const snapshot = try self.catalogValidationSnapshotLocked();
+        return snapshot.index.matchesPublication(contract, self.metadata_group_id, incarnation, snapshot.tables, snapshot.ranges);
+    }
+
+    pub fn validateTablePublication(self: *MetadataService, contract: metadata_api.CatalogTablePublicationContract) !bool {
+        try self.ensureLinearizableRead();
+        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+        const incarnation = try self.metadataIncarnation();
+        const snapshot = try self.catalogValidationSnapshotLocked();
+        return snapshot.index.matchesTablePublication(contract, self.metadata_group_id, incarnation, snapshot.tables);
+    }
+
+    fn captureCatalogValidationSnapshot(self: *MetadataService) !CatalogValidationSnapshot {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        var snapshot: CatalogValidationSnapshot = .{};
+        errdefer snapshot.deinit(self.alloc);
+        snapshot.tables = try store.listTables(self.alloc, self.metadata_group_id);
+        snapshot.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
+        snapshot.index = try metadata_api.CatalogProjectionIndex.init(self.alloc, snapshot.tables, snapshot.ranges);
+        return snapshot;
+    }
+
+    fn catalogValidationSnapshotLocked(self: *MetadataService) !*const CatalogValidationSnapshot {
+        try self.ensureLifecycleListenerRegistered();
+        const current_epoch = self.projection_epoch.load(.acquire);
+        if (self.catalog_validation_cache.snapshot != null and
+            self.catalog_validation_cache.projection_epoch == current_epoch)
+        {
+            return &(self.catalog_validation_cache.snapshot orelse unreachable);
+        }
+
+        // MetadataService does not own the HTTP runtime lock. Stabilize the
+        // two projected lists against the listener epoch instead, so a table
+        // and its ranges can never come from different applied revisions.
+        var attempts: usize = 0;
+        while (attempts < 4) : (attempts += 1) {
+            const before = self.projection_epoch.load(.acquire);
+            var fresh = try self.captureCatalogValidationSnapshot();
+            errdefer fresh.deinit(self.alloc);
+            const after = self.projection_epoch.load(.acquire);
+            if (before != after) {
+                fresh.deinit(self.alloc);
+                continue;
+            }
+            if (self.catalog_validation_cache.snapshot) |*snapshot| snapshot.deinit(self.alloc);
+            self.catalog_validation_cache = .{ .projection_epoch = after, .snapshot = fresh };
+            return &(self.catalog_validation_cache.snapshot orelse unreachable);
+        }
+        return error.CatalogProjectionUnstable;
     }
 
     pub fn freeAdminSnapshot(self: *MetadataService, snapshot: *metadata_api.AdminSnapshot) void {
@@ -3444,7 +3531,7 @@ pub const MetadataHttpService = struct {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
         const core = try self.projectedCoreSnapshotLocked();
-        return contract.matchesProjection(self.metadata_group_id, incarnation, core.tables, core.ranges);
+        return core.catalog_index.matchesPublication(contract, self.metadata_group_id, incarnation, core.tables, core.ranges);
     }
 
     pub fn validateTablePublication(self: *MetadataHttpService, contract: metadata_api.CatalogTablePublicationContract) !bool {
@@ -3454,7 +3541,7 @@ pub const MetadataHttpService = struct {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
         const core = try self.projectedCoreSnapshotLocked();
-        return contract.matchesProjection(self.metadata_group_id, incarnation, core.tables, core.ranges);
+        return core.catalog_index.matchesTablePublication(contract, self.metadata_group_id, incarnation, core.tables);
     }
 
     pub fn freeAdminSnapshot(self: *MetadataHttpService, snapshot: *metadata_api.AdminSnapshot) void {
@@ -3539,6 +3626,7 @@ pub const MetadataHttpService = struct {
         errdefer snapshot.deinit(self.alloc);
         snapshot.tables = try store.listTables(self.alloc, self.metadata_group_id);
         snapshot.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
+        snapshot.catalog_index = try metadata_api.CatalogProjectionIndex.init(self.alloc, snapshot.tables, snapshot.ranges);
         snapshot.stores = try store.listStores(self.alloc, self.metadata_group_id);
         snapshot.placement_intents = try store.listPlacementIntents(self.alloc, self.metadata_group_id);
         snapshot.shuffle_join_leases = try store.listShuffleJoinLeases(self.alloc, self.metadata_group_id);

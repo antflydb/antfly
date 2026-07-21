@@ -4873,6 +4873,7 @@ pub fn build(b: *std.Build) void {
             "structural reconcile pending set never revisits completed groups",
             "structural reconcile completion rejects ranges added after contract capture",
             "structural reconcile production topology fence rejects ranges added after capture",
+            "structural reconcile production catalog fails closed without table publication fence",
             "structural reconcile fences incarnation initialization and discards empty topology",
             "provisioned structural reconcile blocks table write admission",
             "provisioned schema reconcile keeps reads and status available",
@@ -5081,6 +5082,7 @@ pub fn build(b: *std.Build) void {
             "table provisioner restore rejects mismatched doc identity namespace",
             "table provisioner replaces embedding index when metadata incarnation changes",
             "catalog table topology is order independent and detects range mutation",
+            "metadata http server serves status and filtered admin routes",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

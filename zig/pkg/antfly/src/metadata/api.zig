@@ -216,6 +216,110 @@ pub const CatalogTableTopology = struct {
     digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 };
 
+/// Non-owning indexes over a stable catalog projection. Building the index is
+/// linear in the projection size; publication checks are constant time.
+pub const CatalogProjectionIndex = struct {
+    table_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    range_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    table_topologies: std.AutoHashMapUnmanaged(u64, CatalogTableTopology) = .empty,
+
+    pub fn init(
+        alloc: std.mem.Allocator,
+        tables: []const table_manager.TableRecord,
+        ranges: []const table_manager.RangeRecord,
+    ) !CatalogProjectionIndex {
+        var self: CatalogProjectionIndex = .{};
+        errdefer self.deinit(alloc);
+        try self.table_indexes.ensureTotalCapacity(alloc, @intCast(tables.len));
+        try self.range_indexes.ensureTotalCapacity(alloc, @intCast(ranges.len));
+        try self.table_topologies.ensureTotalCapacity(alloc, @intCast(tables.len));
+
+        for (tables, 0..) |table, index| {
+            self.table_indexes.putAssumeCapacity(table.table_id, index);
+            self.table_topologies.putAssumeCapacity(table.table_id, .{
+                .range_count = 0,
+                .digest = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+            });
+        }
+        for (ranges, 0..) |range, index| {
+            self.range_indexes.putAssumeCapacity(range.group_id, index);
+            const topology = self.table_topologies.getPtr(range.table_id) orelse continue;
+            topology.range_count += 1;
+            addCatalogTopologyDigest(&topology.digest, catalogRangeTopologyDigest(range));
+        }
+        var iterator = self.table_topologies.iterator();
+        while (iterator.next()) |entry| {
+            entry.value_ptr.digest = finalizeCatalogTableTopology(
+                entry.key_ptr.*,
+                entry.value_ptr.range_count,
+                entry.value_ptr.digest,
+            );
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *CatalogProjectionIndex, alloc: std.mem.Allocator) void {
+        self.table_indexes.deinit(alloc);
+        self.range_indexes.deinit(alloc);
+        self.table_topologies.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn matchesPublication(
+        self: *const CatalogProjectionIndex,
+        contract: CatalogPublicationContract,
+        metadata_group_id: u64,
+        incarnation_value: ?MetadataClusterIncarnation,
+        tables: []const table_manager.TableRecord,
+        ranges: []const table_manager.RangeRecord,
+    ) bool {
+        if (!catalogIdentityMatches(contract.metadata_group_id, contract.metadata_incarnation, metadata_group_id, incarnation_value)) return false;
+        const table_index = self.table_indexes.get(contract.table_id) orelse return false;
+        const table = &tables[table_index];
+        if (!catalogTableDefinitionMatches(contract.table_name, contract.schema_json, contract.indexes_json, table)) return false;
+        const range_index = self.range_indexes.get(contract.range.group_id) orelse return false;
+        const range = &ranges[range_index];
+        return range.table_id == contract.table_id and table_manager.rangeRecordsEqual(contract.range, range.*);
+    }
+
+    pub fn matchesTablePublication(
+        self: *const CatalogProjectionIndex,
+        contract: CatalogTablePublicationContract,
+        metadata_group_id: u64,
+        incarnation_value: ?MetadataClusterIncarnation,
+        tables: []const table_manager.TableRecord,
+    ) bool {
+        if (!catalogIdentityMatches(contract.metadata_group_id, contract.metadata_incarnation, metadata_group_id, incarnation_value)) return false;
+        const table_index = self.table_indexes.get(contract.table_id) orelse return false;
+        if (!catalogTableDefinitionMatches(contract.table_name, contract.schema_json, contract.indexes_json, &tables[table_index])) return false;
+        const topology = self.table_topologies.get(contract.table_id) orelse return false;
+        return topology.range_count == contract.topology.range_count and
+            std.crypto.timing_safe.eql(@TypeOf(topology.digest), topology.digest, contract.topology.digest);
+    }
+};
+
+fn catalogIdentityMatches(
+    expected_group_id: u64,
+    expected_incarnation: MetadataClusterIncarnation,
+    actual_group_id: u64,
+    actual_incarnation_value: ?MetadataClusterIncarnation,
+) bool {
+    if (actual_group_id != expected_group_id) return false;
+    const actual_incarnation = actual_incarnation_value orelse return false;
+    return std.mem.eql(u8, &actual_incarnation, &expected_incarnation);
+}
+
+fn catalogTableDefinitionMatches(
+    expected_name: []const u8,
+    expected_schema_json: []const u8,
+    expected_indexes_json: []const u8,
+    actual: *const table_manager.TableRecord,
+) bool {
+    return std.mem.eql(u8, expected_name, actual.name) and
+        std.mem.eql(u8, expected_schema_json, actual.schema_json) and
+        std.mem.eql(u8, expected_indexes_json, actual.indexes_json);
+}
+
 /// Compact whole-table fence used after a linearizable metadata read. The
 /// digest is an order-independent SHA-256 multiset accumulator over every
 /// range field, so validation does not depend on projection iteration order.
@@ -268,28 +372,40 @@ pub fn catalogTableTopology(table_id: u64, ranges: []const table_manager.RangeRe
     for (ranges) |range| {
         if (range.table_id != table_id) continue;
         range_count += 1;
-        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        hashCatalogTopologyU64(&hasher, range.group_id);
-        hashCatalogTopologyU64(&hasher, range.range_id);
-        hashCatalogTopologyU64(&hasher, range.table_id);
-        hashCatalogTopologyBytes(&hasher, range.start_key);
-        if (range.end_key) |end_key| {
-            hasher.update(&.{1});
-            hashCatalogTopologyBytes(&hasher, end_key);
-        } else {
-            hasher.update(&.{0});
-        }
-        hashCatalogTopologyU64(&hasher, range.doc_identity_shard_id);
-        hashCatalogTopologyU64(&hasher, range.doc_identity_range_id);
-        hashCatalogTopologyU64(&hasher, range.split_attempt_epoch);
-        hashCatalogTopologyBytes(&hasher, range.restore_backup_id);
-        hashCatalogTopologyBytes(&hasher, range.restore_location);
-        hashCatalogTopologyBytes(&hasher, range.restore_snapshot_path);
-        var range_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        hasher.final(&range_digest);
-        addCatalogTopologyDigest(&accumulator, range_digest);
+        addCatalogTopologyDigest(&accumulator, catalogRangeTopologyDigest(range));
     }
 
+    return .{ .range_count = range_count, .digest = finalizeCatalogTableTopology(table_id, range_count, accumulator) };
+}
+
+fn catalogRangeTopologyDigest(range: table_manager.RangeRecord) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashCatalogTopologyU64(&hasher, range.group_id);
+    hashCatalogTopologyU64(&hasher, range.range_id);
+    hashCatalogTopologyU64(&hasher, range.table_id);
+    hashCatalogTopologyBytes(&hasher, range.start_key);
+    if (range.end_key) |end_key| {
+        hasher.update(&.{1});
+        hashCatalogTopologyBytes(&hasher, end_key);
+    } else {
+        hasher.update(&.{0});
+    }
+    hashCatalogTopologyU64(&hasher, range.doc_identity_shard_id);
+    hashCatalogTopologyU64(&hasher, range.doc_identity_range_id);
+    hashCatalogTopologyU64(&hasher, range.split_attempt_epoch);
+    hashCatalogTopologyBytes(&hasher, range.restore_backup_id);
+    hashCatalogTopologyBytes(&hasher, range.restore_location);
+    hashCatalogTopologyBytes(&hasher, range.restore_snapshot_path);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn finalizeCatalogTableTopology(
+    table_id: u64,
+    range_count: u64,
+    accumulator: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-catalog-table-topology-v1");
     hashCatalogTopologyU64(&hasher, table_id);
@@ -297,7 +413,7 @@ pub fn catalogTableTopology(table_id: u64, ranges: []const table_manager.RangeRe
     hasher.update(&accumulator);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
-    return .{ .range_count = range_count, .digest = digest };
+    return digest;
 }
 
 fn hashCatalogTopologyU64(hasher: *std.crypto.hash.sha2.Sha256, value: u64) void {
@@ -366,6 +482,25 @@ test "catalog table topology is order independent and detects range mutation" {
         .topology = expected,
     };
     try std.testing.expect(contract.matches(&snapshot));
+
+    var projection_index = try CatalogProjectionIndex.init(std.testing.allocator, snapshot.tables, snapshot.ranges);
+    defer projection_index.deinit(std.testing.allocator);
+    try std.testing.expect(projection_index.matchesTablePublication(
+        contract,
+        snapshot.status.metadata_group_id,
+        snapshot.status.metadata_incarnation,
+        snapshot.tables,
+    ));
+    try std.testing.expect(projection_index.matchesPublication(.{
+        .metadata_group_id = 1,
+        .metadata_incarnation = incarnation,
+        .table_id = 7,
+        .table_name = "docs",
+        .schema_json = "{\"version\":1}",
+        .indexes_json = "{}",
+        .range = ranges[1],
+    }, snapshot.status.metadata_group_id, snapshot.status.metadata_incarnation, snapshot.tables, snapshot.ranges));
+
     snapshot.ranges = @constCast(changed[0..]);
     try std.testing.expect(!contract.matches(&snapshot));
 }
