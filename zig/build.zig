@@ -2447,6 +2447,7 @@ pub fn build(b: *std.Build) void {
 
     const httpx_tests = b.addTest(.{
         .root_module = httpx_mod,
+        .filters = selectTestFilters(b, &.{}),
     });
     const run_httpx_tests = b.addRunArtifact(httpx_tests);
     const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");

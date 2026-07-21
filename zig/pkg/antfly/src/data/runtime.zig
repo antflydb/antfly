@@ -74,6 +74,7 @@ const provision_head_poll_startup_interval_ms: u64 = std.time.ms_per_s;
 const provision_head_poll_interval_ms: u64 = 5 * std.time.ms_per_s;
 const runtime_status_refresh_interval_ms: u64 = std.time.ms_per_s;
 const split_transition_batch_leader_wait_ns: u64 = 500 * std.time.ns_per_ms;
+const split_transition_source_leader_wait_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_refresh_max_db_opens_per_run: usize = 16;
 const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_s;
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
@@ -5564,7 +5565,53 @@ pub const DataServer = struct {
 
     fn requireLocalDataRaftLeader(self: *DataServer, group_id: u64) !void {
         const raft = self.data_raft orelse return;
-        if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
+        const deadline_ns = platform_time.monotonicNs() +| split_transition_source_leader_wait_ns;
+        var last_campaign_ns: u64 = 0;
+
+        while (true) {
+            var can_wait_for_local_campaign = false;
+            {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+
+                if (raft.host.http_host.host.isLocalLeader(group_id)) return;
+                const local_node_id = raft.host.http_host.host.cfg.local_node_id;
+                const status = raft.host.http_host.host.raftStatus(group_id) orelse
+                    return error.GroupLeaderUnavailable;
+
+                // A routed structural action may arrive while the cached
+                // leader is between terms. Let the selected local voter drive
+                // a bounded election instead of immediately bouncing the
+                // action across every replica and relying on a later control
+                // loop retry. A known remote leader or a non-voter must still
+                // fail fast so the hosted adapter can rediscover the owner.
+                can_wait_for_local_campaign = status.soft.leader_id == null and
+                    localRaftStatusIsVoter(status, local_node_id);
+                if (!can_wait_for_local_campaign) return error.GroupLeaderUnavailable;
+
+                if (localRaftStatusShouldBootstrapCampaign(status, local_node_id)) {
+                    const now_ns = platform_time.monotonicNs();
+                    if (last_campaign_ns == 0 or
+                        now_ns -| last_campaign_ns >= data_raft_campaign_retry_interval_ns)
+                    {
+                        raft.host.http_host.campaignGroup(group_id) catch |err| {
+                            std.log.warn("data raft transition campaign failed group_id={} node_id={} err={}", .{
+                                group_id,
+                                local_node_id,
+                                err,
+                            });
+                        };
+                        last_campaign_ns = now_ns;
+                    }
+                }
+            }
+
+            if (!can_wait_for_local_campaign or platform_time.monotonicNs() >= deadline_ns) {
+                self.logRaftBatchLeaderTimeout(group_id);
+                return error.GroupLeaderUnavailable;
+            }
+            sleepDataRaftBatchLeaderRetry();
+        }
     }
 
     fn lockLocalTransition(self: *DataServer) void {

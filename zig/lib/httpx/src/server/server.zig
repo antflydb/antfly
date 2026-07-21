@@ -854,8 +854,6 @@ pub const Server = struct {
             std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
         }
 
-        std.debug.print("Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
-
         while (self.running and self.shutdown_mode.load(.acquire) == 0) {
             // Block accept loop when at max concurrent connections.
             // Gate before accept so we don't hold open sockets while waiting.
