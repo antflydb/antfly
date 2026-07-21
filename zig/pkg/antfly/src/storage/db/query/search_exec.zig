@@ -12284,15 +12284,12 @@ fn searchDenseInternal(
         };
 
         const hbc_search_start = platform_time.monotonicNs();
-        var route = denseSearchRoute(native_constraints, paging);
-        if (route.exact_native_filter and executor.exact_dense_search == null) route = .{
-            .exact_native_filter = false,
-            .name = "hbc",
-            .reason = "exact_executor_unavailable",
-        };
+        const route = denseSearchRoute(native_constraints, paging, executor.exact_dense_search != null);
         profile.search_route = route.name;
         profile.route_reason = route.reason;
         var results = if (route.exact_native_filter) blk: {
+            // The callback is an optional executor override, not an exact-route
+            // capability gate. Preserve the built-in exact scorer fallback.
             const exact = if (executor.exact_dense_search) |exact_search|
                 try exact_search(executor.ctx, entry, hbc_req)
             else
@@ -12508,6 +12505,7 @@ const DenseSearchRoute = struct {
 fn denseSearchRoute(
     native_constraints: NativeDenseConstraints,
     paging: ComponentPaging,
+    exact_executor_available: bool,
 ) DenseSearchRoute {
     if (!native_constraints.positive_filter) return .{
         .exact_native_filter = false,
@@ -12524,7 +12522,10 @@ fn denseSearchRoute(
     if (native_constraints.filter_ids.len <= budget) return .{
         .exact_native_filter = true,
         .name = "exact_native_filter",
-        .reason = "candidate_count_within_budget",
+        .reason = if (exact_executor_available)
+            "candidate_count_within_budget"
+        else
+            "candidate_count_within_budget_builtin",
     };
     return .{
         .exact_native_filter = false,
@@ -12536,7 +12537,7 @@ fn denseSearchRoute(
 test "dense search route reports exact native filter budget decisions" {
     const paging = ComponentPaging{ .offset = 0, .limit = 100 };
 
-    const no_filter = denseSearchRoute(.{}, paging);
+    const no_filter = denseSearchRoute(.{}, paging, false);
     try std.testing.expect(!no_filter.exact_native_filter);
     try std.testing.expectEqualStrings("hbc", no_filter.name);
     try std.testing.expectEqualStrings("no_native_filter", no_filter.reason);
@@ -12545,16 +12546,24 @@ test "dense search route reports exact native filter budget decisions" {
     const within_budget = denseSearchRoute(.{
         .positive_filter = true,
         .filter_ids = &within_budget_ids,
-    }, paging);
+    }, paging, true);
     try std.testing.expect(within_budget.exact_native_filter);
     try std.testing.expectEqualStrings("exact_native_filter", within_budget.name);
     try std.testing.expectEqualStrings("candidate_count_within_budget", within_budget.reason);
+
+    const builtin_fallback = denseSearchRoute(.{
+        .positive_filter = true,
+        .filter_ids = &within_budget_ids,
+    }, paging, false);
+    try std.testing.expect(builtin_fallback.exact_native_filter);
+    try std.testing.expectEqualStrings("exact_native_filter", builtin_fallback.name);
+    try std.testing.expectEqualStrings("candidate_count_within_budget_builtin", builtin_fallback.reason);
 
     var over_budget_ids: [3201]u64 = undefined;
     const over_budget = denseSearchRoute(.{
         .positive_filter = true,
         .filter_ids = &over_budget_ids,
-    }, paging);
+    }, paging, false);
     try std.testing.expect(!over_budget.exact_native_filter);
     try std.testing.expectEqualStrings("hbc", over_budget.name);
     try std.testing.expectEqualStrings("native_filter_candidate_budget_exceeded", over_budget.reason);
