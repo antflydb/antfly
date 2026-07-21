@@ -328,6 +328,18 @@ pub const ManagedHostService = struct {
         _ = try self.stepTransitions();
     }
 
+    /// Advances consensus without stepping transition executors. Runtime
+    /// owners serialize this with other Raft access and schedule transition
+    /// work in their control-round critical section.
+    pub fn runRaftRoundOnly(self: *ManagedHostService) !void {
+        _ = try self.host.runRoundBounded(
+            self.cfg.max_inbound_messages,
+            self.cfg.max_tick_groups,
+            self.cfg.max_ready_groups,
+        );
+        self.metrics.sync_rounds += 1;
+    }
+
     pub fn stepTransitions(self: *ManagedHostService) !transition_service.TransitionStepResult {
         if (!self.holdsTransitionAuthority()) return .{};
         if (self.transition_svc) |*transition_svc| {
@@ -909,7 +921,7 @@ test "managed host service syncs queued metadata updates" {
     try std.testing.expectEqual(@as(usize, 1), svc.metrics.sync_rounds);
 }
 
-test "managed host service steps queued transitions during runtime rounds" {
+test "metadata service managed host steps queued transitions only during control rounds" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -1050,6 +1062,10 @@ test "managed host service steps queued transitions during runtime rounds" {
         .source_group_id = 7,
         .destination_group_id = 8,
     });
+
+    try svc.runRaftRoundOnly();
+    try std.testing.expectEqual(@as(usize, 1), svc.metrics.queued_split_transitions);
+    try std.testing.expectEqual(@as(usize, 0), svc.metrics.completed_split_transitions);
 
     try svc.runRound();
     try svc.runRound();

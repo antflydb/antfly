@@ -5417,17 +5417,17 @@ pub const DataServer = struct {
                 );
             };
             const group_summary = group_result catch |err| {
-                self.finishVisibleProvisionedMetadataReconcile();
+                self.finishVisibleProvisionedMetadataReconcile(false);
                 return err;
             };
             summary.merge(group_summary);
         }
 
-        self.finishVisibleProvisionedMetadataReconcile();
+        self.finishVisibleProvisionedMetadataReconcile(summary.indexes_pending == 0);
         return summary;
     }
 
-    fn finishVisibleProvisionedMetadataReconcile(self: *DataServer) void {
+    fn finishVisibleProvisionedMetadataReconcile(self: *DataServer, schedule_startup_catch_up: bool) void {
         // This is an in-place catalog reconciliation, not a filesystem-root
         // publication. Retain the writer generation and retire only readers
         // and artifact caches that could have observed the previous catalog.
@@ -5440,7 +5440,9 @@ pub const DataServer = struct {
         self.clearProvisionedStartupCatchUpBackoffs();
         self.invalidateLocalGroupStatusCache();
         self.runtime_status_dirty.store(true, .release);
-        self.provisioned_startup_catch_up_dirty.store(true, .release);
+        if (schedule_startup_catch_up) {
+            self.provisioned_startup_catch_up_dirty.store(true, .release);
+        }
         self.store_status_dirty.store(true, .release);
     }
 
@@ -10023,10 +10025,7 @@ pub const DataServer = struct {
     }
 
     pub fn shouldDeferProvisionedReplicaRootReconcile(self: *const DataServer) bool {
-        if (self.provisioned_startup_catch_up_active.load(.acquire)) return true;
-        return self.provisioned_startup_catch_up_dirty.load(.acquire) and
-            self.last_provision_metadata_epoch != null and
-            self.last_provision_fingerprint == null;
+        return self.provisioned_startup_catch_up_active.load(.acquire);
     }
 
     fn reportLocalSchemaProgress(
@@ -18076,7 +18075,7 @@ test "data runtime keeps status refresh dirty for non-startup async index work" 
     try std.testing.expect(!DataServer.runtimeStatusStartupCatchUpDebtPresent(bulk_statuses[0..]));
 }
 
-test "data runtime defers replica-root reconcile only for unresolved startup debt on known metadata" {
+test "data runtime defers replica-root reconcile only while startup catch-up owns the shard" {
     var server: DataServer = .{
         .alloc = std.testing.allocator,
         .provisioned_storage = undefined,
@@ -18095,7 +18094,7 @@ test "data runtime defers replica-root reconcile only for unresolved startup deb
     try std.testing.expect(!server.shouldDeferProvisionedReplicaRootReconcile());
 
     server.last_provision_metadata_epoch = 17;
-    try std.testing.expect(server.shouldDeferProvisionedReplicaRootReconcile());
+    try std.testing.expect(!server.shouldDeferProvisionedReplicaRootReconcile());
 
     server.last_provision_fingerprint = 99;
     try std.testing.expect(!server.shouldDeferProvisionedReplicaRootReconcile());
