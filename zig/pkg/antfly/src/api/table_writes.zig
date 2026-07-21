@@ -4721,6 +4721,12 @@ pub const ProvisionedTableWriteSource = struct {
         structural_reconcile_waiters: usize = 0,
         restore_preparations: usize = 0,
         generation_preparation_active: bool = false,
+
+        fn structuralReconcileReserved(self: TableActivity) bool {
+            return self.structural_reconcile_active or
+                self.structural_reconcile_queued > 0 or
+                self.structural_reconcile_waiters > 0;
+        }
     };
 
     const StartupCatchUpBackoff = struct {
@@ -5870,12 +5876,18 @@ pub const ProvisionedTableWriteSource = struct {
         }
     };
 
-    pub fn beginGroupRefreshActivity(
+    pub fn tryBeginGroupRefreshActivity(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_id: u64,
-    ) GroupRefreshActivity {
-        self.beginGroupOperation(table_name, group_id);
+    ) ?GroupRefreshActivity {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        if (self.findTableActivityLocked(table_name, null)) |index| {
+            if (self.active_table_activities.items[index].structuralReconcileReserved()) return null;
+        }
+        if (!self.tryBeginGroupOperationLocked(table_name, group_id)) return null;
         return .{
             .source = self,
             .table_name = table_name,
@@ -26952,6 +26964,41 @@ test "provisioned table write source read request blocks group operation" {
 
     try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
     try std.testing.expect(source.hasReadBlockingActivityBestEffort("docs", 7001));
+}
+
+test "structural reconcile reservation defers metadata group refresh without blocking admitted work" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-structural-reconcile-maintenance", NoCatalog.iface());
+    try std.testing.expect(source.tryBeginGroupOperation("docs", 7001));
+    source.reserveStructuralReconcileActivity("docs");
+    // Work admitted before the reservation must be able to drain; the
+    // reconcile worker waits for that request at its table-level handoff.
+    source.endGroupOperation("docs", 7001);
+    try std.testing.expect(source.tryBeginGroupRefreshActivity("docs", 7001) == null);
+
+    source.beginReservedStructuralReconcileActivity("docs");
+    try std.testing.expect(source.tryBeginGroupRefreshActivity("docs", 7001) == null);
+    // The reconcile owner uses the explicitly read-compatible path to advance
+    // one bounded shard quantum while its table reservation remains active.
+    try std.testing.expect(source.tryBeginReadCompatibleGroupOperation("docs", 7001));
+    source.endGroupOperation("docs", 7001);
+    source.endStructuralReconcileActivity("docs");
+
+    try std.testing.expect(source.tryBeginGroupOperation("docs", 7001));
+    source.endGroupOperation("docs", 7001);
+    var refresh = source.tryBeginGroupRefreshActivity("docs", 7001) orelse return error.TestUnexpectedResult;
+    refresh.deinit();
 }
 
 test "provisioned table write request queues structural reconcile ahead of later writes" {

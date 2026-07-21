@@ -907,7 +907,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expect(saw_draft);
 
     const joined_batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
-        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$set","path":"customer_id","value":"cust:a"}]},{"key":"doc:b","operations":[{"op":"$set","path":"customer_id","value":"cust:b"}]},{"key":"doc:c","operations":[{"op":"$set","path":"customer_id","value":"cust:missing"}]}]}
+        \\{"sync_level":"full_text","transforms":[{"key":"doc:a","operations":[{"op":"$set","path":"customer_id","value":"cust:a"}]},{"key":"doc:b","operations":[{"op":"$set","path":"customer_id","value":"cust:b"}]},{"key":"doc:c","operations":[{"op":"$set","path":"customer_id","value":"cust:missing"}]}]}
     );
     defer std.testing.allocator.free(joined_batch_body);
     var joined_batch = try client.fetchBatch(base_uri, "docs", joined_batch_body);

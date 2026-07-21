@@ -4866,6 +4866,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table transition waiter queues ahead of later writers",
             "provisioned table transition waiter queues ahead of later readers",
             "provisioned table write request queues structural reconcile ahead of later writes",
+            "structural reconcile reservation defers metadata group refresh without blocking admitted work",
             "queued structural reconcile reserves write admission before its worker starts",
             "structural reconcile retry backoff is bounded",
             "structural reconcile productive quantum yields immediately while blocked work backs off",

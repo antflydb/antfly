@@ -5407,7 +5407,8 @@ pub const DataServer = struct {
             const table = findTableById(tables, range.table_id) orelse continue;
 
             const group_result = reconcile: {
-                var activity = refresh_write_source.beginGroupRefreshActivity(table.name, group_id);
+                var activity = refresh_write_source.tryBeginGroupRefreshActivity(table.name, group_id) orelse
+                    break :reconcile error.WriterLocked;
                 defer activity.deinit();
 
                 var group_id_one = [_]u64{group_id};
@@ -9982,7 +9983,12 @@ pub const DataServer = struct {
                 const table = findTableById(snapshot.tables, range.table_id) orelse continue;
 
                 {
-                    var activity = refresh_write_source.beginGroupRefreshActivity(table.name, group_id);
+                    var activity = refresh_write_source.tryBeginGroupRefreshActivity(table.name, group_id) orelse {
+                        self.last_provision_metadata_epoch = head.metadata_epoch;
+                        self.last_provision_fingerprint = null;
+                        self.provisioned_root_refresh_dirty.store(true, .release);
+                        return;
+                    };
                     defer activity.deinit();
 
                     var group_ids_one = [_]u64{group_id};
