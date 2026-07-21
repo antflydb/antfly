@@ -3637,6 +3637,8 @@ pub fn build(b: *std.Build) void {
         "match_all id seek zero limit exposes internal sort profile when sampled",
         "match_all id seek zero limit respects cursor bounds exactly",
         "match_all native candidate sort applies cursor before admission",
+        "dense search route reports exact native filter budget decisions",
+        "document mapper emits default dynamic schema text fields",
         "document mapper emits schema keyword typed doc values",
         "document mapper omits multi-valued schema keyword typed doc values",
         "document mapper omits multi-valued schema numeric typed doc values",

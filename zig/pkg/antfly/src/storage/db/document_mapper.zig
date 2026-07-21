@@ -1603,7 +1603,7 @@ fn extractTextFieldsFromValue(
         if (document_schema) |resolved| {
             try appendSchemaTextFields(alloc, &fields, root, runtime, resolved, text_analysis, observed_field_analyzers);
         }
-        try appendDynamicSchemaTextFields(alloc, &fields, root, runtime, document_schema, text_analysis, observed_field_analyzers);
+        try appendDynamicSchemaTextFields(alloc, &fields, &typed_fields, root, runtime, document_schema, text_analysis, observed_field_analyzers);
         try appendSchemaTypedDocValueFields(alloc, &typed_fields, root, runtime);
         return .{
             .fields = if (fields.items.len > 0) try alloc.dupe(introducer_mod.TextField, fields.items) else &.{},
@@ -1667,6 +1667,7 @@ fn appendSchemaTextFields(
 fn appendDynamicSchemaTextFields(
     alloc: Allocator,
     fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    typed_fields: *std.ArrayListUnmanaged(introducer_mod.TypedFieldValue),
     root: std.json.Value,
     schema: runtime_schema.TableSchema,
     document_schema: ?runtime_schema.FullTextDocument,
@@ -1680,7 +1681,7 @@ fn appendDynamicSchemaTextFields(
         for (resolved.fields) |field| try explicit_paths.append(alloc, field.path);
     }
 
-    try collectDynamicSchemaTextFields(alloc, fields, root, "", schema, document_schema, explicit_paths.items, text_analysis, observed_field_analyzers);
+    try collectDynamicSchemaTextFields(alloc, fields, typed_fields, root, "", schema, document_schema, explicit_paths.items, text_analysis, observed_field_analyzers);
 }
 
 fn appendSchemaTypedDocValueFields(
@@ -1909,6 +1910,7 @@ fn typedValueType(value: typed_dv.TypedValue) typed_dv.ValueType {
 fn collectDynamicSchemaTextFields(
     alloc: Allocator,
     fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
+    typed_fields: *std.ArrayListUnmanaged(introducer_mod.TypedFieldValue),
     value: std.json.Value,
     path: []const u8,
     schema: runtime_schema.TableSchema,
@@ -1917,6 +1919,16 @@ fn collectDynamicSchemaTextFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
 ) !void {
+    if (path.len > 0 and !containsStringSlice(explicit_paths, path)) {
+        if (document_schema) |resolved| {
+            if (pathFallsUnderInferTypeDynamicPath(resolved, path) and
+                runtime_schema.resolveFieldTypeForValue(schema, path, value) == null)
+            {
+                try appendDynamicInferredTypedField(alloc, typed_fields, path, value);
+            }
+        }
+    }
+
     switch (value) {
         .object => |object| {
             if (path.len > 0 and !containsStringSlice(explicit_paths, path)) {
@@ -1939,6 +1951,7 @@ fn collectDynamicSchemaTextFields(
                 try collectDynamicSchemaTextFields(
                     alloc,
                     fields,
+                    typed_fields,
                     entry.value_ptr.*,
                     child_path,
                     schema,
@@ -1951,7 +1964,7 @@ fn collectDynamicSchemaTextFields(
         },
         .array => |array| {
             for (array.items) |item| {
-                try collectDynamicSchemaTextFields(alloc, fields, item, path, schema, document_schema, explicit_paths, text_analysis, observed_field_analyzers);
+                try collectDynamicSchemaTextFields(alloc, fields, typed_fields, item, path, schema, document_schema, explicit_paths, text_analysis, observed_field_analyzers);
             }
         },
         .string => |text| {
@@ -1983,6 +1996,25 @@ fn collectDynamicSchemaTextFields(
         },
         else => {},
     }
+}
+
+fn appendDynamicInferredTypedField(
+    alloc: Allocator,
+    typed_fields: *std.ArrayListUnmanaged(introducer_mod.TypedFieldValue),
+    path: []const u8,
+    value: std.json.Value,
+) !void {
+    const typed_value: typed_dv.TypedValue = switch (value) {
+        .integer => |number| .{ .i64_val = number },
+        .float => |number| if (std.math.isFinite(number)) .{ .f64_val = number } else return,
+        .bool => |boolean| .{ .bool_val = boolean },
+        else => return,
+    };
+    try typed_fields.append(alloc, .{
+        .field_name = try alloc.dupe(u8, path),
+        .value_type = typedValueType(typed_value),
+        .value = typed_value,
+    });
 }
 
 fn appendMappedSubfieldTextFields(
@@ -4344,7 +4376,7 @@ test "document mapper emits default dynamic schema text fields" {
 
     const text_analysis = introducer_mod.TextAnalysisConfig{};
     const segment = (try buildTextSegmentFromDocuments(alloc, &.{
-        .{ .key = "doc:1", .value = "{\"title\":\"Document One\",\"body\":\"alpha benchmark body\",\"status\":\"active\",\"tenant\":\"tenanta\"}" },
+        .{ .key = "doc:1", .value = "{\"title\":\"Document One\",\"body\":\"alpha benchmark body\",\"status\":\"active\",\"tenant\":\"tenanta\",\"id\":42,\"active\":true}" },
     }, text_analysis, schema)).?;
     defer alloc.free(segment);
 
@@ -4357,6 +4389,16 @@ test "document mapper emits default dynamic schema text fields" {
     try std.testing.expect((try reader.invertedIndex("status.keyword")) != null);
     try std.testing.expect((try reader.invertedIndex("tenant")) != null);
     try std.testing.expect((try reader.invertedIndex("tenant.keyword")) != null);
+
+    const id_section = reader.getSection("id", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var id_values = try typed_dv.TypedDocValuesReader.init(alloc, id_section);
+    try std.testing.expectEqual(typed_dv.ValueType.i64_val, id_values.value_type);
+    try std.testing.expectEqual(@as(?i64, 42), try id_values.getI64(0));
+
+    const active_section = reader.getSection("active", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var active_values = try typed_dv.TypedDocValuesReader.init(alloc, active_section);
+    try std.testing.expectEqual(typed_dv.ValueType.bool_val, active_values.value_type);
+    try std.testing.expectEqual(@as(?bool, true), try active_values.getBool(0));
 }
 
 test "document mapper extracts dense vector from configured field" {

@@ -38209,6 +38209,89 @@ test "db default dynamic schema vector term filters project through doc identity
     try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "tenant.keyword", "tenanta"));
 }
 
+test "db dense default dynamic one percent filters exact score top one hundred" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const default_schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, default_schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    const doc_count: usize = 10_000;
+    const eligible_count: usize = 100;
+    const writes = try alloc.alloc(types.BatchWrite, doc_count);
+    defer {
+        for (writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        alloc.free(writes);
+    }
+    for (writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i}),
+            .value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"id\":{d},\"bucket\":\"{s}\",\"embedding\":[{d},0]}}",
+                .{ i, if (i >= doc_count - eligible_count) "selected" else "other", i },
+            ),
+        };
+    }
+    try db.batch(.{
+        .writes = writes,
+        .sync_level = .full_index,
+    });
+
+    const filters = [_][]const u8{
+        "{\"numeric_range\":{\"field\":\"id\",\"min\":9900,\"inclusive_min\":true}}",
+        "{\"term\":{\"bucket\":\"selected\"}}",
+    };
+    for (filters) |filter_query_json| {
+        var profiled = try db.searchDenseProfiled(alloc, .{
+            .index_name = "dv_v1",
+            .primary_text_index_name = "ft_v1",
+            .limit = eligible_count,
+            .include_stored = false,
+            .filter_query_json = filter_query_json,
+        }, .{ .vector = &.{ 9999.0, 0.0 }, .k = eligible_count });
+        defer profiled.result.deinit();
+
+        try std.testing.expectEqual(@as(u32, eligible_count), profiled.result.total_hits);
+        try std.testing.expectEqual(eligible_count, profiled.result.hits.len);
+        try std.testing.expectEqual(@as(u64, eligible_count), profiled.profile.native_filter_candidate_count);
+        try std.testing.expectEqualStrings("exact_native_filter", profiled.profile.search_route);
+        try std.testing.expectEqualStrings("candidate_count_within_budget", profiled.profile.route_reason);
+        for (profiled.result.hits, 0..) |hit, rank| {
+            const expected = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{doc_count - 1 - rank});
+            defer alloc.free(expected);
+            try std.testing.expectEqualStrings(expected, hit.id);
+        }
+    }
+}
+
 test "db exact sort resolves explicit keyword metadata filters natively" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
