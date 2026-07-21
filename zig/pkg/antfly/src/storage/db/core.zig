@@ -965,7 +965,7 @@ pub const DBCore = struct {
     }
 
     pub fn setSchema(self: *DBCore, table_schema: schema_mod.TableSchema) !void {
-        try schema_mod.saveSchema(self.store, self.alloc, table_schema);
+        if (!try schema_mod.saveSchema(self.store, self.alloc, table_schema)) return;
         const next_schema = try schema_mod.loadSchema(self.store, self.alloc);
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
         self.schema = next_schema;

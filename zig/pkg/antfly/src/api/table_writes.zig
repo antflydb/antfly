@@ -18656,6 +18656,13 @@ fn applyLocalTableSchemaJson(
 ) !void {
     if (schema_json.len == 0) return;
 
+    const previous_schema_json = try loadLocalTableSchemaJson(alloc, db);
+    defer if (previous_schema_json) |value| alloc.free(value);
+    const marker_changed = if (previous_schema_json) |value|
+        !std.mem.eql(u8, value, schema_json)
+    else
+        true;
+
     var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
 
@@ -18663,7 +18670,7 @@ fn applyLocalTableSchemaJson(
     defer storage_schema.freeSchema(alloc, runtime_schema);
 
     try db.setSchema(runtime_schema);
-    try db.core.store.put(local_schema_json_key, schema_json);
+    if (marker_changed) try db.core.store.put(local_schema_json_key, schema_json);
 }
 
 fn loadTableIndexesJson(

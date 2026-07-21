@@ -7445,10 +7445,6 @@ pub const DB = struct {
         return .{ .ready = false, .count = scanned_count, .repair_scan_count = scanned_count };
     }
 
-    fn artifactRepairSummaryIndexCount(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
-        return (try self.artifactRepairSummaryIndexSnapshot(alloc, index_name, try self.artifactRepairSummaryReady(alloc))).count;
-    }
-
     fn appendArtifactRepairSummaryWrite(
         self: *DB,
         alloc: Allocator,
@@ -8115,7 +8111,7 @@ pub const DB = struct {
             if (req.artifact_kind) |requested_kind| {
                 if (requested_kind != artifact_kind) continue;
             }
-            if (!(try self.indexRepairRequired(alloc, cfg.name))) continue;
+            if (!(try self.indexGenerationRepairRequired(alloc, cfg.name))) continue;
             scanned += 1;
             if (req.limit != 0 and issues.items.len >= req.limit) {
                 has_more = true;
@@ -10712,7 +10708,7 @@ pub const DB = struct {
             if (!matches_kind) return error.NotFound;
         }
 
-        const repair_required = try self.indexRepairRequired(alloc, cfg.name);
+        const repair_required = try self.indexGenerationRepairRequired(alloc, cfg.name);
         if (!repair_required and !req.force) return result;
         if ((req.repair_job_id == null) != (req.repair_job_created_at_ms == null)) return error.InvalidArgument;
         const repair_job_created_at_ms = req.repair_job_created_at_ms orelse 0;
@@ -10902,7 +10898,7 @@ pub const DB = struct {
                 },
             }
         }
-        if (had_load_failure and self.core.index_manager.loadFailure(cfg.name) == null and (cfg.kind == .full_text or cfg.kind == .algebraic) and !try self.indexRepairRequired(alloc, cfg.name)) {
+        if (had_load_failure and self.core.index_manager.loadFailure(cfg.name) == null and (cfg.kind == .full_text or cfg.kind == .algebraic) and !try self.indexGenerationRepairRequired(alloc, cfg.name)) {
             result.repaired += 1;
             return result;
         }
@@ -10935,7 +10931,7 @@ pub const DB = struct {
             return result;
         }
         result.indexes_rebuilt += 1;
-        if (try self.indexRepairRequired(alloc, cfg.name)) {
+        if (try self.indexGenerationRepairRequired(alloc, cfg.name)) {
             result.unresolved += 1;
             result.debt_remaining = true;
         } else {
@@ -11797,7 +11793,7 @@ pub const DB = struct {
         );
     }
 
-    fn indexRepairRequired(self: *DB, alloc: Allocator, index_name: []const u8) !bool {
+    fn indexGenerationRepairRequired(self: *DB, alloc: Allocator, index_name: []const u8) !bool {
         if (self.core.index_manager.loadFailure(index_name) != null) return true;
         // A durable generation intent is itself authoritative repair debt.
         // Managed catalog admission can intentionally leave the active
@@ -11813,7 +11809,13 @@ pub const DB = struct {
             .clean, .rebuilding => {},
         }
         if (try self.denseCoverageRegressionRepairRequired(alloc, index_name)) return true;
-        return try self.artifactRepairSummaryIndexCount(alloc, index_name) != 0;
+        // Source artifacts have their own durable repair queue. Treating that
+        // queue as generation debt recursively starts another shadow rebuild
+        // after a repaired generation activates but before its source artifact
+        // is regenerated. Managed catch-up repairs source debt, advances replay,
+        // and rebuilds a generation only when one of the structural predicates
+        // above still requires it.
+        return false;
     }
 
     fn denseCoverageRegressionRepairRequired(self: *DB, alloc: Allocator, index_name: []const u8) !bool {
@@ -56641,8 +56643,57 @@ test "db asynchronous dense replay lag is not classified as repair debt" {
         @as(u64, 0),
         db.core.index_manager.denseIndex("dense_idx").?.index.stats().active_count,
     );
-    try std.testing.expect(!(try db.indexRepairRequired(alloc, "dense_idx")));
+    try std.testing.expect(!(try db.indexGenerationRepairRequired(alloc, "dense_idx")));
     try std.testing.expect(!(try db.hasPendingDenseArtifactRebuild(alloc)));
+}
+
+test "db source artifact debt does not synthesize index generation repair debt" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .embedding,
+        .index_name = try alloc.dupe(u8, "dense_idx"),
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_name = try alloc.dupe(u8, "dense_idx"),
+        .artifact_key = try alloc.dupe(u8, "corrupt-artifact"),
+        .reason = .corrupt_artifact,
+        .sequence = db.core.nextDerivedSequence(),
+    };
+    defer issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    const artifact_issues = try db.listArtifactRepairIssues(alloc, .embedding, "dense_idx", 0);
+    defer types.freeArtifactRepairIssues(alloc, artifact_issues);
+    try std.testing.expectEqual(@as(usize, 1), artifact_issues.len);
+    try std.testing.expect(!(try db.indexGenerationRepairRequired(alloc, "dense_idx")));
+
+    var generation_issues = try db.listArtifactRepairIssuesPage(alloc, .{
+        .target = .index,
+        .index_name = "dense_idx",
+    });
+    defer generation_issues.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), generation_issues.issues.len);
 }
 
 test "dense replay progress target matches replay debt target" {
@@ -63732,7 +63783,7 @@ test "db dense artifact planner does not let stale status override authoritative
     try db.core.store.put(status_key, &stale_status);
 
     try std.testing.expect(!(try db.hasPendingDenseArtifactRebuild(alloc)));
-    try std.testing.expect(!(try db.indexRepairRequired(alloc, "dense_idx")));
+    try std.testing.expect(!(try db.indexGenerationRepairRequired(alloc, "dense_idx")));
     try std.testing.expectEqual(
         @as(usize, 0),
         try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc),

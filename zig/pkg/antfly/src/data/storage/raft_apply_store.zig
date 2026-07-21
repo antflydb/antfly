@@ -2049,6 +2049,7 @@ test "data raft apply store parses empty-start colon range" {
 }
 
 test "data raft apply store captures split handoff and replays destination deltas" {
+    const setup_commit_index: u64 = 6;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2073,13 +2074,13 @@ test "data raft apply store captures split handoff and replays destination delta
     defer std.testing.allocator.free(setup);
     try src.snapshotBuilder().applyBatch(.{
         .group_id = 91,
-        .commit_index = 6,
+        .commit_index = setup_commit_index,
         .entries_bytes = setup,
     });
 
     const handoff = try src.captureSplitHandoff(std.testing.allocator, 91);
     defer shard_state_store.freeHandoff(std.testing.allocator, handoff);
-    try std.testing.expectEqual(@as(u64, 1), handoff.base_delta_sequence);
+    try std.testing.expectEqual(setup_commit_index, handoff.base_delta_sequence);
     try dst.applySplitHandoff(std.testing.allocator, 92, handoff);
 
     const catchup_batch = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
@@ -2096,7 +2097,12 @@ test "data raft apply store captures split handoff and replays destination delta
 
     const deltas = try src.listSplitDeltasAfter(std.testing.allocator, 91, handoff.base_delta_sequence);
     defer shard_mod.freeDeltas(std.testing.allocator, deltas);
-    try std.testing.expectEqual(@as(usize, 1), deltas.len);
+    // Split replication preserves the Raft-entry watermark, including source-
+    // side writes that the destination range filter discards during apply.
+    try std.testing.expectEqual(@as(usize, 3), deltas.len);
+    try std.testing.expectEqual(@as(u64, 7), deltas[0].sequence);
+    try std.testing.expectEqual(@as(u64, 8), deltas[1].sequence);
+    try std.testing.expectEqual(@as(u64, 9), deltas[2].sequence);
     try dst.applySplitDeltas(std.testing.allocator, 92, deltas);
 
     const byte_range = try dst.currentRange(std.testing.allocator, 92);

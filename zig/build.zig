@@ -5457,7 +5457,7 @@ pub fn build(b: *std.Build) void {
         .root_module = standalone_runtime_test_mod,
         .filters = &.{
             "standalone runtime module compiles",
-            "standalone runtime local replica reconcile permit stays blocked while startup debt is unresolved",
+            "standalone runtime local replica reconcile permit blocks only active startup catch-up",
             "standalone runtime registers internal group routes explicitly",
             "standalone runtime registers mcp routes before antfarm catch-all",
             "standalone runtime antfarm path guards keep api routes reserved",

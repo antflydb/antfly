@@ -3865,7 +3865,7 @@ test "standalone bridge shared adapter preserves protocol headers and absent bod
     try std.testing.expectEqualStrings("", req.body);
 }
 
-test "standalone runtime local replica reconcile permit stays blocked while startup debt is unresolved" {
+test "standalone runtime local replica reconcile permit blocks only active startup catch-up" {
     var data_server = antfly.data.runtime.DataServer{
         .alloc = std.testing.allocator,
         .provisioned_storage = undefined,
@@ -3884,7 +3884,7 @@ test "standalone runtime local replica reconcile permit stays blocked while star
     try std.testing.expect(runLocalReplicaRootReconcilePermitHook(&data_server));
 
     data_server.last_provision_metadata_epoch = 17;
-    try std.testing.expect(!runLocalReplicaRootReconcilePermitHook(&data_server));
+    try std.testing.expect(runLocalReplicaRootReconcilePermitHook(&data_server));
 
     data_server.last_provision_fingerprint = 99;
     try std.testing.expect(runLocalReplicaRootReconcilePermitHook(&data_server));
