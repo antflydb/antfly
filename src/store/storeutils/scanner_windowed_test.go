@@ -80,7 +80,8 @@ func TestScanForEnrichment_WindowCutPrefixInterleavedKeys(t *testing.T) {
 		insertDocument(t, db, k, []byte(`{"v": true}`), nil, nil)
 	}
 
-	for _, batchSize := range []int{1, 2, 3, 10} {
+	// 0 exercises the <1 clamp: unclamped it would never advance the window.
+	for _, batchSize := range []int{0, 1, 2, 3, 10} {
 		var emitted [][]byte
 		err := ScanForEnrichment(ctx, db, EnrichmentScanOptions{
 			ByteRange:        [2][]byte{[]byte("user"), []byte("user;")},
@@ -107,29 +108,31 @@ func TestScanForBackfill_WindowCutPreservesSummaries(t *testing.T) {
 	ctx := t.Context()
 
 	docKeys := [][]byte{[]byte("doc:1"), []byte("doc:2"), []byte("doc:3"), []byte("doc:4")}
-	for i, k := range docKeys {
+	for _, k := range docKeys {
 		insertDocument(t, db, k, []byte(`{"n": 1}`), nil, map[string]string{
 			"myindex": string(k) + "-summary",
 		})
-		_ = i
 	}
 
-	var emitted []DocumentScanState
-	err := ScanForBackfill(ctx, db, BackfillScanOptions{
-		ByteRange:        [2][]byte{[]byte("doc:"), []byte("doc;")},
-		IncludeSummaries: true,
-		BatchSize:        1,
-		ProcessBatch: func(ctx context.Context, batch []DocumentScanState) error {
-			emitted = append(emitted, batch...)
-			return nil
-		},
-	})
+	// 0 exercises the <1 clamp: unclamped it would never advance the window.
+	for _, batchSize := range []int{0, 1} {
+		var emitted []DocumentScanState
+		err := ScanForBackfill(ctx, db, BackfillScanOptions{
+			ByteRange:        [2][]byte{[]byte("doc:"), []byte("doc;")},
+			IncludeSummaries: true,
+			BatchSize:        batchSize,
+			ProcessBatch: func(ctx context.Context, batch []DocumentScanState) error {
+				emitted = append(emitted, batch...)
+				return nil
+			},
+		})
 
-	require.NoError(t, err)
-	require.Len(t, emitted, len(docKeys))
-	for i, s := range emitted {
-		require.Equal(t, docKeys[i], s.CurrentDocKey)
-		require.Equal(t, string(docKeys[i])+"-summary", s.Summaries["myindex"],
-			"summary must survive the window cut at its own boundary")
+		require.NoError(t, err)
+		require.Len(t, emitted, len(docKeys))
+		for i, s := range emitted {
+			require.Equal(t, docKeys[i], s.CurrentDocKey)
+			require.Equal(t, string(docKeys[i])+"-summary", s.Summaries["myindex"],
+				"summary must survive the window cut at its own boundary")
+		}
 	}
 }

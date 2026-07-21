@@ -125,6 +125,10 @@ type EnrichmentScanOptions struct {
 //
 // Use PrimarySuffix to specify what to scan (DBRangeStart for documents, SummarySuffix for summaries).
 // Use EnrichmentSuffix to specify what enrichment to check for (e.g., EmbeddingSuffix, SummarySuffix).
+//
+// Each batch is processed with the scan iterator closed and the next window
+// opened fresh, so the traversal is not a point-in-time snapshot: an item
+// enriched while a batch is processing is skipped, not re-emitted.
 func ScanForEnrichment(ctx context.Context, db *pebble.DB, opts EnrichmentScanOptions) error {
 	var err error
 	defer func() {
@@ -148,6 +152,12 @@ func ScanForEnrichment(ctx context.Context, db *pebble.DB, opts EnrichmentScanOp
 
 	// When scanning summaries, we don't need JSON deserialization
 	scanningDocuments := bytes.Equal(primarySuffix, DBRangeStart)
+
+	// BatchSize < 1 would cut the window at the first primary key of every
+	// pass without advancing the lower bound - an unlogged infinite loop.
+	if opts.BatchSize < 1 {
+		opts.BatchSize = 1
+	}
 
 	batch := make([]DocumentScanState, 0, opts.BatchSize)
 	var currentDoc *DocumentScanState
@@ -386,6 +396,9 @@ type BackfillScanOptions struct {
 
 // ScanForBackfill scans documents and their associated summaries for backfilling indexes.
 // This is used by BleveIndexV2 during rebuild to efficiently collect documents with their summaries.
+//
+// Each batch is processed with the scan iterator closed and the next window
+// opened fresh, so the traversal is not a point-in-time snapshot.
 func ScanForBackfill(ctx context.Context, db *pebble.DB, opts BackfillScanOptions) error {
 	var err error
 	defer func() {
@@ -400,6 +413,12 @@ func ScanForBackfill(ctx context.Context, db *pebble.DB, opts BackfillScanOption
 			panic(r)
 		}
 	}()
+
+	// BatchSize < 1 would cut the window at the first document key of every
+	// pass without advancing the lower bound - an unlogged infinite loop.
+	if opts.BatchSize < 1 {
+		opts.BatchSize = 1
+	}
 
 	batch := make([]DocumentScanState, 0, opts.BatchSize)
 	var currentDoc *DocumentScanState
@@ -539,10 +558,11 @@ func ScanForBackfill(ctx context.Context, db *pebble.DB, opts BackfillScanOption
 				}
 
 				// Batch full: cut the window exactly at this primary key.
-				// Everything strictly before it was consumed, and
-				// a document's summary/chunk keys always sort after its
+				// Everything strictly before it was consumed, and a
+				// document's summary/chunk keys always sort after its own
 				// primary, so resuming here (inclusive) loses nothing and
-				// re-emits nothing even with prefix-interleaved doc keys.
+				// re-emits nothing. (How prefix-interleaved doc keys group
+				// is a separate, pre-existing concern the cut leaves as-is.)
 				if len(batch) >= opts.BatchSize {
 					resumeKey = append([]byte(nil), key...)
 					return false, nil
