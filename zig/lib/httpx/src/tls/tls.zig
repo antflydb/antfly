@@ -300,12 +300,16 @@ pub const TlsSession = struct {
 
     /// Reads decrypted data from the session.
     pub fn read(self: *Self, buffer: []u8) !usize {
+        if (buffer.len == 0) return 0;
         const c = if (self.client) |*c| c else return error.NotConnected;
-        var iov = [_][]u8{buffer};
-        return c.reader.readVec(&iov) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => error.ReadFailed,
+        const available = c.reader.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => return 0,
+            else => return error.ReadFailed,
         };
+        const len = @min(buffer.len, available.len);
+        @memcpy(buffer[0..len], available[0..len]);
+        c.reader.toss(len);
+        return len;
     }
 
     /// Writes data to be encrypted and sent.
