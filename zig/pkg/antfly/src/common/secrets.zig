@@ -218,11 +218,12 @@ const PersistedSecretsFile = struct {
 };
 
 const FileMetadata = struct {
+    inode: std.Io.File.INode,
     size: u64,
     mtime_ns: i128,
 
     fn eql(self: FileMetadata, other: FileMetadata) bool {
-        return self.size == other.size and self.mtime_ns == other.mtime_ns;
+        return self.inode == other.inode and self.size == other.size and self.mtime_ns == other.mtime_ns;
     }
 };
 
@@ -991,6 +992,7 @@ fn statFileMetadata(path: []const u8) !?FileMetadata {
         else => return err,
     };
     return .{
+        .inode = stat.inode,
         .size = stat.size,
         .mtime_ns = stat.mtime.toNanoseconds(),
     };
@@ -1131,6 +1133,76 @@ test "file secret store reloads valid external replacements including deletions"
     const deleted = try store.getOwned(alloc, "deleted.dynamic_secret");
     defer if (deleted) |value| alloc.free(value);
     try std.testing.expectEqual(@as(?[]u8, null), deleted);
+}
+
+test "file secret store detects projected volume symlink target replacement" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
+        return error.SkipZigTest;
+    }
+
+    const alloc = std.testing.allocator;
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-projected-{d}", .{nowNs()});
+    defer alloc.free(root);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const first_dir = try std.fmt.allocPrint(alloc, "{s}/..2026_01", .{root});
+    defer alloc.free(first_dir);
+    const second_dir = try std.fmt.allocPrint(alloc, "{s}/..2026_02", .{root});
+    defer alloc.free(second_dir);
+    try fs_paths.createDirPathPortable(io, first_dir);
+    try fs_paths.createDirPathPortable(io, second_dir);
+
+    const first_path = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{first_dir});
+    defer alloc.free(first_path);
+    const second_path = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{second_dir});
+    defer alloc.free(second_path);
+    const first_json =
+        \\{"secrets":[{"key":"openai.api_key","value":"first","created_at_ns":1,"updated_at_ns":1}]}
+    ;
+    const second_json =
+        \\{"secrets":[{"key":"openai.api_key","value":"other","created_at_ns":1,"updated_at_ns":1}]}
+    ;
+    try std.testing.expectEqual(first_json.len, second_json.len);
+    try writeFileAtomically(first_path, first_json);
+    try writeFileAtomically(second_path, second_json);
+
+    // Reproduce the hard case for size+mtime detection: projected generations
+    // contain same-length values and carry the same modification timestamp.
+    const first_stat = try std.Io.Dir.cwd().statFile(io, first_path, .{});
+    try std.Io.Dir.cwd().setTimestamps(io, second_path, .{
+        .modify_timestamp = .{ .new = first_stat.mtime },
+    });
+
+    const data_link = try std.fmt.allocPrint(alloc, "{s}/..data", .{root});
+    defer alloc.free(data_link);
+    const next_data_link = try std.fmt.allocPrint(alloc, "{s}/..data-next", .{root});
+    defer alloc.free(next_data_link);
+    const secret_link = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{root});
+    defer alloc.free(secret_link);
+    try std.Io.Dir.cwd().symLink(io, "..2026_01", data_link, .{ .is_directory = true });
+    try std.Io.Dir.cwd().symLink(io, "..data/secrets.json", secret_link, .{});
+
+    var store = try FileStore.init(alloc, secret_link);
+    defer store.deinit();
+    const initial_generation = store.generation();
+    const initial_metadata = store.observed_metadata.?;
+
+    try std.Io.Dir.cwd().symLink(io, "..2026_02", next_data_link, .{ .is_directory = true });
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), next_data_link, std.Io.Dir.cwd(), data_link, io);
+
+    const replacement_metadata = (try statFileMetadata(secret_link)).?;
+    try std.testing.expectEqual(initial_metadata.size, replacement_metadata.size);
+    try std.testing.expectEqual(initial_metadata.mtime_ns, replacement_metadata.mtime_ns);
+    try std.testing.expect(initial_metadata.inode != replacement_metadata.inode);
+
+    const reloaded = try store.getOwned(alloc, "openai.api_key");
+    defer if (reloaded) |value| alloc.free(value);
+    try std.testing.expectEqualStrings("other", reloaded.?);
+    try std.testing.expectEqual(initial_generation + 1, store.generation());
 }
 
 test "file secret store throttles cache-key freshness checks" {

@@ -326,6 +326,28 @@ Key Vault, and similar systems should be deferred until there is a concrete
 customer requirement that cannot be handled by Kubernetes projection or local
 file provisioning.
 
+### Config and secret reconciliation acknowledgement
+
+`config.json` and `secrets.json` have deliberately different acknowledgement
+rules:
+
+- A remote-content routing or credential-reference change is complete only
+  when `GET /status` reports `runtime_config.hash` equal to the SHA-256 of the
+  generated `config.json` (the operator publishes its first 16 characters as
+  `antfly.io/config-hash`) and `runtime_config.stale` is false.
+- A value rotation behind an unchanged `${secret:...}` reference is complete
+  only after `secret_store.generation` advances past the caller's baseline and
+  `secret_store.stale` is false. It does not require a config generation change
+  or pod rollout.
+- `last_reload_failed`, `reload_successes`, and `reload_failures` distinguish a
+  successfully published generation from a last-known-good stale snapshot.
+
+Controllers such as Colony must poll the running Antfly process for these
+acknowledgements; writing the Kubernetes ConfigMap or Secret alone is not a
+runtime acknowledgement. The operator does not read Secret contents. Its
+non-secret pod-template config hash is a compatibility rollout fallback for
+older Antfly versions that do not publish hot-reloaded config snapshots.
+
 Encrypted-at-rest support inside Antfly is still useful for non-Kubernetes
 deployments and simpler VM/bare-metal deployments. It is less urgent for the
 Kubernetes enterprise path, where the external manager and Kubernetes secret
@@ -558,10 +580,10 @@ Additional runtime tests:
 7. [done] Add managed embedder runtime test with a fake OpenAI-compatible
    endpoint.
 8. [done] Migrate generator and reranker provider credential plumbing.
-9. [partial] Preserve and resolve remote-content HTTP header references at
-   fetch time; rotation tests remain.
-10. [partial] Preserve and resolve remote-content S3 references at fetch time;
-   rotation tests remain.
+9. [done] Preserve and resolve remote-content HTTP header references at fetch
+   time.
+10. [done] Preserve and resolve remote-content S3 references at fetch time,
+    including same-length live rotation coverage.
 11. [partial] Migrate foreign DSNs and CDC DSNs; reconnect tests remain.
 12. [done] Add warning logs and compact cluster status for stale reload state.
 13. [done] Document operational behavior for malformed files, file deletion, Kubernetes

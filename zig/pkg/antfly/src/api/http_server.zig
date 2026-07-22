@@ -2516,6 +2516,9 @@ pub const ApiHttpServer = struct {
                 };
                 cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
             }
+            if (self.cfg.remote_content) |remote_content| {
+                if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(self.alloc, &public_status, health);
+            }
             return try jsonResponse(self.alloc, public_status);
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.cluster)) {
@@ -2532,6 +2535,9 @@ pub const ApiHttpServer = struct {
                     std.log.warn("secret store status refresh skipped err={}", .{err});
                 };
                 cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+            }
+            if (self.cfg.remote_content) |remote_content| {
+                if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(self.alloc, &public_status, health);
             }
             var snapshot_opt = try self.source.cachedAdminSnapshot();
             if (snapshot_opt == null) {
@@ -24187,7 +24193,6 @@ test "api index status refreshes synthetic configured index status from write so
         },
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefresh(live_statuses[0..]));
-
 }
 
 test "api index status asks write source when read runtime status is absent" {

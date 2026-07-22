@@ -89,7 +89,9 @@ const Allocator = std.mem.Allocator;
 pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) u64 {
     if (comptime builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
         if (remote_content) |remote| {
-            if (remote.security) |security| {
+            var snapshot = remote.acquire();
+            defer snapshot.deinit();
+            if (snapshot.config.security) |security| {
                 if (security.max_download_size_bytes) |value| return value;
             }
         }

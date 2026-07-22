@@ -32,10 +32,12 @@ pub const ClusterStatus = struct {
     auth_enabled: bool = false,
     deployment_mode: common_config.DeploymentMode = .distributed,
     secret_store: ?SecretStoreStatus = null,
+    runtime_config: ?RuntimeConfigStatus = null,
     storage: ?metadata_openapi.StorageRuntimeStatus = null,
 
     pub fn deinit(self: *ClusterStatus, alloc: std.mem.Allocator) void {
         if (self.message) |message| alloc.free(message);
+        if (self.runtime_config) |*runtime_config| runtime_config.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -46,18 +48,38 @@ pub const ClusterTopology = struct {
     auth_enabled: bool = false,
     deployment_mode: common_config.DeploymentMode = .distributed,
     secret_store: ?SecretStoreStatus = null,
+    runtime_config: ?RuntimeConfigStatus = null,
     storage: ?metadata_openapi.StorageRuntimeStatus = null,
     data: ClusterDataStatus = .{},
 
     pub fn deinit(self: *ClusterTopology, alloc: std.mem.Allocator) void {
         if (self.message) |message| alloc.free(message);
+        if (self.runtime_config) |*runtime_config| runtime_config.deinit(alloc);
         self.data.deinit(alloc);
         self.* = undefined;
     }
 };
 
 pub const SecretStoreStatus = struct {
+    generation: u64 = 0,
+    last_reload_failed: bool = false,
     stale: bool = false,
+    reload_successes: u64 = 0,
+    reload_failures: u64 = 0,
+};
+
+pub const RuntimeConfigStatus = struct {
+    generation: u64 = 0,
+    hash: []u8,
+    last_reload_failed: bool = false,
+    stale: bool = false,
+    reload_successes: u64 = 0,
+    reload_failures: u64 = 0,
+
+    pub fn deinit(self: *RuntimeConfigStatus, alloc: std.mem.Allocator) void {
+        alloc.free(self.hash);
+        self.* = undefined;
+    }
 };
 
 pub const ClusterDataStatus = struct {
@@ -195,12 +217,24 @@ pub fn topologyFromStatusAndSnapshot(
 }
 
 pub fn topologyFromStatus(alloc: std.mem.Allocator, status: ClusterStatus) !ClusterTopology {
+    const message = if (status.message) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (message) |value| alloc.free(value);
+    var runtime_config: ?RuntimeConfigStatus = if (status.runtime_config) |value| .{
+        .generation = value.generation,
+        .hash = try alloc.dupe(u8, value.hash),
+        .last_reload_failed = value.last_reload_failed,
+        .stale = value.stale,
+        .reload_successes = value.reload_successes,
+        .reload_failures = value.reload_failures,
+    } else null;
+    errdefer if (runtime_config) |*value| value.deinit(alloc);
     return .{
         .health = status.health,
-        .message = if (status.message) |message| try alloc.dupe(u8, message) else null,
+        .message = message,
         .auth_enabled = status.auth_enabled,
         .deployment_mode = status.deployment_mode,
         .secret_store = status.secret_store,
+        .runtime_config = runtime_config,
         .storage = status.storage,
         .data = .{},
     };
@@ -297,7 +331,27 @@ pub fn dataFromSnapshot(alloc: std.mem.Allocator, snapshot: *const metadata_api.
 
 pub fn applySecretStoreHealth(status: *ClusterStatus, health: common_secrets.ReloadHealth) void {
     status.secret_store = .{
+        .generation = health.generation,
+        .last_reload_failed = health.last_reload_failed,
         .stale = health.stale_snapshot,
+        .reload_successes = health.reload_successes,
+        .reload_failures = health.reload_failures,
+    };
+}
+
+pub fn applyRuntimeConfigHealth(
+    alloc: std.mem.Allocator,
+    status: *ClusterStatus,
+    health: @import("antfly_scraping").RemoteContentConfig.RuntimeHealth,
+) !void {
+    if (status.runtime_config) |*previous| previous.deinit(alloc);
+    status.runtime_config = .{
+        .generation = health.generation,
+        .hash = try std.fmt.allocPrint(alloc, "{x}", .{health.hash}),
+        .last_reload_failed = health.last_reload_failed,
+        .stale = health.stale_snapshot,
+        .reload_successes = health.reload_successes,
+        .reload_failures = health.reload_failures,
     };
 }
 
@@ -388,4 +442,27 @@ test "cluster status carries non-secret secret store health" {
     });
     const secret_store = status.secret_store orelse return error.TestUnexpectedResult;
     try std.testing.expect(secret_store.stale);
+    try std.testing.expectEqual(@as(u64, 7), secret_store.generation);
+    try std.testing.expect(secret_store.last_reload_failed);
+}
+
+test "cluster status carries non-secret runtime config generation and hash" {
+    const alloc = std.testing.allocator;
+    var status = ClusterStatus{ .health = .healthy };
+    defer status.deinit(alloc);
+    var hash = [_]u8{0} ** 32;
+    hash[0..8].* = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
+    try applyRuntimeConfigHealth(alloc, &status, .{
+        .generation = 4,
+        .hash = hash,
+        .last_reload_failed = true,
+        .stale_snapshot = true,
+        .reload_successes = 4,
+        .reload_failures = 1,
+    });
+    const runtime_config = status.runtime_config orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 4), runtime_config.generation);
+    try std.testing.expectEqualStrings("0123456789abcdef000000000000000000000000000000000000000000000000", runtime_config.hash);
+    try std.testing.expect(runtime_config.last_reload_failed);
+    try std.testing.expect(runtime_config.stale);
 }
