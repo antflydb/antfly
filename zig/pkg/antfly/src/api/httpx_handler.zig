@@ -366,7 +366,10 @@ pub const AntflyApiHandler = struct {
             _ = secret_store.refreshIfChanged() catch |err| {
                 std.log.warn("secret store status refresh skipped err={}", .{err});
             };
-            cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+            try cluster.applySecretStoreHealth(alloc, &public_status, secret_store.healthSnapshot());
+        }
+        if (self.api_server.cfg.remote_content) |remote_content| {
+            if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(alloc, &public_status, health);
         }
         return ctx.json(public_status);
     }
@@ -386,7 +389,10 @@ pub const AntflyApiHandler = struct {
             _ = secret_store.refreshIfChanged() catch |err| {
                 std.log.warn("secret store status refresh skipped err={}", .{err});
             };
-            cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+            try cluster.applySecretStoreHealth(alloc, &public_status, secret_store.healthSnapshot());
+        }
+        if (self.api_server.cfg.remote_content) |remote_content| {
+            if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(alloc, &public_status, health);
         }
         var snapshot_opt = try self.api_server.source.cachedAdminSnapshot();
         if (snapshot_opt == null) {

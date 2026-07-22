@@ -2880,14 +2880,14 @@ pub fn build(b: *std.Build) void {
 
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"file secret store"},
+        .filters = &.{ "file secret store", "remote content runtime", "cluster status carries non-secret" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
     const run_lib_common_secrets_tests = b.addRunArtifact(lib_common_secrets_tests);
-    const lib_common_secrets_test_step = b.step("lib-common-secrets-test", "Run common/secret store tests");
+    const lib_common_secrets_test_step = b.step("lib-common-secrets-test", "Run common secret and remote-content reload tests");
     lib_common_secrets_test_step.dependOn(&run_lib_common_secrets_tests.step);
 
     const lib_casbin_tests = b.addTest(.{

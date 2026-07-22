@@ -34,6 +34,77 @@ import (
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
+func TestGeneratedConfigHashAnnotationChangesWithRemoteContentConfig(t *testing.T) {
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			Config: `{"remote_content":{"default_s3":"primary","s3":{"primary":{"region":"us-west-2","access_key_id":"${secret:s3.access_key}","secret_access_key":"${secret:s3.secret_key}"}}}}`,
+		},
+	}
+
+	first := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(nil), cluster, nil)
+	firstHash := first[generatedConfigHashAnnotation]
+	if firstHash == "" {
+		t.Fatal("expected generated config hash annotation")
+	}
+
+	// A value rotation behind either secret reference is not represented in the
+	// AntflyCluster and cannot affect this hash; changing config/routing does.
+	cluster.Spec.Config = `{"remote_content":{"default_s3":"archive","s3":{"archive":{"region":"us-east-1","access_key_id":"${secret:s3.access_key}","secret_access_key":"${secret:s3.secret_key}"}}}}`
+	second := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(nil), cluster, nil)
+	if second[generatedConfigHashAnnotation] == firstHash {
+		t.Fatal("expected remote-content config change to alter pod-template hash")
+	}
+}
+
+func TestSecretValueOnlyRotationDoesNotChangePodTemplateHash(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cloud-secrets-config", Namespace: "default"},
+		Data:       map[string][]byte{"secrets.json": []byte(`{"value":"first"}`)},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	reconciler := &AntflyClusterReconciler{Client: client}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: secret.Namespace},
+		Spec:       antflyv1.AntflyClusterSpec{Config: `{}`},
+	}
+	envFrom := []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{
+		LocalObjectReference: corev1.LocalObjectReference{Name: secret.Name},
+	}}}
+	first := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(client), cluster, envFrom)
+
+	secret.Data["secrets.json"] = []byte(`{"value":"other"}`)
+	if err := client.Update(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+	second := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(client), cluster, envFrom)
+	if !maps.Equal(second, first) {
+		t.Fatalf("secret value rotation changed pod-template annotations: before=%v after=%v", first, second)
+	}
+}
+
+func TestCompatibilityRolloutGenerationPropagatesToPodTemplate(t *testing.T) {
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example",
+			Annotations: map[string]string{
+				compatibilityRolloutGenerationAnnotation: "secret-sha256-0123456789abcdef",
+			},
+		},
+		Spec: antflyv1.AntflyClusterSpec{Config: `{}`},
+	}
+	annotations := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(nil), cluster, nil)
+	if got := annotations[compatibilityRolloutGenerationAnnotation]; got != "secret-sha256-0123456789abcdef" {
+		t.Fatalf("compatibility rollout generation = %q", got)
+	}
+}
+
 func TestEffectiveTopologyModeFailsClosedForUnknownStoredMode(t *testing.T) {
 	cluster := &antflyv1.AntflyCluster{Spec: antflyv1.AntflyClusterSpec{Mode: antflyv1.ClusterMode("RemovedMode")}}
 	if got := effectiveTopologyMode(cluster); got != topologyModeInvalid {
@@ -9267,6 +9338,15 @@ var _ = Describe("AntflyCluster Controller", func() {
 				}, configMap)
 			}, timeout, interval).Should(Succeed())
 			Expect(configMap.Data).To(HaveKey("config.json"))
+			Expect(configMap.Annotations).To(HaveKey(generatedConfigHashAnnotation))
+			Expect(metadataSts.Spec.Template.Annotations).To(HaveKeyWithValue(
+				generatedConfigHashAnnotation,
+				configMap.Annotations[generatedConfigHashAnnotation],
+			))
+			Expect(dataSts.Spec.Template.Annotations).To(HaveKeyWithValue(
+				generatedConfigHashAnnotation,
+				configMap.Annotations[generatedConfigHashAnnotation],
+			))
 
 			// Verify internal service is created
 			internalSvc := &corev1.Service{}

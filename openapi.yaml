@@ -7396,6 +7396,8 @@ components:
           description: Runtime deployment topology
         secret_store:
           $ref: '#/components/schemas/SecretStoreStatus'
+        runtime_config:
+          $ref: '#/components/schemas/RuntimeConfigStatus'
         storage:
           $ref: '#/components/schemas/StorageRuntimeStatus'
     ClusterTopology:
@@ -7424,6 +7426,8 @@ components:
           description: Runtime deployment topology
         secret_store:
           $ref: '#/components/schemas/SecretStoreStatus'
+        runtime_config:
+          $ref: '#/components/schemas/RuntimeConfigStatus'
         storage:
           $ref: '#/components/schemas/StorageRuntimeStatus'
         data:
@@ -8892,10 +8896,57 @@ components:
       type: object
       description: Non-secret status for the local secrets file store, when one is available.
       properties:
+        generation:
+          type: integer
+          format: uint64
+          description: Generation of the currently published secret-store snapshot.
+        hash:
+          type: string
+          description: Lowercase SHA-256 acknowledgement of the applied secret-store bytes. This is the
+            exact file digest for a single-file store and a deterministic digest aggregate for layered
+            stores; it exposes no plaintext secret values.
+        last_reload_failed:
+          type: boolean
+          description: Whether the latest observed replacement failed to load.
+          x-omitzero: false
         stale:
           type: boolean
           description: Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
           x-omitzero: false
+        reload_successes:
+          type: integer
+          format: uint64
+        reload_failures:
+          type: integer
+          format: uint64
+    RuntimeConfigStatus:
+      type: object
+      description: Non-secret status for the applied config.json snapshot. Hot publication accepts validated
+        remote_content-only changes; startup-only changes remain stale until restart.
+      properties:
+        generation:
+          type: integer
+          format: uint64
+          description: Generation of the fully validated and atomically published configuration.
+        hash:
+          type: string
+          description: Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters
+            match the operator config-hash annotation.
+        last_reload_failed:
+          type: boolean
+          description: Whether the latest observed replacement failed loading, semantic validation, or
+            requires restart because startup-only fields changed.
+          x-omitzero: false
+        stale:
+          type: boolean
+          description: Whether requests are using the last-known-good snapshot after a failed reload.
+          x-omitzero: false
+        reload_successes:
+          type: integer
+          format: uint64
+        reload_failures:
+          type: integer
+          format: uint64
     SecretStatus:
       type: string
       enum:

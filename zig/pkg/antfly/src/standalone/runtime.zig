@@ -1235,6 +1235,25 @@ pub fn runFromIterator(
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
 
+    var remote_content_runtime: antfly.common.remote_content_runtime.Runtime = undefined;
+    var remote_content_runtime_initialized = false;
+    defer if (remote_content_runtime_initialized) remote_content_runtime.deinit();
+    var remote_content_facade = antfly.common.config.Config.RemoteContentConfig{};
+    const remote_content = if (cli.config_path) |config_path| blk: {
+        remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.init(
+            alloc,
+            config_path,
+            if (secret_store_initialized) &secret_store else null,
+            .standalone,
+        );
+        remote_content_runtime_initialized = true;
+        remote_content_runtime.attach(&remote_content_facade);
+        break :blk &remote_content_facade;
+    } else if (loaded_config) |*cfg|
+        if (cfg.remote_content) |*configured| configured else null
+    else
+        null;
+
     const storage_engine = cli.storage_engine orelse if (loaded_config) |*cfg| cfg.storage.engine else .local;
     if (storage_engine == .object) return error.UnsupportedStandaloneStorageEngine;
     const lite_path = if (storage_engine == .lite)
@@ -1441,7 +1460,7 @@ pub fn runFromIterator(
             .storage_maintenance = &storage_maintenance,
             .admin_bearer_token = admin_bearer_token,
             .secret_store = &secret_store,
-            .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
+            .remote_content = remote_content,
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
