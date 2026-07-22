@@ -2954,9 +2954,9 @@ components:
           type: integer
           format: uint64
           description: Generation of the currently published secret-store snapshot.
-        hash:
+        source_generation:
           type: string
-          description: Lowercase SHA-256 acknowledgement of the applied secret-store bytes. This is the exact file digest for a single-file store and a deterministic digest aggregate for layered stores; it exposes no plaintext secret values.
+          description: Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is omitted for files without an acknowledgement generation and never derives from secret values.
         last_reload_failed:
           type: boolean
           description: Whether the latest observed replacement failed to load.
