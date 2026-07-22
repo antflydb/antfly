@@ -2864,7 +2864,7 @@ const python_tls_head_keepalive_server_script =
     "            b'Content-Type: application/xml\\r\\n'\n" ++
     "            b'Connection: keep-alive\\r\\n\\r\\n'\n" ++
     "        )\n" ++
-    "        time.sleep(2.0)\n" ++
+    "        time.sleep(30.0)\n" ++
     "listener.close()\n";
 
 const python_slow_drip_server_script =
@@ -2902,9 +2902,13 @@ fn reserveEphemeralPort(io: Io) !u16 {
 }
 
 fn getWithRetry(client: *Client, io: Io, url: []const u8, max_attempts: usize) !Response {
+    return requestWithRetry(client, io, .GET, url, max_attempts);
+}
+
+fn requestWithRetry(client: *Client, io: Io, method: types.Method, url: []const u8, max_attempts: usize) !Response {
     var attempts: usize = 0;
     while (attempts < max_attempts) : (attempts += 1) {
-        return client.get(url, .{}) catch |err| {
+        return client.request(method, url, .{}) catch |err| {
             if (err != error.ConnectionRefused or attempts + 1 >= max_attempts) return err;
             io.sleep(Io.Duration.fromMilliseconds(100), .awake) catch {};
             continue;
@@ -3301,19 +3305,17 @@ test "HTTPS HEAD returns after headers on a keep-alive connection" {
     };
     defer child.kill(io);
 
-    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
-
     const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/object", .{port});
     defer allocator.free(url);
 
     var client = Client.initWithConfig(allocator, io, .{
         .verify_ssl = false,
         .retry_policy = .{ .max_retries = 0 },
-        .timeouts = .{ .request_ms = 500, .read_ms = 500, .write_ms = 500 },
+        .timeouts = .{ .request_ms = 5_000, .read_ms = 5_000, .write_ms = 5_000 },
     });
     defer client.deinit();
 
-    var resp = try client.head(url, .{});
+    var resp = try requestWithRetry(&client, io, .HEAD, url, 50);
     defer resp.deinit();
 
     try std.testing.expectEqual(@as(u16, 403), resp.status.code);
