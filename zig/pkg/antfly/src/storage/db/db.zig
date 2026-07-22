@@ -666,11 +666,13 @@ const AsyncContext = struct {
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     repair_replay_mutex: ?*std.atomic.Mutex = null,
     repair_sequence: u64 = 0,
+    repair_issue_counter: ?*AtomicU64 = null,
     allow_graph_materialization: bool = true,
     require_graph_resolution_contract: bool = false,
     query_visibility_hook_mutex: std.atomic.Mutex = .unlocked,
     query_visibility_hook: ?QueryVisibilityHook = null,
     query_visibility_hook_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    index_repair_notification_pending: bool = false,
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
     dense_finish_mutex: std.atomic.Mutex = .unlocked,
@@ -3383,6 +3385,12 @@ pub const DB = struct {
                     };
                 }
                 if (repair_state) |*state| {
+                    for (state.entries.items) |entry| {
+                        if (entry.intent.phase != .terminal and entry.intent.automation == .enabled) {
+                            db.async_context.index_repair_notification_pending = true;
+                            break;
+                        }
+                    }
                     db.async_context.index_repair_replay_pinned.store(state.minimumRetainAfterSequence() != null, .release);
                     state.deinit(alloc);
                 }
@@ -3533,9 +3541,21 @@ pub const DB = struct {
     }
 
     pub fn setQueryVisibilityHook(self: *DB, hook: ?QueryVisibilityHook) void {
+        var pending_hook: ?QueryVisibilityHook = null;
         lockAtomic(&self.async_context.query_visibility_hook_mutex);
         self.async_context.query_visibility_hook = hook;
+        if (hook) |attached| {
+            if (self.async_context.index_repair_notification_pending) {
+                self.async_context.index_repair_notification_pending = false;
+                _ = self.async_context.query_visibility_hook_in_flight.fetchAdd(1, .acquire);
+                pending_hook = attached;
+            }
+        }
         self.async_context.query_visibility_hook_mutex.unlock();
+        if (pending_hook) |attached| {
+            attached.notify(.index_repair_pending);
+            _ = self.async_context.query_visibility_hook_in_flight.fetchSub(1, .release);
+        }
         if (hook == null) {
             // A notifier copies the hook before invoking it so the callback may
             // inspect the DB without holding this mutex. Detachment is also a
@@ -3578,14 +3598,6 @@ pub const DB = struct {
         );
     }
 
-    fn acquireQueryVisibilityHook(ctx: *AsyncContext) ?QueryVisibilityHook {
-        lockAtomic(&ctx.query_visibility_hook_mutex);
-        defer ctx.query_visibility_hook_mutex.unlock();
-        const hook = ctx.query_visibility_hook orelse return null;
-        _ = ctx.query_visibility_hook_in_flight.fetchAdd(1, .acquire);
-        return hook;
-    }
-
     fn hasQueryVisibilityHook(ctx: *AsyncContext) bool {
         lockAtomic(&ctx.query_visibility_hook_mutex);
         defer ctx.query_visibility_hook_mutex.unlock();
@@ -3593,7 +3605,20 @@ pub const DB = struct {
     }
 
     fn notifyQueryVisibilityHook(ctx: *AsyncContext, change: QueryVisibilityChange) void {
-        const hook = acquireQueryVisibilityHook(ctx) orelse return;
+        lockAtomic(&ctx.query_visibility_hook_mutex);
+        const hook = ctx.query_visibility_hook orelse {
+            switch (change) {
+                .index_repair_pending => ctx.index_repair_notification_pending = true,
+                else => {},
+            }
+            ctx.query_visibility_hook_mutex.unlock();
+            return;
+        };
+        if (change == .index_repair_pending or change == .index_repair_cleared) {
+            ctx.index_repair_notification_pending = false;
+        }
+        _ = ctx.query_visibility_hook_in_flight.fetchAdd(1, .acquire);
+        ctx.query_visibility_hook_mutex.unlock();
         defer _ = ctx.query_visibility_hook_in_flight.fetchSub(1, .release);
         hook.notify(change);
     }
@@ -10924,6 +10949,19 @@ pub const DB = struct {
             else => return err,
         };
         result.reprocessed += rebuilt.reprocessed;
+        const repair_summary_ready = try self.artifactRepairSummaryReady(alloc);
+        const unresolved_artifacts = if (repair_summary_ready)
+            @max(
+                rebuilt.unresolved_artifacts,
+                (try self.artifactRepairSummaryIndexSnapshot(alloc, cfg.name, true)).count,
+            )
+        else
+            rebuilt.unresolved_artifacts;
+        result.unresolved += unresolved_artifacts;
+        // A rebuilding summary cannot prove absence. Keep the response
+        // degraded without falling back to a corpus scan on this completion
+        // path; background summary maintenance will publish the exact count.
+        result.debt_remaining = result.debt_remaining or !repair_summary_ready or unresolved_artifacts != 0;
         if (rebuilt.yielded) {
             result.in_progress += 1;
             result.unresolved += 1;
@@ -10943,6 +10981,7 @@ pub const DB = struct {
     const ShadowIndexReplacementResult = struct {
         reprocessed: u64 = 0,
         applied_sequence: u64 = 0,
+        unresolved_artifacts: u64 = 0,
         yielded: bool = false,
     };
 
@@ -11098,6 +11137,7 @@ pub const DB = struct {
         var effective_options = options;
         if (durable_repair_id == null) effective_options.yield_check = null;
         const cooperative_dense_build = cfg.kind == .dense_vector and effective_options.yield_check != null;
+        var repair_issue_counter: AtomicU64 = .init(0);
         var shadow_ctx = AsyncContext{
             .alloc = alloc,
             .io = self.backend_runtime.io(),
@@ -11109,6 +11149,7 @@ pub const DB = struct {
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
             .repair_options = effective_options,
+            .repair_issue_counter = &repair_issue_counter,
         };
         defer shadow_ctx.deinit(alloc);
 
@@ -11621,6 +11662,7 @@ pub const DB = struct {
         return .{
             .reprocessed = reprocessed_this_pass,
             .applied_sequence = final_target,
+            .unresolved_artifacts = repair_issue_counter.load(.monotonic),
         };
     }
 
@@ -30929,6 +30971,7 @@ fn recordEmbeddingArtifactRepairIssueContext(
     }
 
     try saveArtifactRepairIssueToStoreWithSummary(ctx.alloc, ctx.store, issue_key, issue, existing == null);
+    if (ctx.repair_issue_counter) |counter| _ = counter.fetchAdd(1, .monotonic);
 }
 
 fn repairKindFromArtifactKind(kind: types.ArtifactKind) types.ArtifactRepairKind {
@@ -31003,6 +31046,7 @@ fn recordArtifactRepairIssueContext(
     }
 
     try saveArtifactRepairIssueToStoreWithSummary(ctx.alloc, ctx.store, issue_key, issue, existing == null);
+    if (ctx.repair_issue_counter) |counter| _ = counter.fetchAdd(1, .monotonic);
 }
 
 fn recordArtifactRepairIssueForRefContext(
@@ -48541,14 +48585,17 @@ test "db index repair shadow swap preserves post snapshot mutations" {
     try std.testing.expectEqualStrings("doc:b", gamma.hits[0].id);
 }
 
-test "db repair issue list reports index repair candidates" {
+test "db artifact repair issue list reports recorded graph issue" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -48569,8 +48616,8 @@ test "db repair issue list reports index repair candidates" {
     try db.recordArtifactRepairIssue(alloc, issue);
 
     var page = try db.listArtifactRepairIssuesPage(alloc, .{
-        .target = .index,
         .artifact_kind = .graph,
+        .index_name = "graph_v1",
         .limit = 10,
     });
     defer page.deinit(alloc);
@@ -48578,18 +48625,22 @@ test "db repair issue list reports index repair candidates" {
     try std.testing.expect(!page.has_more);
     try std.testing.expectEqual(@as(usize, 1), page.issues.len);
     try std.testing.expectEqual(.graph, page.issues[0].artifact_kind);
+    try std.testing.expectEqual(.corrupt_artifact, page.issues[0].reason);
     try std.testing.expectEqualStrings("graph_v1", page.issues[0].index_name);
-    try std.testing.expectEqualStrings("index_repair_required", page.issues[0].last_error);
+    try std.testing.expectEqualStrings("", page.issues[0].last_error);
 }
 
-test "db index repair reports remaining artifact debt after rebuild" {
+test "db artifact repair reports remaining debt when source is missing" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -48610,15 +48661,13 @@ test "db index repair reports remaining artifact debt after rebuild" {
     try db.recordArtifactRepairIssue(alloc, issue);
 
     var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
-        .target = .index,
         .artifact_kind = .graph,
         .index_name = "graph_v1",
         .limit = 1,
-        .force = true,
     });
     defer repair.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), repair.scanned);
-    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 0), repair.indexes_rebuilt);
     try std.testing.expectEqual(@as(u64, 0), repair.repaired);
     try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
     try std.testing.expect(repair.debt_remaining);
@@ -48629,14 +48678,17 @@ test "db index repair reports remaining artifact debt after rebuild" {
     try std.testing.expectEqual(@as(u64, 1), stats.repair_issue_count);
 }
 
-test "db graph index repair records corrupt artifact debt during shadow rebuild" {
+test "db graph generation repair preserves corrupt artifact debt after rebuild" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -48659,7 +48711,7 @@ test "db graph index repair records corrupt artifact debt during shadow rebuild"
     defer repair.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), repair.scanned);
     try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
-    try std.testing.expectEqual(@as(u64, 0), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
     try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
     try std.testing.expect(repair.debt_remaining);
 
@@ -50190,6 +50242,63 @@ test "db managed dense delete quiesces rate-limited enrichment and recreates cle
     try std.testing.expect(!stats.enrichment.worker_failed);
     try std.testing.expectEqual(@as(u64, 3), stats.indexes[0].doc_count);
     try std.testing.expect(stats.indexes[0].replay_applied_sequence >= stats.indexes[0].replay_target_sequence);
+}
+
+test "db dense checkpoint persistence serializes with index apply" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_checkpoint_lock",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    });
+
+    var apply_guard = try db.core.index_manager.lockManagedIndexApply(.{
+        .name = "dense_checkpoint_lock",
+        .kind = .dense_vector,
+    });
+    var apply_locked = true;
+    defer if (apply_locked) apply_guard.unlock();
+
+    const Persist = struct {
+        db: *DB,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(state: *@This()) void {
+            state.started.store(true, .release);
+            state.db.core.index_manager.saveDenseProjectionCheckpointMetadata(
+                "dense_checkpoint_lock",
+                .{ .applied_sequence = 1, .status = .clean },
+            ) catch |err| {
+                state.err = err;
+            };
+            state.done.store(true, .release);
+        }
+    };
+    var persist = Persist{ .db = &db };
+    const thread = try std.Thread.spawn(.{}, Persist.run, .{&persist});
+    while (!persist.started.load(.acquire)) std.atomic.spinLoopHint();
+    sleepNs(25 * std.time.ns_per_ms);
+    const completed_while_apply_active = persist.done.load(.acquire);
+
+    apply_guard.unlock();
+    apply_locked = false;
+    thread.join();
+
+    try std.testing.expect(!completed_while_apply_active);
+    if (persist.err) |err| return err;
+    try std.testing.expect(persist.done.load(.acquire));
 }
 
 test "db open quarantines dense index with unsupported artifact version" {
@@ -61915,6 +62024,78 @@ test "db managed admission materialization never infers debt from replay lag" {
 
     try std.testing.expect((try db.materializeManagedIndexAdmission(alloc, "ft")) == null);
     try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+}
+
+test "db managed visibility hook rehydrates durable repair debt once" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const index_name = "full_text_index_v1";
+
+    const repair_id = repair: {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+
+        // Admission happens before the managed owner installs its hook. Its
+        // process-local edge is deliberately lost across this close.
+        break :repair (try db.admitManagedFullTextIndex(.{
+            .name = index_name,
+            .kind = .full_text,
+            .config_json = "{}",
+        })) orelse return error.TestUnexpectedResult;
+    };
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const Hook = struct {
+        pending: usize = 0,
+
+        fn onChange(
+            ptr: *anyopaque,
+            _: []const u8,
+            _: u64,
+            _: ?*DB,
+            change: QueryVisibilityChange,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (change == .index_repair_pending) self.pending += 1;
+        }
+    };
+    var hook = Hook{};
+    // A clear for one intent cannot prove that all durable repair debt is
+    // gone, so it must not consume a queued scheduler wakeup.
+    DB.notifyQueryVisibilityHook(db.async_context, .index_repair_cleared);
+    db.setQueryVisibilityHook(.{
+        .ptr = &hook,
+        .table_name = "docs",
+        .group_id = 7001,
+        .db = &db,
+        .on_change = Hook.onChange,
+    });
+    try std.testing.expectEqual(@as(usize, 1), hook.pending);
+
+    try std.testing.expectEqual(
+        repair_id,
+        (try db.materializeManagedIndexAdmission(alloc, index_name)) orelse
+            return error.TestUnexpectedResult,
+    );
+    // Reconciliation adopts the same durable intent without creating a hot
+    // loop of cache invalidations and duplicate scheduler notifications.
+    try std.testing.expectEqual(@as(usize, 1), hook.pending);
 }
 
 test "db managed admission rejects regressed identity evidence" {

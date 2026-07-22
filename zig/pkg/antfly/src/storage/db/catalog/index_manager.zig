@@ -2662,6 +2662,11 @@ pub const IndexManager = struct {
         index_name: []const u8,
         checkpoint: apply_state.ProjectionCheckpoint,
     ) !void {
+        var apply_guard = try self.lockManagedIndexApply(.{
+            .name = index_name,
+            .kind = .dense_vector,
+        });
+        defer apply_guard.unlock();
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.saveProjectionCheckpointMetadata(.{
             .applied_sequence = checkpoint.applied_sequence,
@@ -8573,13 +8578,6 @@ pub const IndexManager = struct {
         var backfilled_sequence = store.lastReplaySequence(0);
         if (comptime storeSupportsLatestReplaySequenceForHint(@TypeOf(store))) {
             backfilled_sequence = try store.latestReplaySequenceForHint(replayHintForIndexKind(cfg.kind), backfilled_sequence);
-        }
-        if (cfg.kind == .dense_vector) {
-            try self.saveDenseProjectionCheckpointMetadata(cfg.name, .{
-                .applied_sequence = backfilled_sequence,
-                .status = .clean,
-                .config_hash = types.indexConfigHash(cfg),
-            });
         }
         try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
             self.alloc,
