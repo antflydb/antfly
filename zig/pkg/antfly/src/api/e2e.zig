@@ -7020,15 +7020,13 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     defer split_control_loop.deinit();
     try split_control_loop.stateRef().syncProjected(&svc);
     try split_control_loop.stateRef().seedDesiredFromProjected();
-    _ = try svc.reconcilePreparedIfLeaseHeld(&split_control_loop) orelse
-        return error.ReconcileLeaseNotHeld;
+    _ = try svc.reconcilePreparedEnsuringLease(&split_control_loop);
 
     var split_published = false;
     rounds = 0;
     while (rounds < 64) : (rounds += 1) {
         try svc.runRound();
-        _ = try svc.reconcileOnceIfLeaseHeld(&split_control_loop) orelse
-            return error.ReconcileLeaseNotHeld;
+        _ = try svc.reconcileOnceEnsuringLease(&split_control_loop);
         const updated_ranges = try svc.listProjectedRanges(std.testing.allocator);
         defer svc.freeProjectedRanges(std.testing.allocator, updated_ranges);
         const updated_splits = try svc.listProjectedSplitTransitions(std.testing.allocator);

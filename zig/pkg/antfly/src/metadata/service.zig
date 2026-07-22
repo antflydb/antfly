@@ -1776,6 +1776,19 @@ pub const MetadataService = struct {
         return error.ReconcileLeaseNotHeld;
     }
 
+    /// Acquire or renew the reconcile lease without refreshing the control
+    /// loop's prepared desired state. This is required after a transition
+    /// observation has already been folded into that state: retrying through
+    /// reconcileOnce would overwrite the prepared outcome from projection.
+    pub fn reconcilePreparedEnsuringLease(self: *MetadataService, loop: *metadata_control_loop.MetadataControlLoop) !metadata_control_loop.ReconcileSummary {
+        var rounds: usize = 0;
+        while (rounds < 32) : (rounds += 1) {
+            if (try self.reconcilePreparedIfLeaseHeld(loop)) |summary| return summary;
+            try self.runRound();
+        }
+        return error.ReconcileLeaseNotHeld;
+    }
+
     pub fn applyReconciliationPlan(self: *MetadataService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
         for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
         for (plan.table_upserts) |record| try self.upsertTable(record);
@@ -3348,6 +3361,18 @@ pub const MetadataHttpService = struct {
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
             if (try self.reconcileOnceIfLeaseHeld(loop)) |summary| return summary;
+            try self.runRound();
+        }
+        return error.ReconcileLeaseNotHeld;
+    }
+
+    /// HTTP-backed counterpart of MetadataService's prepared-state lease
+    /// acquisition. The prepared state remains stable while Raft publishes a
+    /// lease renewal.
+    pub fn reconcilePreparedEnsuringLease(self: *MetadataHttpService, loop: *metadata_control_loop.MetadataControlLoop) !metadata_control_loop.ReconcileSummary {
+        var rounds: usize = 0;
+        while (rounds < 32) : (rounds += 1) {
+            if (try self.reconcilePreparedIfLeaseHeld(loop)) |summary| return summary;
             try self.runRound();
         }
         return error.ReconcileLeaseNotHeld;
@@ -7258,7 +7283,7 @@ test "metadata service can apply reconciliation plan proposals" {
     try std.testing.expectEqual(@as(u64, 9101), split_records[0].transition_id);
 }
 
-test "metadata control loop can drive the real metadata service" {
+test "metadata control loop preserves prepared state while renewing its lease" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -7317,6 +7342,7 @@ test "metadata control loop can drive the real metadata service" {
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
     var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+    var reconcile_clock = platform_clock.ManualClock{};
 
     var svc = try MetadataService.init(std.testing.allocator, .{
         .host = .{
@@ -7331,7 +7357,12 @@ test "metadata control loop can drive the real metadata service" {
                 .descriptor_factory = factory.iface(),
             },
         },
-    }, .{});
+    }, .{
+        .reconcile_lease = .{
+            .lease_ttl_ms = 100,
+            .clock = reconcile_clock.clock(),
+        },
+    });
     defer svc.deinit();
 
     _ = try svc.ensureMetadataReplica(.{
@@ -7360,7 +7391,11 @@ test "metadata control loop can drive the real metadata service" {
         .split_key = "doc:h",
     });
 
-    const summary = try svc.reconcileOnceEnsuringLease(&loop);
+    // Force the lease to expire after the caller has staged desired state.
+    // Renewal must not refresh that state from projection and lose the split
+    // request before reconciliation applies it.
+    reconcile_clock.advanceMs(101);
+    const summary = try svc.reconcilePreparedEnsuringLease(&loop);
     try std.testing.expectEqual(@as(usize, 1), summary.split_admissions);
     try std.testing.expectEqual(@as(usize, 0), summary.split_upserts);
 
