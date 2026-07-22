@@ -69,18 +69,22 @@ func TestSecretValueOnlyRotationDoesNotChangePodTemplateHash(t *testing.T) {
 	}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	reconciler := &AntflyClusterReconciler{Client: client}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: secret.Namespace},
+		Spec:       antflyv1.AntflyClusterSpec{Config: `{}`},
+	}
 	envFrom := []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{
 		LocalObjectReference: corev1.LocalObjectReference{Name: secret.Name},
 	}}}
-	first := reconciler.computeEnvFromHash(context.Background(), newEnvFromCache(client), secret.Namespace, envFrom)
+	first := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(client), cluster, envFrom)
 
 	secret.Data["secrets.json"] = []byte(`{"value":"other"}`)
 	if err := client.Update(context.Background(), secret); err != nil {
 		t.Fatal(err)
 	}
-	second := reconciler.computeEnvFromHash(context.Background(), newEnvFromCache(client), secret.Namespace, envFrom)
-	if second != first {
-		t.Fatalf("secret value rotation changed pod-template hash: before=%s after=%s", first, second)
+	second := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(client), cluster, envFrom)
+	if !maps.Equal(second, first) {
+		t.Fatalf("secret value rotation changed pod-template annotations: before=%v after=%v", first, second)
 	}
 }
 

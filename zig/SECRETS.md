@@ -335,6 +335,12 @@ rules:
   when `GET /status` reports `runtime_config.hash` equal to the SHA-256 of the
   generated `config.json` (the operator publishes its first 16 characters as
   `antfly.io/config-hash`) and `runtime_config.stale` is false.
+- Hot publication is deliberately limited to `remote_content`. Before
+  publishing a new full-file hash, Antfly verifies that every startup-only
+  field is unchanged and that named credential routing is structurally
+  complete. A startup-only change leaves the old hash active and reports a
+  stale snapshot until the operator's config-hash rollout starts a process
+  that loaded the complete file.
 - A value rotation behind an unchanged `${secret:...}` reference is complete
   only after `secret_store.generation` advances past the caller's baseline and
   `secret_store.stale` is false. It does not require a config generation change
@@ -347,6 +353,12 @@ acknowledgements; writing the Kubernetes ConfigMap or Secret alone is not a
 runtime acknowledgement. The operator does not read Secret contents. Its
 non-secret pod-template config hash is a compatibility rollout fallback for
 older Antfly versions that do not publish hot-reloaded config snapshots.
+
+Remote-content requests perform a cheap file-identity check at most once per
+second. Reload I/O and validation are serialized separately from snapshot
+publication, so concurrent readers continue using the last-known-good snapshot
+without waiting for file reads or parsing. Status reads perform an exact content
+check so acknowledgement hashes also detect pathological same-metadata edits.
 
 Encrypted-at-rest support inside Antfly is still useful for non-Kubernetes
 deployments and simpler VM/bare-metal deployments. It is less urgent for the

@@ -8916,7 +8916,8 @@ components:
           format: uint64
     RuntimeConfigStatus:
       type: object
-      description: Non-secret status for the hot-reloadable config.json snapshot.
+      description: Non-secret status for the applied config.json snapshot. Hot publication accepts validated
+        remote_content-only changes; startup-only changes remain stale until restart.
       properties:
         generation:
           type: integer
@@ -8924,11 +8925,12 @@ components:
           description: Generation of the fully validated and atomically published configuration.
         hash:
           type: string
-          description: Lowercase SHA-256 of the exact published config.json bytes; its first 16 characters
+          description: Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters
             match the operator config-hash annotation.
         last_reload_failed:
           type: boolean
-          description: Whether the latest observed replacement failed validation or loading.
+          description: Whether the latest observed replacement failed loading, semantic validation, or
+            requires restart because startup-only fields changed.
           x-omitzero: false
         stale:
           type: boolean

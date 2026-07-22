@@ -2608,13 +2608,13 @@ pub const RowFilterEntry = struct {
     filter: std.json.ArrayHashMap(std.json.Value),
 };
 
-/// Non-secret status for the hot-reloadable config.json snapshot.
+/// Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only changes; startup-only changes remain stale until restart.
 pub const RuntimeConfigStatus = struct {
     /// Generation of the fully validated and atomically published configuration.
     generation: ?i64 = null,
-    /// Lowercase SHA-256 of the exact published config.json bytes; its first 16 characters match the operator config-hash annotation.
+    /// Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters match the operator config-hash annotation.
     hash: ?[]const u8 = null,
-    /// Whether the latest observed replacement failed validation or loading.
+    /// Whether the latest observed replacement failed loading, semantic validation, or requires restart because startup-only fields changed.
     last_reload_failed: ?bool = null,
     /// Whether requests are using the last-known-good snapshot after a failed reload.
     stale: ?bool = null,
