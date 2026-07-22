@@ -664,7 +664,9 @@ fn ensureIndexDefinition(
     if (existing) |existing_cfg| {
         if (try indexConfigsEqual(alloc, existing_cfg, desired)) {
             if (desired.kind == .full_text) {
-                _ = try db.materializeManagedIndexAdmission(alloc, desired.name);
+                if (try db.materializeManagedIndexAdmission(alloc, desired.name) != null) {
+                    summary.pending += 1;
+                }
             }
             return;
         }
@@ -686,13 +688,14 @@ fn ensureIndexDefinition(
         .coverage_generation = desired.coverage_generation,
     };
     if (desired.kind == .full_text) {
-        _ = db.admitManagedFullTextIndex(admitted) catch |err| switch (err) {
+        const repair_id = db.admitManagedFullTextIndex(admitted) catch |err| switch (err) {
             error.IndexArtifactCleanupPending => {
                 summary.pending += 1;
                 return;
             },
             else => return err,
         };
+        if (repair_id != null) summary.pending += 1;
     } else {
         db.addIndex(admitted) catch |err| switch (err) {
             error.IndexArtifactCleanupPending => {
@@ -1456,6 +1459,7 @@ test "table provisioner durably enqueues existing corpus full text backfill" {
     const indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}";
     const first = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
     try std.testing.expectEqual(@as(usize, 1), first.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), first.indexes_pending);
     try std.testing.expect(try db.hasPendingIndexRepairIntents(std.testing.allocator));
 
     var initial_state = try db.loadIndexRepairState(std.testing.allocator);
@@ -1469,10 +1473,27 @@ test "table provisioner durably enqueues existing corpus full text backfill" {
     // of dropping or duplicating it.
     const second = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
     try std.testing.expectEqual(@as(usize, 0), second.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), second.indexes_pending);
     var repeated_state = try db.loadIndexRepairState(std.testing.allocator);
     defer repeated_state.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), repeated_state.entries.items.len);
     try std.testing.expectEqual(repair_id, repeated_state.entries.items[0].intent.repair_id);
+
+    var repaired = false;
+    for (0..16) |_| {
+        const step = try db.advanceIndexRepairIntent(std.testing.allocator, repair_id, .{});
+        if (step.repaired) {
+            repaired = true;
+            break;
+        }
+        try std.testing.expect(!step.terminal);
+    }
+    try std.testing.expect(repaired);
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(std.testing.allocator));
+
+    const complete = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
+    try std.testing.expectEqual(@as(usize, 0), complete.indexes_added);
+    try std.testing.expectEqual(@as(usize, 0), complete.indexes_pending);
 }
 
 test "table provisioner replaces embedding index when metadata incarnation changes" {
