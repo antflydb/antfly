@@ -965,6 +965,14 @@ primary document store:
    removing the sidecar intent. A crash between those writes leaves redundant,
    resumable repair state rather than an admitted generation without debt.
 
+Desired-state reconciliation that observes pending repair must enqueue the
+table-group route with the owner repair scheduler, even when admission occurred
+before the DB runtime hook was attached. Scheduler notifications are
+idempotent hints, not repair authority: the durable checkpoint determines what
+work remains, aggregate debt auditing retires routes after every intent clears,
+and bounded fallback discovery is recovery for a missed notification rather
+than the normal scheduling path.
+
 The identity generation captured by the marker is monotonic evidence. Recovery
 fails closed if the current identity summary regresses below it. Concurrent
 writes after admission are normal: repair targets at least the marker's replay

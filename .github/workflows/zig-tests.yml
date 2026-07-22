@@ -195,7 +195,7 @@ jobs:
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
           build_jobs="$jobs"
-          if [ "$build_jobs" -gt 3 ]; then build_jobs=3; fi
+          if [ "$build_jobs" -gt 2 ]; then build_jobs=2; fi
           echo "build_jobs=$build_jobs" >> "$GITHUB_OUTPUT"
 
       - name: Run hermetic Antfly unit tests
@@ -415,7 +415,7 @@ jobs:
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
           build_jobs="$jobs"
-          if [ "$build_jobs" -gt 3 ]; then build_jobs=3; fi
+          if [ "$build_jobs" -gt 2 ]; then build_jobs=2; fi
           echo "build_jobs=$build_jobs" >> "$GITHUB_OUTPUT"
 
       - name: Run full Zig unit tests

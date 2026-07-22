@@ -7265,6 +7265,14 @@ pub const ProvisionedTableWriteSource = struct {
                 try applyLocalTableSchemaJson(alloc, cached.db, table.schema_json);
                 const index_summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, cached.db, table.indexes_json);
                 summary.merge(index_summary);
+                if (index_summary.indexes_pending != 0) {
+                    // Admission can materialize durable repair debt before a
+                    // newly opened DB has its runtime visibility hook. Hand
+                    // the authoritative pending result to the owner directly;
+                    // enqueue is idempotent and the aggregate debt audit
+                    // removes the group once every intent is clear.
+                    self.notifyLocalIndexRepairDebt(table.name, group_id, .enqueue);
+                }
                 try cache.replaceTableMetadataLocked(table.name, table.indexes_json, table.schema_json);
                 continue;
             }
@@ -7294,6 +7302,9 @@ pub const ProvisionedTableWriteSource = struct {
             // if cleanup already completed it admits the replacement now.
             const index_summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, &opened.?, table.indexes_json);
             summary.merge(index_summary);
+            if (index_summary.indexes_pending != 0) {
+                self.notifyLocalIndexRepairDebt(table.name, group_id, .enqueue);
+            }
             try cache.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table.name, table.indexes_json, table.schema_json);
         }
         return summary;
@@ -35682,6 +35693,103 @@ test "replica root reconcile seeds write cache across generation bump" {
     var cached_after_bump = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default_async, null, null);
     cached_after_bump.deinit(alloc);
     try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
+}
+
+test "replica root reconcile enqueues newly admitted managed full text repair" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-reconcile-full-text-repair", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+
+    {
+        var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = identity_namespace });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:1", .value = "{\"title\":\"existing document\"}" }},
+            .sync_level = .write,
+        });
+    }
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const DebtCapture = struct {
+        calls: usize = 0,
+        group_id: u64 = 0,
+        action: ?ProvisionedTableWriteSource.LocalIndexRepairDebtAction = null,
+
+        fn onDebt(
+            ptr: *anyopaque,
+            table_name: []const u8,
+            group_id: u64,
+            action: ProvisionedTableWriteSource.LocalIndexRepairDebtAction,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(std.mem.eql(u8, table_name, "docs"));
+            self.calls += 1;
+            self.group_id = group_id;
+            self.action = action;
+        }
+    };
+
+    const tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .placement_role = "data",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+    }};
+    const ranges = [_]metadata_table_manager.RangeRecord{.{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+        .end_key = null,
+    }};
+    const hosted_groups = [_]u64{7001};
+
+    var generation: u64 = 1;
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
+    var capture: DebtCapture = .{};
+    source.setLocalIndexRepairDebtHook(.{ .ptr = &capture, .on_change = DebtCapture.onDebt });
+
+    const summary = try source.reconcileReplicaRootTablesWithWriteCacheLocked(
+        alloc,
+        1,
+        &hosted_groups,
+        &tables,
+        &ranges,
+        null,
+    );
+    // The managed open admits the catalog entry; the explicit reconciliation
+    // observes that same durable generation and owns the scheduler handoff.
+    try std.testing.expectEqual(@as(usize, 0), summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), summary.indexes_pending);
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(u64, 7001), capture.group_id);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue, capture.action.?);
 }
 
 test "write cache transfers adoptable provisioned db to raft apply source" {
