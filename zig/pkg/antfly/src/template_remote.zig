@@ -472,9 +472,18 @@ fn resolveS3Credential(
     return .{
         .endpoint = if (credential.endpoint) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null,
         .use_ssl = credential.use_ssl,
-        .access_key_id = if (credential.access_key_id) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null,
-        .secret_access_key = if (credential.secret_access_key) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null,
-        .session_token = if (credential.session_token) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null,
+        .access_key_id = if (credential.access_key_id) |value|
+            try common_secrets.resolveReferenceOwned(alloc, secret_store, value)
+        else
+            common_secrets.envValueOwned(alloc, "AWS_ACCESS_KEY_ID"),
+        .secret_access_key = if (credential.secret_access_key) |value|
+            try common_secrets.resolveReferenceOwned(alloc, secret_store, value)
+        else
+            common_secrets.envValueOwned(alloc, "AWS_SECRET_ACCESS_KEY"),
+        .session_token = if (credential.session_token) |value|
+            try common_secrets.resolveReferenceOwned(alloc, secret_store, value)
+        else
+            common_secrets.envValueOwned(alloc, "AWS_SESSION_TOKEN"),
     };
 }
 
@@ -588,6 +597,47 @@ test "template remote S3 credentials observe same-length secret rotation" {
     defer rotated.deinit(alloc);
     try std.testing.expectEqualStrings("ACCESS-TWO", rotated.s3_credentials.?.access_key_id.?);
     try std.testing.expectEqualStrings("SECRET-TWO", rotated.s3_credentials.?.secret_access_key.?);
+}
+
+test "template remote S3 credentials fall back to standard AWS environment" {
+    if (!@import("builtin").link_libc) return error.SkipZigTest;
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const alloc = std.testing.allocator;
+    const old_access = common_secrets.envValueOwned(alloc, "AWS_ACCESS_KEY_ID");
+    defer if (old_access) |value| alloc.free(value);
+    const old_secret = common_secrets.envValueOwned(alloc, "AWS_SECRET_ACCESS_KEY");
+    defer if (old_secret) |value| alloc.free(value);
+    const old_access_z = if (old_access) |value| try alloc.dupeZ(u8, value) else null;
+    defer if (old_access_z) |value| alloc.free(value);
+    const old_secret_z = if (old_secret) |value| try alloc.dupeZ(u8, value) else null;
+    defer if (old_secret_z) |value| alloc.free(value);
+    defer {
+        if (old_access_z) |value| {
+            _ = c.setenv("AWS_ACCESS_KEY_ID", value.ptr, 1);
+        } else {
+            _ = c.unsetenv("AWS_ACCESS_KEY_ID");
+        }
+        if (old_secret_z) |value| {
+            _ = c.setenv("AWS_SECRET_ACCESS_KEY", value.ptr, 1);
+        } else {
+            _ = c.unsetenv("AWS_SECRET_ACCESS_KEY");
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv("AWS_ACCESS_KEY_ID", "ENV-ACCESS", 1));
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv("AWS_SECRET_ACCESS_KEY", "ENV-SECRET", 1));
+
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.deinit(alloc);
+    cfg.default_s3 = try alloc.dupe(u8, "primary");
+    try cfg.s3.put(alloc, try alloc.dupe(u8, "primary"), .{});
+
+    var resolved = try resolveRemoteContentFetchOptions(alloc, &cfg, null, "s3://bucket/document.pdf", null);
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqualStrings("ENV-ACCESS", resolved.s3_credentials.?.access_key_id.?);
+    try std.testing.expectEqualStrings("ENV-SECRET", resolved.s3_credentials.?.secret_access_key.?);
 }
 
 test "template remote S3 fetch passes rotated credentials to downloader" {

@@ -2813,6 +2813,7 @@ exec /antfly standalone --id %d --config /config/config.json \
 }
 
 const generatedConfigHashAnnotation = "antfly.io/config-hash"
+const compatibilityRolloutGenerationAnnotation = "cloud.antfly.io/compatibility-rollout-generation"
 
 // buildPodAnnotations returns the complete annotations for pod templates including:
 // - Service mesh annotations
@@ -2824,6 +2825,13 @@ func (r *AntflyClusterReconciler) buildPodAnnotations(ctx context.Context, cache
 	// Add service mesh annotations
 	if cluster.Spec.ServiceMesh != nil && cluster.Spec.ServiceMesh.Enabled {
 		maps.Copy(annotations, cluster.Spec.ServiceMesh.Annotations)
+	}
+	// Colony uses this non-secret generation only when the running Antfly
+	// version does not expose live-reload acknowledgements. Copying it to the
+	// template provides a compatibility rollout without granting the operator
+	// permission to read Secret contents.
+	if generation := strings.TrimSpace(cluster.Annotations[compatibilityRolloutGenerationAnnotation]); generation != "" {
+		annotations[compatibilityRolloutGenerationAnnotation] = generation
 	}
 
 	// ConfigMap volumes are updated in place, but older Antfly versions only

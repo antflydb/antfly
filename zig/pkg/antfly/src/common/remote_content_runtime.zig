@@ -11,6 +11,7 @@ const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 
 const request_refresh_interval_ns: u64 = std.time.ns_per_s;
+const health_refresh_interval_ns: u64 = 500 * std.time.ns_per_ms;
 
 const FileMetadata = struct {
     inode: std.Io.File.INode,
@@ -71,9 +72,11 @@ pub const Runtime = struct {
     /// wait behind another reload.
     refresh_mutex: std.atomic.Mutex = .unlocked,
     next_request_refresh_ns: std.atomic.Value(u64) = .init(0),
+    next_health_refresh_ns: std.atomic.Value(u64) = .init(0),
     current: *PublishedSnapshot,
     observed_metadata: FileMetadata,
     observed_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    observed_candidate_valid: bool = true,
     startup_static_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
     last_reload_failed: bool = false,
     reload_successes: u64 = 1,
@@ -132,6 +135,21 @@ pub const Runtime = struct {
         return self.refreshIfChangedOwned(true);
     }
 
+    fn refreshIfChangedForHealth(self: *Runtime) void {
+        const now_ns = platform_time.monotonicNs();
+        const scheduled_ns = self.next_health_refresh_ns.load(.acquire);
+        if (scheduled_ns != 0 and now_ns < scheduled_ns) return;
+        if (self.next_health_refresh_ns.cmpxchgStrong(
+            scheduled_ns,
+            now_ns +| health_refresh_interval_ns,
+            .acq_rel,
+            .acquire,
+        ) != null) return;
+        if (!self.refresh_mutex.tryLock()) return;
+        defer self.refresh_mutex.unlock();
+        _ = self.refreshIfChangedOwned(true);
+    }
+
     /// Opportunistically checks for a replacement at a bounded rate. Only the
     /// request that wins both the interval CAS and refresh try-lock performs
     /// I/O; all other requests immediately acquire the current snapshot.
@@ -174,7 +192,12 @@ pub const Runtime = struct {
         platform_sync.lockYielding(&self.publish_mutex);
         const unchanged = self.observed_metadata.eql(image.metadata) and std.mem.eql(u8, &self.observed_hash, &image.hash);
         self.publish_mutex.unlock();
-        if (unchanged) return false;
+        if (unchanged) {
+            platform_sync.lockYielding(&self.publish_mutex);
+            defer self.publish_mutex.unlock();
+            if (self.observed_candidate_valid) self.last_reload_failed = false;
+            return false;
+        }
 
         var next_config = config_mod.Config.parseFromSliceWithSecretsForDeployment(
             self.alloc,
@@ -186,6 +209,7 @@ pub const Runtime = struct {
             defer self.publish_mutex.unlock();
             self.observed_metadata = image.metadata;
             self.observed_hash = image.hash;
+            self.observed_candidate_valid = false;
             self.markFailedLocked(err);
             return false;
         };
@@ -195,6 +219,7 @@ pub const Runtime = struct {
             defer self.publish_mutex.unlock();
             self.observed_metadata = image.metadata;
             self.observed_hash = image.hash;
+            self.observed_candidate_valid = false;
             self.markFailedLocked(err);
             return false;
         };
@@ -204,6 +229,7 @@ pub const Runtime = struct {
             defer self.publish_mutex.unlock();
             self.observed_metadata = image.metadata;
             self.observed_hash = image.hash;
+            self.observed_candidate_valid = false;
             self.markFailedLocked(err);
             return false;
         };
@@ -213,6 +239,7 @@ pub const Runtime = struct {
             defer self.publish_mutex.unlock();
             self.observed_metadata = image.metadata;
             self.observed_hash = image.hash;
+            self.observed_candidate_valid = false;
             self.markFailedLocked(error.RestartRequiredConfigChange);
             return false;
         }
@@ -236,6 +263,7 @@ pub const Runtime = struct {
         self.current = next;
         self.observed_metadata = image.metadata;
         self.observed_hash = image.hash;
+        self.observed_candidate_valid = true;
         self.last_reload_failed = false;
         self.reload_successes +%= 1;
         self.publish_mutex.unlock();
@@ -244,7 +272,7 @@ pub const Runtime = struct {
     }
 
     pub fn health(self: *Runtime) Health {
-        _ = self.refreshIfChanged();
+        self.refreshIfChangedForHealth();
         platform_sync.lockYielding(&self.publish_mutex);
         defer self.publish_mutex.unlock();
         return .{
@@ -315,11 +343,8 @@ fn validateRemoteContentConfig(config: *const config_mod.Config) !void {
     while (s3_it.next()) |entry| {
         if (entry.key_ptr.*.len == 0) return error.InvalidRemoteContentConfig;
         const credential = entry.value_ptr;
-        if (credential.access_key_id == null or credential.access_key_id.?.len == 0 or
-            credential.secret_access_key == null or credential.secret_access_key.?.len == 0)
-        {
-            return error.InvalidRemoteContentConfig;
-        }
+        if (credential.access_key_id) |value| if (value.len == 0) return error.InvalidRemoteContentConfig;
+        if (credential.secret_access_key) |value| if (value.len == 0) return error.InvalidRemoteContentConfig;
         if (credential.buckets) |patterns| {
             for (patterns) |pattern| {
                 if (pattern.len == 0) return error.InvalidRemoteContentConfig;
@@ -599,9 +624,11 @@ test "remote content runtime rejects incomplete and startup-only replacements" {
     try std.testing.expect(runtime.health().stale_snapshot);
 
     // Once a complete remote-content-only candidate arrives, publication and
-    // the exact full-file hash advance together.
+    // the exact full-file hash advance together. Credential fields are
+    // optional because request-time resolution can use the standard AWS
+    // environment fallback.
     try writeTestConfigAtomically(path,
-        \\{"health_port":8081,"remote_content":{"default_s3":"archive","s3":{"archive":{"access_key_id":"access","secret_access_key":"secret"}}}}
+        \\{"health_port":8081,"remote_content":{"default_s3":"archive","s3":{"archive":{}}}}
     );
     try std.testing.expect(runtime.refreshIfChanged());
     var recovered = facade.acquire();

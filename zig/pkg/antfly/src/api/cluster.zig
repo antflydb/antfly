@@ -37,6 +37,7 @@ pub const ClusterStatus = struct {
 
     pub fn deinit(self: *ClusterStatus, alloc: std.mem.Allocator) void {
         if (self.message) |message| alloc.free(message);
+        if (self.secret_store) |*secret_store| secret_store.deinit(alloc);
         if (self.runtime_config) |*runtime_config| runtime_config.deinit(alloc);
         self.* = undefined;
     }
@@ -54,6 +55,7 @@ pub const ClusterTopology = struct {
 
     pub fn deinit(self: *ClusterTopology, alloc: std.mem.Allocator) void {
         if (self.message) |message| alloc.free(message);
+        if (self.secret_store) |*secret_store| secret_store.deinit(alloc);
         if (self.runtime_config) |*runtime_config| runtime_config.deinit(alloc);
         self.data.deinit(alloc);
         self.* = undefined;
@@ -62,10 +64,16 @@ pub const ClusterTopology = struct {
 
 pub const SecretStoreStatus = struct {
     generation: u64 = 0,
+    hash: []u8,
     last_reload_failed: bool = false,
     stale: bool = false,
     reload_successes: u64 = 0,
     reload_failures: u64 = 0,
+
+    pub fn deinit(self: *SecretStoreStatus, alloc: std.mem.Allocator) void {
+        alloc.free(self.hash);
+        self.* = undefined;
+    }
 };
 
 pub const RuntimeConfigStatus = struct {
@@ -228,12 +236,21 @@ pub fn topologyFromStatus(alloc: std.mem.Allocator, status: ClusterStatus) !Clus
         .reload_failures = value.reload_failures,
     } else null;
     errdefer if (runtime_config) |*value| value.deinit(alloc);
+    var secret_store: ?SecretStoreStatus = if (status.secret_store) |value| .{
+        .generation = value.generation,
+        .hash = try alloc.dupe(u8, value.hash),
+        .last_reload_failed = value.last_reload_failed,
+        .stale = value.stale,
+        .reload_successes = value.reload_successes,
+        .reload_failures = value.reload_failures,
+    } else null;
+    errdefer if (secret_store) |*value| value.deinit(alloc);
     return .{
         .health = status.health,
         .message = message,
         .auth_enabled = status.auth_enabled,
         .deployment_mode = status.deployment_mode,
-        .secret_store = status.secret_store,
+        .secret_store = secret_store,
         .runtime_config = runtime_config,
         .storage = status.storage,
         .data = .{},
@@ -329,9 +346,11 @@ pub fn dataFromSnapshot(alloc: std.mem.Allocator, snapshot: *const metadata_api.
     };
 }
 
-pub fn applySecretStoreHealth(status: *ClusterStatus, health: common_secrets.ReloadHealth) void {
+pub fn applySecretStoreHealth(alloc: std.mem.Allocator, status: *ClusterStatus, health: common_secrets.ReloadHealth) !void {
+    if (status.secret_store) |*previous| previous.deinit(alloc);
     status.secret_store = .{
         .generation = health.generation,
+        .hash = try std.fmt.allocPrint(alloc, "{x}", .{health.content_hash}),
         .last_reload_failed = health.last_reload_failed,
         .stale = health.stale_snapshot,
         .reload_successes = health.reload_successes,
@@ -429,9 +448,14 @@ test "cluster status derives degraded and error states from metadata status" {
 }
 
 test "cluster status carries non-secret secret store health" {
+    const alloc = std.testing.allocator;
     var status = ClusterStatus{ .health = .healthy };
-    applySecretStoreHealth(&status, .{
+    defer status.deinit(alloc);
+    var content_hash = [_]u8{0} ** 32;
+    content_hash[0] = 0xab;
+    try applySecretStoreHealth(alloc, &status, .{
         .generation = 7,
+        .content_hash = content_hash,
         .entry_count = 3,
         .last_reload_failed = true,
         .stale_snapshot = true,
@@ -443,6 +467,7 @@ test "cluster status carries non-secret secret store health" {
     const secret_store = status.secret_store orelse return error.TestUnexpectedResult;
     try std.testing.expect(secret_store.stale);
     try std.testing.expectEqual(@as(u64, 7), secret_store.generation);
+    try std.testing.expectEqualStrings("ab00000000000000000000000000000000000000000000000000000000000000", secret_store.hash);
     try std.testing.expect(secret_store.last_reload_failed);
 }
 

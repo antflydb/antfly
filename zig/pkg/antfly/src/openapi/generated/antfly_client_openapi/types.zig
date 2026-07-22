@@ -7452,6 +7452,8 @@ pub const SecretStatus = enum {
 pub const SecretStoreStatus = struct {
     /// Generation of the currently published secret-store snapshot.
     generation: ?i64 = null,
+    /// Lowercase SHA-256 acknowledgement of the applied secret-store bytes. This is the exact file digest for a single-file store and a deterministic digest aggregate for layered stores; it exposes no plaintext secret values.
+    hash: ?[]const u8 = null,
     /// Whether the latest observed replacement failed to load.
     last_reload_failed: ?bool = null,
     /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.

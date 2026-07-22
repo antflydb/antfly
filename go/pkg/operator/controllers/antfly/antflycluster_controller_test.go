@@ -88,6 +88,23 @@ func TestSecretValueOnlyRotationDoesNotChangePodTemplateHash(t *testing.T) {
 	}
 }
 
+func TestCompatibilityRolloutGenerationPropagatesToPodTemplate(t *testing.T) {
+	reconciler := &AntflyClusterReconciler{}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example",
+			Annotations: map[string]string{
+				compatibilityRolloutGenerationAnnotation: "secret-sha256-0123456789abcdef",
+			},
+		},
+		Spec: antflyv1.AntflyClusterSpec{Config: `{}`},
+	}
+	annotations := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(nil), cluster, nil)
+	if got := annotations[compatibilityRolloutGenerationAnnotation]; got != "secret-sha256-0123456789abcdef" {
+		t.Fatalf("compatibility rollout generation = %q", got)
+	}
+}
+
 func TestEffectiveTopologyModeFailsClosedForUnknownStoredMode(t *testing.T) {
 	cluster := &antflyv1.AntflyCluster{Spec: antflyv1.AntflyClusterSpec{Mode: antflyv1.ClusterMode("RemovedMode")}}
 	if got := effectiveTopologyMode(cluster); got != topologyModeInvalid {
