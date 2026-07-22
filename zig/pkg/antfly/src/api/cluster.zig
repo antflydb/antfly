@@ -64,6 +64,9 @@ pub const ClusterTopology = struct {
 
 pub const SecretStoreStatus = struct {
     generation: u64 = 0,
+    /// Protocol capability, independent of whether the currently loaded file
+    /// carries a control-plane publication generation.
+    supports_source_generation: bool = true,
     source_generation: ?[]u8 = null,
     last_reload_failed: bool = false,
     stale: bool = false,
@@ -238,6 +241,7 @@ pub fn topologyFromStatus(alloc: std.mem.Allocator, status: ClusterStatus) !Clus
     errdefer if (runtime_config) |*value| value.deinit(alloc);
     var secret_store: ?SecretStoreStatus = if (status.secret_store) |value| .{
         .generation = value.generation,
+        .supports_source_generation = value.supports_source_generation,
         .source_generation = if (value.source_generation) |generation| try alloc.dupe(u8, generation) else null,
         .last_reload_failed = value.last_reload_failed,
         .stale = value.stale,
@@ -350,6 +354,7 @@ pub fn applySecretStoreHealth(alloc: std.mem.Allocator, status: *ClusterStatus, 
     if (status.secret_store) |*previous| previous.deinit(alloc);
     status.secret_store = .{
         .generation = health.generation,
+        .supports_source_generation = true,
         .source_generation = if (health.source_generation) |generation|
             try std.fmt.allocPrint(alloc, "{x}", .{generation})
         else
@@ -471,8 +476,23 @@ test "cluster status carries non-secret secret store health" {
     const secret_store = status.secret_store orelse return error.TestUnexpectedResult;
     try std.testing.expect(secret_store.stale);
     try std.testing.expectEqual(@as(u64, 7), secret_store.generation);
+    try std.testing.expect(secret_store.supports_source_generation);
     try std.testing.expectEqualStrings("ab00000000000000000000000000000000000000000000000000000000000000", secret_store.source_generation.?);
     try std.testing.expect(secret_store.last_reload_failed);
+}
+
+test "generationless secret store status serializes a null source generation" {
+    const status: ClusterTopology = .{
+        .status = .healthy,
+        .secret_store = .{
+            .supports_source_generation = true,
+            .source_generation = null,
+        },
+    };
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, status, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"supports_source_generation\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_generation\":null") != null);
 }
 
 test "cluster status carries non-secret runtime config generation and hash" {

@@ -2628,7 +2628,9 @@ pub const SecretStatus = enum {
 pub const SecretStoreStatus = struct {
     /// Generation of the currently published secret-store snapshot.
     generation: ?i64 = null,
-    /// Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is omitted for files without an acknowledgement generation and never derives from secret values.
+    /// Whether this runtime supports opaque source-generation acknowledgements. This remains true even when the currently loaded file predates the generation field.
+    supports_source_generation: ?bool = null,
+    /// Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values.
     source_generation: ?[]const u8 = null,
     /// Whether the latest observed replacement failed to load.
     last_reload_failed: ?bool = null,

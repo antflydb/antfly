@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
@@ -55,6 +56,44 @@ func TestGeneratedConfigHashAnnotationChangesWithRemoteContentConfig(t *testing.
 	second := reconciler.buildPodAnnotations(context.Background(), newEnvFromCache(nil), cluster, nil)
 	if second[generatedConfigHashAnnotation] == firstHash {
 		t.Fatal("expected remote-content config change to alter pod-template hash")
+	}
+}
+
+func TestReconcileConfigMapPublishesExactGenerationAndFullHash(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := antflyv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: scheme}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "publication", Namespace: "default", Generation: 9},
+		Spec:       antflyv1.AntflyClusterSpec{Config: `{"remote_content":{"default_s3":"primary"}}`},
+	}
+
+	if err := reconciler.reconcileConfigMap(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	configMap := &corev1.ConfigMap{}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: "publication-config", Namespace: "default"}, configMap); err != nil {
+		t.Fatal(err)
+	}
+	wantSum := sha256.Sum256([]byte(configMap.Data["config.json"]))
+	if cluster.Status.ConfigPublication == nil {
+		t.Fatal("expected config publication status")
+	}
+	if cluster.Status.ConfigPublication.ObservedGeneration != cluster.Generation {
+		t.Fatalf("published generation %d, want %d", cluster.Status.ConfigPublication.ObservedGeneration, cluster.Generation)
+	}
+	wantHash := fmt.Sprintf("%x", wantSum)
+	if cluster.Status.ConfigPublication.SHA256 != wantHash {
+		t.Fatalf("published hash %q, want %q", cluster.Status.ConfigPublication.SHA256, wantHash)
+	}
+	if configMap.Annotations[generatedConfigHashAnnotation] != wantHash[:16] {
+		t.Fatalf("pod-template hash %q does not match publication prefix", configMap.Annotations[generatedConfigHashAnnotation])
 	}
 }
 
@@ -9347,6 +9386,18 @@ var _ = Describe("AntflyCluster Controller", func() {
 				generatedConfigHashAnnotation,
 				configMap.Annotations[generatedConfigHashAnnotation],
 			))
+			configSum := sha256.Sum256([]byte(configMap.Data["config.json"]))
+			wantPublicationHash := fmt.Sprintf("%x", configSum)
+			Eventually(func() string {
+				observed := &antflyv1.AntflyCluster{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: namespace}, observed); err != nil {
+					return ""
+				}
+				if observed.Status.ConfigPublication == nil || observed.Status.ConfigPublication.ObservedGeneration != observed.Generation {
+					return ""
+				}
+				return observed.Status.ConfigPublication.SHA256
+			}, timeout, interval).Should(Equal(wantPublicationHash))
 
 			// Verify internal service is created
 			internalSvc := &corev1.Service{}

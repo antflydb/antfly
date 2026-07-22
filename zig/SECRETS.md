@@ -347,6 +347,13 @@ rules:
   `secret_store.stale` is false. The generation is random publication metadata,
   not a digest of credential bytes. It does not require a config generation
   change or pod rollout.
+- `secret_store.supports_source_generation` advertises the acknowledgement
+  protocol independently of the currently loaded file. A reload-capable
+  process therefore remains distinguishable from a legacy process while
+  migrating a generationless projected Secret.
+- `secret_store.source_generation` is JSON `null` when the applied file has no
+  control-plane acknowledgement generation, including during legacy upgrades
+  and after local secret writes.
 - `last_reload_failed`, `reload_successes`, and `reload_failures` distinguish a
   successfully published generation from a last-known-good stale snapshot.
 
