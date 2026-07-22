@@ -184,9 +184,9 @@ jobs:
 
       # ARC exposes the node CPU count instead of the pod quota. Keep the
       # process affinity aligned with the pod CPU budget, and independently
-      # bound Zig's build/test process fan-out for the 15 GiB runner. Several
-      # unit binaries have multi-GiB peaks, so CPU affinity alone is not a
-      # sufficient memory bound.
+      # give Zig one memory-heavy process slot on the 15 GiB runner. A single
+      # unit artifact can approach half that budget while compiling or running;
+      # it still retains the full CPU set for its internal parallel work.
       - name: Compute CPU bound for unit tests
         if: needs.changes.outputs.zig_tests == 'true'
         id: cpus
@@ -194,9 +194,7 @@ jobs:
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
-          build_jobs="$jobs"
-          if [ "$build_jobs" -gt 2 ]; then build_jobs=2; fi
-          echo "build_jobs=$build_jobs" >> "$GITHUB_OUTPUT"
+          echo "build_jobs=1" >> "$GITHUB_OUTPUT"
 
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
@@ -348,6 +346,16 @@ jobs:
           wait "$unit_pid" || status="$?"
           kill "$watchdog_pid" 2>/dev/null || true
           wait "$watchdog_pid" 2>/dev/null || true
+          if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
+            echo "::group::unit failure cgroup memory"
+            for metric in memory.current memory.peak memory.max memory.events; do
+              if [ -r "/sys/fs/cgroup/$metric" ]; then
+                echo "[$metric]"
+                cat "/sys/fs/cgroup/$metric"
+              fi
+            done
+            echo "::endgroup::"
+          fi
           exit "$status"
 
       - name: Set up Java for TLA+
@@ -406,20 +414,32 @@ jobs:
 
       # The in-process cluster simulations size their thread pools from the
       # visible CPU count, which on ARC reflects the node rather than the pod
-      # quota. Bound the process CPU set independently from Zig's process-level
-      # build fan-out so both CPU and memory remain within the runner budget.
+      # quota. Give Zig one memory-heavy process slot while retaining the full
+      # pod CPU set inside that process.
       - name: Compute CPU bound for heavy test steps
         id: cpus
         run: |
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
-          build_jobs="$jobs"
-          if [ "$build_jobs" -gt 2 ]; then build_jobs=2; fi
-          echo "build_jobs=$build_jobs" >> "$GITHUB_OUTPUT"
+          echo "build_jobs=1" >> "$GITHUB_OUTPUT"
 
       - name: Run full Zig unit tests
-        run: taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="${ZIG_BUILD_FLAGS} -j${{ steps.cpus.outputs.build_jobs }}"
+        run: |
+          set +e
+          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="${ZIG_BUILD_FLAGS} -j${{ steps.cpus.outputs.build_jobs }}"
+          status="$?"
+          if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
+            echo "::group::unit failure cgroup memory"
+            for metric in memory.current memory.peak memory.max memory.events; do
+              if [ -r "/sys/fs/cgroup/$metric" ]; then
+                echo "[$metric]"
+                cat "/sys/fs/cgroup/$metric"
+              fi
+            done
+            echo "::endgroup::"
+          fi
+          exit "$status"
 
       - name: Set up Java for TLA+
         uses: actions/setup-java@v5
@@ -513,13 +533,20 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
 
+      - name: Compute CPU bound for E2E
+        id: e2e_cpus
+        run: |
+          jobs=$(nproc)
+          if [ "$jobs" -gt 8 ]; then jobs=8; fi
+          echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
+
       - name: Build E2E binaries
         run: scripts/ci/zig-build-e2e-binaries.sh
 
       - name: Run base E2E
         env:
           SKIP_BUILD: "1"
-        run: scripts/ci/zig-e2e-base-linux.sh
+        run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
 
   e2e-full:
     name: e2e-full
@@ -560,6 +587,13 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Compute CPU bound for E2E
+        id: e2e_cpus
+        run: |
+          jobs=$(nproc)
+          if [ "$jobs" -gt 8 ]; then jobs=8; fi
+          echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Set up Rust WASI target
         uses: dtolnay/rust-toolchain@stable
@@ -602,7 +636,7 @@ jobs:
           ANTFLY_LSM_OPEN_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          uv run --project e2e/antfly pytest -q --continue-on-collection-errors e2e/antfly
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q --continue-on-collection-errors e2e/antfly
 
       - name: Run Antfly inference full E2E
         id: inference_full_e2e
@@ -613,7 +647,7 @@ jobs:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_DOWNLOAD: "1"
           ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: openai-community/gpt2
-        run: uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
+        run: taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
 
       - name: Report full E2E result
         if: always()
