@@ -2776,8 +2776,10 @@ pub const SecretStatus = enum {
 pub const SecretStoreStatus = struct {
     /// Generation of the currently published secret-store snapshot.
     generation: ?i64 = null,
-    /// Lowercase SHA-256 acknowledgement of the applied secret-store bytes. This is the exact file digest for a single-file store and a deterministic digest aggregate for layered stores; it exposes no plaintext secret values.
-    hash: ?[]const u8 = null,
+    /// Whether this runtime supports opaque source-generation acknowledgements. This remains true even when the currently loaded file predates the generation field.
+    supports_source_generation: ?bool = null,
+    /// Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values.
+    source_generation: ?[]const u8 = null,
     /// Whether the latest observed replacement failed to load.
     last_reload_failed: ?bool = null,
     /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.

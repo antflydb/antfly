@@ -64,14 +64,17 @@ pub const ClusterTopology = struct {
 
 pub const SecretStoreStatus = struct {
     generation: u64 = 0,
-    hash: []u8,
+    /// Protocol capability, independent of whether the currently loaded file
+    /// carries a control-plane publication generation.
+    supports_source_generation: bool = true,
+    source_generation: ?[]u8 = null,
     last_reload_failed: bool = false,
     stale: bool = false,
     reload_successes: u64 = 0,
     reload_failures: u64 = 0,
 
     pub fn deinit(self: *SecretStoreStatus, alloc: std.mem.Allocator) void {
-        alloc.free(self.hash);
+        if (self.source_generation) |value| alloc.free(value);
         self.* = undefined;
     }
 };
@@ -238,7 +241,8 @@ pub fn topologyFromStatus(alloc: std.mem.Allocator, status: ClusterStatus) !Clus
     errdefer if (runtime_config) |*value| value.deinit(alloc);
     var secret_store: ?SecretStoreStatus = if (status.secret_store) |value| .{
         .generation = value.generation,
-        .hash = try alloc.dupe(u8, value.hash),
+        .supports_source_generation = value.supports_source_generation,
+        .source_generation = if (value.source_generation) |generation| try alloc.dupe(u8, generation) else null,
         .last_reload_failed = value.last_reload_failed,
         .stale = value.stale,
         .reload_successes = value.reload_successes,
@@ -350,7 +354,11 @@ pub fn applySecretStoreHealth(alloc: std.mem.Allocator, status: *ClusterStatus, 
     if (status.secret_store) |*previous| previous.deinit(alloc);
     status.secret_store = .{
         .generation = health.generation,
-        .hash = try std.fmt.allocPrint(alloc, "{x}", .{health.content_hash}),
+        .supports_source_generation = true,
+        .source_generation = if (health.source_generation) |generation|
+            try std.fmt.allocPrint(alloc, "{x}", .{generation})
+        else
+            null,
         .last_reload_failed = health.last_reload_failed,
         .stale = health.stale_snapshot,
         .reload_successes = health.reload_successes,
@@ -451,11 +459,12 @@ test "cluster status carries non-secret secret store health" {
     const alloc = std.testing.allocator;
     var status = ClusterStatus{ .health = .healthy };
     defer status.deinit(alloc);
-    var content_hash = [_]u8{0} ** 32;
-    content_hash[0] = 0xab;
+    var source_generation = [_]u8{0} ** 32;
+    source_generation[0] = 0xab;
     try applySecretStoreHealth(alloc, &status, .{
         .generation = 7,
-        .content_hash = content_hash,
+        .content_hash = [_]u8{0} ** 32,
+        .source_generation = source_generation,
         .entry_count = 3,
         .last_reload_failed = true,
         .stale_snapshot = true,
@@ -467,8 +476,23 @@ test "cluster status carries non-secret secret store health" {
     const secret_store = status.secret_store orelse return error.TestUnexpectedResult;
     try std.testing.expect(secret_store.stale);
     try std.testing.expectEqual(@as(u64, 7), secret_store.generation);
-    try std.testing.expectEqualStrings("ab00000000000000000000000000000000000000000000000000000000000000", secret_store.hash);
+    try std.testing.expect(secret_store.supports_source_generation);
+    try std.testing.expectEqualStrings("ab00000000000000000000000000000000000000000000000000000000000000", secret_store.source_generation.?);
     try std.testing.expect(secret_store.last_reload_failed);
+}
+
+test "generationless secret store status serializes a null source generation" {
+    const status: ClusterTopology = .{
+        .status = .healthy,
+        .secret_store = .{
+            .supports_source_generation = true,
+            .source_generation = null,
+        },
+    };
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, status, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"supports_source_generation\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_generation\":null") != null);
 }
 
 test "cluster status carries non-secret runtime config generation and hash" {

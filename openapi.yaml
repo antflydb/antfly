@@ -8900,11 +8900,17 @@ components:
           type: integer
           format: uint64
           description: Generation of the currently published secret-store snapshot.
-        hash:
+        supports_source_generation:
+          type: boolean
+          description: Whether this runtime supports opaque source-generation acknowledgements. This remains
+            true even when the currently loaded file predates the generation field.
+          x-omitzero: false
+        source_generation:
           type: string
-          description: Lowercase SHA-256 acknowledgement of the applied secret-store bytes. This is the
-            exact file digest for a single-file store and a deterministic digest aggregate for layered
-            stores; it exposes no plaintext secret values.
+          nullable: true
+          description: Opaque, non-secret generation embedded by the control plane in the currently applied
+            secrets file. It is null for files without an acknowledgement generation and never derives
+            from secret values.
         last_reload_failed:
           type: boolean
           description: Whether the latest observed replacement failed to load.

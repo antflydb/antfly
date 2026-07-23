@@ -2175,7 +2175,14 @@ func (r *AntflyClusterReconciler) reconcileConfigMap(ctx context.Context, cluste
 		return nil
 	})
 
-	return err
+	if err != nil {
+		return err
+	}
+	cluster.Status.ConfigPublication = &antflyv1.ConfigPublicationStatus{
+		ObservedGeneration: cluster.Generation,
+		SHA256:             fmt.Sprintf("%x", configSum),
+	}
+	return nil
 }
 
 // generateCompleteConfig creates a complete Antfly configuration by merging user config with generated metadata network config
