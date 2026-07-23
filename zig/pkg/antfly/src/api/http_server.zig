@@ -4877,32 +4877,10 @@ pub const ApiHttpServer = struct {
                     error.TableVisibilityTimeout => return try textResponse(self.alloc, 500, "schema update did not converge"),
                     else => return err,
                 };
-                if (self.table_writes) |table_writes_source| {
-                    var background_reconcile_scheduled = false;
-                    if (!local_schema_applied) {
-                        const scheduled = table_writes_source.requestTableStructuralReconcile(self.alloc, table_name) catch |write_err| {
-                            std.log.err("public schema update structural reconcile enqueue failed table={s} err={s}", .{ table_name, @errorName(write_err) });
-                            return write_err;
-                        };
-                        // Embedded/direct DB sources have no reconciliation
-                        // worker and retain their synchronous update contract.
-                        if (scheduled == null) {
-                            _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                                error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                                else => return write_err,
-                            };
-                        } else {
-                            background_reconcile_scheduled = true;
-                        }
-                    }
-                    // A provisioned owner has its own structural worker. Do not
-                    // turn an enqueue-only HTTP contract back into synchronous
-                    // work by driving metadata/reconciliation rounds here.
-                    if (!background_reconcile_scheduled and try self.source.runRound()) {
-                        _ = try self.source.runRound();
-                        _ = try self.source.runRound();
-                    }
-                }
+                self.reconcileProjectedSchemaUpdate(self.alloc, table_name, schema_json, local_schema_applied) catch |write_err| switch (write_err) {
+                    error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
+                    else => return write_err,
+                };
 
                 const body = try self.encodeSchemaUpdateResponse(table_name, schema_json);
                 defer self.alloc.free(body);
@@ -5271,6 +5249,40 @@ pub const ApiHttpServer = struct {
         defer arena_impl.deinit();
         const value = try buildLocalSchemaUpdateStatus(arena_impl.allocator(), table_name, schema_json);
         return try std.json.Stringify.valueAlloc(self.alloc, value, .{});
+    }
+
+    /// Starts local materialization only after the metadata definition is
+    /// visible. Both HTTP implementations call this boundary so a transport
+    /// change cannot silently turn an enqueue-only managed rebuild back into
+    /// synchronous request work.
+    pub fn reconcileProjectedSchemaUpdate(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema_json: []const u8,
+        local_schema_applied: bool,
+    ) !void {
+        const table_writes_source = self.table_writes orelse return;
+        var background_reconcile_scheduled = false;
+        if (!local_schema_applied) {
+            const scheduled = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |err| {
+                std.log.err("public schema update structural reconcile enqueue failed table={s} err={s}", .{ table_name, @errorName(err) });
+                return err;
+            };
+            // Embedded/direct DB sources have no reconciliation worker and
+            // retain their synchronous update contract.
+            if (scheduled == null) {
+                _ = try table_writes_source.updateSchema(alloc, table_name, schema_json);
+            } else {
+                background_reconcile_scheduled = true;
+            }
+        }
+        // A provisioned owner has its own structural worker. Driving metadata
+        // rounds here would put corpus reconstruction back on the HTTP path.
+        if (!background_reconcile_scheduled and try self.source.runRound()) {
+            _ = try self.source.runRound();
+            _ = try self.source.runRound();
+        }
     }
 
     pub fn probeTableStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.TableStorageStatus {

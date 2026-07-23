@@ -358,6 +358,7 @@ pub fn collectLocalSchemaProgressWithOptions(
 pub fn collectLocalSchemaProgressFromRuntime(
     alloc: std.mem.Allocator,
     local_node_id: u64,
+    hosted_group_ids: []const u64,
     tables: []const table_manager.TableRecord,
     ranges: []const table_manager.RangeRecord,
     stores: []const table_manager.StoreRecord,
@@ -371,14 +372,18 @@ pub fn collectLocalSchemaProgressFromRuntime(
         const read_version = try schemaVersion(alloc, table.read_schema_json);
 
         var hosted_ranges: usize = 0;
-        var ready_ranges: usize = 0;
-        for (ranges) |range| {
+        var all_ready = true;
+        for (hosted_group_ids) |group_id| {
+            const range = findRange(ranges, group_id) orelse continue;
             if (range.table_id != table.table_id) continue;
-            const runtime = findLocalRuntimeStatus(stores, local_node_id, table.table_id, range.group_id) orelse continue;
             hosted_ranges += 1;
-            if (runtimeHasReadySchemaVersionIndex(runtime, version, read_version)) ready_ranges += 1;
+            const runtime = findLocalRuntimeStatus(stores, local_node_id, table.table_id, group_id) orelse {
+                all_ready = false;
+                continue;
+            };
+            all_ready = all_ready and runtimeHasReadySchemaVersionIndex(runtime, range, version, read_version);
         }
-        if (hosted_ranges == 0 or ready_ranges != hosted_ranges) continue;
+        if (hosted_ranges == 0 or !all_ready) continue;
         try out.append(alloc, .{
             .table_id = table.table_id,
             .node_id = local_node_id,
@@ -444,6 +449,88 @@ test "schema progress runtime coverage treats opening observations as authoritat
     stores[0].runtime_statuses = &runtimes;
     try std.testing.expect(localSchemaRuntimeCoverageComplete(3, &hosted, &tables, &ranges, &stores));
     try std.testing.expect(!localSchemaRuntimeCoverageComplete(4, &hosted, &tables, &ranges, &stores));
+}
+
+test "runtime schema progress requires every hosted range" {
+    const tables = [_]table_manager.TableRecord{.{
+        .table_id = 11,
+        .name = "docs",
+        .schema_json = "{\"version\":1}",
+        .read_schema_json = "{\"version\":0}",
+    }};
+    const ranges = [_]table_manager.RangeRecord{
+        .{ .group_id = 7, .table_id = 11, .start_key = "", .end_key = "m" },
+        .{ .group_id = 8, .table_id = 11, .start_key = "m" },
+    };
+    const hosted = [_]u64{ 7, 8 };
+    var indexes = [_]table_manager.RuntimeIndexStatusReport{.{
+        .name = "full_text_index_v1",
+        .kind = "full_text",
+        .doc_count = 1,
+        .replay_applied_sequence = 1,
+        .replay_target_sequence = 1,
+    }};
+    var runtimes = [_]table_manager.RuntimeGroupStatusReport{
+        .{
+            .table_id = 11,
+            .group_id = 7,
+            .node_id = 3,
+            .freshness = "fresh",
+            .doc_identity = .{
+                .namespace_table_id = 11,
+                .namespace_shard_id = 7,
+                .namespace_range_id = 7,
+                .next_ordinal = 2,
+                .allocated_ordinals = 1,
+                .live_ordinals = 1,
+            },
+            .indexes = &indexes,
+        },
+        .{
+            .table_id = 11,
+            .group_id = 8,
+            .node_id = 3,
+            .freshness = "fresh",
+            .doc_identity = .{
+                .namespace_table_id = 11,
+                .namespace_shard_id = 8,
+                .namespace_range_id = 8,
+                .next_ordinal = 2,
+                .allocated_ordinals = 1,
+                .live_ordinals = 1,
+            },
+            .indexes = &indexes,
+        },
+    };
+    var stores = [_]table_manager.StoreRecord{.{
+        .store_id = 5,
+        .node_id = 3,
+        .runtime_statuses = runtimes[0..1],
+    }};
+
+    const partial = try collectLocalSchemaProgressFromRuntime(
+        std.testing.allocator,
+        3,
+        &hosted,
+        &tables,
+        &ranges,
+        &stores,
+    );
+    defer std.testing.allocator.free(partial);
+    try std.testing.expectEqual(@as(usize, 0), partial.len);
+
+    stores[0].runtime_statuses = &runtimes;
+    const complete = try collectLocalSchemaProgressFromRuntime(
+        std.testing.allocator,
+        3,
+        &hosted,
+        &tables,
+        &ranges,
+        &stores,
+    );
+    defer std.testing.allocator.free(complete);
+    try std.testing.expectEqual(@as(usize, 1), complete.len);
+    try std.testing.expectEqual(@as(u32, 1), complete[0].schema_version);
 }
 
 pub fn collectLocalRestoreProgress(
@@ -1134,17 +1221,20 @@ fn findLocalRuntimeStatus(
 
 fn runtimeHasReadySchemaVersionIndex(
     runtime: table_manager.RuntimeGroupStatusReport,
+    range: table_manager.RangeRecord,
     schema_version: u32,
     read_schema_version: u32,
 ) bool {
     // Schema cutover must be driven by a current observation of the complete
     // target projection. A catalog-only placeholder and a newly-created empty
     // index both look idle, but neither proves that existing documents were
-    // rebuilt under the target schema. Use source identity cardinality rather
-    // than the aggregate runtime doc count: the latter deliberately preserves
-    // conservative visibility and can be inflated by the retained read index.
+    // rebuilt under the target schema. Identity mutations and their visibility
+    // summary commit atomically with every primary mutation, so the reconciled
+    // O(1) summary is the generation-owner proof. Requiring diagnostic
+    // `complete` here would turn migration progress into a corpus scan and let
+    // a later bounded status observation erase an otherwise valid proof.
     if (!std.mem.eql(u8, runtime.freshness, "fresh")) return false;
-    if (!runtime.doc_identity.complete) return false;
+    if (!runtimeIdentitySummaryIsAuthoritative(runtime, range)) return false;
 
     var target_name_buf: [64]u8 = undefined;
     const target_name = if (schema_version == 0)
@@ -1161,6 +1251,24 @@ fn runtimeHasReadySchemaVersionIndex(
     else
         std.fmt.bufPrint(&read_name_buf, "full_text_index_v{d}", .{read_schema_version}) catch return false;
     _ = findReadyRuntimeFullTextIndex(runtime.indexes, read_name) orelse return true;
+    return true;
+}
+
+fn runtimeIdentitySummaryIsAuthoritative(
+    runtime: table_manager.RuntimeGroupStatusReport,
+    range: table_manager.RangeRecord,
+) bool {
+    const identity = runtime.doc_identity;
+    if (identity.ordinal_capacity_exhausted or identity.rebuild_required) return false;
+    if (runtime.table_id != range.table_id or runtime.group_id != range.group_id) return false;
+    if (identity.namespace_table_id != range.table_id or
+        identity.namespace_shard_id != table_manager.rangeDocIdentityShardId(range) or
+        identity.namespace_range_id != table_manager.rangeDocIdentityRangeId(range)) return false;
+    if (identity.next_ordinal == 0) return false;
+    if (@as(u64, identity.next_ordinal - 1) != identity.allocated_ordinals) return false;
+    const accounted = std.math.add(u64, identity.live_ordinals, identity.tombstone_ordinals) catch return false;
+    if (accounted != identity.allocated_ordinals) return false;
+
     return true;
 }
 
@@ -3007,6 +3115,7 @@ test "table provisioner withholds schema progress when any local shard is missin
 }
 
 test "table provisioner accepts target schema index when retained read index has inflated doc count" {
+    const range = table_manager.RangeRecord{ .group_id = 7, .table_id = 11, .start_key = "" };
     const indexes = [_]table_manager.RuntimeIndexStatusReport{
         .{
             .name = "full_text_index_v0",
@@ -3024,14 +3133,24 @@ test "table provisioner accepts target schema index when retained read index has
         },
     };
     try std.testing.expect(runtimeHasReadySchemaVersionIndex(.{
+        .table_id = range.table_id,
+        .group_id = range.group_id,
         .freshness = "fresh",
         .doc_count = 1500,
-        .doc_identity = .{ .live_ordinals = 1000, .complete = true },
+        .doc_identity = .{
+            .namespace_table_id = range.table_id,
+            .namespace_shard_id = range.group_id,
+            .namespace_range_id = range.group_id,
+            .next_ordinal = 1001,
+            .allocated_ordinals = 1000,
+            .live_ordinals = 1000,
+        },
         .indexes = @constCast(indexes[0..]),
-    }, 1, 0));
+    }, range, 1, 0));
 }
 
-test "table provisioner runtime schema progress requires fresh complete target coverage" {
+test "table provisioner runtime schema progress requires authoritative O(1) identity coverage" {
+    const range = table_manager.RangeRecord{ .group_id = 7, .table_id = 11, .start_key = "" };
     var indexes = [_]table_manager.RuntimeIndexStatusReport{
         .{
             .name = "full_text_index_v0",
@@ -3049,27 +3168,37 @@ test "table provisioner runtime schema progress requires fresh complete target c
         },
     };
     var runtime = table_manager.RuntimeGroupStatusReport{
+        .table_id = range.table_id,
+        .group_id = range.group_id,
         .freshness = "fresh",
         .doc_count = 1000,
-        .doc_identity = .{ .live_ordinals = 1000, .complete = true },
+        .doc_identity = .{
+            .namespace_table_id = range.table_id,
+            .namespace_shard_id = range.group_id,
+            .namespace_range_id = range.group_id,
+            .next_ordinal = 1001,
+            .allocated_ordinals = 1000,
+            .live_ordinals = 1000,
+        },
         .indexes = &indexes,
     };
 
-    try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, 1, 0));
+    try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
 
     indexes[1].doc_count = 1000;
-    try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, 1, 0));
+    try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
 
     runtime.freshness = "stale";
-    try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, 1, 0));
+    try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
 
     runtime.freshness = "fresh";
-    runtime.doc_identity.complete = false;
-    try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, 1, 0));
+    runtime.doc_identity.allocated_ordinals = 999;
+    try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
 
-    runtime.doc_identity.complete = true;
+    runtime.doc_identity.allocated_ordinals = 0;
+    runtime.doc_identity.next_ordinal = 1;
     runtime.doc_count = 0;
     runtime.doc_identity.live_ordinals = 0;
     indexes[1].doc_count = 0;
-    try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, 1, 0));
+    try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
 }

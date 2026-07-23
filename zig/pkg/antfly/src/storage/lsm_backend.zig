@@ -1274,7 +1274,7 @@ pub const Backend = struct {
     };
 
     const L0OverlapCache = struct {
-        const max_run_ids = 64;
+        const max_run_ids = compaction_mod.max_exact_l0_overlap_runs;
 
         valid: bool = false,
         threshold: usize = 0,
@@ -1958,6 +1958,13 @@ pub const Backend = struct {
         if (threshold == 0) return 0;
         var l0_count: usize = 0;
         while (l0_count < self.runs.items.len and self.runs.items[l0_count].level == 0) : (l0_count += 1) {}
+        // Above the soft limit, normal L0 pressure already schedules
+        // compaction. Exact overlap scoring is O(n^2) and runs under `mu`, so
+        // performing it during overload can block point and batch reads for
+        // seconds. Zero here means "not independently scored"; L0 run/byte
+        // pressure remains fully represented by the surrounding metrics.
+        const soft_limit = self.effectiveL0SoftLimitRuns();
+        if (soft_limit == 0 or l0_count > @min(soft_limit, compaction_mod.max_exact_l0_overlap_runs)) return 0;
         const l0_runs = self.runs.items[0..l0_count];
         if (self.l0_overlap_cache.lookup(l0_runs, threshold)) |cached| return cached;
         const result = compaction_mod.largestL0OverlapRunCount(l0_runs, threshold);
@@ -5948,6 +5955,25 @@ test "lsm backend caches exact L0 overlap score until immutable run IDs change" 
     stats = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 3), stats.overlapping_l0_runs);
     try std.testing.expectEqual(@as(usize, 3), backend.l0_overlap_cache.run_count);
+}
+
+test "lsm backend bounds exact overlap scoring above soft L0 pressure" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .compact_threshold_runs = 4,
+        .l0_overlap_compact_threshold_runs = 2,
+        .l0_soft_limit_runs = 4,
+        .l0_hard_limit_runs = 16,
+    });
+    defer backend.close();
+    try appendSyntheticLevelRunsForTest(&backend, 0, 5, 1024);
+    compaction_mod.sortRuns(backend.runs.items);
+
+    const stats = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 5), stats.l0_runs);
+    try std.testing.expectEqual(@as(u64, 1), stats.compactable_l0_runs);
+    try std.testing.expectEqual(@as(u64, 0), stats.overlapping_l0_runs);
+    try std.testing.expect(!backend.l0_overlap_cache.valid);
+    try std.testing.expect(backend.maintenanceScore() > 0);
 }
 
 test "lsm backend tight base level target reports lower-level overflow" {
@@ -12415,6 +12441,80 @@ test "lsm backend point getManySorted reuses cached run blocks below sorted thre
 
     const cache_stats = cache.snapshotStats();
     try std.testing.expect(cache_stats.run_table_block.inserts + cache_stats.run_table_physical_block.inserts > 0);
+}
+
+test "lsm backend cache-backed batch probes do not require the backend mutex" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-cache-batch-with-maintenance-lock";
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .cache = &cache,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "artifact:00000000:dense", "value-0");
+        try txn.commit();
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    const ReadTxn = @TypeOf(read);
+    const Worker = struct {
+        const Context = struct {
+            txn: *ReadTxn,
+            stage: std.atomic.Value(u8) = .init(0),
+            value: ?[]const u8 = null,
+            result: ?anyerror = null,
+        };
+
+        fn run(ctx: *Context) void {
+            const keys = [_][]const u8{"artifact:00000000:dense"};
+            var values: [1]?[]const u8 = .{null};
+            ctx.stage.store(1, .release);
+            ctx.txn.getManySorted(.{ .name = "docs" }, &keys, &values) catch |err| {
+                ctx.result = err;
+                ctx.stage.store(2, .release);
+                return;
+            };
+            ctx.value = values[0];
+            ctx.stage.store(2, .release);
+        }
+    };
+
+    var ctx = Worker.Context{ .txn = &read };
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    var thread = try std.Thread.spawn(.{}, Worker.run, .{&ctx});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    while (ctx.stage.load(.acquire) == 0) platform.time.yieldBriefly();
+    sleepForTest(100 * std.time.ns_per_ms);
+    const completed_without_backend_lock = ctx.stage.load(.acquire) == 2;
+
+    runtime_mod.unlockBackend(Backend, &backend, locked);
+    thread.join();
+    joined = true;
+
+    try std.testing.expect(completed_without_backend_lock);
+    if (ctx.result) |err| return err;
+    try std.testing.expectEqualStrings("value-0", ctx.value.?);
 }
 
 test "lsm backend getManySorted searches prefix-compressed physical blocks directly" {

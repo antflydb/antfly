@@ -2158,6 +2158,11 @@ def stateful_api():
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self.delete(f"/tables/{table_name}/indexes/{index_name}")
 
+        def debug_logs(self) -> str:
+            if self._server is None:
+                return ""
+            return self._server.debug_logs().strip()
+
     yield PublicApi(session, base, server)
     session.close()
     if server is not None:

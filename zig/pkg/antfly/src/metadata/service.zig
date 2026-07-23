@@ -2373,6 +2373,7 @@ pub const MetadataService = struct {
         var local_progress = try metadata_table_provisioner.collectLocalSchemaProgressFromRuntime(
             self.alloc,
             local_node_id,
+            group_ids,
             tables,
             ranges,
             stores,
@@ -4393,6 +4394,7 @@ pub const MetadataHttpService = struct {
         var local_progress = try metadata_table_provisioner.collectLocalSchemaProgressFromRuntime(
             self.alloc,
             local_node_id,
+            group_ids,
             inputs.tables,
             inputs.ranges,
             inputs.stores,

@@ -1586,7 +1586,11 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
 ) -> None:
     cluster = split_scaling_cluster
     table_name = f"scale_split_{time.time_ns()}"
+    timings = _ScalingPhaseTimings(table_name)
+
+    phase_started = time.monotonic()
     cluster.create_table(table_name, num_shards=1)
+    timings.record("create_table", phase_started)
 
     docs = {
         f"doc:{i:03d}": {
@@ -1596,7 +1600,9 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
         }
         for i in range(48)
     }
+    phase_started = time.monotonic()
     _insert_docs(cluster, table_name, docs, min_group_count=1)
+    timings.record("insert_docs", phase_started)
 
     last_reallocate_at = 0.0
 
@@ -1618,14 +1624,47 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
             return None
         return group_ids if len(group_ids) >= 2 else None
 
+    phase_started = time.monotonic()
     split_groups = wait_until(split_completed, timeout_s=180.0, interval_s=0.5)
+    timings.record("split_finalized", phase_started)
     assert split_groups is not None, (
         "table did not finalize an automatic split after exceeding the configured shard size threshold\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
         f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
         f"{cluster.debug_logs()}"
     )
+    phase_started = time.monotonic()
     _assert_docs_readable(cluster, table_name, docs, timeout_s=60.0)
+    timings.record("post_split_reads", phase_started)
+    timings.finish(cluster)
+
+
+class _ScalingPhaseTimings:
+    def __init__(self, table_name: str):
+        self.table_name = table_name
+        self.started = time.monotonic()
+        self.enabled = os.getenv("ANTFLY_E2E_PHASE_TIMINGS") == "1"
+
+    def record(self, name: str, started: float) -> None:
+        elapsed = time.monotonic() - started
+        if self.enabled:
+            print(f"E2E_PHASE table={self.table_name} phase={name} seconds={elapsed:.3f}", flush=True)
+
+    def finish(self, cluster: MultiNodeScalingCluster) -> None:
+        total = time.monotonic() - self.started
+        if not self.enabled:
+            return
+        print(f"E2E_PHASE table={self.table_name} phase=total seconds={total:.3f}", flush=True)
+        slow_threshold = float(os.getenv("ANTFLY_E2E_SLOW_LOG_THRESHOLD_S", "30"))
+        if total < slow_threshold:
+            return
+        print(
+            "E2E_SLOW_SCALING_DIAGNOSTICS\n"
+            f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
+            f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
+            f"{cluster.debug_logs()}",
+            flush=True,
+        )
 
 
 def test_autoscaling_node_churn_keeps_reads_available(

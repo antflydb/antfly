@@ -198,7 +198,11 @@ fn indexRepairFallbackAdvance(
     );
 }
 
-fn indexRepairScanDue(dirty: bool, last_run_at_ms: u64, now_ms: u64, discovery_interval_ms: u64) bool {
+fn indexRepairScanDue(immediate_wake: bool, dirty: bool, last_run_at_ms: u64, now_ms: u64, discovery_interval_ms: u64) bool {
+    // Exact durable notifications are edge-triggered work, not polling. They
+    // bypass the periodic cadence; per-group and scheduler backoff are checked
+    // separately before this decision.
+    if (immediate_wake) return true;
     // Startup catch-up and explicit repair requests provide the initial wake.
     // Do not turn every fresh runtime round into an unsolicited cluster-wide
     // repair discovery scan. Once the executor has run, periodic discovery
@@ -212,11 +216,12 @@ fn indexRepairScanDue(dirty: bool, last_run_at_ms: u64, now_ms: u64, discovery_i
 }
 
 test "index repair scan periodically rediscovers debt after a lost wake" {
-    try std.testing.expect(!indexRepairScanDue(false, 0, 20_000, 30_000));
-    try std.testing.expect(indexRepairScanDue(true, 0, 20_000, 30_000));
-    try std.testing.expect(!indexRepairScanDue(false, 100, 20_000, 30_000));
-    try std.testing.expect(indexRepairScanDue(false, 100, 30_100, 30_000));
-    try std.testing.expect(indexRepairScanDue(true, 100, 5_100, 30_000));
+    try std.testing.expect(!indexRepairScanDue(false, false, 0, 20_000, 30_000));
+    try std.testing.expect(indexRepairScanDue(false, true, 0, 20_000, 30_000));
+    try std.testing.expect(!indexRepairScanDue(false, false, 100, 20_000, 30_000));
+    try std.testing.expect(indexRepairScanDue(false, false, 100, 30_100, 30_000));
+    try std.testing.expect(indexRepairScanDue(false, true, 100, 5_100, 30_000));
+    try std.testing.expect(indexRepairScanDue(true, true, 100, 101, 30_000));
 }
 
 test "index repair fallback backoff never blocks an exact durable wake" {
@@ -497,6 +502,7 @@ const IndexRepairQueueEntry = struct {
     first_seen_ms: u64,
     next_retry_at_ms: u64 = 0,
     transient_failure_count: u32 = 0,
+    immediate_wake_pending: bool = false,
     table_name: ?[]u8 = null,
     previous_group_id: ?u64 = null,
     next_group_id: ?u64 = null,
@@ -504,6 +510,11 @@ const IndexRepairQueueEntry = struct {
     table_id: u64 = 0,
     identity_shard_id: u64 = 0,
     identity_range_id: u64 = 0,
+};
+
+const IndexRepairQueueWake = enum {
+    immediate,
+    retained,
 };
 
 const IndexRepairRoute = struct {
@@ -898,12 +909,20 @@ const RaftTableApplyStateMachine = struct {
             // lifecycle mutation is already durable, leaving Raft replaying a
             // partially applied command.
             if (!batchRequiresDocumentDbApply(decoded.batch.req)) continue;
-            _ = try self.write_source.applyReplicatedBatchGroupLocal(
+            _ = self.write_source.applyPreparedReplicatedBatchGroupLocal(
                 self.alloc,
                 group_id,
                 decoded.table_name,
                 decoded.batch.req,
-            );
+            ) catch |err| {
+                std.log.err("data raft document apply failed group_id={} index={} table={s} err={}", .{
+                    group_id,
+                    entry.index,
+                    decoded.table_name,
+                    err,
+                });
+                return err;
+            };
         }
         if (last_index > 0) try self.setAppliedIndex(group_id, last_index);
     }
@@ -3141,6 +3160,7 @@ pub const DataServer = struct {
     provisioned_index_repair_shutdown: std.atomic.Value(bool) = .init(false),
     provisioned_index_repair_active: std.atomic.Value(bool) = .init(false),
     provisioned_index_repair_dirty: std.atomic.Value(bool) = .init(false),
+    provisioned_index_repair_immediate_wake_count: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_last_run_at_ms: std.atomic.Value(u64) = .init(0),
     provisioned_index_repair_discovery_interval_ms: u64 = default_provisioned_index_repair_discovery_interval_ms,
     provisioned_index_repair_max_activation_gap_sequences: u64 = 200,
@@ -4186,6 +4206,25 @@ pub const DataServer = struct {
     }
 
     pub fn runRound(self: *DataServer) !void {
+        try self.runRaftRoundOnly();
+        try self.runControlRoundOnly();
+    }
+
+    /// Advances only the latency-sensitive data Raft runtime. Production
+    /// runtimes drive this from a dedicated ticker so metadata and storage I/O
+    /// in the control round cannot starve elections, heartbeats, or apply.
+    pub fn runRaftRoundOnly(self: *DataServer) !void {
+        if (self.data_raft) |raft| {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            try raft.runRound();
+        }
+    }
+
+    /// Runs data-node control and maintenance work without advancing Raft.
+    /// Callers must concurrently drive `runRaftRoundOnly` at the configured
+    /// tick cadence.
+    pub fn runControlRoundOnly(self: *DataServer) !void {
         const ha_standby_replication_ok = blk: {
             self.runHAStandbyReplicationRound() catch |err| {
                 _ = self.ha_standby_replication_failure_count.fetchAdd(1, .monotonic);
@@ -4197,11 +4236,6 @@ pub const DataServer = struct {
             break :blk true;
         };
         if (ha_standby_replication_ok) self.clearHAStandbyReplicationError();
-        if (self.data_raft) |raft| {
-            lockAtomic(&self.data_raft_mutex);
-            defer self.data_raft_mutex.unlock();
-            try raft.runRound();
-        }
         self.requestAutoBulkFinishBackground() catch |err| {
             std.log.warn("auto bulk ingest finish start deferred err={}", .{err});
         };
@@ -5065,13 +5099,25 @@ pub const DataServer = struct {
     ) !void {
         const apply_sm = self.data_raft_apply orelse return error.UnsupportedOperation;
         while (apply_sm.appliedIndex(group_id) < target_index) {
-            if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
-            // The runtime loop is the sole owner of transport-driving Raft
-            // rounds. Running a round here can block on peer I/O while holding
-            // data_raft_mutex, preventing that loop from committing the entry
-            // this request is waiting for and defeating this deadline.
+            if (platform_time.monotonicNs() >= deadline_ns) {
+                self.logRaftBatchApplyTimeout(group_id, target_index, apply_sm.appliedIndex(group_id));
+                return error.LeaderUnavailable;
+            }
+            // The dedicated ticker owns transport-driving Raft rounds. Running
+            // one here can block on peer I/O while holding data_raft_mutex,
+            // preventing the ticker from committing the entry this request is
+            // waiting for and defeating this deadline.
             sleepDataRaftBatchLeaderRetry();
         }
+    }
+
+    fn logRaftBatchApplyTimeout(self: *DataServer, group_id: u64, target_index: u64, applied_index: u64) void {
+        std.log.warn("data raft apply wait timed out group_id={} target={} applied={}", .{
+            group_id,
+            target_index,
+            applied_index,
+        });
+        self.logRaftBatchLeaderTimeout(group_id);
     }
 
     fn localDataRaftLeaderReady(self: *DataServer, group_id: u64) bool {
@@ -7340,6 +7386,7 @@ pub const DataServer = struct {
             remote_metadata,
             registration.store_id,
             registration.node_id,
+            local_group_ids,
             runtime_statuses,
             snapshot.tables,
             snapshot.ranges,
@@ -7412,6 +7459,11 @@ pub const DataServer = struct {
             local_intent.learner_node_ids = owned_learners;
             try local_intents.append(self.alloc, local_intent);
         }
+        // A split destination is placed before cutover publishes its range.
+        // Persist its table generation before the Raft host can admit messages
+        // for that group: state-machine apply is deliberately unable to create
+        // storage or consult metadata after an entry has committed.
+        try self.provisionSplitDestinationsBeforeRaftAdmission(snapshot, local_intents.items);
         const placement_fingerprint = dataRaftPlacementIntentsFingerprint(local_intents.items);
         const placement_changed = self.last_data_raft_placement_fingerprint == null or self.last_data_raft_placement_fingerprint.? != placement_fingerprint;
         if (placement_changed) {
@@ -7495,6 +7547,59 @@ pub const DataServer = struct {
         }
 
         self.observeDataRaftStatusFingerprint(dataRaftLocalStatusFingerprint(raft, local_intents.items));
+    }
+
+    fn provisionSplitDestinationsBeforeRaftAdmission(
+        self: *DataServer,
+        snapshot: *const antfly.metadata_api.AdminSnapshot,
+        local_intents: []const antfly.raft.PlacementIntent,
+    ) !void {
+        var has_unpublished_group = false;
+        for (local_intents) |intent| {
+            if (findRangeByGroupId(snapshot.ranges, intent.record.group_id) == null) {
+                has_unpublished_group = true;
+                break;
+            }
+        }
+        if (!has_unpublished_group) return;
+
+        const provisioning_ranges = try collectProvisioningRanges(
+            self.alloc,
+            snapshot.ranges,
+            snapshot.split_transitions,
+        );
+        defer self.alloc.free(provisioning_ranges);
+        const write_source = self.liveRuntimeWriteSource();
+        const backend_runtime = try self.ensureBackendRuntime();
+        var reconciled = false;
+
+        for (local_intents) |intent| {
+            const group_id = intent.record.group_id;
+            if (findRangeByGroupId(snapshot.ranges, group_id) != null) continue;
+            const range = findRangeByGroupId(provisioning_ranges, group_id) orelse
+                return error.MissingProvisioningRange;
+            const table = findTableById(snapshot.tables, range.table_id) orelse
+                return error.MissingProvisioningTable;
+            var activity = write_source.tryBeginGroupRefreshActivity(table.name, group_id) orelse
+                return error.TransitionDestinationProvisioningBusy;
+            defer activity.deinit();
+
+            var group_ids = [_]u64{group_id};
+            lockAtomic(write_source.localDbMutex());
+            const result = write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                self.alloc,
+                snapshot.status.metadata_group_id,
+                group_ids[0..],
+                snapshot.tables,
+                provisioning_ranges,
+                backend_runtime,
+            );
+            write_source.localDbMutex().unlock();
+            _ = try result;
+            reconciled = true;
+        }
+
+        if (reconciled) self.provisioned_storage.invalidateInPlaceMetadataReconcileCaches();
     }
 
     fn invalidateRuntimeStatusForLocalPlacements(
@@ -7909,6 +8014,7 @@ pub const DataServer = struct {
         table_name: ?[]const u8,
         group_id: u64,
         next_retry_at_realtime_ms: u64,
+        wake: IndexRepairQueueWake,
     ) !void {
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         const next_retry_at_ms = indexRepairMonotonicDeadlineMs(
@@ -7926,6 +8032,10 @@ pub const DataServer = struct {
             if (entry.table_name != null or table_name == null) {
                 entry.transient_failure_count = 0;
                 entry.next_retry_at_ms = next_retry_at_ms;
+                if (wake == .immediate and !entry.immediate_wake_pending) {
+                    entry.immediate_wake_pending = true;
+                    _ = self.provisioned_index_repair_immediate_wake_count.fetchAdd(1, .release);
+                }
                 self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
                 self.provisioned_index_repair_dirty.store(true, .release);
                 self.provisioned_index_repair_queue_mutex.unlock();
@@ -7967,6 +8077,10 @@ pub const DataServer = struct {
         }
         gop.value_ptr.transient_failure_count = 0;
         gop.value_ptr.next_retry_at_ms = next_retry_at_ms;
+        if (wake == .immediate and !gop.value_ptr.immediate_wake_pending) {
+            gop.value_ptr.immediate_wake_pending = true;
+            _ = self.provisioned_index_repair_immediate_wake_count.fetchAdd(1, .release);
+        }
         self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
         self.provisioned_index_repair_dirty.store(true, .release);
     }
@@ -8044,15 +8158,15 @@ pub const DataServer = struct {
     }
 
     fn enqueueProvisionedIndexRepair(self: *DataServer, group_id: u64) !void {
-        try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, 0);
+        try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, 0, .immediate);
     }
 
     fn enqueueProvisionedIndexRepairForTable(self: *DataServer, table_name: []const u8, group_id: u64) !void {
-        try self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, 0);
+        try self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, 0, .immediate);
     }
 
     fn enqueueProvisionedIndexRepairWithRetry(self: *DataServer, group_id: u64, next_retry_at_ms: u64) !void {
-        try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, next_retry_at_ms);
+        try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, next_retry_at_ms, .retained);
     }
 
     fn removeProvisionedIndexRepair(self: *DataServer, group_id: u64) void {
@@ -8073,6 +8187,9 @@ pub const DataServer = struct {
         if (self.provisioned_index_repair_queue_cursor == group_id) {
             self.provisioned_index_repair_queue_cursor = removed.next_group_id orelse self.provisioned_index_repair_queue_head;
         }
+        if (removed.immediate_wake_pending) {
+            _ = self.provisioned_index_repair_immediate_wake_count.fetchSub(1, .release);
+        }
         _ = self.provisioned_index_repair_group_ages.remove(group_id);
         if (self.provisioned_index_repair_group_ages.count() == 0) {
             self.provisioned_index_repair_queue_head = null;
@@ -8081,6 +8198,15 @@ pub const DataServer = struct {
         }
         if (removed.table_name) |table_name| self.alloc.free(table_name);
         self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
+    }
+
+    fn consumeProvisionedIndexRepairImmediateWake(self: *DataServer, group_id: u64) void {
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        defer self.provisioned_index_repair_queue_mutex.unlock();
+        const entry = self.provisioned_index_repair_group_ages.getPtr(group_id) orelse return;
+        if (!entry.immediate_wake_pending) return;
+        entry.immediate_wake_pending = false;
+        _ = self.provisioned_index_repair_immediate_wake_count.fetchSub(1, .release);
     }
 
     fn requestProvisionedIndexRepairCancellation(self: *DataServer, group_id: u64) !void {
@@ -8515,6 +8641,7 @@ pub const DataServer = struct {
             group_id: u64,
             next_retry_at_ms: u64,
             table_name: ?[]u8,
+            immediate_wake_pending: bool,
         };
         var queued_repairs = std.ArrayListUnmanaged(QueuedRepair).empty;
         defer {
@@ -8549,6 +8676,7 @@ pub const DataServer = struct {
                 .group_id = group_id,
                 .next_retry_at_ms = entry.next_retry_at_ms,
                 .table_name = queued_table_name,
+                .immediate_wake_pending = entry.immediate_wake_pending,
             }) catch |err| {
                 if (queued_table_name) |table_name| self.alloc.free(table_name);
                 self.provisioned_index_repair_queue_mutex.unlock();
@@ -8576,6 +8704,7 @@ pub const DataServer = struct {
                 // local Raft view converge. Keep durable debt queued while the
                 // independent fallback cursor continues discovering other debt.
                 .retain => {
+                    if (queued.immediate_wake_pending) self.consumeProvisionedIndexRepairImmediateWake(group_id);
                     found_pending = true;
                     continue;
                 },
@@ -8610,6 +8739,7 @@ pub const DataServer = struct {
                 std.log.warn("provisioned index repair candidate allocation failed err={s}", .{@errorName(err)});
                 return;
             };
+            if (queued.immediate_wake_pending) self.consumeProvisionedIndexRepairImmediateWake(group_id);
             // One runnable queued group is sufficient: the executor admits at
             // most one repair, and the linked cursor provides round-robin
             // fairness across subsequent passes.
@@ -8724,6 +8854,12 @@ pub const DataServer = struct {
             };
             ownership_fence.owner_epoch = ownership_fence.currentOwnerEpoch();
             groups_inspected +|= 1;
+            const attempt_started_ns = platform_time.monotonicNs();
+            std.log.info("provisioned index repair begin group={} table={s} queued={}", .{
+                group_id,
+                table_name,
+                candidate.queued,
+            });
             const result = self.liveRuntimeWriteSource().catchUpTableGroupBestEffortWithMetadata(self.alloc, group_id, table_name, .{
                 .advance_index_repairs = true,
                 .index_repair_options = .{
@@ -8761,17 +8897,30 @@ pub const DataServer = struct {
                     return;
                 };
                 std.log.warn(
-                    "provisioned index repair group pass failed group={} table={s} retry_at_monotonic_ms={} err={s}",
-                    .{ group_id, table_name, retry_at_ms, @errorName(err) },
+                    "provisioned index repair group pass failed group={} table={s} duration_ms={} retry_at_monotonic_ms={} err={s}",
+                    .{ group_id, table_name, (platform_time.monotonicNs() -| attempt_started_ns) / std.time.ns_per_ms, retry_at_ms, @errorName(err) },
                 );
                 continue;
             };
+            std.log.info(
+                "provisioned index repair complete group={} table={s} duration_ms={} attempted={} repaired={} pending={} busy={} disk_wait={}",
+                .{
+                    group_id,
+                    table_name,
+                    (platform_time.monotonicNs() -| attempt_started_ns) / std.time.ns_per_ms,
+                    result.index_repair_attempted,
+                    result.index_repair_repaired,
+                    result.index_repair_pending,
+                    result.busy,
+                    result.index_repair_disk_wait,
+                },
+            );
             found_pending = found_pending or result.index_repair_pending;
             if (result.index_repair_disk_wait) {
                 _ = self.provisioned_index_repair_disk_waits.fetchAdd(1, .monotonic);
             }
             if (result.index_repair_pending) {
-                self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, result.index_repair_retry_at_ms) catch |err| {
+                self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, result.index_repair_retry_at_ms, .retained) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                     self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
                     if (!candidate.queued) {
@@ -9118,7 +9267,8 @@ pub const DataServer = struct {
         const not_before_ms = self.provisioned_index_repair_not_before_ms.load(.monotonic);
         if (dirty and not_before_ms != 0 and now_ms < not_before_ms) return;
         const last_run_at_ms = self.provisioned_index_repair_last_run_at_ms.load(.monotonic);
-        if (!indexRepairScanDue(dirty, last_run_at_ms, now_ms, self.provisioned_index_repair_discovery_interval_ms)) return;
+        const immediate_wake = self.provisioned_index_repair_immediate_wake_count.load(.acquire) != 0;
+        if (!indexRepairScanDue(immediate_wake, dirty, last_run_at_ms, now_ms, self.provisioned_index_repair_discovery_interval_ms)) return;
         try self.requestProvisionedIndexRepair();
     }
 
@@ -9923,9 +10073,16 @@ pub const DataServer = struct {
         var snapshot = try remote_metadata.fetchSnapshotForHead(head);
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
 
+        const provisioning_ranges = try collectProvisioningRanges(
+            self.alloc,
+            snapshot.ranges,
+            snapshot.split_transitions,
+        );
+        defer self.alloc.free(provisioning_ranges);
+
         var local_group_ids = try collectLocalGroupIds(self.alloc, snapshot.placement_intents, registration.node_id);
         if (local_group_ids.len == 0 and hasSingleRoleStore(snapshot.stores, registration.role, registration.store_id)) {
-            const fallback_group_ids = try collectAllRangeGroupIds(self.alloc, snapshot.ranges);
+            const fallback_group_ids = try collectAllRangeGroupIds(self.alloc, provisioning_ranges);
             self.alloc.free(local_group_ids);
             local_group_ids = fallback_group_ids;
         }
@@ -9970,7 +10127,7 @@ pub const DataServer = struct {
                     head.metadata_group_id,
                     local_group_ids,
                     snapshot.tables,
-                    snapshot.ranges,
+                    provisioning_ranges,
                 );
             };
             if (self.last_provision_fingerprint == next_fingerprint) {
@@ -9981,7 +10138,7 @@ pub const DataServer = struct {
             const backend_runtime = try self.ensureBackendRuntime();
             for (local_group_ids) |group_id| {
                 if (group_id == head.metadata_group_id) continue;
-                const range = findRangeByGroupId(snapshot.ranges, group_id) orelse continue;
+                const range = findRangeByGroupId(provisioning_ranges, group_id) orelse continue;
                 const table = findTableById(snapshot.tables, range.table_id) orelse continue;
 
                 {
@@ -10002,7 +10159,7 @@ pub const DataServer = struct {
                             head.metadata_group_id,
                             group_ids_one[0..],
                             snapshot.tables,
-                            snapshot.ranges,
+                            provisioning_ranges,
                             backend_runtime,
                         );
                         indexes_pending += summary.indexes_pending;
@@ -10080,6 +10237,7 @@ pub const DataServer = struct {
         remote_metadata: *RemoteMetadataSource,
         store_id: u64,
         local_node_id: u64,
+        local_group_ids: []const u64,
         runtime_statuses: []antfly.metadata.table_manager.RuntimeGroupStatusReport,
         tables: []const antfly.metadata.table_manager.TableRecord,
         ranges: []const antfly.metadata.table_manager.RangeRecord,
@@ -10092,6 +10250,7 @@ pub const DataServer = struct {
         const local_progress = try antfly.metadata.table_provisioner.collectLocalSchemaProgressFromRuntime(
             self.alloc,
             local_node_id,
+            local_group_ids,
             tables,
             ranges,
             stores[0..],
@@ -10101,6 +10260,59 @@ pub const DataServer = struct {
         for (local_progress) |record| {
             try remote_metadata.upsertSchemaProgress(record);
         }
+    }
+
+    pub const LocalSchemaProgressSnapshot = struct {
+        records: []antfly.metadata.SchemaProgressRecord,
+        runtime_coverage_complete: bool,
+
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.records);
+            self.* = undefined;
+        }
+    };
+
+    /// Returns schema-cutover evidence from the generation owner without
+    /// opening a second DB over its live filesystem root.
+    pub fn collectLocalSchemaProgressSnapshot(
+        self: *DataServer,
+        alloc: std.mem.Allocator,
+        tables: []const antfly.metadata.TableRecord,
+        ranges: []const antfly.metadata.RangeRecord,
+    ) !LocalSchemaProgressSnapshot {
+        const registration = self.store_registration orelse return error.StoreRegistrationRequired;
+        const group_ids = try collectAllRangeGroupIds(alloc, ranges);
+        defer alloc.free(group_ids);
+        const runtime_statuses = try self.collectStoreRuntimeStatusReports(
+            alloc,
+            group_ids,
+            tables,
+            ranges,
+            registration,
+        );
+        defer antfly.metadata.table_manager.freeRuntimeGroupStatusReports(alloc, runtime_statuses);
+        const stores = [_]antfly.metadata.StoreRecord{.{
+            .store_id = registration.store_id,
+            .node_id = registration.node_id,
+            .runtime_statuses = runtime_statuses,
+        }};
+        return .{
+            .records = try antfly.metadata.table_provisioner.collectLocalSchemaProgressFromRuntime(
+                alloc,
+                registration.node_id,
+                group_ids,
+                tables,
+                ranges,
+                &stores,
+            ),
+            .runtime_coverage_complete = antfly.metadata.table_provisioner.localSchemaRuntimeCoverageComplete(
+                registration.node_id,
+                group_ids,
+                tables,
+                ranges,
+                &stores,
+            ),
+        };
     }
 
     pub fn initFromMetadataApiUrl(
@@ -11612,6 +11824,109 @@ fn collectAllRangeGroupIds(
     return try out.toOwnedSlice(alloc);
 }
 
+/// Builds the storage-provisioning view of topology. Split destinations are
+/// placed before cutover publishes their range, but their Raft state machine
+/// must never create a table DB implicitly while applying committed entries.
+/// The returned records borrow byte slices from the metadata snapshot.
+fn collectProvisioningRanges(
+    alloc: std.mem.Allocator,
+    published_ranges: []const antfly.metadata.table_manager.RangeRecord,
+    split_transitions: []const antfly.metadata.SplitTransitionRecord,
+) ![]antfly.metadata.table_manager.RangeRecord {
+    var out = try std.ArrayListUnmanaged(antfly.metadata.table_manager.RangeRecord).initCapacity(
+        alloc,
+        published_ranges.len,
+    );
+    errdefer out.deinit(alloc);
+    out.appendSliceAssumeCapacity(published_ranges);
+
+    for (split_transitions) |transition| {
+        switch (transition.phase) {
+            .finalized, .rolled_back => continue,
+            else => {},
+        }
+        if (findRangeByGroupId(out.items, transition.destination_group_id) != null) continue;
+        const split_key = transition.split_key orelse continue;
+        const source = findRangeByGroupId(published_ranges, transition.source_group_id) orelse continue;
+        try out.append(alloc, .{
+            .group_id = transition.destination_group_id,
+            .range_id = transition.destination_group_id,
+            .table_id = source.table_id,
+            .start_key = split_key,
+            .end_key = transition.source_range_end,
+            .doc_identity_shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(source),
+            .doc_identity_range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(source),
+        });
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+test "storage provisioning includes active unpublished split destinations" {
+    const ranges = [_]antfly.metadata.RangeRecord{
+        .{
+            .group_id = 10,
+            .range_id = 101,
+            .table_id = 7,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+            .doc_identity_shard_id = 501,
+            .doc_identity_range_id = 601,
+        },
+        .{
+            .group_id = 30,
+            .range_id = 30,
+            .table_id = 7,
+            .start_key = "doc:t",
+            .end_key = "doc:z",
+            .doc_identity_shard_id = 501,
+            .doc_identity_range_id = 601,
+        },
+    };
+    const transitions = [_]antfly.metadata.SplitTransitionRecord{
+        .{
+            .transition_id = 1001,
+            .attempt_epoch = 1,
+            .source_group_id = 10,
+            .destination_group_id = 20,
+            .phase = .bootstrap_peer,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
+        },
+        .{
+            .transition_id = 1002,
+            .attempt_epoch = 1,
+            .source_group_id = 10,
+            .destination_group_id = 30,
+            .phase = .replay_deltas,
+            .split_key = "doc:t",
+            .source_range_end = "doc:z",
+        },
+        .{
+            .transition_id = 1003,
+            .attempt_epoch = 1,
+            .source_group_id = 10,
+            .destination_group_id = 40,
+            .phase = .rolled_back,
+            .split_key = "doc:w",
+            .source_range_end = "doc:z",
+        },
+    };
+
+    const provisioning = try collectProvisioningRanges(std.testing.allocator, &ranges, &transitions);
+    defer std.testing.allocator.free(provisioning);
+
+    try std.testing.expectEqual(@as(usize, 3), provisioning.len);
+    const destination = findRangeByGroupId(provisioning, 20).?;
+    try std.testing.expectEqual(@as(u64, 20), destination.range_id);
+    try std.testing.expectEqual(@as(u64, 7), destination.table_id);
+    try std.testing.expectEqualStrings("doc:m", destination.start_key);
+    try std.testing.expectEqualStrings("doc:z", destination.end_key.?);
+    try std.testing.expectEqual(@as(u64, 501), destination.doc_identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 601), destination.doc_identity_range_id);
+    try std.testing.expect(findRangeByGroupId(provisioning, 40) == null);
+}
+
 fn hasSingleRoleStore(
     stores: []const antfly.metadata.table_manager.StoreRecord,
     role: []const u8,
@@ -12734,6 +13049,48 @@ fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
 
+const DataRaftTicker = struct {
+    server: *DataServer,
+    io: std.Io,
+    interval_ns: u64,
+    stop_requested: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        while (!self.stop_requested.load(.acquire)) {
+            const started_ns = platform_time.monotonicNs();
+            self.server.runRaftRoundOnly() catch |err| {
+                self.failure = err;
+                self.failed.store(true, .release);
+                return;
+            };
+            const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+            if (elapsed_ns < self.interval_ns) {
+                self.io.sleep(
+                    std.Io.Duration.fromNanoseconds(self.interval_ns - elapsed_ns),
+                    .awake,
+                ) catch |err| {
+                    if (self.stop_requested.load(.acquire)) return;
+                    self.failure = err;
+                    self.failed.store(true, .release);
+                    return;
+                };
+            }
+        }
+    }
+
+    fn check(self: *const @This()) !void {
+        if (!self.failed.load(.acquire)) return;
+        return self.failure orelse error.DataRaftTickerFailed;
+    }
+
+    fn stop(self: *@This(), thread: *std.Thread) void {
+        self.stop_requested.store(true, .release);
+        thread.join();
+    }
+};
+
 pub fn run(init: std.process.Init) !void {
     const alloc = init.gpa;
 
@@ -12900,8 +13257,19 @@ pub fn runFromIterator(
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
+    var raft_ticker = DataRaftTicker{
+        .server = &data_server,
+        .io = init.io,
+        .interval_ns = tick_ms * std.time.ns_per_ms,
+    };
+    var raft_ticker_thread: ?std.Thread = if (data_server.data_raft != null)
+        try std.Thread.spawn(.{}, DataRaftTicker.run, .{&raft_ticker})
+    else
+        null;
+    defer if (raft_ticker_thread) |*thread| raft_ticker.stop(thread);
     while (true) {
-        data_server.runRound() catch |err| {
+        if (raft_ticker_thread != null) try raft_ticker.check();
+        data_server.runControlRoundOnly() catch |err| {
             // Report the fatal round error before deferred listener shutdown.
             // A shutdown failure must not hide the storage/Raft error that
             // caused this process to leave its serving loop.
@@ -13579,6 +13947,75 @@ test "data server registered data raft uses wal state backend by default" {
     const data_raft = server.data_raft orelse return error.MissingDataRaft;
     try std.testing.expect(data_raft.host.owned_wal_replica_provider != null);
     try std.testing.expect(data_raft.host.owned_file_replica_provider == null);
+}
+
+test "data raft ticker advances consensus independently of control rounds" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-independent-raft-ticker", .{tmp.sub_path});
+    defer alloc.free(replica_root);
+
+    var server = try DataServer.initFromMetadataApiUrl(alloc, .{
+        .replica_root_dir = replica_root,
+        .store_registration = .{
+            .node_id = 1,
+            .store_id = 1,
+            .api_url = "http://127.0.0.1:1",
+        },
+    }, "http://127.0.0.1:2");
+    defer server.deinit();
+
+    const snapshot = antfly.metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 9, .metrics = .{} },
+        .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+            .group_id = 77,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }})[0..]),
+        .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{.{
+            .store_id = 1,
+            .node_id = 1,
+            .role = "data",
+            .live = true,
+            .health_class = "healthy",
+            .api_url = "http://127.0.0.1:1",
+            .raft_url = "http://127.0.0.1:2",
+        }})[0..]),
+        .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{.{
+            .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 },
+            .store_id = 1,
+            .peer_node_ids = &.{1},
+        }})[0..]),
+        .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+    };
+    try server.syncDataRaftFromSnapshot(&snapshot);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var ticker = DataRaftTicker{
+        .server = &server,
+        .io = io_impl.io(),
+        .interval_ns = std.time.ns_per_ms,
+    };
+    var ticker_thread = try std.Thread.spawn(.{}, DataRaftTicker.run, .{&ticker});
+    defer ticker.stop(&ticker_thread);
+
+    const deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+    while (!server.localDataRaftLeaderReady(77)) {
+        try ticker.check();
+        if (platform_time.monotonicNs() >= deadline_ns) return error.TestExpectedEqual;
+        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+    }
 }
 
 test "data runtime cli accepts config path" {
@@ -18192,6 +18629,7 @@ test "data runtime repair debt hook targets the affected group queue" {
     try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqualStrings("docs", server.provisioned_index_repair_group_ages.get(7001).?.table_name.?);
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_queue_depth.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
 
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .cancel);
     try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
@@ -18201,6 +18639,7 @@ test "data runtime repair debt hook targets the affected group queue" {
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .remove);
     try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_queue_depth.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
 }
 
 test "data runtime translates durable repair retry deadlines to monotonic time" {
@@ -18272,7 +18711,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
 
     // Retaining an existing exact wake must not allocate, even when its durable
     // retry deadline changes after a cooperative repair slice.
-    try server.enqueueProvisionedIndexRepairWithRetryForTable("docs", 7001, 1234);
+    try server.enqueueProvisionedIndexRepairWithRetryForTable("docs", 7001, 1234, .retained);
     try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
 
     // A fallback-discovered group does require queue storage. Failure must be
@@ -18280,7 +18719,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     // mistaken for retained exact debt.
     try std.testing.expectError(
         error.OutOfMemory,
-        server.enqueueProvisionedIndexRepairWithRetryForTable("docs", 7002, 0),
+        server.enqueueProvisionedIndexRepairWithRetryForTable("docs", 7002, 0, .retained),
     );
     try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7002));
 
@@ -18306,17 +18745,21 @@ test "data runtime repair queue links and removes debt in constant time" {
     try std.testing.expectEqual(@as(?u64, 1), server.provisioned_index_repair_queue_head);
     try std.testing.expectEqual(@as(?u64, 41), server.provisioned_index_repair_queue_tail);
     try std.testing.expectEqual(@as(u64, 41), server.provisioned_index_repair_queue_depth.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 41), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
     // A queue larger than the bounded inspection window must remain immediately
     // schedulable because an uninspected entry may not be in backoff.
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_not_before_ms.load(.monotonic));
 
     server.provisioned_index_repair_queue_cursor = 20;
+    server.consumeProvisionedIndexRepairImmediateWake(20);
+    try std.testing.expectEqual(@as(u64, 40), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
     server.removeProvisionedIndexRepair(1);
     server.removeProvisionedIndexRepair(20);
     server.removeProvisionedIndexRepair(41);
     try std.testing.expectEqual(@as(?u64, 2), server.provisioned_index_repair_queue_head);
     try std.testing.expectEqual(@as(?u64, 40), server.provisioned_index_repair_queue_tail);
     try std.testing.expectEqual(@as(?u64, 21), server.provisioned_index_repair_queue_cursor);
+    try std.testing.expectEqual(@as(u64, 38), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
     try std.testing.expectEqual(@as(?u64, null), server.provisioned_index_repair_group_ages.get(2).?.previous_group_id);
     try std.testing.expectEqual(@as(?u64, null), server.provisioned_index_repair_group_ages.get(40).?.next_group_id);
 }
