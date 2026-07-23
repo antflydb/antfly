@@ -2940,15 +2940,28 @@ pub fn build(b: *std.Build) void {
 
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"file secret store"},
+        .filters = &.{ "file secret store", "remote content runtime" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
     const run_lib_common_secrets_tests = addFilteredTestRunArtifact(b, lib_common_secrets_tests);
-    const lib_common_secrets_test_step = b.step("lib-common-secrets-test", "Run common/secret store tests");
+    const lib_common_secrets_test_step = b.step("lib-common-secrets-test", "Run common secret and remote-content reload tests");
     lib_common_secrets_test_step.dependOn(&run_lib_common_secrets_tests.step);
+
+    const api_cluster_secret_status_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_cluster_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_cluster_secret_status_test_mod, true, true);
+    const api_cluster_secret_status_tests = b.addTest(.{
+        .root_module = api_cluster_secret_status_test_mod,
+        .filters = &.{"cluster status carries non-secret"},
+    });
+    const run_api_cluster_secret_status_tests = addFilteredTestRunArtifact(b, api_cluster_secret_status_tests);
+    lib_common_secrets_test_step.dependOn(&run_api_cluster_secret_status_tests.step);
 
     const lib_casbin_tests = b.addTest(.{
         .root_module = casbin_mod,

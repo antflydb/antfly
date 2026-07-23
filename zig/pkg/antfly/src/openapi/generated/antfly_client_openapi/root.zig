@@ -397,6 +397,7 @@ pub const RetryConfig = types.RetryConfig;
 pub const RoleAssignment = types.RoleAssignment;
 pub const RouteType = types.RouteType;
 pub const RowFilterEntry = types.RowFilterEntry;
+pub const RuntimeConfigStatus = types.RuntimeConfigStatus;
 pub const RuntimeDecl = types.RuntimeDecl;
 pub const SSEError = types.SSEError;
 pub const SSEEvent = types.SSEEvent;
