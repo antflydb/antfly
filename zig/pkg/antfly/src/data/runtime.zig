@@ -99,6 +99,27 @@ const TransitionActionLanes = struct {
         return .{ .mutex = mutex };
     }
 };
+
+/// Snapshot handoff currently materializes one shard generation in memory.
+/// Keep that working set single-flight per data process; independent leaders
+/// on other nodes still transfer concurrently.
+const TransitionActionCapacity = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+
+    const Lease = struct {
+        mutex: *std.atomic.Mutex,
+
+        fn deinit(self: *Lease) void {
+            self.mutex.unlock();
+            self.* = undefined;
+        }
+    };
+
+    fn tryAcquire(self: *TransitionActionCapacity) ?Lease {
+        if (!self.mutex.tryLock()) return null;
+        return .{ .mutex = &self.mutex };
+    }
+};
 const runtime_status_refresh_max_db_opens_per_run: usize = 16;
 const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_s;
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
@@ -391,6 +412,48 @@ fn validateReplicatedSplitTransfer(
 ) !void {
     try antfly.data.storage.shard_state_store.validateSplitIdentity(state, transition_id, attempt_epoch, destination_group_id, null);
     if (state.phase != .splitting and state.phase != .finalizing) return error.SplitInProgress;
+}
+
+fn splitHandoffWorkingSetBytes(
+    handoff: antfly.data.storage.shard_state_store.SplitHandoff,
+) u64 {
+    var total: u64 = @sizeOf(@TypeOf(handoff));
+    total +|= saturatedArrayBytes(
+        antfly.data.storage.shard_state_store.AppliedDataKV,
+        handoff.entries.len,
+    );
+    total +|= saturatedLen(handoff.byte_range.start.len);
+    total +|= saturatedLen(handoff.byte_range.end.len);
+    total +|= saturatedLen(handoff.split_state.split_key.len);
+    total +|= saturatedLen(handoff.split_state.original_range_end.len);
+    for (handoff.entries) |entry| {
+        total +|= saturatedLen(entry.key.len);
+        total +|= saturatedLen(entry.value.len);
+    }
+    return total;
+}
+
+fn splitDeltasWorkingSetBytes(deltas: []const antfly.shard.SplitDelta) u64 {
+    var total = saturatedArrayBytes(antfly.shard.SplitDelta, deltas.len);
+    for (deltas) |delta| {
+        total +|= saturatedArrayBytes(@TypeOf(delta.writes[0]), delta.writes.len);
+        total +|= saturatedArrayBytes(@TypeOf(delta.deletes[0]), delta.deletes.len);
+        for (delta.writes) |write| {
+            total +|= saturatedLen(write.key.len);
+            total +|= saturatedLen(write.value.len);
+        }
+        for (delta.deletes) |key| total +|= saturatedLen(key.len);
+    }
+    return total;
+}
+
+fn saturatedArrayBytes(comptime T: type, len: usize) u64 {
+    const count = saturatedLen(len);
+    return std.math.mul(u64, count, @sizeOf(T)) catch std.math.maxInt(u64);
+}
+
+fn saturatedLen(len: usize) u64 {
+    return std.math.cast(u64, len) orelse std.math.maxInt(u64);
 }
 
 fn validateReplicatedSplitObservation(
@@ -1771,6 +1834,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.lite_docstore_snapshot_cache,
         resource_manager_mod.Slice.inference_prompt_cache,
         resource_manager_mod.Slice.dense_repair_working_set,
+        resource_manager_mod.Slice.shard_transition_working_set,
     }) |slice| {
         const stats = snapshot.slices[@intFromEnum(slice)];
         try health_metrics.appendPromSampleLabeled(writer, name, &.{
@@ -2692,6 +2756,35 @@ test "replicated transition action lanes fail fast without serializing unrelated
     defer reacquired.deinit();
 }
 
+test "replicated transition snapshot working set is single flight" {
+    var capacity = TransitionActionCapacity{};
+    var first = capacity.tryAcquire() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(capacity.tryAcquire() == null);
+    first.deinit();
+    var reacquired = capacity.tryAcquire() orelse return error.TestUnexpectedResult;
+    defer reacquired.deinit();
+}
+
+test "split handoff working set accounts payload bytes" {
+    var entries = [_]antfly.data.storage.shard_state_store.AppliedDataKV{
+        .{ .key = "key", .value = "value" },
+    };
+    const handoff = antfly.data.storage.shard_state_store.SplitHandoff{
+        .byte_range = .{ .start = "m", .end = "z" },
+        .split_state = .{
+            .phase = .splitting,
+            .transition_id = 1,
+            .attempt_epoch = 2,
+            .split_key = "m",
+            .new_shard_id = 3,
+            .original_range_end = "z",
+        },
+        .base_delta_sequence = 4,
+        .entries = &entries,
+    };
+    try std.testing.expect(splitHandoffWorkingSetBytes(handoff) >= "key".len + "value".len);
+}
+
 test "data runtime metadata bootstrap retry delay is bounded and jittered" {
     const registration = StoreRegistrationConfig{
         .node_id = 7,
@@ -3152,6 +3245,7 @@ pub const DataServer = struct {
     data_raft_reconcile_mutex: std.atomic.Mutex = .unlocked,
     local_transition_mutex: std.atomic.Mutex = .unlocked,
     replicated_transition_action_lanes: TransitionActionLanes = .{},
+    replicated_transition_action_capacity: TransitionActionCapacity = .{},
     replicated_transition_action_owner_mutex: std.atomic.Mutex = .unlocked,
     replicated_transition_action_owner_id: u64 = 0,
     replicated_transition_action_shutdown: std.atomic.Value(bool) = .init(false),
@@ -5392,12 +5486,13 @@ pub const DataServer = struct {
                         });
                     };
                 }
-                self.refreshVisibleProvisionedReplicaState() catch |err| {
-                    std.log.warn("failed to refresh provisioned replica state after structural change table={s} err={}", .{
-                        table_name,
-                        err,
-                    });
-                };
+                // Schema, index, and artifact catalog changes reconcile inside
+                // the currently published physical root. Restore advances its
+                // own per-group generation reservation before notifying here.
+                // Advancing every local group on this generic signal fences
+                // unrelated live writers and creates a transient read outage.
+                self.provisioned_storage.invalidateInPlaceMetadataReconcileCaches();
+                self.pruneStaleVisibleWriteCaches();
                 self.syncDataRaftFromRemoteMetadata() catch |err| {
                     std.log.warn("failed to sync data raft placement after structural change table={s} err={}", .{
                         table_name,
@@ -5906,6 +6001,7 @@ pub const DataServer = struct {
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
             try self.enqueueReplicatedSplitAction(.bootstrap, op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+            return;
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .bootstrap_split_destination = op });
         } else {
@@ -5923,6 +6019,7 @@ pub const DataServer = struct {
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
             try self.enqueueReplicatedSplitAction(.catch_up, op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+            return;
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .catch_up_split_destination = op });
         } else {
@@ -5942,6 +6039,8 @@ pub const DataServer = struct {
         server: *DataServer,
         lane: TransitionActionLanes.Lease,
         lane_held: bool = true,
+        capacity: TransitionActionCapacity.Lease,
+        capacity_held: bool = true,
         kind: Kind,
         transition_id: u64,
         attempt_epoch: u64,
@@ -5950,12 +6049,29 @@ pub const DataServer = struct {
 
         fn run(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            defer self.server.invalidateLocalGroupStatusCache();
             defer {
                 self.lane.deinit();
                 self.lane_held = false;
+                self.capacity.deinit();
+                self.capacity_held = false;
             }
-            try self.server.requireLocalDataRaftLeader(self.source_group_id);
-            switch (self.kind) {
+            self.runAction() catch |err| {
+                std.log.warn("replicated split action failed kind={s} transition_id={} attempt_epoch={} source_group_id={} destination_group_id={} err={s}", .{
+                    @tagName(self.kind),
+                    self.transition_id,
+                    self.attempt_epoch,
+                    self.source_group_id,
+                    self.destination_group_id,
+                    @errorName(err),
+                });
+                return err;
+            };
+        }
+
+        fn runAction(self: *@This()) !void {
+            try self.server.requireReplicatedTransitionActionActive(self.source_group_id);
+            return switch (self.kind) {
                 .bootstrap => try self.server.replicateSplitBootstrap(
                     self.transition_id,
                     self.attempt_epoch,
@@ -5968,13 +6084,13 @@ pub const DataServer = struct {
                     self.source_group_id,
                     self.destination_group_id,
                 ),
-            }
-            self.server.invalidateLocalGroupStatusCache();
+            };
         }
 
         fn deinit(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.lane_held) self.lane.deinit();
+            if (self.capacity_held) self.capacity.deinit();
             const alloc = self.alloc;
             alloc.destroy(self);
         }
@@ -5993,6 +6109,9 @@ pub const DataServer = struct {
         var lane = self.replicated_transition_action_lanes.tryAcquire(source_group_id) orelse
             return error.TransitionOperationBusy;
         errdefer lane.deinit();
+        var capacity = self.replicated_transition_action_capacity.tryAcquire() orelse
+            return error.TransitionOperationBusy;
+        errdefer capacity.deinit();
 
         const runtime = try self.ensureBackendRuntime();
         const owner_id = try self.replicatedTransitionActionOwnerId(runtime);
@@ -6003,6 +6122,7 @@ pub const DataServer = struct {
             .alloc = self.alloc,
             .server = self,
             .lane = lane,
+            .capacity = capacity,
             .kind = kind,
             .transition_id = transition_id,
             .attempt_epoch = attempt_epoch,
@@ -6016,6 +6136,12 @@ pub const DataServer = struct {
             .run = ReplicatedSplitActionJob.run,
             .deinit = ReplicatedSplitActionJob.deinit,
         });
+    }
+
+    fn requireReplicatedTransitionActionActive(self: *DataServer, source_group_id: u64) !void {
+        if (self.replicated_transition_action_shutdown.load(.acquire))
+            return error.BackgroundOwnerClosing;
+        try self.requireLocalDataRaftLeader(source_group_id);
     }
 
     fn replicatedTransitionActionOwnerId(
@@ -6050,6 +6176,7 @@ pub const DataServer = struct {
         source_group_id: u64,
         destination_group_id: u64,
     ) !void {
+        try self.requireReplicatedTransitionActionActive(source_group_id);
         const source_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, source_group_id);
         defer self.alloc.free(source_root_dir);
         try self.ensureSplitSourceApplyStoreSeeded(source_root_dir, source_group_id);
@@ -6062,6 +6189,13 @@ pub const DataServer = struct {
             source_group_id,
         );
         defer antfly.data.storage.shard_state_store.freeHandoff(self.alloc, handoff);
+        var handoff_reservation = try self.provisioned_storage.resource_manager.reserveBoundedOversizedSingle(
+            .shard_transition_working_set,
+            splitHandoffWorkingSetBytes(handoff),
+            4,
+        );
+        defer handoff_reservation.release();
+        try self.requireReplicatedTransitionActionActive(source_group_id);
         try validateReplicatedSplitTransfer(handoff.split_state, transition_id, attempt_epoch, destination_group_id);
         std.log.info("split bootstrap captured transition_id={} source_group_id={} destination_group_id={} entries={} watermark={}", .{
             transition_id,
@@ -6083,7 +6217,7 @@ pub const DataServer = struct {
         // Reserve the exact destination generation before streaming data. The
         // begin checkpoint is idempotent, and makes a later completion marker
         // impossible to apply without the corresponding bootstrap identity.
-        try self.requireLocalDataRaftLeader(source_group_id);
+        try self.requireReplicatedTransitionActionActive(source_group_id);
         try self.replicateSplitDestinationCheckpoint(
             destination_group_id,
             table_name,
@@ -6097,7 +6231,7 @@ pub const DataServer = struct {
         const max_writes_per_batch: usize = 128;
         var offset: usize = 0;
         while (offset < handoff.entries.len) {
-            try self.requireLocalDataRaftLeader(source_group_id);
+            try self.requireReplicatedTransitionActionActive(source_group_id);
             const end = @min(offset + max_writes_per_batch, handoff.entries.len);
             const writes = try self.alloc.alloc(antfly.db.types.BatchWrite, end - offset);
             defer self.alloc.free(writes);
@@ -6110,7 +6244,7 @@ pub const DataServer = struct {
             }, false);
             offset = end;
         }
-        try self.requireLocalDataRaftLeader(source_group_id);
+        try self.requireReplicatedTransitionActionActive(source_group_id);
         try self.replicateSplitDestinationCheckpoint(
             destination_group_id,
             table_name,
@@ -6120,7 +6254,7 @@ pub const DataServer = struct {
             .destination_complete,
             false,
         );
-        try self.requireLocalDataRaftLeader(source_group_id);
+        try self.requireReplicatedTransitionActionActive(source_group_id);
         try self.replicateSplitSourceAcknowledgement(
             source_group_id,
             destination_group_id,
@@ -6173,6 +6307,7 @@ pub const DataServer = struct {
         source_group_id: u64,
         destination_group_id: u64,
     ) !void {
+        try self.requireReplicatedTransitionActionActive(source_group_id);
         const source_store = self.localTransitionApplyStore() orelse return error.MissingSplitSourceStore;
         const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse return error.UnknownGroup;
         defer self.alloc.free(table_name);
@@ -6185,9 +6320,16 @@ pub const DataServer = struct {
         const after_seq = if (source_ack) |ack| ack else 0;
         const deltas = try source_store.listSplitDeltasAfter(self.alloc, source_group_id, after_seq);
         defer antfly.shard.freeDeltas(self.alloc, deltas);
+        var delta_reservation = try self.provisioned_storage.resource_manager.reserveBoundedOversizedSingle(
+            .shard_transition_working_set,
+            splitDeltasWorkingSetBytes(deltas),
+            4,
+        );
+        defer delta_reservation.release();
 
         var refresh_destination_route = true;
         for (deltas) |delta| {
+            try self.requireReplicatedTransitionActionActive(source_group_id);
             var writes = std.ArrayListUnmanaged(antfly.db.types.BatchWrite).empty;
             defer writes.deinit(self.alloc);
             var deletes = std.ArrayListUnmanaged([]const u8).empty;
@@ -6221,7 +6363,7 @@ pub const DataServer = struct {
             }, refresh_destination_route);
             refresh_destination_route = false;
         }
-        try self.requireLocalDataRaftLeader(source_group_id);
+        try self.requireReplicatedTransitionActionActive(source_group_id);
         try self.replicateSplitDestinationCheckpoint(
             destination_group_id,
             table_name,
@@ -6231,7 +6373,7 @@ pub const DataServer = struct {
             .destination_complete,
             refresh_destination_route,
         );
-        try self.requireLocalDataRaftLeader(source_group_id);
+        try self.requireReplicatedTransitionActionActive(source_group_id);
         try self.replicateSplitSourceAcknowledgement(
             source_group_id,
             destination_group_id,
@@ -19010,6 +19152,41 @@ test "data runtime structural changes preserve writer-published runtime status a
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.doc_count);
+}
+
+test "data runtime structural changes preserve physical root generations" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/replicas", .{tmp.sub_path});
+    defer alloc.free(replica_root);
+    const group_root = try std.fmt.allocPrint(alloc, "{s}/group-77", .{replica_root});
+    defer alloc.free(group_root);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, group_root);
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = undefined,
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.write_source.deinit();
+    defer server.provisioned_storage.deinit();
+
+    try server.provisioned_storage.bumpGroupVisibleRootGenerations(&.{77});
+    const generation_before = server.provisioned_storage.visibleRootGenerationForGroup(77);
+    DataServer.onLocalTableChanged(&server, "docs", .structural);
+    try std.testing.expectEqual(
+        generation_before,
+        server.provisioned_storage.visibleRootGenerationForGroup(77),
+    );
 }
 
 test "data runtime startup catch-up prefers cached admin snapshot" {

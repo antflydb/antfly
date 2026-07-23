@@ -2479,6 +2479,16 @@ pub const ProvisionedTableWriteCache = struct {
             }
             break :blk null;
         };
+        if (replace_index) |i| {
+            const current = self.table_metadata.items[i];
+            if (current.indexes_json != null and
+                current.schema_json != null and
+                std.mem.eql(u8, current.indexes_json.?, indexes_json) and
+                std.mem.eql(u8, current.schema_json.?, schema_json))
+            {
+                return;
+            }
+        }
         if (replace_index == null) try self.table_metadata.ensureUnusedCapacity(self.alloc, 1);
         var replacement = try self.cloneTableMetadataAlloc(table_name, indexes_json, schema_json);
         errdefer replacement.deinit(self.alloc);
@@ -2491,6 +2501,19 @@ pub const ProvisionedTableWriteCache = struct {
 
         if (self.table_metadata.items.len >= max_cached_write_tables) self.evictOldestTable();
         self.table_metadata.appendAssumeCapacity(replacement);
+    }
+
+    fn replaceEntrySchemaLocked(
+        self: *ProvisionedTableWriteCache,
+        entry: *Entry,
+        schema_json: []const u8,
+    ) !void {
+        if (entry.schema_json) |current| {
+            if (std.mem.eql(u8, current, schema_json)) return;
+        }
+        const replacement = try self.alloc.dupe(u8, schema_json);
+        if (entry.schema_json) |current| self.alloc.free(current);
+        entry.schema_json = replacement;
     }
 
     fn replaceTableMetadataAndRetireEntriesLocked(
@@ -8466,10 +8489,19 @@ pub const ProvisionedTableWriteSource = struct {
         return self.active_table_activities.items[index].structural_reconcile_active;
     }
 
-    fn readCompatibleGroupOperationActiveBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+    fn readCompatibleMaintenanceActiveBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
+        if (self.findTableActivityLocked(table_name, null)) |index| {
+            // Structural reconciliation invalidates the resident writer while
+            // retaining the published read generation. Its reservation stays
+            // continuous across cooperative group quanta and queue retries,
+            // so it is the authoritative fallback fence between those quanta.
+            // Restore/drop use structural_active instead and must never enter
+            // this read-compatible path.
+            if (self.active_table_activities.items[index].structuralReconcileReserved()) return true;
+        }
         const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
         const entry = self.active_table_activities.items[index];
         return entry.operation_active and entry.operation_allows_reads;
@@ -9063,7 +9095,7 @@ pub const ProvisionedTableWriteSource = struct {
         // generation-pinned readonly cache instead of racing to create another
         // writer-cache owner. Once the replacement is resident, subsequent
         // queries lease it normally while the unpublished target builds.
-        if (resident.cached == null and self.readCompatibleGroupOperationActiveBestEffort(table_name, group_id)) {
+        if (resident.cached == null and self.readCompatibleMaintenanceActiveBestEffort(table_name, group_id)) {
             self.endReadRequest(table_name);
             read_request_active = false;
             return null;
@@ -9076,6 +9108,15 @@ pub const ProvisionedTableWriteSource = struct {
             // second writer open and turning a healthy ownership handoff into
             // a transient 503. Resident hits above never pay this wait.
             resident = self.waitForResidentDbOpen(table_name, group_id, lsm_root_generation);
+        }
+
+        // Maintenance can begin while this request waits on another owner's
+        // cache-open barrier. Recheck under the activity lock before treating
+        // a stale resident generation as an outage.
+        if (resident.cached == null and self.readCompatibleMaintenanceActiveBestEffort(table_name, group_id)) {
+            self.endReadRequest(table_name);
+            read_request_active = false;
+            return null;
         }
 
         if (resident.cached == null and resident.mismatched_generation) return error.ReadUnavailable;
@@ -9888,21 +9929,17 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         target_index_name: ?[]const u8,
     ) !void {
+        _ = self;
         if (target_index_name) |index_name| {
             std.log.info("structural reconcile begin table={s} index={s}", .{ table_name, index_name });
         } else {
             std.log.info("structural reconcile begin table={s}", .{table_name});
         }
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateWriteCache(table_name);
-        self.invalidateReadCache(table_name);
-        // Keep the last published read-generation snapshot available while
-        // the replacement index builds. The migration state comes from the
-        // catalog; clearing this snapshot would force status requests to open
-        // the live writer and recreate the maintenance outage this background
-        // path is intended to avoid.
-        self.local_db_mutex.unlock();
-        self.drainWriteCachePendingCloses();
+        // The structural reservation has already drained foreground writes.
+        // Keep the current generation owner resident: reconciliation mutates
+        // only unpublished schema/index state and readers safely lease this DB
+        // until activation. Retiring it here creates a writerless handoff in
+        // which both repair and reads race to reopen the same physical root.
     }
 
     fn reconcileTableStructureStep(
@@ -10165,6 +10202,15 @@ pub const ProvisionedTableWriteSource = struct {
             defer if (cached_active) cached.deinit(alloc);
 
             if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+            if (metadata.indexes_json) |indexes_json| {
+                if (metadata.schema_json) |schema_json| {
+                    lockAtomic(&self.local_db_mutex);
+                    defer self.local_db_mutex.unlock();
+                    try cache.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
+                    try cache.replaceEntrySchemaLocked(cached.entry.?, schema_json);
+                    cached.schema_json = cached.entry.?.schema_json;
+                }
+            }
             if (metadata.indexes_json) |indexes_json| {
                 // Reconciliation owns the desired-state diff. Pre-deleting
                 // configured names would turn an unchanged generation into a
@@ -12231,18 +12277,17 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         db: *db_mod.DB,
     ) void {
-        if (self.runtime_status_cache != null) {
-            drainManagedDbBeforeClose(db) catch |err| {
-                if (!isTransientReplayVisibilityError(err)) {
-                    std.log.warn("transient managed writer drain before status publish failed table={s} group_id={} err={s}", .{
-                        table_name,
-                        group_id,
-                        @errorName(err),
-                    });
-                }
-            };
+        drainManagedDbBeforeClose(db) catch |err| {
+            if (!isTransientReplayVisibilityError(err)) {
+                std.log.warn("transient managed writer drain before close failed table={s} group_id={} err={s}", .{
+                    table_name,
+                    group_id,
+                    @errorName(err),
+                });
+            }
+        };
+        if (self.runtime_status_cache != null)
             _ = self.publishManagedRuntimeStatusBestEffort(table_name, group_id, db);
-        }
     }
 
     fn txnBeginGroupLocal(
@@ -24307,17 +24352,6 @@ test "provisioned table write source drains managed dense enrichment before clos
 
     const FakeCatalog = struct {
         var indexes_json_buf: []const u8 = "";
-        var tables = [_]metadata_table_manager.TableRecord{.{
-            .table_id = 7,
-            .name = "docs",
-            .placement_role = "data",
-        }};
-        var ranges = [_]metadata_table_manager.RangeRecord{.{
-            .group_id = 7001,
-            .table_id = 7,
-            .start_key = "",
-            .end_key = null,
-        }};
 
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -24330,11 +24364,26 @@ test "provisioned table write source drains managed dense enrichment before clos
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            tables[0].indexes_json = indexes_json_buf;
+            const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer std.testing.allocator.free(tables);
+            tables[0] = .{
+                .table_id = 7,
+                .name = "docs",
+                .placement_role = "data",
+                .indexes_json = indexes_json_buf,
+            };
+            const ranges = try std.testing.allocator.alloc(metadata_table_manager.RangeRecord, 1);
+            errdefer std.testing.allocator.free(ranges);
+            ranges[0] = .{
+                .group_id = 7001,
+                .table_id = 7,
+                .start_key = "",
+                .end_key = null,
+            };
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = tables[0..],
-                .ranges = ranges[0..],
+                .tables = tables,
+                .ranges = ranges,
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -24342,7 +24391,10 @@ test "provisioned table write source drains managed dense enrichment before clos
             };
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            std.testing.allocator.free(snapshot.tables);
+            std.testing.allocator.free(snapshot.ranges);
+        }
     };
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -24432,17 +24484,6 @@ test "provisioned table write cache eventually runs managed dense enrichment for
 
     const FakeCatalog = struct {
         var indexes_json_buf: []const u8 = "";
-        var tables = [_]metadata_table_manager.TableRecord{.{
-            .table_id = 7,
-            .name = "docs",
-            .placement_role = "data",
-        }};
-        var ranges = [_]metadata_table_manager.RangeRecord{.{
-            .group_id = 7001,
-            .table_id = 7,
-            .start_key = "",
-            .end_key = null,
-        }};
 
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -24455,11 +24496,26 @@ test "provisioned table write cache eventually runs managed dense enrichment for
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            tables[0].indexes_json = indexes_json_buf;
+            const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer std.testing.allocator.free(tables);
+            tables[0] = .{
+                .table_id = 7,
+                .name = "docs",
+                .placement_role = "data",
+                .indexes_json = indexes_json_buf,
+            };
+            const ranges = try std.testing.allocator.alloc(metadata_table_manager.RangeRecord, 1);
+            errdefer std.testing.allocator.free(ranges);
+            ranges[0] = .{
+                .group_id = 7001,
+                .table_id = 7,
+                .start_key = "",
+                .end_key = null,
+            };
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = tables[0..],
-                .ranges = ranges[0..],
+                .tables = tables,
+                .ranges = ranges,
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -24467,7 +24523,10 @@ test "provisioned table write cache eventually runs managed dense enrichment for
             };
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            std.testing.allocator.free(snapshot.tables);
+            std.testing.allocator.free(snapshot.ranges);
+        }
     };
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -24578,20 +24637,26 @@ test "provisioned managed replay tails converge and publish without later traffi
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer std.testing.allocator.free(tables);
+            tables[0] = .{
+                .table_id = 7,
+                .name = "docs",
+                .placement_role = "data",
+                .indexes_json = indexes_json_buf,
+            };
+            const ranges = try std.testing.allocator.alloc(metadata_table_manager.RangeRecord, 1);
+            errdefer std.testing.allocator.free(ranges);
+            ranges[0] = .{
+                .group_id = 7001,
+                .table_id = 7,
+                .start_key = "",
+                .end_key = null,
+            };
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .placement_role = "data",
-                    .indexes_json = indexes_json_buf,
-                }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                    .group_id = 7001,
-                    .table_id = 7,
-                    .start_key = "",
-                    .end_key = null,
-                }})[0..]),
+                .tables = tables,
+                .ranges = ranges,
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -24599,7 +24664,10 @@ test "provisioned managed replay tails converge and publish without later traffi
             };
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            std.testing.allocator.free(snapshot.tables);
+            std.testing.allocator.free(snapshot.ranges);
+        }
     };
 
     const Wait = struct {
@@ -35999,7 +36067,17 @@ test "resident DB lease adopts seeded write cache across visible generation bump
     });
     seeded.release(alloc);
 
+    try source.prepareTableStructuralReconcile("docs", null);
+    var retained = (try resident.leaseGroup(alloc, "docs", 7001, generation)).?;
+    retained.release(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+
     generation = 2;
+    try std.testing.expectError(error.ReadUnavailable, resident.leaseGroup(alloc, "docs", 7001, generation));
+
+    source.reserveStructuralReconcileActivity("docs");
+    try std.testing.expect((try resident.leaseGroup(alloc, "docs", 7001, generation)) == null);
+    source.cancelStructuralReconcileReservation("docs");
     try std.testing.expectError(error.ReadUnavailable, resident.leaseGroup(alloc, "docs", 7001, generation));
 
     write_cache.entries.items[0].allow_generation_adoption = true;

@@ -923,7 +923,7 @@ class MultiNodeScalingCluster:
                     parts.append(f"[{label} pid {proc.pid}] gdb failed: {exc!r}")
         return "\n".join(parts)
 
-    def stop(self, *, timeout_s: float = 10.0) -> None:
+    def stop(self, *, timeout_s: float = 10.0, test_failed: bool = False) -> None:
         procs = [proc for proc in [*self.data_procs, *self.metadata_procs] if proc.poll() is None]
         for proc in procs:
             proc.send_signal(signal.SIGTERM)
@@ -941,30 +941,32 @@ class MultiNodeScalingCluster:
         for handle in self.log_files:
             if not handle.closed:
                 handle.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
 @pytest.fixture
-def multi_node_scaling_cluster() -> MultiNodeScalingCluster:
+def multi_node_scaling_cluster(request: pytest.FixtureRequest) -> MultiNodeScalingCluster:
     cluster = MultiNodeScalingCluster(_scaling_antfly_binary())
     try:
         yield cluster
     finally:
-        cluster.stop()
+        report = getattr(request.node, "rep_call", None)
+        cluster.stop(test_failed=bool(report and report.failed))
 
 
 @pytest.fixture
-def compact_scaling_cluster() -> MultiNodeScalingCluster:
+def compact_scaling_cluster(request: pytest.FixtureRequest) -> MultiNodeScalingCluster:
     cluster = MultiNodeScalingCluster(_scaling_antfly_binary(), initial_data_node_count=3)
     try:
         yield cluster
     finally:
-        cluster.stop()
+        report = getattr(request.node, "rep_call", None)
+        cluster.stop(test_failed=bool(report and report.failed))
 
 
 @pytest.fixture
-def split_scaling_cluster() -> MultiNodeScalingCluster:
+def split_scaling_cluster(request: pytest.FixtureRequest) -> MultiNodeScalingCluster:
     cluster = MultiNodeScalingCluster(
         _scaling_antfly_binary(),
         initial_data_node_count=5,
@@ -973,7 +975,8 @@ def split_scaling_cluster() -> MultiNodeScalingCluster:
     try:
         yield cluster
     finally:
-        cluster.stop()
+        report = getattr(request.node, "rep_call", None)
+        cluster.stop(test_failed=bool(report and report.failed))
 
 
 def _scaling_antfly_binary() -> str:
@@ -1631,10 +1634,16 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
     phase_started = time.monotonic()
     split_groups = wait_until(split_completed, timeout_s=180.0, interval_s=0.5)
     timings.record("split_finalized", phase_started)
+    native_stacks = (
+        cluster.native_stack_dumps(per_process_timeout_s=5.0)
+        if split_groups is None and os.getenv("ANTFLY_E2E_NATIVE_STACKS") == "1"
+        else "<native stack collection disabled>"
+    )
     assert split_groups is not None, (
         "table did not finalize an automatic split after exceeding the configured shard size threshold\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
         f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
+        f"native stacks:\n{native_stacks}\n"
         f"{cluster.debug_logs()}"
     )
     phase_started = time.monotonic()

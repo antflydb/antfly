@@ -45,8 +45,22 @@ export ANTFLY_BIN="${ANTFLY_BIN:-./zig-out/bin/antfly}"
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/antfly-pycache}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/antfly-ci-uv-cache}"
 export ANTFLY_E2E_PHASE_TIMINGS="${ANTFLY_E2E_PHASE_TIMINGS:-1}"
+export ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE="${ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE:-1}"
+export ANTFLY_E2E_NATIVE_STACKS="${ANTFLY_E2E_NATIVE_STACKS:-1}"
+export ANTFLY_LSM_OPEN_DEBUG="${ANTFLY_LSM_OPEN_DEBUG:-1}"
+export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
 
+failures=0
 for ((iteration = 1; iteration <= repeats; iteration++)); do
-  printf '\nE2E regression iteration %d/%d\n' "$iteration" "$repeats"
-  uv run --project e2e/antfly pytest -q -s --durations=10 "${tests[@]}"
+  for test_name in "${tests[@]}"; do
+    printf '\nE2E regression iteration %d/%d test=%s\n' "$iteration" "$repeats" "$test_name"
+    if ! uv run --project e2e/antfly pytest -q -s --durations=10 "$test_name"; then
+      failures=$((failures + 1))
+    fi
+  done
 done
+
+if ((failures > 0)); then
+  printf '\nE2E regression loop recorded %d failed test runs\n' "$failures" >&2
+  exit 1
+fi

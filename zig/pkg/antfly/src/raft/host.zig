@@ -398,6 +398,24 @@ pub const Host = struct {
         self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
     }
 
+    pub fn cancelReplicaBootstrapPreparation(self: *Host, record: catalog.ReplicaRecord) void {
+        if (record.backup_restore_bootstrap == null or self.hasReplica(record.group_id)) return;
+        self.clearBootstrapStatus(record.group_id);
+    }
+
+    pub fn snapshotReplicaCatalog(
+        self: *Host,
+        alloc: std.mem.Allocator,
+    ) !?[]catalog.ReplicaRecord {
+        const replica_catalog = self.deps.replica_catalog orelse return null;
+        return try replica_catalog.listReplicas(alloc);
+    }
+
+    pub fn restoreReplicaCatalog(self: *Host, records: []const catalog.ReplicaRecord) !void {
+        const replica_catalog = self.deps.replica_catalog orelse return;
+        try replica_catalog.replaceReplicas(records);
+    }
+
     pub fn prepareReplicaRemoval(self: *Host, group_id: u64) !void {
         if (self.deps.replica_catalog) |replica_catalog| {
             _ = try replica_catalog.removeReplica(group_id);
@@ -1166,6 +1184,7 @@ test "host can ensure and remove a replica" {
                     .upsert_replica = upsertReplica,
                     .remove_replica = removeReplica,
                     .list_replicas = listReplicas,
+                    .replace_replicas = replaceReplicas,
                 },
             };
         }
@@ -1182,6 +1201,8 @@ test "host can ensure and remove a replica" {
         fn listReplicas(_: *anyopaque, alloc: std.mem.Allocator) ![]catalog.ReplicaRecord {
             return try alloc.alloc(catalog.ReplicaRecord, 0);
         }
+
+        fn replaceReplicas(_: *anyopaque, _: []const catalog.ReplicaRecord) !void {}
     };
 
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);

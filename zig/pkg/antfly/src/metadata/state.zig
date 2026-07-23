@@ -578,6 +578,11 @@ const GroupStatusMergeState = struct {
     doc_identity_namespace_conflict: bool = false,
 };
 
+const PlacementNodeKey = struct {
+    group_id: u64,
+    node_id: u64,
+};
+
 pub fn mergeHealthyGroupStatuses(
     alloc: std.mem.Allocator,
     tables: []const metadata_table_manager.TableRecord,
@@ -594,18 +599,34 @@ pub fn mergeHealthyGroupStatuses(
     defer states.deinit(alloc);
     var indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
     defer indexes.deinit(alloc);
+    var placement_generations = std.AutoHashMapUnmanaged(PlacementNodeKey, u64).empty;
+    defer placement_generations.deinit(alloc);
+    var placement_counts = std.AutoHashMapUnmanaged(u64, u16).empty;
+    defer placement_counts.deinit(alloc);
+    try placement_generations.ensureTotalCapacity(alloc, @intCast(placement_intents.len));
+    try placement_counts.ensureTotalCapacity(alloc, @intCast(placement_intents.len));
+    for (placement_intents) |intent| {
+        placement_generations.putAssumeCapacity(.{
+            .group_id = intent.record.group_id,
+            .node_id = intent.record.local_node_id,
+        }, intent.relocation_generation);
+        const count = placement_counts.getOrPutAssumeCapacity(intent.record.group_id);
+        if (!count.found_existing) count.value_ptr.* = 0;
+        count.value_ptr.* +|= 1;
+    }
 
     for (stores) |store| {
         if (!store.live) continue;
         if (!std.mem.eql(u8, store.health_class, "healthy")) continue;
 
         for (store.group_statuses) |group_status| {
-            if (placement_intents.len > 0 and !storeHasPlacement(placement_intents, group_status.group_id, store.node_id)) continue;
-            if (placement_intents.len > 0 and !groupStatusMatchesPlacementGeneration(
-                placement_intents,
-                store.node_id,
-                group_status,
-            )) continue;
+            if (placement_intents.len > 0) {
+                const generation = placement_generations.get(.{
+                    .group_id = group_status.group_id,
+                    .node_id = store.node_id,
+                }) orelse continue;
+                if (generation != group_status.relocation_generation) continue;
+            }
             const entry = try indexes.getOrPut(alloc, group_status.group_id);
             if (!entry.found_existing) {
                 entry.value_ptr.* = states.items.len;
@@ -652,7 +673,10 @@ pub fn mergeHealthyGroupStatuses(
         }
 
         for (store.runtime_statuses) |runtime_status| {
-            if (!storeHasPlacement(placement_intents, runtime_status.group_id, store.node_id)) continue;
+            if (!placement_generations.contains(.{
+                .group_id = runtime_status.group_id,
+                .node_id = store.node_id,
+            })) continue;
             if (runtime_status.doc_count == 0 and runtime_status.disk_bytes == 0 and !runtimeDocIdentityHasFacts(runtime_status.doc_identity)) continue;
             const entry = try indexes.getOrPut(alloc, runtime_status.group_id);
             if (!entry.found_existing) {
@@ -671,7 +695,7 @@ pub fn mergeHealthyGroupStatuses(
                     .created_at_millis = runtime_status.created_at_millis,
                     .updated_at_millis = updated_at_millis,
                     .local_voter = true,
-                    .voter_count = countPlacementIntents(placement_intents, runtime_status.group_id),
+                    .voter_count = placement_counts.get(runtime_status.group_id) orelse 0,
                 },
             };
             if (state.latest == null or moreCompleteGroupStatus(candidate.report, state.latest.?.report)) {
@@ -681,7 +705,7 @@ pub fn mergeHealthyGroupStatuses(
                 state.healthy_voter_reports +|= 1;
                 state.last_voter_store_id = store.store_id;
             }
-            const voter_count = countPlacementIntents(placement_intents, runtime_status.group_id);
+            const voter_count = placement_counts.get(runtime_status.group_id) orelse 0;
             if (voter_count > 0) {
                 if (state.observed_voter_count) |existing| {
                     if (existing != voter_count) state.ambiguous_voter_count = true;
@@ -740,18 +764,6 @@ pub fn mergeHealthyGroupStatuses(
     overlayRestoreReadiness(merged, tables, ranges, placement_intents, restore_progresses);
     refreshDocIdentityLifecycles(merged);
     return merged;
-}
-
-fn groupStatusMatchesPlacementGeneration(
-    placements: []const raft_reconciler.PlacementIntent,
-    node_id: u64,
-    status: metadata_table_manager.GroupStatusReport,
-) bool {
-    for (placements) |intent| {
-        if (intent.record.group_id != status.group_id or intent.record.local_node_id != node_id) continue;
-        return intent.relocation_generation == status.relocation_generation;
-    }
-    return false;
 }
 
 pub fn freeMergedGroupStatuses(alloc: std.mem.Allocator, statuses: []metadata_reconciler.MergedGroupStatus) void {
@@ -853,21 +865,6 @@ fn markDocIdentityRebuildRequiredOnNamespaceMismatch(
 
 fn refreshDocIdentityLifecycles(merged: []metadata_reconciler.MergedGroupStatus) void {
     for (merged) |*status| metadata_reconciler.refreshDocIdentityLifecycle(status);
-}
-
-fn storeHasPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
-    for (placements) |intent| {
-        if (intent.record.group_id == group_id and intent.record.local_node_id == node_id) return true;
-    }
-    return false;
-}
-
-fn countPlacementIntents(placements: []const raft_reconciler.PlacementIntent, group_id: u64) u16 {
-    var count: u16 = 0;
-    for (placements) |intent| {
-        if (intent.record.group_id == group_id) count +|= 1;
-    }
-    return count;
 }
 
 fn moreCompleteGroupStatus(candidate: metadata_table_manager.GroupStatusReport, current: metadata_table_manager.GroupStatusReport) bool {

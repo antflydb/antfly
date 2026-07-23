@@ -183,6 +183,7 @@ pub const ReplicaCatalog = struct {
         upsert_replica: *const fn (ptr: *anyopaque, record: ReplicaRecord) anyerror!void,
         remove_replica: *const fn (ptr: *anyopaque, group_id: u64) anyerror!bool,
         list_replicas: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]ReplicaRecord,
+        replace_replicas: *const fn (ptr: *anyopaque, records: []const ReplicaRecord) anyerror!void,
     };
 
     pub fn upsertReplica(self: ReplicaCatalog, record: ReplicaRecord) !void {
@@ -195,6 +196,13 @@ pub const ReplicaCatalog = struct {
 
     pub fn listReplicas(self: ReplicaCatalog, alloc: std.mem.Allocator) ![]ReplicaRecord {
         return try self.vtable.list_replicas(self.ptr, alloc);
+    }
+
+    pub fn replaceReplicas(
+        self: ReplicaCatalog,
+        records: []const ReplicaRecord,
+    ) !void {
+        return try self.vtable.replace_replicas(self.ptr, records);
     }
 };
 
@@ -220,6 +228,7 @@ pub const MemoryReplicaCatalog = struct {
                 .upsert_replica = upsertReplica,
                 .remove_replica = removeReplica,
                 .list_replicas = listReplicas,
+                .replace_replicas = replaceReplicas,
             },
         };
     }
@@ -244,7 +253,10 @@ pub const MemoryReplicaCatalog = struct {
 
     fn removeReplica(ptr: *anyopaque, group_id: u64) !bool {
         const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
-        return self.records.remove(group_id);
+        const removed = self.records.fetchRemove(group_id) orelse return false;
+        var record = removed.value;
+        record.deinit(self.alloc);
+        return true;
     }
 
     fn listReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) ![]ReplicaRecord {
@@ -258,6 +270,14 @@ pub const MemoryReplicaCatalog = struct {
         var it = self.records.valueIterator();
         while (it.next()) |record| : (i += 1) out[i] = try record.clone(alloc);
         return out;
+    }
+
+    fn replaceReplicas(ptr: *anyopaque, records: []const ReplicaRecord) !void {
+        const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
+        var next = try cloneReplicaMap(self.alloc, records);
+        errdefer deinitReplicaMap(self.alloc, &next);
+        deinitReplicaMap(self.alloc, &self.records);
+        self.records = next;
     }
 };
 
@@ -297,6 +317,7 @@ pub const FileReplicaCatalog = struct {
                 .upsert_replica = upsertReplica,
                 .remove_replica = removeReplica,
                 .list_replicas = listReplicas,
+                .replace_replicas = replaceReplicas,
             },
         };
     }
@@ -306,25 +327,42 @@ pub const FileReplicaCatalog = struct {
         if (self.records.getPtr(record.group_id)) |existing| {
             if (eqlReplicaRecord(existing.*, record)) return;
         }
-        const owned = try record.clone(self.alloc);
-        errdefer {
-            var cleanup = owned;
-            cleanup.deinit(self.alloc);
-        }
-        if (self.records.getPtr(record.group_id)) |existing| {
-            existing.deinit(self.alloc);
-            existing.* = owned;
+        var owned = try record.clone(self.alloc);
+        var map_owns_record = false;
+        defer if (!map_owns_record) owned.deinit(self.alloc);
+
+        const entry = try self.records.getOrPut(self.alloc, record.group_id);
+        if (entry.found_existing) {
+            var previous = entry.value_ptr.*;
+            entry.value_ptr.* = owned;
+            map_owns_record = true;
+            self.persist() catch |err| {
+                entry.value_ptr.* = previous;
+                map_owns_record = false;
+                return err;
+            };
+            previous.deinit(self.alloc);
         } else {
-            try self.records.put(self.alloc, record.group_id, owned);
+            entry.value_ptr.* = owned;
+            map_owns_record = true;
+            self.persist() catch |err| {
+                _ = self.records.fetchRemove(record.group_id) orelse unreachable;
+                map_owns_record = false;
+                return err;
+            };
         }
-        try self.persist();
     }
 
     fn removeReplica(ptr: *anyopaque, group_id: u64) !bool {
         const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
-        const removed = self.records.remove(group_id);
-        if (removed) try self.persist();
-        return removed;
+        const removed = self.records.fetchRemove(group_id) orelse return false;
+        self.persist() catch |err| {
+            self.records.putAssumeCapacity(group_id, removed.value);
+            return err;
+        };
+        var record = removed.value;
+        record.deinit(self.alloc);
+        return true;
     }
 
     fn listReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) ![]ReplicaRecord {
@@ -335,6 +373,20 @@ pub const FileReplicaCatalog = struct {
         var it = self.records.valueIterator();
         while (it.next()) |record| : (i += 1) out[i] = try record.clone(alloc);
         return out;
+    }
+
+    fn replaceReplicas(ptr: *anyopaque, records: []const ReplicaRecord) !void {
+        const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
+        var next = try cloneReplicaMap(self.alloc, records);
+        errdefer deinitReplicaMap(self.alloc, &next);
+
+        var previous = self.records;
+        self.records = next;
+        self.persist() catch |err| {
+            self.records = previous;
+            return err;
+        };
+        deinitReplicaMap(self.alloc, &previous);
     }
 
     fn load(self: *FileReplicaCatalog) !void {
@@ -474,6 +526,34 @@ pub const FileReplicaCatalog = struct {
     }
 };
 
+fn cloneReplicaMap(
+    alloc: std.mem.Allocator,
+    records: []const ReplicaRecord,
+) !std.AutoHashMapUnmanaged(u64, ReplicaRecord) {
+    var out = std.AutoHashMapUnmanaged(u64, ReplicaRecord).empty;
+    errdefer deinitReplicaMap(alloc, &out);
+    try out.ensureTotalCapacity(alloc, @intCast(records.len));
+    for (records) |record| {
+        const owned = try record.clone(alloc);
+        const entry = out.getOrPutAssumeCapacity(record.group_id);
+        if (entry.found_existing) {
+            entry.value_ptr.deinit(alloc);
+        }
+        entry.value_ptr.* = owned;
+    }
+    return out;
+}
+
+fn deinitReplicaMap(
+    alloc: std.mem.Allocator,
+    records: *std.AutoHashMapUnmanaged(u64, ReplicaRecord),
+) void {
+    var it = records.valueIterator();
+    while (it.next()) |record| record.deinit(alloc);
+    records.deinit(alloc);
+    records.* = .empty;
+}
+
 test "raft replica catalog storage module compiles" {
     _ = ReplicaBootstrapMode;
     _ = BackupRestoreBootstrapRecord;
@@ -579,4 +659,55 @@ test "file replica catalog persists backup restore bootstrap records across reop
         try std.testing.expectEqualStrings("file:///tmp/backups", records[0].backup_restore_bootstrap.?.location);
         try std.testing.expectEqualStrings("snap-22/groups/22", records[0].backup_restore_bootstrap.?.snapshot_path);
     }
+}
+
+test "file replica catalog rolls back failed durable upserts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(catalog_path);
+    const unwritable_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(unwritable_path);
+
+    var replica_catalog = try FileReplicaCatalog.init(std.testing.allocator, catalog_path);
+    defer replica_catalog.deinit();
+    try replica_catalog.catalog().upsertReplica(.{
+        .group_id = 23,
+        .replica_id = 1,
+        .local_node_id = 2,
+        .metadata_version = 3,
+    });
+
+    std.testing.allocator.free(replica_catalog.path);
+    replica_catalog.path = try std.testing.allocator.dupe(u8, unwritable_path);
+    try std.testing.expectError(error.IsDir, replica_catalog.catalog().upsertReplica(.{
+        .group_id = 23,
+        .replica_id = 4,
+        .local_node_id = 5,
+        .metadata_version = 6,
+    }));
+    replica_catalog.catalog().upsertReplica(.{
+        .group_id = 24,
+        .replica_id = 7,
+        .local_node_id = 8,
+    }) catch |err| try std.testing.expect(err == error.IsDir);
+
+    {
+        const records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+        defer freeReplicaRecords(std.testing.allocator, records);
+        try std.testing.expectEqual(@as(usize, 1), records.len);
+        try std.testing.expectEqual(@as(u64, 23), records[0].group_id);
+        try std.testing.expectEqual(@as(u64, 1), records[0].replica_id);
+        try std.testing.expectEqual(@as(u64, 3), records[0].metadata_version);
+    }
+
+    std.testing.allocator.free(replica_catalog.path);
+    replica_catalog.path = try std.testing.allocator.dupe(u8, catalog_path);
+    try replica_catalog.catalog().upsertReplica(.{
+        .group_id = 23,
+        .replica_id = 9,
+        .local_node_id = 2,
+        .metadata_version = 10,
+    });
 }

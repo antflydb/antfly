@@ -539,6 +539,13 @@ fn projectionSignalChangesProjectedCore(kind: metadata_storage.raft_apply_store.
     };
 }
 
+fn projectionSignalChangesTransitionReadiness(kind: metadata_storage.raft_apply_store.ProjectionSignalKind) bool {
+    return switch (kind) {
+        .store, .placement_intent => true,
+        else => false,
+    };
+}
+
 test "metadata service catalog validation epoch ignores non-catalog projection traffic" {
     try std.testing.expect(projectionSignalChangesCatalog(.table));
     try std.testing.expect(projectionSignalChangesCatalog(.range));
@@ -796,10 +803,8 @@ const ProjectedCoreSnapshotCache = struct {
 };
 
 const TransitionReadinessCache = struct {
-    catalog_epoch: u64 = 0,
-    core_epoch: u64 = 0,
-    placement_epoch: u64 = 0,
-    transition_epoch: u64 = 0,
+    initialized: bool = false,
+    epoch: u64 = 0,
     ready_by_group: std.AutoHashMapUnmanaged(u64, bool) = .empty,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -811,6 +816,19 @@ const TransitionReadinessCache = struct {
 const TransitionPlacementKey = struct {
     group_id: u64,
     store_id: u64,
+};
+
+const TransitionReadinessInputs = struct {
+    stores: []metadata_table_manager.StoreRecord,
+    placement_intents: []raft_reconciler.PlacementIntent,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.stores) |store| metadata_table_manager.freeStore(alloc, store);
+        alloc.free(self.stores);
+        for (self.placement_intents) |intent| raft_reconciler.freeIntentOwned(alloc, intent);
+        alloc.free(self.placement_intents);
+        self.* = undefined;
+    }
 };
 
 const ProjectedCoreSnapshotDiagnostics = struct {
@@ -1239,6 +1257,7 @@ pub const MetadataService = struct {
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
     json_response_peak_bytes: std.atomic.Value(u64) = .init(0),
     control_round_mutex: std.Io.Mutex = .init,
+    placement_reconcile_mutex: std.Io.Mutex = .init,
     runtime_mutex: std.Io.Mutex = .init,
     transition_mutex: std.Io.Mutex = .init,
     backend_runtime_mutex: std.Io.Mutex = .init,
@@ -2189,6 +2208,9 @@ pub const MetadataService = struct {
     }
 
     fn refreshLocalPlacementIntents(self: *MetadataService) !void {
+        self.placement_reconcile_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.placement_reconcile_mutex.unlock(std.Options.debug_io);
+
         const current_epoch = self.placement_epoch.load(.monotonic);
         if (!shouldRefreshLocalEpoch(
             self.local_placement_epoch,
@@ -2247,6 +2269,12 @@ pub const MetadataService = struct {
         };
 
         self.lockRuntime();
+        if (self.placement_epoch.load(.monotonic) != current_epoch) {
+            self.unlockRuntime();
+            try reconcile.abortDurable();
+            self.local_placement_epoch = null;
+            return;
+        }
         defer self.unlockRuntime();
         _ = try reconcile.commit();
         self.local_placement_epoch = current_epoch;
@@ -2696,6 +2724,7 @@ pub const MetadataHttpService = struct {
     projection_epoch: std.atomic.Value(u64) = .init(1),
     catalog_epoch: std.atomic.Value(u64) = .init(1),
     projected_core_epoch: std.atomic.Value(u64) = .init(1),
+    transition_readiness_epoch: std.atomic.Value(u64) = .init(1),
     placement_epoch: std.atomic.Value(u64) = .init(1),
     reconcile_lease_epoch: std.atomic.Value(u64) = .init(1),
     transition_epoch: std.atomic.Value(u64) = .init(1),
@@ -2715,6 +2744,7 @@ pub const MetadataHttpService = struct {
     cdc_runtime_mutex: std.Io.Mutex = .init,
     reconcile_lease: metadata_reconcile_lease.State,
     runtime_mutex: std.Io.Mutex = .init,
+    placement_reconcile_mutex: std.Io.Mutex = .init,
     transition_mutex: std.Io.Mutex = .init,
     transition_metrics_mutex: std.Io.Mutex = .init,
     transition_metrics_snapshot: raft_transition_service.TransitionServiceMetrics = .{},
@@ -2733,6 +2763,7 @@ pub const MetadataHttpService = struct {
     routed_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     reconcile_lease_projection_cache: ReconcileLeaseProjectionCache = .{},
     projected_core_snapshot_cache: ProjectedCoreSnapshotCache = .{},
+    transition_readiness_mutex: std.Io.Mutex = .init,
     transition_readiness_cache: TransitionReadinessCache = .{},
     metadata_status_cache_mutex: std.Io.Mutex = .init,
     metadata_status_cache_valid: bool = false,
@@ -2924,6 +2955,9 @@ pub const MetadataHttpService = struct {
         }
         if (projectionSignalChangesProjectedCore(signal.kind)) {
             _ = self.projected_core_epoch.fetchAdd(1, .release);
+        }
+        if (projectionSignalChangesTransitionReadiness(signal.kind)) {
+            _ = self.transition_readiness_epoch.fetchAdd(1, .release);
         }
         switch (signal.kind) {
             .table, .range, .store, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
@@ -3844,75 +3878,50 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn groupTransitionReady(self: *MetadataHttpService, group_id: u64) !bool {
+        self.transition_readiness_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.transition_readiness_mutex.unlock(std.Options.debug_io);
+
+        const cache = &self.transition_readiness_cache;
+        for (0..4) |_| {
+            const epoch = self.transition_readiness_epoch.load(.acquire);
+            if (cache.initialized and cache.epoch == epoch) {
+                return cache.ready_by_group.get(group_id) orelse false;
+            }
+
+            var inputs = try self.captureTransitionReadinessInputs();
+            defer inputs.deinit(self.alloc);
+            var next = try buildTransitionReadinessMap(
+                self.alloc,
+                inputs.stores,
+                inputs.placement_intents,
+            );
+            if (self.transition_readiness_epoch.load(.acquire) != epoch) {
+                next.deinit(self.alloc);
+                continue;
+            }
+
+            cache.ready_by_group.deinit(self.alloc);
+            cache.ready_by_group = next;
+            cache.epoch = epoch;
+            cache.initialized = true;
+            return cache.ready_by_group.get(group_id) orelse false;
+        }
+        return error.MetadataProjectionAdvanced;
+    }
+
+    fn captureTransitionReadinessInputs(self: *MetadataHttpService) !TransitionReadinessInputs {
         self.lockRuntime();
         defer self.unlockRuntime();
-        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
-
-        const catalog_epoch = self.catalog_epoch.load(.acquire);
-        const core_epoch = self.projected_core_epoch.load(.acquire);
-        const placement_epoch = self.placement_epoch.load(.monotonic);
-        const transition_epoch = self.transition_epoch.load(.monotonic);
-        const cache = &self.transition_readiness_cache;
-        if (cache.catalog_epoch != catalog_epoch or
-            cache.core_epoch != core_epoch or
-            cache.placement_epoch != placement_epoch or
-            cache.transition_epoch != transition_epoch)
-        {
-            const catalog = try self.catalogValidationSnapshotLocked();
-            const core = try self.projectedCoreSnapshotLocked();
-            const merged = try metadata_state.mergeHealthyGroupStatuses(
-                self.alloc,
-                catalog.tables,
-                catalog.ranges,
-                core.placement_intents,
-                core.restore_progresses,
-                core.stores,
-                core.split_transitions,
-                core.merge_transitions,
-                &.{},
-                &.{},
-            );
-            defer self.alloc.free(merged);
-
-            var placement_counts = std.AutoHashMapUnmanaged(u64, u32).empty;
-            defer placement_counts.deinit(self.alloc);
-            var placement_stores = std.AutoHashMapUnmanaged(TransitionPlacementKey, void).empty;
-            defer placement_stores.deinit(self.alloc);
-            try placement_counts.ensureTotalCapacity(self.alloc, @intCast(core.placement_intents.len));
-            try placement_stores.ensureTotalCapacity(self.alloc, @intCast(core.placement_intents.len));
-            for (core.placement_intents) |intent| {
-                const count = placement_counts.getOrPutAssumeCapacity(intent.record.group_id);
-                if (!count.found_existing) count.value_ptr.* = 0;
-                count.value_ptr.* +|= 1;
-                placement_stores.putAssumeCapacity(.{
-                    .group_id = intent.record.group_id,
-                    .store_id = intent.store_id,
-                }, {});
-            }
-
-            cache.ready_by_group.clearRetainingCapacity();
-            try cache.ready_by_group.ensureTotalCapacity(self.alloc, @intCast(merged.len));
-            for (merged) |group_status| {
-                const expected_voters = placement_counts.get(group_status.group_id) orelse 0;
-                cache.ready_by_group.putAssumeCapacity(
-                    group_status.group_id,
-                    transitionStatusHasStablePlacement(
-                        group_status,
-                        expected_voters,
-                        placement_stores.contains(.{
-                            .group_id = group_status.group_id,
-                            .store_id = group_status.leader_store_id,
-                        }),
-                    ),
-                );
-            }
-            cache.catalog_epoch = catalog_epoch;
-            cache.core_epoch = core_epoch;
-            cache.placement_epoch = placement_epoch;
-            cache.transition_epoch = transition_epoch;
+        const core = try self.projectedCoreSnapshotLocked();
+        const stores = try cloneProjectedStoresOwned(self.alloc, core.stores);
+        errdefer {
+            for (stores) |store| metadata_table_manager.freeStore(self.alloc, store);
+            self.alloc.free(stores);
         }
-        return cache.ready_by_group.get(group_id) orelse false;
+        return .{
+            .stores = stores,
+            .placement_intents = try cloneProjectedPlacementIntentsOwned(self.alloc, core.placement_intents),
+        };
     }
 
     pub fn validatePublication(self: *MetadataHttpService, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -4324,6 +4333,9 @@ pub const MetadataHttpService = struct {
     }
 
     fn refreshLocalPlacementIntents(self: *MetadataHttpService, round_inputs: ?*const LocalPlacementInputs) !void {
+        self.placement_reconcile_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.placement_reconcile_mutex.unlock(std.Options.debug_io);
+
         const current_epoch = self.placement_epoch.load(.monotonic);
         if (!shouldRefreshLocalEpoch(
             self.local_placement_epoch,
@@ -4393,6 +4405,12 @@ pub const MetadataHttpService = struct {
         };
 
         self.lockRuntime();
+        if (self.placement_epoch.load(.monotonic) != current_epoch) {
+            self.unlockRuntime();
+            try reconcile.abortDurable();
+            self.local_placement_epoch = null;
+            return;
+        }
         defer self.unlockRuntime();
         _ = try reconcile.commit();
         self.local_placement_epoch = current_epoch;
@@ -6432,6 +6450,60 @@ fn transitionStatusHasStablePlacement(
         !status.joint_consensus;
 }
 
+fn buildTransitionReadinessMap(
+    alloc: std.mem.Allocator,
+    stores: []const metadata_table_manager.StoreRecord,
+    placements: []const raft_reconciler.PlacementIntent,
+) !std.AutoHashMapUnmanaged(u64, bool) {
+    const merged = try metadata_state.mergeHealthyGroupStatuses(
+        alloc,
+        &.{},
+        &.{},
+        placements,
+        &.{},
+        stores,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+    );
+    defer alloc.free(merged);
+
+    var placement_counts = std.AutoHashMapUnmanaged(u64, u32).empty;
+    defer placement_counts.deinit(alloc);
+    var placement_stores = std.AutoHashMapUnmanaged(TransitionPlacementKey, void).empty;
+    defer placement_stores.deinit(alloc);
+    try placement_counts.ensureTotalCapacity(alloc, @intCast(placements.len));
+    try placement_stores.ensureTotalCapacity(alloc, @intCast(placements.len));
+    for (placements) |intent| {
+        const count = placement_counts.getOrPutAssumeCapacity(intent.record.group_id);
+        if (!count.found_existing) count.value_ptr.* = 0;
+        count.value_ptr.* +|= 1;
+        placement_stores.putAssumeCapacity(.{
+            .group_id = intent.record.group_id,
+            .store_id = intent.store_id,
+        }, {});
+    }
+
+    var ready_by_group = std.AutoHashMapUnmanaged(u64, bool).empty;
+    errdefer ready_by_group.deinit(alloc);
+    try ready_by_group.ensureTotalCapacity(alloc, @intCast(merged.len));
+    for (merged) |status| {
+        ready_by_group.putAssumeCapacity(
+            status.group_id,
+            transitionStatusHasStablePlacement(
+                status,
+                placement_counts.get(status.group_id) orelse 0,
+                placement_stores.contains(.{
+                    .group_id = status.group_id,
+                    .store_id = status.leader_store_id,
+                }),
+            ),
+        );
+    }
+    return ready_by_group;
+}
+
 test "metadata service transition readiness requires stable healthy placement" {
     const placements = [_]raft_reconciler.PlacementIntent{
         .{ .store_id = 1, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 } },
@@ -6455,6 +6527,54 @@ test "metadata service transition readiness requires stable healthy placement" {
     status.joint_consensus = false;
     status.leader_store_id = 99;
     try std.testing.expect(!transitionStatusHasStablePlacement(status, placements.len, false));
+}
+
+test "metadata service transition readiness map rejects stale placement generations" {
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .store_id = 1, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 }, .relocation_generation = 4 },
+        .{ .store_id = 2, .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 }, .relocation_generation = 4 },
+        .{ .store_id = 3, .record = .{ .group_id = 77, .replica_id = 3, .local_node_id = 3 }, .relocation_generation = 4 },
+    };
+    var leader_statuses = [_]metadata_table_manager.GroupStatusReport{
+        .{
+            .group_id = 77,
+            .local_leader = true,
+            .local_voter = true,
+            .voter_set_known = true,
+            .voter_count = 3,
+            .relocation_generation = 4,
+        },
+    };
+    var follower_statuses = [_]metadata_table_manager.GroupStatusReport{
+        .{
+            .group_id = 77,
+            .local_voter = true,
+            .voter_set_known = true,
+            .voter_count = 3,
+            .relocation_generation = 4,
+        },
+    };
+    var stores = [_]metadata_table_manager.StoreRecord{
+        .{ .store_id = 1, .node_id = 1, .live = true, .health_class = "healthy", .group_statuses = &leader_statuses },
+        .{ .store_id = 2, .node_id = 2, .live = true, .health_class = "healthy", .group_statuses = &follower_statuses },
+        .{ .store_id = 3, .node_id = 3, .live = true, .health_class = "healthy", .group_statuses = &follower_statuses },
+    };
+
+    var ready = try buildTransitionReadinessMap(std.testing.allocator, &stores, &placements);
+    defer ready.deinit(std.testing.allocator);
+    try std.testing.expect(ready.get(77) orelse false);
+
+    var stale_leader_statuses = leader_statuses;
+    stale_leader_statuses[0].relocation_generation = 3;
+    var stale_follower_statuses = follower_statuses;
+    stale_follower_statuses[0].relocation_generation = 3;
+    var stale_stores = stores;
+    stale_stores[0].group_statuses = &stale_leader_statuses;
+    stale_stores[1].group_statuses = &stale_follower_statuses;
+    stale_stores[2].group_statuses = &stale_follower_statuses;
+    var stale = try buildTransitionReadinessMap(std.testing.allocator, &stale_stores, &placements);
+    defer stale.deinit(std.testing.allocator);
+    try std.testing.expect(!(stale.get(77) orelse false));
 }
 
 fn groupHasExpectedHealthyPlacement(
