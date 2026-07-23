@@ -29,6 +29,31 @@ pub const ProgressSource = struct {
     }
 };
 
+pub const RuntimeCadence = struct {
+    pub const default_raft_tick_ms: u64 = 100;
+    pub const default_control_tick_ms: u64 = 100;
+    pub const min_raft_tick_ms: u64 = 1;
+    pub const max_raft_tick_ms: u64 = 1_000;
+    pub const min_control_tick_ms: u64 = 1;
+    pub const max_control_tick_ms: u64 = 60_000;
+
+    raft_tick_ns: u64,
+    control_tick_ns: u64,
+
+    pub fn fromMillis(raft_tick_ms: u64, control_tick_ms: u64) !RuntimeCadence {
+        if (raft_tick_ms < min_raft_tick_ms or raft_tick_ms > max_raft_tick_ms)
+            return error.InvalidRaftTickInterval;
+        if (control_tick_ms < min_control_tick_ms or control_tick_ms > max_control_tick_ms)
+            return error.InvalidControlTickInterval;
+        return .{
+            .raft_tick_ns = std.math.mul(u64, raft_tick_ms, std.time.ns_per_ms) catch
+                return error.InvalidRaftTickInterval,
+            .control_tick_ns = std.math.mul(u64, control_tick_ms, std.time.ns_per_ms) catch
+                return error.InvalidControlTickInterval,
+        };
+    }
+};
+
 /// Owns the dedicated scheduling lane for one Raft runtime. The source retains
 /// semantic ownership of the Raft service and its synchronization; this driver
 /// owns only cadence, failure propagation, cancellation, and thread lifetime.
@@ -45,7 +70,8 @@ pub const ManagedProgressDriver = struct {
     interval_ns: u64,
     thread: ?std.Thread = null,
     state: State = .initialized,
-    stop_requested: std.atomic.Value(bool) = .init(false),
+    stop_event: std.Io.Event = .unset,
+    failure_event: std.Io.Event = .unset,
     failed: std.atomic.Value(bool) = .init(false),
     failure: ?anyerror = null,
 
@@ -71,9 +97,29 @@ pub const ManagedProgressDriver = struct {
         return self.failure orelse error.RaftProgressDriverFailed;
     }
 
+    pub fn isHealthy(self: *const ManagedProgressDriver) bool {
+        return !self.failed.load(.acquire);
+    }
+
+    /// Sleeps for control-plane cadence while remaining immediately responsive
+    /// to a fatal progress-lane failure.
+    pub fn waitForFailureOrTimeout(self: *ManagedProgressDriver, timeout_ns: u64) !void {
+        try self.check();
+        self.failure_event.waitTimeout(self.io, .{
+            .duration = .{
+                .raw = std.Io.Duration.fromNanoseconds(timeout_ns),
+                .clock = .awake,
+            },
+        }) catch |err| switch (err) {
+            error.Timeout => return,
+            error.Canceled => return error.Canceled,
+        };
+        try self.check();
+    }
+
     pub fn stop(self: *ManagedProgressDriver) void {
         if (self.state != .running) return;
-        self.stop_requested.store(true, .release);
+        self.stop_event.set(self.io);
         if (self.thread) |thread| thread.join();
         self.thread = null;
         self.state = .stopped;
@@ -85,26 +131,35 @@ pub const ManagedProgressDriver = struct {
     }
 
     fn run(self: *ManagedProgressDriver) void {
-        while (!self.stop_requested.load(.acquire)) {
+        while (!self.stop_event.isSet()) {
             const started_ns = platform_time.monotonicNs();
             self.source.runOnce() catch |err| {
-                self.failure = err;
-                self.failed.store(true, .release);
+                self.publishFailure(err);
                 return;
             };
             const elapsed_ns = platform_time.monotonicNs() -| started_ns;
             if (elapsed_ns < self.interval_ns) {
-                self.io.sleep(
-                    std.Io.Duration.fromNanoseconds(self.interval_ns - elapsed_ns),
-                    .awake,
-                ) catch |err| {
-                    if (self.stop_requested.load(.acquire)) return;
-                    self.failure = err;
-                    self.failed.store(true, .release);
-                    return;
+                self.stop_event.waitTimeout(self.io, .{
+                    .duration = .{
+                        .raw = std.Io.Duration.fromNanoseconds(self.interval_ns - elapsed_ns),
+                        .clock = .awake,
+                    },
+                }) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    error.Canceled => {
+                        if (self.stop_event.isSet()) return;
+                        self.publishFailure(err);
+                        return;
+                    },
                 };
             }
         }
+    }
+
+    fn publishFailure(self: *ManagedProgressDriver, err: anyerror) void {
+        self.failure = err;
+        self.failed.store(true, .release);
+        self.failure_event.set(self.io);
     }
 };
 
@@ -403,6 +458,51 @@ test "managed raft progress driver publishes source failure" {
         try io_impl.io().sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expectError(error.InjectedFailure, driver.check());
+    try std.testing.expect(!driver.isHealthy());
+    try std.testing.expectError(error.InjectedFailure, driver.waitForFailureOrTimeout(std.time.ns_per_s));
+}
+
+test "managed raft progress driver stop interrupts a long cadence wait" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const Counter = struct {
+        count: std.atomic.Value(u64) = .init(0),
+
+        fn runOnce(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.count.fetchAdd(1, .release);
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var counter = Counter{};
+    var driver = ManagedProgressDriver.init(io_impl.io(), .{
+        .ptr = &counter,
+        .run_once = Counter.runOnce,
+    }, std.time.ns_per_hour);
+    defer driver.deinit();
+    try driver.start();
+
+    const deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    while (counter.count.load(.acquire) == 0) {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.TestExpectedEqual;
+        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+    }
+
+    const stop_started_ns = platform_time.monotonicNs();
+    driver.stop();
+    try std.testing.expect(platform_time.monotonicNs() -| stop_started_ns < 100 * std.time.ns_per_ms);
+}
+
+test "raft runtime cadence validates independent intervals" {
+    const cadence = try RuntimeCadence.fromMillis(25, 250);
+    try std.testing.expectEqual(@as(u64, 25 * std.time.ns_per_ms), cadence.raft_tick_ns);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), cadence.control_tick_ns);
+    try std.testing.expectError(error.InvalidRaftTickInterval, RuntimeCadence.fromMillis(0, 100));
+    try std.testing.expectError(error.InvalidRaftTickInterval, RuntimeCadence.fromMillis(1_001, 100));
+    try std.testing.expectError(error.InvalidControlTickInterval, RuntimeCadence.fromMillis(100, 0));
+    try std.testing.expectError(error.InvalidControlTickInterval, RuntimeCadence.fromMillis(100, 60_001));
 }
 
 test "managed host runtime deterministically drains metadata updates" {

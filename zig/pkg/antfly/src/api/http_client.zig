@@ -28,6 +28,8 @@ const test_contract_helpers = @import("test_contract_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 
+const transition_control_rpc_timeout_ms: u32 = 5_000;
+
 fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
     return try std.json.parseFromSlice(T, alloc, body, .{});
 }
@@ -2015,6 +2017,11 @@ pub const ApiHttpClient = struct {
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
+            // Transition RPCs run from a persistent control loop. A peer that
+            // accepts a connection but never responds must not monopolize that
+            // loop indefinitely; TransitionService retries idempotent actions
+            // with bounded backoff after this deadline.
+            .timeout_ms = transition_control_rpc_timeout_ms,
             .body = body,
         });
         defer resp.deinit(self.alloc);
@@ -2527,6 +2534,40 @@ pub fn expectGroupArtifactRepairRunMapsCancelUnavailableForTest() !void {
 
 test "api http client maps remote repair cancel unavailable" {
     try expectGroupArtifactRepairRunMapsCancelUnavailableForTest();
+}
+
+test "api http client bounds transition control RPCs" {
+    const TimeoutExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expectEqual(transition_control_rpc_timeout_ms, req.timeout_ms.?);
+            try std.testing.expect(std.mem.endsWith(
+                u8,
+                req.uri,
+                "/internal/v1/groups/7/shard-ops/observe-split",
+            ));
+            return error.Timeout;
+        }
+    };
+
+    var executor = TimeoutExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(error.Timeout, client.fetchGroupShardObserveSplit(
+        "http://127.0.0.1:1",
+        7,
+        .{
+            .transition_id = 77,
+            .attempt_epoch = 1,
+            .source_group_id = 7,
+            .destination_group_id = 8,
+        },
+    ));
 }
 
 test "api http client encodes table name for repair cancel callback" {

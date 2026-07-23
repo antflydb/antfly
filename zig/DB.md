@@ -263,6 +263,42 @@ startup owner to resume derived repair after a crash. Replica bootstrap restore
 must finish before `ensureReplica()` activates the group; an active replica is
 never force-restored by raw path.
 
+Data-Raft placement reconciliation follows the same staged boundary. One
+reconcile-generation mutex serializes metadata snapshots, while the Raft owner
+mutex protects only live `MultiRaft` mutation. Under the owner mutex,
+reconciliation captures an immutable desired-state plan and marks any restore
+bootstrap as preparing. Restore I/O, descriptor construction, and replica
+catalog fsync then run without the owner mutex, so the dedicated Raft progress
+driver can continue elections, heartbeats, transport, and committed apply.
+Catalog admission is durable before a prepared descriptor is published.
+Reconciliation reacquires the owner mutex only to install or retire replicas,
+refresh peers, reconcile membership, and publish the exact apply-store group
+set. A preparation failure leaves the live runtime unchanged and the
+apply-store's conservative old-or-new admission set in place for retry.
+
+The dedicated Raft progress lane owns consensus progress and durable metadata
+projection, but it never mutates the in-memory split/merge transition
+controller. The control lane is the controller's sole writer: each control
+round hydrates it from durable projected transition records before observing or
+stepping work. This makes a projection update a durable wakeup rather than an
+ephemeral queue handoff, so a delayed control round, leadership change, or
+process restart cannot lose admitted transition work. Controller access is
+serialized independently from the Raft owner lock; transition storage and
+network I/O therefore cannot delay elections, heartbeats, or Ready processing.
+Each peer control RPC has a finite deadline and retries through the durable
+transition record, so an accepted connection that stops responding cannot
+permanently monopolize the control lane. Health and metrics read a separately
+published fixed-size controller snapshot and remain available while such an RPC
+is in flight. Transition readiness reads a projected topology snapshot rather
+than the rich admin snapshot; the latter may perform live transition
+observations and must never be called recursively by the controller.
+Replicated split observations read the durable data apply projection under its
+per-shard lock; they never wait for the corresponding action lane. Replicated
+split actions use fixed, group-sharded singleflight lanes and fail fast when
+the same lane is already active. An abandoned or timed-out RPC therefore
+cannot queue unbounded duplicate handlers, block observation of its own
+progress, or serialize transitions assigned to independent lanes.
+
 Publication errors are pre-commit errors. After a directory rename or exchange
 makes the new generation visible, publication returns either `durable` or
 `durability_uncertain` and the caller must finish cache invalidation and reopen

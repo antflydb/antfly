@@ -363,7 +363,7 @@ pub const HostedShardOperationAdapter = struct {
     }
 
     fn requireGroupReadyForTransition(self: *HostedShardOperationAdapter, group_id: u64) !void {
-        var snapshot = try self.catalog.adminSnapshot();
+        var snapshot = try self.catalog.topologySnapshot();
         defer self.catalog.freeAdminSnapshot(&snapshot);
         if (!groupReadyForTransition(&snapshot, group_id)) return error.GroupLeaderUnavailable;
     }
@@ -435,6 +435,50 @@ test "transition destination requires a stable healthy voter set" {
     };
 
     try std.testing.expect(groupReadyForTransition(&snapshot, 77));
+
+    const Catalog = struct {
+        snapshot: *metadata_api.AdminSnapshot,
+        admin_calls: usize = 0,
+        topology_calls: usize = 0,
+
+        fn source(self: *@This()) api_table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .topology_snapshot = topologySnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.admin_calls += 1;
+            return error.RecursiveAdminSnapshot;
+        }
+
+        fn topologySnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.topology_calls += 1;
+            return self.snapshot.*;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog = Catalog{ .snapshot = &snapshot };
+    var adapter = HostedShardOperationAdapter{
+        .alloc = std.testing.allocator,
+        .catalog = catalog.source(),
+        .router = undefined,
+        .data_router = undefined,
+        .executor = undefined,
+    };
+    try adapter.requireGroupReadyForTransition(77);
+    try std.testing.expectEqual(@as(usize, 0), catalog.admin_calls);
+    try std.testing.expectEqual(@as(usize, 1), catalog.topology_calls);
+
     statuses[0].healthy_voter_reports = 2;
     try std.testing.expect(!groupReadyForTransition(&snapshot, 77));
     statuses[0].healthy_voter_reports = 3;

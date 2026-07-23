@@ -61,7 +61,8 @@ const CliConfig = struct {
     join: bool = false,
     health_enabled: ?bool = null,
     health_port: ?u16 = null,
-    tick_ms: ?u64 = null,
+    raft_tick_ms: u64 = antfly.raft.RuntimeCadence.default_raft_tick_ms,
+    control_tick_ms: u64 = antfly.raft.RuntimeCadence.default_control_tick_ms,
     local_node_id: ?u64 = null,
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
@@ -158,6 +159,7 @@ const ResolvedPaths = struct {
 /// metadata runtime and the standalone runtime so both expose the same metric set.
 pub const HealthSource = struct {
     server: *Server,
+    raft_progress: ?*const antfly.raft.ManagedProgressDriver = null,
 
     pub fn readiness(self: *HealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
@@ -175,7 +177,8 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
-        return self.server.metadataHttpService().probeReady();
+        return self.server.metadataHttpService().probeReady() and
+            (self.raft_progress == null or self.raft_progress.?.isHealthy());
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
@@ -760,6 +763,10 @@ pub fn runFromIterator(
         printUsage(argv0);
         return;
     }
+    const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
+        cli.raft_tick_ms,
+        cli.control_tick_ms,
+    ) catch return error.InvalidArguments;
 
     var secret_store: antfly.common.secrets.FileStore = undefined;
     var secret_store_initialized = false;
@@ -887,7 +894,18 @@ pub fn runFromIterator(
     defer alloc.free(admin_uri);
     std.debug.print("metadata admin api listening on {s}\n", .{admin_uri});
 
-    var metadata_health = HealthSource{ .server = &server };
+    var raft_progress = antfly.raft.ManagedProgressDriver.init(
+        init.io,
+        server.raftProgressSource(),
+        runtime_cadence.raft_tick_ns,
+    );
+    defer raft_progress.deinit();
+    try raft_progress.start();
+
+    var metadata_health = HealthSource{
+        .server = &server,
+        .raft_progress = &raft_progress,
+    };
     const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
     const health_port = if (health_enabled)
         cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
@@ -902,21 +920,9 @@ pub fn runFromIterator(
     );
     defer if (health_server) |hs| hs.deinit();
 
-    const tick_ms = cli.tick_ms orelse 100;
-    var req = std.posix.timespec{
-        .sec = @intCast(tick_ms / std.time.ms_per_s),
-        .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
-    };
     const preferred_bootstrap_campaigner = metadataClusterPreferredCampaigner(cluster_peers, local_node_id);
-    const bootstrap_campaign_retry_interval_ns = metadataBootstrapCampaignRetryIntervalNs(tick_ms);
+    const bootstrap_campaign_retry_interval_ns = metadataBootstrapCampaignRetryIntervalNs(cli.raft_tick_ms);
     var last_bootstrap_campaign_retry_ns = platform_time.monotonicNs();
-    var raft_progress = antfly.raft.ManagedProgressDriver.init(
-        init.io,
-        server.raftProgressSource(),
-        tick_ms * std.time.ns_per_ms,
-    );
-    defer raft_progress.deinit();
-    try raft_progress.start();
     while (true) {
         try raft_progress.check();
         if (preferred_bootstrap_campaigner) {
@@ -942,12 +948,7 @@ pub fn runFromIterator(
         if (cdc_round_elapsed_ns > std.time.ns_per_s) {
             std.log.warn("metadata runCdcRound slow elapsed_ms={d}", .{@divTrunc(cdc_round_elapsed_ns, std.time.ns_per_ms)});
         }
-        const err = std.posix.errno(std.posix.system.nanosleep(&req, &req));
-        switch (err) {
-            .SUCCESS => {},
-            .INTR => continue,
-            else => return std.posix.unexpectedErrno(err),
-        }
+        try raft_progress.waitForFailureOrTimeout(runtime_cadence.control_tick_ns);
     }
 }
 
@@ -1004,8 +1005,12 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.health_enabled = parseBoolFlag(arg["--health=".len..]) orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--tick-ms")) {
-            cfg.tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--raft-tick-ms")) {
+            cfg.raft_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--control-tick-ms")) {
+            cfg.control_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -1369,7 +1374,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --join                         Join an existing metadata cluster (not yet supported)
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
-        \\  --tick-ms <ms>                 Sleep interval while serving (default: 25)
+        \\  --raft-tick-ms <ms>            Consensus progress interval, 1-1000 (default: 100)
+        \\  --control-tick-ms <ms>         Control scheduling interval, 1-60000 (default: 100)
         \\  --data-dir <path>              Local storage root for metadata data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path

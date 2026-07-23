@@ -72,6 +72,15 @@ pub const ManagedServiceMetrics = struct {
     merge_ready_to_finalize: usize = 0,
 };
 
+const PendingUpdateLane = enum {
+    control,
+    raft,
+
+    fn deliversTransitions(self: PendingUpdateLane) bool {
+        return self == .control;
+    }
+};
+
 const TestSingleNodeFactory = struct {
     alloc: std.mem.Allocator,
     store: *raft_engine.core.MemoryStorage,
@@ -673,11 +682,7 @@ pub const ManagedHttpHostService = struct {
             self.cfg.max_ready_groups,
         );
         self.last_runtime_round = result.runtime;
-        try self.enqueueTransitionUpdates(self.pending_updates.items);
-        self.metrics.applied_updates += self.pending_updates.items.len;
-        self.metrics.sync_rounds += 1;
-        self.clearPending();
-        self.metrics.queued_updates = 0;
+        try self.finishPendingSync(.control);
         _ = try self.stepTransitions();
         return result;
     }
@@ -690,11 +695,7 @@ pub const ManagedHttpHostService = struct {
             self.cfg.max_ready_groups,
         );
         self.last_runtime_round = result.runtime;
-        try self.enqueueTransitionUpdates(self.pending_updates.items);
-        self.metrics.applied_updates += self.pending_updates.items.len;
-        self.metrics.sync_rounds += 1;
-        self.clearPending();
-        self.metrics.queued_updates = 0;
+        try self.finishPendingSync(.raft);
         return result;
     }
 
@@ -782,6 +783,18 @@ pub const ManagedHttpHostService = struct {
     fn clearPending(self: *ManagedHttpHostService) void {
         for (self.pending_updates.items) |*update| update.deinit(self.alloc);
         self.pending_updates.clearRetainingCapacity();
+    }
+
+    fn finishPendingSync(self: *ManagedHttpHostService, lane: PendingUpdateLane) !void {
+        // The dedicated Raft lane owns consensus progress and durable
+        // projection only. Transition-controller state is hydrated from that
+        // projection by the control lane; mutating it here would introduce a
+        // second writer racing observation and step execution.
+        if (lane.deliversTransitions()) try self.enqueueTransitionUpdates(self.pending_updates.items);
+        self.metrics.applied_updates += self.pending_updates.items.len;
+        self.metrics.sync_rounds += 1;
+        self.clearPending();
+        self.metrics.queued_updates = 0;
     }
 
     fn requestReadableLeaseViaRequester(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
@@ -1075,6 +1088,11 @@ test "metadata service managed host steps queued transitions only during control
 
     try std.testing.expectEqual(@as(usize, 0), svc.metrics.queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 1), svc.metrics.completed_split_transitions);
+}
+
+test "raft-only rounds do not deliver transition updates to the controller" {
+    try std.testing.expect(!PendingUpdateLane.raft.deliversTransitions());
+    try std.testing.expect(PendingUpdateLane.control.deliversTransitions());
 }
 
 test "managed host service queues transition metadata updates after sync" {

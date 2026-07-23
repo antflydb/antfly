@@ -123,6 +123,17 @@ pub const HostedReplicaStatus = enum {
     failed,
 };
 
+pub const PreparedReplica = struct {
+    factory: ReplicaDescriptorFactory,
+    descriptor: raft_engine.runtime.ReplicaDescriptor,
+    bootstrap_prepared: bool,
+
+    pub fn deinit(self: *PreparedReplica, alloc: std.mem.Allocator) void {
+        self.factory.freeDescriptor(alloc, &self.descriptor);
+        self.* = undefined;
+    }
+};
+
 pub const BootstrapStatusKind = enum {
     backup_db_snapshot_restore,
 };
@@ -297,52 +308,107 @@ pub const Host = struct {
     }
 
     pub fn ensureReplica(self: *Host, record: catalog.ReplicaRecord) !raft_engine.runtime.EnsureReplicaResult {
-        if (self.runtime_host.group(record.group_id) == null) {
-            if (record.backup_restore_bootstrap != null) {
-                self.noteBootstrapPreparing(record.group_id, .backup_db_snapshot_restore, record.backup_restore_bootstrap);
-                if (self.deps.backup_restore_bootstrapper) |bootstrapper| {
-                    bootstrapper.prepareBackupRestore(record) catch |err| {
-                        self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
-                        return err;
-                    };
-                } else if (self.cfg.replica_root_dir) |replica_root_dir| {
-                    backup_restore.applyBackupRestoreFromRecord(
-                        self.alloc,
-                        replica_root_dir,
-                        record.group_id,
-                        record.backup_restore_bootstrap.?,
-                    ) catch |err| {
-                        self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
-                        return err;
-                    };
-                } else {
-                    self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, error.MissingBackupRestoreBootstrapHandler, record.backup_restore_bootstrap);
-                    return error.MissingBackupRestoreBootstrapHandler;
-                }
+        const prepare_bootstrap = !self.hasReplica(record.group_id) and record.backup_restore_bootstrap != null;
+        if (prepare_bootstrap) self.noteReplicaBootstrapPreparing(record);
+        var prepared = self.prepareReplica(record, prepare_bootstrap) catch |err| {
+            if (prepare_bootstrap) self.noteReplicaBootstrapPreparationFailure(record, err);
+            return err;
+        };
+        defer prepared.deinit(self.alloc);
+        return try self.installPreparedReplica(record, &prepared);
+    }
+
+    pub fn hasReplica(self: *Host, group_id: u64) bool {
+        return self.runtime_host.group(group_id) != null;
+    }
+
+    /// Performs filesystem, descriptor, and catalog durability work without
+    /// mutating the live Raft runtime. Callers must serialize reconcile plans,
+    /// but Raft progress may continue concurrently while this method runs.
+    pub fn prepareReplica(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepare_bootstrap: bool,
+    ) !PreparedReplica {
+        const should_prepare_bootstrap = prepare_bootstrap and record.backup_restore_bootstrap != null;
+        if (should_prepare_bootstrap) {
+            if (self.deps.backup_restore_bootstrapper) |bootstrapper| {
+                try bootstrapper.prepareBackupRestore(record);
+            } else if (self.cfg.replica_root_dir) |replica_root_dir| {
+                try backup_restore.applyBackupRestoreFromRecord(
+                    self.alloc,
+                    replica_root_dir,
+                    record.group_id,
+                    record.backup_restore_bootstrap.?,
+                );
+            } else {
+                return error.MissingBackupRestoreBootstrapHandler;
             }
         }
 
         const factory = self.deps.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;
-        var desc = try factory.buildDescriptor(record);
-        defer factory.freeDescriptor(self.alloc, &desc);
-
-        desc.group.raft_config.trace_logger = self.cfg.trace_logger orelse
+        var descriptor = try factory.buildDescriptor(record);
+        errdefer factory.freeDescriptor(self.alloc, &descriptor);
+        descriptor.group.raft_config.trace_logger = self.cfg.trace_logger orelse
             if (comptime build_options.with_tla) tracing.stderrRaftTraceLogger() else null;
 
-        const result = self.runtime_host.ensureReplica(desc) catch |err| {
-            if (record.backup_restore_bootstrap != null) {
+        // Persist admission before publication. A crash between these steps
+        // leaves a recoverable catalog entry instead of an untracked live group.
+        if (self.deps.replica_catalog) |replica_catalog| {
+            try replica_catalog.upsertReplica(record);
+        }
+        return .{
+            .factory = factory,
+            .descriptor = descriptor,
+            .bootstrap_prepared = should_prepare_bootstrap,
+        };
+    }
+
+    /// Publishes a fully prepared descriptor into the single-owner runtime.
+    /// This method must execute under the runtime owner's serialization lock.
+    pub fn installPreparedReplica(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepared: *PreparedReplica,
+    ) !raft_engine.runtime.EnsureReplicaResult {
+        const result = self.runtime_host.ensureReplica(prepared.descriptor) catch |err| {
+            if (prepared.bootstrap_prepared) {
                 self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
             }
             return err;
         };
         self.metrics.ensure_replica_calls += 1;
-        if (record.backup_restore_bootstrap != null) {
+        if (prepared.bootstrap_prepared) {
             self.noteBootstrapSuccess(record.group_id, .backup_db_snapshot_restore, record.backup_restore_bootstrap);
         }
-        if (self.deps.replica_catalog) |replica_catalog| {
-            try replica_catalog.upsertReplica(record);
-        }
         return result;
+    }
+
+    pub fn noteReplicaBootstrapPreparing(self: *Host, record: catalog.ReplicaRecord) void {
+        if (record.backup_restore_bootstrap == null) return;
+        self.noteBootstrapPreparing(record.group_id, .backup_db_snapshot_restore, record.backup_restore_bootstrap);
+    }
+
+    pub fn noteReplicaBootstrapPreparationFailure(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        err: anyerror,
+    ) void {
+        if (record.backup_restore_bootstrap == null) return;
+        self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
+    }
+
+    pub fn prepareReplicaRemoval(self: *Host, group_id: u64) !void {
+        if (self.deps.replica_catalog) |replica_catalog| {
+            _ = try replica_catalog.removeReplica(group_id);
+        }
+    }
+
+    pub fn removePreparedReplica(self: *Host, group_id: u64) !void {
+        if (self.runtime_host.group(group_id) == null) return error.UnknownGroup;
+        try self.runtime_host.removeReplica(group_id);
+        self.metrics.remove_replica_calls += 1;
+        self.clearBootstrapStatus(group_id);
     }
 
     pub fn restoreReplicasFromCatalog(self: *Host, alloc: std.mem.Allocator) !usize {

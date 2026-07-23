@@ -39,6 +39,7 @@ const raft_catalog = @import("../raft/catalog.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_managed_host = @import("../raft/managed_host.zig");
 const raft_service = @import("../raft/service.zig");
+const raft_transition_service = @import("../raft/transition_service.zig");
 const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
@@ -437,6 +438,26 @@ pub const MetadataHttpServiceDeps = struct {
 };
 
 pub const MetadataStatus = metadata_api.MetadataStatus;
+
+fn applyTransitionMetrics(
+    target: *raft_service.ManagedServiceMetrics,
+    source: raft_transition_service.TransitionServiceMetrics,
+) void {
+    target.queued_split_transitions = source.queued_split_transitions;
+    target.queued_merge_transitions = source.queued_merge_transitions;
+    target.stepped_split_transitions = source.stepped_split_transitions;
+    target.stepped_merge_transitions = source.stepped_merge_transitions;
+    target.completed_split_transitions = source.completed_split_transitions;
+    target.completed_merge_transitions = source.completed_merge_transitions;
+    target.awaiting_split_source_start = source.awaiting_split_source_start;
+    target.bootstrapping_split_destination = source.bootstrapping_split_destination;
+    target.split_replay_blocked = source.split_replay_blocked;
+    target.split_ready_to_finalize = source.split_ready_to_finalize;
+    target.awaiting_merge_receiver_acceptance = source.awaiting_merge_receiver_acceptance;
+    target.bootstrapping_merge_receiver = source.bootstrapping_merge_receiver;
+    target.merge_replay_blocked = source.merge_replay_blocked;
+    target.merge_ready_to_finalize = source.merge_ready_to_finalize;
+}
 
 const LinearizableMetadataReadTracker = struct {
     alloc: std.mem.Allocator,
@@ -2661,6 +2682,9 @@ pub const MetadataHttpService = struct {
     cdc_runtime_mutex: std.Io.Mutex = .init,
     reconcile_lease: metadata_reconcile_lease.State,
     runtime_mutex: std.Io.Mutex = .init,
+    transition_mutex: std.Io.Mutex = .init,
+    transition_metrics_mutex: std.Io.Mutex = .init,
+    transition_metrics_snapshot: raft_transition_service.TransitionServiceMetrics = .{},
     lifecycle_signal: LifecycleSignal,
     lifecycle_reconcile_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     lifecycle_reconcile_hook: ?LifecycleReconcileHook = null,
@@ -2753,6 +2777,7 @@ pub const MetadataHttpService = struct {
         read_tracker_owned = false;
         owned_backend_runtime = null;
         errdefer service.deinit();
+        service.publishTransitionMetricsLocked();
         try foreign_mod.registerDefaultPostgresExecutor(alloc, &service.cdc_backfill_registry);
         return service;
     }
@@ -3258,7 +3283,7 @@ pub const MetadataHttpService = struct {
         try self.runLifecycleReconcileHookIfRequested();
         run_round_trace.recordSince("run_lifecycle_reconcile_hook", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
-        _ = try self.raft.stepTransitions();
+        _ = try self.stepTransitions();
         run_round_trace.recordSince("step_post_reconcile_transitions", phase_start_ns);
     }
 
@@ -3328,7 +3353,7 @@ pub const MetadataHttpService = struct {
         try self.completeRestoreIntentsIfReady(&local_projection_inputs, &local_placement_inputs);
         try self.runReplicationBackfillRound();
         try self.runLifecycleReconcileHookIfRequested();
-        _ = try self.raft.stepTransitions();
+        _ = try self.stepTransitions();
     }
 
     pub fn runCdcRound(self: *MetadataHttpService) !void {
@@ -3395,19 +3420,47 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn observeSplitTransition(self: *MetadataHttpService, transition_id: u64) !?transition_state.SplitObservation {
+        self.transition_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.transition_mutex.unlock(std.Options.debug_io);
         return try self.raft.observeSplitTransition(transition_id);
     }
 
     pub fn observeMergeTransition(self: *MetadataHttpService, transition_id: u64) !?transition_state.MergeObservation {
+        self.transition_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.transition_mutex.unlock(std.Options.debug_io);
         return try self.raft.observeMergeTransition(transition_id);
     }
 
+    fn stepTransitions(self: *MetadataHttpService) !raft_transition_service.TransitionStepResult {
+        self.transition_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.transition_mutex.unlock(std.Options.debug_io);
+        defer self.publishTransitionMetricsLocked();
+        return try self.raft.stepTransitions();
+    }
+
     pub fn syncPending(self: *MetadataHttpService) !raft_managed_host.ManagedSyncResult {
+        self.lockRuntime();
+        defer self.unlockRuntime();
         return try self.raft.syncPendingRaftOnly();
     }
 
     pub fn metrics(self: *MetadataHttpService) raft_service.ManagedServiceMetrics {
-        return self.raft.metrics;
+        // Runtime counters and transition counters have independent writers.
+        // Copy each domain under its short publication lock so a slow
+        // transition RPC never blocks health or metrics endpoints.
+        var snapshot = raft_service.ManagedServiceMetrics{};
+        self.lockRuntime();
+        snapshot.queued_updates = self.raft.metrics.queued_updates;
+        snapshot.applied_updates = self.raft.metrics.applied_updates;
+        snapshot.sync_rounds = self.raft.metrics.sync_rounds;
+        snapshot.read_lease_requests = self.raft.metrics.read_lease_requests;
+        self.unlockRuntime();
+
+        self.transition_metrics_mutex.lockUncancelable(std.Options.debug_io);
+        const transition_metrics = self.transition_metrics_snapshot;
+        self.transition_metrics_mutex.unlock(std.Options.debug_io);
+        applyTransitionMetrics(&snapshot, transition_metrics);
+        return snapshot;
     }
 
     pub fn head(self: *MetadataHttpService) metadata_api.MetadataHead {
@@ -3683,8 +3736,19 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn adminSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
+        return try self.buildAdminSnapshot(true);
+    }
+
+    /// Returns projected topology without observing live transitions. This is
+    /// safe to call from transition execution while the controller is owned by
+    /// the control lane.
+    pub fn topologySnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
+        return try self.buildAdminSnapshot(false);
+    }
+
+    fn buildAdminSnapshot(self: *MetadataHttpService, include_detailed_status: bool) !metadata_api.AdminSnapshot {
         var snapshot: metadata_api.AdminSnapshot = .{
-            .status = try self.metadataStatus(),
+            .status = if (include_detailed_status) try self.metadataStatus() else self.fallbackStatus(),
             .tables = &.{},
             .ranges = &.{},
             .stores = &.{},
@@ -4220,6 +4284,9 @@ pub const MetadataHttpService = struct {
     }
 
     fn refreshLocalTransitions(self: *MetadataHttpService, round_inputs: ?*const LocalTransitionInputs) !void {
+        self.transition_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.transition_mutex.unlock(std.Options.debug_io);
+        defer self.publishTransitionMetricsLocked();
         const transition_svc = if (self.raft.transition_svc) |*svc| svc else return;
         const current_epoch = self.transition_epoch.load(.monotonic);
         if (!shouldRefreshLocalEpoch(
@@ -4277,6 +4344,15 @@ pub const MetadataHttpService = struct {
         self.raft.metrics.queued_merge_transitions = transition_svc.metrics.queued_merge_transitions;
         self.local_transition_epoch = current_epoch;
         self.last_local_transition_refresh_at_ms = nowMs();
+    }
+
+    /// Publishes a fixed-size transition metric snapshot. The caller owns the
+    /// transition mutex (or is still in single-threaded initialization).
+    fn publishTransitionMetricsLocked(self: *MetadataHttpService) void {
+        const snapshot: raft_transition_service.TransitionServiceMetrics = if (self.raft.transition_svc) |*svc| svc.metrics else .{};
+        self.transition_metrics_mutex.lockUncancelable(std.Options.debug_io);
+        self.transition_metrics_snapshot = snapshot;
+        self.transition_metrics_mutex.unlock(std.Options.debug_io);
     }
 
     fn refreshLocalTableProvisioning(self: *MetadataHttpService, round_inputs: ?*const LocalProjectionInputs) !metadata_table_provisioner.ProvisionSummary {

@@ -2919,7 +2919,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_common_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "provider registry", "std http listener", "std http executor" },
+        .filters = &.{ "provider registry", "std http listener", "std http executor", "threaded connector" },
     });
     const run_lib_common_tests = addFilteredTestRunArtifact(b, lib_common_tests);
     const lib_common_test_step = b.step("lib-common-test", "Run common/provider registry tests");
@@ -3308,6 +3308,8 @@ pub fn build(b: *std.Build) void {
     const raft_runtime_default_filters = [_][]const u8{
         "managed raft progress driver advances independently and joins on stop",
         "managed raft progress driver publishes source failure",
+        "managed raft progress driver stop interrupts a long cadence wait",
+        "raft runtime cadence validates independent intervals",
     };
     const raft_runtime_tests = b.addTest(.{
         .root_module = raft_runtime_test_mod,

@@ -94,7 +94,7 @@ const CliConfig = struct {
     bind_port: ?u16 = null,
     health_enabled: ?bool = null,
     health_port: ?u16 = null,
-    tick_ms: ?u64 = null,
+    control_tick_ms: u64 = antfly.raft.RuntimeCadence.default_control_tick_ms,
     local_node_id: ?u64 = null,
     auth_enabled: ?bool = null,
     ard_base_url: ?[]const u8 = null,
@@ -1584,7 +1584,11 @@ pub fn runFromIterator(
     // Print only after the public listener has successfully bound.
     std.debug.print("standalone local metadata enabled (raft disabled)\n", .{});
 
-    const tick_ms = cli.tick_ms orelse 100;
+    const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
+        antfly.raft.RuntimeCadence.default_raft_tick_ms,
+        cli.control_tick_ms,
+    ) catch return error.InvalidArguments;
+    const tick_ms = @divExact(runtime_cadence.control_tick_ns, std.time.ns_per_ms);
     var req = std.posix.timespec{
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
@@ -2820,8 +2824,8 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.health_enabled = parseBoolFlag(arg["--health=".len..]) orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--tick-ms")) {
-            cfg.tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--control-tick-ms")) {
+            cfg.control_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--auth")) {
@@ -3636,7 +3640,7 @@ fn printUsage() void {
         \\  --ard-publisher-domain <name>         ARD did:web publisher domain (default: antfly.local)
         \\  --ard-display-name <name>             ARD catalog host display name (default: Antfly)
         \\  --ard-public-catalog <bool>           Publish anonymous /.well-known ARD bootstrap when auth is enabled
-        \\  --tick-ms <ms>                        Sleep interval while serving (default: 25)
+        \\  --control-tick-ms <ms>                Control scheduling interval, 1-60000 (default: 100)
         \\  --models-dir <path>                   Embedded AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <path>                       Embedded Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --inference-host-budget-mb <n>        Embedded inference native generation host budget override

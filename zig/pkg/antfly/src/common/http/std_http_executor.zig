@@ -15,6 +15,7 @@
 const std = @import("std");
 const common = @import("http_common.zig");
 const std_http_listener = @import("std_http_listener.zig");
+const threaded_connect_io = @import("threaded_connect_io.zig");
 
 pub const StdHttpExecutorConfig = struct {
     read_buffer_size: usize = 8 * 1024,
@@ -36,6 +37,7 @@ pub const StdHttpExecutor = struct {
     alloc: std.mem.Allocator,
     cfg: StdHttpExecutorConfig,
     io_impl: *std.Io.Threaded,
+    io_vtable: *std.Io.VTable,
     io_owner: IoOwner,
     client: std.http.Client,
     lifecycle_mutex: std.Io.Mutex,
@@ -49,10 +51,12 @@ pub const StdHttpExecutor = struct {
     pub fn initInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig) void {
         const io_impl = alloc.create(std.Io.Threaded) catch @panic("OOM");
         io_impl.* = std.Io.Threaded.init(alloc, .{ .stack_size = cfg.thread_stack_size });
+        const io_vtable = threaded_connect_io.createVTable(alloc, io_impl) catch @panic("OOM");
         self.* = .{
             .alloc = alloc,
             .cfg = cfg,
             .io_impl = io_impl,
+            .io_vtable = io_vtable,
             .io_owner = .owned,
             .client = undefined,
             .lifecycle_mutex = .init,
@@ -65,17 +69,19 @@ pub const StdHttpExecutor = struct {
         };
         self.client = .{
             .allocator = alloc,
-            .io = io_impl.io(),
+            .io = threaded_connect_io.io(io_impl, io_vtable),
             .read_buffer_size = cfg.read_buffer_size,
             .write_buffer_size = cfg.write_buffer_size,
         };
     }
 
     pub fn initSharedInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig, io_impl: *std.Io.Threaded) void {
+        const io_vtable = threaded_connect_io.createVTable(alloc, io_impl) catch @panic("OOM");
         self.* = .{
             .alloc = alloc,
             .cfg = cfg,
             .io_impl = io_impl,
+            .io_vtable = io_vtable,
             .io_owner = .shared,
             .client = undefined,
             .lifecycle_mutex = .init,
@@ -88,7 +94,7 @@ pub const StdHttpExecutor = struct {
         };
         self.client = .{
             .allocator = alloc,
-            .io = io_impl.io(),
+            .io = threaded_connect_io.io(io_impl, io_vtable),
             .read_buffer_size = cfg.read_buffer_size,
             .write_buffer_size = cfg.write_buffer_size,
         };
@@ -110,6 +116,7 @@ pub const StdHttpExecutor = struct {
         self.lifecycle_mutex.unlock(io);
 
         self.client.deinit();
+        self.alloc.destroy(self.io_vtable);
         if (self.io_owner == .owned) {
             self.io_impl.deinit();
             self.alloc.destroy(self.io_impl);
@@ -196,7 +203,7 @@ pub const StdHttpExecutor = struct {
     }
 
     fn executeDirect(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
-        const io = self.io_impl.io();
+        const io = threaded_connect_io.io(self.io_impl, self.io_vtable);
         if (self.cfg.keep_alive) self.client_mutex.lockUncancelable(io);
         defer if (self.cfg.keep_alive) self.client_mutex.unlock(io);
 

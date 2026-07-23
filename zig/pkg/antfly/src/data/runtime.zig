@@ -75,6 +75,30 @@ const provision_head_poll_interval_ms: u64 = 5 * std.time.ms_per_s;
 const runtime_status_refresh_interval_ms: u64 = std.time.ms_per_s;
 const split_transition_batch_leader_wait_ns: u64 = 500 * std.time.ns_per_ms;
 const split_transition_source_leader_wait_ns: u64 = 5 * std.time.ns_per_s;
+const transition_action_lane_count: usize = 64;
+
+const TransitionActionLanes = struct {
+    mutexes: [transition_action_lane_count]std.atomic.Mutex =
+        [_]std.atomic.Mutex{.unlocked} ** transition_action_lane_count,
+
+    const Lease = struct {
+        mutex: *std.atomic.Mutex,
+
+        fn deinit(self: *Lease) void {
+            self.mutex.unlock();
+            self.* = undefined;
+        }
+    };
+
+    fn tryAcquire(self: *TransitionActionLanes, group_id: u64) ?Lease {
+        comptime std.debug.assert(std.math.isPowerOfTwo(transition_action_lane_count));
+        const mixed = group_id ^ (group_id >> 33) ^ (group_id >> 17);
+        const index: usize = @intCast(mixed & (transition_action_lane_count - 1));
+        const mutex = &self.mutexes[index];
+        if (!mutex.tryLock()) return null;
+        return .{ .mutex = mutex };
+    }
+};
 const runtime_status_refresh_max_db_opens_per_run: usize = 16;
 const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_s;
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
@@ -567,7 +591,8 @@ const CliConfig = struct {
     store_id: ?u64 = null,
     store_role: ?[]const u8 = null,
     failure_domain: ?[]const u8 = null,
-    tick_ms: ?u64 = null,
+    raft_tick_ms: u64 = antfly.raft.RuntimeCadence.default_raft_tick_ms,
+    control_tick_ms: u64 = antfly.raft.RuntimeCadence.default_control_tick_ms,
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
@@ -947,6 +972,7 @@ fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
 /// remote metadata API.
 pub const HealthSource = struct {
     data_server: *DataServer,
+    raft_progress: ?*const antfly.raft.ManagedProgressDriver = null,
     lsm_maintenance_metrics_mutex: std.atomic.Mutex = .unlocked,
     lsm_maintenance_metrics_stats: lsm_backend_mod.Backend.MaintenanceStats = .{},
     lsm_maintenance_metrics_built_at_ns: u64 = 0,
@@ -977,7 +1003,9 @@ pub const HealthSource = struct {
 
     fn checkReady(ptr: *anyopaque) bool {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
-        return self.data_server.http_server != null and self.data_server.listener != null;
+        return self.data_server.http_server != null and
+            self.data_server.listener != null and
+            (self.raft_progress == null or self.raft_progress.?.isHealthy());
     }
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
@@ -2555,6 +2583,11 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         error.ProposalDropped,
         error.LeaderTransferInProgress,
         error.StoreRegistrationNotVisible,
+        // Destination admission intentionally fails closed while another
+        // table/group lifecycle owner is active. Retrying through the bounded
+        // control-plane backoff preserves that exclusion without terminating
+        // the data process and permanently removing a destination voter.
+        error.TransitionDestinationProvisioningBusy,
         // Placement projection is multi-row. A store can observe its local
         // row before every row needed to prove the incumbent voter set is
         // visible. Refusing to bootstrap from that partial set is required,
@@ -2603,7 +2636,26 @@ test "data runtime treats metadata leadership churn as retryable bootstrap failu
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRegistrationNotVisible));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MissingAuthoritativeBootstrapVoters));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.TransitionDestinationProvisioningBusy));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidArguments));
+}
+
+test "replicated transition action lanes fail fast without serializing unrelated groups" {
+    var lanes = TransitionActionLanes{};
+    var first = lanes.tryAcquire(100) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(lanes.tryAcquire(100) == null);
+
+    var independent: ?TransitionActionLanes.Lease = null;
+    for (101..101 + transition_action_lane_count) |group_id| {
+        independent = lanes.tryAcquire(group_id);
+        if (independent != null) break;
+    }
+    var other = independent orelse return error.TestUnexpectedResult;
+    defer other.deinit();
+
+    first.deinit();
+    var reacquired = lanes.tryAcquire(100) orelse return error.TestUnexpectedResult;
+    defer reacquired.deinit();
 }
 
 test "data runtime metadata bootstrap retry delay is bounded and jittered" {
@@ -3061,7 +3113,11 @@ pub const DataServer = struct {
     metadata_http_service: ?*antfly.metadata_service.MetadataHttpService = null,
     data_raft: ?*antfly.raft.ManagedHttpHostService = null,
     data_raft_mutex: std.atomic.Mutex = .unlocked,
+    /// Serializes desired-state snapshots while allowing the Raft progress
+    /// thread to continue during blocking restore and catalog durability I/O.
+    data_raft_reconcile_mutex: std.atomic.Mutex = .unlocked,
     local_transition_mutex: std.atomic.Mutex = .unlocked,
+    replicated_transition_action_lanes: TransitionActionLanes = .{},
     data_raft_factory: ?*DataDescriptorFactory = null,
     data_raft_store: ?*raft_engine.core.MemoryStorage = null,
     data_raft_apply: ?*RaftTableApplyStateMachine = null,
@@ -5684,8 +5740,10 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.local_transition_runtime) |runtime| return try runtime.shardOperationAdapter().observeSplit(record);
         if (self.data_raft != null) {
-            lockAtomic(&self.local_transition_mutex);
-            defer self.local_transition_mutex.unlock();
+            // Replicated observations are synchronized by the apply store's
+            // per-shard mutex. They must remain available while a transition
+            // action performs metadata or destination I/O; otherwise that I/O
+            // can recursively request an observation and deadlock.
             return .{ .status = try self.observeReplicatedSplit(record.transition_id, record.attempt_epoch, record.source_group_id, record.destination_group_id) };
         }
         lockAtomic(&self.local_transition_mutex);
@@ -5769,8 +5827,9 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
-            lockAtomic(&self.local_transition_mutex);
-            defer self.local_transition_mutex.unlock();
+            var lane = self.replicated_transition_action_lanes.tryAcquire(op.source_group_id) orelse
+                return error.TransitionOperationBusy;
+            defer lane.deinit();
             try self.replicateSplitSourceTransition(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, .prepare, op.split_key);
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .prepare_split_source = op });
@@ -5788,8 +5847,9 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
-            lockAtomic(&self.local_transition_mutex);
-            defer self.local_transition_mutex.unlock();
+            var lane = self.replicated_transition_action_lanes.tryAcquire(op.source_group_id) orelse
+                return error.TransitionOperationBusy;
+            defer lane.deinit();
             try self.replicateSplitSourceTransition(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, .start, "");
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .start_split_source = op });
@@ -5807,8 +5867,9 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
-            lockAtomic(&self.local_transition_mutex);
-            defer self.local_transition_mutex.unlock();
+            var lane = self.replicated_transition_action_lanes.tryAcquire(op.source_group_id) orelse
+                return error.TransitionOperationBusy;
+            defer lane.deinit();
             try self.replicateSplitBootstrap(
                 op.transition_id,
                 op.attempt_epoch,
@@ -5831,8 +5892,9 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
-            lockAtomic(&self.local_transition_mutex);
-            defer self.local_transition_mutex.unlock();
+            var lane = self.replicated_transition_action_lanes.tryAcquire(op.source_group_id) orelse
+                return error.TransitionOperationBusy;
+            defer lane.deinit();
             try self.replicateSplitCatchUp(
                 op.transition_id,
                 op.attempt_epoch,
@@ -6145,8 +6207,9 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
-            lockAtomic(&self.local_transition_mutex);
-            defer self.local_transition_mutex.unlock();
+            var lane = self.replicated_transition_action_lanes.tryAcquire(op.source_group_id) orelse
+                return error.TransitionOperationBusy;
+            defer lane.deinit();
             try self.replicateSplitSourceTransition(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, .finalize, "");
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .finalize_split_source = op });
@@ -6164,8 +6227,9 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
-            lockAtomic(&self.local_transition_mutex);
-            defer self.local_transition_mutex.unlock();
+            var lane = self.replicated_transition_action_lanes.tryAcquire(op.source_group_id) orelse
+                return error.TransitionOperationBusy;
+            defer lane.deinit();
             try self.replicateSplitSourceTransition(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, .rollback, "");
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .rollback_split = op });
@@ -7441,6 +7505,9 @@ pub const DataServer = struct {
         const factory = self.data_raft_factory orelse return;
         const registration = self.store_registration orelse return;
 
+        lockAtomic(&self.data_raft_reconcile_mutex);
+        defer self.data_raft_reconcile_mutex.unlock();
+
         var placement_topology = try PlacementTopologyIndex.initForSnapshot(
             self.alloc,
             snapshot.placement_intents,
@@ -7521,16 +7588,36 @@ pub const DataServer = struct {
         defer self.alloc.free(active_group_ids);
         for (local_intents.items, active_group_ids) |intent, *group_id| group_id.* = intent.record.group_id;
 
-        lockAtomic(&self.data_raft_mutex);
-        defer self.data_raft_mutex.unlock();
         // Admit old-or-new before reconciliation because host reconciliation
         // can have partial side effects before returning an error. Exact new
         // placement is committed only after the host converges.
         var apply_group_transition = try raft.beginDataApplyGroupTransition(active_group_ids);
         defer if (apply_group_transition) |*transition| transition.deinit();
-        try factory.replacePeerSets(local_intents.items, &placement_topology);
-        try raft.host.replacePlacementIntents(local_intents.items);
-        _ = try raft.host.reconcileOnce();
+
+        var reconcile = reconcile: {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            try factory.replacePeerSets(local_intents.items, &placement_topology);
+            try raft.host.replacePlacementIntents(local_intents.items);
+            var prepared = try raft.host.prepareReconcile();
+            prepared.beginPreparation();
+            break :reconcile prepared;
+        };
+        defer reconcile.deinit();
+
+        // Restore, descriptor construction, and catalog fsync happen here,
+        // outside the Raft owner lock. The dedicated progress driver can keep
+        // elections, heartbeats, committed apply, and transport moving.
+        reconcile.prepareDurable() catch |err| {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            reconcile.notePreparationFailure(err);
+            return err;
+        };
+
+        lockAtomic(&self.data_raft_mutex);
+        defer self.data_raft_mutex.unlock();
+        _ = try reconcile.commit();
         if (apply_group_transition) |*transition| transition.commit();
         if (updates.items.len > 0) try raft.host.applyBatch(updates.items);
         for (local_intents.items) |intent| {
@@ -13083,6 +13170,10 @@ pub fn runFromIterator(
         printUsage(argv0);
         return;
     }
+    const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
+        cli.raft_tick_ms,
+        cli.control_tick_ms,
+    ) catch return error.InvalidArguments;
 
     var secret_store: antfly.common.secrets.FileStore = undefined;
     var secret_store_initialized = false;
@@ -13207,7 +13298,18 @@ pub fn runFromIterator(
     if (metadata_api_urls.urls.len > 1) std.debug.print(" (+{d} more)", .{metadata_api_urls.urls.len - 1});
     std.debug.print("\n", .{});
 
-    var data_health = HealthSource{ .data_server = &data_server };
+    var raft_progress = antfly.raft.ManagedProgressDriver.init(
+        init.io,
+        data_server.raftProgressSource(),
+        runtime_cadence.raft_tick_ns,
+    );
+    defer raft_progress.deinit();
+    if (data_server.data_raft != null) try raft_progress.start();
+
+    var data_health = HealthSource{
+        .data_server = &data_server,
+        .raft_progress = if (data_server.data_raft != null) &raft_progress else null,
+    };
     const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
     const health_port = if (health_enabled)
         cli.health_port orelse if (loaded_config) |*cfg| cfg.health_port else antfly.common.config.default_health_port
@@ -13222,18 +13324,6 @@ pub fn runFromIterator(
     );
     defer if (health_server) |hs| hs.deinit();
 
-    const tick_ms = cli.tick_ms orelse 100;
-    var req = std.posix.timespec{
-        .sec = @intCast(tick_ms / std.time.ms_per_s),
-        .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
-    };
-    var raft_progress = antfly.raft.ManagedProgressDriver.init(
-        init.io,
-        data_server.raftProgressSource(),
-        tick_ms * std.time.ns_per_ms,
-    );
-    defer raft_progress.deinit();
-    if (data_server.data_raft != null) try raft_progress.start();
     while (true) {
         if (data_server.data_raft != null) try raft_progress.check();
         data_server.runControlRoundOnly() catch |err| {
@@ -13243,11 +13333,13 @@ pub fn runFromIterator(
             std.log.err("data server round failed err={s}", .{@errorName(err)});
             return err;
         };
-        const err = std.posix.errno(std.posix.system.nanosleep(&req, &req));
-        switch (err) {
-            .SUCCESS => {},
-            .INTR => continue,
-            else => return std.posix.unexpectedErrno(err),
+        if (data_server.data_raft != null) {
+            try raft_progress.waitForFailureOrTimeout(runtime_cadence.control_tick_ns);
+        } else {
+            try init.io.sleep(
+                std.Io.Duration.fromNanoseconds(runtime_cadence.control_tick_ns),
+                .awake,
+            );
         }
     }
 }
@@ -13343,8 +13435,12 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.failure_domain = args.next() orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--tick-ms")) {
-            cfg.tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--raft-tick-ms")) {
+            cfg.raft_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--control-tick-ms")) {
+            cfg.control_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -13654,7 +13750,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --store-id <id>                Register this split data process as metadata store <id>
         \\  --store-role <role>            Registered store role (default: data)
         \\  --failure-domain <name>        Registered store failure domain
-        \\  --tick-ms <ms>                 Sleep interval while serving (default: 25)
+        \\  --raft-tick-ms <ms>            Consensus progress interval, 1-1000 (default: 100)
+        \\  --control-tick-ms <ms>         Control scheduling interval, 1-60000 (default: 100)
         \\  --data-dir <path>              Local storage root for data node data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path

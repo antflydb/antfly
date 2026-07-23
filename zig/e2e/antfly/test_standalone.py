@@ -178,7 +178,7 @@ class EmbeddedInferenceStandaloneServer:
             str(self.public_port),
             "--health-port",
             str(self.health_port),
-            "--tick-ms",
+            "--control-tick-ms",
             "5",
             "--models-dir",
             str(self.models_dir),

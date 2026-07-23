@@ -32,6 +32,10 @@ pub const CatalogSource = struct {
     pub const VTable = struct {
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        /// Returns projected catalog/topology state without invoking live
+        /// transition observations. Internal transition planning uses this to
+        /// avoid recursively entering its own controller.
+        topology_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         /// Production sources must fail closed when either linearizable
         /// publication validator is unavailable.
         requires_linearizable_publication_fence: bool = false,
@@ -42,6 +46,11 @@ pub const CatalogSource = struct {
 
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
         return try self.vtable.admin_snapshot(self.ptr);
+    }
+
+    pub fn topologySnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
+        const snapshot = self.vtable.topology_snapshot orelse self.vtable.admin_snapshot;
+        return try snapshot(self.ptr);
     }
 
     pub fn freeAdminSnapshot(self: CatalogSource, snapshot: *metadata_api.AdminSnapshot) void {
@@ -76,6 +85,7 @@ pub const CatalogSource = struct {
             .ptr = svc,
             .vtable = &.{
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
+                .topology_snapshot = metadataHttpServiceTopologySnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataHttpServiceValidatePublication,
@@ -124,6 +134,45 @@ fn emptyAdminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
 }
 
 fn emptyFreeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+test "catalog topology snapshots use the non-observing callback" {
+    const Source = struct {
+        admin_calls: usize = 0,
+        topology_calls: usize = 0,
+
+        fn catalog(self: *@This()) CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .topology_snapshot = topologySnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.admin_calls += 1;
+            return emptyAdminSnapshot(undefined);
+        }
+
+        fn topologySnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.topology_calls += 1;
+            return emptyAdminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = Source{};
+    const catalog = source.catalog();
+    var snapshot = try catalog.topologySnapshot();
+    catalog.freeAdminSnapshot(&snapshot);
+    try std.testing.expectEqual(@as(usize, 0), source.admin_calls);
+    try std.testing.expectEqual(@as(usize, 1), source.topology_calls);
+}
 
 pub const TableRangeRef = struct {
     group_id: u64,
@@ -364,6 +413,11 @@ fn metadataServiceValidateTablePublication(ptr: *anyopaque, contract: metadata_a
 fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return try svc.adminSnapshot();
+}
+
+fn metadataHttpServiceTopologySnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.topologySnapshot();
 }
 
 fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {

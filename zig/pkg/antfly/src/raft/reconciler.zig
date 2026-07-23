@@ -243,6 +243,97 @@ pub const ReconcileResult = struct {
     membership_proposals: usize = 0,
 };
 
+const PreparedEnsure = struct {
+    intent_index: usize,
+    intent_hash: u64,
+    prepare_bootstrap: bool,
+    replica: ?host_mod.PreparedReplica = null,
+};
+
+/// An immutable desired-state snapshot split into a blocking durability phase
+/// and a short live-runtime publication phase. The caller serializes plans and
+/// executes begin/commit while holding the Raft owner's lock; prepareDurable
+/// deliberately runs without that lock so consensus progress cannot be
+/// blocked by restore I/O, descriptor construction, or catalog fsync.
+pub const PreparedReconcile = struct {
+    owner: *Reconciler,
+    intents: []PlacementIntent,
+    ensures: []PreparedEnsure,
+    removals: []u64,
+    failed_ensure_index: ?usize = null,
+    durability_complete: bool = false,
+    committed: bool = false,
+
+    pub fn deinit(self: *PreparedReconcile) void {
+        for (self.ensures) |*entry| {
+            if (entry.replica) |*replica| replica.deinit(self.owner.alloc);
+        }
+        self.owner.alloc.free(self.ensures);
+        self.owner.alloc.free(self.removals);
+        freeIntentSlice(self.owner.alloc, self.intents);
+        self.* = undefined;
+    }
+
+    pub fn beginPreparation(self: *PreparedReconcile) void {
+        for (self.ensures) |entry| {
+            if (!entry.prepare_bootstrap) continue;
+            self.owner.host.noteReplicaBootstrapPreparing(self.intents[entry.intent_index].record);
+        }
+    }
+
+    pub fn prepareDurable(self: *PreparedReconcile) !void {
+        if (self.durability_complete or self.committed) return error.InvalidReconcilePhase;
+        for (self.ensures, 0..) |*entry, index| {
+            const record = self.intents[entry.intent_index].record;
+            entry.replica = self.owner.host.prepareReplica(record, entry.prepare_bootstrap) catch |err| {
+                self.failed_ensure_index = index;
+                return err;
+            };
+        }
+        for (self.removals) |group_id| try self.owner.host.prepareReplicaRemoval(group_id);
+        self.durability_complete = true;
+    }
+
+    pub fn notePreparationFailure(self: *PreparedReconcile, err: anyerror) void {
+        const index = self.failed_ensure_index orelse return;
+        const entry = self.ensures[index];
+        if (!entry.prepare_bootstrap) return;
+        self.owner.host.noteReplicaBootstrapPreparationFailure(
+            self.intents[entry.intent_index].record,
+            err,
+        );
+    }
+
+    pub fn commit(self: *PreparedReconcile) !ReconcileResult {
+        if (!self.durability_complete or self.committed) return error.InvalidReconcilePhase;
+
+        var result: ReconcileResult = .{};
+        for (self.ensures) |*entry| {
+            const intent = self.intents[entry.intent_index];
+            const prepared = if (entry.replica) |*replica| replica else return error.InvalidReconcilePhase;
+            _ = try self.owner.host.installPreparedReplica(intent.record, prepared);
+            result.ensured += 1;
+            result.refreshed_peers += try self.owner.refreshPeerEndpoints(intent);
+            try self.owner.last_intent_hashes.put(
+                self.owner.alloc,
+                intent.record.group_id,
+                entry.intent_hash,
+            );
+        }
+        for (self.intents) |intent| {
+            if (try self.owner.reconcileRaftMembership(intent)) result.membership_proposals += 1;
+        }
+        for (self.removals) |group_id| {
+            try self.owner.host.removePreparedReplica(group_id);
+            _ = self.owner.last_intent_hashes.remove(group_id);
+            result.removed += 1;
+        }
+        self.owner.host.metrics.reconcile_rounds += 1;
+        self.committed = true;
+        return result;
+    }
+};
+
 pub const Reconciler = struct {
     alloc: std.mem.Allocator,
     host: *host_mod.Host,
@@ -254,17 +345,20 @@ pub const Reconciler = struct {
         self.last_intent_hashes = .empty;
     }
 
-    pub fn reconcileOnce(self: *Reconciler) !ReconcileResult {
+    pub fn prepare(self: *Reconciler) !PreparedReconcile {
         const intents = try self.provider.listLocalIntents(self.alloc, self.host.cfg.local_node_id);
-        defer freeIntentSlice(self.alloc, intents);
+        errdefer freeIntentSlice(self.alloc, intents);
         const existing = try self.host.listGroupIds(self.alloc);
         defer self.alloc.free(existing);
 
         var desired_group_ids = std.AutoHashMapUnmanaged(u64, void).empty;
         defer desired_group_ids.deinit(self.alloc);
+        var ensures = std.ArrayListUnmanaged(PreparedEnsure).empty;
+        errdefer ensures.deinit(self.alloc);
+        var removals = std.ArrayListUnmanaged(u64).empty;
+        errdefer removals.deinit(self.alloc);
 
-        var result: ReconcileResult = .{};
-        for (intents) |intent| {
+        for (intents, 0..) |intent, intent_index| {
             try desired_group_ids.put(self.alloc, intent.record.group_id, {});
 
             const intent_hash = hashIntent(intent);
@@ -276,34 +370,57 @@ pub const Reconciler = struct {
                 stored_hash.? != intent_hash;
 
             if (should_apply) {
-                _ = try self.host.ensureReplica(intent.record);
-                result.ensured += 1;
-                for (intent.peer_node_ids) |node_id| {
-                    if (node_id == self.host.cfg.local_node_id) continue;
-                    result.refreshed_peers += self.host.refreshPeerEndpoints(intent.record.group_id, node_id) catch |err| switch (err) {
-                        error.UnknownPeer => 0,
-                        else => return err,
-                    };
-                }
-                for (intent.learner_node_ids) |node_id| {
-                    if (node_id == self.host.cfg.local_node_id or containsNodeId(intent.peer_node_ids, node_id)) continue;
-                    result.refreshed_peers += self.host.refreshPeerEndpoints(intent.record.group_id, node_id) catch |err| switch (err) {
-                        error.UnknownPeer => 0,
-                        else => return err,
-                    };
-                }
-                try self.last_intent_hashes.put(self.alloc, intent.record.group_id, intent_hash);
+                try ensures.append(self.alloc, .{
+                    .intent_index = intent_index,
+                    .intent_hash = intent_hash,
+                    .prepare_bootstrap = !self.host.hasReplica(intent.record.group_id) and
+                        intent.record.backup_restore_bootstrap != null,
+                });
             }
-            if (try self.reconcileRaftMembership(intent)) result.membership_proposals += 1;
         }
         for (existing) |group_id| {
             if (desired_group_ids.contains(group_id)) continue;
-            try self.host.removeReplica(group_id);
-            _ = self.last_intent_hashes.remove(group_id);
-            result.removed += 1;
+            try removals.append(self.alloc, group_id);
         }
-        self.host.metrics.reconcile_rounds += 1;
-        return result;
+        const owned_ensures = try ensures.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(owned_ensures);
+        const owned_removals = try removals.toOwnedSlice(self.alloc);
+        return .{
+            .owner = self,
+            .intents = intents,
+            .ensures = owned_ensures,
+            .removals = owned_removals,
+        };
+    }
+
+    pub fn reconcileOnce(self: *Reconciler) !ReconcileResult {
+        var prepared = try self.prepare();
+        defer prepared.deinit();
+        prepared.beginPreparation();
+        prepared.prepareDurable() catch |err| {
+            prepared.notePreparationFailure(err);
+            return err;
+        };
+        return try prepared.commit();
+    }
+
+    fn refreshPeerEndpoints(self: *Reconciler, intent: PlacementIntent) !usize {
+        var refreshed: usize = 0;
+        for (intent.peer_node_ids) |node_id| {
+            if (node_id == self.host.cfg.local_node_id) continue;
+            refreshed += self.host.refreshPeerEndpoints(intent.record.group_id, node_id) catch |err| switch (err) {
+                error.UnknownPeer => 0,
+                else => return err,
+            };
+        }
+        for (intent.learner_node_ids) |node_id| {
+            if (node_id == self.host.cfg.local_node_id or containsNodeId(intent.peer_node_ids, node_id)) continue;
+            refreshed += self.host.refreshPeerEndpoints(intent.record.group_id, node_id) catch |err| switch (err) {
+                error.UnknownPeer => 0,
+                else => return err,
+            };
+        }
+        return refreshed;
     }
 
     fn reconcileRaftMembership(self: *Reconciler, intent: PlacementIntent) !bool {
@@ -557,6 +674,238 @@ pub fn freeIntentOwned(alloc: std.mem.Allocator, intent: PlacementIntent) void {
 fn freeIntentSlice(alloc: std.mem.Allocator, intents: []PlacementIntent) void {
     for (intents) |intent| freeIntent(alloc, intent);
     alloc.free(intents);
+}
+
+const StagedReconcileTestFactory = struct {
+    alloc: std.mem.Allocator,
+    stores: [2]*raft_engine.core.MemoryStorage,
+
+    fn iface(self: *@This()) host_mod.ReplicaDescriptorFactory {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .build_descriptor = buildDescriptor,
+                .free_descriptor = freeDescriptor,
+            },
+        };
+    }
+
+    fn buildDescriptor(ptr: *anyopaque, record: catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const store = if (record.group_id % 2 == 0) self.stores[0] else self.stores[1];
+        const peers = try self.alloc.dupe(
+            raft_engine.core.types.NodeId,
+            &[_]raft_engine.core.types.NodeId{record.local_node_id},
+        );
+        return .{
+            .group = .{
+                .group_id = record.group_id,
+                .local_node_id = record.local_node_id,
+                .raft_config = .{
+                    .id = record.local_node_id,
+                    .group_id = record.group_id,
+                    .peers = peers,
+                    .election_tick = 5,
+                    .heartbeat_tick = 1,
+                    .pre_vote = false,
+                },
+                .storage = store.storage(),
+            },
+            .bootstrap = .persisted,
+        };
+    }
+
+    fn freeDescriptor(ptr: *anyopaque, _: std.mem.Allocator, descriptor: *raft_engine.runtime.ReplicaDescriptor) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.alloc.free(descriptor.group.raft_config.peers);
+    }
+};
+
+test "prepared reconcile persists admission before runtime publication" {
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var factory = StagedReconcileTestFactory{
+        .alloc = std.testing.allocator,
+        .stores = .{ &store_a, &store_b },
+    };
+    var replica_catalog = catalog.MemoryReplicaCatalog.init(std.testing.allocator);
+    defer replica_catalog.deinit();
+    var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .descriptor_factory = factory.iface(),
+        .replica_catalog = replica_catalog.catalog(),
+    });
+    defer host.deinit();
+    var provider = MemoryPlacementProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    try provider.replaceAll(&.{.{
+        .record = .{ .group_id = 502, .replica_id = 1, .local_node_id = 1 },
+    }});
+    var owner = Reconciler{
+        .alloc = std.testing.allocator,
+        .host = &host,
+        .provider = provider.provider(),
+    };
+    defer owner.deinit();
+
+    var prepared = try owner.prepare();
+    defer prepared.deinit();
+    prepared.beginPreparation();
+    try prepared.prepareDurable();
+
+    try std.testing.expectEqual(host_mod.HostedReplicaStatus.absent, host.status(502));
+    const records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+    defer catalog.freeReplicaRecords(std.testing.allocator, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(@as(u64, 502), records[0].group_id);
+
+    const result = try prepared.commit();
+    try std.testing.expectEqual(@as(usize, 1), result.ensured);
+    try std.testing.expectEqual(host_mod.HostedReplicaStatus.active, host.status(502));
+}
+
+test "prepared reconcile failure never publishes an unprepared replica" {
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var factory = StagedReconcileTestFactory{
+        .alloc = std.testing.allocator,
+        .stores = .{ &store_a, &store_b },
+    };
+    var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .descriptor_factory = factory.iface(),
+    });
+    defer host.deinit();
+    var provider = MemoryPlacementProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    try provider.replaceAll(&.{.{
+        .record = .{
+            .group_id = 503,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .bootstrap_mode = .fetch_snapshot,
+            .backup_restore_bootstrap = .{
+                .backup_id = "backup-503",
+                .location = "file:///unused",
+                .snapshot_path = "backup-503/groups/503",
+            },
+        },
+    }});
+    var owner = Reconciler{
+        .alloc = std.testing.allocator,
+        .host = &host,
+        .provider = provider.provider(),
+    };
+    defer owner.deinit();
+
+    var prepared = try owner.prepare();
+    defer prepared.deinit();
+    prepared.beginPreparation();
+    const failure = prepared.prepareDurable();
+    try std.testing.expectError(error.MissingBackupRestoreBootstrapHandler, failure);
+    prepared.notePreparationFailure(error.MissingBackupRestoreBootstrapHandler);
+
+    try std.testing.expectEqual(host_mod.HostedReplicaStatus.failed, host.status(503));
+    try std.testing.expect(!host.hasReplica(503));
+    try std.testing.expectError(error.InvalidReconcilePhase, prepared.commit());
+}
+
+test "blocked reconcile preparation does not block existing raft progress" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const BlockingBootstrapper = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn iface(self: *@This()) host_mod.BackupRestoreBootstrapper {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .prepare_backup_restore = prepareBackupRestore },
+            };
+        }
+
+        fn prepareBackupRestore(ptr: *anyopaque, _: catalog.ReplicaRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    const PrepareThread = struct {
+        prepared: *PreparedReconcile,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.prepared.prepareDurable() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var factory = StagedReconcileTestFactory{
+        .alloc = std.testing.allocator,
+        .stores = .{ &store_a, &store_b },
+    };
+    var bootstrapper = BlockingBootstrapper{};
+    var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .descriptor_factory = factory.iface(),
+        .backup_restore_bootstrapper = bootstrapper.iface(),
+    });
+    defer host.deinit();
+    _ = try host.ensureReplica(.{ .group_id = 504, .replica_id = 1, .local_node_id = 1 });
+
+    var provider = MemoryPlacementProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    try provider.replaceAll(&.{.{
+        .record = .{
+            .group_id = 505,
+            .replica_id = 2,
+            .local_node_id = 1,
+            .bootstrap_mode = .fetch_snapshot,
+            .backup_restore_bootstrap = .{
+                .backup_id = "backup-505",
+                .location = "file:///unused",
+                .snapshot_path = "backup-505/groups/505",
+            },
+        },
+    }});
+    var owner = Reconciler{
+        .alloc = std.testing.allocator,
+        .host = &host,
+        .provider = provider.provider(),
+    };
+    defer owner.deinit();
+    var prepared = try owner.prepare();
+    defer prepared.deinit();
+    prepared.beginPreparation();
+
+    var prepare_thread = PrepareThread{ .prepared = &prepared };
+    const thread = try std.Thread.spawn(.{}, PrepareThread.run, .{&prepare_thread});
+    var thread_joined = false;
+    defer {
+        if (!thread_joined) {
+            bootstrapper.release.store(true, .release);
+            thread.join();
+        }
+    }
+    while (!bootstrapper.entered.load(.acquire)) std.Thread.yield() catch {};
+
+    const rounds_before = host.metricsSnapshot().runtime_rounds;
+    _ = try host.runRound(1, 1);
+    try std.testing.expectEqual(rounds_before + 1, host.metricsSnapshot().runtime_rounds);
+
+    bootstrapper.release.store(true, .release);
+    thread.join();
+    thread_joined = true;
+    try std.testing.expect(prepare_thread.failure == null);
+    const result = try prepared.commit();
+    try std.testing.expectEqual(@as(usize, 1), result.ensured);
+    try std.testing.expectEqual(@as(usize, 1), result.removed);
 }
 
 test "reconciler can ensure desired replicas and remove stale ones" {

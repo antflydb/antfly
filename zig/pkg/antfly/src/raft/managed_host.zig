@@ -417,6 +417,10 @@ pub const ManagedHttpHost = struct {
         return try self.reconciler_loop.reconcileOnce();
     }
 
+    pub fn prepareReconcile(self: *ManagedHttpHost) !reconciler.PreparedReconcile {
+        return try self.reconciler_loop.prepare();
+    }
+
     pub fn replacePlacementIntents(self: *ManagedHttpHost, intents: []const reconciler.PlacementIntent) !void {
         try self.view.replaceReplicaIntents(intents);
     }
