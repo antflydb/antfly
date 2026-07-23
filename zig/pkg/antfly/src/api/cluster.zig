@@ -354,7 +354,7 @@ pub fn applySecretStoreHealth(alloc: std.mem.Allocator, status: *ClusterStatus, 
     if (status.secret_store) |*previous| previous.deinit(alloc);
     status.secret_store = .{
         .generation = health.generation,
-        .supports_source_generation = true,
+        .supports_source_generation = health.supports_source_generation,
         .source_generation = if (health.source_generation) |generation|
             try std.fmt.allocPrint(alloc, "{x}", .{generation})
         else
@@ -464,6 +464,7 @@ test "cluster status carries non-secret secret store health" {
     try applySecretStoreHealth(alloc, &status, .{
         .generation = 7,
         .content_hash = [_]u8{0} ** 32,
+        .supports_source_generation = true,
         .source_generation = source_generation,
         .entry_count = 3,
         .last_reload_failed = true,
@@ -493,6 +494,27 @@ test "generationless secret store status serializes a null source generation" {
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"supports_source_generation\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_generation\":null") != null);
+}
+
+test "secret store status preserves unsupported source generation capability" {
+    const alloc = std.testing.allocator;
+    var status = ClusterStatus{ .health = .healthy };
+    defer status.deinit(alloc);
+    try applySecretStoreHealth(alloc, &status, .{
+        .generation = 2,
+        .content_hash = [_]u8{0} ** 32,
+        .supports_source_generation = false,
+        .entry_count = 2,
+        .last_reload_failed = false,
+        .stale_snapshot = false,
+        .reload_successes = 1,
+        .reload_failures = 0,
+        .last_success_ns = 1,
+        .last_failure_ns = 0,
+    });
+    const secret_store = status.secret_store orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!secret_store.supports_source_generation);
+    try std.testing.expect(secret_store.source_generation == null);
 }
 
 test "cluster status carries non-secret runtime config generation and hash" {

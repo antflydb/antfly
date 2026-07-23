@@ -9635,7 +9635,7 @@ type SecretStoreStatus struct {
 	// Stale Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
 	Stale bool `json:"stale,omitempty"`
 
-	// SupportsSourceGeneration Whether this runtime supports opaque source-generation acknowledgements. This remains true even when the currently loaded file predates the generation field.
+	// SupportsSourceGeneration Whether this store can expose one exact opaque source-generation acknowledgement. This remains true when a single loaded file predates the generation field, and is false for layered stores whose served snapshot has multiple publication sources.
 	SupportsSourceGeneration bool `json:"supports_source_generation,omitempty"`
 }
 
