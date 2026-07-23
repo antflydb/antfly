@@ -155,6 +155,10 @@ pub const ResolvedSecret = struct {
 pub const ReloadHealth = struct {
     generation: u64,
     content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    /// Whether this store can expose one exact control-plane publication
+    /// generation. Layered stores intentionally cannot: more than one file
+    /// contributes to the served snapshot.
+    supports_source_generation: bool,
     source_generation: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
     entry_count: usize,
     last_reload_failed: bool,
@@ -729,6 +733,7 @@ pub const FileStore = struct {
         return .{
             .generation = self.generation_value,
             .content_hash = self.content_hash,
+            .supports_source_generation = self.fallbacks.len == 0,
             .source_generation = if (self.fallbacks.len == 0) self.source_generation else null,
             .entry_count = self.entries.count(),
             .last_reload_failed = self.last_reload_failed,
@@ -1258,6 +1263,7 @@ test "file secret store detects projected volume symlink target replacement" {
     try std.testing.expectEqual(initial_generation + 1, store.generation());
     const health = store.healthSnapshot();
     const expected_source_generation = [_]u8{0xbb} ** 32;
+    try std.testing.expect(health.supports_source_generation);
     try std.testing.expectEqualSlices(u8, &expected_source_generation, &health.source_generation.?);
 }
 
@@ -1381,7 +1387,7 @@ test "layered file secret store resolves primary before fallback and writes prim
     defer deleteFile(fallback_path) catch {};
 
     try writeFileAtomically(primary_path,
-        \\{"secrets":[{"key":"openai.api_key","value":"primary-openai","created_at_ns":1,"updated_at_ns":1},{"key":"shared.key","value":"primary-shared","created_at_ns":1,"updated_at_ns":1}]}
+        \\{"generation":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","secrets":[{"key":"openai.api_key","value":"primary-openai","created_at_ns":1,"updated_at_ns":1},{"key":"shared.key","value":"primary-shared","created_at_ns":1,"updated_at_ns":1}]}
     );
     try writeFileAtomically(fallback_path,
         \\{"secrets":[{"key":"antfly.runtime.test.token","value":"fallback-token","created_at_ns":1,"updated_at_ns":1},{"key":"shared.key","value":"fallback-shared","created_at_ns":1,"updated_at_ns":1}]}
@@ -1389,6 +1395,10 @@ test "layered file secret store resolves primary before fallback and writes prim
 
     var store = try FileStore.initLayered(alloc, &.{ primary_path, fallback_path });
     defer store.deinit();
+
+    const health = store.healthSnapshot();
+    try std.testing.expect(!health.supports_source_generation);
+    try std.testing.expectEqual(@as(?[std.crypto.hash.sha2.Sha256.digest_length]u8, null), health.source_generation);
 
     const primary = try store.getOwned(alloc, "openai.api_key");
     defer if (primary) |value| alloc.free(value);
