@@ -61,7 +61,7 @@ pub const ReadOptions = struct {
     prompt: ?[]const u8 = null,
     max_tokens: ?usize = null,
     cache_dtype: ?[]const u8 = null,
-    correlation_id: ?[]const u8 = null,
+    source_fingerprint: ?[]const u8 = null,
 };
 
 pub fn flattenStructuredToFields(allocator: std.mem.Allocator, value: *const StructuredValue) ![]Field {

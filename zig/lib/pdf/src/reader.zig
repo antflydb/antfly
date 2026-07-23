@@ -4868,7 +4868,7 @@ fn applyStreamFilterAlloc(
         }
         const inflated = try inflated_list.toOwnedSlice(alloc);
         defer alloc.free(inflated);
-        const decoded = try applyPredictorAlloc(alloc, inflated, param);
+        const decoded = try applyPredictorAlloc(alloc, inflated, param, max_decoded_stream_bytes);
         return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
     }
     if (std.mem.eql(u8, name, "ASCIIHexDecode")) {
@@ -4876,8 +4876,7 @@ fn applyStreamFilterAlloc(
         return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
     }
     if (std.mem.eql(u8, name, "ASCII85Decode")) {
-        const decoded = try ascii85DecodeAlloc(alloc, input);
-        return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
+        return try ascii85DecodeAlloc(alloc, input, max_decoded_stream_bytes);
     }
     if (std.mem.eql(u8, name, "LZWDecode")) {
         return try lzwDecodeAlloc(alloc, input, param, max_decoded_stream_bytes);
@@ -4922,7 +4921,7 @@ fn asciiHexDecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-fn ascii85DecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
+fn ascii85DecodeAlloc(alloc: Allocator, input: []const u8, max_bytes: usize) ![]u8 {
     var digits = std.ArrayList(u8).empty;
     defer digits.deinit(alloc);
     var out = std.ArrayList(u8).empty;
@@ -4935,13 +4934,14 @@ fn ascii85DecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
         if (ch == '~') break;
         if (ch == 'z') {
             if (digits.items.len != 0) return error.MalformedAscii85;
+            if (out.items.len > max_bytes or 4 > max_bytes - out.items.len) return error.DecodedStreamTooLarge;
             try out.appendSlice(alloc, &.{ 0, 0, 0, 0 });
             continue;
         }
         if (ch < '!' or ch > 'u') return error.MalformedAscii85;
         try digits.append(alloc, ch - '!');
         if (digits.items.len == 5) {
-            try appendAscii85Group(alloc, &out, digits.items, 4);
+            try appendAscii85Group(alloc, &out, digits.items, 4, max_bytes);
             digits.clearRetainingCapacity();
         }
     }
@@ -4949,7 +4949,7 @@ fn ascii85DecodeAlloc(alloc: Allocator, input: []const u8) ![]u8 {
     if (digits.items.len > 0) {
         const original_len = digits.items.len;
         while (digits.items.len < 5) try digits.append(alloc, 'u' - '!');
-        try appendAscii85Group(alloc, &out, digits.items, original_len - 1);
+        try appendAscii85Group(alloc, &out, digits.items, original_len - 1, max_bytes);
     }
 
     return try out.toOwnedSlice(alloc);
@@ -5032,7 +5032,7 @@ fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Obj
 
     const decoded = try out.toOwnedSlice(alloc);
     defer alloc.free(decoded);
-    const predicted = try applyPredictorAlloc(alloc, decoded, param);
+    const predicted = try applyPredictorAlloc(alloc, decoded, param, max_bytes);
     return try enforceDecodedStreamLimit(alloc, predicted, max_bytes);
 }
 
@@ -5093,7 +5093,13 @@ fn parseRawCode(raw: []const u8) u32 {
     return code;
 }
 
-fn appendAscii85Group(alloc: Allocator, out: *std.ArrayList(u8), digits: []const u8, keep_bytes: usize) !void {
+fn appendAscii85Group(
+    alloc: Allocator,
+    out: *std.ArrayList(u8),
+    digits: []const u8,
+    keep_bytes: usize,
+    max_bytes: usize,
+) !void {
     var value: u64 = 0;
     for (digits) |digit| value = value * 85 + digit;
     var buf: [4]u8 = .{
@@ -5102,10 +5108,16 @@ fn appendAscii85Group(alloc: Allocator, out: *std.ArrayList(u8), digits: []const
         @intCast((value >> 8) & 0xff),
         @intCast(value & 0xff),
     };
+    if (out.items.len > max_bytes or keep_bytes > max_bytes - out.items.len) return error.DecodedStreamTooLarge;
     try out.appendSlice(alloc, buf[0..keep_bytes]);
 }
 
-fn applyPredictorAlloc(alloc: Allocator, decoded: []const u8, param: ?*const syntax.Object) ![]u8 {
+fn applyPredictorAlloc(
+    alloc: Allocator,
+    decoded: []const u8,
+    param: ?*const syntax.Object,
+    max_bytes: usize,
+) ![]u8 {
     if (param == null or param.?.* != .dict) return try alloc.dupe(u8, decoded);
     const predictor_obj = param.?.get("Predictor") orelse return try alloc.dupe(u8, decoded);
     const predictor = predictor_obj.asInteger() orelse return try alloc.dupe(u8, decoded);
@@ -5116,14 +5128,27 @@ fn applyPredictorAlloc(alloc: Allocator, decoded: []const u8, param: ?*const syn
     const bits_i = if (param.?.get("BitsPerComponent")) |obj| obj.asInteger() orelse 8 else 8;
     if (columns_i <= 0 or colors_i <= 0 or bits_i <= 0) return error.UnsupportedPredictor;
 
-    const bytes_per_pixel: usize = @intCast(@divTrunc(colors_i * bits_i + 7, 8));
-    const row_len: usize = @intCast(@divTrunc(columns_i * colors_i * bits_i + 7, 8));
+    const columns = std.math.cast(usize, columns_i) orelse return error.UnsupportedPredictor;
+    const colors = std.math.cast(usize, colors_i) orelse return error.UnsupportedPredictor;
+    const bits = std.math.cast(usize, bits_i) orelse return error.UnsupportedPredictor;
+    if (colors > 32) return error.UnsupportedPredictor;
+    switch (bits) {
+        1, 2, 4, 8, 16 => {},
+        else => return error.UnsupportedPredictor,
+    }
+    const bits_per_pixel = std.math.mul(usize, colors, bits) catch return error.UnsupportedPredictor;
+    const bytes_per_pixel = (std.math.add(usize, bits_per_pixel, 7) catch return error.UnsupportedPredictor) / 8;
+    const row_bits = std.math.mul(usize, columns, bits_per_pixel) catch return error.UnsupportedPredictor;
+    const row_len = (std.math.add(usize, row_bits, 7) catch return error.UnsupportedPredictor) / 8;
+    if (row_len == 0) return error.UnsupportedPredictor;
+    if (row_len > max_bytes) return error.DecodedStreamTooLarge;
+    if (row_len > decoded.len) return error.MalformedPredictorData;
 
     if (predictor == 2) {
         // TIFF Predictor 2 stores each sample as its difference from the
         // corresponding sample in the preceding pixel. PDF image streams in
         // the wild commonly use this with 8-bit RGB and grayscale data.
-        if (bits_i != 8 or row_len == 0 or decoded.len % row_len != 0) return error.UnsupportedPredictor;
+        if (bits != 8 or decoded.len % row_len != 0) return error.UnsupportedPredictor;
         const out = try alloc.dupe(u8, decoded);
         var row_start: usize = 0;
         while (row_start < out.len) : (row_start += row_len) {
@@ -5135,7 +5160,8 @@ fn applyPredictorAlloc(alloc: Allocator, decoded: []const u8, param: ?*const syn
         return out;
     }
     if (predictor < 10 or predictor > 15) return error.UnsupportedPredictor;
-    if ((row_len + 1) == 0 or decoded.len % (row_len + 1) != 0) return error.MalformedPredictorData;
+    const encoded_row_len = std.math.add(usize, row_len, 1) catch return error.UnsupportedPredictor;
+    if (decoded.len % encoded_row_len != 0) return error.MalformedPredictorData;
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
@@ -9445,11 +9471,37 @@ test "reader can decode run length stream object" {
 
 test "stream decoders enforce the decoded byte budget before growth" {
     const alloc = std.testing.allocator;
+    try std.testing.expectError(error.DecodedStreamTooLarge, ascii85DecodeAlloc(alloc, "zz~>", 7));
+
     const lzw = &.{ 0x80, 0x0b, 0x60, 0x50, 0x22, 0x0c, 0x0c, 0x85, 0x01 };
     try std.testing.expectError(error.DecodedStreamTooLarge, lzwDecodeAlloc(alloc, lzw, null, 5));
 
     const run_length = &.{ 2, 'A', 'B', 'C', 254, 'Z', 128 };
     try std.testing.expectError(error.DecodedStreamTooLarge, runLengthDecodeAlloc(alloc, run_length, 5));
+}
+
+test "predictor dimensions reject overflow and oversized rows before allocation" {
+    var overflow_entries = [_]syntax.DictEntry{
+        .{ .key = @constCast("Predictor"), .value = .{ .integer = 12 } },
+        .{ .key = @constCast("Columns"), .value = .{ .integer = std.math.maxInt(i64) } },
+        .{ .key = @constCast("Colors"), .value = .{ .integer = 32 } },
+        .{ .key = @constCast("BitsPerComponent"), .value = .{ .integer = 16 } },
+    };
+    var overflow_param: syntax.Object = .{ .dict = &overflow_entries };
+    try std.testing.expectError(
+        error.UnsupportedPredictor,
+        applyPredictorAlloc(std.testing.allocator, &.{0}, &overflow_param, 256),
+    );
+
+    var oversized_entries = [_]syntax.DictEntry{
+        .{ .key = @constCast("Predictor"), .value = .{ .integer = 12 } },
+        .{ .key = @constCast("Columns"), .value = .{ .integer = 1024 } },
+    };
+    var oversized_param: syntax.Object = .{ .dict = &oversized_entries };
+    try std.testing.expectError(
+        error.DecodedStreamTooLarge,
+        applyPredictorAlloc(std.testing.allocator, &.{0}, &oversized_param, 128),
+    );
 }
 
 test "reader can extract plain text from simple page content" {

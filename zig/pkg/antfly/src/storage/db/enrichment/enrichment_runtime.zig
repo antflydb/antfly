@@ -2924,7 +2924,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     var source_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(source_bytes, &source_digest, .{});
     const source_hex = std.fmt.bytesToHex(source_digest, .lower);
-    const profile_source_id = source_hex[0..16];
+    const source_fingerprint = source_hex[0..16];
 
     const pending_status = switch (kind) {
         .ocr => "pending_ocr",
@@ -2972,7 +2972,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
                 units[idx].ocr_render_dpi = config.ocr_render_dpi;
                 const render_started_ns = runtime.config.clock.nowRealtimeNs();
                 const rendered_page = pdf_session.?.renderPagePngAdaptiveAlloc(alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
-                    logRuntimeOcrRenderProfile(runtime, profile_source_id, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));
+                    logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));
                     if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
                     try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "render");
                     try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, err);
@@ -2983,7 +2983,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
                 units[idx].ocr_rendered_height = rendered_page.height;
                 units[idx].ocr_rendered_bytes = rendered_page.png.len;
                 rendered = rendered_page.png;
-                logRuntimeOcrRenderProfile(runtime, profile_source_id, unit.page_number, config.ocr_render_dpi, rendered_page.effective_dpi, rendered_page.width, rendered_page.height, rendered_page.png.len, render_started_ns, null);
+                logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, rendered_page.effective_dpi, rendered_page.width, rendered_page.height, rendered_page.png.len, render_started_ns, null);
             }
         }
         // Avoid allocating the base64 and JSON copies when the encoded PNG
@@ -3009,7 +3009,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
             .source_text = if (rendered != null) "" else source_url,
             .source_parts_json = parts_json,
             .content_type = "text/plain",
-            .correlation_id = profile_source_id,
+            .source_fingerprint = source_fingerprint,
         };
         const request_bytes = runtimeGeneratedTextRequestBytes(request);
         if (request_bytes > batch_policy.max_bytes) {
@@ -3020,7 +3020,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
             continue;
         }
         if (requests.items.len > 0 and (requests.items.len >= batch_policy.max_items or batch_bytes + request_bytes > batch_policy.max_bytes)) {
-            try flushRuntimeGeneratedTextBatch(runtime, alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, profile_source_id);
+            try flushRuntimeGeneratedTextBatch(runtime, alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
             requests.clearRetainingCapacity();
             unit_indices.clearRetainingCapacity();
             batch_bytes = 0;
@@ -3032,7 +3032,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         batch_bytes = addUsizeSaturating(batch_bytes, request_bytes);
     }
     if (requests.items.len > 0) {
-        try flushRuntimeGeneratedTextBatch(runtime, alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, profile_source_id);
+        try flushRuntimeGeneratedTextBatch(runtime, alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
     }
 }
 
@@ -3063,7 +3063,7 @@ fn flushRuntimeGeneratedTextBatch(
     kind: RuntimeGeneratedUnitTextKind,
     quality_config: document_extraction_mod.OcrQualityConfig,
     ocr_prompt: []const u8,
-    profile_source_id: []const u8,
+    source_fingerprint: []const u8,
 ) !void {
     if (requests.len == 0) return;
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
@@ -3071,20 +3071,20 @@ fn flushRuntimeGeneratedTextBatch(
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const request_bytes = runtimeGeneratedTextBatchBytes(requests);
     var produced = producer.produceBatch(alloc, requests) catch |err| {
-        logRuntimeOcrBatchProfile(runtime, profile_source_id, units, unit_indices, requests.len, request_bytes, "serial_fallback", @errorName(err), started_ns);
+        logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", @errorName(err), started_ns);
         if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
         for (unit_indices) |unit_idx| try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, profile_source_id, @errorName(err));
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, @errorName(err));
     };
     if (produced.len != requests.len) {
         for (produced) |item| {
             if (item.len > 0) alloc.free(item);
         }
         alloc.free(produced);
-        logRuntimeOcrBatchProfile(runtime, profile_source_id, units, unit_indices, requests.len, request_bytes, "serial_fallback", "response_count_mismatch", started_ns);
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, profile_source_id, "response_count_mismatch");
+        logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", "response_count_mismatch", started_ns);
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, "response_count_mismatch");
     }
-    logRuntimeOcrBatchProfile(runtime, profile_source_id, units, unit_indices, requests.len, request_bytes, "batch", null, started_ns);
+    logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "batch", null, started_ns);
 
     defer alloc.free(produced);
     errdefer {
@@ -3115,20 +3115,20 @@ fn flushRuntimeGeneratedTextBatchSequential(
     kind: RuntimeGeneratedUnitTextKind,
     quality_config: document_extraction_mod.OcrQualityConfig,
     ocr_prompt: []const u8,
-    profile_source_id: []const u8,
+    source_fingerprint: []const u8,
     fallback_reason: []const u8,
 ) !void {
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
     for (requests, unit_indices) |request, unit_idx| {
         const started_ns = runtime.config.clock.nowRealtimeNs();
         const produced = producer.produce(alloc, request) catch |err| {
-            logRuntimeOcrBatchProfile(runtime, profile_source_id, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", @errorName(err), started_ns);
+            logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", @errorName(err), started_ns);
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
             try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
             continue;
         };
-        logRuntimeOcrBatchProfile(runtime, profile_source_id, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", fallback_reason, started_ns);
+        logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", fallback_reason, started_ns);
         applyRuntimeGeneratedUnitText(alloc, &units[unit_idx], produced, method, "completed", kind, quality_config, ocr_prompt) catch |err| {
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
@@ -3156,7 +3156,7 @@ fn profileElapsedMs(runtime: *EnrichmentRuntime, started_ns: u64) f64 {
 
 fn logRuntimeOcrRenderProfile(
     runtime: *EnrichmentRuntime,
-    source_id: []const u8,
+    source_fingerprint: []const u8,
     page_number: ?u32,
     requested_dpi: u16,
     effective_dpi: ?u16,
@@ -3167,14 +3167,14 @@ fn logRuntimeOcrRenderProfile(
     failure: ?[]const u8,
 ) void {
     if (!runtimeReadProfileEnabled()) return;
-    std.log.info("read-profile phase=pdf_render source_sha256={s} page={?d} requested_dpi={d} effective_dpi={?d} width={?d} height={?d} encoded_bytes={?d} failure={?s} elapsed_ms={d:.3}", .{
-        source_id, page_number, requested_dpi, effective_dpi, width, height, encoded_bytes, failure, profileElapsedMs(runtime, started_ns),
+    std.log.info("read-profile phase=pdf_render source_fingerprint={s} page={?d} requested_dpi={d} effective_dpi={?d} width={?d} height={?d} encoded_bytes={?d} failure={?s} elapsed_ms={d:.3}", .{
+        source_fingerprint, page_number, requested_dpi, effective_dpi, width, height, encoded_bytes, failure, profileElapsedMs(runtime, started_ns),
     });
 }
 
 fn logRuntimeOcrBatchProfile(
     runtime: *EnrichmentRuntime,
-    source_id: []const u8,
+    source_fingerprint: []const u8,
     units: []const document_extraction_mod.Unit,
     unit_indices: []const usize,
     batch_size: usize,
@@ -3186,8 +3186,8 @@ fn logRuntimeOcrBatchProfile(
     if (!runtimeReadProfileEnabled()) return;
     const first_page = if (unit_indices.len > 0) units[unit_indices[0]].page_number else null;
     const last_page = if (unit_indices.len > 0) units[unit_indices[unit_indices.len - 1]].page_number else null;
-    std.log.info("read-profile phase=ocr_batch source_sha256={s} first_page={?d} last_page={?d} batch_size={d} request_bytes={d} mode={s} serial_fallback_reason={?s} elapsed_ms={d:.3}", .{
-        source_id, first_page, last_page, batch_size, request_bytes, mode, fallback_reason, profileElapsedMs(runtime, started_ns),
+    std.log.info("read-profile phase=ocr_batch source_fingerprint={s} first_page={?d} last_page={?d} batch_size={d} request_bytes={d} mode={s} serial_fallback_reason={?s} elapsed_ms={d:.3}", .{
+        source_fingerprint, first_page, last_page, batch_size, request_bytes, mode, fallback_reason, profileElapsedMs(runtime, started_ns),
     });
 }
 

@@ -69,7 +69,7 @@ const VisionLoadedReader = struct {
         var raw = try self.core.readRaw(image_data, .{
             .prompt = normalized_prompt,
             .max_tokens = options.max_tokens,
-            .correlation_id = options.correlation_id,
+            .source_fingerprint = options.source_fingerprint,
         });
         defer raw.deinit();
 
@@ -82,7 +82,7 @@ const VisionLoadedReader = struct {
         const raw_results = try self.core.readRawBatch(image_datas, .{
             .prompt = normalized_prompt,
             .max_tokens = options.max_tokens,
-            .correlation_id = options.correlation_id,
+            .source_fingerprint = options.source_fingerprint,
         });
         defer {
             for (raw_results) |raw| {
