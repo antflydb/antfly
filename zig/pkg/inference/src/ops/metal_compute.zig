@@ -22653,6 +22653,7 @@ fn expectUniformMetalSdpa(
     head_dim: usize,
     masked: bool,
 ) !void {
+    const key_step: f32 = 0.01;
     const hidden = num_heads * head_dim;
     const total = batch * seq_len * hidden;
     const qkv_shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden) };
@@ -22680,7 +22681,7 @@ fn expectUniformMetalSdpa(
                     v_data[idx] =
                         @as(f32, @floatFromInt(b)) * 0.1 +
                         @as(f32, @floatFromInt(h)) * 0.01 +
-                        @as(f32, @floatFromInt(ki)) * 0.001 +
+                        @as(f32, @floatFromInt(ki)) * key_step +
                         @as(f32, @floatFromInt(d)) * 0.0001;
                 }
             }
@@ -22716,7 +22717,7 @@ fn expectUniformMetalSdpa(
                     const expected =
                         @as(f32, @floatFromInt(b)) * 0.1 +
                         @as(f32, @floatFromInt(h)) * 0.01 +
-                        mean_ki * 0.001 +
+                        mean_ki * key_step +
                         @as(f32, @floatFromInt(d)) * 0.0001;
                     try std.testing.expectApproxEqAbs(expected, out_data[idx], 5e-4);
                 }
