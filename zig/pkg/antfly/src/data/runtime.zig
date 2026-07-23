@@ -2084,6 +2084,40 @@ test "data server repair owner cancels and drains through backend runtime" {
     try std.testing.expect(!server.provisioned_index_repair_active.load(.acquire));
 }
 
+test "data server rejects replicated transition admission after owner shutdown" {
+    const alloc = std.testing.allocator;
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const catalog = antfly.public_api.table_catalog.CatalogSource{
+        .ptr = undefined,
+        .vtable = undefined,
+    };
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            ".",
+            catalog,
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(1),
+        .backend_runtime = runtime.ptr(),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    server.replicated_transition_action_shutdown.store(true, .release);
+    try std.testing.expectError(
+        error.BackgroundOwnerClosing,
+        server.replicatedTransitionActionOwnerId(runtime.ptr()),
+    );
+    try std.testing.expectEqual(@as(u64, 0), server.replicated_transition_action_owner_id);
+}
+
 const RuntimeStatusDiskUsageCacheEntry = struct {
     disk_bytes: u64 = 0,
     checked_at_ns: u64 = 0,
@@ -3118,6 +3152,9 @@ pub const DataServer = struct {
     data_raft_reconcile_mutex: std.atomic.Mutex = .unlocked,
     local_transition_mutex: std.atomic.Mutex = .unlocked,
     replicated_transition_action_lanes: TransitionActionLanes = .{},
+    replicated_transition_action_owner_mutex: std.atomic.Mutex = .unlocked,
+    replicated_transition_action_owner_id: u64 = 0,
+    replicated_transition_action_shutdown: std.atomic.Value(bool) = .init(false),
     data_raft_factory: ?*DataDescriptorFactory = null,
     data_raft_store: ?*raft_engine.core.MemoryStorage = null,
     data_raft_apply: ?*RaftTableApplyStateMachine = null,
@@ -4417,6 +4454,7 @@ pub const DataServer = struct {
         self.joinProvisionedWarmupThread();
         self.joinProvisionedStartupCatchUpThread();
         self.stopProvisionedIndexRepair();
+        self.stopReplicatedTransitionActions();
         self.clearProvisionedStartupCatchUpTarget();
         if (self.listener) |*listener| listener.deinit();
         if (self.http_server) |*http_server| http_server.deinit();
@@ -5867,15 +5905,7 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
-            var lane = self.replicated_transition_action_lanes.tryAcquire(op.source_group_id) orelse
-                return error.TransitionOperationBusy;
-            defer lane.deinit();
-            try self.replicateSplitBootstrap(
-                op.transition_id,
-                op.attempt_epoch,
-                op.source_group_id,
-                op.destination_group_id,
-            );
+            try self.enqueueReplicatedSplitAction(.bootstrap, op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .bootstrap_split_destination = op });
         } else {
@@ -5892,15 +5922,7 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
-            var lane = self.replicated_transition_action_lanes.tryAcquire(op.source_group_id) orelse
-                return error.TransitionOperationBusy;
-            defer lane.deinit();
-            try self.replicateSplitCatchUp(
-                op.transition_id,
-                op.attempt_epoch,
-                op.source_group_id,
-                op.destination_group_id,
-            );
+            try self.enqueueReplicatedSplitAction(.catch_up, op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .catch_up_split_destination = op });
         } else {
@@ -5911,6 +5933,114 @@ pub const DataServer = struct {
             _ = try runtime.runtime().catchUpDestination(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
         }
         self.invalidateLocalGroupStatusCache();
+    }
+
+    const ReplicatedSplitActionJob = struct {
+        const Kind = enum { bootstrap, catch_up };
+
+        alloc: std.mem.Allocator,
+        server: *DataServer,
+        lane: TransitionActionLanes.Lease,
+        lane_held: bool = true,
+        kind: Kind,
+        transition_id: u64,
+        attempt_epoch: u64,
+        source_group_id: u64,
+        destination_group_id: u64,
+
+        fn run(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            defer {
+                self.lane.deinit();
+                self.lane_held = false;
+            }
+            try self.server.requireLocalDataRaftLeader(self.source_group_id);
+            switch (self.kind) {
+                .bootstrap => try self.server.replicateSplitBootstrap(
+                    self.transition_id,
+                    self.attempt_epoch,
+                    self.source_group_id,
+                    self.destination_group_id,
+                ),
+                .catch_up => try self.server.replicateSplitCatchUp(
+                    self.transition_id,
+                    self.attempt_epoch,
+                    self.source_group_id,
+                    self.destination_group_id,
+                ),
+            }
+            self.server.invalidateLocalGroupStatusCache();
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.lane_held) self.lane.deinit();
+            const alloc = self.alloc;
+            alloc.destroy(self);
+        }
+    };
+
+    fn enqueueReplicatedSplitAction(
+        self: *DataServer,
+        kind: ReplicatedSplitActionJob.Kind,
+        transition_id: u64,
+        attempt_epoch: u64,
+        source_group_id: u64,
+        destination_group_id: u64,
+    ) !void {
+        if (self.replicated_transition_action_shutdown.load(.acquire))
+            return error.BackgroundOwnerClosing;
+        var lane = self.replicated_transition_action_lanes.tryAcquire(source_group_id) orelse
+            return error.TransitionOperationBusy;
+        errdefer lane.deinit();
+
+        const runtime = try self.ensureBackendRuntime();
+        const owner_id = try self.replicatedTransitionActionOwnerId(runtime);
+
+        const job = try self.alloc.create(ReplicatedSplitActionJob);
+        errdefer self.alloc.destroy(job);
+        job.* = .{
+            .alloc = self.alloc,
+            .server = self,
+            .lane = lane,
+            .kind = kind,
+            .transition_id = transition_id,
+            .attempt_epoch = attempt_epoch,
+            .source_group_id = source_group_id,
+            .destination_group_id = destination_group_id,
+        };
+        try runtime.durable_jobs.submit(.{
+            .owner_id = owner_id,
+            .class = .maintenance,
+            .ptr = job,
+            .run = ReplicatedSplitActionJob.run,
+            .deinit = ReplicatedSplitActionJob.deinit,
+        });
+    }
+
+    fn replicatedTransitionActionOwnerId(
+        self: *DataServer,
+        runtime: *backend_runtime_mod.BackendRuntime,
+    ) !u64 {
+        lockAtomic(&self.replicated_transition_action_owner_mutex);
+        defer self.replicated_transition_action_owner_mutex.unlock();
+        if (self.replicated_transition_action_shutdown.load(.acquire))
+            return error.BackgroundOwnerClosing;
+        if (self.replicated_transition_action_owner_id == 0) {
+            self.replicated_transition_action_owner_id = runtime.allocOwnerId();
+        }
+        return self.replicated_transition_action_owner_id;
+    }
+
+    fn stopReplicatedTransitionActions(self: *DataServer) void {
+        self.replicated_transition_action_shutdown.store(true, .release);
+        lockAtomic(&self.replicated_transition_action_owner_mutex);
+        const owner_id = self.replicated_transition_action_owner_id;
+        const runtime = self.backend_runtime;
+        self.replicated_transition_action_owner_mutex.unlock();
+        if (owner_id != 0) {
+            if (runtime) |active_runtime| active_runtime.durable_jobs.closeOwner(owner_id);
+        }
     }
 
     fn replicateSplitBootstrap(

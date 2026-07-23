@@ -73,13 +73,32 @@ pub const ManagedProgressDriver = struct {
     stop_event: std.Io.Event = .unset,
     failure_event: std.Io.Event = .unset,
     failed: std.atomic.Value(bool) = .init(false),
+    round_in_progress: std.atomic.Value(bool) = .init(false),
+    round_started_ns: std.atomic.Value(u64) = .init(0),
+    round_completed_ns: std.atomic.Value(u64) = .init(0),
+    stall_timeout_ns: u64,
     failure: ?anyerror = null,
 
     pub fn init(io: std.Io, source: ProgressSource, interval_ns: u64) ManagedProgressDriver {
+        return initWithStallTimeout(
+            io,
+            source,
+            interval_ns,
+            @max(5 * std.time.ns_per_s, std.math.mul(u64, interval_ns, 10) catch std.math.maxInt(u64)),
+        );
+    }
+
+    fn initWithStallTimeout(
+        io: std.Io,
+        source: ProgressSource,
+        interval_ns: u64,
+        stall_timeout_ns: u64,
+    ) ManagedProgressDriver {
         return .{
             .io = io,
             .source = source,
             .interval_ns = interval_ns,
+            .stall_timeout_ns = stall_timeout_ns,
         };
     }
 
@@ -93,21 +112,28 @@ pub const ManagedProgressDriver = struct {
     }
 
     pub fn check(self: *const ManagedProgressDriver) !void {
-        if (!self.failed.load(.acquire)) return;
-        return self.failure orelse error.RaftProgressDriverFailed;
+        if (self.failed.load(.acquire))
+            return self.failure orelse error.RaftProgressDriverFailed;
+        if (self.isStalled(platform_time.monotonicNs()))
+            return error.RaftProgressDriverStalled;
     }
 
     pub fn isHealthy(self: *const ManagedProgressDriver) bool {
-        return !self.failed.load(.acquire);
+        self.check() catch return false;
+        return true;
     }
 
     /// Sleeps for control-plane cadence while remaining immediately responsive
     /// to a fatal progress-lane failure.
     pub fn waitForFailureOrTimeout(self: *ManagedProgressDriver, timeout_ns: u64) !void {
         try self.check();
+        const wait_ns = if (self.round_in_progress.load(.acquire))
+            @min(timeout_ns, self.stall_timeout_ns)
+        else
+            timeout_ns;
         self.failure_event.waitTimeout(self.io, .{
             .duration = .{
-                .raw = std.Io.Duration.fromNanoseconds(timeout_ns),
+                .raw = std.Io.Duration.fromNanoseconds(wait_ns),
                 .clock = .awake,
             },
         }) catch |err| switch (err) {
@@ -133,11 +159,16 @@ pub const ManagedProgressDriver = struct {
     fn run(self: *ManagedProgressDriver) void {
         while (!self.stop_event.isSet()) {
             const started_ns = platform_time.monotonicNs();
+            self.round_started_ns.store(started_ns, .release);
+            self.round_in_progress.store(true, .release);
             self.source.runOnce() catch |err| {
                 self.publishFailure(err);
                 return;
             };
-            const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+            const completed_ns = platform_time.monotonicNs();
+            self.round_completed_ns.store(completed_ns, .release);
+            self.round_in_progress.store(false, .release);
+            const elapsed_ns = completed_ns -| started_ns;
             if (elapsed_ns < self.interval_ns) {
                 self.stop_event.waitTimeout(self.io, .{
                     .duration = .{
@@ -160,6 +191,12 @@ pub const ManagedProgressDriver = struct {
         self.failure = err;
         self.failed.store(true, .release);
         self.failure_event.set(self.io);
+    }
+
+    fn isStalled(self: *const ManagedProgressDriver, now_ns: u64) bool {
+        if (!self.round_in_progress.load(.acquire)) return false;
+        const started_ns = self.round_started_ns.load(.acquire);
+        return now_ns -| started_ns >= self.stall_timeout_ns;
     }
 };
 
@@ -460,6 +497,24 @@ test "managed raft progress driver publishes source failure" {
     try std.testing.expectError(error.InjectedFailure, driver.check());
     try std.testing.expect(!driver.isHealthy());
     try std.testing.expectError(error.InjectedFailure, driver.waitForFailureOrTimeout(std.time.ns_per_s));
+}
+
+test "managed raft progress driver reports a wedged round unhealthy" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const Noop = struct {
+        fn runOnce(_: *anyopaque) !void {}
+    };
+    var driver = ManagedProgressDriver.initWithStallTimeout(io_impl.io(), .{
+        .ptr = undefined,
+        .run_once = Noop.runOnce,
+    }, std.time.ns_per_ms, std.time.ns_per_ms);
+    defer driver.deinit();
+
+    driver.round_started_ns.store(platform_time.monotonicNs() -| (2 * std.time.ns_per_ms), .release);
+    driver.round_in_progress.store(true, .release);
+    try std.testing.expectError(error.RaftProgressDriverStalled, driver.check());
+    try std.testing.expect(!driver.isHealthy());
 }
 
 test "managed raft progress driver stop interrupts a long cadence wait" {

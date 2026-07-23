@@ -3321,8 +3321,10 @@ pub fn build(b: *std.Build) void {
     const raft_runtime_default_filters = [_][]const u8{
         "managed raft progress driver advances independently and joins on stop",
         "managed raft progress driver publishes source failure",
+        "managed raft progress driver reports a wedged round unhealthy",
         "managed raft progress driver stop interrupts a long cadence wait",
         "raft runtime cadence validates independent intervals",
+        "transition destination requires a stable healthy voter set",
     };
     const raft_runtime_tests = b.addTest(.{
         .root_module = raft_runtime_test_mod,
@@ -3531,6 +3533,7 @@ pub fn build(b: *std.Build) void {
         "index repair queue removes only authoritative non-local ownership",
         "store capacity reporting preserves the last good observation on probe failure",
         "data server repair owner cancels and drains through backend runtime",
+        "data server rejects replicated transition admission after owner shutdown",
         "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime local group status does not open roots owned by transitions",
@@ -5086,7 +5089,6 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "metadata service ",
-            "metadata control loop can drive the real metadata service",
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
             "metadata http service catalog cache is independent from volatile projection traffic",

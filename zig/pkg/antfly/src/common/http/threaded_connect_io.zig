@@ -88,19 +88,15 @@ fn netConnectIpPosix(
         ));
         if (classifyConnectErrno(connect_errno)) |disposition| switch (disposition) {
             .connected => break,
-            .pending => try waitForConnect(original_io, socket_fd, deadline),
-        } else switch (connect_errno) {
-            .INTR => continue,
-            .ADDRNOTAVAIL => return error.AddressUnavailable,
-            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-            .CONNREFUSED => return error.ConnectionRefused,
-            .CONNRESET => return error.ConnectionResetByPeer,
-            .HOSTUNREACH => return error.HostUnreachable,
-            .NETUNREACH => return error.NetworkUnreachable,
-            .TIMEDOUT => return error.Timeout,
-            .ACCES => return error.AccessDenied,
-            .NETDOWN => return error.NetworkDown,
-            else => return error.Unexpected,
+            .pending => {
+                try waitForConnect(original_io, socket_fd, deadline);
+                break;
+            },
+        } else if (connect_errno == .INTR) {
+            continue;
+        } else {
+            try connectError(connect_errno);
+            unreachable;
         }
     }
 
@@ -192,8 +188,52 @@ fn waitForConnect(
         try original_io.vtable.checkCancel(original_io.userdata);
         const timeout_ms = try boundedPollTimeout(original_io, deadline);
         poll_fds[0].revents = 0;
-        if (try posix.poll(&poll_fds, timeout_ms) != 0) return;
+        if (try posix.poll(&poll_fds, timeout_ms) == 0) continue;
+        if (poll_fds[0].revents & posix.POLL.NVAL != 0) return error.Unexpected;
+        return connectError(try socketPendingError(original_io, fd));
     }
+}
+
+fn socketPendingError(
+    original_io: std.Io,
+    fd: posix.fd_t,
+) std.Io.net.IpAddress.ConnectError!posix.E {
+    while (true) {
+        try original_io.vtable.checkCancel(original_io.userdata);
+        var socket_error: c_int = 0;
+        var value_len: posix.socklen_t = @sizeOf(c_int);
+        const rc = std.c.getsockopt(
+            fd,
+            posix.SOL.SOCKET,
+            posix.SO.ERROR,
+            @ptrCast(&socket_error),
+            &value_len,
+        );
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (value_len != @sizeOf(c_int) or socket_error < 0) return error.Unexpected;
+                return @enumFromInt(socket_error);
+            },
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn connectError(err: posix.E) std.Io.net.IpAddress.ConnectError!void {
+    return switch (err) {
+        .SUCCESS, .ISCONN => {},
+        .ADDRNOTAVAIL => error.AddressUnavailable,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .CONNREFUSED => error.ConnectionRefused,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .TIMEDOUT => error.Timeout,
+        .ACCES => error.AccessDenied,
+        .NETDOWN => error.NetworkDown,
+        else => error.Unexpected,
+    };
 }
 
 fn boundedPollTimeout(
@@ -236,4 +276,6 @@ test "threaded connector accepts already-connected completion" {
         classifyConnectErrno(.INPROGRESS).?,
     );
     try std.testing.expect(classifyConnectErrno(.CONNREFUSED) == null);
+    try connectError(.SUCCESS);
+    try std.testing.expectError(error.ConnectionRefused, connectError(.CONNREFUSED));
 }

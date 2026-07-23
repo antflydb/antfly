@@ -795,6 +795,24 @@ const ProjectedCoreSnapshotCache = struct {
     }
 };
 
+const TransitionReadinessCache = struct {
+    catalog_epoch: u64 = 0,
+    core_epoch: u64 = 0,
+    placement_epoch: u64 = 0,
+    transition_epoch: u64 = 0,
+    ready_by_group: std.AutoHashMapUnmanaged(u64, bool) = .empty,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.ready_by_group.deinit(alloc);
+        self.* = .{};
+    }
+};
+
+const TransitionPlacementKey = struct {
+    group_id: u64,
+    store_id: u64,
+};
+
 const ProjectedCoreSnapshotDiagnostics = struct {
     cached: bool = false,
     tables: usize = 0,
@@ -2194,28 +2212,43 @@ pub const MetadataService = struct {
             try local.append(self.alloc, try raft_reconciler.cloneIntentOwned(self.alloc, intent));
         }
 
+        var reconcile = reconcile: {
+            self.lockRuntime();
+            defer self.unlockRuntime();
+            if (!containsLocalIntent(local.items, self.metadata_group_id)) {
+                if (self.raft.host.host.raftStatus(self.metadata_group_id)) |raft_status| {
+                    try local.append(self.alloc, .{
+                        .record = .{
+                            .group_id = self.metadata_group_id,
+                            .replica_id = local_node_id,
+                            .local_node_id = local_node_id,
+                            .bootstrap_mode = .persisted,
+                        },
+                        .peer_node_ids = try allocPeerNodeIdsExcludingSelf(
+                            self.alloc,
+                            raft_status.conf_state.voters,
+                            local_node_id,
+                        ),
+                    });
+                }
+            }
+            try self.raft.host.replacePlacementIntents(local.items);
+            var prepared = try self.raft.host.prepareReconcile();
+            prepared.beginPreparation();
+            break :reconcile prepared;
+        };
+        defer reconcile.deinit();
+
+        reconcile.prepareDurable() catch |err| {
+            self.lockRuntime();
+            defer self.unlockRuntime();
+            reconcile.notePreparationFailure(err);
+            return err;
+        };
+
         self.lockRuntime();
         defer self.unlockRuntime();
-        if (!containsLocalIntent(local.items, self.metadata_group_id)) {
-            if (self.raft.host.host.raftStatus(self.metadata_group_id)) |raft_status| {
-                try local.append(self.alloc, .{
-                    .record = .{
-                        .group_id = self.metadata_group_id,
-                        .replica_id = local_node_id,
-                        .local_node_id = local_node_id,
-                        .bootstrap_mode = .persisted,
-                    },
-                    .peer_node_ids = try allocPeerNodeIdsExcludingSelf(
-                        self.alloc,
-                        raft_status.conf_state.voters,
-                        local_node_id,
-                    ),
-                });
-            }
-        }
-
-        try self.raft.host.replacePlacementIntents(local.items);
-        _ = try self.raft.host.reconcileOnce();
+        _ = try reconcile.commit();
         self.local_placement_epoch = current_epoch;
         self.last_local_placement_refresh_at_ms = nowMs();
     }
@@ -2700,6 +2733,7 @@ pub const MetadataHttpService = struct {
     routed_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     reconcile_lease_projection_cache: ReconcileLeaseProjectionCache = .{},
     projected_core_snapshot_cache: ProjectedCoreSnapshotCache = .{},
+    transition_readiness_cache: TransitionReadinessCache = .{},
     metadata_status_cache_mutex: std.Io.Mutex = .init,
     metadata_status_cache_valid: bool = false,
     metadata_status_cache: MetadataStatus = .{ .metadata_group_id = 0, .metrics = .{} },
@@ -2788,6 +2822,7 @@ pub const MetadataHttpService = struct {
         self.raft.deinit();
         self.catalog_validation_cache.deinit(self.alloc);
         self.projected_core_snapshot_cache.deinit(self.alloc);
+        self.transition_readiness_cache.deinit(self.alloc);
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
         self.lifecycle_signal.deinit();
@@ -3739,13 +3774,6 @@ pub const MetadataHttpService = struct {
         return try self.buildAdminSnapshot(true);
     }
 
-    /// Returns projected topology without observing live transitions. This is
-    /// safe to call from transition execution while the controller is owned by
-    /// the control lane.
-    pub fn topologySnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
-        return try self.buildAdminSnapshot(false);
-    }
-
     fn buildAdminSnapshot(self: *MetadataHttpService, include_detailed_status: bool) !metadata_api.AdminSnapshot {
         var snapshot: metadata_api.AdminSnapshot = .{
             .status = if (include_detailed_status) try self.metadataStatus() else self.fallbackStatus(),
@@ -3813,6 +3841,78 @@ pub const MetadataHttpService = struct {
             &.{},
         );
         return snapshot;
+    }
+
+    pub fn groupTransitionReady(self: *MetadataHttpService, group_id: u64) !bool {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+
+        const catalog_epoch = self.catalog_epoch.load(.acquire);
+        const core_epoch = self.projected_core_epoch.load(.acquire);
+        const placement_epoch = self.placement_epoch.load(.monotonic);
+        const transition_epoch = self.transition_epoch.load(.monotonic);
+        const cache = &self.transition_readiness_cache;
+        if (cache.catalog_epoch != catalog_epoch or
+            cache.core_epoch != core_epoch or
+            cache.placement_epoch != placement_epoch or
+            cache.transition_epoch != transition_epoch)
+        {
+            const catalog = try self.catalogValidationSnapshotLocked();
+            const core = try self.projectedCoreSnapshotLocked();
+            const merged = try metadata_state.mergeHealthyGroupStatuses(
+                self.alloc,
+                catalog.tables,
+                catalog.ranges,
+                core.placement_intents,
+                core.restore_progresses,
+                core.stores,
+                core.split_transitions,
+                core.merge_transitions,
+                &.{},
+                &.{},
+            );
+            defer self.alloc.free(merged);
+
+            var placement_counts = std.AutoHashMapUnmanaged(u64, u32).empty;
+            defer placement_counts.deinit(self.alloc);
+            var placement_stores = std.AutoHashMapUnmanaged(TransitionPlacementKey, void).empty;
+            defer placement_stores.deinit(self.alloc);
+            try placement_counts.ensureTotalCapacity(self.alloc, @intCast(core.placement_intents.len));
+            try placement_stores.ensureTotalCapacity(self.alloc, @intCast(core.placement_intents.len));
+            for (core.placement_intents) |intent| {
+                const count = placement_counts.getOrPutAssumeCapacity(intent.record.group_id);
+                if (!count.found_existing) count.value_ptr.* = 0;
+                count.value_ptr.* +|= 1;
+                placement_stores.putAssumeCapacity(.{
+                    .group_id = intent.record.group_id,
+                    .store_id = intent.store_id,
+                }, {});
+            }
+
+            cache.ready_by_group.clearRetainingCapacity();
+            try cache.ready_by_group.ensureTotalCapacity(self.alloc, @intCast(merged.len));
+            for (merged) |group_status| {
+                const expected_voters = placement_counts.get(group_status.group_id) orelse 0;
+                cache.ready_by_group.putAssumeCapacity(
+                    group_status.group_id,
+                    transitionStatusHasStablePlacement(
+                        group_status,
+                        expected_voters,
+                        placement_stores.contains(.{
+                            .group_id = group_status.group_id,
+                            .store_id = group_status.leader_store_id,
+                        }),
+                    ),
+                );
+            }
+            cache.catalog_epoch = catalog_epoch;
+            cache.core_epoch = core_epoch;
+            cache.placement_epoch = placement_epoch;
+            cache.transition_epoch = transition_epoch;
+        }
+        return cache.ready_by_group.get(group_id) orelse false;
     }
 
     pub fn validatePublication(self: *MetadataHttpService, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -4272,13 +4372,29 @@ pub const MetadataHttpService = struct {
             }
         }
 
-        // `replacePlacementIntents()` mutates the shared metadata view that also backs the
-        // managed host's placement provider. Hold the runtime lock across the mutation and
-        // immediate reconcile so concurrent admin requests cannot observe torn placement state.
+        // Publish the desired state and construct an immutable plan while the
+        // runtime is locked. Durable restore/catalog I/O runs outside the lock;
+        // only failure accounting and final installation re-enter it.
+        var reconcile = reconcile: {
+            self.lockRuntime();
+            defer self.unlockRuntime();
+            try self.raft.host.replacePlacementIntents(local.items);
+            var prepared = try self.raft.host.prepareReconcile();
+            prepared.beginPreparation();
+            break :reconcile prepared;
+        };
+        defer reconcile.deinit();
+
+        reconcile.prepareDurable() catch |err| {
+            self.lockRuntime();
+            defer self.unlockRuntime();
+            reconcile.notePreparationFailure(err);
+            return err;
+        };
+
         self.lockRuntime();
         defer self.unlockRuntime();
-        try self.raft.host.replacePlacementIntents(local.items);
-        _ = try self.raft.host.reconcileOnce();
+        _ = try reconcile.commit();
         self.local_placement_epoch = current_epoch;
         self.last_local_placement_refresh_at_ms = nowMs();
     }
@@ -6298,6 +6414,47 @@ fn findMergedGroupStatus(
         if (status.group_id == group_id) return status;
     }
     return null;
+}
+
+fn transitionStatusHasStablePlacement(
+    status: metadata_reconciler.MergedGroupStatus,
+    expected_voters: u32,
+    leader_placed: bool,
+) bool {
+    if (expected_voters == 0 or expected_voters > std.math.maxInt(u16)) return false;
+    const expected_voter_count: u16 = @intCast(expected_voters);
+    return status.leader_known and
+        status.leader_store_id != 0 and
+        leader_placed and
+        status.voter_count_known and
+        status.voter_count == expected_voter_count and
+        status.healthy_voter_reports >= status.voter_count and
+        !status.joint_consensus;
+}
+
+test "metadata service transition readiness requires stable healthy placement" {
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .store_id = 1, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 } },
+        .{ .store_id = 2, .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 } },
+        .{ .store_id = 3, .record = .{ .group_id = 77, .replica_id = 3, .local_node_id = 3 } },
+    };
+    var status = metadata_reconciler.MergedGroupStatus{
+        .group_id = 77,
+        .leader_known = true,
+        .leader_store_id = 1,
+        .voter_count_known = true,
+        .voter_count = 3,
+        .healthy_voter_reports = 3,
+    };
+    try std.testing.expect(transitionStatusHasStablePlacement(status, placements.len, true));
+    status.healthy_voter_reports = 2;
+    try std.testing.expect(!transitionStatusHasStablePlacement(status, placements.len, true));
+    status.healthy_voter_reports = 3;
+    status.joint_consensus = true;
+    try std.testing.expect(!transitionStatusHasStablePlacement(status, placements.len, true));
+    status.joint_consensus = false;
+    status.leader_store_id = 99;
+    try std.testing.expect(!transitionStatusHasStablePlacement(status, placements.len, false));
 }
 
 fn groupHasExpectedHealthyPlacement(

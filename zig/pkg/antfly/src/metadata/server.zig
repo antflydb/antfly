@@ -85,6 +85,10 @@ pub const MetadataServer = struct {
                 metadataStoreGroupRouter(svc),
                 metadataDataBearingStoreGroupRouter(svc),
                 svc.raft.host.http_host.request_executor,
+                .{
+                    .ptr = svc,
+                    .is_ready = metadataGroupTransitionReady,
+                },
                 local_ops,
             );
             try svc.raft.replaceTransitionOps(hosted_ops.adapter());
@@ -215,6 +219,11 @@ pub const MetadataServer = struct {
             .owned_admin_mux = owned_admin_mux,
             .owned_admin_listener = owned_admin_listener,
         };
+    }
+
+    fn metadataGroupTransitionReady(ptr: *anyopaque, group_id: u64) !bool {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try svc.groupTransitionReady(group_id);
     }
 
     pub fn deinit(self: *MetadataServer) void {

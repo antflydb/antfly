@@ -33,12 +33,22 @@ const CatchUpMergeReceiver = @FieldType(metadata_mod.TransitionAction, "catch_up
 const FinalizeMerge = @FieldType(metadata_mod.TransitionAction, "finalize_merge");
 const RollbackMerge = @FieldType(metadata_mod.TransitionAction, "rollback_merge");
 
+pub const GroupTransitionReadinessSource = struct {
+    ptr: *anyopaque,
+    is_ready: *const fn (ptr: *anyopaque, group_id: u64) anyerror!bool,
+
+    pub fn isReady(self: @This(), group_id: u64) !bool {
+        return try self.is_ready(self.ptr, group_id);
+    }
+};
+
 pub const HostedShardOperationAdapter = struct {
     alloc: std.mem.Allocator,
     catalog: api_table_catalog.CatalogSource,
     router: api_table_router.HostedGroupRouter,
     data_router: api_table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
+    readiness: GroupTransitionReadinessSource,
     local_ops: ?shard_ops.ShardOperationAdapter = null,
 
     pub fn init(
@@ -46,9 +56,10 @@ pub const HostedShardOperationAdapter = struct {
         catalog: api_table_catalog.CatalogSource,
         router: api_table_router.HostedGroupRouter,
         executor: http_common.RequestExecutor,
+        readiness: GroupTransitionReadinessSource,
         local_ops: ?shard_ops.ShardOperationAdapter,
     ) HostedShardOperationAdapter {
-        return initWithRouters(alloc, catalog, router, router, executor, local_ops);
+        return initWithRouters(alloc, catalog, router, router, executor, readiness, local_ops);
     }
 
     pub fn initWithRouters(
@@ -57,6 +68,7 @@ pub const HostedShardOperationAdapter = struct {
         placement_router: api_table_router.HostedGroupRouter,
         data_router: api_table_router.HostedGroupRouter,
         executor: http_common.RequestExecutor,
+        readiness: GroupTransitionReadinessSource,
         local_ops: ?shard_ops.ShardOperationAdapter,
     ) HostedShardOperationAdapter {
         return .{
@@ -65,6 +77,7 @@ pub const HostedShardOperationAdapter = struct {
             .router = placement_router,
             .data_router = data_router,
             .executor = executor,
+            .readiness = readiness,
             .local_ops = local_ops,
         };
     }
@@ -363,9 +376,7 @@ pub const HostedShardOperationAdapter = struct {
     }
 
     fn requireGroupReadyForTransition(self: *HostedShardOperationAdapter, group_id: u64) !void {
-        var snapshot = try self.catalog.topologySnapshot();
-        defer self.catalog.freeAdminSnapshot(&snapshot);
-        if (!groupReadyForTransition(&snapshot, group_id)) return error.GroupLeaderUnavailable;
+        if (!try self.readiness.isReady(group_id)) return error.GroupLeaderUnavailable;
     }
 };
 
@@ -376,120 +387,36 @@ fn isLeaderRediscoveryError(err: anyerror) bool {
     };
 }
 
-fn groupReadyForTransition(snapshot: *const metadata_api.AdminSnapshot, group_id: u64) bool {
-    var expected_voters: usize = 0;
-    for (snapshot.placement_intents) |intent| {
-        if (intent.record.group_id == group_id) expected_voters += 1;
-    }
-    if (expected_voters == 0 or expected_voters > std.math.maxInt(u16)) return false;
-
-    const expected_voter_count: u16 = @intCast(expected_voters);
-    for (snapshot.merged_group_statuses) |status| {
-        if (status.group_id != group_id) continue;
-        var leader_placed = false;
-        for (snapshot.placement_intents) |intent| {
-            if (intent.record.group_id == group_id and intent.store_id == status.leader_store_id) {
-                leader_placed = true;
-                break;
-            }
-        }
-        return status.leader_known and
-            status.leader_store_id != 0 and
-            leader_placed and
-            status.voter_count_known and
-            status.voter_count == expected_voter_count and
-            status.voter_count > 0 and
-            status.healthy_voter_reports >= status.voter_count and
-            !status.joint_consensus;
-    }
-    return false;
-}
-
 test "transition destination requires a stable healthy voter set" {
-    const metadata_table_manager = @import("../metadata/table_manager.zig");
-    const metadata_reconciler = @import("../metadata/reconciler.zig");
-    const raft_reconciler = @import("reconciler.zig");
+    const Readiness = struct {
+        ready: bool,
+        calls: usize = 0,
 
-    var placements = [_]raft_reconciler.PlacementIntent{
-        .{ .store_id = 1, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 } },
-        .{ .store_id = 2, .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 } },
-        .{ .store_id = 3, .record = .{ .group_id = 77, .replica_id = 3, .local_node_id = 3 } },
-    };
-    var statuses = [_]metadata_reconciler.MergedGroupStatus{.{
-        .group_id = 77,
-        .leader_known = true,
-        .leader_store_id = 1,
-        .voter_count_known = true,
-        .voter_count = 3,
-        .healthy_voter_reports = 3,
-    }};
-    var snapshot = metadata_api.AdminSnapshot{
-        .status = .{ .metadata_group_id = 1, .metrics = .{} },
-        .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
-        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-        .placement_intents = placements[0..],
-        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-        .merged_group_statuses = statuses[0..],
-    };
-
-    try std.testing.expect(groupReadyForTransition(&snapshot, 77));
-
-    const Catalog = struct {
-        snapshot: *metadata_api.AdminSnapshot,
-        admin_calls: usize = 0,
-        topology_calls: usize = 0,
-
-        fn source(self: *@This()) api_table_catalog.CatalogSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .topology_snapshot = topologySnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
+        fn source(self: *@This()) GroupTransitionReadinessSource {
+            return .{ .ptr = self, .is_ready = isReady };
         }
 
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        fn isReady(ptr: *anyopaque, group_id: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.admin_calls += 1;
-            return error.RecursiveAdminSnapshot;
+            try std.testing.expectEqual(@as(u64, 77), group_id);
+            self.calls += 1;
+            return self.ready;
         }
-
-        fn topologySnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.topology_calls += 1;
-            return self.snapshot.*;
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    var catalog = Catalog{ .snapshot = &snapshot };
+    var readiness = Readiness{ .ready = true };
     var adapter = HostedShardOperationAdapter{
         .alloc = std.testing.allocator,
-        .catalog = catalog.source(),
+        .catalog = undefined,
         .router = undefined,
         .data_router = undefined,
         .executor = undefined,
+        .readiness = readiness.source(),
     };
     try adapter.requireGroupReadyForTransition(77);
-    try std.testing.expectEqual(@as(usize, 0), catalog.admin_calls);
-    try std.testing.expectEqual(@as(usize, 1), catalog.topology_calls);
-
-    statuses[0].healthy_voter_reports = 2;
-    try std.testing.expect(!groupReadyForTransition(&snapshot, 77));
-    statuses[0].healthy_voter_reports = 3;
-    statuses[0].joint_consensus = true;
-    try std.testing.expect(!groupReadyForTransition(&snapshot, 77));
-    statuses[0].joint_consensus = false;
-    statuses[0].voter_count = 2;
-    try std.testing.expect(!groupReadyForTransition(&snapshot, 77));
-    statuses[0].voter_count = 3;
-    statuses[0].leader_store_id = 99;
-    try std.testing.expect(!groupReadyForTransition(&snapshot, 77));
+    readiness.ready = false;
+    try std.testing.expectError(error.GroupLeaderUnavailable, adapter.requireGroupReadyForTransition(77));
+    try std.testing.expectEqual(@as(usize, 2), readiness.calls);
 }
 
 pub const HostedShardDbAdapter = struct {
@@ -771,6 +698,7 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
         FakeCatalog.iface(),
         router.iface(),
         undefined,
+        undefined,
         fake_ops.adapter(),
     );
 
@@ -864,6 +792,7 @@ test "hosted shard operation adapter rediscovers leader across placed replicas" 
         undefined,
         router.iface(),
         executor.executor(),
+        undefined,
         null,
     );
     try hosted.adapter().execute(.{

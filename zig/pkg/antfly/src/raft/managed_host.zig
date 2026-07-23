@@ -186,6 +186,10 @@ pub const ManagedHost = struct {
         return try self.reconciler_loop.reconcileOnce();
     }
 
+    pub fn prepareReconcile(self: *ManagedHost) !reconciler.PreparedReconcile {
+        return try self.reconciler_loop.prepare();
+    }
+
     pub fn replacePlacementIntents(self: *ManagedHost, intents: []const reconciler.PlacementIntent) !void {
         try self.view.replaceReplicaIntents(intents);
     }
