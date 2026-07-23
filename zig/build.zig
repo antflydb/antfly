@@ -1788,6 +1788,13 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, data_runtime_test_mod, true, true);
 
+    const raft_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft_runtime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, raft_runtime_test_mod, true, true);
+
     const filesystem_capacity_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/filesystem_capacity_test_root.zig"),
         .target = target,
@@ -3297,6 +3304,20 @@ pub fn build(b: *std.Build) void {
         .filters = selectTestFilters(b, &raft_unit_default_filters),
     });
     const run_raft_unit_tests = addFilteredTestRunArtifact(b, raft_unit_tests);
+
+    const raft_runtime_default_filters = [_][]const u8{
+        "managed raft progress driver advances independently and joins on stop",
+        "managed raft progress driver publishes source failure",
+    };
+    const raft_runtime_tests = b.addTest(.{
+        .root_module = raft_runtime_test_mod,
+        .filters = selectTestFilters(b, &raft_runtime_default_filters),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_raft_runtime_tests = addFilteredTestRunArtifact(b, raft_runtime_tests);
 
     const raft_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -5514,6 +5535,10 @@ pub fn build(b: *std.Build) void {
 
     const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
+    raft_test_step.dependOn(&run_raft_runtime_tests.step);
+
+    const raft_runtime_test_step = b.step("raft-runtime-test", "Run focused managed Raft runtime tests");
+    raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
 
     const raft_transport_test_step = b.step("raft-transport-test", "Run raft transport unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
@@ -5563,6 +5588,7 @@ pub fn build(b: *std.Build) void {
         unit_test_step.dependOn(ha_test_step);
     }
     unit_test_step.dependOn(&run_raft_unit_tests.step);
+    unit_test_step.dependOn(&run_raft_runtime_tests.step);
 
     // Progress mode uses one union-filtered root artifact too. Storage and
     // metadata module paths overlap, while raft-transport is a strict subset

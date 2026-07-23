@@ -4221,6 +4221,18 @@ pub const DataServer = struct {
         }
     }
 
+    fn raftProgressSource(self: *DataServer) antfly.raft.ProgressSource {
+        return .{
+            .ptr = self,
+            .run_once = runRaftProgressOnce,
+        };
+    }
+
+    fn runRaftProgressOnce(ptr: *anyopaque) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return try self.runRaftRoundOnly();
+    }
+
     /// Runs data-node control and maintenance work without advancing Raft.
     /// Callers must concurrently drive `runRaftRoundOnly` at the configured
     /// tick cadence.
@@ -13049,48 +13061,6 @@ fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
 
-const DataRaftTicker = struct {
-    server: *DataServer,
-    io: std.Io,
-    interval_ns: u64,
-    stop_requested: std.atomic.Value(bool) = .init(false),
-    failed: std.atomic.Value(bool) = .init(false),
-    failure: ?anyerror = null,
-
-    fn run(self: *@This()) void {
-        while (!self.stop_requested.load(.acquire)) {
-            const started_ns = platform_time.monotonicNs();
-            self.server.runRaftRoundOnly() catch |err| {
-                self.failure = err;
-                self.failed.store(true, .release);
-                return;
-            };
-            const elapsed_ns = platform_time.monotonicNs() -| started_ns;
-            if (elapsed_ns < self.interval_ns) {
-                self.io.sleep(
-                    std.Io.Duration.fromNanoseconds(self.interval_ns - elapsed_ns),
-                    .awake,
-                ) catch |err| {
-                    if (self.stop_requested.load(.acquire)) return;
-                    self.failure = err;
-                    self.failed.store(true, .release);
-                    return;
-                };
-            }
-        }
-    }
-
-    fn check(self: *const @This()) !void {
-        if (!self.failed.load(.acquire)) return;
-        return self.failure orelse error.DataRaftTickerFailed;
-    }
-
-    fn stop(self: *@This(), thread: *std.Thread) void {
-        self.stop_requested.store(true, .release);
-        thread.join();
-    }
-};
-
 pub fn run(init: std.process.Init) !void {
     const alloc = init.gpa;
 
@@ -13257,18 +13227,15 @@ pub fn runFromIterator(
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
-    var raft_ticker = DataRaftTicker{
-        .server = &data_server,
-        .io = init.io,
-        .interval_ns = tick_ms * std.time.ns_per_ms,
-    };
-    var raft_ticker_thread: ?std.Thread = if (data_server.data_raft != null)
-        try std.Thread.spawn(.{}, DataRaftTicker.run, .{&raft_ticker})
-    else
-        null;
-    defer if (raft_ticker_thread) |*thread| raft_ticker.stop(thread);
+    var raft_progress = antfly.raft.ManagedProgressDriver.init(
+        init.io,
+        data_server.raftProgressSource(),
+        tick_ms * std.time.ns_per_ms,
+    );
+    defer raft_progress.deinit();
+    if (data_server.data_raft != null) try raft_progress.start();
     while (true) {
-        if (raft_ticker_thread != null) try raft_ticker.check();
+        if (data_server.data_raft != null) try raft_progress.check();
         data_server.runControlRoundOnly() catch |err| {
             // Report the fatal round error before deferred listener shutdown.
             // A shutdown failure must not hide the storage/Raft error that
@@ -14002,17 +13969,17 @@ test "data raft ticker advances consensus independently of control rounds" {
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    var ticker = DataRaftTicker{
-        .server = &server,
-        .io = io_impl.io(),
-        .interval_ns = std.time.ns_per_ms,
-    };
-    var ticker_thread = try std.Thread.spawn(.{}, DataRaftTicker.run, .{&ticker});
-    defer ticker.stop(&ticker_thread);
+    var progress = antfly.raft.ManagedProgressDriver.init(
+        io_impl.io(),
+        server.raftProgressSource(),
+        std.time.ns_per_ms,
+    );
+    defer progress.deinit();
+    try progress.start();
 
     const deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
     while (!server.localDataRaftLeaderReady(77)) {
-        try ticker.check();
+        try progress.check();
         if (platform_time.monotonicNs() >= deadline_ns) return error.TestExpectedEqual;
         try io_impl.io().sleep(.fromMilliseconds(1), .awake);
     }

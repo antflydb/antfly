@@ -12,11 +12,101 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const builtin = @import("builtin");
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const managed_host = @import("managed_host.zig");
 const metadata_view = @import("metadata_view.zig");
 const service = @import("service.zig");
 const reconciler = @import("reconciler.zig");
+
+pub const ProgressSource = struct {
+    ptr: *anyopaque,
+    run_once: *const fn (ptr: *anyopaque) anyerror!void,
+
+    pub fn runOnce(self: ProgressSource) !void {
+        return try self.run_once(self.ptr);
+    }
+};
+
+/// Owns the dedicated scheduling lane for one Raft runtime. The source retains
+/// semantic ownership of the Raft service and its synchronization; this driver
+/// owns only cadence, failure propagation, cancellation, and thread lifetime.
+/// A driver is one-shot: construct a new driver for a new runtime generation.
+pub const ManagedProgressDriver = struct {
+    const State = enum {
+        initialized,
+        running,
+        stopped,
+    };
+
+    io: std.Io,
+    source: ProgressSource,
+    interval_ns: u64,
+    thread: ?std.Thread = null,
+    state: State = .initialized,
+    stop_requested: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+
+    pub fn init(io: std.Io, source: ProgressSource, interval_ns: u64) ManagedProgressDriver {
+        return .{
+            .io = io,
+            .source = source,
+            .interval_ns = interval_ns,
+        };
+    }
+
+    pub fn start(self: *ManagedProgressDriver) !void {
+        if (self.state != .initialized) return error.AlreadyStarted;
+        if (self.interval_ns == 0) return error.InvalidInterval;
+        if (comptime builtin.single_threaded) return error.UnsupportedPlatform;
+
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.state = .running;
+    }
+
+    pub fn check(self: *const ManagedProgressDriver) !void {
+        if (!self.failed.load(.acquire)) return;
+        return self.failure orelse error.RaftProgressDriverFailed;
+    }
+
+    pub fn stop(self: *ManagedProgressDriver) void {
+        if (self.state != .running) return;
+        self.stop_requested.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.state = .stopped;
+    }
+
+    pub fn deinit(self: *ManagedProgressDriver) void {
+        self.stop();
+        self.* = undefined;
+    }
+
+    fn run(self: *ManagedProgressDriver) void {
+        while (!self.stop_requested.load(.acquire)) {
+            const started_ns = platform_time.monotonicNs();
+            self.source.runOnce() catch |err| {
+                self.failure = err;
+                self.failed.store(true, .release);
+                return;
+            };
+            const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+            if (elapsed_ns < self.interval_ns) {
+                self.io.sleep(
+                    std.Io.Duration.fromNanoseconds(self.interval_ns - elapsed_ns),
+                    .awake,
+                ) catch |err| {
+                    if (self.stop_requested.load(.acquire)) return;
+                    self.failure = err;
+                    self.failed.store(true, .release);
+                    return;
+                };
+            }
+        }
+    }
+};
 
 pub const MetadataUpdateSource = struct {
     ptr: *anyopaque,
@@ -248,6 +338,72 @@ pub const ManagedHttpHostRuntime = struct {
         return result;
     }
 };
+
+test "managed raft progress driver advances independently and joins on stop" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const Counter = struct {
+        count: std.atomic.Value(u64) = .init(0),
+
+        fn runOnce(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.count.fetchAdd(1, .release);
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var counter = Counter{};
+    var driver = ManagedProgressDriver.init(io_impl.io(), .{
+        .ptr = &counter,
+        .run_once = Counter.runOnce,
+    }, std.time.ns_per_ms);
+    defer driver.deinit();
+    try driver.start();
+
+    const deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    while (counter.count.load(.acquire) < 3) {
+        try driver.check();
+        if (platform_time.monotonicNs() >= deadline_ns) return error.TestExpectedEqual;
+        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+    }
+
+    driver.stop();
+    const stopped_count = counter.count.load(.acquire);
+    try io_impl.io().sleep(.fromMilliseconds(5), .awake);
+    try std.testing.expectEqual(stopped_count, counter.count.load(.acquire));
+    try std.testing.expectError(error.AlreadyStarted, driver.start());
+}
+
+test "managed raft progress driver publishes source failure" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const FailingSource = struct {
+        count: std.atomic.Value(u64) = .init(0),
+
+        fn runOnce(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.count.fetchAdd(1, .acq_rel) >= 2) return error.InjectedFailure;
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var source = FailingSource{};
+    var driver = ManagedProgressDriver.init(io_impl.io(), .{
+        .ptr = &source,
+        .run_once = FailingSource.runOnce,
+    }, std.time.ns_per_ms);
+    defer driver.deinit();
+    try driver.start();
+
+    const deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    while (!driver.failed.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.TestExpectedEqual;
+        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.InjectedFailure, driver.check());
+}
 
 test "managed host runtime deterministically drains metadata updates" {
     const raft_engine = @import("raft_engine");

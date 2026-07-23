@@ -88,6 +88,8 @@ pub const ManagedHttpHost = managed_host.ManagedHttpHost;
 pub const ManagedHttpHostConfig = managed_host.ManagedHttpHostConfig;
 pub const ManagedHttpHostDeps = managed_host.ManagedHttpHostDeps;
 pub const ManagedSyncResult = managed_host.ManagedSyncResult;
+pub const ProgressSource = runtime_loop.ProgressSource;
+pub const ManagedProgressDriver = runtime_loop.ManagedProgressDriver;
 pub const MetadataUpdateSource = runtime_loop.MetadataUpdateSource;
 pub const MetadataUpdateSink = runtime_loop.MetadataUpdateSink;
 pub const RuntimeLoopConfig = runtime_loop.RuntimeLoopConfig;
@@ -194,6 +196,8 @@ test "raft integration module compiles" {
     _ = ManagedHttpHostConfig;
     _ = ManagedHttpHostDeps;
     _ = ManagedSyncResult;
+    _ = ProgressSource;
+    _ = ManagedProgressDriver;
     _ = MetadataUpdateSource;
     _ = MetadataUpdateSink;
     _ = RuntimeLoopConfig;
