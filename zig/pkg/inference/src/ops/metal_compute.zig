@@ -22902,6 +22902,14 @@ test "metal_compute: scaled dot product attention handles Florence window layout
     try expectUniformMetalSdpa(std.testing.allocator, 6, 49, 8, 32, false);
 }
 
+test "metal_compute: scaled dot product attention strides keys and output dimensions" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    try expectUniformMetalSdpa(std.testing.allocator, 1, 257, 1, 1, false);
+    try expectUniformMetalSdpa(std.testing.allocator, 1, 1, 1, 257, false);
+}
+
 test "metal_compute: linearTriple is owned by metal backend" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
