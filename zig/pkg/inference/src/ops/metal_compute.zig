@@ -22645,6 +22645,87 @@ test "metal_compute: divideConsumeLeft uploads equal-size host rhs instead of do
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 2, 2, 8 }, out_data);
 }
 
+fn expectUniformMetalSdpa(
+    allocator: std.mem.Allocator,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    masked: bool,
+) !void {
+    const key_step: f32 = 0.01;
+    const hidden = num_heads * head_dim;
+    const total = batch * seq_len * hidden;
+    const qkv_shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden) };
+
+    const q_data = try allocator.alloc(f32, total);
+    defer allocator.free(q_data);
+    @memset(q_data, 0.0);
+    const k_data = try allocator.alloc(f32, total);
+    defer allocator.free(k_data);
+    @memset(k_data, 0.0);
+    const v_data = try allocator.alloc(f32, total);
+    defer allocator.free(v_data);
+    const mask = try allocator.alloc(i64, if (masked) batch * seq_len else 0);
+    defer allocator.free(mask);
+
+    for (0..batch) |b| {
+        const allowed = if (masked) 1 + (b % @min(seq_len, 17)) else seq_len;
+        if (masked) {
+            for (0..seq_len) |ki| mask[b * seq_len + ki] = if (ki < allowed) 1 else 0;
+        }
+        for (0..seq_len) |ki| {
+            for (0..num_heads) |h| {
+                for (0..head_dim) |d| {
+                    const idx = (b * seq_len + ki) * hidden + h * head_dim + d;
+                    v_data[idx] =
+                        @as(f32, @floatFromInt(b)) * 0.1 +
+                        @as(f32, @floatFromInt(h)) * 0.01 +
+                        @as(f32, @floatFromInt(ki)) * key_step +
+                        @as(f32, @floatFromInt(d)) * 0.0001;
+                }
+            }
+        }
+    }
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const q = try metal_cb.fromFloat32Shape(q_data, &qkv_shape);
+    defer metal_cb.free(q);
+    const k = try metal_cb.fromFloat32Shape(k_data, &qkv_shape);
+    defer metal_cb.free(k);
+    const v = try metal_cb.fromFloat32Shape(v_data, &qkv_shape);
+    defer metal_cb.free(v);
+
+    const out = try metal_cb.scaledDotProductAttention(q, k, v, mask, null, batch, seq_len, num_heads, head_dim);
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    for ([_]usize{ 0, batch / 2, batch - 1 }) |b| {
+        const allowed = if (masked) 1 + (b % @min(seq_len, 17)) else seq_len;
+        const mean_ki = @as(f32, @floatFromInt(allowed - 1)) * 0.5;
+        for ([_]usize{ 0, num_heads - 1 }) |h| {
+            for ([_]usize{ 0, seq_len / 2, seq_len - 1 }) |qi| {
+                for ([_]usize{ 0, head_dim - 1 }) |d| {
+                    const idx = (b * seq_len + qi) * hidden + h * head_dim + d;
+                    const expected =
+                        @as(f32, @floatFromInt(b)) * 0.1 +
+                        @as(f32, @floatFromInt(h)) * 0.01 +
+                        mean_ki * key_step +
+                        @as(f32, @floatFromInt(d)) * 0.0001;
+                    try std.testing.expectApproxEqAbs(expected, out_data[idx], 5e-4);
+                }
+            }
+        }
+    }
+}
+
 test "metal_compute: scaled dot product attention fallback preserves shape and values" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
@@ -22806,6 +22887,28 @@ test "metal_compute: scaled dot product attention supports seq-major interleaved
     for (expected, out_data) |expected_value, actual_value| {
         try std.testing.expectApproxEqAbs(expected_value, actual_value, 1e-4);
     }
+}
+
+test "metal_compute: scaled dot product attention handles BGE-scale masked batches" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    try expectUniformMetalSdpa(std.testing.allocator, 50, 128, 12, 64, true);
+}
+
+test "metal_compute: scaled dot product attention handles Florence window layout" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    try expectUniformMetalSdpa(std.testing.allocator, 6, 49, 8, 32, false);
+}
+
+test "metal_compute: scaled dot product attention strides keys and output dimensions" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    try expectUniformMetalSdpa(std.testing.allocator, 1, 257, 1, 1, false);
+    try expectUniformMetalSdpa(std.testing.allocator, 1, 1, 1, 257, false);
 }
 
 test "metal_compute: linearTriple is owned by metal backend" {
