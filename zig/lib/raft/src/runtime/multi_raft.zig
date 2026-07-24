@@ -780,24 +780,47 @@ pub const MultiRaft = struct {
             if (batch) |persist_batch| persist_batch.finish() catch unreachable;
         };
 
-        var scanned: usize = 0;
+        var fair_attempts: usize = 0;
         const scan_limit = self.groups.count();
-        var ready_pass = self.scheduler.beginReadyPass();
-        defer self.scheduler.finishReadyPass(&ready_pass);
         const scan_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        while (scanned < scan_limit) : (scanned += 1) {
-            if (processed >= max_groups) break;
-            const group_id = self.scheduler.nextReadyGroup(&ready_pass) orelse break;
-            const ready_processed = if (diagnostics) |diag| blk: {
-                var ready_diag = ReadyGroupDiagnostics{ .group_id = group_id };
-                const ready_start_ns = clock.monotonicNs();
-                const processed_ready = try self.processReadyIntoOutbox(group_id, &outbox, batch, false, false, &ready_diag);
-                ready_diag.elapsed_ns = clock.elapsedSinceNs(ready_start_ns);
-                ready_diag.processed = processed_ready;
-                if (ready_diag.elapsed_ns > diag.slowest_ready_group.elapsed_ns) diag.slowest_ready_group = ready_diag;
-                break :blk processed_ready;
-            } else try self.processReadyIntoOutbox(group_id, &outbox, batch, false, false, null);
-            if (ready_processed) processed += 1;
+        {
+            var ready_pass = self.scheduler.beginReadyPass(.fair);
+            defer self.scheduler.finishReadyPass(&ready_pass);
+            while (fair_attempts < scan_limit) : (fair_attempts += 1) {
+                if (processed >= max_groups) break;
+                const group_id = self.scheduler.nextReadyGroup(&ready_pass) orelse break;
+                if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics)) {
+                    processed += 1;
+                }
+            }
+        }
+
+        // If budget remains, every group received one fair opportunity above.
+        // Spend that budget only on hints produced while useful work advanced.
+        // A no-progress pass stops retries so backpressure cannot busy-spin.
+        var continuation_attempts: usize = 0;
+        const continuation_attempt_limit = max_groups - processed;
+        while (processed > 0 and
+            processed < max_groups and
+            continuation_attempts < continuation_attempt_limit and
+            self.scheduler.hasQueuedReady())
+        {
+            var attempted_this_pass: usize = 0;
+            var progressed_this_pass: usize = 0;
+            {
+                var ready_pass = self.scheduler.beginReadyPass(.queued_only);
+                defer self.scheduler.finishReadyPass(&ready_pass);
+                while (processed < max_groups and continuation_attempts < continuation_attempt_limit) {
+                    const group_id = self.scheduler.nextReadyGroup(&ready_pass) orelse break;
+                    continuation_attempts += 1;
+                    attempted_this_pass += 1;
+                    if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics)) {
+                        processed += 1;
+                        progressed_this_pass += 1;
+                    }
+                }
+            }
+            if (attempted_this_pass == 0 or progressed_this_pass == 0) break;
         }
         if (diagnostics) |diag| diag.scan_elapsed_ns = clock.elapsedSinceNs(scan_start_ns);
 
@@ -821,6 +844,41 @@ pub const MultiRaft = struct {
         }
         self.refreshQueueMetrics();
         return processed;
+    }
+
+    fn processReadyCandidate(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        outbox: *TransportOutbox,
+        persist_batch: ?storage_iface.PersistBatch,
+        diagnostics: ?*DrainReadyDiagnostics,
+    ) !bool {
+        if (diagnostics) |diag| {
+            var ready_diag = ReadyGroupDiagnostics{ .group_id = group_id };
+            const ready_start_ns = clock.monotonicNs();
+            const processed = try self.processReadyIntoOutbox(
+                group_id,
+                outbox,
+                persist_batch,
+                false,
+                false,
+                &ready_diag,
+            );
+            ready_diag.elapsed_ns = clock.elapsedSinceNs(ready_start_ns);
+            ready_diag.processed = processed;
+            if (ready_diag.elapsed_ns > diag.slowest_ready_group.elapsed_ns) {
+                diag.slowest_ready_group = ready_diag;
+            }
+            return processed;
+        }
+        return try self.processReadyIntoOutbox(
+            group_id,
+            outbox,
+            persist_batch,
+            false,
+            false,
+            null,
+        );
     }
 
     fn processReadyIntoOutbox(

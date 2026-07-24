@@ -601,13 +601,16 @@ test "multi raft processReady drains a synchronous single-node group" {
     try std.testing.expectEqual(@as(core.types.Index, 1), store.hard_state.commit_index);
 }
 
-test "multi raft processReady executes async local storage pipeline" {
-    var store = core.MemoryStorage.init(std.testing.allocator);
-    defer store.deinit();
+test "multi raft drainReady continues async pipeline without starving peer" {
+    var async_store = core.MemoryStorage.init(std.testing.allocator);
+    defer async_store.deinit();
+    var peer_store = core.MemoryStorage.init(std.testing.allocator);
+    defer peer_store.deinit();
 
     var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
     defer storage_recorder.deinit();
-    try storage_recorder.registerStore(21, &store);
+    try storage_recorder.registerStore(21, &async_store);
+    try storage_recorder.registerStore(22, &peer_store);
 
     var apply_recorder = ApplyRecorder{ .alloc = std.testing.allocator };
     var transport_recorder = TransportRecorder{ .alloc = std.testing.allocator };
@@ -619,25 +622,59 @@ test "multi raft processReady executes async local storage pipeline" {
     });
     defer host.deinit();
 
-    try addSingleNodeGroup(&host, 21, &store, true);
+    try addSingleNodeGroup(&host, 21, &async_store, true);
+    try addSingleNodeGroup(&host, 22, &peer_store, false);
     try host.group(21).?.campaign();
+    try host.group(22).?.campaign();
 
-    const passes = try drainGroup(&host, 21);
-    try std.testing.expect(passes > 1);
+    const processed = try host.drainReady(16);
+    try std.testing.expect(processed > 2);
     try std.testing.expectEqual(@as(usize, 0), try host.drainReady(8));
 
-    const grp = host.group(21).?;
-    try std.testing.expect(!grp.hasReady());
-    try std.testing.expectEqual(core.types.StateRole.leader, grp.status().soft.role);
-    try std.testing.expectEqual(@as(core.types.Index, 1), grp.status().hard.commit_index);
+    const async_group = host.group(21).?;
+    try std.testing.expect(!async_group.hasReady());
+    try std.testing.expectEqual(core.types.StateRole.leader, async_group.status().soft.role);
+    try std.testing.expectEqual(@as(core.types.Index, 1), async_group.status().hard.commit_index);
+    const peer_group = host.group(22).?;
+    try std.testing.expect(!peer_group.hasReady());
+    try std.testing.expectEqual(core.types.StateRole.leader, peer_group.status().soft.role);
+    try std.testing.expectEqual(@as(core.types.Index, 1), peer_group.status().hard.commit_index);
 
     try std.testing.expect(storage_recorder.persist_calls > 0);
-    try std.testing.expectEqual(@as(usize, 1), storage_recorder.persisted_entries);
+    try std.testing.expectEqual(@as(usize, 2), storage_recorder.persisted_entries);
     try std.testing.expect(apply_recorder.apply_calls > 0);
-    try std.testing.expectEqual(@as(usize, 1), apply_recorder.applied_entries);
+    try std.testing.expectEqual(@as(usize, 2), apply_recorder.applied_entries);
     try std.testing.expectEqual(@as(core.types.Index, 1), apply_recorder.last_applied_index);
     try std.testing.expectEqual(@as(usize, 0), transport_recorder.sent_messages);
-    try std.testing.expectEqual(@as(core.types.Index, 1), store.hard_state.commit_index);
+    try std.testing.expectEqual(@as(core.types.Index, 1), async_store.hard_state.commit_index);
+    try std.testing.expectEqual(@as(core.types.Index, 1), peer_store.hard_state.commit_index);
+}
+
+test "multi raft drainReady does not retry a no-progress frontier" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(23, &store);
+
+    var backpressure = BackpressureRecorder{ .allow = false };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+        .group_storage = storage_recorder.iface(),
+        .backpressure = backpressure.iface(),
+    });
+    defer host.deinit();
+
+    try addSingleNodeGroup(&host, 23, &store, false);
+    try host.campaignGroup(23);
+
+    try std.testing.expectEqual(@as(usize, 0), try host.drainReady(64));
+    try std.testing.expectEqual(@as(usize, 1), backpressure.calls);
+    try std.testing.expect(host.group(23).?.hasReady());
+
+    backpressure.allow = true;
+    try std.testing.expect(try host.drainReady(64) > 0);
+    try std.testing.expect(!host.group(23).?.hasReady());
 }
 
 test "multi raft drainReady processes multiple hosted groups" {

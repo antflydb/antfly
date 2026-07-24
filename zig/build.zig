@@ -3339,6 +3339,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_raft_runtime_tests = addFilteredTestRunArtifact(b, raft_runtime_tests);
 
+    const raft_ready_continuation_tests = b.addTest(.{
+        .root_module = raft_engine_mod,
+        .filters = &.{
+            "multi raft drainReady continues async pipeline without starving peer",
+            "multi raft drainReady does not retry a no-progress frontier",
+        },
+    });
+    const run_raft_ready_continuation_tests = addFilteredTestRunArtifact(b, raft_ready_continuation_tests);
+
     const raft_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
         // The top-level Raft declaration walk makes the nested transport test
@@ -5564,9 +5573,11 @@ pub fn build(b: *std.Build) void {
     const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
     raft_test_step.dependOn(&run_raft_runtime_tests.step);
+    raft_test_step.dependOn(&run_raft_ready_continuation_tests.step);
 
     const raft_runtime_test_step = b.step("raft-runtime-test", "Run focused managed Raft runtime tests");
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
+    raft_runtime_test_step.dependOn(&run_raft_ready_continuation_tests.step);
 
     const raft_transport_test_step = b.step("raft-transport-test", "Run raft transport unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
@@ -5617,6 +5628,7 @@ pub fn build(b: *std.Build) void {
     }
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_runtime_tests.step);
+    unit_test_step.dependOn(&run_raft_ready_continuation_tests.step);
 
     // Progress mode uses one union-filtered root artifact too. Storage and
     // metadata module paths overlap, while raft-transport is a strict subset

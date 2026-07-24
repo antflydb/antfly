@@ -32,7 +32,15 @@ pub const Scheduler = struct {
         ready_visit_epoch: u64 = 0,
     };
 
+    pub const ReadyPassKind = enum {
+        /// Prioritize queued hints, then audit every registered group once.
+        fair,
+        /// Consume only hints present when the pass begins.
+        queued_only,
+    };
+
     pub const ReadyPass = struct {
+        kind: ReadyPassKind,
         epoch: u64,
         priority_end: usize,
         fallback_checked: usize = 0,
@@ -112,7 +120,7 @@ pub const Scheduler = struct {
         return self.nextRoundRobinGroup(&self.cursor);
     }
 
-    pub fn beginReadyPass(self: *Scheduler) ReadyPass {
+    pub fn beginReadyPass(self: *Scheduler, kind: ReadyPassKind) ReadyPass {
         std.debug.assert(!self.ready_pass_active);
         self.ready_pass_active = true;
         self.ready_epoch +%= 1;
@@ -123,6 +131,7 @@ pub const Scheduler = struct {
         }
         // Hints appended while this pass runs belong to the next pass.
         return .{
+            .kind = kind,
             .epoch = self.ready_epoch,
             .priority_end = self.ready_queue.items.len,
         };
@@ -143,16 +152,18 @@ pub const Scheduler = struct {
             return group_id;
         }
 
-        // Hints are an optimization, not a correctness requirement. Probe each
-        // registered group once so a dropped wakeup cannot strand Raft work.
-        while (pass.fallback_checked < self.group_ids.items.len) {
-            const group_id = self.group_ids.items[self.ready_cursor];
-            self.ready_cursor = (self.ready_cursor + 1) % self.group_ids.items.len;
-            pass.fallback_checked += 1;
-            const state = self.groups.getPtr(group_id) orelse continue;
-            if (state.quiesced or state.ready_visit_epoch == pass.epoch) continue;
-            state.ready_visit_epoch = pass.epoch;
-            return group_id;
+        if (pass.kind == .fair) {
+            // Hints are an optimization, not a correctness requirement. Probe
+            // every group once so a dropped wakeup cannot strand Raft work.
+            while (pass.fallback_checked < self.group_ids.items.len) {
+                const group_id = self.group_ids.items[self.ready_cursor];
+                self.ready_cursor = (self.ready_cursor + 1) % self.group_ids.items.len;
+                pass.fallback_checked += 1;
+                const state = self.groups.getPtr(group_id) orelse continue;
+                if (state.quiesced or state.ready_visit_epoch == pass.epoch) continue;
+                state.ready_visit_epoch = pass.epoch;
+                return group_id;
+            }
         }
         return null;
     }
@@ -170,6 +181,12 @@ pub const Scheduler = struct {
         self.ready_queue_head = 0;
         self.ready_pass_active = false;
         pass.* = undefined;
+    }
+
+    pub fn hasQueuedReady(self: *const Scheduler) bool {
+        std.debug.assert(!self.ready_pass_active);
+        std.debug.assert(self.ready_queue_head == 0);
+        return self.ready_queue.items.len > 0;
     }
 
     pub fn quiesceGroup(self: *Scheduler, group_id: core.types.GroupId) !void {
@@ -297,7 +314,7 @@ test "scheduler skips quiesced groups" {
     try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextTickGroup());
     try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextTickGroup());
     {
-        var pass = scheduler.beginReadyPass();
+        var pass = scheduler.beginReadyPass(.fair);
         defer scheduler.finishReadyPass(&pass);
         try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup(&pass));
         try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup(&pass));
@@ -318,7 +335,7 @@ test "scheduler prioritizes each ready group once per pass" {
     try scheduler.registerGroup(3);
 
     for (0..8) |_| scheduler.noteActivity(3);
-    var first_pass = scheduler.beginReadyPass();
+    var first_pass = scheduler.beginReadyPass(.fair);
     try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup(&first_pass));
     scheduler.noteReady(3);
     try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup(&first_pass));
@@ -326,7 +343,7 @@ test "scheduler prioritizes each ready group once per pass" {
     try std.testing.expectEqual(@as(?core.types.GroupId, null), scheduler.nextReadyGroup(&first_pass));
     scheduler.finishReadyPass(&first_pass);
 
-    var second_pass = scheduler.beginReadyPass();
+    var second_pass = scheduler.beginReadyPass(.queued_only);
     defer scheduler.finishReadyPass(&second_pass);
     try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup(&second_pass));
 }
@@ -340,7 +357,7 @@ test "scheduler unregister normalizes ready cursor independently" {
     try scheduler.registerGroup(3);
 
     {
-        var pass = scheduler.beginReadyPass();
+        var pass = scheduler.beginReadyPass(.fair);
         defer scheduler.finishReadyPass(&pass);
         try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup(&pass));
         try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextReadyGroup(&pass));
@@ -348,7 +365,7 @@ test "scheduler unregister normalizes ready cursor independently" {
     }
 
     try std.testing.expect(scheduler.unregisterGroup(1));
-    var pass = scheduler.beginReadyPass();
+    var pass = scheduler.beginReadyPass(.fair);
     defer scheduler.finishReadyPass(&pass);
     try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextReadyGroup(&pass));
     try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup(&pass));

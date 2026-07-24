@@ -37,7 +37,7 @@ test "raft scheduler ready priority cannot starve consensus ticks" {
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualSlices(u64, &.{ 3, 1 }, second);
 
-    var ready_pass = scheduler.beginReadyPass();
+    var ready_pass = scheduler.beginReadyPass(.fair);
     try std.testing.expectEqual(@as(?u64, 1), scheduler.nextReadyGroup(&ready_pass));
     scheduler.noteReady(1);
     try std.testing.expectEqual(@as(?u64, 2), scheduler.nextReadyGroup(&ready_pass));
@@ -45,7 +45,7 @@ test "raft scheduler ready priority cannot starve consensus ticks" {
     try std.testing.expectEqual(@as(?u64, null), scheduler.nextReadyGroup(&ready_pass));
     scheduler.finishReadyPass(&ready_pass);
 
-    var requeued_pass = scheduler.beginReadyPass();
+    var requeued_pass = scheduler.beginReadyPass(.queued_only);
     defer scheduler.finishReadyPass(&requeued_pass);
     try std.testing.expectEqual(@as(?u64, 1), scheduler.nextReadyGroup(&requeued_pass));
 
@@ -58,9 +58,56 @@ test "raft scheduler ready priority cannot starve consensus ticks" {
     reused.noteReady(1);
     try std.testing.expect(reused.unregisterGroup(1));
     try reused.registerGroup(1);
-    var reused_pass = reused.beginReadyPass();
+    var reused_pass = reused.beginReadyPass(.fair);
     defer reused.finishReadyPass(&reused_pass);
     try std.testing.expectEqual(@as(?u64, 2), reused.nextReadyGroup(&reused_pass));
+
+    {
+        var bounded = raft_engine.runtime.scheduler.Scheduler.init(std.testing.allocator, .{});
+        defer bounded.deinit();
+        const group_count = 32;
+        for (0..group_count) |index| {
+            const group_id: u64 = @intCast(index + 1);
+            try bounded.registerGroup(group_id);
+            bounded.noteReady(group_id);
+        }
+
+        // Requeue every group while consuming the original frontier. This
+        // reaches the exact 2N physical queue bound before compaction.
+        var full_pass = bounded.beginReadyPass(.queued_only);
+        for (0..group_count) |index| {
+            const group_id: u64 = @intCast(index + 1);
+            try std.testing.expectEqual(@as(?u64, group_id), bounded.nextReadyGroup(&full_pass));
+            bounded.noteReady(group_id);
+        }
+        try std.testing.expectEqual(@as(?u64, null), bounded.nextReadyGroup(&full_pass));
+        bounded.finishReadyPass(&full_pass);
+        try std.testing.expect(bounded.hasQueuedReady());
+
+        // Stop partway through the compacted frontier and verify that both
+        // unconsumed and newly requeued hints retain deterministic FIFO order.
+        const partial_count = 7;
+        var partial_pass = bounded.beginReadyPass(.queued_only);
+        for (0..partial_count) |index| {
+            const group_id: u64 = @intCast(index + 1);
+            try std.testing.expectEqual(@as(?u64, group_id), bounded.nextReadyGroup(&partial_pass));
+            bounded.noteReady(group_id);
+        }
+        bounded.finishReadyPass(&partial_pass);
+
+        var compacted_pass = bounded.beginReadyPass(.queued_only);
+        for (partial_count..group_count) |index| {
+            const group_id: u64 = @intCast(index + 1);
+            try std.testing.expectEqual(@as(?u64, group_id), bounded.nextReadyGroup(&compacted_pass));
+        }
+        for (0..partial_count) |index| {
+            const group_id: u64 = @intCast(index + 1);
+            try std.testing.expectEqual(@as(?u64, group_id), bounded.nextReadyGroup(&compacted_pass));
+        }
+        try std.testing.expectEqual(@as(?u64, null), bounded.nextReadyGroup(&compacted_pass));
+        bounded.finishReadyPass(&compacted_pass);
+        try std.testing.expect(!bounded.hasQueuedReady());
+    }
 
     const Register = struct {
         fn run(alloc: std.mem.Allocator) !void {
