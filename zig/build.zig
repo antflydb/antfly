@@ -3343,6 +3343,7 @@ pub fn build(b: *std.Build) void {
         "raft runtime cadence validates independent intervals",
         "transition destination requires a stable healthy voter set",
         "transition service retries split bootstrap after leader recovery",
+        "raft scheduler ready priority cannot starve consensus ticks",
     };
     const raft_runtime_tests = b.addTest(.{
         .root_module = raft_runtime_test_mod,
@@ -3353,6 +3354,16 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_raft_runtime_tests = addFilteredTestRunArtifact(b, raft_runtime_tests);
+
+    const raft_ready_continuation_tests = b.addTest(.{
+        .root_module = raft_engine_mod,
+        .filters = &.{
+            "multi raft drainReady continues async pipeline without starving peer",
+            "multi raft drainReady does not retry a no-progress frontier",
+            "multi raft drainReady reserves continuations for productive groups",
+        },
+    });
+    const run_raft_ready_continuation_tests = addFilteredTestRunArtifact(b, raft_ready_continuation_tests);
 
     const raft_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -3671,6 +3682,8 @@ pub fn build(b: *std.Build) void {
         "file replica catalog rejects an existing truncated empty file",
         "raft batch round trips internal split checkpoint",
         "raft batch round trips internal split replication identity",
+        "paged authoritative reconciliation removes stale out-of-range documents before publication",
+        "paged authoritative reconciliation is allocation-failure safe",
         "group state range scan is allocation-failure safe",
         "shard state store persists split lifecycle and ownership",
         "shard state store decodes legacy split acknowledgement layouts",
@@ -4575,7 +4588,7 @@ pub fn build(b: *std.Build) void {
             "remote simple vector query uses vector worker route",
             "encode query request serializes internal resolved doc filters with wire context",
             "simple vector shard request carries serializable resolved doc filter",
-            "api http server maps public query doc identity mismatch to unavailable",
+            "api http server preserves public query availability errors",
             "api http server maps retrieval agent doc identity mismatch to unavailable",
             "api http server query builder maps doc identity mismatch to unavailable",
             "api http server surfaces structured doc identity conflicts for transaction commits",
@@ -4889,6 +4902,7 @@ pub fn build(b: *std.Build) void {
             "cached all-skipped coverage observation is a runtime fact",
             "table runtime snapshot cache clones stored status",
             "table runtime snapshot cache batch publication is table epoch atomic",
+            "table runtime snapshot cache lifecycle transition replaces and fences observations",
             "table runtime snapshot cache batch preserves newer group observations",
             "runtime status cache stable absence removal retires the old table epoch",
             "partial coverage embeddings readiness counts skipped source units",
@@ -4898,6 +4912,7 @@ pub fn build(b: *std.Build) void {
             "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
             "managed embeddings coverage debt does not fabricate replay debt",
             "external embeddings index readiness does not require table doc coverage",
+            "api http server preserves public query availability errors",
             "api http server create index waits for exact target config projection",
         },
         .test_runner = .{
@@ -4957,6 +4972,7 @@ pub fn build(b: *std.Build) void {
             "managed repair visibility edges retire cached readers and runtime status",
             "table runtime snapshot cache invalidation fences a stale observed publisher",
             "runtime status hook orders completed observation without crossing invalidation",
+            "structural repair publication advances the table lifecycle epoch",
             "table runtime snapshot cache live publication does not starve structural refresh",
             "table runtime snapshot cache preserves live completion over regressing persisted projection",
             "table runtime snapshot cache table fences isolate unrelated invalidations",
@@ -5581,9 +5597,11 @@ pub fn build(b: *std.Build) void {
     raft_test_step.dependOn(&run_raft_unit_tests.step);
     raft_test_step.dependOn(&run_raft_runtime_tests.step);
     raft_test_step.dependOn(&run_raft_library_tests.step);
+    raft_test_step.dependOn(&run_raft_ready_continuation_tests.step);
 
     const raft_runtime_test_step = b.step("raft-runtime-test", "Run focused managed Raft runtime tests");
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
+    raft_runtime_test_step.dependOn(&run_raft_ready_continuation_tests.step);
 
     const raft_transport_test_step = b.step("raft-transport-test", "Run raft transport unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
@@ -5635,6 +5653,7 @@ pub fn build(b: *std.Build) void {
     }
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_runtime_tests.step);
+    unit_test_step.dependOn(&run_raft_ready_continuation_tests.step);
 
     // Progress mode uses one union-filtered root artifact too. Storage and
     // metadata module paths overlap, while raft-transport is a strict subset

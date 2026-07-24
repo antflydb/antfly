@@ -1329,7 +1329,9 @@ export class AntflyClient {
       return data;
     },
 
-    listAll: async (options: Omit<RestoreJobListOptions, "cursor"> = {}): Promise<RestoreJob[]> => {
+    listAll: async (
+      options: Omit<RestoreJobListOptions, "cursor"> = {}
+    ): Promise<RestoreJob[]> => {
       const jobs: RestoreJob[] = [];
       const seen = new Set<string>();
       let cursor: string | undefined;
@@ -1338,8 +1340,7 @@ export class AntflyClient {
         jobs.push(...page.jobs);
         cursor = page.next_cursor;
         if (cursor) {
-          if (seen.has(cursor))
-            throw new Error(`List restore jobs returned a repeated cursor: ${cursor}`);
+          if (seen.has(cursor)) throw new Error(`List restore jobs returned a repeated cursor: ${cursor}`);
           seen.add(cursor);
         }
       } while (cursor);

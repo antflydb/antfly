@@ -1596,6 +1596,7 @@ pub const ApiHttpServer = struct {
     const join_context_vtable = distributed_join.JoinContext.VTable{
         .admin_snapshot = joinCtxAdminSnapshot,
         .free_admin_snapshot = joinCtxFreeAdminSnapshot,
+        .local_table_stats = joinCtxLocalTableStats,
         .get_join_shuffle_lease = joinCtxGetJoinShuffleLease,
         .upsert_join_shuffle_lease = joinCtxUpsertJoinShuffleLease,
         .remove_join_shuffle_lease = joinCtxRemoveJoinShuffleLease,
@@ -1613,6 +1614,31 @@ pub const ApiHttpServer = struct {
     fn joinCtxFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         self.source.freeAdminSnapshot(snapshot);
+    }
+
+    fn joinCtxLocalTableStats(
+        ptr: *anyopaque,
+        table_name: []const u8,
+        snapshot: *const metadata_api.AdminSnapshot,
+    ) anyerror!?distributed_join.JoinTableStats {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const table = tables_api.findTableByName(snapshot, table_name) orelse return null;
+        var statuses = (try self.localTableRuntimeStatusesWithSnapshot(table_name, snapshot)) orelse return null;
+        defer statuses.deinit(self.alloc);
+
+        var stats: distributed_join.JoinTableStats = .{};
+        for (snapshot.ranges) |range| {
+            if (range.table_id != table.table_id) continue;
+            const status = for (statuses.items) |item| {
+                if (item.group_id == range.group_id and runtime_status.statusRuntimeFresh(item)) break item;
+            } else return null;
+            stats.row_count +|= status.stats.doc_count;
+            stats.size_bytes +|= status.disk_bytes;
+            stats.shard_count += 1;
+        }
+        if (stats.shard_count == 0) return null;
+        stats.has_stats = true;
+        return stats;
     }
 
     fn joinCtxGetJoinShuffleLease(ptr: *anyopaque, job_id: u64) anyerror!?metadata_table_manager.ShuffleJoinLeaseRecord {
@@ -6897,7 +6923,7 @@ pub const ApiHttpServer = struct {
                 error.InvalidQueryRequest => return error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
-                error.TableNotFound => return error.TableNotFound,
+                error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
                 error.ModelNotFound => return error.ModelNotFound,
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -6909,8 +6935,8 @@ pub const ApiHttpServer = struct {
                 => return err,
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
                 error.IndexRebuilding => return error.IndexRebuilding,
-                error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
-                error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
+                error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
+                error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
                 error.Timeout => return error.Timeout,
                 else => {
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
@@ -6939,8 +6965,9 @@ pub const ApiHttpServer = struct {
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.IndexRebuilding => return error.IndexRebuilding,
-            error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
+            error.TableNotFound, error.NotFound => return error.NotFound,
+            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             else => {
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -6988,8 +7015,9 @@ pub const ApiHttpServer = struct {
             error.EmbedUpstreamFailure,
             => return err,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
+            error.IndexRebuilding => return error.IndexRebuilding,
+            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             error.Timeout => return error.Timeout,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
@@ -8367,6 +8395,37 @@ pub const ApiHttpServer = struct {
         return try self.handlePublicTableMultiQuery(null, body, authenticated_identity);
     }
 
+    fn publicQueryDispatchErrorResponse(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        err: anyerror,
+    ) !http_common.HttpResponse {
+        return switch (err) {
+            error.InvalidQueryRequest => try invalidPublicQueryRequestResponse(self.alloc),
+            error.UnsupportedExactSort => try unsupportedExactSortResponse(self.alloc),
+            error.UnsupportedQueryRequest => try unsupportedPublicQueryResponse(self.alloc, body),
+            error.IdentityReadGenerationChanged => try retryableTextResponse(self.alloc, 409, "identity read generation changed"),
+            error.QueryCandidateBudgetExceeded => try queryCandidateBudgetExceededResponse(self.alloc),
+            error.QueryEmbeddingInputTooLarge => try textResponse(self.alloc, 413, "query embedding input too large"),
+            error.QueryEmbeddingOverloaded => try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
+            error.EmbedRateLimited => try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
+            error.EmbedTransientFailure => try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
+            error.EmbedUpstreamFailure => try textResponse(self.alloc, 502, "query embedding provider failed"),
+            error.Timeout => try textResponse(self.alloc, 504, "query timed out"),
+            error.NotFound, error.TableNotFound => try textResponse(self.alloc, 404, "not found"),
+            error.ModelNotFound => try modelNotFoundResponse(self.alloc),
+            error.DocIdentityNamespaceMismatch => try textResponse(self.alloc, 503, "doc identity unavailable"),
+            error.IndexRebuilding => try indexRebuildingResponse(self.alloc),
+            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try textResponse(self.alloc, 503, "read requires primary"),
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try textResponse(self.alloc, 503, "standby read unavailable"),
+            else => {
+                std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
+                return try textResponse(self.alloc, 500, "query failed");
+            },
+        };
+    }
+
     pub fn handlePublicTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
@@ -8380,27 +8439,7 @@ pub const ApiHttpServer = struct {
             body,
             row_filter_json,
             authenticated_identity,
-        ) catch |err| switch (err) {
-            error.InvalidQueryRequest => return try invalidPublicQueryRequestResponse(self.alloc),
-            error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
-            error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, body),
-            error.IdentityReadGenerationChanged => return try retryableTextResponse(self.alloc, 409, "identity read generation changed"),
-            error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
-            error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
-            error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
-            error.EmbedRateLimited => return try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
-            error.EmbedTransientFailure => return try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
-            error.EmbedUpstreamFailure => return try textResponse(self.alloc, 502, "query embedding provider failed"),
-            error.Timeout => return try textResponse(self.alloc, 504, "query timed out"),
-            error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-            error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
-            error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
-            error.IndexRebuilding => return try indexRebuildingResponse(self.alloc),
-            else => {
-                std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
-                return try textResponse(self.alloc, 500, "query failed");
-            },
-        };
+        ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, body, err);
         defer self.alloc.free(response_body);
 
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -8452,27 +8491,7 @@ pub const ApiHttpServer = struct {
                 line,
                 row_filter_json,
                 authenticated_identity,
-            ) catch |err| switch (err) {
-                error.InvalidQueryRequest => return try invalidPublicQueryRequestResponse(self.alloc),
-                error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
-                error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, line),
-                error.IdentityReadGenerationChanged => return try retryableTextResponse(self.alloc, 409, "identity read generation changed"),
-                error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
-                error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
-                error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
-                error.EmbedRateLimited => return try retryableTextResponse(self.alloc, 429, "query embedding rate limited"),
-                error.EmbedTransientFailure => return try retryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
-                error.EmbedUpstreamFailure => return try textResponse(self.alloc, 502, "query embedding provider failed"),
-                error.Timeout => return try textResponse(self.alloc, 504, "query timed out"),
-                error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-                error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
-                error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
-                error.IndexRebuilding => return try indexRebuildingResponse(self.alloc),
-                else => {
-                    std.log.err("public table multiquery execution failed table={s} err={}", .{ table_name, err });
-                    return try textResponse(self.alloc, 500, "query failed");
-                },
-            };
+            ) catch |err| return try self.publicQueryDispatchErrorResponse(table_name, line, err);
             defer self.alloc.free(response_body);
 
             var parsed = std.json.parseFromSlice(std.json.Value, arena, response_body, .{
@@ -21821,7 +21840,7 @@ test "api http server handleInternalRoute matches handle for internal group look
     try std.testing.expectEqualStrings(via_handle.headers[0].value, via_internal.headers[0].value);
 }
 
-test "api http server maps public query doc identity mismatch to unavailable" {
+test "api http server preserves public query availability errors" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
@@ -21840,9 +21859,11 @@ test "api http server maps public query doc identity mismatch to unavailable" {
     };
 
     const FakeReads = struct {
-        fn source() table_reads.TableReadSource {
+        query_error: anyerror,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .lookup = lookup,
                     .scan = scan,
@@ -21875,27 +21896,49 @@ test "api http server maps public query doc identity mismatch to unavailable" {
         }
 
         fn query(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             table_name: []const u8,
             _: db_mod.types.SearchRequest,
             _: raft_mod.ReadConsistency,
         ) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            return error.DocIdentityNamespaceMismatch;
+            return self.query_error;
         }
     };
 
-    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), null);
-    defer server.deinit();
+    const cases = [_]struct {
+        query_error: anyerror,
+        status: u16,
+        body: []const u8,
+    }{
+        .{ .query_error = error.DocIdentityNamespaceMismatch, .status = 503, .body = "doc identity unavailable" },
+        .{ .query_error = error.ReadUnavailable, .status = 503, .body = "standby read unavailable" },
+        .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "read requires primary" },
+        .{ .query_error = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}" },
+        .{ .query_error = error.TableNotFound, .status = 404, .body = "not found" },
+    };
+    for (cases) |case| {
+        var reads = FakeReads{ .query_error = case.query_error };
+        var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
+        defer server.deinit();
 
-    var resp = try server.handlePublicTableQuery("docs",
-        \\{"query":{"match_all":{}}}
-    , null);
-    defer resp.deinit(alloc);
+        var resp = try server.handlePublicTableQuery("docs",
+            \\{"query":{"match_all":{}}}
+        , null);
+        defer resp.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u16, 503), resp.status);
-    try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+        try std.testing.expectEqual(case.status, resp.status);
+        try std.testing.expectEqualStrings(case.body, resp.body);
+
+        var multi_resp = try server.handlePublicTableMultiQuery("docs",
+            \\{"query":{"match_all":{}}}
+        , null);
+        defer multi_resp.deinit(alloc);
+        try std.testing.expectEqual(case.status, multi_resp.status);
+        try std.testing.expectEqualStrings(case.body, multi_resp.body);
+    }
 }
 
 test "api http server retries transient query EndOfStream before returning 500" {
@@ -27358,6 +27401,122 @@ test "api http server join planner uses snapshot stats for low-selectivity looku
     try std.testing.expect(plan.used_stats);
     try std.testing.expect(!plan.shuffle_candidate);
     try std.testing.expect(plan.estimated_cost > 0);
+}
+
+test "api http server join planner uses complete fresh local stats before metadata publication" {
+    const FakeSource = struct {
+        snapshot: metadata_api.AdminSnapshot,
+
+        fn status(ptr: *anyopaque) !metadata_api.MetadataStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.snapshot.status;
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.snapshot;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .local_runtime_statuses = localRuntimeStatuses,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn localRuntimeStatuses(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) !?runtime_status.LocalTableRuntimeStatuses {
+            const group_id: u64 = if (std.mem.eql(u8, table_name, "docs"))
+                101
+            else if (std.mem.eql(u8, table_name, "customers"))
+                201
+            else
+                return null;
+            const doc_count: u64 = if (group_id == 101) 2 else 3;
+            const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            items[0] = .{
+                .group_id = group_id,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+                .disk_bytes = 1024,
+                .stats = .{ .doc_count = doc_count },
+            };
+            return .{ .items = items };
+        }
+    };
+
+    var tables = [_]metadata_table_manager.TableRecord{
+        .{ .table_id = 1, .name = "docs", .placement_role = "data" },
+        .{ .table_id = 2, .name = "customers", .placement_role = "data" },
+    };
+    var ranges = [_]metadata_table_manager.RangeRecord{
+        .{ .group_id = 101, .table_id = 1, .start_key = "", .end_key = null },
+        .{ .group_id = 201, .table_id = 2, .start_key = "", .end_key = null },
+    };
+    var fake = FakeSource{
+        .snapshot = .{
+            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .tables = tables[0..],
+            .ranges = ranges[0..],
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+            .merged_group_statuses = &.{},
+        },
+    };
+    var reads = FakeReads{};
+
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, .{
+        .ptr = &fake,
+        .vtable = &.{
+            .status = FakeSource.status,
+            .admin_snapshot = FakeSource.adminSnapshot,
+            .free_admin_snapshot = FakeSource.freeAdminSnapshot,
+        },
+    }, reads.source(), null);
+    defer server.deinit();
+
+    var parsed_hits = try parseTestQueryHitsAlloc(std.testing.allocator,
+        \\[
+        \\  {"_id":"doc:1","_source":{"customer_id":"cust:1"}},
+        \\  {"_id":"doc:2","_source":{"customer_id":"cust:2"}}
+        \\]
+    );
+    defer parsed_hits.deinit(std.testing.allocator);
+
+    const join: ApiHttpServer.SupportedJoinRequest = .{
+        .right_table = @constCast("customers"),
+        .join_type = .inner,
+        .left_field = @constCast("customer_id"),
+        .right_field = @constCast("_id"),
+    };
+    const plan = try server.planSupportedJoinExecution(std.testing.allocator, "docs", join, parsed_hits.values, .{});
+    try std.testing.expectEqual(ApiHttpServer.RightJoinQueryResult.StrategyUsed.broadcast, plan.strategy);
+    try std.testing.expect(plan.used_stats);
 }
 
 test "api http server join planner uses foreign source statistics" {

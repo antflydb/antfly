@@ -82,7 +82,7 @@ import {
   generateSearchableFields,
   type SearchableField,
 } from "../utils/fieldUtils";
-import { buildTableQueryRequest } from "./table-query";
+import { buildTableQueryRequest, parseTableQueryRequest } from "./table-query";
 
 const formatBytes = (bytes: number, decimals = 2) => {
   if (bytes === 0) return "0 Bytes";
@@ -274,46 +274,35 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     }
   }, [indexes, queryIndexes.length]);
 
-  const semanticQueryRequestString = useMemo(() => {
-    return JSON.stringify(
-      buildTableQueryRequest({
-        query,
-        queryIndexes,
-        selectedFields,
-        semanticQuery,
-        filterQuery,
-        includeProfile,
-      }),
-      null,
-      2
-    );
+  const semanticQueryRequest = useMemo(() => {
+    return buildTableQueryRequest({
+      query,
+      queryIndexes,
+      selectedFields,
+      semanticQuery,
+      filterQuery,
+      includeProfile,
+    });
   }, [query, queryIndexes, filterQuery, semanticQuery, selectedFields, includeProfile]);
+  const semanticQueryRequestString = useMemo(
+    () => JSON.stringify(semanticQueryRequest, null, 2),
+    [semanticQueryRequest]
+  );
 
   const [queryJsonString, setQueryJsonString] = useState(semanticQueryRequestString);
-  const isJsonQueryValid = useMemo(() => {
-    try {
-      JSON.parse(queryJsonString);
-      return true;
-    } catch {
-      return false;
-    }
-  }, [queryJsonString]);
-
-  const semanticQueryRequest = useMemo(() => {
-    try {
-      return JSON.parse(semanticQueryRequestString);
-    } catch {
-      return {};
-    }
-  }, [semanticQueryRequestString]);
+  const parsedJsonQuery = useMemo(
+    () => parseTableQueryRequest(queryJsonString),
+    [queryJsonString]
+  );
+  const isJsonQueryValid = parsedJsonQuery !== null;
 
   const handleQueryModeChange = (v: string) => {
     const mode = v as "builder" | "json";
     if (mode === "json") {
       setQueryJsonString(semanticQueryRequestString);
     } else if (mode === "builder") {
-      try {
-        const queryRequest = JSON.parse(queryJsonString);
+      const queryRequest = parseTableQueryRequest(queryJsonString);
+      if (queryRequest) {
         setQueryIndexes(queryRequest.indexes || []);
         setSelectedFields(queryRequest.fields || []);
         setFieldInput(""); // Clear field input when switching from JSON mode
@@ -338,9 +327,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         if (offset !== undefined) semanticPart.offset = offset;
         setSemanticQuery(JSON.stringify(semanticPart, null, 2));
         setError(null);
-      } catch (e) {
-        setError("Invalid JSON in query editor. Please fix it before switching to builder mode.");
-        console.error("Invalid JSON in full query editor:", e);
+      } else {
+        setError("The query editor must contain one JSON object.");
         return;
       }
     }
@@ -453,15 +441,18 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const handleRunQuery = useCallback(async () => {
     if (!tableName) return;
     try {
-      const queryRequest =
-        queryMode === "json" ? JSON.parse(queryJsonString) : semanticQueryRequest;
+      const queryRequest = queryMode === "json" ? parsedJsonQuery : semanticQueryRequest;
+      if (!queryRequest) {
+        setError("The query editor must contain one JSON object.");
+        return;
+      }
       const response = await api.tables.query(tableName, queryRequest);
       setQueryResult(response?.responses?.[0] || null);
     } catch (e) {
       setError(`Failed to run query on table ${tableName}.`);
       console.error(e);
     }
-  }, [tableName, queryMode, queryJsonString, semanticQueryRequest]);
+  }, [tableName, queryMode, parsedJsonQuery, semanticQueryRequest]);
 
   // Global Ctrl+Enter handler for search section
   useEffect(() => {
@@ -1134,20 +1125,12 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                 </TabsContent>
                 <TabsContent value="json">
                   {(() => {
-                    let jsonObject: unknown;
-                    let parseError = false;
-                    try {
-                      jsonObject = JSON.parse(queryJsonString);
-                    } catch {
-                      parseError = true;
-                    }
-
-                    if (parseError) {
+                    if (!parsedJsonQuery) {
                       return (
                         <div className="flex flex-col gap-2">
                           <Alert variant="destructive">
                             <AlertDescription>
-                              The current query is not valid JSON. Please correct it.
+                              The current query must be one valid JSON object.
                             </AlertDescription>
                           </Alert>
                           <Textarea
@@ -1162,7 +1145,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                       );
                     }
 
-                    return <JsonViewer json={jsonObject as object} />;
+                    return <JsonViewer json={parsedJsonQuery} />;
                   })()}
                 </TabsContent>
               </div>

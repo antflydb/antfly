@@ -9,6 +9,21 @@ export interface TableQueryBuilderState {
   includeProfile: boolean;
 }
 
+function parseJsonObject(source: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(source);
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function parseTableQueryRequest(source: string): QueryRequest | null {
+  return parseJsonObject(source) as QueryRequest | null;
+}
+
 export function buildTableQueryRequest({
   query,
   queryIndexes,
@@ -28,25 +43,18 @@ export function buildTableQueryRequest({
     request.fields = selectedFields;
   }
 
-  try {
-    const options = JSON.parse(semanticQuery);
-    request.aggregations = options.aggregations;
-    request.limit = options.limit ?? 10;
-    if (!hasSemanticQuery && options.offset !== undefined) {
-      request.offset = options.offset;
-    }
-  } catch (error) {
-    request.limit = 10;
-    console.error("Invalid semantic query JSON:", error);
+  const options = parseJsonObject(semanticQuery);
+  if (options?.aggregations !== undefined) {
+    request.aggregations = options.aggregations as QueryRequest["aggregations"];
+  }
+  request.limit = typeof options?.limit === "number" ? options.limit : 10;
+  if (!hasSemanticQuery && typeof options?.offset === "number") {
+    request.offset = options.offset;
   }
 
-  try {
-    const filter = JSON.parse(filterQuery);
-    if (Object.keys(filter).length > 0) {
-      request.filter_query = filter;
-    }
-  } catch (error) {
-    console.error("Invalid filter query JSON:", error);
+  const filter = parseJsonObject(filterQuery);
+  if (filter && Object.keys(filter).length > 0) {
+    request.filter_query = filter as QueryRequest["filter_query"];
   }
 
   request.profile = includeProfile;

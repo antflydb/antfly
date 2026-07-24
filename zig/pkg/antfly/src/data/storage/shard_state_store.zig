@@ -173,6 +173,13 @@ pub fn currentRange(store: *docstore.DocStore, alloc: std.mem.Allocator, group_i
     return try currentRangeTxn(&txn, alloc, group_id);
 }
 
+fn dupeRangeAlloc(alloc: std.mem.Allocator, byte_range: AppliedDataRange) !AppliedDataRange {
+    const start = try alloc.dupe(u8, byte_range.start);
+    errdefer if (start.len > 0) alloc.free(start);
+    const end = try alloc.dupe(u8, byte_range.end);
+    return .{ .start = start, .end = end };
+}
+
 fn currentRangeTxn(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) !AppliedDataRange {
     const key = try groupRangeKeyAlloc(alloc, group_id);
     defer alloc.free(key);
@@ -1425,14 +1432,15 @@ fn sourceContainsProjectedDocuments(
         while (source_key) |candidate| {
             switch (std.mem.order(u8, candidate, projected_key)) {
                 .lt => {
-                    alloc.free(candidate);
-                    source_key = try nextPrimaryRawKeyAlloc(
+                    const replacement = try nextPrimaryRawKeyAlloc(
                         &source_cursor,
                         &source_entry,
                         alloc,
                         null,
                         source_upper,
                     );
+                    alloc.free(candidate);
+                    source_key = replacement;
                 },
                 .eq => break,
                 .gt => return false,
@@ -1443,14 +1451,37 @@ fn sourceContainsProjectedDocuments(
     return true;
 }
 
-const DeletePhysicalRangePage = struct {
-    next_after_key: ?[]u8,
-    exhausted: bool,
+const DeletePhysicalKeySpan = struct {
+    offset: usize,
+    len: usize,
+};
+
+const DeletePhysicalRangeScratch = struct {
+    key_bytes: std.ArrayListUnmanaged(u8) = .empty,
+    key_spans: std.ArrayListUnmanaged(DeletePhysicalKeySpan) = .empty,
+    after_key: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn clearPage(self: *@This()) void {
+        self.key_bytes.clearRetainingCapacity();
+        self.key_spans.clearRetainingCapacity();
+    }
+
+    fn resetRange(self: *@This()) void {
+        self.clearPage();
+        self.after_key.clearRetainingCapacity();
+    }
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.next_after_key) |key| alloc.free(key);
+        self.key_bytes.deinit(alloc);
+        self.key_spans.deinit(alloc);
+        self.after_key.deinit(alloc);
         self.* = undefined;
     }
+};
+
+const DeletePhysicalRangePage = struct {
+    exhausted: bool,
+    deleted_entries: usize,
 };
 
 fn deleteGroupDocumentPhysicalRangePage(
@@ -1459,22 +1490,17 @@ fn deleteGroupDocumentPhysicalRangePage(
     logical_prefix: []const u8,
     lower: []const u8,
     upper: []const u8,
-    after_key: ?[]const u8,
+    scratch: *DeletePhysicalRangeScratch,
     max_page_entries: usize,
     max_page_bytes: usize,
 ) !DeletePhysicalRangePage {
     if (std.mem.order(u8, lower, upper) != .lt) return .{
-        .next_after_key = null,
         .exhausted = true,
+        .deleted_entries = 0,
     };
-    var deletes = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (deletes.items) |key| alloc.free(key);
-        deletes.deinit(alloc);
-    }
+    scratch.clearPage();
+    errdefer scratch.clearPage();
 
-    var next_after_key: ?[]u8 = null;
-    errdefer if (next_after_key) |key| alloc.free(key);
     var exhausted = true;
     {
         var read_txn = try projected.beginReadTxn();
@@ -1485,6 +1511,10 @@ fn deleteGroupDocumentPhysicalRangePage(
 
         var scanned_entries: usize = 0;
         var scanned_bytes: usize = 0;
+        const after_key: ?[]const u8 = if (scratch.after_key.items.len > 0)
+            scratch.after_key.items
+        else
+            null;
         var entry = try cursor.seekAtOrAfter(after_key orelse lower);
         while (entry) |kv| : (entry = try cursor.next()) {
             if (std.mem.order(u8, kv.key, upper) != .lt) break;
@@ -1503,9 +1533,12 @@ fn deleteGroupDocumentPhysicalRangePage(
             defer alloc.free(logical_key);
             if (!std.mem.startsWith(u8, logical_key, logical_prefix))
                 return error.InvalidAppliedDataRange;
-            try deletes.append(alloc, try alloc.dupe(u8, kv.key));
-            if (next_after_key) |key| alloc.free(key);
-            next_after_key = try alloc.dupe(u8, kv.key);
+            const key_offset = scratch.key_bytes.items.len;
+            try scratch.key_bytes.appendSlice(alloc, kv.key);
+            try scratch.key_spans.append(alloc, .{
+                .offset = key_offset,
+                .len = kv.key.len,
+            });
             scanned_entries += 1;
             scanned_bytes +|= kv.key.len;
             if (scanned_entries >= max_page_entries or scanned_bytes >= max_page_bytes) {
@@ -1515,48 +1548,62 @@ fn deleteGroupDocumentPhysicalRangePage(
         }
     }
 
-    if (deletes.items.len > 0) {
+    if (!exhausted) {
+        if (scratch.key_spans.items.len == 0) return error.InvalidAppliedDataRange;
+        const last = scratch.key_spans.items[scratch.key_spans.items.len - 1];
+        try scratch.after_key.ensureTotalCapacity(alloc, last.len);
+    }
+
+    if (scratch.key_spans.items.len > 0) {
         var write_txn = try projected.beginWriteTxn();
         errdefer write_txn.abort();
-        for (deletes.items) |key| try write_txn.delete(key);
+        for (scratch.key_spans.items) |span| {
+            try write_txn.delete(scratch.key_bytes.items[span.offset..][0..span.len]);
+        }
         try write_txn.commit();
     }
 
-    if (!exhausted and next_after_key == null) return error.InvalidAppliedDataRange;
+    const deleted_entries = scratch.key_spans.items.len;
+    if (!exhausted) {
+        if (deleted_entries == 0) return error.InvalidAppliedDataRange;
+        const last = scratch.key_spans.items[deleted_entries - 1];
+        scratch.after_key.clearRetainingCapacity();
+        scratch.after_key.appendSliceAssumeCapacity(
+            scratch.key_bytes.items[last.offset..][0..last.len],
+        );
+    } else {
+        scratch.after_key.clearRetainingCapacity();
+    }
+    scratch.clearPage();
     return .{
-        .next_after_key = next_after_key,
         .exhausted = exhausted,
+        .deleted_entries = deleted_entries,
     };
 }
 
-fn deleteGroupDocumentPhysicalRangePaged(
+fn deleteGroupDocumentPhysicalRangePagedWithScratch(
     projected: *docstore.DocStore,
     alloc: std.mem.Allocator,
     logical_prefix: []const u8,
     lower: []const u8,
     upper: []const u8,
+    scratch: *DeletePhysicalRangeScratch,
     max_page_entries: usize,
     max_page_bytes: usize,
 ) !void {
-    var after_key: ?[]u8 = null;
-    defer if (after_key) |key| alloc.free(key);
+    scratch.resetRange();
     while (true) {
-        var page = try deleteGroupDocumentPhysicalRangePage(
+        const page = try deleteGroupDocumentPhysicalRangePage(
             projected,
             alloc,
             logical_prefix,
             lower,
             upper,
-            after_key,
+            scratch,
             max_page_entries,
             max_page_bytes,
         );
-        defer page.deinit(alloc);
         if (page.exhausted) break;
-        const next_after_key = page.next_after_key orelse return error.InvalidAppliedDataRange;
-        const retained = try alloc.dupe(u8, next_after_key);
-        if (after_key) |key| alloc.free(key);
-        after_key = retained;
     }
 }
 
@@ -1575,16 +1622,19 @@ fn deleteGroupDocumentsOutsideRangePaged(
     const group_upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse
         return error.InvalidAppliedDataRange;
     defer alloc.free(group_upper);
+    var scratch = DeletePhysicalRangeScratch{};
+    defer scratch.deinit(alloc);
 
     if (byte_range.start.len > 0) {
         const retained_lower = try groupDocumentLowerBoundAlloc(alloc, group_id, byte_range.start);
         defer alloc.free(retained_lower);
-        try deleteGroupDocumentPhysicalRangePaged(
+        try deleteGroupDocumentPhysicalRangePagedWithScratch(
             projected,
             alloc,
             logical_prefix,
             group_lower,
             retained_lower,
+            &scratch,
             max_page_entries,
             max_page_bytes,
         );
@@ -1593,12 +1643,13 @@ fn deleteGroupDocumentsOutsideRangePaged(
         const retained_upper = (try groupDocumentUpperBoundAlloc(alloc, group_id, byte_range.end)) orelse
             return error.InvalidAppliedDataRange;
         defer alloc.free(retained_upper);
-        try deleteGroupDocumentPhysicalRangePaged(
+        try deleteGroupDocumentPhysicalRangePagedWithScratch(
             projected,
             alloc,
             logical_prefix,
             retained_upper,
             group_upper,
+            &scratch,
             max_page_entries,
             max_page_bytes,
         );
@@ -1705,10 +1756,7 @@ pub fn reconcileAuthoritativeGroupDocumentsPaged(
     const replacement_range: AppliedDataRange = if (active_split != null)
         try currentRange(projected, alloc, group_id)
     else
-        .{
-            .start = try alloc.dupe(u8, byte_range.start),
-            .end = try alloc.dupe(u8, byte_range.end),
-        };
+        try dupeRangeAlloc(alloc, byte_range);
     defer range_state.freeRange(alloc, replacement_range);
     const range_key = try groupRangeKeyAlloc(alloc, group_id);
     defer alloc.free(range_key);
@@ -1811,9 +1859,13 @@ test "paged authoritative reconciliation removes stale out-of-range documents be
         61,
         .{ .start = "doc:0", .end = "doc:zz" },
         &.{
-            .{ .key = "doc:0", .value = "stale-before" },
+            .{ .key = "doc:00", .value = "stale-before-0" },
+            .{ .key = "doc:01", .value = "stale-before-1" },
+            .{ .key = "doc:02", .value = "stale-before-2" },
             .{ .key = "doc:b", .value = "old" },
-            .{ .key = "doc:z", .value = "stale-after" },
+            .{ .key = "doc:x", .value = "stale-after-0" },
+            .{ .key = "doc:y", .value = "stale-after-1" },
+            .{ .key = "doc:z", .value = "stale-after-2" },
         },
     );
     for ([_]AppliedDataKV{
@@ -1841,7 +1893,7 @@ test "paged authoritative reconciliation removes stale out-of-range documents be
     );
     const state_after_invalid_range = try groupState(&projected, alloc, 61);
     defer freeGroupStateEntries(alloc, state_after_invalid_range);
-    try std.testing.expectEqual(@as(usize, 3), state_after_invalid_range.len);
+    try std.testing.expectEqual(@as(usize, 7), state_after_invalid_range.len);
     try std.testing.expectError(error.NotFound, projected.get(alloc, marker_key));
 
     const logical_prefix = try groupDocumentPrefixAlloc(alloc, 61);
@@ -1850,25 +1902,46 @@ test "paged authoritative reconciliation removes stale out-of-range documents be
     defer alloc.free(group_lower);
     const retained_lower = try groupDocumentLowerBoundAlloc(alloc, 61, "doc:a");
     defer alloc.free(retained_lower);
-    var interrupted_cleanup = try deleteGroupDocumentPhysicalRangePage(
+    var cleanup_scratch = DeletePhysicalRangeScratch{};
+    defer cleanup_scratch.deinit(alloc);
+    const interrupted_cleanup = try deleteGroupDocumentPhysicalRangePage(
         &projected,
         alloc,
         logical_prefix,
         group_lower,
         retained_lower,
-        null,
+        &cleanup_scratch,
         1,
         1,
     );
-    defer interrupted_cleanup.deinit(alloc);
     try std.testing.expect(!interrupted_cleanup.exhausted);
-    try std.testing.expect(interrupted_cleanup.next_after_key != null);
+    try std.testing.expectEqual(@as(usize, 1), interrupted_cleanup.deleted_entries);
+    try std.testing.expect(cleanup_scratch.after_key.items.len > 0);
     try std.testing.expectError(error.NotFound, projected.get(alloc, marker_key));
     const interrupted_state = try groupState(&projected, alloc, 61);
     defer freeGroupStateEntries(alloc, interrupted_state);
-    try std.testing.expectEqual(@as(usize, 2), interrupted_state.len);
-    try std.testing.expectEqualStrings("doc:b", interrupted_state[0].key);
-    try std.testing.expectEqualStrings("doc:z", interrupted_state[1].key);
+    try std.testing.expectEqual(@as(usize, 6), interrupted_state.len);
+    try std.testing.expectEqualStrings("doc:01", interrupted_state[0].key);
+
+    const first_resume_key = try alloc.dupe(u8, cleanup_scratch.after_key.items);
+    defer alloc.free(first_resume_key);
+    const resumed_cleanup = try deleteGroupDocumentPhysicalRangePage(
+        &projected,
+        alloc,
+        logical_prefix,
+        group_lower,
+        retained_lower,
+        &cleanup_scratch,
+        1,
+        1,
+    );
+    try std.testing.expect(!resumed_cleanup.exhausted);
+    try std.testing.expectEqual(@as(usize, 1), resumed_cleanup.deleted_entries);
+    try std.testing.expect(std.mem.order(u8, first_resume_key, cleanup_scratch.after_key.items) == .lt);
+    const resumed_state = try groupState(&projected, alloc, 61);
+    defer freeGroupStateEntries(alloc, resumed_state);
+    try std.testing.expectEqual(@as(usize, 5), resumed_state.len);
+    try std.testing.expectEqualStrings("doc:02", resumed_state[0].key);
 
     for (0..2) |_| {
         try reconcileAuthoritativeGroupDocumentsPaged(
@@ -1897,6 +1970,81 @@ test "paged authoritative reconciliation removes stale out-of-range documents be
     const marker = try projected.get(alloc, marker_key);
     defer alloc.free(marker);
     try std.testing.expectEqualStrings("complete", marker);
+}
+
+test "paged authoritative reconciliation is allocation-failure safe" {
+    const setup_alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const projected_path = try std.fmt.allocPrint(setup_alloc, ".zig-cache/tmp/{s}/paged-reconcile-oom-projected", .{tmp.sub_path});
+    defer setup_alloc.free(projected_path);
+    const projected_path_z = try setup_alloc.dupeZ(u8, projected_path);
+    defer setup_alloc.free(projected_path_z);
+    var projected = try docstore.DocStore.open(setup_alloc, projected_path_z.ptr, .{});
+    defer projected.close();
+
+    const source_path = try std.fmt.allocPrint(setup_alloc, ".zig-cache/tmp/{s}/paged-reconcile-oom-source", .{tmp.sub_path});
+    defer setup_alloc.free(source_path);
+    const source_path_z = try setup_alloc.dupeZ(u8, source_path);
+    defer setup_alloc.free(source_path_z);
+    var source = try docstore.DocStore.open(setup_alloc, source_path_z.ptr, .{});
+    defer source.close();
+
+    try replaceGroupSnapshot(
+        &projected,
+        setup_alloc,
+        62,
+        .{ .start = "doc:0", .end = "doc:zz" },
+        &.{
+            .{ .key = "doc:00", .value = "stale-before-0" },
+            .{ .key = "doc:01", .value = "stale-before-1" },
+            .{ .key = "doc:c", .value = "old" },
+            .{ .key = "doc:x", .value = "stale-after-0" },
+            .{ .key = "doc:y", .value = "stale-after-1" },
+        },
+    );
+    for ([_]AppliedDataKV{
+        .{ .key = "doc:a", .value = "a" },
+        .{ .key = "doc:b", .value = "b" },
+        .{ .key = "doc:c", .value = "new" },
+        .{ .key = "doc:d", .value = "d" },
+    }) |entry| {
+        const key = try internal_keys.documentKeyAlloc(setup_alloc, entry.key);
+        defer setup_alloc.free(key);
+        try source.put(key, entry.value);
+    }
+
+    const Runner = struct {
+        fn run(
+            alloc: std.mem.Allocator,
+            projected_store: *docstore.DocStore,
+            source_store: *docstore.DocStore,
+        ) !void {
+            const marker_key = "\x00\x00__metadata__:paged-reconcile-oom-complete";
+            try reconcileAuthoritativeGroupDocumentsPaged(
+                projected_store,
+                source_store,
+                alloc,
+                62,
+                .{ .start = "doc:a", .end = "doc:m" },
+                &.{.{ .key = marker_key, .value = "complete" }},
+                1,
+                32,
+            );
+            const state = try groupState(projected_store, alloc, 62);
+            defer freeGroupStateEntries(alloc, state);
+            try std.testing.expectEqual(@as(usize, 4), state.len);
+            const marker = try projected_store.get(alloc, marker_key);
+            defer alloc.free(marker);
+            try std.testing.expectEqualStrings("complete", marker);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        setup_alloc,
+        Runner.run,
+        .{ &projected, &source },
+    );
 }
 
 test "group state range scan is allocation-failure safe" {

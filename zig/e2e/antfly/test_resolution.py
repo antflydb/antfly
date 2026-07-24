@@ -50,6 +50,7 @@ AUTOGRAPH_CLUSTER_STARTUP_TIMEOUT_S = 115.0
 AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S = 5.0
 POLL_INTERVAL_S = 0.5
 POLL_REQUEST_TIMEOUT_S = 5.0
+WRITE_REQUEST_TIMEOUT_FLOOR_S = 5.0
 
 
 def _new_e2e_deadline() -> "_Deadline":
@@ -169,8 +170,26 @@ class _Api:
     ) -> dict:
         payload = {"inserts": {doc_id: body}, "sync_level": sync_level}
         max_timeout = 120.0 if sync_level in {"enrichments", "full_index"} else 30.0
+        last_retryable_response: str | None = None
         while True:
-            timeout = deadline.request_timeout(max_timeout) if deadline is not None else max_timeout
+            try:
+                timeout = (
+                    deadline.request_timeout(
+                        max_timeout,
+                        minimum_timeout_s=WRITE_REQUEST_TIMEOUT_FLOOR_S,
+                    )
+                    if deadline is not None
+                    else max_timeout
+                )
+            except AssertionError as exc:
+                stacks = self._server.native_stack_dumps()
+                raise AssertionError(
+                    f"batch insert exhausted its {deadline.timeout_s:.1f}s deadline "
+                    f"table={table!r} key={doc_id!r} sync_level={sync_level!r} "
+                    f"last_retryable_response={last_retryable_response!r}"
+                    f"\n[native stacks]\n{stacks}"
+                    f"\n[logs]\n{self._server.debug_logs()}"
+                ) from exc
             try:
                 response = self.s.post(f"{self.url}/tables/{table}/batch", json=payload, timeout=timeout)
             except requests.RequestException as exc:
@@ -189,6 +208,7 @@ class _Api:
                 and response.text.strip() == "write unavailable"
                 and not deadline.expired()
             ):
+                last_retryable_response = f"{response.status_code} {response.text.strip()}"
                 deadline.sleep()
                 continue
             return self._check(response)
@@ -264,11 +284,19 @@ class _Deadline:
     def expired(self) -> bool:
         return self.remaining() <= 0.0
 
-    def request_timeout(self, max_timeout_s: float = POLL_REQUEST_TIMEOUT_S) -> float:
+    def request_timeout(
+        self,
+        max_timeout_s: float = POLL_REQUEST_TIMEOUT_S,
+        *,
+        minimum_timeout_s: float = 0.1,
+    ) -> float:
         remaining = self.remaining()
-        if remaining <= 0.0:
-            raise AssertionError(f"deadline expired after {self.timeout_s}s")
-        return max(0.1, min(max_timeout_s, remaining))
+        if remaining < minimum_timeout_s:
+            raise AssertionError(
+                f"deadline has {remaining:.3f}s remaining, below the "
+                f"{minimum_timeout_s:.3f}s request floor"
+            )
+        return min(max_timeout_s, remaining)
 
     def sleep(self) -> None:
         remaining = self.remaining()

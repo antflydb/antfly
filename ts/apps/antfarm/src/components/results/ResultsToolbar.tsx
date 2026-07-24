@@ -97,7 +97,9 @@ const ResultsToolbar: React.FC<ResultsToolbarProps> = ({
         {/* Stats */}
         <div className="flex items-center gap-2 flex-wrap">
           {totalHits !== undefined && (
-            <Badge className="font-mono">{formatTotalHits(totalHits)}</Badge>
+            <Badge className="font-mono">
+              {formatTotalHits(totalHits)}
+            </Badge>
           )}
           {queryTime !== undefined && (
             <Badge className="font-mono text-xs">{formatQueryTime(queryTime)}</Badge>

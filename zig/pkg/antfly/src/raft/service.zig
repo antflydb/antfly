@@ -32,7 +32,7 @@ const resource_manager = @import("../storage/resource_manager.zig");
 pub const ManagedServiceConfig = struct {
     max_inbound_messages: usize = host_mod.default_max_inbound_messages_per_round,
     max_tick_groups: usize = 64,
-    max_ready_groups: usize = 64,
+    max_ready_steps: usize = 64,
 };
 
 pub const TransitionAuthority = struct {
@@ -131,7 +131,7 @@ fn establishManagedHostTransitionAuthorityForTest(svc: *ManagedHostService, grou
         _ = try svc.host.runRoundBounded(
             svc.cfg.max_inbound_messages,
             svc.cfg.max_tick_groups,
-            svc.cfg.max_ready_groups,
+            svc.cfg.max_ready_steps,
         );
     }
     return error.SimulationProgressTimeout;
@@ -316,7 +316,7 @@ pub const ManagedHostService = struct {
             self.pending_updates.items,
             self.cfg.max_inbound_messages,
             self.cfg.max_tick_groups,
-            self.cfg.max_ready_groups,
+            self.cfg.max_ready_steps,
         );
         try self.enqueueTransitionUpdates(self.pending_updates.items);
         self.metrics.applied_updates += self.pending_updates.items.len;
@@ -331,7 +331,7 @@ pub const ManagedHostService = struct {
         _ = try self.host.runRoundBounded(
             self.cfg.max_inbound_messages,
             self.cfg.max_tick_groups,
-            self.cfg.max_ready_groups,
+            self.cfg.max_ready_steps,
         );
         self.metrics.sync_rounds += 1;
         _ = try self.stepTransitions();
@@ -344,7 +344,7 @@ pub const ManagedHostService = struct {
         _ = try self.host.runRoundBounded(
             self.cfg.max_inbound_messages,
             self.cfg.max_tick_groups,
-            self.cfg.max_ready_groups,
+            self.cfg.max_ready_steps,
         );
         self.metrics.sync_rounds += 1;
     }
@@ -679,7 +679,7 @@ pub const ManagedHttpHostService = struct {
             self.pending_updates.items,
             self.cfg.max_inbound_messages,
             self.cfg.max_tick_groups,
-            self.cfg.max_ready_groups,
+            self.cfg.max_ready_steps,
         );
         self.last_runtime_round = result.runtime;
         try self.finishPendingSync(.control);
@@ -692,7 +692,7 @@ pub const ManagedHttpHostService = struct {
             self.pending_updates.items,
             self.cfg.max_inbound_messages,
             self.cfg.max_tick_groups,
-            self.cfg.max_ready_groups,
+            self.cfg.max_ready_steps,
         );
         self.last_runtime_round = result.runtime;
         try self.finishPendingSync(.raft);
@@ -703,7 +703,7 @@ pub const ManagedHttpHostService = struct {
         self.last_runtime_round = try self.host.runRoundBounded(
             self.cfg.max_inbound_messages,
             self.cfg.max_tick_groups,
-            self.cfg.max_ready_groups,
+            self.cfg.max_ready_steps,
         );
         self.metrics.sync_rounds += 1;
         _ = try self.stepTransitions();
@@ -713,7 +713,7 @@ pub const ManagedHttpHostService = struct {
         self.last_runtime_round = try self.host.runRoundBounded(
             self.cfg.max_inbound_messages,
             self.cfg.max_tick_groups,
-            self.cfg.max_ready_groups,
+            self.cfg.max_ready_steps,
         );
         self.metrics.sync_rounds += 1;
     }

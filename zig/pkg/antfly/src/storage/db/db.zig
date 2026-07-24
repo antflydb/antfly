@@ -26669,34 +26669,19 @@ fn prepareGeneratedEnrichments(
     // ArrayList.items may be shorter than its backing allocation. Release
     // owned fields item-by-item, then let the list free its exact capacity.
     errdefer {
-        for (documents.items) |doc| {
-            self.alloc.free(doc.key);
-            if (doc.cleaned_value) |value| self.alloc.free(value);
-            for (doc.targets) |target| self.alloc.free(target.index_name);
-            if (doc.targets.len > 0) self.alloc.free(doc.targets);
-        }
+        for (documents.items) |doc| derived_types.deinitDerivedDocument(self.alloc, doc);
         documents.deinit(self.alloc);
     }
     var dense_embeddings = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
     errdefer {
-        for (dense_embeddings.items) |embedding| {
-            self.alloc.free(embedding.index_name);
-            if (embedding.parent_doc_key) |parent_doc_key| self.alloc.free(parent_doc_key);
-            self.alloc.free(embedding.doc_key);
-            if (embedding.artifact_key) |artifact_key| self.alloc.free(artifact_key);
-            if (embedding.vector.len > 0) self.alloc.free(embedding.vector);
-        }
+        for (dense_embeddings.items) |embedding|
+            derived_types.deinitDerivedDenseEmbedding(self.alloc, embedding);
         dense_embeddings.deinit(self.alloc);
     }
     var sparse_embeddings = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
     errdefer {
-        for (sparse_embeddings.items) |embedding| {
-            self.alloc.free(embedding.index_name);
-            self.alloc.free(embedding.doc_key);
-            if (embedding.artifact_key) |artifact_key| self.alloc.free(artifact_key);
-            if (embedding.indices.len > 0) self.alloc.free(embedding.indices);
-            if (embedding.values.len > 0) self.alloc.free(embedding.values);
-        }
+        for (sparse_embeddings.items) |embedding|
+            derived_types.deinitDerivedSparseEmbedding(self.alloc, embedding);
         sparse_embeddings.deinit(self.alloc);
     }
     var planned = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
@@ -26952,17 +26937,17 @@ const DocumentChildRangeDispatchGroup = struct {
         self.artifact_writes.deinit(alloc);
         for (self.artifact_delete_keys.items) |key| alloc.free(@constCast(key));
         self.artifact_delete_keys.deinit(alloc);
-        var derived_batch = derived_types.DerivedBatch{
-            .documents = self.documents.items,
-            .dense_embeddings = self.dense_embeddings.items,
-            .sparse_embeddings = self.sparse_embeddings.items,
-            .generated_enrichment_refs = self.generated_enrichment_refs.items,
-        };
-        derived_types.deinitDerivedBatch(alloc, &derived_batch);
-        self.documents = .empty;
-        self.dense_embeddings = .empty;
-        self.sparse_embeddings = .empty;
-        self.generated_enrichment_refs = .empty;
+        for (self.documents.items) |doc| derived_types.deinitDerivedDocument(alloc, doc);
+        self.documents.deinit(alloc);
+        for (self.dense_embeddings.items) |embedding|
+            derived_types.deinitDerivedDenseEmbedding(alloc, embedding);
+        self.dense_embeddings.deinit(alloc);
+        for (self.sparse_embeddings.items) |embedding|
+            derived_types.deinitDerivedSparseEmbedding(alloc, embedding);
+        self.sparse_embeddings.deinit(alloc);
+        for (self.generated_enrichment_refs.items) |request|
+            enrichment_types.freeGeneratedRef(alloc, request);
+        self.generated_enrichment_refs.deinit(alloc);
         self.* = undefined;
     }
 
@@ -27038,41 +27023,8 @@ fn partitionRemoteDocumentChildRangeGeneratedBatch(
     try collectDocumentChildRangeRoutingSnapshots(self, generated.*, &snapshots);
     if (snapshots.items.len == 0) return;
 
-    var local_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-    errdefer {
-        for (local_writes.items) |write| {
-            self.alloc.free(@constCast(write.key));
-            self.alloc.free(@constCast(write.value));
-        }
-        local_writes.deinit(self.alloc);
-    }
-    for (generated.artifact_writes) |write| {
-        if (try documentChildRangeRouteForKey(self.alloc, snapshots.items, write.key)) |route| {
-            const group = try ensureDocumentChildRangeDispatchGroup(self.alloc, out, route);
-            try group.artifact_writes.append(self.alloc, write);
-        } else {
-            try local_writes.append(self.alloc, write);
-        }
-    }
-    if (generated.artifact_writes.len > 0) self.alloc.free(generated.artifact_writes);
-    generated.artifact_writes = try local_writes.toOwnedSlice(self.alloc);
-
-    var local_deletes = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer {
-        for (local_deletes.items) |key| self.alloc.free(@constCast(key));
-        local_deletes.deinit(self.alloc);
-    }
-    for (generated.artifact_delete_keys) |key| {
-        if (try documentChildRangeRouteForKey(self.alloc, snapshots.items, key)) |route| {
-            const group = try ensureDocumentChildRangeDispatchGroup(self.alloc, out, route);
-            try group.artifact_delete_keys.append(self.alloc, key);
-        } else {
-            try local_deletes.append(self.alloc, key);
-        }
-    }
-    if (generated.artifact_delete_keys.len > 0) self.alloc.free(generated.artifact_delete_keys);
-    generated.artifact_delete_keys = try local_deletes.toOwnedSlice(self.alloc);
-
+    try partitionRemoteArtifactWrites(self.alloc, snapshots.items, &generated.artifact_writes, out);
+    try partitionRemoteArtifactDeletes(self.alloc, snapshots.items, &generated.artifact_delete_keys, out);
     try partitionRemoteDerivedDocuments(self.alloc, snapshots.items, &generated.documents, out);
     try partitionRemoteDenseEmbeddings(self.alloc, snapshots.items, &generated.dense_embeddings, out);
     try partitionRemoteSparseEmbeddings(self.alloc, snapshots.items, &generated.sparse_embeddings, out);
@@ -27179,17 +27131,19 @@ fn keyWithinDocumentChildRange(key: []const u8, range: types.DocumentArtifactChi
     return std.mem.order(u8, key, range.end_key_exclusive) == .lt;
 }
 
-fn ensureDocumentChildRangeDispatchGroup(
+const local_document_child_range_destination = std.math.maxInt(usize);
+
+fn ensureDocumentChildRangeDispatchGroupIndex(
     alloc: Allocator,
     groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
     route: DocumentChildRangeRoute,
-) !*DocumentChildRangeDispatchGroup {
-    for (groups.items) |*group| {
+) !usize {
+    for (groups.items, 0..) |group, i| {
         if (group.owner_group_id == route.owner_group_id and
             std.mem.eql(u8, group.doc_key, route.doc_key) and
             std.mem.eql(u8, group.artifact_name, route.artifact_name))
         {
-            return group;
+            return i;
         }
     }
     const doc_key = try alloc.dupe(u8, route.doc_key);
@@ -27201,7 +27155,97 @@ fn ensureDocumentChildRangeDispatchGroup(
         .doc_key = doc_key,
         .artifact_name = artifact_name,
     });
-    return &groups.items[groups.items.len - 1];
+    return groups.items.len - 1;
+}
+
+fn countDocumentChildRangeDestinations(
+    alloc: Allocator,
+    destinations: []const usize,
+    group_count: usize,
+) !struct { local: usize, groups: []usize } {
+    const group_counts = try alloc.alloc(usize, group_count);
+    @memset(group_counts, 0);
+    var local_count: usize = 0;
+    for (destinations) |destination| {
+        if (destination == local_document_child_range_destination) {
+            local_count += 1;
+        } else {
+            group_counts[destination] += 1;
+        }
+    }
+    return .{ .local = local_count, .groups = group_counts };
+}
+
+fn partitionRemoteArtifactWrites(
+    alloc: Allocator,
+    snapshots: []const DocumentChildRangeRoutingSnapshot,
+    writes: *[]types.BatchWrite,
+    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
+) !void {
+    const destinations = try alloc.alloc(usize, writes.*.len);
+    defer if (destinations.len > 0) alloc.free(destinations);
+    for (writes.*, 0..) |write, i| {
+        destinations[i] = if (try documentChildRangeRouteForKey(alloc, snapshots, write.key)) |route|
+            try ensureDocumentChildRangeDispatchGroupIndex(alloc, groups, route)
+        else
+            local_document_child_range_destination;
+    }
+
+    const counts = try countDocumentChildRangeDestinations(alloc, destinations, groups.items.len);
+    defer if (counts.groups.len > 0) alloc.free(counts.groups);
+    const local = try alloc.alloc(types.BatchWrite, counts.local);
+    errdefer if (local.len > 0) alloc.free(local);
+    for (groups.items, counts.groups) |*group, count| {
+        try group.artifact_writes.ensureUnusedCapacity(alloc, count);
+    }
+
+    var local_i: usize = 0;
+    for (writes.*, destinations) |write, destination| {
+        if (destination == local_document_child_range_destination) {
+            local[local_i] = write;
+            local_i += 1;
+        } else {
+            groups.items[destination].artifact_writes.appendAssumeCapacity(write);
+        }
+    }
+    if (writes.*.len > 0) alloc.free(writes.*);
+    writes.* = local;
+}
+
+fn partitionRemoteArtifactDeletes(
+    alloc: Allocator,
+    snapshots: []const DocumentChildRangeRoutingSnapshot,
+    keys: *[]const []const u8,
+    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
+) !void {
+    const destinations = try alloc.alloc(usize, keys.*.len);
+    defer if (destinations.len > 0) alloc.free(destinations);
+    for (keys.*, 0..) |key, i| {
+        destinations[i] = if (try documentChildRangeRouteForKey(alloc, snapshots, key)) |route|
+            try ensureDocumentChildRangeDispatchGroupIndex(alloc, groups, route)
+        else
+            local_document_child_range_destination;
+    }
+
+    const counts = try countDocumentChildRangeDestinations(alloc, destinations, groups.items.len);
+    defer if (counts.groups.len > 0) alloc.free(counts.groups);
+    const local = try alloc.alloc([]const u8, counts.local);
+    errdefer if (local.len > 0) alloc.free(local);
+    for (groups.items, counts.groups) |*group, count| {
+        try group.artifact_delete_keys.ensureUnusedCapacity(alloc, count);
+    }
+
+    var local_i: usize = 0;
+    for (keys.*, destinations) |key, destination| {
+        if (destination == local_document_child_range_destination) {
+            local[local_i] = key;
+            local_i += 1;
+        } else {
+            groups.items[destination].artifact_delete_keys.appendAssumeCapacity(key);
+        }
+    }
+    if (keys.*.len > 0) alloc.free(keys.*);
+    keys.* = local;
 }
 
 fn partitionRemoteDerivedDocuments(
@@ -27210,21 +27254,34 @@ fn partitionRemoteDerivedDocuments(
     documents: *[]const derived_types.DerivedDocument,
     groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
 ) !void {
-    var local = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
-    errdefer {
-        var batch = derived_types.DerivedBatch{ .documents = local.items };
-        derived_types.deinitDerivedBatch(alloc, &batch);
+    const destinations = try alloc.alloc(usize, documents.*.len);
+    defer if (destinations.len > 0) alloc.free(destinations);
+    for (documents.*, 0..) |doc, i| {
+        destinations[i] = if (try documentChildRangeRouteForKey(alloc, snapshots, doc.key)) |route|
+            try ensureDocumentChildRangeDispatchGroupIndex(alloc, groups, route)
+        else
+            local_document_child_range_destination;
     }
-    for (documents.*) |doc| {
-        if (try documentChildRangeRouteForKey(alloc, snapshots, doc.key)) |route| {
-            const group = try ensureDocumentChildRangeDispatchGroup(alloc, groups, route);
-            try group.documents.append(alloc, doc);
+
+    const counts = try countDocumentChildRangeDestinations(alloc, destinations, groups.items.len);
+    defer if (counts.groups.len > 0) alloc.free(counts.groups);
+    const local = try alloc.alloc(derived_types.DerivedDocument, counts.local);
+    errdefer if (local.len > 0) alloc.free(local);
+    for (groups.items, counts.groups) |*group, count| {
+        try group.documents.ensureUnusedCapacity(alloc, count);
+    }
+
+    var local_i: usize = 0;
+    for (documents.*, destinations) |doc, destination| {
+        if (destination == local_document_child_range_destination) {
+            local[local_i] = doc;
+            local_i += 1;
         } else {
-            try local.append(alloc, doc);
+            groups.items[destination].documents.appendAssumeCapacity(doc);
         }
     }
     if (documents.*.len > 0) alloc.free(documents.*);
-    documents.* = try local.toOwnedSlice(alloc);
+    documents.* = local;
 }
 
 fn partitionRemoteDenseEmbeddings(
@@ -27233,22 +27290,35 @@ fn partitionRemoteDenseEmbeddings(
     embeddings: *[]const derived_types.DerivedDenseEmbeddingWrite,
     groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
 ) !void {
-    var local = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
-    errdefer {
-        var batch = derived_types.DerivedBatch{ .dense_embeddings = local.items };
-        derived_types.deinitDerivedBatch(alloc, &batch);
-    }
-    for (embeddings.*) |embedding| {
+    const destinations = try alloc.alloc(usize, embeddings.*.len);
+    defer if (destinations.len > 0) alloc.free(destinations);
+    for (embeddings.*, 0..) |embedding, i| {
         const route_key = embedding.artifact_key orelse embedding.doc_key;
-        if (try documentChildRangeRouteForKey(alloc, snapshots, route_key)) |route| {
-            const group = try ensureDocumentChildRangeDispatchGroup(alloc, groups, route);
-            try group.dense_embeddings.append(alloc, embedding);
+        destinations[i] = if (try documentChildRangeRouteForKey(alloc, snapshots, route_key)) |route|
+            try ensureDocumentChildRangeDispatchGroupIndex(alloc, groups, route)
+        else
+            local_document_child_range_destination;
+    }
+
+    const counts = try countDocumentChildRangeDestinations(alloc, destinations, groups.items.len);
+    defer if (counts.groups.len > 0) alloc.free(counts.groups);
+    const local = try alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, counts.local);
+    errdefer if (local.len > 0) alloc.free(local);
+    for (groups.items, counts.groups) |*group, count| {
+        try group.dense_embeddings.ensureUnusedCapacity(alloc, count);
+    }
+
+    var local_i: usize = 0;
+    for (embeddings.*, destinations) |embedding, destination| {
+        if (destination == local_document_child_range_destination) {
+            local[local_i] = embedding;
+            local_i += 1;
         } else {
-            try local.append(alloc, embedding);
+            groups.items[destination].dense_embeddings.appendAssumeCapacity(embedding);
         }
     }
     if (embeddings.*.len > 0) alloc.free(embeddings.*);
-    embeddings.* = try local.toOwnedSlice(alloc);
+    embeddings.* = local;
 }
 
 fn partitionRemoteSparseEmbeddings(
@@ -27257,22 +27327,35 @@ fn partitionRemoteSparseEmbeddings(
     embeddings: *[]const derived_types.DerivedSparseEmbeddingWrite,
     groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
 ) !void {
-    var local = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
-    errdefer {
-        var batch = derived_types.DerivedBatch{ .sparse_embeddings = local.items };
-        derived_types.deinitDerivedBatch(alloc, &batch);
-    }
-    for (embeddings.*) |embedding| {
+    const destinations = try alloc.alloc(usize, embeddings.*.len);
+    defer if (destinations.len > 0) alloc.free(destinations);
+    for (embeddings.*, 0..) |embedding, i| {
         const route_key = embedding.artifact_key orelse embedding.doc_key;
-        if (try documentChildRangeRouteForKey(alloc, snapshots, route_key)) |route| {
-            const group = try ensureDocumentChildRangeDispatchGroup(alloc, groups, route);
-            try group.sparse_embeddings.append(alloc, embedding);
+        destinations[i] = if (try documentChildRangeRouteForKey(alloc, snapshots, route_key)) |route|
+            try ensureDocumentChildRangeDispatchGroupIndex(alloc, groups, route)
+        else
+            local_document_child_range_destination;
+    }
+
+    const counts = try countDocumentChildRangeDestinations(alloc, destinations, groups.items.len);
+    defer if (counts.groups.len > 0) alloc.free(counts.groups);
+    const local = try alloc.alloc(derived_types.DerivedSparseEmbeddingWrite, counts.local);
+    errdefer if (local.len > 0) alloc.free(local);
+    for (groups.items, counts.groups) |*group, count| {
+        try group.sparse_embeddings.ensureUnusedCapacity(alloc, count);
+    }
+
+    var local_i: usize = 0;
+    for (embeddings.*, destinations) |embedding, destination| {
+        if (destination == local_document_child_range_destination) {
+            local[local_i] = embedding;
+            local_i += 1;
         } else {
-            try local.append(alloc, embedding);
+            groups.items[destination].sparse_embeddings.appendAssumeCapacity(embedding);
         }
     }
     if (embeddings.*.len > 0) alloc.free(embeddings.*);
-    embeddings.* = try local.toOwnedSlice(alloc);
+    embeddings.* = local;
 }
 
 fn appendPrecomputedGraphSourceArtifacts(
@@ -28038,6 +28121,30 @@ fn parsePatternRfc3339ToNs(text: []const u8) !?u64 {
     return try db_query_graph.parsePatternRfc3339ToNs(text);
 }
 
+fn appendDerivedTargetRefAlloc(
+    alloc: Allocator,
+    targets: *std.ArrayListUnmanaged(derived_types.DerivedTargetRef),
+    kind: derived_types.DerivedTarget,
+    index_name: []const u8,
+) !void {
+    const owned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(owned_index_name);
+    try targets.append(alloc, .{
+        .kind = kind,
+        .index_name = owned_index_name,
+    });
+}
+
+fn appendOwnedConstBytes(
+    alloc: Allocator,
+    values: *std.ArrayListUnmanaged([]const u8),
+    value: []const u8,
+) !void {
+    const owned = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned);
+    try values.append(alloc, owned);
+}
+
 fn buildDerivedBatch(
     alloc: Allocator,
     req: types.BatchRequest,
@@ -28048,52 +28155,41 @@ fn buildDerivedBatch(
     var documents = try alloc.alloc(derived_types.DerivedDocument, req.writes.len);
     var initialized: usize = 0;
     errdefer {
-        var tmp = derived_types.DerivedBatch{ .documents = documents[0..initialized] };
-        derived_types.deinitDerivedBatch(alloc, &tmp);
+        for (documents[0..initialized]) |doc| derived_types.deinitDerivedDocument(alloc, doc);
+        if (documents.len > 0) alloc.free(documents);
     }
 
     for (req.writes, 0..) |write, i| {
         var targets = std.ArrayListUnmanaged(derived_types.DerivedTargetRef).empty;
         defer targets.deinit(alloc);
+        errdefer for (targets.items) |target| alloc.free(target.index_name);
 
         if (extracted[i].cleaned_value != null) {
-            try targets.append(alloc, .{
-                .kind = .full_text,
-                .index_name = try alloc.dupe(u8, "*"),
-            });
+            try appendDerivedTargetRefAlloc(alloc, &targets, .full_text, "*");
         }
         for (extracted[i].dense_embeddings) |embedding| {
-            try targets.append(alloc, .{
-                .kind = .dense_vector,
-                .index_name = try alloc.dupe(u8, embedding.index_name),
-            });
+            try appendDerivedTargetRefAlloc(alloc, &targets, .dense_vector, embedding.index_name);
         }
         for (extracted[i].sparse_embeddings) |embedding| {
-            try targets.append(alloc, .{
-                .kind = .sparse_vector,
-                .index_name = try alloc.dupe(u8, embedding.index_name),
-            });
+            try appendDerivedTargetRefAlloc(alloc, &targets, .sparse_vector, embedding.index_name);
         }
         for (extracted[i].mentioned_graph_indexes) |index_name| {
-            try targets.append(alloc, .{
-                .kind = .graph,
-                .index_name = try alloc.dupe(u8, index_name),
-            });
+            try appendDerivedTargetRefAlloc(alloc, &targets, .graph, index_name);
         }
         for (req.graph_writes) |graph_write| {
             if (std.mem.eql(u8, graph_write.source, write.key)) {
-                try targets.append(alloc, .{
-                    .kind = .graph,
-                    .index_name = try alloc.dupe(u8, graph_write.index_name),
-                });
+                try appendDerivedTargetRefAlloc(alloc, &targets, .graph, graph_write.index_name);
             }
         }
 
+        const key = try alloc.dupe(u8, write.key);
+        errdefer alloc.free(key);
+        const owned_targets = try targets.toOwnedSlice(alloc);
         documents[i] = .{
-            .key = try alloc.dupe(u8, write.key),
+            .key = key,
             .action = if (extracted[i].cleaned_value == null) .preserve_base_document else .upsert,
             .cleaned_value = null,
-            .targets = try targets.toOwnedSlice(alloc),
+            .targets = owned_targets,
         };
         initialized += 1;
     }
@@ -28115,9 +28211,10 @@ fn buildDerivedBatch(
 
     var overwritten_doc_keys_list = std.ArrayListUnmanaged([]const u8).empty;
     defer overwritten_doc_keys_list.deinit(alloc);
+    errdefer for (overwritten_doc_keys_list.items) |key| alloc.free(@constCast(key));
     for (req.writes, 0..) |write, i| {
         if (extracted[i].cleaned_value != null) {
-            try overwritten_doc_keys_list.append(alloc, try alloc.dupe(u8, write.key));
+            try appendOwnedConstBytes(alloc, &overwritten_doc_keys_list, write.key);
         }
     }
 
@@ -28127,147 +28224,146 @@ fn buildDerivedBatch(
         changed_artifact_keys_list.deinit(alloc);
     }
     for (changed_artifact_keys) |key| {
-        try changed_artifact_keys_list.append(alloc, try alloc.dupe(u8, key));
+        try appendOwnedConstBytes(alloc, &changed_artifact_keys_list, key);
     }
     for (deleted_artifact_keys) |key| {
         if (!internal_keys.isAssetArtifactKey(key) and !internal_keys.isGraphEdgeArtifactKey(key)) continue;
-        try changed_artifact_keys_list.append(alloc, try alloc.dupe(u8, key));
+        try appendOwnedConstBytes(alloc, &changed_artifact_keys_list, key);
     }
 
     var graph_doc_clears = std.ArrayListUnmanaged(derived_types.DerivedGraphDocClear).empty;
     errdefer {
-        for (graph_doc_clears.items) |clear| {
-            alloc.free(clear.key);
-            for (clear.index_names) |index_name| alloc.free(index_name);
-            if (clear.index_names.len > 0) alloc.free(clear.index_names);
-        }
+        for (graph_doc_clears.items) |clear| derived_types.deinitDerivedGraphDocClear(alloc, clear);
         graph_doc_clears.deinit(alloc);
     }
     for (req.writes, 0..) |write, i| {
         if (extracted[i].mentioned_graph_indexes.len == 0) continue;
-        var index_names = try alloc.alloc([]const u8, extracted[i].mentioned_graph_indexes.len);
-        for (extracted[i].mentioned_graph_indexes, 0..) |index_name, j| {
-            index_names[j] = try alloc.dupe(u8, index_name);
-        }
-        try graph_doc_clears.append(alloc, .{
-            .key = try alloc.dupe(u8, write.key),
-            .index_names = index_names,
+        const clear = try derived_types.cloneDerivedGraphDocClear(alloc, .{
+            .key = write.key,
+            .index_names = extracted[i].mentioned_graph_indexes,
         });
+        errdefer derived_types.deinitDerivedGraphDocClear(alloc, clear);
+        try graph_doc_clears.append(alloc, clear);
     }
 
     var graph_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
     errdefer {
-        for (graph_writes.items) |write| {
-            alloc.free(@constCast(write.index_name));
-            alloc.free(@constCast(write.source));
-            alloc.free(@constCast(write.target));
-            alloc.free(@constCast(write.edge_type));
-            if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-        }
+        for (graph_writes.items) |write| derived_types.deinitDerivedGraphWrite(alloc, write);
         graph_writes.deinit(alloc);
     }
     for (extracted) |item| {
         for (item.graph_writes) |write| {
-            try graph_writes.append(alloc, .{
-                .index_name = try alloc.dupe(u8, write.index_name),
-                .source = try alloc.dupe(u8, write.source),
-                .target = try alloc.dupe(u8, write.target),
-                .edge_type = try alloc.dupe(u8, write.edge_type),
-                .weight = write.weight,
-                .created_at = write.created_at,
-                .updated_at = write.updated_at,
-                .metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "",
-            });
+            const cloned = try derived_types.cloneDerivedGraphWrite(alloc, write);
+            errdefer derived_types.deinitDerivedGraphWrite(alloc, cloned);
+            try graph_writes.append(alloc, cloned);
         }
     }
     for (req.graph_writes) |write| {
-        try graph_writes.append(alloc, .{
-            .index_name = try alloc.dupe(u8, write.index_name),
-            .source = try alloc.dupe(u8, write.source),
-            .target = try alloc.dupe(u8, write.target),
-            .edge_type = try alloc.dupe(u8, write.edge_type),
-            .weight = write.weight,
-            .created_at = write.created_at,
-            .updated_at = write.updated_at,
-            .metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "",
-        });
+        const cloned = try derived_types.cloneDerivedGraphWrite(alloc, write);
+        errdefer derived_types.deinitDerivedGraphWrite(alloc, cloned);
+        try graph_writes.append(alloc, cloned);
     }
 
     var graph_deletes = std.ArrayListUnmanaged(types.GraphEdgeDelete).empty;
     errdefer {
-        for (graph_deletes.items) |delete| {
-            alloc.free(@constCast(delete.index_name));
-            alloc.free(@constCast(delete.source));
-            alloc.free(@constCast(delete.target));
-            alloc.free(@constCast(delete.edge_type));
-        }
+        for (graph_deletes.items) |delete| derived_types.deinitDerivedGraphDelete(alloc, delete);
         graph_deletes.deinit(alloc);
     }
     for (req.graph_deletes) |delete| {
-        try graph_deletes.append(alloc, .{
-            .index_name = try alloc.dupe(u8, delete.index_name),
-            .source = try alloc.dupe(u8, delete.source),
-            .target = try alloc.dupe(u8, delete.target),
-            .edge_type = try alloc.dupe(u8, delete.edge_type),
-        });
+        const cloned = try derived_types.cloneDerivedGraphDelete(alloc, delete);
+        errdefer derived_types.deinitDerivedGraphDelete(alloc, cloned);
+        try graph_deletes.append(alloc, cloned);
     }
 
     var dense_embeddings = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
     errdefer {
-        for (dense_embeddings.items) |embedding| {
-            alloc.free(embedding.index_name);
-            if (embedding.parent_doc_key) |parent_doc_key| alloc.free(parent_doc_key);
-            alloc.free(embedding.doc_key);
-            if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-            if (embedding.vector.len > 0) alloc.free(embedding.vector);
-        }
+        for (dense_embeddings.items) |embedding|
+            derived_types.deinitDerivedDenseEmbedding(alloc, embedding);
         dense_embeddings.deinit(alloc);
     }
     for (extracted) |item| {
         for (item.dense_embeddings) |embedding| {
-            try dense_embeddings.append(alloc, .{
-                .index_name = try alloc.dupe(u8, embedding.index_name),
-                .doc_key = try alloc.dupe(u8, embedding.doc_key),
-                .artifact_key = if (embedding.artifact_key) |artifact_key| try alloc.dupe(u8, artifact_key) else null,
-                .vector = if (embedding.artifact_key != null) &.{} else try alloc.dupe(f32, embedding.vector),
+            const cloned = try derived_types.cloneDerivedDenseEmbedding(alloc, .{
+                .index_name = embedding.index_name,
+                .doc_key = embedding.doc_key,
+                .artifact_key = embedding.artifact_key,
+                .vector = if (embedding.artifact_key != null) &.{} else embedding.vector,
             });
+            errdefer derived_types.deinitDerivedDenseEmbedding(alloc, cloned);
+            try dense_embeddings.append(alloc, cloned);
         }
     }
 
     var sparse_embeddings = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
     errdefer {
-        for (sparse_embeddings.items) |embedding| {
-            alloc.free(embedding.index_name);
-            alloc.free(embedding.doc_key);
-            if (embedding.indices.len > 0) alloc.free(embedding.indices);
-            if (embedding.values.len > 0) alloc.free(embedding.values);
-        }
+        for (sparse_embeddings.items) |embedding|
+            derived_types.deinitDerivedSparseEmbedding(alloc, embedding);
         sparse_embeddings.deinit(alloc);
     }
     for (extracted) |item| {
         for (item.sparse_embeddings) |embedding| {
-            try sparse_embeddings.append(alloc, .{
-                .index_name = try alloc.dupe(u8, embedding.index_name),
-                .doc_key = try alloc.dupe(u8, embedding.doc_key),
-                .artifact_key = if (embedding.artifact_key) |artifact_key| try alloc.dupe(u8, artifact_key) else null,
-                .indices = try alloc.dupe(u32, embedding.indices),
-                .values = try alloc.dupe(f32, embedding.values),
+            const cloned = try derived_types.cloneDerivedSparseEmbedding(alloc, .{
+                .index_name = embedding.index_name,
+                .doc_key = embedding.doc_key,
+                .artifact_key = embedding.artifact_key,
+                .indices = embedding.indices,
+                .values = embedding.values,
             });
+            errdefer derived_types.deinitDerivedSparseEmbedding(alloc, cloned);
+            try sparse_embeddings.append(alloc, cloned);
         }
+    }
+
+    const overwritten_doc_keys = try overwritten_doc_keys_list.toOwnedSlice(alloc);
+    errdefer {
+        for (overwritten_doc_keys) |key| alloc.free(@constCast(key));
+        if (overwritten_doc_keys.len > 0) alloc.free(overwritten_doc_keys);
+    }
+    const owned_changed_artifact_keys = try changed_artifact_keys_list.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_changed_artifact_keys) |key| alloc.free(@constCast(key));
+        if (owned_changed_artifact_keys.len > 0) alloc.free(owned_changed_artifact_keys);
+    }
+    const owned_graph_doc_clears = try graph_doc_clears.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_graph_doc_clears) |clear| derived_types.deinitDerivedGraphDocClear(alloc, clear);
+        if (owned_graph_doc_clears.len > 0) alloc.free(owned_graph_doc_clears);
+    }
+    const owned_dense_embeddings = try dense_embeddings.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_dense_embeddings) |embedding|
+            derived_types.deinitDerivedDenseEmbedding(alloc, embedding);
+        if (owned_dense_embeddings.len > 0) alloc.free(owned_dense_embeddings);
+    }
+    const owned_sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_sparse_embeddings) |embedding|
+            derived_types.deinitDerivedSparseEmbedding(alloc, embedding);
+        if (owned_sparse_embeddings.len > 0) alloc.free(owned_sparse_embeddings);
+    }
+    const owned_graph_writes = try graph_writes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_graph_writes) |write| derived_types.deinitDerivedGraphWrite(alloc, write);
+        if (owned_graph_writes.len > 0) alloc.free(owned_graph_writes);
+    }
+    const owned_graph_deletes = try graph_deletes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_graph_deletes) |delete| derived_types.deinitDerivedGraphDelete(alloc, delete);
+        if (owned_graph_deletes.len > 0) alloc.free(owned_graph_deletes);
     }
 
     return .{
         .sequence = 0,
         .documents = documents,
         .deleted_keys = deleted_keys,
-        .overwritten_doc_keys = try overwritten_doc_keys_list.toOwnedSlice(alloc),
-        .changed_artifact_keys = try changed_artifact_keys_list.toOwnedSlice(alloc),
-        .graph_doc_clears = try graph_doc_clears.toOwnedSlice(alloc),
-        .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
-        .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
+        .overwritten_doc_keys = overwritten_doc_keys,
+        .changed_artifact_keys = owned_changed_artifact_keys,
+        .graph_doc_clears = owned_graph_doc_clears,
+        .dense_embeddings = owned_dense_embeddings,
+        .sparse_embeddings = owned_sparse_embeddings,
         .generated_enrichment_refs = &.{},
-        .graph_writes = try graph_writes.toOwnedSlice(alloc),
-        .graph_deletes = try graph_deletes.toOwnedSlice(alloc),
+        .graph_writes = owned_graph_writes,
+        .graph_deletes = owned_graph_deletes,
     };
 }
 
@@ -46984,6 +47080,76 @@ test "db dispatches generated document child range artifacts to remote owner" {
     try std.testing.expect(std.mem.indexOf(u8, capture.first_value.?, "\"_artifact_route_status\":\"remote_committed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture.first_value.?, "\"_artifact_owner_group_id\":7002") != null);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, remote_unit_key));
+}
+
+test "document child range partition preserves single ownership on allocation failure" {
+    const alloc = std.testing.allocator;
+    const remote_key = try internal_keys.documentUnitArtifactKeyAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        "page:000001",
+    );
+    defer alloc.free(remote_key);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator, routed_key: []const u8) !void {
+                const range = types.DocumentArtifactChildRange{
+                    .range_id = @constCast("range:000000"),
+                    .range_kind = @constCast("unit"),
+                    .artifact_name = @constCast("document_units_v1"),
+                    .split_boundary = @constCast("unit"),
+                    .placement = @constCast("remote"),
+                    .owner_group_id = 7002,
+                    .placement_generation = 7,
+                    .route_status = @constCast("remote_committed"),
+                    .split_eligible = true,
+                    .start_key = @constCast(routed_key),
+                    .end_key_exclusive = @constCast(""),
+                    .last_key = @constCast(routed_key),
+                    .child_count = 1,
+                };
+                const snapshot = DocumentChildRangeRoutingSnapshot{
+                    .doc_key = @constCast("doc:a"),
+                    .manifest_artifact_name = @constCast("document_units_v1"),
+                    .child_ranges = @constCast(&[_]types.DocumentArtifactChildRange{range}),
+                };
+
+                var source = try derived_types.cloneBatch(failing_alloc, .{
+                    .documents = &.{
+                        .{ .key = routed_key, .targets = &.{.{ .kind = .full_text, .index_name = "full_text_index_v0" }} },
+                        .{ .key = "doc:local", .targets = &.{.{ .kind = .graph, .index_name = "graph_v1" }} },
+                    },
+                });
+                var documents = source.documents;
+                source.documents = &.{};
+                defer {
+                    var local_batch = derived_types.DerivedBatch{ .documents = documents };
+                    derived_types.deinitDerivedBatch(failing_alloc, &local_batch);
+                    derived_types.deinitDerivedBatch(failing_alloc, &source);
+                }
+
+                var groups = std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup).empty;
+                defer {
+                    for (groups.items) |*group| group.deinit(failing_alloc);
+                    groups.deinit(failing_alloc);
+                }
+
+                try partitionRemoteDerivedDocuments(
+                    failing_alloc,
+                    &.{snapshot},
+                    &documents,
+                    &groups,
+                );
+                try std.testing.expectEqual(@as(usize, 1), documents.len);
+                try std.testing.expectEqual(@as(usize, 1), groups.items.len);
+                try std.testing.expectEqual(@as(usize, 1), groups.items[0].documents.items.len);
+            }
+        }.run,
+        .{remote_key},
+    );
 }
 
 test "db retries remote document child range dispatch from durable outbox" {

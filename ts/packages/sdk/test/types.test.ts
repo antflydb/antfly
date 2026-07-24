@@ -31,7 +31,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function generatedSortProfileDeclaration(): string {
   const generatedApi = readFileSync(join(__dirname, "../src/public-api.d.ts"), "utf8");
-  const match = generatedApi.match(/SortProfile: \{[\s\S]*?\n {8}\};/);
+  const match = generatedApi.match(/SortProfile: \{[\s\S]*?\n        \};/);
   if (!match) {
     throw new Error("generated SortProfile declaration not found");
   }

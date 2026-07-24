@@ -128,22 +128,41 @@ pub fn freeGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReques
 }
 
 pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentRequest) !GeneratedEnrichmentRequest {
+    const index_name = try alloc.dupe(u8, request.index_name);
+    errdefer alloc.free(index_name);
+    const artifact_name = if (request.artifact_name.len > 0) try alloc.dupe(u8, request.artifact_name) else "";
+    errdefer if (artifact_name.len > 0) alloc.free(artifact_name);
+    const embedding_name = if (request.embedding_name.len > 0) try alloc.dupe(u8, request.embedding_name) else "";
+    errdefer if (embedding_name.len > 0) alloc.free(embedding_name);
+    const doc_key = try alloc.dupe(u8, request.doc_key);
+    errdefer alloc.free(doc_key);
+    const source_field = try alloc.dupe(u8, request.source_field);
+    errdefer alloc.free(source_field);
+    const source_template = if (request.source_template.len > 0) try alloc.dupe(u8, request.source_template) else "";
+    errdefer if (source_template.len > 0) alloc.free(source_template);
+    const chunker_json = if (request.chunker_json.len > 0) try alloc.dupe(u8, request.chunker_json) else "";
+    errdefer if (chunker_json.len > 0) alloc.free(chunker_json);
+    const content_type = if (request.content_type.len > 0) try alloc.dupe(u8, request.content_type) else "";
+    errdefer if (content_type.len > 0) alloc.free(content_type);
+    const producer_json = if (request.producer_json.len > 0) try alloc.dupe(u8, request.producer_json) else "";
+    errdefer if (producer_json.len > 0) alloc.free(producer_json);
+    const execution_json = if (request.execution_json.len > 0) try alloc.dupe(u8, request.execution_json) else "";
     return .{
         .kind = request.kind,
-        .index_name = try alloc.dupe(u8, request.index_name),
-        .artifact_name = if (request.artifact_name.len > 0) try alloc.dupe(u8, request.artifact_name) else "",
-        .embedding_name = if (request.embedding_name.len > 0) try alloc.dupe(u8, request.embedding_name) else "",
-        .doc_key = try alloc.dupe(u8, request.doc_key),
-        .source_field = try alloc.dupe(u8, request.source_field),
-        .source_template = if (request.source_template.len > 0) try alloc.dupe(u8, request.source_template) else "",
+        .index_name = index_name,
+        .artifact_name = artifact_name,
+        .embedding_name = embedding_name,
+        .doc_key = doc_key,
+        .source_field = source_field,
+        .source_template = source_template,
         .expected_dims = request.expected_dims,
         .chunk_size = request.chunk_size,
         .chunk_overlap = request.chunk_overlap,
-        .chunker_json = if (request.chunker_json.len > 0) try alloc.dupe(u8, request.chunker_json) else "",
+        .chunker_json = chunker_json,
         .full_text_index = request.full_text_index,
-        .content_type = if (request.content_type.len > 0) try alloc.dupe(u8, request.content_type) else "",
-        .producer_json = if (request.producer_json.len > 0) try alloc.dupe(u8, request.producer_json) else "",
-        .execution_json = if (request.execution_json.len > 0) try alloc.dupe(u8, request.execution_json) else "",
+        .content_type = content_type,
+        .producer_json = producer_json,
+        .execution_json = execution_json,
     };
 }
 
@@ -160,12 +179,19 @@ pub fn freeGeneratedRef(alloc: Allocator, request: GeneratedEnrichmentRef) void 
 }
 
 pub fn cloneGeneratedRef(alloc: Allocator, request: GeneratedEnrichmentRef) !GeneratedEnrichmentRef {
+    const index_name = try alloc.dupe(u8, request.index_name);
+    errdefer alloc.free(index_name);
+    const artifact_name = if (request.artifact_name.len > 0) try alloc.dupe(u8, request.artifact_name) else "";
+    errdefer if (artifact_name.len > 0) alloc.free(artifact_name);
+    const embedding_name = if (request.embedding_name.len > 0) try alloc.dupe(u8, request.embedding_name) else "";
+    errdefer if (embedding_name.len > 0) alloc.free(embedding_name);
+    const doc_key = try alloc.dupe(u8, request.doc_key);
     return .{
         .kind = request.kind,
-        .index_name = try alloc.dupe(u8, request.index_name),
-        .artifact_name = if (request.artifact_name.len > 0) try alloc.dupe(u8, request.artifact_name) else "",
-        .embedding_name = if (request.embedding_name.len > 0) try alloc.dupe(u8, request.embedding_name) else "",
-        .doc_key = try alloc.dupe(u8, request.doc_key),
+        .index_name = index_name,
+        .artifact_name = artifact_name,
+        .embedding_name = embedding_name,
+        .doc_key = doc_key,
     };
 }
 
@@ -178,8 +204,8 @@ pub fn cloneGeneratedRequests(alloc: Allocator, requests: []const GeneratedEnric
     const cloned = try alloc.alloc(GeneratedEnrichmentRequest, requests.len);
     var initialized: usize = 0;
     errdefer {
-        deinitGeneratedRequests(alloc, cloned[0..initialized]);
-        alloc.free(cloned);
+        for (cloned[0..initialized]) |request| freeGeneratedRequest(alloc, request);
+        if (cloned.len > 0) alloc.free(cloned);
     }
 
     for (requests, 0..) |request, i| {
@@ -193,8 +219,8 @@ pub fn cloneGeneratedRefs(alloc: Allocator, requests: []const GeneratedEnrichmen
     const cloned = try alloc.alloc(GeneratedEnrichmentRef, requests.len);
     var initialized: usize = 0;
     errdefer {
-        deinitGeneratedRefs(alloc, cloned[0..initialized]);
-        alloc.free(cloned);
+        for (cloned[0..initialized]) |request| freeGeneratedRef(alloc, request);
+        if (cloned.len > 0) alloc.free(cloned);
     }
 
     for (requests, 0..) |request, i| {
@@ -302,4 +328,43 @@ test "generated enrichment request clone without source_template" {
     try std.testing.expectEqual(@as(usize, 1), cloned.len);
     try std.testing.expectEqualStrings("body", cloned[0].source_field);
     try std.testing.expectEqual(@as(usize, 0), cloned[0].source_template.len);
+}
+
+test "generated enrichment request clone releases every partial allocation" {
+    const source = [_]GeneratedEnrichmentRequest{
+        .{
+            .kind = .dense_embedding,
+            .index_name = "dense_v1",
+            .artifact_name = "chunks_v1",
+            .embedding_name = "embedding_v1",
+            .doc_key = "doc:a",
+            .source_field = "body",
+            .source_template = "{{title}} {{body}}",
+            .expected_dims = 768,
+            .chunk_size = 512,
+            .chunk_overlap = 64,
+            .chunker_json = "{\"provider\":\"antfly\"}",
+            .content_type = "text/plain",
+            .producer_json = "{\"type\":\"chunk\"}",
+            .execution_json = "{\"batch_size\":32}",
+        },
+        .{
+            .kind = .asset,
+            .index_name = "assets_v1",
+            .doc_key = "doc:b",
+            .source_field = "url",
+        },
+    };
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        struct {
+            fn run(alloc: Allocator, requests: []const GeneratedEnrichmentRequest) !void {
+                const cloned = try cloneGeneratedRequests(alloc, requests);
+                defer deinitGeneratedRequests(alloc, cloned);
+                try std.testing.expectEqual(requests.len, cloned.len);
+            }
+        }.run,
+        .{source[0..]},
+    );
 }

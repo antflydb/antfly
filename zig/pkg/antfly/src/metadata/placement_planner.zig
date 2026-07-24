@@ -163,6 +163,7 @@ pub const PlacementPlanner = struct {
             const membership_repair = groupNeedsMembershipRepair(
                 current_intents,
                 range.group_id,
+                replica_count,
                 candidate_node_ids,
                 candidate_domains,
                 table.placement_role,
@@ -202,7 +203,10 @@ pub const PlacementPlanner = struct {
                 try orderCandidates(self.alloc, candidate_node_ids, candidate_domains, start, &load_by_node);
             defer self.alloc.free(ordered);
             while (selected.items.len < replica_count) {
-                const node_id = chooseNextCandidate(ordered, selection_exclusions.items, &pair_by_nodes, candidate_domains, table.placement_role) orelse break;
+                const node_id = (if (membership_repair)
+                    chooseNextRepairCandidate(ordered, selection_exclusions.items, candidate_domains, table.placement_role)
+                else
+                    chooseNextCandidate(ordered, selection_exclusions.items, &pair_by_nodes, candidate_domains, table.placement_role)) orelse break;
                 if (containsNode(selected.items, node_id)) break;
                 try selected.append(self.alloc, node_id);
                 try selection_exclusions.append(self.alloc, node_id);
@@ -391,6 +395,31 @@ fn chooseNextCandidate(
             best_node = node_id;
             best_domain_score = domain_score;
             best_pair_score = pair_score;
+            best_order_index = order_index;
+        }
+    }
+    return best_node;
+}
+
+fn chooseNextRepairCandidate(
+    ordered: []const u64,
+    selected: []const u64,
+    candidate_domains: []const CandidateDomain,
+    placement_role: []const u8,
+) ?u64 {
+    var best_node: ?u64 = null;
+    var best_domain_score: usize = std.math.maxInt(usize);
+    var best_order_index: usize = std.math.maxInt(usize);
+    for (ordered, 0..) |node_id, order_index| {
+        if (containsNode(selected, node_id)) continue;
+        if (!candidateSelectable(candidate_domains, node_id, placement_role)) continue;
+        const domain_score = domainScore(selected, node_id, candidate_domains);
+        if (best_node == null or
+            domain_score < best_domain_score or
+            (domain_score == best_domain_score and order_index < best_order_index))
+        {
+            best_node = node_id;
+            best_domain_score = domain_score;
             best_order_index = order_index;
         }
     }
@@ -731,22 +760,26 @@ fn candidateRetentionAllowed(candidate_domains: []const CandidateDomain, node_id
 fn groupNeedsMembershipRepair(
     current_intents: []const raft_reconciler.PlacementIntent,
     group_id: u64,
+    replica_count: usize,
     candidate_node_ids: []const u64,
     candidate_domains: []const CandidateDomain,
     placement_role: []const u8,
 ) bool {
+    var current_count: usize = 0;
     for (current_intents, 0..) |intent, i| {
         if (intent.record.group_id != group_id) continue;
+        current_count += 1;
         if (!containsNode(candidate_node_ids, intent.record.local_node_id) or
             !candidateSelectable(candidate_domains, intent.record.local_node_id, placement_role))
             return true;
         for (current_intents[i + 1 ..]) |other| {
             if (other.record.group_id == group_id and
-                other.record.replica_id == intent.record.replica_id)
+                (other.record.replica_id == intent.record.replica_id or
+                    other.record.local_node_id == intent.record.local_node_id))
                 return true;
         }
     }
-    return false;
+    return current_count != 0 and current_count != replica_count;
 }
 
 fn containsNode(nodes: []const u64, node_id: u64) bool {
@@ -1233,4 +1266,81 @@ test "placement planner repairs quota-full duplicate replica ids" {
     for (intents, 0..) |intent, i| replica_ids[i] = intent.record.replica_id;
     std.mem.sort(u64, &replica_ids, {}, std.sort.asc(u64));
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, &replica_ids);
+}
+
+test "placement planner repairs missing replicas with a stable target" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 154, .name = "docs", .desired_replica_count = 3 });
+    try manager.upsertRange(.{
+        .group_id = 15401,
+        .table_id = 154,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 15401, .replica_id = 1, .local_node_id = 101 }, .peer_node_ids = &.{ 101, 102 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 15401, .replica_id = 2, .local_node_id = 102 }, .peer_node_ids = &.{ 101, 102 }, .serving_state = .serving },
+    };
+    const candidates = [_]CandidateDomain{
+        .{ .node_id = 101, .role = "data", .failure_domain = "rack-a" },
+        .{ .node_id = 102, .role = "data", .failure_domain = "rack-b" },
+        .{ .node_id = 103, .role = "data", .failure_domain = "rack-c", .available_bytes = std.math.maxInt(u64) },
+        .{ .node_id = 104, .role = "data", .failure_domain = "rack-d", .read_load = 500 },
+        .{ .node_id = 105, .role = "data", .failure_domain = "rack-e", .write_load = 500 },
+    };
+
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const first = try planner.planAllIntentsWithCurrentAndDomains(
+        &manager,
+        &.{ 101, 102, 103, 104, 105 },
+        &current,
+        &candidates,
+    );
+    defer planner.freeIntents(std.testing.allocator, first);
+
+    const changed_candidates = [_]CandidateDomain{
+        .{ .node_id = 105, .role = "data", .failure_domain = "rack-e", .available_bytes = std.math.maxInt(u64) },
+        .{ .node_id = 104, .role = "data", .failure_domain = "rack-d", .write_load = 700 },
+        .{ .node_id = 103, .role = "data", .failure_domain = "rack-c", .read_load = 700 },
+        .{ .node_id = 102, .role = "data", .failure_domain = "rack-b" },
+        .{ .node_id = 101, .role = "data", .failure_domain = "rack-a" },
+    };
+    const retried = try planner.planAllIntentsWithCurrentAndDomains(
+        &manager,
+        &.{ 105, 104, 103, 102, 101 },
+        &current,
+        &changed_candidates,
+    );
+    defer planner.freeIntents(std.testing.allocator, retried);
+
+    var first_target: ?raft_reconciler.PlacementIntent = null;
+    var retried_target: ?raft_reconciler.PlacementIntent = null;
+    for (first) |intent| {
+        if (findCurrentIntent(&current, 15401, intent.record.local_node_id) == null) first_target = intent;
+    }
+    for (retried) |intent| {
+        if (findCurrentIntent(&current, 15401, intent.record.local_node_id) == null) retried_target = intent;
+    }
+    try std.testing.expectEqual(@as(usize, 3), first.len);
+    try std.testing.expectEqual(first_target.?.record.local_node_id, retried_target.?.record.local_node_id);
+    try std.testing.expectEqual(@as(u64, 3), first_target.?.record.replica_id);
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.bootstrapping, first_target.?.serving_state);
+}
+
+test "membership repair detects under and over replication" {
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 15501, .replica_id = 1, .local_node_id = 101 } },
+        .{ .record = .{ .group_id = 15501, .replica_id = 2, .local_node_id = 102 } },
+    };
+    const candidates = [_]CandidateDomain{
+        .{ .node_id = 101, .role = "data" },
+        .{ .node_id = 102, .role = "data" },
+        .{ .node_id = 103, .role = "data" },
+    };
+
+    try std.testing.expect(!groupNeedsMembershipRepair(&current, 15501, 2, &.{ 101, 102, 103 }, &candidates, "data"));
+    try std.testing.expect(groupNeedsMembershipRepair(&current, 15501, 3, &.{ 101, 102, 103 }, &candidates, "data"));
+    try std.testing.expect(groupNeedsMembershipRepair(&current, 15501, 1, &.{ 101, 102, 103 }, &candidates, "data"));
 }

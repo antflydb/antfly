@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTableQueryRequest } from "./table-query";
+import { buildTableQueryRequest, parseTableQueryRequest } from "./table-query";
 
 describe("buildTableQueryRequest", () => {
   it("builds a match-all request when the builder query is empty", () => {
@@ -52,6 +52,29 @@ describe("buildTableQueryRequest", () => {
       limit: 7,
       filter_query: { match: { text: "session" } },
       profile: true,
+    });
+  });
+
+  it("rejects non-object JSON request bodies", () => {
+    expect(parseTableQueryRequest("null")).toBeNull();
+    expect(parseTableQueryRequest("[]")).toBeNull();
+    expect(parseTableQueryRequest('"query"')).toBeNull();
+    expect(parseTableQueryRequest('{"limit": 5}')).toEqual({ limit: 5 });
+  });
+
+  it("ignores non-object builder options and filters", () => {
+    expect(
+      buildTableQueryRequest({
+        query: "",
+        queryIndexes: [],
+        selectedFields: [],
+        semanticQuery: "[]",
+        filterQuery: '["not", "a", "filter"]',
+        includeProfile: false,
+      })
+    ).toEqual({
+      limit: 10,
+      profile: false,
     });
   });
 });

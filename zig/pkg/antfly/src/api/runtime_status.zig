@@ -420,6 +420,67 @@ pub const TableRuntimeSnapshotCache = struct {
         return if (published or statuses.len == 0) .published else .stale_observation;
     }
 
+    /// Atomically replaces a table's visible observations while advancing its
+    /// lifecycle epoch. Use this when a durable structural transition makes
+    /// every observation from the preceding epoch unsafe to republish.
+    pub fn publishLifecycleTransition(
+        self: *@This(),
+        token: PublicationToken,
+        table_name: []const u8,
+        statuses: []const LocalTableRuntimeStatus,
+    ) !PublishResult {
+        for (statuses, 0..) |status, index| {
+            for (statuses[0..index]) |previous| {
+                if (previous.group_id == status.group_id) return error.DuplicateRuntimeStatusGroup;
+            }
+        }
+
+        var replacement = std.AutoHashMapUnmanaged(u64, LocalTableRuntimeStatus).empty;
+        var replacement_owned = true;
+        defer if (replacement_owned) {
+            var it = replacement.valueIterator();
+            while (it.next()) |status| status.deinit(self.alloc);
+            replacement.deinit(self.alloc);
+        };
+        try replacement.ensureTotalCapacity(self.alloc, @intCast(statuses.len));
+        for (statuses) |status| {
+            const owned = try status.clone(self.alloc);
+            replacement.putAssumeCapacityNoClobber(status.group_id, owned);
+        }
+
+        lockAtomic(&self.mutex);
+        const state = self.tables.getPtr(table_name) orelse {
+            self.mutex.unlock();
+            return .stale_table;
+        };
+        if (!std.meta.eql(state.epoch, token.table_epoch)) {
+            self.mutex.unlock();
+            return .stale_table;
+        }
+
+        const observation_generation = self.takeObservationGenerationLocked();
+        const now_ns = platform_time.monotonicNs();
+        var replacement_it = replacement.valueIterator();
+        while (replacement_it.next()) |status| {
+            status.cache_observation_generation = observation_generation;
+            status.withMetadataDefaults(.live_writer_publish, now_ns);
+        }
+
+        self.advanceInvalidationEpochLocked();
+        self.advanceTopologyRevisionLocked();
+        state.epoch.invalidation_epoch = self.next_invalidation_epoch;
+        var retired = state.groups;
+        state.groups = replacement;
+        replacement = .empty;
+        replacement_owned = false;
+        self.mutex.unlock();
+
+        var retired_it = retired.valueIterator();
+        while (retired_it.next()) |status| status.deinit(self.alloc);
+        retired.deinit(self.alloc);
+        return .published;
+    }
+
     /// Consumes every snapshot. Epoch-valid tables publish independently;
     /// catalog-wide absence removals occur only when topology stayed stable.
     pub fn publishRefresh(
@@ -2288,6 +2349,59 @@ test "table runtime snapshot cache batch publication is table epoch atomic" {
         try cache.publishGroups(stale_token, "docs", &statuses),
     );
     try std.testing.expect((try cache.snapshot(alloc, "docs")) == null);
+}
+
+test "table runtime snapshot cache lifecycle transition replaces and fences observations" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const initial_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroups(initial_token, "docs", &.{
+            .{ .group_id = 7, .stats = .{ .doc_count = 10 } },
+            .{ .group_id = 8, .stats = .{ .doc_count = 20 } },
+        }),
+    );
+
+    const in_flight_token = try cache.capturePublicationToken("docs");
+    const transition_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishLifecycleTransition(transition_token, "docs", &.{
+            .{
+                .group_id = 7,
+                .metadata = .{
+                    .source = .startup_catch_up,
+                    .freshness = .catching_up,
+                },
+                .stats = .{ .doc_count = 10 },
+            },
+        }),
+    );
+
+    const current_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        transition_token.table_epoch.root_generation,
+        current_token.table_epoch.root_generation,
+    );
+    try std.testing.expect(
+        transition_token.table_epoch.invalidation_epoch != current_token.table_epoch.invalidation_epoch,
+    );
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_table,
+        try cache.publishGroup(in_flight_token, "docs", .{
+            .group_id = 8,
+            .stats = .{ .doc_count = 21 },
+        }),
+    );
+
+    var docs = (try cache.snapshot(alloc, "docs")).?;
+    defer docs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), docs.items.len);
+    try std.testing.expectEqual(@as(u64, 7), docs.items[0].group_id);
+    try std.testing.expectEqual(RuntimeStatusFreshness.catching_up, docs.items[0].metadata.freshness);
 }
 
 test "table runtime snapshot cache batch preserves newer group observations" {

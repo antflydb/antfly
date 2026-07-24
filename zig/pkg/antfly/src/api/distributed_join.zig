@@ -44,6 +44,11 @@ pub const JoinContext = struct {
     pub const VTable = struct {
         admin_snapshot: *const fn (*anyopaque) anyerror!?metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (*anyopaque, *metadata_api.AdminSnapshot) void,
+        local_table_stats: ?*const fn (
+            *anyopaque,
+            []const u8,
+            *const metadata_api.AdminSnapshot,
+        ) anyerror!?JoinTableStats = null,
         get_join_shuffle_lease: ?*const fn (*anyopaque, u64) anyerror!?metadata_table_manager.ShuffleJoinLeaseRecord = null,
         upsert_join_shuffle_lease: ?*const fn (*anyopaque, metadata_table_manager.ShuffleJoinLeaseRecord) anyerror!void = null,
         remove_join_shuffle_lease: ?*const fn (*anyopaque, u64) anyerror!void = null,
@@ -59,6 +64,15 @@ pub const JoinContext = struct {
 
     pub fn freeAdminSnapshot(self: JoinContext, snapshot: *metadata_api.AdminSnapshot) void {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
+    }
+
+    pub fn localTableStats(
+        self: JoinContext,
+        table_name: []const u8,
+        snapshot: *const metadata_api.AdminSnapshot,
+    ) !?JoinTableStats {
+        const fn_ptr = self.vtable.local_table_stats orelse return null;
+        return try fn_ptr(self.ptr, table_name, snapshot);
     }
 
     pub fn getJoinShuffleLease(self: JoinContext, job_id: u64) !?metadata_table_manager.ShuffleJoinLeaseRecord {
@@ -3373,8 +3387,18 @@ pub fn planSupportedJoinExecution(
     };
     defer ctx.freeAdminSnapshot(&snapshot);
 
-    const left_stats = estimateJoinTableStatsFromSnapshot(&snapshot, left_table_name);
-    const right_stats = foreign_right_stats orelse estimateJoinTableStatsFromSnapshot(&snapshot, join.right_table);
+    var left_stats = estimateJoinTableStatsFromSnapshot(&snapshot, left_table_name);
+    if (!left_stats.has_stats) {
+        if (ctx.localTableStats(left_table_name, &snapshot) catch null) |local_stats| {
+            left_stats = local_stats;
+        }
+    }
+    var right_stats = foreign_right_stats orelse estimateJoinTableStatsFromSnapshot(&snapshot, join.right_table);
+    if (foreign_right_stats == null and !right_stats.has_stats) {
+        if (ctx.localTableStats(join.right_table, &snapshot) catch null) |local_stats| {
+            right_stats = local_stats;
+        }
+    }
     plan.used_stats = left_stats.has_stats or right_stats.has_stats;
 
     if (join_model.resolveJoinStrategyHint(RightJoinQueryResult.StrategyUsed, join, supported_index_lookup)) |hint| {

@@ -930,18 +930,11 @@ test "public api smoke e2e creates table inserts and queries documents" {
     const join_hits = join_response.hits.?.hits.?;
     try std.testing.expectEqual(@as(usize, 2), join_hits.len);
     const base_join_profile = join_response.profile.?.object.get("join").?.object;
-    const strategy_used = base_join_profile.get("strategy_used").?.string;
-    const planner_used_stats = base_join_profile.get("planner_used_stats").?.bool;
-    // Runtime cardinality publication races this embedded query. Before those
-    // statistics arrive, a primary-key equality join uses direct lookups;
-    // afterward, the planner may validly choose a statistics-aware broadcast.
-    if (std.mem.eql(u8, strategy_used, "index_lookup")) {
-        try std.testing.expect(!planner_used_stats);
-    } else if (std.mem.eql(u8, strategy_used, "broadcast")) {
-        try std.testing.expect(planner_used_stats);
-    } else {
-        return error.TestUnexpectedResult;
-    }
+    try std.testing.expectEqualStrings("broadcast", base_join_profile.get("strategy_used").?.string);
+    // Shared provisioned storage publishes writer-owned runtime cardinalities
+    // even in this embedded fixture, so the planner can make the same
+    // statistics-aware broadcast decision as a production data server.
+    try std.testing.expect(base_join_profile.get("planner_used_stats").?.bool);
     try std.testing.expect(!base_join_profile.get("shuffle_candidate").?.bool);
     try std.testing.expect(!base_join_profile.get("forced_broadcast_fallback").?.bool);
 
