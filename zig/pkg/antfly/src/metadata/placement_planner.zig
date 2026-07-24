@@ -212,11 +212,14 @@ pub const PlacementPlanner = struct {
                 else
                     .persisted;
                 var source_intent: ?raft_reconciler.PlacementIntent = null;
+                var replacement_source: ?raft_reconciler.PlacementIntent = null;
                 if (existing_intent == null and has_current_group) {
-                    source_intent = if (dropped_source_index < dropped_sources.len)
-                        dropped_sources[dropped_source_index]
-                    else
-                        findRelocationSourceIntent(current_intents, range.group_id);
+                    if (dropped_source_index < dropped_sources.len) {
+                        replacement_source = dropped_sources[dropped_source_index];
+                        source_intent = replacement_source;
+                    } else {
+                        source_intent = findRelocationSourceIntent(current_intents, range.group_id);
+                    }
                     dropped_source_index += 1;
                 }
                 const serving_state: raft_reconciler.PlacementServingState = if (existing_intent) |existing|
@@ -225,10 +228,16 @@ pub const PlacementPlanner = struct {
                     .bootstrapping
                 else
                     .serving;
+                const replica_id = if (existing_intent) |existing|
+                    existing.record.replica_id
+                else if (replacement_source) |source|
+                    source.record.replica_id
+                else
+                    @as(u64, @intCast(replica_index + 1));
                 try out.append(self.alloc, .{
                     .record = .{
                         .group_id = range.group_id,
-                        .replica_id = @as(u64, @intCast(replica_index + 1)),
+                        .replica_id = replica_id,
                         .local_node_id = node_id,
                         .bootstrap_mode = bootstrap_mode,
                     },
@@ -950,9 +959,12 @@ test "placement planner tags replacement with the dropped current peer as source
         if (findCurrentIntent(&current, 1501, intent.record.local_node_id) == null) replacement = intent;
     }
     const target = replacement orelse return error.MissingReplacement;
+    try std.testing.expectEqual(@as(u64, 2), target.record.replica_id);
     try std.testing.expectEqual(@as(u64, 101), target.relocation_source_node_id);
     try std.testing.expectEqual(@as(u64, 101), target.relocation_source_store_id);
     try std.testing.expectEqual(raft_reconciler.PlacementServingState.bootstrapping, target.serving_state);
+    try std.testing.expectEqual(@as(u64, 1), findCurrentIntent(intents, 1501, 105).?.record.replica_id);
+    try std.testing.expectEqual(@as(u64, 3), findCurrentIntent(intents, 1501, 102).?.record.replica_id);
 }
 
 test "placement planner preserves protected unconverged members during forced rebalance" {
