@@ -3535,8 +3535,6 @@ pub fn build(b: *std.Build) void {
         "store capacity reporting preserves the last good observation on probe failure",
         "data server repair owner cancels and drains through backend runtime",
         "data server rejects replicated transition admission after owner shutdown",
-        "replicated transition snapshot working set is single flight",
-        "split handoff working set accounts payload bytes",
         "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime local group status does not open roots owned by transitions",

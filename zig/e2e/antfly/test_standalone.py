@@ -30,7 +30,7 @@ from typing import Any
 import pytest
 import requests
 
-from conftest import antfly_public_api_url, inference_public_api_url
+from conftest import antfly_public_api_url, inference_public_api_url, lookup_key_path
 from helpers import wait_until
 
 
@@ -515,9 +515,22 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
     for table_name in table_names[:-1]:
         batch = embedded_standalone_api.batch_write(table_name, inserts=docs)
         assert batch["inserted"] == len(docs)
+    survivor_doc = {"title": "The surviving table remains queryable after peer tables are retired."}
+    survivor_batch = embedded_standalone_api.batch_write(
+        table_names[-1],
+        inserts={"doc:survivor": survivor_doc},
+    )
+    assert survivor_batch["inserted"] == 1
 
     for table_name in table_names[:-1]:
         embedded_standalone_api.delete_table(table_name)
+
+    survivor = requests.get(
+        f"{embedded_standalone_runtime['base_url']}{lookup_key_path(table_names[-1], 'doc:survivor')}",
+        timeout=30,
+    )
+    survivor.raise_for_status()
+    assert survivor.json() == survivor_doc
 
     response = requests.get(f"{embedded_standalone_runtime['base_url']}/status", timeout=30)
     response.raise_for_status()
