@@ -396,6 +396,47 @@ pub const IndexRepairActivationStats = struct {
     last_budget_ns: u64 = 0,
 };
 
+pub const DerivedRecoverableRetryStats = struct {
+    total: u64 = 0,
+    writer_locked: u64 = 0,
+    resource_budget: u64 = 0,
+    replay_document_not_visible: u64 = 0,
+    artifact_repair_required: u64 = 0,
+    not_found: u64 = 0,
+};
+
+const DerivedRecoverableRetryCounters = struct {
+    total: std.atomic.Value(u64) = .init(0),
+    writer_locked: std.atomic.Value(u64) = .init(0),
+    resource_budget: std.atomic.Value(u64) = .init(0),
+    replay_document_not_visible: std.atomic.Value(u64) = .init(0),
+    artifact_repair_required: std.atomic.Value(u64) = .init(0),
+    not_found: std.atomic.Value(u64) = .init(0),
+
+    fn record(self: *@This(), err: anyerror) void {
+        _ = self.total.fetchAdd(1, .monotonic);
+        switch (err) {
+            error.WriterLocked => _ = self.writer_locked.fetchAdd(1, .monotonic),
+            error.ResourceBudgetExceeded => _ = self.resource_budget.fetchAdd(1, .monotonic),
+            error.ReplayDocumentNotVisible => _ = self.replay_document_not_visible.fetchAdd(1, .monotonic),
+            error.ArtifactRepairRequired => _ = self.artifact_repair_required.fetchAdd(1, .monotonic),
+            error.NotFound => _ = self.not_found.fetchAdd(1, .monotonic),
+            else => {},
+        }
+    }
+
+    fn snapshot(self: *const @This()) DerivedRecoverableRetryStats {
+        return .{
+            .total = self.total.load(.monotonic),
+            .writer_locked = self.writer_locked.load(.monotonic),
+            .resource_budget = self.resource_budget.load(.monotonic),
+            .replay_document_not_visible = self.replay_document_not_visible.load(.monotonic),
+            .artifact_repair_required = self.artifact_repair_required.load(.monotonic),
+            .not_found = self.not_found.load(.monotonic),
+        };
+    }
+};
+
 const MutableSlice = struct {
     budget: Budget = .{},
     policy: Policy = .{},
@@ -423,6 +464,7 @@ pub const ResourceManager = struct {
     query_embedding_cache_ttl_ns: u64,
     query_embedding_max_inflight: usize,
     index_repair_activation: IndexRepairActivationStats = .{},
+    derived_recoverable_retry_counters: DerivedRecoverableRetryCounters = .{},
     capacity_source: ?CapacitySource = null,
 
     pub fn init(options: Options) ResourceManager {
@@ -475,6 +517,17 @@ pub const ResourceManager = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         return self.index_repair_activation;
+    }
+
+    /// Process-lifetime retry counters for the provisioned storage domain.
+    /// Per-DB executors can be evicted and reopened, so Prometheus counters
+    /// must be owned by this longer-lived manager instead of those executors.
+    pub fn recordDerivedRecoverableRetry(self: *ResourceManager, err: anyerror) void {
+        self.derived_recoverable_retry_counters.record(err);
+    }
+
+    pub fn derivedRecoverableRetryStats(self: *const ResourceManager) DerivedRecoverableRetryStats {
+        return self.derived_recoverable_retry_counters.snapshot();
     }
 
     /// Install the capacity source for this manager's storage domain.

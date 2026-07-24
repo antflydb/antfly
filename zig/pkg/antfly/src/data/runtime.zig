@@ -1198,7 +1198,12 @@ pub const HealthSource = struct {
         try writeLsmMaintenanceMetrics(writer, lsm_maintenance_stats.stats);
         try writeLsmWriteMetrics(writer, live_write_source.lsmWriteStatsBestEffort());
         try writeTextMergeMetrics(writer, live_write_source.textMergeStatsBestEffort());
-        try writeAsyncIndexingMetrics(writer, live_write_source.asyncIndexingStatsBestEffort());
+        var async_indexing_stats = live_write_source.asyncIndexingStatsBestEffort();
+        applyProcessDerivedRetryStats(
+            &async_indexing_stats,
+            self.data_server.provisioned_storage.resource_manager.derivedRecoverableRetryStats(),
+        );
+        try writeAsyncIndexingMetrics(writer, async_indexing_stats);
         try antfly.db.query_metrics.writePrometheus(writer);
         try antfly.db.enrichment_utf8_text.writePrometheus(writer);
     }
@@ -1663,6 +1668,18 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_manifest_ns_total", "counter", "Manifest write nanoseconds observed during dense catch-up finish", stats.dense_catch_up.manifest_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_write_pressure_compactions_total", "counter", "Write-pressure compactions observed during dense catch-up finish", stats.dense_catch_up.write_pressure_compactions);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_write_pressure_ns_total", "counter", "Write-pressure compaction nanoseconds observed during dense catch-up finish", stats.dense_catch_up.write_pressure_ns);
+}
+
+fn applyProcessDerivedRetryStats(
+    stats: *antfly.db.types.AsyncIndexingStats,
+    retries: resource_manager_mod.DerivedRecoverableRetryStats,
+) void {
+    stats.derived_workers.recoverable_retries = retries.total;
+    stats.derived_workers.writer_locked_retries = retries.writer_locked;
+    stats.derived_workers.resource_budget_retries = retries.resource_budget;
+    stats.derived_workers.replay_document_not_visible_retries = retries.replay_document_not_visible;
+    stats.derived_workers.artifact_repair_required_retries = retries.artifact_repair_required;
+    stats.derived_workers.not_found_retries = retries.not_found;
 }
 
 fn appendDerivedRetrySample(writer: *std.Io.Writer, reason: []const u8, count: u64) !void {
@@ -20658,12 +20675,15 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
                     .workers = 2,
                     .workers_with_replay_debt = 1,
                     .max_replay_lag_sequences = 3,
-                    .recoverable_retries = 11,
-                    .writer_locked_retries = 7,
-                    .resource_budget_retries = 1,
-                    .replay_document_not_visible_retries = 1,
-                    .artifact_repair_required_retries = 1,
-                    .not_found_retries = 1,
+                    // Deliberately stale relative to the process-owned
+                    // counters populated below. Counter export must not fall
+                    // back to this evictable runtime snapshot.
+                    .recoverable_retries = 110,
+                    .writer_locked_retries = 70,
+                    .resource_budget_retries = 10,
+                    .replay_document_not_visible_retries = 10,
+                    .artifact_repair_required_retries = 10,
+                    .not_found_retries = 10,
                 },
                 .startup = .{
                     .active = true,
@@ -20748,6 +20768,11 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     server.provisioned_root_refresh_completed.store(7, .monotonic);
     server.provisioned_root_refresh_failed.store(1, .monotonic);
     server.provisioned_root_refresh_last_duration_ns.store(66, .monotonic);
+    for (0..7) |_| server.provisioned_storage.resource_manager.recordDerivedRecoverableRetry(error.WriterLocked);
+    server.provisioned_storage.resource_manager.recordDerivedRecoverableRetry(error.ResourceBudgetExceeded);
+    server.provisioned_storage.resource_manager.recordDerivedRecoverableRetry(error.ReplayDocumentNotVisible);
+    server.provisioned_storage.resource_manager.recordDerivedRecoverableRetry(error.ArtifactRepairRequired);
+    server.provisioned_storage.resource_manager.recordDerivedRecoverableRetry(error.NotFound);
 
     var health = HealthSource{ .data_server = &server };
     var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);

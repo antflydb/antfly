@@ -96,10 +96,12 @@ pub const RecoverableRetryCounters = struct {
 
 pub fn recordRecoverableRetry(
     counters: *RecoverableRetryCounters,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
     backoff: *RecoverableRetryBackoff,
     err: anyerror,
 ) u64 {
     counters.record(err);
+    if (resource_manager) |manager| manager.recordDerivedRecoverableRetry(err);
     return backoff.nextDelayNs();
 }
 
@@ -260,14 +262,17 @@ test "recoverable retry backoff is bounded and resets" {
 
 test "writer-locked derived-worker retries are counted and backoffed" {
     var counters = RecoverableRetryCounters{};
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
     var backoff = RecoverableRetryBackoff{};
     try std.testing.expectEqual(
         @as(u64, 10 * std.time.ns_per_ms),
-        recordRecoverableRetry(&counters, &backoff, error.WriterLocked),
+        recordRecoverableRetry(&counters, &manager, &backoff, error.WriterLocked),
     );
     const stats = counters.snapshot();
     try std.testing.expectEqual(@as(u64, 1), stats.total);
     try std.testing.expectEqual(@as(u64, 1), stats.writer_locked);
+    try std.testing.expectEqual(@as(u64, 1), manager.derivedRecoverableRetryStats().writer_locked);
 }
 
 test "recoverable retry counters preserve failure reasons" {
