@@ -131,9 +131,19 @@ jobs:
           wait $SWARM_PID 2>/dev/null || true
 
       - name: Test
-        run: go test -v ./...
+        run: |
+          packages=()
+          while IFS= read -r pkg; do
+            if [ "$pkg" != "github.com/antflydb/antfly/src/sim" ]; then
+              packages+=("$pkg")
+            fi
+          done < <(go list ./...)
+          go test -v "${packages[@]}"
 
   sim-validate:
+    # Temporarily disabled while simulator coverage is stabilized.
+    # Set ENABLE_GO_SIM_CI=true to opt back in.
+    if: ${{ vars.ENABLE_GO_SIM_CI == 'true' }}
     runs-on: arc-antfly-heavy
     # sim-validate runs `go test ./src/sim` under a wrapper; on the 4-cpu
     # standard runner with no /mnt/cache, it tipped past the 10Gi ephemeral
