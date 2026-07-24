@@ -782,10 +782,12 @@ pub const MultiRaft = struct {
 
         var scanned: usize = 0;
         const scan_limit = self.groups.count();
+        var ready_pass = self.scheduler.beginReadyPass();
+        defer self.scheduler.finishReadyPass(&ready_pass);
         const scan_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         while (scanned < scan_limit) : (scanned += 1) {
             if (processed >= max_groups) break;
-            const group_id = self.scheduler.nextReadyGroup() orelse break;
+            const group_id = self.scheduler.nextReadyGroup(&ready_pass) orelse break;
             const ready_processed = if (diagnostics) |diag| blk: {
                 var ready_diag = ReadyGroupDiagnostics{ .group_id = group_id };
                 const ready_start_ns = clock.monotonicNs();
@@ -1489,8 +1491,8 @@ pub const MultiRaft = struct {
 
     fn resumeOnActivity(self: *MultiRaft, group_id: core.types.GroupId) !void {
         if (!self.groups.contains(group_id)) return error.UnknownGroup;
-        self.scheduler.noteActivity(group_id);
         if (self.isGroupQuiesced(group_id)) try self.resumeGroup(group_id);
+        self.scheduler.noteActivity(group_id);
     }
 
     fn transportReceiver(self: *MultiRaft) transport_iface.TransportReceiver {

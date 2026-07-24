@@ -715,6 +715,124 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
     assert beta_hits[0]["_id"] == "doc:b"
 
 
+def test_stateful_drop_tables_with_pending_enrichment_preserves_unrelated_owner(
+    single_item_enrichment_batches,
+    stateful_api,
+    rate_limited_openai_embedder,
+):
+    hot_tables = [f"stateful_drop_pending_{time.time_ns()}_{i}" for i in range(3)]
+    survivor = f"stateful_drop_survivor_{time.time_ns()}"
+    created_tables = {*hot_tables, survivor}
+    index_name = "semantic_idx"
+    index_payload = {
+        "name": index_name,
+        "type": "embeddings",
+        "field": "body",
+        "dimension": 3,
+        "embedder": {
+            "provider": "openai",
+            "model": "text-embedding-3-small",
+            "url": rate_limited_openai_embedder.url,
+        },
+    }
+
+    try:
+        for table_name in [*hot_tables, survivor]:
+            created = stateful_api.create_table(table_name, num_shards=1)
+            assert created["name"] == table_name
+        rate_limited_openai_embedder.allow_all_requests()
+        for table_name in hot_tables:
+            assert stateful_api.create_index(table_name, index_name, index_payload) == {}
+            assert wait_until(
+                lambda table_name=table_name: ready_index_status(
+                    stateful_api.get_index(table_name, index_name)
+                ),
+                timeout_s=30.0,
+                interval_s=0.1,
+            )
+        rate_limited_openai_embedder.deny_requests()
+
+        docs = {
+            f"doc:{i:02d}": {
+                "title": f"pending document {i}",
+                "body": f"rate limited semantic payload {i}",
+            }
+            for i in range(24)
+        }
+        for table_name in hot_tables:
+            batch = stateful_api.batch_write(
+                table_name,
+                inserts=docs,
+                sync_level="write",
+            )
+            assert batch["inserted"] == len(docs)
+
+        pending_statuses: dict[str, dict] = {}
+
+        def pending_work_observed() -> dict | None:
+            stats = rate_limited_openai_embedder.stats()
+            for table_name in hot_tables:
+                try:
+                    detail = stateful_api.get_index(table_name, index_name)
+                except requests.RequestException:
+                    continue
+                pending_statuses[table_name] = detail
+            if stats["rate_limited_requests"] == 0 or len(pending_statuses) != len(hot_tables):
+                return None
+            if not all(
+                int(detail.get("status", {}).get("coverage", {}).get("pending", 0)) > 0
+                for detail in pending_statuses.values()
+            ):
+                return None
+            return {"embedder": stats, "indexes": pending_statuses.copy()}
+
+        observed = wait_until(
+            pending_work_observed,
+            timeout_s=30.0,
+            interval_s=0.1,
+        )
+        assert observed is not None, json.dumps(
+            {
+                "embedder": rate_limited_openai_embedder.stats(),
+                "indexes": pending_statuses,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+
+        for table_name in hot_tables:
+            stateful_api.delete_table(table_name)
+
+        def dropped_tables_are_absent() -> dict | None:
+            try:
+                names = {table["name"] for table in stateful_api.get("/tables")}
+            except requests.RequestException:
+                return None
+            return {"tables": names} if not names.intersection(hot_tables) else None
+
+        assert wait_until(
+            dropped_tables_are_absent,
+            timeout_s=30.0,
+            interval_s=0.1,
+        )
+
+        survivor_batch = stateful_api.batch_write(
+            survivor,
+            inserts={"doc:survivor": {"title": "survivor remains writable"}},
+            sync_level="write",
+        )
+        assert survivor_batch["inserted"] == 1
+        survivor_doc = stateful_api.lookup_key(survivor, "doc:survivor")
+        assert survivor_doc["title"] == "survivor remains writable"
+    finally:
+        rate_limited_openai_embedder.allow_all_requests()
+        for table_name in sorted(created_tables):
+            try:
+                stateful_api.delete_table(table_name)
+            except requests.RequestException:
+                pass
+
+
 def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrichment_without_recreate(
     single_item_enrichment_batches,
     stateful_api,

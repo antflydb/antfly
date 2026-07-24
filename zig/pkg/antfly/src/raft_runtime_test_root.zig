@@ -21,7 +21,6 @@ const transition_service = @import("raft/transition_service.zig");
 test "raft scheduler ready priority cannot starve consensus ticks" {
     var scheduler = raft_engine.runtime.scheduler.Scheduler.init(std.testing.allocator, .{
         .max_tick_batch = 2,
-        .priority_boost = 8,
     });
     defer scheduler.deinit();
 
@@ -38,12 +37,20 @@ test "raft scheduler ready priority cannot starve consensus ticks" {
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualSlices(u64, &.{ 3, 1 }, second);
 
-    try std.testing.expectEqual(@as(?u64, 1), scheduler.nextReadyGroup());
-    try std.testing.expectEqual(@as(?u64, 1), scheduler.nextReadyGroup());
+    var ready_pass = scheduler.beginReadyPass();
+    try std.testing.expectEqual(@as(?u64, 1), scheduler.nextReadyGroup(&ready_pass));
+    scheduler.noteReady(1);
+    try std.testing.expectEqual(@as(?u64, 2), scheduler.nextReadyGroup(&ready_pass));
+    try std.testing.expectEqual(@as(?u64, 3), scheduler.nextReadyGroup(&ready_pass));
+    try std.testing.expectEqual(@as(?u64, null), scheduler.nextReadyGroup(&ready_pass));
+    scheduler.finishReadyPass(&ready_pass);
+
+    var requeued_pass = scheduler.beginReadyPass();
+    defer scheduler.finishReadyPass(&requeued_pass);
+    try std.testing.expectEqual(@as(?u64, 1), scheduler.nextReadyGroup(&requeued_pass));
 
     var reused = raft_engine.runtime.scheduler.Scheduler.init(std.testing.allocator, .{
         .max_tick_batch = 8,
-        .priority_boost = 8,
     });
     defer reused.deinit();
     try reused.registerGroup(1);
@@ -51,7 +58,9 @@ test "raft scheduler ready priority cannot starve consensus ticks" {
     reused.noteReady(1);
     try std.testing.expect(reused.unregisterGroup(1));
     try reused.registerGroup(1);
-    try std.testing.expectEqual(@as(?u64, 2), reused.nextReadyGroup());
+    var reused_pass = reused.beginReadyPass();
+    defer reused.finishReadyPass(&reused_pass);
+    try std.testing.expectEqual(@as(?u64, 2), reused.nextReadyGroup(&reused_pass));
 
     const Register = struct {
         fn run(alloc: std.mem.Allocator) !void {

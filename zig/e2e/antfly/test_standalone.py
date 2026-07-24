@@ -367,6 +367,14 @@ def embedded_standalone_api(embedded_standalone_runtime):
                 )
             return self._check(response)
 
+        def get_index(self, table_name: str, index_name: str) -> dict:
+            with self._request_lock:
+                response = self.s.get(
+                    f"{self.url}/tables/{table_name}/indexes/{index_name}",
+                    timeout=30,
+                )
+            return self._check(response)
+
         def delete_table(self, table_name: str) -> dict:
             with self._request_lock:
                 response = self.s.delete(f"{self.url}/tables/{table_name}", timeout=30)
@@ -536,14 +544,47 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
             batch = embedded_standalone_api.batch_write(table_name, inserts=docs)
             assert batch["inserted"] == len(docs)
 
+        latest_index_statuses: dict[str, dict] = {}
+
+        def observe_pending_embedding_work() -> dict | None:
+            for table_name in hot_tables:
+                try:
+                    detail = embedded_standalone_api.get_index(table_name, "semantic_idx")
+                except (requests.RequestException, ValueError):
+                    continue
+                latest_index_statuses[table_name] = detail
+                status = detail.get("status", {})
+                coverage = status.get("coverage", {})
+                replay_applied = int(status.get("replay_applied_sequence", 0))
+                replay_target = int(status.get("replay_target_sequence", 0))
+                if (
+                    int(coverage.get("pending", 0)) > 0
+                    or replay_applied < replay_target
+                    or status.get("catch_up_active") is True
+                    or status.get("backfill_active") is True
+                ):
+                    return {"table": table_name, "status": detail}
+            return None
+
+        pending = wait_until(
+            observe_pending_embedding_work,
+            timeout_s=15.0,
+            interval_s=0.05,
+        )
+        if pending is None:
+            raise AssertionError(
+                "standalone table-drop workload never exposed pending embedding work\n"
+                f"last index statuses:\n{json.dumps(latest_index_statuses, indent=2, sort_keys=True)}\n"
+                f"server logs:\n{embedded_standalone_runtime['logs']()}"
+            )
+
         for table_name in hot_tables:
             embedded_standalone_api.delete_table(table_name)
-            created_tables.discard(table_name)
 
         def dropped_tables_are_absent() -> bool:
             try:
                 names = {table["name"] for table in embedded_standalone_api.list_tables()}
-            except requests.RequestException:
+            except (requests.RequestException, ValueError):
                 return False
             return not names.intersection(hot_tables)
 
@@ -569,7 +610,7 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
         response = requests.get(f"{embedded_standalone_runtime['base_url']}/status", timeout=30)
         response.raise_for_status()
     finally:
-        for table_name in created_tables:
+        for table_name in sorted(created_tables):
             try:
                 embedded_standalone_api.delete_table(table_name)
             except (requests.RequestException, ValueError):

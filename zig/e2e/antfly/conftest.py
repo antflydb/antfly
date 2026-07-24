@@ -1122,6 +1122,10 @@ class RateLimitedOpenAiEmbeddingServer:
         with self._lock:
             self._allowed_successes = 2**31 - 1
 
+    def deny_requests(self) -> None:
+        with self._lock:
+            self._allowed_successes = self._successful_requests
+
     def stats(self) -> dict[str, int]:
         with self._lock:
             return {

@@ -18,7 +18,6 @@ const core = @import("../core/mod.zig");
 pub const SchedulerConfig = struct {
     tick_interval_ms: u32 = 100,
     max_tick_batch: usize = 128,
-    priority_boost: u8 = 2,
 };
 
 pub const VirtualTime = struct {
@@ -27,13 +26,28 @@ pub const VirtualTime = struct {
 };
 
 pub const Scheduler = struct {
+    const GroupState = struct {
+        quiesced: bool = false,
+        ready_queued: bool = false,
+        ready_visit_epoch: u64 = 0,
+    };
+
+    pub const ReadyPass = struct {
+        epoch: u64,
+        priority_end: usize,
+        fallback_checked: usize = 0,
+    };
+
     alloc: std.mem.Allocator,
     cfg: SchedulerConfig,
     time: VirtualTime = .{},
     group_ids: std.ArrayListUnmanaged(core.types.GroupId) = .empty,
-    registered: std.AutoHashMapUnmanaged(core.types.GroupId, void) = .empty,
-    quiesced: std.AutoHashMapUnmanaged(core.types.GroupId, void) = .empty,
-    priority: std.AutoHashMapUnmanaged(core.types.GroupId, u8) = .empty,
+    groups: std.AutoHashMapUnmanaged(core.types.GroupId, GroupState) = .empty,
+    ready_queue: std.ArrayListUnmanaged(core.types.GroupId) = .empty,
+    ready_queue_head: usize = 0,
+    active_group_count: usize = 0,
+    ready_epoch: u64 = 0,
+    ready_pass_active: bool = false,
     cursor: usize = 0,
     ready_cursor: usize = 0,
 
@@ -46,26 +60,35 @@ pub const Scheduler = struct {
 
     pub fn deinit(self: *Scheduler) void {
         self.group_ids.deinit(self.alloc);
-        self.registered.deinit(self.alloc);
-        self.quiesced.deinit(self.alloc);
-        self.priority.deinit(self.alloc);
+        self.groups.deinit(self.alloc);
+        self.ready_queue.deinit(self.alloc);
         self.* = undefined;
     }
 
     pub fn registerGroup(self: *Scheduler, group_id: core.types.GroupId) !void {
-        if (self.registered.contains(group_id)) return error.GroupAlreadyRegistered;
-        try self.group_ids.append(self.alloc, group_id);
-        errdefer _ = self.group_ids.pop();
-        try self.registered.putNoClobber(self.alloc, group_id, {});
+        std.debug.assert(!self.ready_pass_active);
+        if (self.groups.contains(group_id)) return error.GroupAlreadyRegistered;
+
+        try self.group_ids.ensureUnusedCapacity(self.alloc, 1);
+        // At most one hint per group exists between passes. During a pass,
+        // every visited group may append one hint for the following pass.
+        const queue_capacity = std.math.mul(usize, self.group_ids.items.len + 1, 2) catch
+            return error.OutOfMemory;
+        try self.ready_queue.ensureTotalCapacity(self.alloc, queue_capacity);
+        try self.groups.putNoClobber(self.alloc, group_id, .{});
+        self.group_ids.appendAssumeCapacity(group_id);
+        self.active_group_count += 1;
     }
 
     pub fn unregisterGroup(self: *Scheduler, group_id: core.types.GroupId) bool {
+        std.debug.assert(!self.ready_pass_active);
+        const state = self.groups.get(group_id) orelse return false;
         for (self.group_ids.items, 0..) |existing, i| {
             if (existing != group_id) continue;
             _ = self.group_ids.orderedRemove(i);
-            _ = self.registered.remove(group_id);
-            _ = self.quiesced.remove(group_id);
-            _ = self.priority.remove(group_id);
+            _ = self.groups.remove(group_id);
+            if (!state.quiesced) self.active_group_count -= 1;
+            self.removeQueuedGroup(group_id);
             if (self.group_ids.items.len == 0) {
                 self.cursor = 0;
                 self.ready_cursor = 0;
@@ -89,25 +112,92 @@ pub const Scheduler = struct {
         return self.nextRoundRobinGroup(&self.cursor);
     }
 
-    pub fn nextReadyGroup(self: *Scheduler) ?core.types.GroupId {
-        return self.nextPriorityGroup(&self.ready_cursor);
+    pub fn beginReadyPass(self: *Scheduler) ReadyPass {
+        std.debug.assert(!self.ready_pass_active);
+        self.ready_pass_active = true;
+        self.ready_epoch +%= 1;
+        if (self.ready_epoch == 0) {
+            var states = self.groups.valueIterator();
+            while (states.next()) |state| state.ready_visit_epoch = 0;
+            self.ready_epoch = 1;
+        }
+        // Hints appended while this pass runs belong to the next pass.
+        return .{
+            .epoch = self.ready_epoch,
+            .priority_end = self.ready_queue.items.len,
+        };
+    }
+
+    pub fn nextReadyGroup(self: *Scheduler, pass: *ReadyPass) ?core.types.GroupId {
+        std.debug.assert(self.ready_pass_active);
+        std.debug.assert(pass.epoch == self.ready_epoch);
+
+        while (self.ready_queue_head < pass.priority_end) {
+            const group_id = self.ready_queue.items[self.ready_queue_head];
+            self.ready_queue_head += 1;
+            const state = self.groups.getPtr(group_id) orelse continue;
+            if (!state.ready_queued) continue;
+            state.ready_queued = false;
+            if (state.quiesced or state.ready_visit_epoch == pass.epoch) continue;
+            state.ready_visit_epoch = pass.epoch;
+            return group_id;
+        }
+
+        // Hints are an optimization, not a correctness requirement. Probe each
+        // registered group once so a dropped wakeup cannot strand Raft work.
+        while (pass.fallback_checked < self.group_ids.items.len) {
+            const group_id = self.group_ids.items[self.ready_cursor];
+            self.ready_cursor = (self.ready_cursor + 1) % self.group_ids.items.len;
+            pass.fallback_checked += 1;
+            const state = self.groups.getPtr(group_id) orelse continue;
+            if (state.quiesced or state.ready_visit_epoch == pass.epoch) continue;
+            state.ready_visit_epoch = pass.epoch;
+            return group_id;
+        }
+        return null;
+    }
+
+    pub fn finishReadyPass(self: *Scheduler, pass: *ReadyPass) void {
+        std.debug.assert(self.ready_pass_active);
+        std.debug.assert(pass.epoch == self.ready_epoch);
+        const remaining = self.ready_queue.items.len - self.ready_queue_head;
+        std.mem.copyForwards(
+            core.types.GroupId,
+            self.ready_queue.items[0..remaining],
+            self.ready_queue.items[self.ready_queue_head..],
+        );
+        self.ready_queue.items.len = remaining;
+        self.ready_queue_head = 0;
+        self.ready_pass_active = false;
+        pass.* = undefined;
     }
 
     pub fn quiesceGroup(self: *Scheduler, group_id: core.types.GroupId) !void {
-        if (!self.isRegistered(group_id)) return error.UnknownGroup;
-        try self.quiesced.put(self.alloc, group_id, {});
+        std.debug.assert(!self.ready_pass_active);
+        const state = self.groups.getPtr(group_id) orelse return error.UnknownGroup;
+        if (state.quiesced) return;
+        state.quiesced = true;
+        state.ready_queued = false;
+        self.active_group_count -= 1;
+        self.removeQueuedGroup(group_id);
     }
 
     pub fn resumeGroup(self: *Scheduler, group_id: core.types.GroupId) bool {
-        return self.quiesced.remove(group_id);
+        std.debug.assert(!self.ready_pass_active);
+        const state = self.groups.getPtr(group_id) orelse return false;
+        if (!state.quiesced) return false;
+        state.quiesced = false;
+        self.active_group_count += 1;
+        return true;
     }
 
     pub fn isQuiesced(self: *const Scheduler, group_id: core.types.GroupId) bool {
-        return self.quiesced.contains(group_id);
+        const state = self.groups.get(group_id) orelse return false;
+        return state.quiesced;
     }
 
     pub fn activeGroupCount(self: *const Scheduler) usize {
-        return self.group_ids.items.len - self.quiesced.count();
+        return self.active_group_count;
     }
 
     pub fn nowMs(self: *const Scheduler) u64 {
@@ -141,58 +231,37 @@ pub const Scheduler = struct {
     }
 
     pub fn noteReady(self: *Scheduler, group_id: core.types.GroupId) void {
-        self.boostGroup(group_id, self.cfg.priority_boost);
+        self.enqueueReady(group_id);
     }
 
     pub fn noteActivity(self: *Scheduler, group_id: core.types.GroupId) void {
-        self.boostGroup(group_id, self.cfg.priority_boost);
+        self.enqueueReady(group_id);
     }
 
-    fn isRegistered(self: *const Scheduler, group_id: core.types.GroupId) bool {
-        return self.registered.contains(group_id);
+    fn enqueueReady(self: *Scheduler, group_id: core.types.GroupId) void {
+        const state = self.groups.getPtr(group_id) orelse return;
+        if (state.quiesced or state.ready_queued) return;
+        std.debug.assert(self.ready_queue.items.len < self.ready_queue.capacity);
+        self.ready_queue.appendAssumeCapacity(group_id);
+        state.ready_queued = true;
     }
 
-    fn boostGroup(self: *Scheduler, group_id: core.types.GroupId, amount: u8) void {
-        if (!self.isRegistered(group_id) or self.isQuiesced(group_id)) return;
-        const gop = self.priority.getOrPut(self.alloc, group_id) catch return;
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        const current = gop.value_ptr.*;
-        gop.value_ptr.* = std.math.add(u8, current, amount) catch std.math.maxInt(u8);
+    fn removeQueuedGroup(self: *Scheduler, group_id: core.types.GroupId) void {
+        std.debug.assert(!self.ready_pass_active);
+        std.debug.assert(self.ready_queue_head == 0);
+        var retained: usize = 0;
+        for (self.ready_queue.items) |queued| {
+            if (queued == group_id) continue;
+            self.ready_queue.items[retained] = queued;
+            retained += 1;
+        }
+        self.ready_queue.items.len = retained;
     }
 
     fn nextRoundRobinGroup(self: *Scheduler, cursor: *usize) ?core.types.GroupId {
         if (self.group_ids.items.len == 0) return null;
 
         var checked: usize = 0;
-        while (checked < self.group_ids.items.len) : (checked += 1) {
-            const group_id = self.group_ids.items[cursor.*];
-            cursor.* = (cursor.* + 1) % self.group_ids.items.len;
-            if (!self.isQuiesced(group_id)) return group_id;
-        }
-        return null;
-    }
-
-    fn nextPriorityGroup(self: *Scheduler, cursor: *usize) ?core.types.GroupId {
-        if (self.group_ids.items.len == 0) return null;
-
-        var checked: usize = 0;
-        while (checked < self.group_ids.items.len) : (checked += 1) {
-            const group_id = self.group_ids.items[cursor.*];
-            cursor.* = (cursor.* + 1) % self.group_ids.items.len;
-            if (self.isQuiesced(group_id)) continue;
-            if (self.priority.getPtr(group_id)) |score| {
-                if (score.* > 0) {
-                    if (score.* == 1) {
-                        _ = self.priority.remove(group_id);
-                    } else {
-                        score.* -= 1;
-                    }
-                    return group_id;
-                }
-            }
-        }
-
-        checked = 0;
         while (checked < self.group_ids.items.len) : (checked += 1) {
             const group_id = self.group_ids.items[cursor.*];
             cursor.* = (cursor.* + 1) % self.group_ids.items.len;
@@ -227,26 +296,39 @@ test "scheduler skips quiesced groups" {
 
     try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextTickGroup());
     try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextTickGroup());
-    try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup());
-    try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup());
+    {
+        var pass = scheduler.beginReadyPass();
+        defer scheduler.finishReadyPass(&pass);
+        try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup(&pass));
+        try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup(&pass));
+        try std.testing.expectEqual(@as(?core.types.GroupId, null), scheduler.nextReadyGroup(&pass));
+    }
 
     try std.testing.expect(scheduler.resumeGroup(2));
     try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextTickGroup());
     try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextTickGroup());
 }
 
-test "scheduler boosts active groups ahead of plain round robin" {
-    var scheduler = Scheduler.init(std.testing.allocator, .{ .priority_boost = 2 });
+test "scheduler prioritizes each ready group once per pass" {
+    var scheduler = Scheduler.init(std.testing.allocator, .{});
     defer scheduler.deinit();
 
     try scheduler.registerGroup(1);
     try scheduler.registerGroup(2);
     try scheduler.registerGroup(3);
 
-    scheduler.noteActivity(3);
-    try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup());
-    try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup());
-    try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup());
+    for (0..8) |_| scheduler.noteActivity(3);
+    var first_pass = scheduler.beginReadyPass();
+    try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup(&first_pass));
+    scheduler.noteReady(3);
+    try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup(&first_pass));
+    try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextReadyGroup(&first_pass));
+    try std.testing.expectEqual(@as(?core.types.GroupId, null), scheduler.nextReadyGroup(&first_pass));
+    scheduler.finishReadyPass(&first_pass);
+
+    var second_pass = scheduler.beginReadyPass();
+    defer scheduler.finishReadyPass(&second_pass);
+    try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup(&second_pass));
 }
 
 test "scheduler unregister normalizes ready cursor independently" {
@@ -257,13 +339,19 @@ test "scheduler unregister normalizes ready cursor independently" {
     try scheduler.registerGroup(2);
     try scheduler.registerGroup(3);
 
-    try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup());
-    try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextReadyGroup());
-    try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup());
+    {
+        var pass = scheduler.beginReadyPass();
+        defer scheduler.finishReadyPass(&pass);
+        try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup(&pass));
+        try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextReadyGroup(&pass));
+        try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup(&pass));
+    }
 
     try std.testing.expect(scheduler.unregisterGroup(1));
-    try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextReadyGroup());
-    try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup());
+    var pass = scheduler.beginReadyPass();
+    defer scheduler.finishReadyPass(&pass);
+    try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextReadyGroup(&pass));
+    try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup(&pass));
 }
 
 test "scheduler advances virtual time explicitly" {
