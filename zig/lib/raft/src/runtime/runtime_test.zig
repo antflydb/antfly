@@ -949,6 +949,7 @@ test "multi raft applies an incoming snapshot before stale compaction maintenanc
         .applied_index = 2,
         .incarnation = incarnation,
         .enqueue_sequence = 1,
+        .conf_state = try (core.types.ConfState{ .voters = peers[0..] }).clone(std.testing.allocator),
     });
     try host.step(66, .{
         .msg_type = .snapshot,
