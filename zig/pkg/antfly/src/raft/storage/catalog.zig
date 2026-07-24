@@ -17,6 +17,9 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const raft_engine = @import("raft_engine");
 const platform_sync = @import("antfly_platform").sync;
 
+const replica_catalog_header = "ANTFLY_REPLICA_CATALOG 1";
+const max_replica_catalog_record_bytes = 64 * 1024;
+
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
@@ -493,76 +496,34 @@ pub const FileReplicaCatalog = struct {
         };
         defer file.close(self.io());
 
-        // Total catalog size is unbounded by design, but one malformed record
-        // cannot force an unbounded allocation during startup.
-        var read_buffer: [64 * 1024]u8 = undefined;
+        // Total catalog size is unbounded by design, but each independently
+        // parsed record has the same limit enforced by persistence.
+        var read_buffer: [max_replica_catalog_record_bytes + 1]u8 = undefined;
         var reader = file.reader(self.io(), &read_buffer);
+        const header = (reader.interface.takeDelimiter('\n') catch |err| switch (err) {
+            error.StreamTooLong => return error.InvalidReplicaCatalog,
+            else => return err,
+        }) orelse return;
+        if (!std.mem.eql(u8, header, replica_catalog_header))
+            return error.InvalidReplicaCatalog;
+
         while ((reader.interface.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => return error.ReplicaCatalogRecordTooLarge,
             else => return err,
         })) |line| {
             if (line.len == 0) continue;
-            var fields = std.mem.tokenizeScalar(u8, line, ' ');
-            const group_id = std.fmt.parseInt(u64, fields.next() orelse return error.InvalidReplicaCatalog, 10) catch return error.InvalidReplicaCatalog;
-            const replica_id = std.fmt.parseInt(u64, fields.next() orelse return error.InvalidReplicaCatalog, 10) catch return error.InvalidReplicaCatalog;
-            const local_node_id = std.fmt.parseInt(u64, fields.next() orelse return error.InvalidReplicaCatalog, 10) catch return error.InvalidReplicaCatalog;
-            const bootstrap_raw = fields.next() orelse return error.InvalidReplicaCatalog;
-            const metadata_version = std.fmt.parseInt(u64, fields.next() orelse return error.InvalidReplicaCatalog, 10) catch return error.InvalidReplicaCatalog;
-            const bootstrap_mode: ReplicaBootstrapMode = std.meta.stringToEnum(ReplicaBootstrapMode, bootstrap_raw) orelse return error.InvalidReplicaCatalog;
-            var record: ReplicaRecord = .{
-                .group_id = group_id,
-                .replica_id = replica_id,
-                .local_node_id = local_node_id,
-                .bootstrap_mode = bootstrap_mode,
-                .metadata_version = metadata_version,
-            };
+            if (line.len > max_replica_catalog_record_bytes)
+                return error.ReplicaCatalogRecordTooLarge;
+            var parsed = std.json.parseFromSlice(ReplicaRecord, self.alloc, line, .{
+                .allocate = .alloc_always,
+            }) catch return error.InvalidReplicaCatalog;
+            defer parsed.deinit();
+            try validateReplicaRecord(parsed.value);
+            var record = try parsed.value.clone(self.alloc);
             errdefer record.deinit(self.alloc);
-            if (fields.next()) |source_tag| {
-                if (std.mem.eql(u8, source_tag, "raft")) {
-                    const from_raw = fields.next() orelse return error.InvalidReplicaCatalog;
-                    const term_raw = fields.next() orelse return error.InvalidReplicaCatalog;
-                    const snapshot_id = fields.next() orelse return error.InvalidReplicaCatalog;
-                    const uri = fields.next() orelse "";
-                    record.snapshot_bootstrap = .{
-                        .from_node_id = std.fmt.parseInt(u64, from_raw, 10) catch return error.InvalidReplicaCatalog,
-                        .term = std.fmt.parseInt(u64, term_raw, 10) catch return error.InvalidReplicaCatalog,
-                        .snapshot_id = "",
-                        .uri = "",
-                    };
-                    record.snapshot_bootstrap.?.snapshot_id = try self.alloc.dupe(u8, snapshot_id);
-                    record.snapshot_bootstrap.?.uri = try self.alloc.dupe(u8, uri);
-                } else if (std.mem.eql(u8, source_tag, "backup")) {
-                    const backup_id = fields.next() orelse return error.InvalidReplicaCatalog;
-                    const location = fields.next() orelse return error.InvalidReplicaCatalog;
-                    const snapshot_path = fields.next() orelse return error.InvalidReplicaCatalog;
-                    record.backup_restore_bootstrap = .{
-                        .backup_id = "",
-                        .location = "",
-                        .snapshot_path = "",
-                    };
-                    record.backup_restore_bootstrap.?.backup_id = try self.alloc.dupe(u8, backup_id);
-                    record.backup_restore_bootstrap.?.location = try self.alloc.dupe(u8, location);
-                    record.backup_restore_bootstrap.?.snapshot_path = try self.alloc.dupe(u8, snapshot_path);
-                } else if (bootstrap_mode == .fetch_snapshot) {
-                    const from_raw = source_tag;
-                    const term_raw = fields.next() orelse return error.InvalidReplicaCatalog;
-                    const snapshot_id = fields.next() orelse return error.InvalidReplicaCatalog;
-                    const uri = fields.next() orelse "";
-                    record.snapshot_bootstrap = .{
-                        .from_node_id = std.fmt.parseInt(u64, from_raw, 10) catch return error.InvalidReplicaCatalog,
-                        .term = std.fmt.parseInt(u64, term_raw, 10) catch return error.InvalidReplicaCatalog,
-                        .snapshot_id = "",
-                        .uri = "",
-                    };
-                    record.snapshot_bootstrap.?.snapshot_id = try self.alloc.dupe(u8, snapshot_id);
-                    record.snapshot_bootstrap.?.uri = try self.alloc.dupe(u8, uri);
-                } else {
-                    return error.InvalidReplicaCatalog;
-                }
-            }
-            if (fields.next() != null or self.records.contains(group_id))
+            if (self.records.contains(record.group_id))
                 return error.InvalidReplicaCatalog;
-            try self.records.put(self.alloc, group_id, record);
+            try self.records.put(self.alloc, record.group_id, record);
         }
     }
 
@@ -664,6 +625,11 @@ fn deinitReplicaMap(
     records.* = .empty;
 }
 
+fn validateReplicaRecord(record: ReplicaRecord) !void {
+    if (record.snapshot_bootstrap != null and record.backup_restore_bootstrap != null)
+        return error.InvalidReplicaCatalog;
+}
+
 fn writeCatalogAtomicallyDurable(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -702,39 +668,17 @@ fn writeCatalogAtomicallyDurable(
             defer file.close(io);
             var buf: [4096]u8 = undefined;
             var writer = file.writer(io, &buf);
+            try writer.interface.writeAll(replica_catalog_header);
+            try writer.interface.writeByte('\n');
+            var record_buffer: [max_replica_catalog_record_bytes]u8 = undefined;
             for (records) |record| {
-                if (record.snapshot_bootstrap) |snapshot| {
-                    try writer.interface.print("{d} {d} {d} {s} {d} raft {d} {d} {s} {s}\n", .{
-                        record.group_id,
-                        record.replica_id,
-                        record.local_node_id,
-                        @tagName(record.bootstrap_mode),
-                        record.metadata_version,
-                        snapshot.from_node_id,
-                        snapshot.term,
-                        snapshot.snapshot_id,
-                        snapshot.uri,
-                    });
-                } else if (record.backup_restore_bootstrap) |backup| {
-                    try writer.interface.print("{d} {d} {d} {s} {d} backup {s} {s} {s}\n", .{
-                        record.group_id,
-                        record.replica_id,
-                        record.local_node_id,
-                        @tagName(record.bootstrap_mode),
-                        record.metadata_version,
-                        backup.backup_id,
-                        backup.location,
-                        backup.snapshot_path,
-                    });
-                } else {
-                    try writer.interface.print("{d} {d} {d} {s} {d}\n", .{
-                        record.group_id,
-                        record.replica_id,
-                        record.local_node_id,
-                        @tagName(record.bootstrap_mode),
-                        record.metadata_version,
-                    });
-                }
+                try validateReplicaRecord(record.*);
+                var record_writer = std.Io.Writer.fixed(&record_buffer);
+                std.json.Stringify.value(record.*, .{}, &record_writer) catch |err| switch (err) {
+                    error.WriteFailed => return error.ReplicaCatalogRecordTooLarge,
+                };
+                try writer.interface.writeAll(record_writer.buffered());
+                try writer.interface.writeByte('\n');
             }
             try writer.end();
             try file.sync(io);
@@ -888,6 +832,83 @@ test "file replica catalog reopens catalogs larger than one MiB" {
     for (records) |record| try std.testing.expectEqual(uri.len, record.snapshot_bootstrap.?.uri.len);
 }
 
+test "file replica catalog round trips escaped bootstrap fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-escaped", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    {
+        var replica_catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
+        defer replica_catalog.deinit();
+        try replica_catalog.catalog().upsertReplica(.{
+            .group_id = 23,
+            .replica_id = 4,
+            .local_node_id = 6,
+            .bootstrap_mode = .fetch_snapshot,
+            .snapshot_bootstrap = .{
+                .from_node_id = 8,
+                .term = 9,
+                .snapshot_id = "snapshot with spaces\nand a newline",
+                .uri = "file:///tmp/snapshot path?q=hello world",
+            },
+        });
+    }
+
+    var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);
+    defer reopened.deinit();
+    const records = try reopened.catalog().listReplicas(std.testing.allocator);
+    defer freeReplicaRecords(std.testing.allocator, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqualStrings(
+        "snapshot with spaces\nand a newline",
+        records[0].snapshot_bootstrap.?.snapshot_id,
+    );
+    try std.testing.expectEqualStrings(
+        "file:///tmp/snapshot path?q=hello world",
+        records[0].snapshot_bootstrap.?.uri,
+    );
+}
+
+test "file replica catalog rejects records its loader cannot reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-oversized", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const oversized_uri = try std.testing.allocator.alloc(u8, max_replica_catalog_record_bytes);
+    defer std.testing.allocator.free(oversized_uri);
+    @memset(oversized_uri, 'x');
+
+    {
+        var replica_catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
+        defer replica_catalog.deinit();
+        const iface = replica_catalog.catalog();
+        const revision_before = iface.revision();
+        try std.testing.expectError(error.ReplicaCatalogRecordTooLarge, iface.upsertReplica(.{
+            .group_id = 24,
+            .replica_id = 5,
+            .local_node_id = 7,
+            .bootstrap_mode = .fetch_snapshot,
+            .snapshot_bootstrap = .{
+                .from_node_id = 9,
+                .snapshot_id = "snapshot",
+                .uri = oversized_uri,
+            },
+        }));
+        try std.testing.expectEqual(revision_before, iface.revision());
+        const records = try iface.listReplicas(std.testing.allocator);
+        defer freeReplicaRecords(std.testing.allocator, records);
+        try std.testing.expectEqual(@as(usize, 0), records.len);
+    }
+
+    var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);
+    defer reopened.deinit();
+    const records = try reopened.catalog().listReplicas(std.testing.allocator);
+    defer freeReplicaRecords(std.testing.allocator, records);
+    try std.testing.expectEqual(@as(usize, 0), records.len);
+}
+
 test "file replica catalog rejects duplicate groups without leaking loaded records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -897,8 +918,9 @@ test "file replica catalog rejects duplicate groups without leaking loaded recor
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = path,
         .data =
-        \\21 2 5 persisted 9
-        \\21 3 5 persisted 10
+        \\ANTFLY_REPLICA_CATALOG 1
+        \\{"group_id":21,"replica_id":2,"local_node_id":5,"bootstrap_mode":"persisted","metadata_version":9,"snapshot_bootstrap":null,"backup_restore_bootstrap":null}
+        \\{"group_id":21,"replica_id":3,"local_node_id":5,"bootstrap_mode":"persisted","metadata_version":10,"snapshot_bootstrap":null,"backup_restore_bootstrap":null}
         \\
         ,
     });
