@@ -100,26 +100,6 @@ const TransitionActionLanes = struct {
     }
 };
 
-/// Snapshot handoff currently materializes one shard generation in memory.
-/// Keep that working set single-flight per data process; independent leaders
-/// on other nodes still transfer concurrently.
-const TransitionActionCapacity = struct {
-    mutex: std.atomic.Mutex = .unlocked,
-
-    const Lease = struct {
-        mutex: *std.atomic.Mutex,
-
-        fn deinit(self: *Lease) void {
-            self.mutex.unlock();
-            self.* = undefined;
-        }
-    };
-
-    fn tryAcquire(self: *TransitionActionCapacity) ?Lease {
-        if (!self.mutex.tryLock()) return null;
-        return .{ .mutex = &self.mutex };
-    }
-};
 const runtime_status_refresh_max_db_opens_per_run: usize = 16;
 const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_s;
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
@@ -412,48 +392,6 @@ fn validateReplicatedSplitTransfer(
 ) !void {
     try antfly.data.storage.shard_state_store.validateSplitIdentity(state, transition_id, attempt_epoch, destination_group_id, null);
     if (state.phase != .splitting and state.phase != .finalizing) return error.SplitInProgress;
-}
-
-fn splitHandoffWorkingSetBytes(
-    handoff: antfly.data.storage.shard_state_store.SplitHandoff,
-) u64 {
-    var total: u64 = @sizeOf(@TypeOf(handoff));
-    total +|= saturatedArrayBytes(
-        antfly.data.storage.shard_state_store.AppliedDataKV,
-        handoff.entries.len,
-    );
-    total +|= saturatedLen(handoff.byte_range.start.len);
-    total +|= saturatedLen(handoff.byte_range.end.len);
-    total +|= saturatedLen(handoff.split_state.split_key.len);
-    total +|= saturatedLen(handoff.split_state.original_range_end.len);
-    for (handoff.entries) |entry| {
-        total +|= saturatedLen(entry.key.len);
-        total +|= saturatedLen(entry.value.len);
-    }
-    return total;
-}
-
-fn splitDeltasWorkingSetBytes(deltas: []const antfly.shard.SplitDelta) u64 {
-    var total = saturatedArrayBytes(antfly.shard.SplitDelta, deltas.len);
-    for (deltas) |delta| {
-        total +|= saturatedArrayBytes(@TypeOf(delta.writes[0]), delta.writes.len);
-        total +|= saturatedArrayBytes(@TypeOf(delta.deletes[0]), delta.deletes.len);
-        for (delta.writes) |write| {
-            total +|= saturatedLen(write.key.len);
-            total +|= saturatedLen(write.value.len);
-        }
-        for (delta.deletes) |key| total +|= saturatedLen(key.len);
-    }
-    return total;
-}
-
-fn saturatedArrayBytes(comptime T: type, len: usize) u64 {
-    const count = saturatedLen(len);
-    return std.math.mul(u64, count, @sizeOf(T)) catch std.math.maxInt(u64);
-}
-
-fn saturatedLen(len: usize) u64 {
-    return std.math.cast(u64, len) orelse std.math.maxInt(u64);
 }
 
 fn validateReplicatedSplitObservation(
@@ -2654,6 +2592,16 @@ fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
     };
 }
 
+fn isSupersededHAStandbyReplicationRound(err: anyerror) bool {
+    // Replication fetches intentionally release ha_state_mutex while waiting
+    // on the upstream. Promotion can replace the standby generation between
+    // config capture and fetch, or while a fetch is in flight. Discarding
+    // either attempt is successful synchronization, not an availability
+    // failure.
+    return err == error.HAStandbyNotConfigured or
+        err == error.HAStandbyStateChanged;
+}
+
 test "data server keeps upstream replication availability failures nonfatal" {
     inline for (.{
         error.InvalidInternalReplicationRequest,
@@ -2665,6 +2613,12 @@ test "data server keeps upstream replication availability failures nonfatal" {
     }) |err| {
         try std.testing.expect(isNonFatalHAStandbyReplicationError(err));
         try std.testing.expect(haStandbyReplicationErrorCode(err) != .Other);
+    }
+    inline for (.{
+        error.HAStandbyNotConfigured,
+        error.HAStandbyStateChanged,
+    }) |err| {
+        try std.testing.expect(isSupersededHAStandbyReplicationRound(err));
     }
 }
 
@@ -2754,35 +2708,6 @@ test "replicated transition action lanes fail fast without serializing unrelated
     first.deinit();
     var reacquired = lanes.tryAcquire(100) orelse return error.TestUnexpectedResult;
     defer reacquired.deinit();
-}
-
-test "replicated transition snapshot working set is single flight" {
-    var capacity = TransitionActionCapacity{};
-    var first = capacity.tryAcquire() orelse return error.TestUnexpectedResult;
-    try std.testing.expect(capacity.tryAcquire() == null);
-    first.deinit();
-    var reacquired = capacity.tryAcquire() orelse return error.TestUnexpectedResult;
-    defer reacquired.deinit();
-}
-
-test "split handoff working set accounts payload bytes" {
-    var entries = [_]antfly.data.storage.shard_state_store.AppliedDataKV{
-        .{ .key = "key", .value = "value" },
-    };
-    const handoff = antfly.data.storage.shard_state_store.SplitHandoff{
-        .byte_range = .{ .start = "m", .end = "z" },
-        .split_state = .{
-            .phase = .splitting,
-            .transition_id = 1,
-            .attempt_epoch = 2,
-            .split_key = "m",
-            .new_shard_id = 3,
-            .original_range_end = "z",
-        },
-        .base_delta_sequence = 4,
-        .entries = &entries,
-    };
-    try std.testing.expect(splitHandoffWorkingSetBytes(handoff) >= "key".len + "value".len);
 }
 
 test "data runtime metadata bootstrap retry delay is bounded and jittered" {
@@ -3245,7 +3170,6 @@ pub const DataServer = struct {
     data_raft_reconcile_mutex: std.atomic.Mutex = .unlocked,
     local_transition_mutex: std.atomic.Mutex = .unlocked,
     replicated_transition_action_lanes: TransitionActionLanes = .{},
-    replicated_transition_action_capacity: TransitionActionCapacity = .{},
     replicated_transition_action_owner_mutex: std.atomic.Mutex = .unlocked,
     replicated_transition_action_owner_id: u64 = 0,
     replicated_transition_action_shutdown: std.atomic.Value(bool) = .init(false),
@@ -4048,7 +3972,6 @@ pub const DataServer = struct {
         errdefer promoted_primary.close();
 
         self.ha_public_gate_state.beginPromotion();
-        self.ha_cfg.standby_owner.?.* = null;
         self.ha_cfg.admin_context.?.standby = null;
         if (self.ha_admin_server) |*server| {
             server.ctx.standby = null;
@@ -4426,6 +4349,7 @@ pub const DataServer = struct {
     pub fn runControlRoundOnly(self: *DataServer) !void {
         const ha_standby_replication_ok = blk: {
             self.runHAStandbyReplicationRound() catch |err| {
+                if (isSupersededHAStandbyReplicationRound(err)) break :blk true;
                 _ = self.ha_standby_replication_failure_count.fetchAdd(1, .monotonic);
                 self.recordHAStandbyReplicationError(err);
                 if (!isNonFatalHAStandbyReplicationError(err)) return err;
@@ -6039,8 +5963,6 @@ pub const DataServer = struct {
         server: *DataServer,
         lane: TransitionActionLanes.Lease,
         lane_held: bool = true,
-        capacity: TransitionActionCapacity.Lease,
-        capacity_held: bool = true,
         kind: Kind,
         transition_id: u64,
         attempt_epoch: u64,
@@ -6053,8 +5975,6 @@ pub const DataServer = struct {
             defer {
                 self.lane.deinit();
                 self.lane_held = false;
-                self.capacity.deinit();
-                self.capacity_held = false;
             }
             self.runAction() catch |err| {
                 std.log.warn("replicated split action failed kind={s} transition_id={} attempt_epoch={} source_group_id={} destination_group_id={} err={s}", .{
@@ -6090,7 +6010,6 @@ pub const DataServer = struct {
         fn deinit(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.lane_held) self.lane.deinit();
-            if (self.capacity_held) self.capacity.deinit();
             const alloc = self.alloc;
             alloc.destroy(self);
         }
@@ -6109,9 +6028,6 @@ pub const DataServer = struct {
         var lane = self.replicated_transition_action_lanes.tryAcquire(source_group_id) orelse
             return error.TransitionOperationBusy;
         errdefer lane.deinit();
-        var capacity = self.replicated_transition_action_capacity.tryAcquire() orelse
-            return error.TransitionOperationBusy;
-        errdefer capacity.deinit();
 
         const runtime = try self.ensureBackendRuntime();
         const owner_id = try self.replicatedTransitionActionOwnerId(runtime);
@@ -6122,7 +6038,6 @@ pub const DataServer = struct {
             .alloc = self.alloc,
             .server = self,
             .lane = lane,
-            .capacity = capacity,
             .kind = kind,
             .transition_id = transition_id,
             .attempt_epoch = attempt_epoch,
@@ -6176,6 +6091,34 @@ pub const DataServer = struct {
         source_group_id: u64,
         destination_group_id: u64,
     ) !void {
+        var budgeted_alloc = resource_manager_mod.BudgetedAllocator.init(
+            &self.provisioned_storage.resource_manager,
+            .shard_transition_working_set,
+            self.alloc,
+            4,
+        );
+        defer budgeted_alloc.deinit();
+        return self.replicateSplitBootstrapBudgeted(
+            budgeted_alloc.allocator(),
+            transition_id,
+            attempt_epoch,
+            source_group_id,
+            destination_group_id,
+        ) catch |err| {
+            if (err == error.OutOfMemory and budgeted_alloc.denied())
+                return error.ResourceBudgetExceeded;
+            return err;
+        };
+    }
+
+    fn replicateSplitBootstrapBudgeted(
+        self: *DataServer,
+        work_alloc: std.mem.Allocator,
+        transition_id: u64,
+        attempt_epoch: u64,
+        source_group_id: u64,
+        destination_group_id: u64,
+    ) !void {
         try self.requireReplicatedTransitionActionActive(source_group_id);
         const source_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, source_group_id);
         defer self.alloc.free(source_root_dir);
@@ -6185,16 +6128,11 @@ pub const DataServer = struct {
         // projection already received split control entries. Repair document
         // projection and derive the handoff under one exact watermark.
         const handoff = try self.captureReconciledSplitSourceHandoff(
+            work_alloc,
             source_store,
             source_group_id,
         );
-        defer antfly.data.storage.shard_state_store.freeHandoff(self.alloc, handoff);
-        var handoff_reservation = try self.provisioned_storage.resource_manager.reserveBoundedOversizedSingle(
-            .shard_transition_working_set,
-            splitHandoffWorkingSetBytes(handoff),
-            4,
-        );
-        defer handoff_reservation.release();
+        defer antfly.data.storage.shard_state_store.freeHandoff(work_alloc, handoff);
         try self.requireReplicatedTransitionActionActive(source_group_id);
         try validateReplicatedSplitTransfer(handoff.split_state, transition_id, attempt_epoch, destination_group_id);
         std.log.info("split bootstrap captured transition_id={} source_group_id={} destination_group_id={} entries={} watermark={}", .{
@@ -6233,8 +6171,8 @@ pub const DataServer = struct {
         while (offset < handoff.entries.len) {
             try self.requireReplicatedTransitionActionActive(source_group_id);
             const end = @min(offset + max_writes_per_batch, handoff.entries.len);
-            const writes = try self.alloc.alloc(antfly.db.types.BatchWrite, end - offset);
-            defer self.alloc.free(writes);
+            const writes = try work_alloc.alloc(antfly.db.types.BatchWrite, end - offset);
+            defer work_alloc.free(writes);
             for (handoff.entries[offset..end], 0..) |entry, i| {
                 writes[i] = .{ .key = entry.key, .value = entry.value };
             }
@@ -6307,6 +6245,34 @@ pub const DataServer = struct {
         source_group_id: u64,
         destination_group_id: u64,
     ) !void {
+        var budgeted_alloc = resource_manager_mod.BudgetedAllocator.init(
+            &self.provisioned_storage.resource_manager,
+            .shard_transition_working_set,
+            self.alloc,
+            4,
+        );
+        defer budgeted_alloc.deinit();
+        return self.replicateSplitCatchUpBudgeted(
+            budgeted_alloc.allocator(),
+            transition_id,
+            attempt_epoch,
+            source_group_id,
+            destination_group_id,
+        ) catch |err| {
+            if (err == error.OutOfMemory and budgeted_alloc.denied())
+                return error.ResourceBudgetExceeded;
+            return err;
+        };
+    }
+
+    fn replicateSplitCatchUpBudgeted(
+        self: *DataServer,
+        work_alloc: std.mem.Allocator,
+        transition_id: u64,
+        attempt_epoch: u64,
+        source_group_id: u64,
+        destination_group_id: u64,
+    ) !void {
         try self.requireReplicatedTransitionActionActive(source_group_id);
         const source_store = self.localTransitionApplyStore() orelse return error.MissingSplitSourceStore;
         const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse return error.UnknownGroup;
@@ -6318,37 +6284,31 @@ pub const DataServer = struct {
         const source_seq = try source_store.currentSplitDeltaSequence(self.alloc, source_group_id);
         const source_ack = try self.splitProgressForSource(transition_id, attempt_epoch, source_group_id, destination_group_id);
         const after_seq = if (source_ack) |ack| ack else 0;
-        const deltas = try source_store.listSplitDeltasAfter(self.alloc, source_group_id, after_seq);
-        defer antfly.shard.freeDeltas(self.alloc, deltas);
-        var delta_reservation = try self.provisioned_storage.resource_manager.reserveBoundedOversizedSingle(
-            .shard_transition_working_set,
-            splitDeltasWorkingSetBytes(deltas),
-            4,
-        );
-        defer delta_reservation.release();
+        const deltas = try source_store.listSplitDeltasAfter(work_alloc, source_group_id, after_seq);
+        defer antfly.shard.freeDeltas(work_alloc, deltas);
 
         var refresh_destination_route = true;
         for (deltas) |delta| {
             try self.requireReplicatedTransitionActionActive(source_group_id);
             var writes = std.ArrayListUnmanaged(antfly.db.types.BatchWrite).empty;
-            defer writes.deinit(self.alloc);
+            defer writes.deinit(work_alloc);
             var deletes = std.ArrayListUnmanaged([]const u8).empty;
             defer {
-                for (deletes.items) |key| self.alloc.free(@constCast(key));
-                deletes.deinit(self.alloc);
+                for (deletes.items) |key| work_alloc.free(@constCast(key));
+                deletes.deinit(work_alloc);
             }
             var owned_write_keys = std.ArrayListUnmanaged([]u8).empty;
             defer {
-                for (owned_write_keys.items) |key| self.alloc.free(key);
-                owned_write_keys.deinit(self.alloc);
+                for (owned_write_keys.items) |key| work_alloc.free(key);
+                owned_write_keys.deinit(work_alloc);
             }
             for (delta.writes) |write| {
-                const key = try decodeSplitDeltaDocumentKeyAlloc(self.alloc, write.key);
-                try owned_write_keys.append(self.alloc, key);
-                try writes.append(self.alloc, .{ .key = key, .value = write.value });
+                const key = try decodeSplitDeltaDocumentKeyAlloc(work_alloc, write.key);
+                try owned_write_keys.append(work_alloc, key);
+                try writes.append(work_alloc, .{ .key = key, .value = write.value });
             }
             for (delta.deletes) |raw_key| {
-                try deletes.append(self.alloc, try decodeSplitDeltaDocumentKeyAlloc(self.alloc, raw_key));
+                try deletes.append(work_alloc, try decodeSplitDeltaDocumentKeyAlloc(work_alloc, raw_key));
             }
             var delta_replication = replication;
             delta_replication.operation = .delta;
@@ -6792,6 +6752,7 @@ pub const DataServer = struct {
                 }
             }
             switch (try self.reconcileSplitSourceApplyStoreFromAuthoritativeDb(
+                self.alloc,
                 source_store,
                 source_group_id,
                 watermark,
@@ -6807,6 +6768,7 @@ pub const DataServer = struct {
 
     fn captureReconciledSplitSourceHandoff(
         self: *DataServer,
+        work_alloc: std.mem.Allocator,
         source_store: *antfly.data.RaftApplyStore,
         source_group_id: u64,
     ) !antfly.data.storage.raft_apply_store.SplitHandoff {
@@ -6819,6 +6781,7 @@ pub const DataServer = struct {
                     return error.SplitSourceProjectionNotReady;
             }
             switch (try self.reconcileSplitSourceApplyStoreFromAuthoritativeDb(
+                work_alloc,
                 source_store,
                 source_group_id,
                 watermark,
@@ -6834,6 +6797,7 @@ pub const DataServer = struct {
 
     fn reconcileSplitSourceApplyStoreFromAuthoritativeDb(
         self: *DataServer,
+        work_alloc: std.mem.Allocator,
         source_store: *antfly.data.RaftApplyStore,
         source_group_id: u64,
         watermark: ?antfly.data.AppliedDataBatch,
@@ -6860,7 +6824,7 @@ pub const DataServer = struct {
         transition_activity.withWriter(
             self.alloc,
             reconcileSplitSourceApplyStoreWithScopedDb,
-            .{ self, source_store, source_group_id, watermark, capture_handoff, &result },
+            .{ work_alloc, source_store, source_group_id, watermark, capture_handoff, &result },
         ) catch |err| switch (err) {
             error.FileNotFound => return error.SplitSourceProjectionNotReady,
             else => return err,
@@ -6870,14 +6834,15 @@ pub const DataServer = struct {
 
     fn reconcileSplitSourceApplyStoreWithScopedDb(
         db: *antfly.db.DB,
-        self: *DataServer,
+        work_alloc: std.mem.Allocator,
         source_store: *antfly.data.RaftApplyStore,
         source_group_id: u64,
         watermark: ?antfly.data.AppliedDataBatch,
         capture_handoff: bool,
         result: *SplitProjectionReconcileResult,
     ) !void {
-        result.* = try self.reconcileSplitSourceApplyStoreFromDb(
+        result.* = try reconcileSplitSourceApplyStoreFromDb(
+            work_alloc,
             source_store,
             source_group_id,
             db,
@@ -6887,7 +6852,7 @@ pub const DataServer = struct {
     }
 
     fn reconcileSplitSourceApplyStoreFromDb(
-        self: *DataServer,
+        work_alloc: std.mem.Allocator,
         source_store: *antfly.data.RaftApplyStore,
         source_group_id: u64,
         db: *antfly.db.DB,
@@ -6897,7 +6862,7 @@ pub const DataServer = struct {
         if (capture_handoff) {
             const expected = watermark orelse return error.SplitSourceProjectionNotReady;
             if (try source_store.captureVerifiedSplitHandoffAtRootIncarnation(
-                self.alloc,
+                work_alloc,
                 source_group_id,
                 expected,
                 try db.durableRootIncarnation(),
@@ -6907,32 +6872,32 @@ pub const DataServer = struct {
         var entries = std.ArrayListUnmanaged(antfly.data.AppliedDataKV).empty;
         defer {
             for (entries.items) |entry| {
-                self.alloc.free(@constCast(entry.key));
-                self.alloc.free(@constCast(entry.value));
+                work_alloc.free(@constCast(entry.key));
+                work_alloc.free(@constCast(entry.value));
             }
-            entries.deinit(self.alloc);
+            entries.deinit(work_alloc);
         }
 
-        const active_split = try source_store.currentSplitState(self.alloc, source_group_id);
-        defer if (active_split) |state| antfly.data.storage.shard_state_store.freeSplitState(self.alloc, state);
+        const active_split = try source_store.currentSplitState(work_alloc, source_group_id);
+        defer if (active_split) |state| antfly.data.storage.shard_state_store.freeSplitState(work_alloc, state);
         var projected_range: ?antfly.db.types.ByteRange = null;
-        defer if (projected_range) |range| range_state_mod.freeRange(self.alloc, range);
+        defer if (projected_range) |range| range_state_mod.freeRange(work_alloc, range);
 
         const byte_range = if (active_split) |state| blk: {
             // A serving DB may already expose the narrowed source range while
             // the projection still needs the retained right half for handoff.
             // Split state is the durable owner of that pre-cutover boundary.
-            const current = try source_store.currentRange(self.alloc, source_group_id);
+            const current = try source_store.currentRange(work_alloc, source_group_id);
             projected_range = current;
             break :blk antfly.db.types.ByteRange{
                 .start = current.start,
                 .end = state.original_range_end,
             };
         } else db.getRange();
-        const lower = try antfly.internal_keys.documentRangeLowerAlloc(self.alloc, byte_range.start);
-        defer self.alloc.free(lower);
-        const upper = if (byte_range.end.len > 0) try antfly.internal_keys.documentRangeLowerAlloc(self.alloc, byte_range.end) else null;
-        defer if (upper) |owned| self.alloc.free(owned);
+        const lower = try antfly.internal_keys.documentRangeLowerAlloc(work_alloc, byte_range.start);
+        defer work_alloc.free(lower);
+        const upper = if (byte_range.end.len > 0) try antfly.internal_keys.documentRangeLowerAlloc(work_alloc, byte_range.end) else null;
+        defer if (upper) |owned| work_alloc.free(owned);
 
         const ScanState = struct {
             alloc: std.mem.Allocator,
@@ -6949,7 +6914,7 @@ pub const DataServer = struct {
                 return .@"continue";
             }
         };
-        var scan_state = ScanState{ .alloc = self.alloc, .entries = &entries };
+        var scan_state = ScanState{ .alloc = work_alloc, .entries = &entries };
         var read_txn = try db.core.store.beginReadTxn();
         defer read_txn.abort();
         try db.core.store.scanReadTxnWithContext(
@@ -6963,7 +6928,7 @@ pub const DataServer = struct {
         if (watermark) |expected| {
             if (capture_handoff) {
                 const handoff = (try source_store.reconcileAndCaptureSplitHandoffAtRootIncarnation(
-                    self.alloc,
+                    work_alloc,
                     source_group_id,
                     expected,
                     try db.durableRootIncarnation(),
@@ -6973,7 +6938,7 @@ pub const DataServer = struct {
                 return .{ .handoff = handoff };
             }
             return if (try source_store.reconcileGroupSnapshotAtRootIncarnation(
-                self.alloc,
+                work_alloc,
                 source_group_id,
                 expected,
                 try db.durableRootIncarnation(),
@@ -6983,7 +6948,7 @@ pub const DataServer = struct {
         }
         if (capture_handoff) return error.SplitSourceProjectionNotReady;
         return if (try source_store.seedGroupSnapshotIfAbsent(
-            self.alloc,
+            work_alloc,
             source_group_id,
             try db.durableRootIncarnation(),
             byte_range,

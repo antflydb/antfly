@@ -330,6 +330,26 @@ pub const Host = struct {
         record: catalog.ReplicaRecord,
         prepare_bootstrap: bool,
     ) !PreparedReplica {
+        return try self.prepareReplicaWithCatalog(record, prepare_bootstrap, true);
+    }
+
+    /// Builds a descriptor and any replacement filesystem generation without
+    /// publishing catalog admission. Reconciliation commits all catalog
+    /// mutations together after its desired-state epoch is revalidated.
+    pub fn prepareReplicaUnpublished(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepare_bootstrap: bool,
+    ) !PreparedReplica {
+        return try self.prepareReplicaWithCatalog(record, prepare_bootstrap, false);
+    }
+
+    fn prepareReplicaWithCatalog(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepare_bootstrap: bool,
+        persist_catalog: bool,
+    ) !PreparedReplica {
         const should_prepare_bootstrap = prepare_bootstrap and record.backup_restore_bootstrap != null;
         if (should_prepare_bootstrap) {
             if (self.deps.backup_restore_bootstrapper) |bootstrapper| {
@@ -354,9 +374,9 @@ pub const Host = struct {
 
         // Persist admission before publication. A crash between these steps
         // leaves a recoverable catalog entry instead of an untracked live group.
-        if (self.deps.replica_catalog) |replica_catalog| {
+        if (persist_catalog) if (self.deps.replica_catalog) |replica_catalog| {
             try replica_catalog.upsertReplica(record);
-        }
+        };
         return .{
             .factory = factory,
             .descriptor = descriptor,
@@ -403,23 +423,23 @@ pub const Host = struct {
         self.clearBootstrapStatus(record.group_id);
     }
 
-    pub fn snapshotReplicaCatalog(
-        self: *Host,
-        alloc: std.mem.Allocator,
-    ) !?[]catalog.ReplicaRecord {
+    pub fn replicaCatalogRevision(self: *Host) ?u64 {
         const replica_catalog = self.deps.replica_catalog orelse return null;
-        return try replica_catalog.listReplicas(alloc);
+        return replica_catalog.revision();
     }
 
-    pub fn restoreReplicaCatalog(self: *Host, records: []const catalog.ReplicaRecord) !void {
+    pub fn commitReplicaCatalog(
+        self: *Host,
+        expected_revision: ?u64,
+        upserts: []const catalog.ReplicaRecord,
+        removals: []const u64,
+    ) !void {
         const replica_catalog = self.deps.replica_catalog orelse return;
-        try replica_catalog.replaceReplicas(records);
-    }
-
-    pub fn prepareReplicaRemoval(self: *Host, group_id: u64) !void {
-        if (self.deps.replica_catalog) |replica_catalog| {
-            _ = try replica_catalog.removeReplica(group_id);
-        }
+        try replica_catalog.applyBatch(
+            expected_revision orelse return error.MissingReplicaCatalogRevision,
+            upserts,
+            removals,
+        );
     }
 
     pub fn removePreparedReplica(self: *Host, group_id: u64) !void {
@@ -1184,7 +1204,8 @@ test "host can ensure and remove a replica" {
                     .upsert_replica = upsertReplica,
                     .remove_replica = removeReplica,
                     .list_replicas = listReplicas,
-                    .replace_replicas = replaceReplicas,
+                    .revision = revision,
+                    .apply_batch = applyBatch,
                 },
             };
         }
@@ -1202,7 +1223,16 @@ test "host can ensure and remove a replica" {
             return try alloc.alloc(catalog.ReplicaRecord, 0);
         }
 
-        fn replaceReplicas(_: *anyopaque, _: []const catalog.ReplicaRecord) !void {}
+        fn revision(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn applyBatch(
+            _: *anyopaque,
+            _: u64,
+            _: []const catalog.ReplicaRecord,
+            _: []const u64,
+        ) !void {}
     };
 
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);

@@ -65,10 +65,11 @@ pub const Server = struct {
     }
 
     fn handleWithAllocator(self: *Server, response_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-        if (self.state_mutex) |mutex| {
+        const state_mutex = self.state_mutex;
+        if (state_mutex) |mutex| {
             platform_sync.lockYielding(mutex);
-            defer mutex.unlock();
         }
+        defer if (state_mutex) |mutex| mutex.unlock();
         const path = requestPath(req.uri);
         switch (req.method) {
             .GET => {

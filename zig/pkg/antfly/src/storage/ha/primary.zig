@@ -168,18 +168,15 @@ pub const Primary = struct {
     ) !Primary {
         if (handoff.switch_lsn == 0) return error.InvalidPromotionHandoff;
         if (handoff.next_lsn != handoff.switch_lsn + 1) return error.InvalidPromotionHandoff;
-        if (!std.meta.eql(standby.identity, handoff.identity)) return error.InvalidPromotionHandoff;
 
         var slots = try slot_store.SlotStore.open(alloc, slot_store_path, options.slot_store_options);
         errdefer slots.close();
+        try standby.lockExclusive();
+        defer standby.unlockExclusive();
+        if (!std.meta.eql(standby.identity, handoff.identity)) return error.InvalidPromotionHandoff;
         try validatePromotedLog(alloc, &standby.receive_log, handoff);
 
-        const standby_alloc = standby.alloc;
-        standby.progress_wal.close();
-        const log = standby.receive_log;
-        standby_alloc.free(standby.progress_wal_path);
-        standby_alloc.free(standby.receive_log_path);
-        standby.* = undefined;
+        const log = standby.consumePromotedReceiveLogLocked();
         return .{
             .alloc = alloc,
             .identity = handoff.identity,
@@ -894,6 +891,89 @@ test "storage.ha primary opens from promoted standby handoff and continues write
     try validateRecordIdentity(promoted_identity, appended.record);
     try std.testing.expectEqual(@as(u64, 2), appended.record.previous_lsn);
     try std.testing.expectEqualStrings("after-promotion", appended.record.payload);
+}
+
+test "storage.ha primary adoption serializes standby ownership transfer" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "serialized-adoption");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+    _ = try standby.receive(.{
+        .kind = .batch_mutation,
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = "before-promotion",
+    });
+    var apply_ctx: u8 = 0;
+    _ = try standby.applyAvailable(&apply_ctx, noOpApply);
+    _ = try standby.promote(.{
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .fencing_confirmed = true,
+    });
+    const handoff = try standby.promotedPrimaryHandoff();
+
+    const Adoption = struct {
+        standby: *standby_mod.Standby,
+        slot_store_path: [*:0]const u8,
+        handoff: standby_mod.PromotionHandoff,
+        started: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+        primary: ?Primary = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.primary = Primary.adoptPromotedStandby(
+                std.testing.allocator,
+                self.standby,
+                self.slot_store_path,
+                self.handoff,
+                .{},
+            ) catch |err| {
+                self.err = err;
+                self.finished.store(true, .release);
+                return;
+            };
+            self.finished.store(true, .release);
+        }
+    };
+
+    try standby.lockExclusive();
+    var adoption = Adoption{
+        .standby = &standby,
+        .slot_store_path = paths.slots.ptr,
+        .handoff = handoff,
+    };
+    var thread = std.Thread.spawn(.{}, Adoption.run, .{&adoption}) catch |err| {
+        standby.unlockExclusive();
+        return err;
+    };
+    while (!adoption.started.load(.acquire)) std.atomic.spinLoopHint();
+    for (0..10_000) |_| {
+        if (adoption.finished.load(.acquire)) break;
+        std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(!adoption.finished.load(.acquire));
+
+    standby.unlockExclusive();
+    thread.join();
+    if (adoption.err) |err| return err;
+    var primary = adoption.primary orelse return error.TestExpectedEqual;
+    defer primary.close();
+
+    try std.testing.expectError(error.StandbyConsumed, standby.applyAvailable(&apply_ctx, noOpApply));
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 3), try primary.append(.{ .payload = "after-adoption" }));
 }
 
 test "storage.ha primary rejects duplicate slot creation without regressing progress" {

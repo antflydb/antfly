@@ -798,6 +798,7 @@ pub const ProvisionedTableWriteCache = struct {
         lsm_root_generation: u64,
         ha_write_gate_generation: ?u64 = null,
         table_name: []u8,
+        managed_config_fingerprint: [32]u8,
         promotion_owner_state: PromotionOwnerState = .{},
         db: db_mod.DB,
         schema_json: ?[]u8 = null,
@@ -862,6 +863,21 @@ pub const ProvisionedTableWriteCache = struct {
             self.* = undefined;
         }
     };
+
+    fn managedConfigFingerprint(indexes_json: ?[]const u8) [32]u8 {
+        var fingerprint: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(indexes_json orelse "", &fingerprint, .{});
+        return fingerprint;
+    }
+
+    fn entryManagedConfigMatches(entry: *const Entry, indexes_json: ?[]const u8) bool {
+        const desired = managedConfigFingerprint(indexes_json);
+        return std.mem.eql(u8, &entry.managed_config_fingerprint, &desired);
+    }
+
+    fn publishEntryManagedConfig(entry: *Entry, indexes_json: ?[]const u8) void {
+        entry.managed_config_fingerprint = managedConfigFingerprint(indexes_json);
+    }
 
     pub const PromotionLeadershipSource = struct {
         ptr: *anyopaque,
@@ -1509,6 +1525,7 @@ pub const ProvisionedTableWriteCache = struct {
             .lsm_root_generation = lsm_root_generation,
             .ha_write_gate_generation = haWriteGateCurrentGeneration(self.ha_write_gate),
             .table_name = owned_table_name,
+            .managed_config_fingerprint = managedConfigFingerprint(metadata.indexes_json),
             .db = opened.db,
             .schema_json = if (metadata.schema_json) |value| try self.alloc.dupe(u8, value) else null,
             .active_leases = 1,
@@ -1802,6 +1819,7 @@ pub const ProvisionedTableWriteCache = struct {
             .lsm_root_generation = lsm_root_generation,
             .ha_write_gate_generation = haWriteGateCurrentGeneration(self.ha_write_gate),
             .table_name = owned_table_name,
+            .managed_config_fingerprint = managedConfigFingerprint(prepared.indexes_json),
             .db = db,
             .schema_json = prepared.schema_json,
             .active_leases = 1,
@@ -1857,6 +1875,7 @@ pub const ProvisionedTableWriteCache = struct {
             .lsm_root_generation = lsm_root_generation,
             .ha_write_gate_generation = haWriteGateCurrentGeneration(self.ha_write_gate),
             .table_name = owned_table_name,
+            .managed_config_fingerprint = managedConfigFingerprint(indexes_json),
             .db = db,
             .schema_json = owned_schema_json,
             .active_leases = 0,
@@ -10200,9 +10219,35 @@ pub const ProvisionedTableWriteSource = struct {
             };
             var cached_active = true;
             defer if (cached_active) cached.deinit(alloc);
+            errdefer if (cached_active) {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
+                cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+                cached_active = false;
+            };
 
             if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
             if (metadata.indexes_json) |indexes_json| {
+                const managed_config_matches = matches: {
+                    lockAtomic(&self.local_db_mutex);
+                    defer self.local_db_mutex.unlock();
+                    break :matches ProvisionedTableWriteCache.entryManagedConfigMatches(cached.entry.?, indexes_json);
+                };
+                if (!managed_config_matches) {
+                    try reconfigureManagedDbEnrichments(
+                        alloc,
+                        cached.db,
+                        indexes_json,
+                        self.backend_runtime,
+                        self.antfly_provider,
+                        self.inference_api_url,
+                        self.secret_store,
+                        self.remote_content,
+                    );
+                    lockAtomic(&self.local_db_mutex);
+                    ProvisionedTableWriteCache.publishEntryManagedConfig(cached.entry.?, indexes_json);
+                    self.local_db_mutex.unlock();
+                }
                 if (metadata.schema_json) |schema_json| {
                     lockAtomic(&self.local_db_mutex);
                     defer self.local_db_mutex.unlock();
@@ -15381,12 +15426,16 @@ fn applyIndexCreateToCachedDb(
 
     const owned_name = try alloc.dupe(u8, index_name);
     defer alloc.free(owned_name);
-    var enrichments = try createManagedDbEnrichments(db.runtime_alloc, indexes_json, backend_runtime, antfly_provider, inference_api_url, secret_store, remote_content);
-    errdefer enrichments.deinit(db.runtime_alloc);
-    if (enrichments.enabled()) {
-        try db.reconfigureEnrichmentRuntime(enrichments.takeConfig());
-    }
-    try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json);
+    try reconfigureManagedDbEnrichments(
+        alloc,
+        db,
+        indexes_json,
+        backend_runtime,
+        antfly_provider,
+        inference_api_url,
+        secret_store,
+        remote_content,
+    );
     db.addIndex(.{
         .name = owned_name,
         .kind = kind,
@@ -15493,6 +15542,7 @@ fn reconcileCachedLocalTableIndexCreate(
             cached_active = false;
             return err;
         };
+        ProvisionedTableWriteCache.publishEntryManagedConfig(cached.entry.?, metadata.indexes_json);
         publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
             cached_active = false;
@@ -15547,6 +15597,21 @@ fn reconcileCachedLocalTableIndexDrop(
                 return err;
             },
         };
+        reconfigureManagedDbEnrichments(
+            alloc,
+            cached.db,
+            metadata.indexes_json,
+            self.backend_runtime,
+            self.antfly_provider,
+            self.inference_api_url,
+            self.secret_store,
+            self.remote_content,
+        ) catch |err| {
+            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
+            cached_active = false;
+            return err;
+        };
+        ProvisionedTableWriteCache.publishEntryManagedConfig(cached.entry.?, metadata.indexes_json);
         // DB.deleteIndex removes the target worker synchronously. Do not wait for
         // global derived/maintenance idle here: unrelated managed workers may be
         // rate-limited or retrying, and delete-index must stay a bounded metadata
@@ -16574,6 +16639,32 @@ fn createManagedDbEnrichments(
         .asset_runtime = asset_runtime,
         .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
     };
+}
+
+fn reconfigureManagedDbEnrichments(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    antfly_provider: ?managed_embedder.AntflyProvider,
+    inference_api_url: ?[]const u8,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+) !void {
+    var enrichments = try createManagedDbEnrichments(
+        db.runtime_alloc,
+        indexes_json,
+        backend_runtime,
+        antfly_provider,
+        inference_api_url,
+        secret_store,
+        remote_content,
+    );
+    errdefer enrichments.deinit(db.runtime_alloc);
+    // An empty replacement is meaningful: dropping the last managed producer
+    // must retire the old provider instead of leaving an unused runtime alive.
+    try db.reconfigureEnrichmentRuntime(enrichments.takeConfig());
+    try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json);
 }
 
 pub const StartupCatchUpMetadata = struct {
@@ -24440,7 +24531,7 @@ test "provisioned table write source drains managed dense enrichment before clos
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
-test "provisioned table write cache eventually runs managed dense enrichment for write sync" {
+test "structural reconcile reconfigures retained writer before managed dense writes" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-managed-dense-write-cache";
 
@@ -24540,10 +24631,11 @@ test "provisioned table write cache eventually runs managed dense enrichment for
     const base_uri = try listener.baseUri(alloc);
     defer alloc.free(base_uri);
 
-    FakeCatalog.indexes_json_buf = try std.fmt.allocPrint(alloc,
+    const managed_indexes_json = try std.fmt.allocPrint(alloc,
         \\{{"semantic_idx":{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}}}}}}
     , .{base_uri});
-    defer alloc.free(FakeCatalog.indexes_json_buf);
+    defer alloc.free(managed_indexes_json);
+    FakeCatalog.indexes_json_buf = "{}";
 
     FakeEmbeddingProvider.request_count.store(0, .monotonic);
 
@@ -24552,6 +24644,37 @@ test "provisioned table write cache eventually runs managed dense enrichment for
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
     source.write_cache = &write_cache;
+    // Create the resident writer from the table's original empty index
+    // configuration. Structural reconciliation must update this owner in
+    // place; replacing the writer merely hides the lifecycle bug.
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "seed", .value = "{\"title\":\"no managed field\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expect(write_cache.entries.items[0].db.enrichment_runtime == null);
+
+    FakeCatalog.indexes_json_buf = managed_indexes_json;
+    var observations = std.ArrayListUnmanaged(ProvisionedTableWriteSource.StructuralRuntimeObservation).empty;
+    defer {
+        for (observations.items) |*observation| observation.deinit(alloc);
+        observations.deinit(alloc);
+    }
+    try observations.ensureTotalCapacity(alloc, 1);
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.StructuralReconcileGroupOutcome.complete,
+        try source.reconcileTableGroupStructureWithRuntime(
+            alloc,
+            7001,
+            "docs",
+            .{
+                .indexes_json = managed_indexes_json,
+                .schema_json = "{}",
+            },
+            &observations,
+        ),
+    );
+    try std.testing.expect(write_cache.entries.items[0].db.enrichment_runtime != null);
+
     _ = try source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha body\"}" }},
         .sync_level = .write,

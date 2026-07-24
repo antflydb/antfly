@@ -260,7 +260,8 @@ pub const PreparedReconcile = struct {
     intents: []PlacementIntent,
     ensures: []PreparedEnsure,
     removals: []u64,
-    catalog_before: ?[]catalog.ReplicaRecord,
+    catalog_upserts: []catalog.ReplicaRecord,
+    catalog_revision: ?u64,
     failed_ensure_index: ?usize = null,
     durability_complete: bool = false,
     committed: bool = false,
@@ -272,7 +273,7 @@ pub const PreparedReconcile = struct {
         }
         self.owner.alloc.free(self.ensures);
         self.owner.alloc.free(self.removals);
-        if (self.catalog_before) |records| catalog.freeReplicaRecords(self.owner.alloc, records);
+        self.owner.alloc.free(self.catalog_upserts);
         freeIntentSlice(self.owner.alloc, self.intents);
         self.* = undefined;
     }
@@ -288,12 +289,11 @@ pub const PreparedReconcile = struct {
         if (self.durability_complete or self.committed) return error.InvalidReconcilePhase;
         for (self.ensures, 0..) |*entry, index| {
             const record = self.intents[entry.intent_index].record;
-            entry.replica = self.owner.host.prepareReplica(record, entry.prepare_bootstrap) catch |err| {
+            entry.replica = self.owner.host.prepareReplicaUnpublished(record, entry.prepare_bootstrap) catch |err| {
                 self.failed_ensure_index = index;
                 return err;
             };
         }
-        for (self.removals) |group_id| try self.owner.host.prepareReplicaRemoval(group_id);
         self.durability_complete = true;
     }
 
@@ -310,6 +310,13 @@ pub const PreparedReconcile = struct {
     pub fn commit(self: *PreparedReconcile) !ReconcileResult {
         if (!self.durability_complete or self.committed or self.aborted) return error.InvalidReconcilePhase;
 
+        if (self.catalog_upserts.len > 0 or self.removals.len > 0) {
+            try self.owner.host.commitReplicaCatalog(
+                self.catalog_revision,
+                self.catalog_upserts,
+                self.removals,
+            );
+        }
         var result: ReconcileResult = .{};
         for (self.ensures) |*entry| {
             const intent = self.intents[entry.intent_index];
@@ -336,13 +343,11 @@ pub const PreparedReconcile = struct {
         return result;
     }
 
-    /// Restores the exact durable catalog observed when this plan was prepared.
-    /// Callers use this when an external desired-state generation changes during
-    /// durability work, before any prepared descriptor is published live.
+    /// Discards unpublished descriptors after the caller observes a newer
+    /// desired-state epoch. Durable catalog state is untouched until commit.
     pub fn abortDurable(self: *PreparedReconcile) !void {
         if (!self.durability_complete or self.committed or self.aborted)
             return error.InvalidReconcilePhase;
-        if (self.catalog_before) |records| try self.owner.host.restoreReplicaCatalog(records);
         for (self.ensures) |entry| {
             if (!entry.prepare_bootstrap) continue;
             self.owner.host.cancelReplicaBootstrapPreparation(self.intents[entry.intent_index].record);
@@ -365,8 +370,6 @@ pub const Reconciler = struct {
     pub fn prepare(self: *Reconciler) !PreparedReconcile {
         const intents = try self.provider.listLocalIntents(self.alloc, self.host.cfg.local_node_id);
         errdefer freeIntentSlice(self.alloc, intents);
-        const catalog_before = try self.host.snapshotReplicaCatalog(self.alloc);
-        errdefer if (catalog_before) |records| catalog.freeReplicaRecords(self.alloc, records);
         const existing = try self.host.listGroupIds(self.alloc);
         defer self.alloc.free(existing);
 
@@ -404,12 +407,22 @@ pub const Reconciler = struct {
         const owned_ensures = try ensures.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(owned_ensures);
         const owned_removals = try removals.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(owned_removals);
+        const catalog_upserts = try self.alloc.alloc(catalog.ReplicaRecord, owned_ensures.len);
+        for (owned_ensures, 0..) |entry, index| {
+            catalog_upserts[index] = intents[entry.intent_index].record;
+        }
+        const catalog_revision = if (catalog_upserts.len > 0 or owned_removals.len > 0)
+            self.host.replicaCatalogRevision()
+        else
+            null;
         return .{
             .owner = self,
             .intents = intents,
             .ensures = owned_ensures,
             .removals = owned_removals,
-            .catalog_before = catalog_before,
+            .catalog_upserts = catalog_upserts,
+            .catalog_revision = catalog_revision,
         };
     }
 
@@ -741,7 +754,7 @@ const StagedReconcileTestFactory = struct {
     }
 };
 
-test "prepared reconcile persists admission before runtime publication" {
+test "prepared reconcile publishes catalog admission atomically before runtime publication" {
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store_a.deinit();
     var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -775,17 +788,24 @@ test "prepared reconcile persists admission before runtime publication" {
     try prepared.prepareDurable();
 
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.absent, host.status(502));
-    const records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
-    defer catalog.freeReplicaRecords(std.testing.allocator, records);
-    try std.testing.expectEqual(@as(usize, 1), records.len);
-    try std.testing.expectEqual(@as(u64, 502), records[0].group_id);
+    {
+        const records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+        defer catalog.freeReplicaRecords(std.testing.allocator, records);
+        try std.testing.expectEqual(@as(usize, 0), records.len);
+    }
 
     const result = try prepared.commit();
     try std.testing.expectEqual(@as(usize, 1), result.ensured);
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.active, host.status(502));
+    {
+        const records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+        defer catalog.freeReplicaRecords(std.testing.allocator, records);
+        try std.testing.expectEqual(@as(usize, 1), records.len);
+        try std.testing.expectEqual(@as(u64, 502), records[0].group_id);
+    }
 }
 
-test "aborted prepared reconcile restores the exact durable catalog" {
+test "prepared reconcile rejects catalog races without clobbering concurrent admissions" {
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store_a.deinit();
     var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -831,15 +851,29 @@ test "aborted prepared reconcile restores the exact durable catalog" {
         const staged = try replica_catalog.catalog().listReplicas(std.testing.allocator);
         defer catalog.freeReplicaRecords(std.testing.allocator, staged);
         try std.testing.expectEqual(@as(usize, 1), staged.len);
-        try std.testing.expectEqual(@as(u64, 502), staged[0].group_id);
+        try std.testing.expectEqual(@as(u64, 501), staged[0].group_id);
     }
 
+    try replica_catalog.catalog().upsertReplica(.{
+        .group_id = 503,
+        .replica_id = 3,
+        .local_node_id = 1,
+    });
+    try std.testing.expectError(error.ReplicaCatalogRevisionChanged, prepared.commit());
     try prepared.abortDurable();
     {
         const restored = try replica_catalog.catalog().listReplicas(std.testing.allocator);
         defer catalog.freeReplicaRecords(std.testing.allocator, restored);
-        try std.testing.expectEqual(@as(usize, 1), restored.len);
-        try std.testing.expectEqual(@as(u64, 501), restored[0].group_id);
+        try std.testing.expectEqual(@as(usize, 2), restored.len);
+        var saw_501 = false;
+        var saw_503 = false;
+        for (restored) |record| {
+            saw_501 = saw_501 or record.group_id == 501;
+            saw_503 = saw_503 or record.group_id == 503;
+            try std.testing.expect(record.group_id != 502);
+        }
+        try std.testing.expect(saw_501);
+        try std.testing.expect(saw_503);
     }
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.active, host.status(501));
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.absent, host.status(502));

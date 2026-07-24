@@ -393,10 +393,10 @@ class HACluster:
             "manifest_path": manifest_path,
         }
 
-    def close(self) -> None:
+    def close(self, *, test_failed: bool = False) -> None:
         self.standby.close()
         self.primary.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
     def debug_logs(self) -> str:
@@ -404,7 +404,7 @@ class HACluster:
 
 
 @pytest.fixture
-def ha_cluster() -> HACluster:
+def ha_cluster(request: pytest.FixtureRequest) -> HACluster:
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"Antfly binary not found: {binary}")
@@ -417,7 +417,8 @@ def ha_cluster() -> HACluster:
     try:
         yield cluster
     finally:
-        cluster.close()
+        report = getattr(request.node, "rep_call", None)
+        cluster.close(test_failed=bool(report and report.failed))
 
 
 def _wait_for_standby_applied(cluster: HACluster, lsn: int, *, timeout_s: float = 20.0) -> dict[str, Any]:

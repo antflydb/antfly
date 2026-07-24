@@ -25,6 +25,7 @@ const Crc32 = std.hash.Crc32;
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const wal_mod = @import("../wal.zig");
+const platform_sync = @import("antfly_platform").sync;
 
 const progress_magic = [8]u8{ 'A', 'F', 'H', 'A', 'P', 'R', 'G', '\n' };
 const progress_version: u16 = 1;
@@ -128,6 +129,8 @@ pub const Standby = struct {
     receive_log: replication_log.ReplicationLog,
     progress_wal: wal_mod.WAL,
     progress: Progress,
+    operation_mutex: std.atomic.Mutex = .unlocked,
+    consumed: bool = false,
 
     pub fn open(
         alloc: Allocator,
@@ -204,12 +207,15 @@ pub const Standby = struct {
     }
 
     pub fn close(self: *Standby) void {
+        platform_sync.lockYielding(&self.operation_mutex);
+        defer self.operation_mutex.unlock();
+        if (self.consumed) return;
         const alloc = self.alloc;
         self.progress_wal.close();
         self.receive_log.close();
         alloc.free(self.progress_wal_path);
         alloc.free(self.receive_log_path);
-        self.* = undefined;
+        self.consumed = true;
     }
 
     pub fn receiveLogPath(self: *const Standby) []const u8 {
@@ -233,6 +239,12 @@ pub const Standby = struct {
     }
 
     pub fn receive(self: *Standby, record: replication_record.Record) !u64 {
+        try self.lockExclusive();
+        defer self.unlockExclusive();
+        return try self.receiveUnlocked(record);
+    }
+
+    fn receiveUnlocked(self: *Standby, record: replication_record.Record) !u64 {
         if (record.kind == .timeline_switch) {
             return try self.receiveTimelineSwitch(record);
         }
@@ -301,6 +313,8 @@ pub const Standby = struct {
     }
 
     pub fn bootstrapCheckpoint(self: *Standby, checkpoint_lsn: u64, payload: []const u8) !void {
+        try self.lockExclusive();
+        defer self.unlockExclusive();
         if (checkpoint_lsn == 0) return error.InvalidCheckpointLsn;
         if (self.progress.received_lsn != 0 or
             self.progress.applied_lsn != 0 or
@@ -330,6 +344,8 @@ pub const Standby = struct {
     }
 
     pub fn applyAvailable(self: *Standby, ctx: *anyopaque, apply_fn: ApplyFn) !usize {
+        try self.lockExclusive();
+        defer self.unlockExclusive();
         const from_lsn = self.progress.applied_lsn + 1;
         const entries = try self.receive_log.iterateFrom(self.alloc, from_lsn);
         defer replication_log.freeEntries(self.alloc, entries);
@@ -360,6 +376,8 @@ pub const Standby = struct {
     }
 
     pub fn promote(self: *Standby, request: PromotionRequest) !PromotionResult {
+        try self.lockExclusive();
+        defer self.unlockExclusive();
         if (request.new_timeline_id <= self.identity.timeline_id) return error.InvalidTimelineSwitch;
         if (request.new_epoch <= self.identity.epoch) return error.InvalidTimelineSwitch;
         if (!request.fencing_confirmed and !request.force) return error.FencingRequired;
@@ -413,6 +431,8 @@ pub const Standby = struct {
     }
 
     pub fn promotedPrimaryHandoff(self: *Standby) !PromotionHandoff {
+        try self.lockExclusive();
+        defer self.unlockExclusive();
         if (self.progress.safe_read_lsn == 0) return error.StandbyNotPromoted;
         if (self.progress.applied_lsn != self.progress.safe_read_lsn) return error.PromotionNotApplied;
 
@@ -439,6 +459,32 @@ pub const Standby = struct {
             .switch_lsn = switch_lsn,
             .next_lsn = switch_lsn + 1,
         };
+    }
+
+    pub fn lockExclusive(self: *Standby) !void {
+        platform_sync.lockYielding(&self.operation_mutex);
+        if (self.consumed) {
+            self.operation_mutex.unlock();
+            return error.StandbyConsumed;
+        }
+    }
+
+    pub fn unlockExclusive(self: *Standby) void {
+        self.operation_mutex.unlock();
+    }
+
+    /// Transfers the receive log after the caller has acquired the exclusive
+    /// standby operation lease. The standby remains a valid consumed tombstone
+    /// so blocked operations can fail deterministically instead of observing
+    /// poisoned memory.
+    pub fn consumePromotedReceiveLogLocked(self: *Standby) replication_log.ReplicationLog {
+        std.debug.assert(!self.consumed);
+        const log = self.receive_log;
+        self.progress_wal.close();
+        self.alloc.free(self.progress_wal_path);
+        self.alloc.free(self.receive_log_path);
+        self.consumed = true;
+        return log;
     }
 
     fn validateReceivedLog(self: *Standby) !?Identity {

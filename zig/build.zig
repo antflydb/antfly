@@ -4757,6 +4757,7 @@ pub fn build(b: *std.Build) void {
             "table runtime snapshot cache clones stored status",
             "table runtime snapshot cache rejects a late stale live observation",
             "table runtime snapshot cache replacement preserves a newer live observation",
+            "structural reconcile reconfigures retained writer before managed dense writes",
             "provisioned managed replay tails converge and publish without later traffic",
             "provisioned runtime status overlays live writer replay target without republishing stats",
             "provisioned runtime status live replay overlay preserves cold dense visibility refresh",
@@ -5208,6 +5209,8 @@ pub fn build(b: *std.Build) void {
         "resource manager capacity source is immutable after composition",
         "capacity reservation revalidation fails closed when available space falls",
         "resource manager background deferral follows slice policy",
+        "budgeted allocator admits before allocation and releases exact live bytes",
+        "budgeted allocator allows concurrent operations within the shared hard limit",
     };
     // Retain the API declaration walk that owns provisioned_storage. Zig
     // compile filters otherwise prune that module before the exact runtime

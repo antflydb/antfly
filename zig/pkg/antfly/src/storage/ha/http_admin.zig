@@ -131,10 +131,11 @@ pub const Server = struct {
         if (req.method == .GET and std.mem.eql(u8, path, Routes.health)) {
             return try textResponse(self.alloc, 200, "ok");
         }
-        if (self.auth.state_mutex) |mutex| {
+        const state_mutex = self.auth.state_mutex;
+        if (state_mutex) |mutex| {
             platform_sync.lockYielding(mutex);
-            defer mutex.unlock();
         }
+        defer if (state_mutex) |mutex| mutex.unlock();
         defer if (self.auth.state_changed) |hook| hook.run();
         switch (req.method) {
             .GET => {
@@ -2762,6 +2763,42 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_promote.body, "\"node_id\":\"standby-a\"");
     try expectContains(typed_promote.body, "\"fence_generation\":1");
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2");
+}
+
+test "storage.ha http admin holds state lock through mutation hook" {
+    const Observation = struct {
+        mutex: *std.atomic.Mutex,
+        hook_ran: bool = false,
+        hook_observed_lock: bool = false,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.hook_ran = true;
+            if (self.mutex.tryLock()) {
+                self.mutex.unlock();
+                return;
+            }
+            self.hook_observed_lock = true;
+        }
+    };
+
+    var mutex: std.atomic.Mutex = .unlocked;
+    var observation = Observation{ .mutex = &mutex };
+    var server = Server.initWithOptions(std.testing.allocator, .{}, .{
+        .state_mutex = &mutex,
+        .state_changed = .{
+            .ptr = &observation,
+            .run_fn = Observation.run,
+        },
+    });
+
+    var response = try server.handle(.{ .method = .GET, .uri = Routes.ready });
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expect(observation.hook_ran);
+    try std.testing.expect(observation.hook_observed_lock);
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
 }
 
 test "storage.ha http admin reports unsafe promotion as conflict" {
