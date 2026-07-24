@@ -212,11 +212,22 @@ def ready_index_status(index_info: dict[str, Any], *, require_query_fresh: bool 
         return None
     if not isinstance(status, dict):
         return None
+    if status.get("error"):
+        return None
     if status.get("materialization_blocked", False):
         return None
     if status.get("rebuilding", status.get("backfill_active", False)):
         return None
+    if status.get("backfill_state") == "failed":
+        return None
     if isinstance(status.get("repair"), dict):
+        return None
+    if status.get("repair_degraded") is True:
+        return None
+    if status.get("repair_summary_ready") is False:
+        return None
+    repair_issue_count = status.get("repair_issue_count")
+    if type(repair_issue_count) is int and repair_issue_count > 0:
         return None
     if status.get("dense_publish_pending", False):
         return None
@@ -334,7 +345,7 @@ def raise_request_error_with_logs(
         raise err
     message = f"{err}\nserver logs:\n{logs}"
     if proc_statuses:
-        message += f"\nserver exit status:\n" + "\n".join(proc_statuses)
+        message += "\nserver exit status:\n" + "\n".join(proc_statuses)
     raise err.__class__(
         message,
         request=getattr(err, "request", None),

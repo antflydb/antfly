@@ -185,6 +185,17 @@ def test_ready_index_status_requires_current_coverage_observation():
     rebuilding["status"]["repair"] = {"state": "rebuilding", "action_required": False}
     assert ready_index_status(rebuilding) is None
 
+    for field, value in (
+        ("error", "load failed: UnsupportedVersion"),
+        ("backfill_state", "failed"),
+        ("repair_degraded", True),
+        ("repair_summary_ready", False),
+        ("repair_issue_count", 1),
+    ):
+        terminal = json.loads(json.dumps(ready_status))
+        terminal["status"][field] = value
+        assert ready_index_status(terminal) is None
+
 
 def _retrying_partial_index(stateful_api, table_name: str, index_name: str, *, expected_docs: int) -> dict | None:
     try:
@@ -2004,7 +2015,7 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
     rebuilt = _maybe_serverless_build(serverless_api, table_name)
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or 2
-    ready = _wait_for_serverless_build_status(
+    _wait_for_serverless_build_status(
         serverless_api,
         table_name,
         lambda current: (
@@ -2121,7 +2132,7 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
     )
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or (first_head_version + 1)
-    ready = _wait_for_serverless_build_status(
+    _wait_for_serverless_build_status(
         serverless_api,
         table_name,
         lambda current: (
@@ -2342,7 +2353,7 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(ser
     rebuilt = _maybe_serverless_build(serverless_api, table_name)
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or (first_head_version + 1)
-    ready = _wait_for_serverless_build_status(
+    _wait_for_serverless_build_status(
         serverless_api,
         table_name,
         lambda current: (

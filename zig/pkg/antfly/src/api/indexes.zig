@@ -1922,6 +1922,25 @@ test "derived coverage aggregation rejects stale index incarnations" {
         .coverage_identity_ready = true,
         .replay_applied_sequence = 8,
         .replay_target_sequence = 8,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_applied_sequence = 8,
+        .projection_checkpoint_generation = 41,
+        .projection_checkpoint_config_hash = 99,
+        .checkpoint_replay_tail_sequence_count = 3,
+        .repair_degraded = true,
+        .repair_issue_count = 5,
+        .repair_summary_ready = true,
+        .repair_scan_issue_count = 4,
+        .hbc_cache = .{
+            .total_bytes = 1024,
+            .accounted_bytes = 768,
+            .node = .{ .used_bytes = 256, .insertions = 9 },
+        },
+        .hbc_posting = .{
+            .scanned_nodes = 7,
+            .dirty_postings = 2,
+            .maintenance_repaired_postings = 1,
+        },
     }};
     const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 1,
@@ -1955,7 +1974,13 @@ test "derived coverage aggregation rejects stale index incarnations" {
         99,
         null,
         .{},
-        null,
+        .{
+            .enabled = true,
+            .target_sequence = 8,
+            .applied_sequence = 7,
+            .processed_requests = 6,
+            .worker_failed = true,
+        },
         null,
         null,
         .{},
@@ -1970,6 +1995,19 @@ test "derived coverage aggregation rejects stale index incarnations" {
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"observation_incomplete_reasons\":[\"config_mismatch\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"config_mismatch_group_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"produced\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"projection_checkpoint_status\":\"rebuilding\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"projection_checkpoint_applied_sequence\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"projection_checkpoint_generation\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"projection_checkpoint_config_hash\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"checkpoint_replay_tail_sequence_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"repair_degraded\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"repair_issue_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"repair_summary_ready\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"repair_issue_count_estimated\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"repair_scan_issue_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"hbc_cache\":{\"total_bytes\":0,\"accounted_bytes\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"hbc_posting\":{\"scanned_nodes\":0,\"scanned_postings\":0,\"dirty_postings\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"enrichment_runtime\":{\"enabled\":false,\"target_sequence\":0,\"applied_sequence\":0") != null);
 }
 
 test "derived coverage rejects unknown freshness for aggregate and shard views" {
@@ -2628,35 +2666,35 @@ fn appendSingleIndexRuntimeStatus(
     try out.appendSlice(alloc, if (replay_catch_up_required) "true" else "false");
     if (@hasField(@TypeOf(item), "projection_checkpoint_status")) {
         try out.appendSlice(alloc, ",\"projection_checkpoint_status\":");
-        try appendJsonString(alloc, out, item.projection_checkpoint_status);
+        try appendJsonString(alloc, out, if (embeddings_materialization_current) item.projection_checkpoint_status else "rebuilding");
         try out.appendSlice(alloc, ",\"projection_checkpoint_applied_sequence\":");
-        try appendIntValue(alloc, out, item.projection_checkpoint_applied_sequence);
+        try appendIntValue(alloc, out, if (embeddings_materialization_current) item.projection_checkpoint_applied_sequence else 0);
         try out.appendSlice(alloc, ",\"projection_checkpoint_generation\":");
-        try appendIntValue(alloc, out, item.projection_checkpoint_generation);
+        try appendIntValue(alloc, out, if (embeddings_materialization_current) item.projection_checkpoint_generation else 0);
         try out.appendSlice(alloc, ",\"projection_checkpoint_config_hash\":");
-        try appendIntValue(alloc, out, item.projection_checkpoint_config_hash);
+        try appendIntValue(alloc, out, if (embeddings_materialization_current) item.projection_checkpoint_config_hash else 0);
         try out.appendSlice(alloc, ",\"checkpoint_replay_tail_sequence_count\":");
-        try appendIntValue(alloc, out, item.checkpoint_replay_tail_sequence_count);
+        try appendIntValue(alloc, out, if (embeddings_materialization_current) item.checkpoint_replay_tail_sequence_count else 0);
     }
     if (@hasField(@TypeOf(item), "repair_degraded")) {
         try out.appendSlice(alloc, ",\"repair_degraded\":");
-        try out.appendSlice(alloc, if (item.repair_degraded) "true" else "false");
+        try out.appendSlice(alloc, if (embeddings_materialization_current and item.repair_degraded) "true" else "false");
     }
     if (@hasField(@TypeOf(item), "repair_issue_count")) {
         try out.appendSlice(alloc, ",\"repair_issue_count\":");
-        try appendIntValue(alloc, out, item.repair_issue_count);
+        try appendIntValue(alloc, out, if (embeddings_materialization_current) item.repair_issue_count else 0);
     }
     if (@hasField(@TypeOf(item), "repair_summary_ready")) {
         try out.appendSlice(alloc, ",\"repair_summary_ready\":");
-        try out.appendSlice(alloc, if (item.repair_summary_ready) "true" else "false");
+        try out.appendSlice(alloc, if (embeddings_materialization_current and item.repair_summary_ready) "true" else "false");
     }
     if (@hasField(@TypeOf(item), "repair_issue_count_estimated")) {
         try out.appendSlice(alloc, ",\"repair_issue_count_estimated\":");
-        try out.appendSlice(alloc, if (item.repair_issue_count_estimated) "true" else "false");
+        try out.appendSlice(alloc, if (!embeddings_materialization_current or item.repair_issue_count_estimated) "true" else "false");
     }
     if (@hasField(@TypeOf(item), "repair_scan_issue_count")) {
         try out.appendSlice(alloc, ",\"repair_scan_issue_count\":");
-        try appendIntValue(alloc, out, item.repair_scan_issue_count);
+        try appendIntValue(alloc, out, if (embeddings_materialization_current) item.repair_scan_issue_count else 0);
     }
     try out.appendSlice(alloc, ",\"runtime_present\":");
     try out.appendSlice(alloc, if (runtime_present) "true" else "false");
@@ -2706,11 +2744,11 @@ fn appendSingleIndexRuntimeStatus(
     }
     if (index_type == .embeddings) {
         try out.appendSlice(alloc, ",\"hbc_cache\":");
-        try appendHbcCacheStatus(alloc, out, item.hbc_cache);
+        try appendHbcCacheStatus(alloc, out, if (embeddings_materialization_current) item.hbc_cache else .{});
         try out.appendSlice(alloc, ",\"hbc_posting\":");
-        try appendHbcPostingStatus(alloc, out, item.hbc_posting);
+        try appendHbcPostingStatus(alloc, out, if (embeddings_materialization_current) item.hbc_posting else .{});
         try out.appendSlice(alloc, ",\"enrichment_runtime\":");
-        try appendEnrichmentRuntimeStatus(alloc, out, enrichment orelse .{});
+        try appendEnrichmentRuntimeStatus(alloc, out, visible_enrichment orelse .{});
     }
     try out.appendSlice(alloc, ",\"async_indexing\":");
     try appendAsyncIndexingStatus(alloc, out, async_indexing);
