@@ -26666,22 +26666,38 @@ fn prepareGeneratedEnrichments(
         artifact_delete_keys.deinit(self.alloc);
     }
     var documents = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
+    // ArrayList.items may be shorter than its backing allocation. Release
+    // owned fields item-by-item, then let the list free its exact capacity.
     errdefer {
-        var tmp = derived_types.DerivedBatch{ .documents = documents.items };
-        derived_types.deinitDerivedBatch(self.alloc, &tmp);
-        documents = .empty;
+        for (documents.items) |doc| {
+            self.alloc.free(doc.key);
+            if (doc.cleaned_value) |value| self.alloc.free(value);
+            for (doc.targets) |target| self.alloc.free(target.index_name);
+            if (doc.targets.len > 0) self.alloc.free(doc.targets);
+        }
+        documents.deinit(self.alloc);
     }
     var dense_embeddings = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
     errdefer {
-        var tmp = derived_types.DerivedBatch{ .dense_embeddings = dense_embeddings.items };
-        derived_types.deinitDerivedBatch(self.alloc, &tmp);
-        dense_embeddings = .empty;
+        for (dense_embeddings.items) |embedding| {
+            self.alloc.free(embedding.index_name);
+            if (embedding.parent_doc_key) |parent_doc_key| self.alloc.free(parent_doc_key);
+            self.alloc.free(embedding.doc_key);
+            if (embedding.artifact_key) |artifact_key| self.alloc.free(artifact_key);
+            if (embedding.vector.len > 0) self.alloc.free(embedding.vector);
+        }
+        dense_embeddings.deinit(self.alloc);
     }
     var sparse_embeddings = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
     errdefer {
-        var tmp = derived_types.DerivedBatch{ .sparse_embeddings = sparse_embeddings.items };
-        derived_types.deinitDerivedBatch(self.alloc, &tmp);
-        sparse_embeddings = .empty;
+        for (sparse_embeddings.items) |embedding| {
+            self.alloc.free(embedding.index_name);
+            self.alloc.free(embedding.doc_key);
+            if (embedding.artifact_key) |artifact_key| self.alloc.free(artifact_key);
+            if (embedding.indices.len > 0) self.alloc.free(embedding.indices);
+            if (embedding.values.len > 0) self.alloc.free(embedding.values);
+        }
+        sparse_embeddings.deinit(self.alloc);
     }
     var planned = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
     errdefer {

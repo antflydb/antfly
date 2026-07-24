@@ -3536,6 +3536,9 @@ pub fn build(b: *std.Build) void {
     serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
 
     const lib_data_runtime_default_filters = [_][]const u8{
+        "failed full index enrichment does not make resident reads unavailable",
+        "enrichment runtime status reports worker lifecycle diagnostics",
+        "enrichment index status encodes worker lifecycle diagnostics",
         "index repair scan periodically rediscovers debt after a lost wake",
         "index repair lost-wakeup fallback stays bounded at large group counts",
         "index repair lost-wakeup audit meets rotation target within supported envelope",
