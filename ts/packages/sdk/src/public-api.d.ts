@@ -2685,6 +2685,7 @@ export interface components {
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
             secret_store?: components["schemas"]["SecretStoreStatus"];
+            runtime_config?: components["schemas"]["RuntimeConfigStatus"];
             storage?: components["schemas"]["StorageRuntimeStatus"];
         } & {
             [key: string]: unknown;
@@ -2701,6 +2702,7 @@ export interface components {
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
             secret_store?: components["schemas"]["SecretStoreStatus"];
+            runtime_config?: components["schemas"]["RuntimeConfigStatus"];
             storage?: components["schemas"]["StorageRuntimeStatus"];
             data: components["schemas"]["ClusterDataStatus"];
         } & {
@@ -3617,8 +3619,41 @@ export interface components {
         };
         /** @description Non-secret status for the local secrets file store, when one is available. */
         SecretStoreStatus: {
+            /**
+             * Format: uint64
+             * @description Generation of the currently published secret-store snapshot.
+             */
+            generation?: number;
+            /** @description Whether this store can expose one exact opaque source-generation acknowledgement. This remains true when a single loaded file predates the generation field, and is false for layered stores whose served snapshot has multiple publication sources. */
+            supports_source_generation?: boolean;
+            /** @description Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values. */
+            source_generation?: string | null;
+            /** @description Whether the latest observed replacement failed to load. */
+            last_reload_failed?: boolean;
             /** @description Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh. */
             stale?: boolean;
+            /** Format: uint64 */
+            reload_successes?: number;
+            /** Format: uint64 */
+            reload_failures?: number;
+        };
+        /** @description Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only changes; startup-only changes remain stale until restart. */
+        RuntimeConfigStatus: {
+            /**
+             * Format: uint64
+             * @description Generation of the fully validated and atomically published configuration.
+             */
+            generation?: number;
+            /** @description Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters match the operator config-hash annotation. */
+            hash?: string;
+            /** @description Whether the latest observed replacement failed loading, semantic validation, or requires restart because startup-only fields changed. */
+            last_reload_failed?: boolean;
+            /** @description Whether requests are using the last-known-good snapshot after a failed reload. */
+            stale?: boolean;
+            /** Format: uint64 */
+            reload_successes?: number;
+            /** Format: uint64 */
+            reload_failures?: number;
         };
         /**
          * @description Source of the secret configuration

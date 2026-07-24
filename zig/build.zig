@@ -1774,6 +1774,13 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, lib_test_mod, true, true);
 
+    const raft_sim_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft_sim_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, raft_sim_test_mod, true, true);
+
     const introducer_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/introducer.zig"),
         .target = target,
@@ -3318,6 +3325,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_raft_unit_tests = addFilteredTestRunArtifact(b, raft_unit_tests);
 
+    // The Antfly-rooted Raft tests below cover integration call sites but do
+    // not collect tests declared by the raft library's own root module.
+    const raft_library_tests = b.addTest(.{
+        .root_module = raft_engine_mod,
+    });
+    const run_raft_library_tests = b.addRunArtifact(raft_library_tests);
+    const raft_library_test_step = b.step("lib-raft-test", "Run standalone raft library tests");
+    raft_library_test_step.dependOn(&run_raft_library_tests.step);
+
     const raft_runtime_default_filters = [_][]const u8{
         "managed raft progress driver advances independently and joins on stop",
         "managed raft progress driver publishes source failure",
@@ -3371,7 +3387,7 @@ pub fn build(b: *std.Build) void {
         "cluster simulation drives merge transition actions deterministically",
     };
     const lib_raft_sim_tests = b.addTest(.{
-        .root_module = lib_test_mod,
+        .root_module = raft_sim_test_mod,
         .filters = &lib_raft_sim_default_filters,
     });
     const run_lib_raft_sim_tests = addFilteredTestRunArtifact(b, lib_raft_sim_tests);
@@ -3538,6 +3554,9 @@ pub fn build(b: *std.Build) void {
     serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
 
     const lib_data_runtime_default_filters = [_][]const u8{
+        "failed full index enrichment does not make resident reads unavailable",
+        "enrichment runtime status reports worker lifecycle diagnostics",
+        "enrichment index status encodes worker lifecycle diagnostics",
         "index repair scan periodically rediscovers debt after a lost wake",
         "index repair lost-wakeup fallback stays bounded at large group counts",
         "index repair lost-wakeup audit meets rotation target within supported envelope",
@@ -5578,6 +5597,7 @@ pub fn build(b: *std.Build) void {
     const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
     raft_test_step.dependOn(&run_raft_runtime_tests.step);
+    raft_test_step.dependOn(&run_raft_library_tests.step);
     raft_test_step.dependOn(&run_raft_ready_continuation_tests.step);
 
     const raft_runtime_test_step = b.step("raft-runtime-test", "Run focused managed Raft runtime tests");
@@ -5588,6 +5608,7 @@ pub fn build(b: *std.Build) void {
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
 
     unit_test_step.dependOn(&run_lib_regex_tests.step);
+    unit_test_step.dependOn(&run_raft_library_tests.step);
     unit_test_step.dependOn(&run_lib_jsonschema_tests.step);
     unit_test_step.dependOn(&run_lib_generating_tests.step);
     unit_test_step.dependOn(&run_lib_embeddings_tests.step);

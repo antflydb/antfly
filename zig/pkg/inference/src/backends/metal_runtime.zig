@@ -4215,6 +4215,17 @@ pub fn decoderRuntimeConvertDTypeF32Device(self: anytype, input: MetalTensor, ki
     return output_device;
 }
 
+fn metalSdpaRuntimeSucceeded(rc: c_int) !bool {
+    if (rc == -18) return error.MetalSdpaThreadgroupRequired;
+    return rc == 0;
+}
+
+test "metal runtime SDPA required threadgroup failure does not fall back" {
+    try std.testing.expect(try metalSdpaRuntimeSucceeded(0));
+    try std.testing.expect(!(try metalSdpaRuntimeSucceeded(-1)));
+    try std.testing.expectError(error.MetalSdpaThreadgroupRequired, metalSdpaRuntimeSucceeded(-18));
+}
+
 pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -4279,7 +4290,7 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
+    if (!try metalSdpaRuntimeSucceeded(rc)) return null;
     return output_device;
 }
 

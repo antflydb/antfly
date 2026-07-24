@@ -160,6 +160,17 @@ pub const PlacementPlanner = struct {
 
             var selected = std.ArrayListUnmanaged(u64).empty;
             defer selected.deinit(self.alloc);
+            const membership_repair = groupNeedsMembershipRepair(
+                current_intents,
+                range.group_id,
+                replica_count,
+                candidate_node_ids,
+                candidate_domains,
+                table.placement_role,
+            );
+            const protect_current_members =
+                std.sort.binarySearch(u64, protected_group_ids, range.group_id, compareNodeId) != null or
+                membership_repair;
             const preserved = try collectCurrentPeers(
                 self.alloc,
                 current_intents,
@@ -167,21 +178,38 @@ pub const PlacementPlanner = struct {
                 candidate_node_ids,
                 candidate_domains,
                 table.placement_role,
-                std.sort.binarySearch(u64, protected_group_ids, range.group_id, compareNodeId) != null,
+                protect_current_members,
             );
             defer self.alloc.free(preserved);
+            var selection_exclusions = std.ArrayListUnmanaged(u64).empty;
+            defer selection_exclusions.deinit(self.alloc);
             for (preserved) |node_id| {
                 if (selected.items.len >= replica_count) break;
                 try selected.append(self.alloc, node_id);
+                try selection_exclusions.append(self.alloc, node_id);
+            }
+            for (current_intents) |intent| {
+                if (intent.record.group_id != range.group_id or
+                    containsNode(selection_exclusions.items, intent.record.local_node_id))
+                    continue;
+                if (replicaIdExistsOnSelectedNode(current_intents, range.group_id, intent.record.replica_id, selected.items))
+                    try selection_exclusions.append(self.alloc, intent.record.local_node_id);
             }
 
             const start = @as(usize, @intCast(range.group_id % candidate_node_ids.len));
-            const ordered = try orderCandidates(self.alloc, candidate_node_ids, candidate_domains, start, &load_by_node);
+            const ordered = if (membership_repair)
+                try orderRepairCandidates(self.alloc, candidate_node_ids, range.group_id)
+            else
+                try orderCandidates(self.alloc, candidate_node_ids, candidate_domains, start, &load_by_node);
             defer self.alloc.free(ordered);
             while (selected.items.len < replica_count) {
-                const node_id = chooseNextCandidate(ordered, selected.items, &pair_by_nodes, candidate_domains, table.placement_role) orelse break;
+                const node_id = (if (membership_repair)
+                    chooseNextRepairCandidate(ordered, selection_exclusions.items, candidate_domains, table.placement_role)
+                else
+                    chooseNextCandidate(ordered, selection_exclusions.items, &pair_by_nodes, candidate_domains, table.placement_role)) orelse break;
                 if (containsNode(selected.items, node_id)) break;
                 try selected.append(self.alloc, node_id);
+                try selection_exclusions.append(self.alloc, node_id);
             }
 
             const dropped_sources = try collectDroppedCurrentPeers(self.alloc, current_intents, range.group_id, selected.items);
@@ -190,6 +218,8 @@ pub const PlacementPlanner = struct {
 
             const peers = try self.alloc.dupe(u64, selected.items);
             defer self.alloc.free(peers);
+            var assigned_replica_ids = std.ArrayListUnmanaged(u64).empty;
+            defer assigned_replica_ids.deinit(self.alloc);
             for (peers) |node_id| {
                 const entry = try load_by_node.getOrPut(self.alloc, node_id);
                 if (!entry.found_existing) entry.value_ptr.* = 0;
@@ -212,11 +242,14 @@ pub const PlacementPlanner = struct {
                 else
                     .persisted;
                 var source_intent: ?raft_reconciler.PlacementIntent = null;
+                var replacement_source: ?raft_reconciler.PlacementIntent = null;
                 if (existing_intent == null and has_current_group) {
-                    source_intent = if (dropped_source_index < dropped_sources.len)
-                        dropped_sources[dropped_source_index]
-                    else
-                        findRelocationSourceIntent(current_intents, range.group_id);
+                    if (dropped_source_index < dropped_sources.len) {
+                        replacement_source = dropped_sources[dropped_source_index];
+                        source_intent = replacement_source;
+                    } else {
+                        source_intent = findRelocationSourceIntent(current_intents, range.group_id);
+                    }
                     dropped_source_index += 1;
                 }
                 const serving_state: raft_reconciler.PlacementServingState = if (existing_intent) |existing|
@@ -225,10 +258,21 @@ pub const PlacementPlanner = struct {
                     .bootstrapping
                 else
                     .serving;
+                const preferred_replica_id = if (existing_intent) |existing|
+                    existing.record.replica_id
+                else if (replacement_source) |source|
+                    source.record.replica_id
+                else
+                    @as(u64, @intCast(replica_index + 1));
+                const replica_id = if (!containsNode(assigned_replica_ids.items, preferred_replica_id))
+                    preferred_replica_id
+                else
+                    firstUnusedReplicaId(assigned_replica_ids.items, replica_count);
+                try assigned_replica_ids.append(self.alloc, replica_id);
                 try out.append(self.alloc, .{
                     .record = .{
                         .group_id = range.group_id,
-                        .replica_id = @as(u64, @intCast(replica_index + 1)),
+                        .replica_id = replica_id,
                         .local_node_id = node_id,
                         .bootstrap_mode = bootstrap_mode,
                     },
@@ -357,6 +401,31 @@ fn chooseNextCandidate(
     return best_node;
 }
 
+fn chooseNextRepairCandidate(
+    ordered: []const u64,
+    selected: []const u64,
+    candidate_domains: []const CandidateDomain,
+    placement_role: []const u8,
+) ?u64 {
+    var best_node: ?u64 = null;
+    var best_domain_score: usize = std.math.maxInt(usize);
+    var best_order_index: usize = std.math.maxInt(usize);
+    for (ordered, 0..) |node_id, order_index| {
+        if (containsNode(selected, node_id)) continue;
+        if (!candidateSelectable(candidate_domains, node_id, placement_role)) continue;
+        const domain_score = domainScore(selected, node_id, candidate_domains);
+        if (best_node == null or
+            domain_score < best_domain_score or
+            (domain_score == best_domain_score and order_index < best_order_index))
+        {
+            best_node = node_id;
+            best_domain_score = domain_score;
+            best_order_index = order_index;
+        }
+    }
+    return best_node;
+}
+
 fn pairScore(
     selected: []const u64,
     candidate_node_id: u64,
@@ -475,6 +544,39 @@ fn orderCandidates(
     return out;
 }
 
+fn orderRepairCandidates(
+    alloc: std.mem.Allocator,
+    candidate_node_ids: []const u64,
+    group_id: u64,
+) ![]u64 {
+    const Candidate = struct {
+        node_id: u64,
+        repair_order: u64,
+    };
+
+    const ranked = try alloc.alloc(Candidate, candidate_node_ids.len);
+    defer alloc.free(ranked);
+    for (candidate_node_ids, 0..) |node_id, i| {
+        ranked[i] = .{
+            .node_id = node_id,
+            // Membership repair must choose the same replacement from a stale
+            // projection retry. Live load and capacity signals are deliberately
+            // excluded; they can change between otherwise identical plans.
+            .repair_order = (node_id *% 0x9e3779b97f4a7c15) ^ group_id,
+        };
+    }
+    std.mem.sort(Candidate, ranked, {}, struct {
+        fn lessThan(_: void, a: Candidate, b: Candidate) bool {
+            if (a.repair_order != b.repair_order) return a.repair_order < b.repair_order;
+            return a.node_id < b.node_id;
+        }
+    }.lessThan);
+
+    const out = try alloc.alloc(u64, candidate_node_ids.len);
+    for (ranked, 0..) |candidate, i| out[i] = candidate.node_id;
+    return out;
+}
+
 fn collectCurrentPeers(
     alloc: std.mem.Allocator,
     current_intents: []const raft_reconciler.PlacementIntent,
@@ -487,6 +589,8 @@ fn collectCurrentPeers(
     const ExistingPeer = struct {
         node_id: u64,
         replica_id: u64,
+        relocation_generation: u64,
+        serving_state: raft_reconciler.PlacementServingState,
     };
 
     var peers = std.ArrayListUnmanaged(ExistingPeer).empty;
@@ -507,19 +611,46 @@ fn collectCurrentPeers(
         try peers.append(alloc, .{
             .node_id = intent.record.local_node_id,
             .replica_id = intent.record.replica_id,
+            .relocation_generation = intent.relocation_generation,
+            .serving_state = intent.serving_state,
         });
     }
     std.mem.sort(ExistingPeer, peers.items, {}, struct {
         fn lessThan(_: void, a: ExistingPeer, b: ExistingPeer) bool {
-            if (a.replica_id == b.replica_id) return a.node_id < b.node_id;
-            return a.replica_id < b.replica_id;
+            if (a.replica_id != b.replica_id) return a.replica_id < b.replica_id;
+            const a_rank = placementServingStateRank(a.serving_state);
+            const b_rank = placementServingStateRank(b.serving_state);
+            if (a_rank != b_rank) return a_rank > b_rank;
+            if (a.relocation_generation != b.relocation_generation)
+                return a.relocation_generation > b.relocation_generation;
+            return a.node_id < b.node_id;
         }
     }.lessThan);
+
+    var unique_count: usize = 0;
+    for (peers.items) |peer| {
+        if (unique_count > 0 and peers.items[unique_count - 1].replica_id == peer.replica_id) continue;
+        peers.items[unique_count] = peer;
+        unique_count += 1;
+    }
+    peers.items.len = unique_count;
 
     const out = try alloc.alloc(u64, peers.items.len);
     for (peers.items, 0..) |peer, i| out[i] = peer.node_id;
     peers.deinit(alloc);
     return out;
+}
+
+fn placementServingStateRank(state: raft_reconciler.PlacementServingState) u8 {
+    return switch (state) {
+        .serving => 6,
+        .cutover_ready => 5,
+        .replaying => 4,
+        .bootstrapping => 3,
+        .planned => 2,
+        .draining => 1,
+        .retiring => 0,
+    };
 }
 
 fn collectDroppedCurrentPeers(
@@ -557,6 +688,28 @@ fn findCurrentIntent(
         return intent;
     }
     return null;
+}
+
+fn replicaIdExistsOnSelectedNode(
+    current_intents: []const raft_reconciler.PlacementIntent,
+    group_id: u64,
+    replica_id: u64,
+    selected_nodes: []const u64,
+) bool {
+    for (current_intents) |intent| {
+        if (intent.record.group_id == group_id and
+            intent.record.replica_id == replica_id and
+            containsNode(selected_nodes, intent.record.local_node_id))
+            return true;
+    }
+    return false;
+}
+
+fn firstUnusedReplicaId(used_replica_ids: []const u64, replica_count: usize) u64 {
+    for (1..replica_count + 1) |candidate| {
+        if (!containsNode(used_replica_ids, @intCast(candidate))) return @intCast(candidate);
+    }
+    unreachable;
 }
 
 fn load_byNode(load_by_node: *const std.AutoHashMapUnmanaged(u64, usize), node_id: u64) usize {
@@ -602,6 +755,31 @@ fn candidateRetentionAllowed(candidate_domains: []const CandidateDomain, node_id
         }
     }
     return true;
+}
+
+fn groupNeedsMembershipRepair(
+    current_intents: []const raft_reconciler.PlacementIntent,
+    group_id: u64,
+    replica_count: usize,
+    candidate_node_ids: []const u64,
+    candidate_domains: []const CandidateDomain,
+    placement_role: []const u8,
+) bool {
+    var current_count: usize = 0;
+    for (current_intents, 0..) |intent, i| {
+        if (intent.record.group_id != group_id) continue;
+        current_count += 1;
+        if (!containsNode(candidate_node_ids, intent.record.local_node_id) or
+            !candidateSelectable(candidate_domains, intent.record.local_node_id, placement_role))
+            return true;
+        for (current_intents[i + 1 ..]) |other| {
+            if (other.record.group_id == group_id and
+                (other.record.replica_id == intent.record.replica_id or
+                    other.record.local_node_id == intent.record.local_node_id))
+                return true;
+        }
+    }
+    return current_count != 0 and current_count != replica_count;
 }
 
 fn containsNode(nodes: []const u64, node_id: u64) bool {
@@ -913,14 +1091,17 @@ test "placement planner tags replacement with the dropped current peer as source
         .{ .record = .{ .group_id = 1501, .replica_id = 3, .local_node_id = 102, .bootstrap_mode = .persisted }, .store_id = 102, .peer_node_ids = &.{ 105, 101, 102 }, .serving_state = .serving },
     };
     const candidate_domains = [_]CandidateDomain{
+        .{ .node_id = 101, .store_id = 101, .role = "data", .failure_domain = "rack-a", .status_tag = .excluded, .retain_current = false },
         .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b" },
         .{ .node_id = 103, .store_id = 103, .role = "data", .failure_domain = "rack-c" },
         .{ .node_id = 104, .store_id = 104, .role = "data", .failure_domain = "rack-d" },
-        .{ .node_id = 105, .store_id = 105, .role = "data", .failure_domain = "rack-e" },
+        // A load rebalance request must not move this healthy survivor in the
+        // same plan that replaces the excluded member.
+        .{ .node_id = 105, .store_id = 105, .role = "data", .failure_domain = "rack-e", .retain_current = false },
     };
 
     var planner = PlacementPlanner.init(std.testing.allocator);
-    const intents = try planner.planAllIntentsWithCurrentAndDomains(&manager, &.{ 102, 103, 104, 105 }, &current, &candidate_domains);
+    const intents = try planner.planAllIntentsWithCurrentAndDomains(&manager, &.{ 101, 102, 103, 104, 105 }, &current, &candidate_domains);
     defer planner.freeIntents(std.testing.allocator, intents);
 
     var replacement: ?raft_reconciler.PlacementIntent = null;
@@ -929,9 +1110,32 @@ test "placement planner tags replacement with the dropped current peer as source
         if (findCurrentIntent(&current, 1501, intent.record.local_node_id) == null) replacement = intent;
     }
     const target = replacement orelse return error.MissingReplacement;
+    try std.testing.expectEqual(@as(u64, 2), target.record.replica_id);
     try std.testing.expectEqual(@as(u64, 101), target.relocation_source_node_id);
     try std.testing.expectEqual(@as(u64, 101), target.relocation_source_store_id);
     try std.testing.expectEqual(raft_reconciler.PlacementServingState.bootstrapping, target.serving_state);
+    try std.testing.expectEqual(@as(u64, 1), findCurrentIntent(intents, 1501, 105).?.record.replica_id);
+    try std.testing.expectEqual(@as(u64, 3), findCurrentIntent(intents, 1501, 102).?.record.replica_id);
+
+    const changed_candidates = [_]CandidateDomain{
+        .{ .node_id = 105, .store_id = 105, .role = "data", .failure_domain = "rack-e", .retain_current = false, .read_load = 999 },
+        .{ .node_id = 104, .store_id = 104, .role = "data", .failure_domain = "rack-d", .available_bytes = 1 },
+        .{ .node_id = 103, .store_id = 103, .role = "data", .failure_domain = "rack-c", .write_load = 999 },
+        .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b", .available_bytes = std.math.maxInt(u64) },
+        .{ .node_id = 101, .store_id = 101, .role = "data", .failure_domain = "rack-a", .status_tag = .excluded, .retain_current = false },
+    };
+    const retried = try planner.planAllIntentsWithCurrentAndDomains(
+        &manager,
+        &.{ 105, 104, 103, 102, 101 },
+        &current,
+        &changed_candidates,
+    );
+    defer planner.freeIntents(std.testing.allocator, retried);
+    var retried_target: ?raft_reconciler.PlacementIntent = null;
+    for (retried) |intent| {
+        if (findCurrentIntent(&current, 1501, intent.record.local_node_id) == null) retried_target = intent;
+    }
+    try std.testing.expectEqual(target.record.local_node_id, retried_target.?.record.local_node_id);
 }
 
 test "placement planner preserves protected unconverged members during forced rebalance" {
@@ -972,4 +1176,171 @@ test "placement planner preserves protected unconverged members during forced re
     try std.testing.expect(findCurrentIntent(intents, 15101, 101) != null);
     try std.testing.expect(findCurrentIntent(intents, 15101, 102) != null);
     try std.testing.expect(findCurrentIntent(intents, 15101, 105) != null);
+}
+
+test "placement planner keeps the most advanced duplicate replacement member" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 152, .name = "docs", .desired_replica_count = 3 });
+    try manager.upsertRange(.{
+        .group_id = 15201,
+        .table_id = 152,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    // A prior reconciliation may leave more than one replacement carrying the
+    // retired replica id. Protected planning must latch the replacement that
+    // made the most progress instead of switching targets by node id.
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 15201, .replica_id = 1, .local_node_id = 101 }, .peer_node_ids = &.{ 101, 102, 103, 104, 105 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 15201, .replica_id = 2, .local_node_id = 102 }, .peer_node_ids = &.{ 101, 102, 103, 104, 105 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 15201, .replica_id = 3, .local_node_id = 103 }, .peer_node_ids = &.{ 101, 102, 103, 104, 105 }, .serving_state = .draining, .relocation_generation = 10 },
+        .{ .record = .{ .group_id = 15201, .replica_id = 3, .local_node_id = 104 }, .peer_node_ids = &.{ 101, 102, 103, 104, 105 }, .serving_state = .serving, .relocation_generation = 11 },
+        .{ .record = .{ .group_id = 15201, .replica_id = 3, .local_node_id = 105 }, .peer_node_ids = &.{ 101, 102, 103, 104, 105 }, .serving_state = .draining, .relocation_generation = 1 },
+    };
+    const candidates = [_]CandidateDomain{
+        .{ .node_id = 101, .role = "data", .failure_domain = "", .retain_current = false },
+        .{ .node_id = 102, .role = "data", .failure_domain = "", .retain_current = false },
+        .{ .node_id = 103, .role = "data", .failure_domain = "", .retain_current = false },
+        .{ .node_id = 104, .role = "data", .failure_domain = "", .retain_current = false },
+        .{ .node_id = 105, .role = "data", .failure_domain = "", .status_tag = .excluded, .retain_current = false },
+    };
+
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const intents = try planner.planAllIntentsWithConstraints(
+        &manager,
+        &.{ 101, 102, 103, 104, 105 },
+        &current,
+        &candidates,
+        &.{},
+        &.{15201},
+    );
+    defer planner.freeIntents(std.testing.allocator, intents);
+
+    try std.testing.expectEqual(@as(usize, 3), intents.len);
+    try std.testing.expect(findCurrentIntent(intents, 15201, 104) != null);
+    try std.testing.expect(findCurrentIntent(intents, 15201, 103) == null);
+    try std.testing.expect(findCurrentIntent(intents, 15201, 105) == null);
+}
+
+test "placement planner repairs quota-full duplicate replica ids" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 153, .name = "docs", .desired_replica_count = 3 });
+    try manager.upsertRange(.{
+        .group_id = 15301,
+        .table_id = 153,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 15301, .replica_id = 1, .local_node_id = 101 }, .peer_node_ids = &.{ 101, 102, 103 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 15301, .replica_id = 2, .local_node_id = 102 }, .peer_node_ids = &.{ 101, 102, 103 }, .serving_state = .planned, .relocation_generation = 10 },
+        .{ .record = .{ .group_id = 15301, .replica_id = 2, .local_node_id = 103 }, .peer_node_ids = &.{ 101, 102, 103 }, .serving_state = .serving, .relocation_generation = 11 },
+    };
+    const candidates = [_]CandidateDomain{
+        .{ .node_id = 101, .role = "data", .failure_domain = "" },
+        .{ .node_id = 102, .role = "data", .failure_domain = "" },
+        .{ .node_id = 103, .role = "data", .failure_domain = "" },
+        .{ .node_id = 104, .role = "data", .failure_domain = "" },
+    };
+
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const intents = try planner.planAllIntentsWithConstraints(
+        &manager,
+        &.{ 101, 102, 103, 104 },
+        &current,
+        &candidates,
+        &.{},
+        &.{15301},
+    );
+    defer planner.freeIntents(std.testing.allocator, intents);
+
+    try std.testing.expectEqual(@as(usize, 3), intents.len);
+    try std.testing.expect(findCurrentIntent(intents, 15301, 101) != null);
+    try std.testing.expect(findCurrentIntent(intents, 15301, 103) != null);
+    try std.testing.expect(findCurrentIntent(intents, 15301, 102) == null);
+    var replica_ids: [3]u64 = undefined;
+    for (intents, 0..) |intent, i| replica_ids[i] = intent.record.replica_id;
+    std.mem.sort(u64, &replica_ids, {}, std.sort.asc(u64));
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, &replica_ids);
+}
+
+test "placement planner repairs missing replicas with a stable target" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 154, .name = "docs", .desired_replica_count = 3 });
+    try manager.upsertRange(.{
+        .group_id = 15401,
+        .table_id = 154,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 15401, .replica_id = 1, .local_node_id = 101 }, .peer_node_ids = &.{ 101, 102 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 15401, .replica_id = 2, .local_node_id = 102 }, .peer_node_ids = &.{ 101, 102 }, .serving_state = .serving },
+    };
+    const candidates = [_]CandidateDomain{
+        .{ .node_id = 101, .role = "data", .failure_domain = "rack-a" },
+        .{ .node_id = 102, .role = "data", .failure_domain = "rack-b" },
+        .{ .node_id = 103, .role = "data", .failure_domain = "rack-c", .available_bytes = std.math.maxInt(u64) },
+        .{ .node_id = 104, .role = "data", .failure_domain = "rack-d", .read_load = 500 },
+        .{ .node_id = 105, .role = "data", .failure_domain = "rack-e", .write_load = 500 },
+    };
+
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const first = try planner.planAllIntentsWithCurrentAndDomains(
+        &manager,
+        &.{ 101, 102, 103, 104, 105 },
+        &current,
+        &candidates,
+    );
+    defer planner.freeIntents(std.testing.allocator, first);
+
+    const changed_candidates = [_]CandidateDomain{
+        .{ .node_id = 105, .role = "data", .failure_domain = "rack-e", .available_bytes = std.math.maxInt(u64) },
+        .{ .node_id = 104, .role = "data", .failure_domain = "rack-d", .write_load = 700 },
+        .{ .node_id = 103, .role = "data", .failure_domain = "rack-c", .read_load = 700 },
+        .{ .node_id = 102, .role = "data", .failure_domain = "rack-b" },
+        .{ .node_id = 101, .role = "data", .failure_domain = "rack-a" },
+    };
+    const retried = try planner.planAllIntentsWithCurrentAndDomains(
+        &manager,
+        &.{ 105, 104, 103, 102, 101 },
+        &current,
+        &changed_candidates,
+    );
+    defer planner.freeIntents(std.testing.allocator, retried);
+
+    var first_target: ?raft_reconciler.PlacementIntent = null;
+    var retried_target: ?raft_reconciler.PlacementIntent = null;
+    for (first) |intent| {
+        if (findCurrentIntent(&current, 15401, intent.record.local_node_id) == null) first_target = intent;
+    }
+    for (retried) |intent| {
+        if (findCurrentIntent(&current, 15401, intent.record.local_node_id) == null) retried_target = intent;
+    }
+    try std.testing.expectEqual(@as(usize, 3), first.len);
+    try std.testing.expectEqual(first_target.?.record.local_node_id, retried_target.?.record.local_node_id);
+    try std.testing.expectEqual(@as(u64, 3), first_target.?.record.replica_id);
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.bootstrapping, first_target.?.serving_state);
+}
+
+test "membership repair detects under and over replication" {
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 15501, .replica_id = 1, .local_node_id = 101 } },
+        .{ .record = .{ .group_id = 15501, .replica_id = 2, .local_node_id = 102 } },
+    };
+    const candidates = [_]CandidateDomain{
+        .{ .node_id = 101, .role = "data" },
+        .{ .node_id = 102, .role = "data" },
+        .{ .node_id = 103, .role = "data" },
+    };
+
+    try std.testing.expect(!groupNeedsMembershipRepair(&current, 15501, 2, &.{ 101, 102, 103 }, &candidates, "data"));
+    try std.testing.expect(groupNeedsMembershipRepair(&current, 15501, 3, &.{ 101, 102, 103 }, &candidates, "data"));
+    try std.testing.expect(groupNeedsMembershipRepair(&current, 15501, 1, &.{ 101, 102, 103 }, &candidates, "data"));
 }

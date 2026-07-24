@@ -1589,6 +1589,8 @@ fn aggregateEnrichmentStats(dst: *db_mod.types.EnrichmentStats, src: db_mod.type
     dst.fatal_error_count += src.fatal_error_count;
     dst.retrying = dst.retrying or src.retrying;
     dst.worker_failed = dst.worker_failed or src.worker_failed;
+    dst.worker_started = dst.worker_started or src.worker_started;
+    dst.stalled = dst.stalled or src.stalled;
     dst.skip_by_hash_count += src.skip_by_hash_count;
     dst.skipped_source_count += src.skipped_source_count;
     dst.codec_decode_failures += src.codec_decode_failures;
@@ -2338,6 +2340,10 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try out.appendSlice(alloc, if (stats.retrying) "true" else "false");
     try out.appendSlice(alloc, ",\"worker_failed\":");
     try out.appendSlice(alloc, if (stats.worker_failed) "true" else "false");
+    try out.appendSlice(alloc, ",\"worker_started\":");
+    try out.appendSlice(alloc, if (stats.worker_started) "true" else "false");
+    try out.appendSlice(alloc, ",\"stalled\":");
+    try out.appendSlice(alloc, if (stats.stalled) "true" else "false");
     try out.appendSlice(alloc, ",\"skip_by_hash_count\":");
     try appendIntValue(alloc, out, stats.skip_by_hash_count);
     try out.appendSlice(alloc, ",\"skipped_source_count\":");
@@ -2371,6 +2377,22 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try out.appendSlice(alloc, ",\"total_embed_ns\":");
     try appendIntValue(alloc, out, stats.total_embed_ns);
     try out.append(alloc, '}');
+}
+
+test "enrichment index status encodes worker lifecycle diagnostics" {
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+
+    try appendEnrichmentRuntimeStatus(std.testing.allocator, &encoded, .{
+        .enabled = true,
+        .target_sequence = 5,
+        .applied_sequence = 1,
+        .worker_started = false,
+        .stalled = true,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"worker_started\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"stalled\":true") != null);
 }
 
 fn appendSingleIndexRuntimeStatus(
@@ -4100,7 +4122,7 @@ test "index encoders aggregate preserved synthetic shard counters" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
 }
 
-test "single embeddings index encoder treats stale enrichment tail as ready when coverage is complete" {
+test "single embeddings index encoder fences stale runtime materialization" {
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -4158,12 +4180,14 @@ test "single embeddings index encoder treats stale enrichment tail as ready when
 
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_visible_doc_count\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"runtime_fresh\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"stale_groups\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending_sequence_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending_sequence_count\":0") != null);
 }
 
 test "index encoders report missing and stale topology groups without probing databases" {
@@ -4225,6 +4249,11 @@ test "index encoders report missing and stale topology groups without probing da
 }
 
 test "single embeddings index encoder exposes replay and enrichment runtime state" {
+    const config_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "semantic_idx", parsed_config.value);
+
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -4234,6 +4263,10 @@ test "single embeddings index encoder exposes replay and enrichment runtime stat
         .node_count = 1,
         .backfill_active = true,
         .backfill_progress = 0.2,
+        .coverage_produced_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 1,
         .replay_target_sequence = 5,
         .replay_catch_up_required = true,
@@ -4244,8 +4277,10 @@ test "single embeddings index encoder exposes replay and enrichment runtime stat
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 1,
+            .source_doc_count = 1,
             .index_count = 1,
             .indexes = indexes,
             .enrichment = .{
@@ -4267,7 +4302,7 @@ test "single embeddings index encoder exposes replay and enrichment runtime stat
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -4280,7 +4315,9 @@ test "single embeddings index encoder exposes replay and enrichment runtime stat
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.200") != null);
+    // Coverage is complete even though replay is retrying. Keep those two
+    // dimensions separate instead of presenting replay lag as missing rows.
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":1.000") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"retrying\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":5") != null);
@@ -4293,6 +4330,11 @@ test "single embeddings index encoder exposes replay and enrichment runtime stat
 }
 
 test "single embeddings index encoder synthesizes replay state from enrichment runtime" {
+    const config_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "semantic_idx", parsed_config.value);
+
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -4300,6 +4342,10 @@ test "single embeddings index encoder synthesizes replay state from enrichment r
         .kind = .dense_vector,
         .doc_count = 1,
         .node_count = 1,
+        .coverage_produced_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
     };
     defer std.testing.allocator.free(indexes[0].name);
 
@@ -4307,8 +4353,10 @@ test "single embeddings index encoder synthesizes replay state from enrichment r
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 1,
+            .source_doc_count = 1,
             .index_count = 1,
             .indexes = indexes,
             .enrichment = .{
@@ -4330,7 +4378,7 @@ test "single embeddings index encoder synthesizes replay state from enrichment r
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -4356,6 +4404,15 @@ test "single embeddings index encoder synthesizes replay state from enrichment r
 
 test "single embeddings index encoder scopes isolated enrichment failure to one index" {
     const alloc = std.testing.allocator;
+    const visual_config_json = "{\"type\":\"embeddings\",\"field\":\"image\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_visual_config = try std.json.parseFromSlice(std.json.Value, alloc, visual_config_json, .{});
+    defer parsed_visual_config.deinit();
+    const visual_config_hash = try expectedCoverageConfigHash(alloc, "visual_idx", parsed_visual_config.value);
+    const semantic_config_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_semantic_config = try std.json.parseFromSlice(std.json.Value, alloc, semantic_config_json, .{});
+    defer parsed_semantic_config.deinit();
+    const semantic_config_hash = try expectedCoverageConfigHash(alloc, "semantic_idx", parsed_semantic_config.value);
+
     const indexes = try alloc.alloc(db_mod.types.DBIndexStats, 2);
     defer alloc.free(indexes);
     indexes[0] = .{
@@ -4363,6 +4420,9 @@ test "single embeddings index encoder scopes isolated enrichment failure to one 
         .kind = .dense_vector,
         .doc_count = 0,
         .node_count = 0,
+        .coverage_generation = 42,
+        .coverage_config_hash = visual_config_hash,
+        .coverage_identity_ready = true,
         .enrichment_failed = true,
     };
     indexes[1] = .{
@@ -4370,6 +4430,10 @@ test "single embeddings index encoder scopes isolated enrichment failure to one 
         .kind = .dense_vector,
         .doc_count = 1,
         .node_count = 1,
+        .coverage_produced_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = semantic_config_hash,
+        .coverage_identity_ready = true,
     };
     defer alloc.free(indexes[0].name);
     defer alloc.free(indexes[1].name);
@@ -4381,6 +4445,7 @@ test "single embeddings index encoder scopes isolated enrichment failure to one 
         .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 1,
+            .source_doc_count = 1,
             .index_count = 2,
             .indexes = indexes,
             .enrichment = .{
@@ -4402,7 +4467,7 @@ test "single embeddings index encoder scopes isolated enrichment failure to one 
             .table_id = 7,
             .name = "docs",
             .indexes_json =
-            \\{"visual_idx":{"type":"embeddings","field":"image","dimension":3},"semantic_idx":{"type":"embeddings","field":"body","dimension":3}}
+            \\{"visual_idx":{"type":"embeddings","field":"image","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"_coverage_incarnation":42},"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"_coverage_incarnation":42}}
             ,
             .placement_role = "data",
         }})[0..]),
@@ -4425,6 +4490,11 @@ test "single embeddings index encoder scopes isolated enrichment failure to one 
 }
 
 test "single embeddings index encoder keeps published visibility separate from replay debt" {
+    const config_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "semantic_idx", parsed_config.value);
+
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -4432,6 +4502,10 @@ test "single embeddings index encoder keeps published visibility separate from r
         .kind = .dense_vector,
         .doc_count = 3,
         .node_count = 1,
+        .coverage_produced_count = 3,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 0,
         .replay_target_sequence = 3,
         .replay_catch_up_required = true,
@@ -4445,6 +4519,7 @@ test "single embeddings index encoder keeps published visibility separate from r
         .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 3,
+            .source_doc_count = 3,
             .index_count = 1,
             .indexes = indexes,
         },
@@ -4456,7 +4531,7 @@ test "single embeddings index encoder keeps published visibility separate from r
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -4468,16 +4543,22 @@ test "single embeddings index encoder keeps published visibility separate from r
 
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":1.000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_visible_doc_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":true") != null);
 }
 
 test "single embeddings index encoder keeps backfill active while enrichment replay lags" {
+    const config_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "semantic_idx", parsed_config.value);
+
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -4485,6 +4566,10 @@ test "single embeddings index encoder keeps backfill active while enrichment rep
         .kind = .dense_vector,
         .doc_count = 3,
         .node_count = 1,
+        .coverage_produced_count = 3,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 3,
         .replay_target_sequence = 3,
         .replay_catch_up_required = false,
@@ -4498,6 +4583,7 @@ test "single embeddings index encoder keeps backfill active while enrichment rep
         .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 3,
+            .source_doc_count = 3,
             .index_count = 1,
             .indexes = indexes,
             .enrichment = .{
@@ -4515,7 +4601,7 @@ test "single embeddings index encoder keeps backfill active while enrichment rep
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -5323,6 +5409,11 @@ test "empty embeddings index status is ready without dense artifact visibility" 
 }
 
 test "single embeddings index encoder keeps partial backfill active while indexed docs lag table docs" {
+    const config_json = "{\"type\":\"embeddings\",\"coverage_policy\":\"partial\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "semantic_idx", parsed_config.value);
+
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -5330,6 +5421,9 @@ test "single embeddings index encoder keeps partial backfill active while indexe
         .kind = .dense_vector,
         .doc_count = 0,
         .node_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 1,
         .replay_target_sequence = 1,
     };
@@ -5339,8 +5433,10 @@ test "single embeddings index encoder keeps partial backfill active while indexe
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 3,
+            .source_doc_count = 3,
             .index_count = 1,
             .indexes = indexes,
             .enrichment = .{
@@ -5355,7 +5451,7 @@ test "single embeddings index encoder keeps partial backfill active while indexe
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"coverage_policy\":\"partial\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),

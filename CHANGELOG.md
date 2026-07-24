@@ -21,6 +21,15 @@ All notable changes to Antfly will be documented in this file.
 
 ## Releases
 
+### [0.2.0] - Unreleased
+
+#### Upgrade compatibility
+
+Antfly 0.2.0 is not an in-place data-directory upgrade from 0.1.x. Durable
+formats changed without a 0.1.x compatibility path. Replace or wipe 0.1.x pods
+and create fresh 0.2.0 data directories; export and restore any data that must
+be retained.
+
 ### [0.1.1] - 2026-03-31
 
 #### Highlights

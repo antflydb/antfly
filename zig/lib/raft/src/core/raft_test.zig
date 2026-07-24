@@ -508,7 +508,7 @@ test "leader incrementally catches up follower within retained snapshot suffix" 
             .term = 11,
             .conf_state = .{ .voters = voters[0..] },
         },
-        .data = "latest-state",
+        .data = @constCast("latest-state"),
     }, 7);
     storage.setHardState(.{ .current_term = 11, .commit_index = 11 });
 
@@ -948,8 +948,9 @@ test "removed leader rejects proposals without mutating its log" {
     const last_index = raft.status().last_index;
     try std.testing.expectEqual(types.StateRole.leader, raft.status().soft.role);
     try std.testing.expectError(error.NotLeader, raft.propose("must-not-append"));
+    var changes = [_]types.ConfChangeSingle{.{ .change_type = .add_node, .node_id = 3 }};
     try std.testing.expectError(error.NotLeader, raft.proposeConfChangeV2(.{
-        .changes = &.{.{ .change_type = .add_node, .node_id = 3 }},
+        .changes = changes[0..],
     }));
     try std.testing.expectEqual(last_index, raft.status().last_index);
 }

@@ -25123,13 +25123,14 @@ test "provisioned managed replay tails converge and publish without later traffi
     reopened.db.setQueryVisibilityHook(null);
 }
 
-test "provisioned write cache invalidation closes failed managed enrichment db without aborting" {
+test "failed full index enrichment does not make resident reads unavailable" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-managed-dense-write-cache-failed-close";
 
     const FakeEmbeddingProvider = struct {
         var request_count: std.atomic.Value(u32) = .init(0);
         var rate_limited_count: std.atomic.Value(u32) = .init(0);
+        var allow_first_success: std.atomic.Value(bool) = .init(false);
 
         fn executor() http_common.RequestExecutor {
             return .{
@@ -25148,7 +25149,7 @@ test "provisioned write cache invalidation closes failed managed enrichment db w
             defer parsed_req.deinit();
 
             const request_index = request_count.fetchAdd(1, .monotonic);
-            if (request_index == 0) {
+            if (allow_first_success.load(.acquire) and request_index == 0) {
                 const body = try std.fmt.allocPrint(
                     arena,
                     "{{\"object\":\"list\",\"data\":[{{\"object\":\"embedding\",\"index\":0,\"embedding\":[1,0,0]}}],\"model\":\"test-embed\",\"usage\":{{\"prompt_tokens\":1,\"total_tokens\":1}}}}",
@@ -25175,6 +25176,33 @@ test "provisioned write cache invalidation closes failed managed enrichment db w
 
     const FakeCatalog = struct {
         var indexes_json_buf: []const u8 = "";
+        var tables = [_]metadata_table_manager.TableRecord{
+            .{
+                .table_id = 7,
+                .name = "docs",
+                .placement_role = "data",
+            },
+            .{
+                .table_id = 8,
+                .name = "stable",
+                .placement_role = "data",
+                .indexes_json = "{\"indexes\":[]}",
+            },
+        };
+        var ranges = [_]metadata_table_manager.RangeRecord{
+            .{
+                .group_id = 7001,
+                .table_id = 7,
+                .start_key = "",
+                .end_key = null,
+            },
+            .{
+                .group_id = 7002,
+                .table_id = 8,
+                .start_key = "",
+                .end_key = null,
+            },
+        };
 
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -25187,20 +25215,11 @@ test "provisioned write cache invalidation closes failed managed enrichment db w
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            tables[0].indexes_json = indexes_json_buf;
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .placement_role = "data",
-                    .indexes_json = indexes_json_buf,
-                }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                    .group_id = 7001,
-                    .table_id = 7,
-                    .start_key = "",
-                    .end_key = null,
-                }})[0..]),
+                .tables = tables[0..],
+                .ranges = ranges[0..],
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -25229,12 +25248,22 @@ test "provisioned write cache invalidation closes failed managed enrichment db w
 
     FakeEmbeddingProvider.request_count.store(0, .monotonic);
     FakeEmbeddingProvider.rate_limited_count.store(0, .monotonic);
+    FakeEmbeddingProvider.allow_first_success.store(false, .monotonic);
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
     source.write_cache = &write_cache;
+
+    _ = try source.source().batch(alloc, "stable", .{
+        .writes = &.{.{
+            .key = "doc:stable",
+            .value = "{\"body\":\"stable body\"}",
+        }},
+        .sync_level = .write,
+    });
+
     _ = try source.source().batch(alloc, "docs", .{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"body\":\"alpha body\"}" },
@@ -25249,11 +25278,45 @@ test "provisioned write cache invalidation closes failed managed enrichment db w
     }
 
     try std.testing.expect(FakeEmbeddingProvider.rate_limited_count.load(.monotonic) > 0);
+    try std.testing.expectEqual(@as(usize, 2), write_cache.entries.items.len);
+
+    FakeEmbeddingProvider.request_count.store(0, .monotonic);
+    FakeEmbeddingProvider.allow_first_success.store(true, .release);
+    try std.testing.expectError(error.EmbedRateLimited, source.source().batch(alloc, "docs", .{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"updated alpha body\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"updated beta body\"}" },
+        },
+        .sync_level = .full_index,
+    }));
+
+    // The failed request invalidates only its table's resident writer. No
+    // successful follow-up write is needed before either table can be read.
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
 
-    source.invalidateWriteCache("docs");
+    const resident = source.residentDbSource();
+    var affected = (try resident.leaseGroup(
+        alloc,
+        "docs",
+        7001,
+        table_reads.backend_current_root_generation,
+    )).?;
+    defer affected.release(alloc);
+    var affected_doc = (try affected.db.lookup(alloc, "doc:a", .{})).?;
+    defer affected_doc.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, affected_doc.json, "alpha body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, affected_doc.json, "updated alpha body") == null);
 
-    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    var unrelated = (try resident.leaseGroup(
+        alloc,
+        "stable",
+        7002,
+        table_reads.backend_current_root_generation,
+    )).?;
+    defer unrelated.release(alloc);
+    var unrelated_doc = (try unrelated.db.lookup(alloc, "doc:stable", .{})).?;
+    defer unrelated_doc.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, unrelated_doc.json, "stable body") != null);
 }
 
 test "provisioned table write source invalidates cached query db after managed dense replay becomes visible" {

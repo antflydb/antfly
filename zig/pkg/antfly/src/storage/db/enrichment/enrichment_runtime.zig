@@ -1575,8 +1575,13 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         const ownership_stats = self.ownership.stats();
         const projection_status = runtimeProjectionStatus(self.retrying, self.worker_failed);
         const config_hash = enrichmentCatalogConfigHash(self.alloc, self.index_manager) catch 0;
+        const enabled = self.config.dense_embedder != null or
+            self.config.sparse_embedder != null or
+            self.config.asset_producer != null or
+            self.config.enable_without_producers;
+        const worker_started = self.future != null;
         return .{
-            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null or self.config.asset_producer != null or self.config.enable_without_producers,
+            .enabled = enabled,
             .lease_owned = ownership_stats.lease_owned,
             .has_lease = ownership_stats.has_lease,
             .acquisition_count = ownership_stats.acquisition_count,
@@ -1595,6 +1600,15 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .fatal_error_count = self.fatal_error_count,
             .retrying = self.retrying,
             .worker_failed = self.worker_failed,
+            .worker_started = worker_started,
+            .stalled = enrichmentWorkerStalled(
+                enabled,
+                self.target_sequence,
+                self.applied_sequence,
+                worker_started,
+                self.retrying,
+                self.worker_failed,
+            ),
             .skip_by_hash_count = self.skip_by_hash_count,
             .skipped_source_count = self.skipped_source_count,
             .codec_decode_failures = self.codec_decode_failures,
@@ -1659,6 +1673,30 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.notifyStatusHook();
     }
 };
+
+fn enrichmentWorkerStalled(
+    enabled: bool,
+    target_sequence: u64,
+    applied_sequence: u64,
+    worker_started: bool,
+    retrying: bool,
+    worker_failed: bool,
+) bool {
+    return enabled and
+        target_sequence > applied_sequence and
+        !worker_started and
+        !retrying and
+        !worker_failed;
+}
+
+test "enrichment runtime status reports worker lifecycle diagnostics" {
+    try std.testing.expect(enrichmentWorkerStalled(true, 5, 1, false, false, false));
+    try std.testing.expect(!enrichmentWorkerStalled(true, 5, 1, true, false, false));
+    try std.testing.expect(!enrichmentWorkerStalled(true, 5, 1, false, true, false));
+    try std.testing.expect(!enrichmentWorkerStalled(true, 5, 1, false, false, true));
+    try std.testing.expect(!enrichmentWorkerStalled(true, 5, 5, false, false, false));
+    try std.testing.expect(!enrichmentWorkerStalled(false, 5, 1, false, false, false));
+}
 
 fn handleWorkerLoopError(runtime: *EnrichmentRuntime, io: Io, err: anyerror) void {
     if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;

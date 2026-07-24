@@ -167,6 +167,7 @@ const PendingApplyTask = struct {
     snapshot: ?core.types.Snapshot,
     entries: []core.Entry,
     read_states: []core.ReadState,
+    conf_state: ?core.types.ConfState,
     approx_bytes: usize,
 
     fn deinit(self: *PendingApplyTask, alloc: std.mem.Allocator) void {
@@ -174,6 +175,7 @@ const PendingApplyTask = struct {
         core.types.freeEntries(alloc, self.entries);
         for (self.read_states) |*read_state| read_state.deinit(alloc);
         if (self.read_states.len > 0) alloc.free(self.read_states);
+        if (self.conf_state) |*conf_state| conf_state.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -204,7 +206,7 @@ const SnapshotBuildResult = union(enum) {
     failure: struct {
         group_id: core.types.GroupId,
         incarnation: u64,
-        applied_index: core.types.Index,
+        metadata: core.types.SnapshotMetadata,
         cause: anyerror,
     },
 
@@ -214,7 +216,7 @@ const SnapshotBuildResult = union(enum) {
                 result.metadata.deinit(std.heap.page_allocator);
                 result.payload.deinit(std.heap.page_allocator);
             },
-            .failure => {},
+            .failure => |*result| result.metadata.deinit(std.heap.page_allocator),
         }
         self.* = undefined;
     }
@@ -332,7 +334,6 @@ const SnapshotBuildWorker = struct {
             self.mutex.unlock(io);
 
             const started_ns = clock.monotonicNs();
-            const applied_index = request.metadata.index;
             const payload = request.source.materialize(std.heap.page_allocator);
 
             self.mutex.lockUncancelable(io);
@@ -352,11 +353,10 @@ const SnapshotBuildWorker = struct {
                     .build_ns = clock.elapsedSinceNs(started_ns),
                 } }
             else |err| blk: {
-                request.metadata.deinit(std.heap.page_allocator);
                 break :blk .{ .failure = .{
                     .group_id = request.group_id,
                     .incarnation = request.incarnation,
-                    .applied_index = applied_index,
+                    .metadata = request.metadata,
                     .cause = err,
                 } };
             };
@@ -374,8 +374,14 @@ const SnapshotCandidate = struct {
     applied_index: core.types.Index,
     incarnation: u64,
     enqueue_sequence: u64,
+    conf_state: core.types.ConfState,
     retry_attempt: u8 = 0,
     retry_after_ns: u64 = 0,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.conf_state.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 const snapshot_retry_base_ns: u64 = 10 * std.time.ns_per_ms;
@@ -430,6 +436,8 @@ pub const MultiRaft = struct {
         self.pending_outbox.deinit(self.alloc);
         for (self.pending_apply.items) |*task| task.deinit(self.alloc);
         self.pending_apply.deinit(self.alloc);
+        var snapshot_candidates = self.snapshot_candidates.valueIterator();
+        while (snapshot_candidates.next()) |candidate| candidate.deinit(self.alloc);
         self.snapshot_candidates.deinit(self.alloc);
         self.scheduler.deinit();
         self.* = undefined;
@@ -533,7 +541,7 @@ pub const MultiRaft = struct {
         const incarnation = self.group_incarnations.get(group_id) orelse return false;
         const removed = self.groups.fetchRemove(group_id) orelse return false;
         _ = self.group_incarnations.remove(group_id);
-        _ = self.snapshot_candidates.remove(group_id);
+        self.removeSnapshotCandidate(group_id);
         if (self.snapshot_worker) |worker| worker.retireGroup(group_id, incarnation);
         if (self.snapshot_publish) |*result| {
             if (result.belongsTo(group_id, incarnation)) {
@@ -920,6 +928,19 @@ pub const MultiRaft = struct {
 
         const ready_pressure = summarizeReady(group_id, ready);
         const async_storage_writes = grp.asyncStorageWrites();
+        // Applying a committed configuration change mutates Raft progress and
+        // can append to (and reallocate) the node's message buffer. Ready's
+        // message slice aliases that buffer, so preserve it before applying a
+        // configuration change. Async handling also steps local messages and
+        // therefore always needs an owned copy.
+        const clone_messages_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+        var owned_ready_messages: ?[]core.Message = null;
+        defer if (owned_ready_messages) |messages| core.message.freeMessages(self.alloc, messages);
+        const ready_messages = if (async_storage_writes or containsConfChange(ready.committed_entries)) blk: {
+            owned_ready_messages = try core.message.cloneMessages(self.alloc, ready.messages);
+            break :blk owned_ready_messages.?;
+        } else ready.messages;
+        if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
         if (diagnostics) |diag| {
             diag.message_count = ready_pressure.message_count;
             diag.message_bytes = ready_pressure.message_bytes;
@@ -1022,14 +1043,14 @@ pub const MultiRaft = struct {
 
         if (async_storage_writes) {
             const async_ready_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-            try self.handleAsyncReady(group_id, grp, ready, outbox, flush_apply_queue, diagnostics);
+            try self.handleAsyncReady(group_id, grp, ready, ready_messages, outbox, flush_apply_queue, diagnostics);
             if (diagnostics) |diag| diag.async_ready_elapsed_ns = clock.elapsedSinceNs(async_ready_start_ns);
         } else {
             const enqueue_apply_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-            try self.enqueueApply(group_id, ready.snapshot, ready.committed_entries, ready.read_states);
+            try self.enqueueApply(group_id, ready.snapshot, ready.committed_entries, ready.read_states, grp.status().conf_state);
             if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
             const outbox_append_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-            try outbox.appendMessages(self.alloc, group_id, ready.messages);
+            try outbox.appendMessages(self.alloc, group_id, ready_messages);
             if (diagnostics) |diag| diag.outbox_append_elapsed_ns = clock.elapsedSinceNs(outbox_append_start_ns);
             const advance_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             grp.advance(ready);
@@ -1055,22 +1076,26 @@ pub const MultiRaft = struct {
         return true;
     }
 
+    fn containsConfChange(entries: []const core.Entry) bool {
+        for (entries) |entry| switch (entry.entry_type) {
+            .conf_change, .conf_change_v2 => return true,
+            else => {},
+        };
+        return false;
+    }
+
     fn handleAsyncReady(
         self: *MultiRaft,
         group_id: core.types.GroupId,
         grp: *group_mod.Group,
         ready: core.Ready,
+        ready_messages: []const core.Message,
         outbox: *TransportOutbox,
         flush_apply_queue: bool,
         diagnostics: ?*ReadyGroupDiagnostics,
     ) !void {
-        const clone_messages_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        const messages = try core.message.cloneMessages(self.alloc, ready.messages);
-        defer core.message.freeMessages(self.alloc, messages);
-        if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
-
         const enqueue_apply_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        try self.enqueueApply(group_id, ready.snapshot, ready.committed_entries, ready.read_states);
+        try self.enqueueApply(group_id, ready.snapshot, ready.committed_entries, ready.read_states, grp.status().conf_state);
         if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
         if (flush_apply_queue) {
             const inline_apply_flush_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
@@ -1079,7 +1104,7 @@ pub const MultiRaft = struct {
         }
 
         const async_message_loop_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        for (messages) |msg| {
+        for (ready_messages) |msg| {
             switch (msg.msg_type) {
                 .storage_append => try self.handleLocalStorageAppend(group_id, grp, msg, outbox),
                 .storage_apply => try self.handleLocalStorageApply(group_id, grp, msg, outbox),
@@ -1095,6 +1120,7 @@ pub const MultiRaft = struct {
         snapshot: ?core.types.Snapshot,
         committed_entries: []const core.Entry,
         read_states: []const core.ReadState,
+        conf_state: core.types.ConfState,
     ) !void {
         if (snapshot == null and committed_entries.len == 0 and read_states.len == 0) return;
 
@@ -1116,11 +1142,19 @@ pub const MultiRaft = struct {
         const cloned_entries = try core.types.cloneEntries(self.alloc, committed_entries);
         var entries_owned = true;
         errdefer if (entries_owned) core.types.freeEntries(self.alloc, cloned_entries);
+        var cloned_conf_state: ?core.types.ConfState = if (committed_entries.len > 0 and
+            self.cfg.applied_log_retained_entries != 0)
+            try conf_state.clone(self.alloc)
+        else
+            null;
+        var conf_state_owned = cloned_conf_state != null;
+        errdefer if (cloned_conf_state) |*owned| if (conf_state_owned) owned.deinit(self.alloc);
         var task: PendingApplyTask = .{
             .group_id = group_id,
             .snapshot = cloned_snapshot,
             .entries = cloned_entries,
             .read_states = cloned_read_states,
+            .conf_state = cloned_conf_state,
             .approx_bytes = core.types.entriesApproxEncodedSize(committed_entries) +
                 approxReadStatesSize(read_states) +
                 if (snapshot) |value| value.data.len else 0,
@@ -1128,12 +1162,13 @@ pub const MultiRaft = struct {
         read_states_owned = false;
         snapshot_owned = false;
         entries_owned = false;
+        conf_state_owned = false;
         self.pending_apply.append(self.alloc, task) catch |err| {
             task.deinit(self.alloc);
             return err;
         };
         if (snapshot != null) {
-            _ = self.snapshot_candidates.remove(group_id);
+            self.removeSnapshotCandidate(group_id);
             self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
         }
     }
@@ -1201,7 +1236,7 @@ pub const MultiRaft = struct {
         for (tasks, 0..) |task, task_index| {
             if (task.snapshot != null) {
                 applied_snapshot = true;
-                _ = self.snapshot_candidates.remove(task.group_id);
+                self.removeSnapshotCandidate(task.group_id);
             }
             if (task.entries.len == 0) continue;
             var has_later_group_entries = false;
@@ -1214,7 +1249,7 @@ pub const MultiRaft = struct {
             if (has_later_group_entries) continue;
             const last_applied = task.entries[task.entries.len - 1].index;
             const incarnation = self.group_incarnations.get(task.group_id) orelse continue;
-            self.queueSnapshotCandidate(task.group_id, last_applied, incarnation, false) catch |err| {
+            self.queueSnapshotCandidate(task.group_id, last_applied, incarnation, task.conf_state.?, false) catch |err| {
                 self.metrics.snapshot_compaction_failures += 1;
                 std.log.warn("raft snapshot compaction candidate deferred group_id={d} applied_index={d} error={s}", .{
                     task.group_id,
@@ -1244,16 +1279,26 @@ pub const MultiRaft = struct {
         group_id: core.types.GroupId,
         applied_index: core.types.Index,
         incarnation: u64,
+        conf_state: core.types.ConfState,
         retry: bool,
     ) !void {
         const candidate = try self.snapshot_candidates.getOrPut(self.alloc, group_id);
         if (!candidate.found_existing or candidate.value_ptr.incarnation != incarnation) {
+            const cloned_conf_state = conf_state.clone(self.alloc) catch |err| {
+                if (!candidate.found_existing) _ = self.snapshot_candidates.remove(group_id);
+                return err;
+            };
+            if (candidate.found_existing) candidate.value_ptr.deinit(self.alloc);
             candidate.value_ptr.* = .{
                 .applied_index = applied_index,
                 .incarnation = incarnation,
                 .enqueue_sequence = self.takeSnapshotCandidateSequence(),
+                .conf_state = cloned_conf_state,
             };
         } else if (applied_index > candidate.value_ptr.applied_index) {
+            const cloned_conf_state = try conf_state.clone(self.alloc);
+            candidate.value_ptr.conf_state.deinit(self.alloc);
+            candidate.value_ptr.conf_state = cloned_conf_state;
             candidate.value_ptr.applied_index = applied_index;
         }
         if (retry) {
@@ -1270,13 +1315,25 @@ pub const MultiRaft = struct {
         return sequence;
     }
 
+    fn removeSnapshotCandidate(self: *MultiRaft, group_id: core.types.GroupId) void {
+        const removed = self.snapshot_candidates.fetchRemove(group_id) orelse return;
+        var candidate = removed.value;
+        candidate.deinit(self.alloc);
+    }
+
+    fn clearSnapshotCandidates(self: *MultiRaft) void {
+        var candidates = self.snapshot_candidates.valueIterator();
+        while (candidates.next()) |candidate| candidate.deinit(self.alloc);
+        self.snapshot_candidates.clearRetainingCapacity();
+    }
+
     fn dispatchNextSnapshotCompaction(self: *MultiRaft) !void {
         if (self.cfg.applied_log_retained_entries == 0 or self.snapshot_candidates.count() == 0) return;
         defer self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
         if (self.snapshot_publish != null) return;
         const state_machine = self.hooks.state_machine orelse return;
         if (state_machine.vtable.prepare_snapshot == null) {
-            self.snapshot_candidates.clearRetainingCapacity();
+            self.clearSnapshotCandidates();
             return;
         }
         if (self.hooks.group_storage == null) return;
@@ -1302,37 +1359,37 @@ pub const MultiRaft = struct {
             const last_applied = selected.applied_index;
             const incarnation = selected.incarnation;
             if (self.group_incarnations.get(group_id) != incarnation) {
-                _ = self.snapshot_candidates.remove(group_id);
+                self.removeSnapshotCandidate(group_id);
                 continue;
             }
             const grp = self.groups.getPtr(group_id) orelse {
-                _ = self.snapshot_candidates.remove(group_id);
+                self.removeSnapshotCandidate(group_id);
                 continue;
             };
             if (last_applied <= self.cfg.applied_log_retained_entries) {
-                _ = self.snapshot_candidates.remove(group_id);
+                self.removeSnapshotCandidate(group_id);
                 continue;
             }
             const compact_index = last_applied - self.cfg.applied_log_retained_entries;
             if (self.cfg.applied_log_compaction_single_node_only and grp.status().conf_state.voters.len != 1) {
-                _ = self.snapshot_candidates.remove(group_id);
+                self.removeSnapshotCandidate(group_id);
                 continue;
             }
             const first_index = grp.raw_node.raft.log.firstIndex();
             if (compact_index < first_index) {
-                _ = self.snapshot_candidates.remove(group_id);
+                self.removeSnapshotCandidate(group_id);
                 continue;
             }
             const compacted_index = first_index - 1;
             if (self.cfg.applied_log_compaction_min_interval_entries > 0 and
                 compact_index - compacted_index < self.cfg.applied_log_compaction_min_interval_entries)
             {
-                _ = self.snapshot_candidates.remove(group_id);
+                self.removeSnapshotCandidate(group_id);
                 continue;
             }
             const source = (state_machine.prepareSnapshot(group_id, last_applied) catch |err| {
                 self.metrics.snapshot_compaction_failures += 1;
-                try self.queueSnapshotCandidate(group_id, last_applied, incarnation, true);
+                try self.queueSnapshotCandidate(group_id, last_applied, incarnation, selected.conf_state, true);
                 std.log.warn("raft snapshot compaction preparation deferred group_id={d} applied_index={d} error={s}", .{
                     group_id,
                     last_applied,
@@ -1340,20 +1397,19 @@ pub const MultiRaft = struct {
                 });
                 return;
             }) orelse {
-                _ = self.snapshot_candidates.remove(group_id);
+                self.removeSnapshotCandidate(group_id);
                 continue;
             };
             var source_owned = true;
             defer if (source_owned) source.deinit();
-            const status = grp.status();
             const snapshot_term = grp.termAt(last_applied) catch |err| {
                 if (err == error.IndexNotFound) {
-                    _ = self.snapshot_candidates.remove(group_id);
+                    self.removeSnapshotCandidate(group_id);
                     self.metrics.snapshot_compaction_stale_drops += 1;
                     continue;
                 }
                 self.metrics.snapshot_compaction_failures += 1;
-                try self.queueSnapshotCandidate(group_id, last_applied, incarnation, true);
+                try self.queueSnapshotCandidate(group_id, last_applied, incarnation, selected.conf_state, true);
                 std.log.warn("raft snapshot compaction term lookup deferred group_id={d} applied_index={d} error={s}", .{
                     group_id,
                     last_applied,
@@ -1364,7 +1420,7 @@ pub const MultiRaft = struct {
             var metadata = core.types.SnapshotMetadata{
                 .index = last_applied,
                 .term = snapshot_term,
-                .conf_state = try status.conf_state.clone(std.heap.page_allocator),
+                .conf_state = try selected.conf_state.clone(std.heap.page_allocator),
             };
             var metadata_owned = true;
             defer if (metadata_owned) metadata.deinit(std.heap.page_allocator);
@@ -1380,7 +1436,7 @@ pub const MultiRaft = struct {
             }
             source_owned = false;
             metadata_owned = false;
-            _ = self.snapshot_candidates.remove(group_id);
+            self.removeSnapshotCandidate(group_id);
             self.metrics.snapshot_compaction_requests += 1;
             return;
         }
@@ -1409,15 +1465,19 @@ pub const MultiRaft = struct {
                 self.metrics.snapshot_compaction_failures += 1;
                 std.log.warn("raft snapshot compaction build failed group_id={d} applied_index={d} error={s}", .{
                     failure.group_id,
-                    failure.applied_index,
+                    failure.metadata.index,
                     @errorName(failure.cause),
                 });
                 if (self.group_incarnations.get(failure.group_id) == failure.incarnation) {
-                    try self.queueSnapshotCandidate(failure.group_id, failure.applied_index, failure.incarnation, true);
+                    try self.queueSnapshotCandidate(
+                        failure.group_id,
+                        failure.metadata.index,
+                        failure.incarnation,
+                        failure.metadata.conf_state,
+                        true,
+                    );
                 }
-                self.snapshot_publish = null;
-                self.snapshot_publish_retry_attempt = 0;
-                self.snapshot_publish_retry_after_ns = 0;
+                self.clearSnapshotPublish(result);
                 self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
             },
             .success => |*completed| {
@@ -1468,6 +1528,7 @@ pub const MultiRaft = struct {
                             completed.group_id,
                             completed.metadata.index,
                             completed.incarnation,
+                            completed.metadata.conf_state,
                             true,
                         );
                         self.clearSnapshotPublish(result);
@@ -1697,13 +1758,52 @@ test "snapshot candidate coalescing ignores later read-only apply work" {
     var entries = [_]core.Entry{.{ .term = 1, .index = 5 }};
     var read_states = [_]core.ReadState{.{ .index = 5, .request_ctx = &.{} }};
     const tasks = [_]PendingApplyTask{
-        .{ .group_id = 7, .snapshot = null, .entries = &entries, .read_states = &.{}, .approx_bytes = 0 },
-        .{ .group_id = 7, .snapshot = null, .entries = &.{}, .read_states = &read_states, .approx_bytes = 0 },
+        .{ .group_id = 7, .snapshot = null, .entries = &entries, .read_states = &.{}, .conf_state = .{}, .approx_bytes = 0 },
+        .{ .group_id = 7, .snapshot = null, .entries = &.{}, .read_states = &read_states, .conf_state = null, .approx_bytes = 0 },
     };
 
     try std.testing.expect(!host.scheduleAppliedLogCompaction(&tasks));
     const candidate = host.snapshot_candidates.get(7) orelse return error.MissingSnapshotCandidate;
     try std.testing.expectEqual(@as(core.types.Index, 5), candidate.applied_index);
+}
+
+test "snapshot candidate keeps configuration at its applied index" {
+    var host = MultiRaft.init(std.testing.allocator, .{ .applied_log_retained_entries = 2 }, .{});
+    defer host.deinit();
+    try host.group_incarnations.put(std.testing.allocator, 8, 1);
+
+    var voters_at_five = [_]core.types.NodeId{1};
+    var entries_at_five = [_]core.Entry{.{ .term = 1, .index = 5 }};
+    const applied_at_five = [_]PendingApplyTask{.{
+        .group_id = 8,
+        .snapshot = null,
+        .entries = &entries_at_five,
+        .read_states = &.{},
+        .conf_state = .{ .voters = voters_at_five[0..] },
+        .approx_bytes = 0,
+    }};
+
+    try std.testing.expect(!host.scheduleAppliedLogCompaction(&applied_at_five));
+    voters_at_five[0] = 99;
+
+    const candidate_at_five = host.snapshot_candidates.get(8) orelse return error.MissingSnapshotCandidate;
+    try std.testing.expectEqualSlices(core.types.NodeId, &.{1}, candidate_at_five.conf_state.voters);
+
+    var voters_at_six = [_]core.types.NodeId{ 1, 2 };
+    var entries_at_six = [_]core.Entry{.{ .term = 1, .index = 6 }};
+    const applied_at_six = [_]PendingApplyTask{.{
+        .group_id = 8,
+        .snapshot = null,
+        .entries = &entries_at_six,
+        .read_states = &.{},
+        .conf_state = .{ .voters = voters_at_six[0..] },
+        .approx_bytes = 0,
+    }};
+
+    try std.testing.expect(!host.scheduleAppliedLogCompaction(&applied_at_six));
+    const candidate_at_six = host.snapshot_candidates.get(8) orelse return error.MissingSnapshotCandidate;
+    try std.testing.expectEqual(@as(core.types.Index, 6), candidate_at_six.applied_index);
+    try std.testing.expectEqualSlices(core.types.NodeId, &.{ 1, 2 }, candidate_at_six.conf_state.voters);
 }
 
 const GroupBatchBuilder = struct {
