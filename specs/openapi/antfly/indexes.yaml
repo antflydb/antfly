@@ -576,6 +576,140 @@ components:
         degraded:
           type: boolean
           description: "Whether coverage is complete under best_effort but includes terminal failures."
+    EnrichmentRuntimeStatus:
+      type: object
+      additionalProperties: false
+      description: "Runtime state for the durable embeddings enrichment worker."
+      required:
+        - enabled
+        - target_sequence
+        - applied_sequence
+        - pending_sequence_count
+        - projection_checkpoint_status
+        - projection_checkpoint_applied_sequence
+        - projection_checkpoint_generation
+        - projection_checkpoint_config_hash
+        - checkpoint_replay_tail_sequence_count
+        - processed_requests
+        - error_count
+        - retryable_error_count
+        - fatal_error_count
+        - retrying
+        - worker_failed
+        - worker_started
+        - stalled
+        - skip_by_hash_count
+        - skipped_source_count
+        - codec_decode_failures
+        - embed_batches_started
+        - embed_batches_completed
+        - embed_items_started
+        - embed_items_completed
+        - active_embed_batch_items
+        - active_embed_batch_bytes
+        - active_embed_batch_max_bytes
+        - active_embed_batch_started_ms
+        - last_embed_batch_items
+        - last_embed_batch_bytes
+        - last_embed_batch_max_bytes
+        - last_embed_batch_ns
+        - total_embed_ns
+      properties:
+        enabled:
+          type: boolean
+        target_sequence:
+          type: integer
+          format: uint64
+        applied_sequence:
+          type: integer
+          format: uint64
+        pending_sequence_count:
+          type: integer
+          format: uint64
+        projection_checkpoint_status:
+          type: string
+        projection_checkpoint_applied_sequence:
+          type: integer
+          format: uint64
+        projection_checkpoint_generation:
+          type: integer
+          format: uint64
+        projection_checkpoint_config_hash:
+          type: integer
+          format: uint64
+        checkpoint_replay_tail_sequence_count:
+          type: integer
+          format: uint64
+        processed_requests:
+          type: integer
+          format: uint64
+        error_count:
+          type: integer
+          format: uint64
+        retryable_error_count:
+          type: integer
+          format: uint64
+        fatal_error_count:
+          type: integer
+          format: uint64
+        retrying:
+          type: boolean
+        worker_failed:
+          type: boolean
+        worker_started:
+          type: boolean
+          description: "Whether the background enrichment worker is currently running."
+        stalled:
+          type: boolean
+          description: "Whether work is pending with no running worker, retry, or terminal failure explaining the backlog."
+        skip_by_hash_count:
+          type: integer
+          format: uint64
+        skipped_source_count:
+          type: integer
+          format: uint64
+        codec_decode_failures:
+          type: integer
+          format: uint64
+        embed_batches_started:
+          type: integer
+          format: uint64
+        embed_batches_completed:
+          type: integer
+          format: uint64
+        embed_items_started:
+          type: integer
+          format: uint64
+        embed_items_completed:
+          type: integer
+          format: uint64
+        active_embed_batch_items:
+          type: integer
+          format: uint64
+        active_embed_batch_bytes:
+          type: integer
+          format: uint64
+        active_embed_batch_max_bytes:
+          type: integer
+          format: uint64
+        active_embed_batch_started_ms:
+          type: integer
+          format: uint64
+        last_embed_batch_items:
+          type: integer
+          format: uint64
+        last_embed_batch_bytes:
+          type: integer
+          format: uint64
+        last_embed_batch_max_bytes:
+          type: integer
+          format: uint64
+        last_embed_batch_ns:
+          type: integer
+          format: uint64
+        total_embed_ns:
+          type: integer
+          format: uint64
     EmbeddingsIndexStats:
       type: object
       description: "Statistics for an embeddings index (dense or sparse)"
@@ -720,14 +854,7 @@ components:
           type: integer
           format: uint64
         enrichment_runtime:
-          x-go-type-skip-optional-pointer: true
-          type: object
-          additionalProperties: true
-          properties:
-            pending_sequence_count:
-              type: integer
-              format: uint64
-          description: "Embedding enrichment worker runtime diagnostics."
+          $ref: "#/components/schemas/EnrichmentRuntimeStatus"
         hbc_cache:
           x-go-type-skip-optional-pointer: true
           type: object

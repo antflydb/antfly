@@ -12,11 +12,11 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.derived_coverage_status import DerivedCoverageStatus
     from ..models.embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
-    from ..models.embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
     from ..models.embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
     from ..models.embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
     from ..models.embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
     from ..models.embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
+    from ..models.enrichment_runtime_status import EnrichmentRuntimeStatus
     from ..models.index_repair_status import IndexRepairStatus
 
 
@@ -65,8 +65,8 @@ class EmbeddingsIndexStats:
         catch_up_phase (str | Unset):
         catch_up_applied_sequence (int | Unset):
         catch_up_target_sequence (int | Unset):
-        enrichment_runtime (EmbeddingsIndexStatsEnrichmentRuntime | Unset): Embedding enrichment worker runtime
-            diagnostics.
+        enrichment_runtime (EnrichmentRuntimeStatus | Unset): Runtime state for the durable embeddings enrichment
+            worker.
         hbc_cache (EmbeddingsIndexStatsHbcCache | Unset):
         hbc_posting (EmbeddingsIndexStatsHbcPosting | Unset):
         async_indexing (EmbeddingsIndexStatsAsyncIndexing | Unset):
@@ -132,7 +132,7 @@ class EmbeddingsIndexStats:
     catch_up_phase: str | Unset = UNSET
     catch_up_applied_sequence: int | Unset = UNSET
     catch_up_target_sequence: int | Unset = UNSET
-    enrichment_runtime: EmbeddingsIndexStatsEnrichmentRuntime | Unset = UNSET
+    enrichment_runtime: EnrichmentRuntimeStatus | Unset = UNSET
     hbc_cache: EmbeddingsIndexStatsHbcCache | Unset = UNSET
     hbc_posting: EmbeddingsIndexStatsHbcPosting | Unset = UNSET
     async_indexing: EmbeddingsIndexStatsAsyncIndexing | Unset = UNSET
@@ -424,11 +424,11 @@ class EmbeddingsIndexStats:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.derived_coverage_status import DerivedCoverageStatus
         from ..models.embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
-        from ..models.embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
         from ..models.embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
         from ..models.embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
         from ..models.embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
         from ..models.embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
+        from ..models.enrichment_runtime_status import EnrichmentRuntimeStatus
         from ..models.index_repair_status import IndexRepairStatus
 
         d = dict(src_dict)
@@ -511,11 +511,11 @@ class EmbeddingsIndexStats:
         catch_up_target_sequence = d.pop("catch_up_target_sequence", UNSET)
 
         _enrichment_runtime = d.pop("enrichment_runtime", UNSET)
-        enrichment_runtime: EmbeddingsIndexStatsEnrichmentRuntime | Unset
+        enrichment_runtime: EnrichmentRuntimeStatus | Unset
         if isinstance(_enrichment_runtime, Unset):
             enrichment_runtime = UNSET
         else:
-            enrichment_runtime = EmbeddingsIndexStatsEnrichmentRuntime.from_dict(_enrichment_runtime)
+            enrichment_runtime = EnrichmentRuntimeStatus.from_dict(_enrichment_runtime)
 
         _hbc_cache = d.pop("hbc_cache", UNSET)
         hbc_cache: EmbeddingsIndexStatsHbcCache | Unset

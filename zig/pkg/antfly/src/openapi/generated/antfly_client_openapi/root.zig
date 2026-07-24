@@ -135,6 +135,7 @@ pub const EmbeddingsIndexConfig = types.EmbeddingsIndexConfig;
 pub const EmbeddingsIndexStats = types.EmbeddingsIndexStats;
 pub const EnrichmentConfig = types.EnrichmentConfig;
 pub const EnrichmentKind = types.EnrichmentKind;
+pub const EnrichmentRuntimeStatus = types.EnrichmentRuntimeStatus;
 pub const Error = types.Error;
 pub const EvalConfig = types.EvalConfig;
 pub const EvalOptions = types.EvalOptions;

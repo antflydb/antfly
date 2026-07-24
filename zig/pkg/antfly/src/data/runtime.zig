@@ -2123,7 +2123,20 @@ test "data server rejects replicated transition admission after owner shutdown" 
 const RuntimeStatusDiskUsageCacheEntry = struct {
     disk_bytes: u64 = 0,
     checked_at_ns: u64 = 0,
+    lsm_root_generation: u64 = 0,
 };
+
+fn runtimeStatusDiskUsageCacheReusable(
+    entry: RuntimeStatusDiskUsageCacheEntry,
+    lsm_root_generation: u64,
+    now_ns: u64,
+    active: bool,
+    doc_count: u64,
+) bool {
+    if (entry.lsm_root_generation != lsm_root_generation) return false;
+    if (entry.disk_bytes == 0 and doc_count > 0) return false;
+    return active or now_ns -| entry.checked_at_ns < runtime_status_disk_usage_refresh_interval_ns;
+}
 
 const OwnedLocalGroupStatusRefresh = struct {
     alloc: std.mem.Allocator,
@@ -2784,6 +2797,21 @@ test "idle cached runtime status stays fresh only for the published root generat
     pending.stats.enrichment.target_sequence = 9;
     pending.stats.enrichment.applied_sequence = 8;
     try std.testing.expect(!DataServer.cachedRuntimeStatusRemainsFresh(pending, 3));
+}
+
+test "runtime status disk usage cache is scoped to one root generation" {
+    const entry = RuntimeStatusDiskUsageCacheEntry{
+        .disk_bytes = 4096,
+        .checked_at_ns = 100,
+        .lsm_root_generation = 7,
+    };
+    try std.testing.expect(runtimeStatusDiskUsageCacheReusable(entry, 7, 101, false, 1));
+    try std.testing.expect(runtimeStatusDiskUsageCacheReusable(entry, 7, std.math.maxInt(u64), true, 1));
+    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(entry, 8, 101, true, 1));
+
+    var zero_entry = entry;
+    zero_entry.disk_bytes = 0;
+    try std.testing.expect(!runtimeStatusDiskUsageCacheReusable(zero_entry, 7, 101, false, 1));
 }
 
 test "data runtime stamps one producer generation on every reported group" {
@@ -8150,6 +8178,7 @@ pub const DataServer = struct {
         defer self.alloc.free(db_path);
         if (self.runtimeStatusDiskUsageBytesBestEffort(group_id, db_path, status.*)) |disk_bytes| {
             status.disk_bytes = disk_bytes;
+            status.disk_bytes_known = true;
         }
         if (status.created_at_millis == 0) {
             if (db) |ptr| {
@@ -8166,11 +8195,19 @@ pub const DataServer = struct {
     ) ?u64 {
         const now_ns = platform_time.monotonicNs();
         const active = runtimeStatusHasActiveBackgroundWork(status);
+        const lsm_root_generation = if (status.metadata.lsm_root_generation != 0)
+            status.metadata.lsm_root_generation
+        else
+            self.provisioned_storage.visibleRootGenerationForGroup(group_id);
         lockAtomic(&self.runtime_status_disk_usage_cache_mutex);
         if (self.runtime_status_disk_usage_cache.get(group_id)) |entry| {
-            const fresh = now_ns -| entry.checked_at_ns < runtime_status_disk_usage_refresh_interval_ns;
-            const zero_cache_for_nonempty_group = entry.disk_bytes == 0 and status.stats.doc_count > 0;
-            if ((active or fresh) and !zero_cache_for_nonempty_group) {
+            if (runtimeStatusDiskUsageCacheReusable(
+                entry,
+                lsm_root_generation,
+                now_ns,
+                active,
+                status.stats.doc_count,
+            )) {
                 self.runtime_status_disk_usage_cache_mutex.unlock();
                 return entry.disk_bytes;
             }
@@ -8185,6 +8222,7 @@ pub const DataServer = struct {
         self.runtime_status_disk_usage_cache.put(self.alloc, group_id, .{
             .disk_bytes = disk_bytes,
             .checked_at_ns = now_ns,
+            .lsm_root_generation = lsm_root_generation,
         }) catch {};
         return disk_bytes;
     }
@@ -12016,6 +12054,7 @@ fn runtimeStatusReportFromLocalStatus(
         .status_generation = status.metadata.status_generation,
         .doc_count = controlPlaneDocumentCount(status.stats),
         .disk_bytes = status.disk_bytes,
+        .disk_bytes_known = status.disk_bytes_known,
         .created_at_millis = status.created_at_millis,
         .index_count = status.stats.index_count,
         .enrichment_enabled = status.stats.enrichment.enabled,
@@ -12023,6 +12062,8 @@ fn runtimeStatusReportFromLocalStatus(
         .enrichment_applied_sequence = status.stats.enrichment.applied_sequence,
         .enrichment_retrying = status.stats.enrichment.retrying,
         .enrichment_worker_failed = status.stats.enrichment.worker_failed,
+        .enrichment_worker_started = status.stats.enrichment.worker_started,
+        .enrichment_stalled = status.stats.enrichment.stalled,
         .async_indexing_active = status.stats.async_indexing.startup.active or
             status.stats.async_indexing.dense_catch_up.active or
             status.stats.async_indexing.bulk_coalescing.active_session,

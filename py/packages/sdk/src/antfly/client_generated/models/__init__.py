@@ -164,7 +164,6 @@ from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
 from .embeddings_index_stats import EmbeddingsIndexStats
 from .embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
-from .embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
 from .embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
 from .embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
 from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
@@ -172,6 +171,7 @@ from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
 from .enrichment_kind import EnrichmentKind
+from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -427,6 +427,9 @@ from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
 from .installed_extension import InstalledExtension
 from .installed_extension_status import InstalledExtensionStatus
+from .invoke_inference_connection_body import InvokeInferenceConnectionBody
+from .invoke_inference_connection_operation import InvokeInferenceConnectionOperation
+from .invoke_inference_connection_response_200 import InvokeInferenceConnectionResponse200
 from .ip_range_query import IPRangeQuery
 from .join_condition import JoinCondition
 from .join_operator import JoinOperator
@@ -557,6 +560,7 @@ from .role_assignment import RoleAssignment
 from .route_type import RouteType
 from .row_filter_entry import RowFilterEntry
 from .row_filter_entry_filter import RowFilterEntryFilter
+from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
 from .secret_entry import SecretEntry
@@ -832,7 +836,6 @@ __all__ = (
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
     "EmbeddingsIndexStatsAsyncIndexing",
-    "EmbeddingsIndexStatsEnrichmentRuntime",
     "EmbeddingsIndexStatsHbcCache",
     "EmbeddingsIndexStatsHbcPosting",
     "EmbeddingsIndexStatsIndexType",
@@ -842,6 +845,7 @@ __all__ = (
     "EmbeddingType3",
     "EnrichmentConfig",
     "EnrichmentKind",
+    "EnrichmentRuntimeStatus",
     "Error",
     "EvalConfig",
     "EvalOptions",
@@ -1097,6 +1101,9 @@ __all__ = (
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
     "InstallManifest",
+    "InvokeInferenceConnectionBody",
+    "InvokeInferenceConnectionOperation",
+    "InvokeInferenceConnectionResponse200",
     "IPRangeQuery",
     "JoinCondition",
     "JoinOperator",
@@ -1227,6 +1234,7 @@ __all__ = (
     "RouteType",
     "RowFilterEntry",
     "RowFilterEntryFilter",
+    "RuntimeConfigStatus",
     "RuntimeDecl",
     "RuntimeDeclMode",
     "SecretEntry",

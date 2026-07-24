@@ -1619,7 +1619,7 @@ pub const AntflyApiHandler = struct {
         };
         defer self.api_server.source.freeAdminSnapshot(&snapshot);
         var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
-        const storage_statuses = try self.api_server.bestEffortSingleTableStorageStatuses(decoded_table_name, &storage_status_buf);
+        const storage_statuses = try self.api_server.bestEffortSingleTableStorageStatuses(decoded_table_name, &snapshot, &storage_status_buf);
         const body = (try tables_api.encodeSingleTableStatusWithStorageStatuses(alloc, &snapshot, decoded_table_name, storage_statuses)) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");

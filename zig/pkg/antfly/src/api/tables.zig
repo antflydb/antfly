@@ -207,6 +207,7 @@ pub const LsmStorageStatus = struct {
 pub const TableStorageStatus = struct {
     table_name: []const u8,
     empty: bool,
+    disk_usage: ?u64 = null,
     lsm: ?LsmStorageStatus = null,
     observed_dynamic_field_capability_sets: []table_reads.ObservedDynamicFieldCapabilitySet = &.{},
 };
@@ -1056,9 +1057,10 @@ fn buildTableStatus(
         .replication_sources = try parseReplicationSources(alloc, snapshot, table, include_replication_runtime),
         .field_capabilities = try generatedFieldCapabilitiesAlloc(alloc, table, storage_status),
         .storage_status = .{
-            // Report persisted LSM run bytes when live runtime statistics are
-            // available; unknown is more accurate than a hardcoded zero.
-            .disk_usage = if (lsm_status) |lsm| lsm.run_bytes else null,
+            .disk_usage = if (storage_status) |status|
+                if (status.disk_usage) |bytes| @intCast(@min(bytes, std.math.maxInt(i64))) else null
+            else
+                null,
             .empty = empty,
             .lsm = lsm_status,
         },
@@ -2959,6 +2961,7 @@ test "metadata.table status encoder honors storage status overrides" {
     const storage_statuses = [_]TableStorageStatus{.{
         .table_name = "docs",
         .empty = true,
+        .disk_usage = 99,
         .lsm = .{
             .run_count = 3,
             .run_bytes = 44,
@@ -3037,7 +3040,7 @@ test "metadata.table status encoder honors storage status overrides" {
 
     const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":44,\"empty\":true,\"lsm\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":99,\"empty\":true,\"lsm\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"run_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"l0_bytes\":33") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lower_level_run_count\":2") != null);

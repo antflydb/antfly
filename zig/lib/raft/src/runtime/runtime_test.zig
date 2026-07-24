@@ -1879,6 +1879,36 @@ test "multi raft backpressure can defer ready processing" {
     try std.testing.expectEqual(@as(core.types.Index, 1), store.hard_state.commit_index);
 }
 
+test "multi raft backpressure rejects async ready before cloning messages" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(135, &store);
+
+    var backpressure = BackpressureRecorder{ .allow = false };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+        .group_storage = storage_recorder.iface(),
+        .backpressure = backpressure.iface(),
+    });
+    defer host.deinit();
+
+    try addSingleNodeGroup(&host, 135, &store, true);
+    try host.campaignGroup(135);
+    try std.testing.expect(host.group(135).?.hasReady());
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_alloc = host.alloc;
+    const process_result = blk: {
+        host.alloc = failing.allocator();
+        defer host.alloc = original_alloc;
+        break :blk host.processReady(135);
+    };
+    try std.testing.expectEqual(false, try process_result);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+}
+
 test "multi raft limit backpressure denies oversized snapshot ready" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();

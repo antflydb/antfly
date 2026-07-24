@@ -928,19 +928,6 @@ pub const MultiRaft = struct {
 
         const ready_pressure = summarizeReady(group_id, ready);
         const async_storage_writes = grp.asyncStorageWrites();
-        // Applying a committed configuration change mutates Raft progress and
-        // can append to (and reallocate) the node's message buffer. Ready's
-        // message slice aliases that buffer, so preserve it before applying a
-        // configuration change. Async handling also steps local messages and
-        // therefore always needs an owned copy.
-        const clone_messages_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        var owned_ready_messages: ?[]core.Message = null;
-        defer if (owned_ready_messages) |messages| core.message.freeMessages(self.alloc, messages);
-        const ready_messages = if (async_storage_writes or containsConfChange(ready.committed_entries)) blk: {
-            owned_ready_messages = try core.message.cloneMessages(self.alloc, ready.messages);
-            break :blk owned_ready_messages.?;
-        } else ready.messages;
-        if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
         if (diagnostics) |diag| {
             diag.message_count = ready_pressure.message_count;
             diag.message_bytes = ready_pressure.message_bytes;
@@ -1014,6 +1001,19 @@ pub const MultiRaft = struct {
         defer if (snapshot_started) {
             self.hooks.snapshot_throttle.?.endSnapshot(group_id);
         };
+
+        // Applying a committed configuration change mutates Raft progress and
+        // can reallocate the node's aliased message buffer. Async handling also
+        // steps local messages. Delay the ownership copy until all admission
+        // gates accept this Ready so deferred work has zero clone churn.
+        const clone_messages_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+        var owned_ready_messages: ?[]core.Message = null;
+        defer if (owned_ready_messages) |messages| core.message.freeMessages(self.alloc, messages);
+        const ready_messages = if (async_storage_writes or containsConfChange(ready.committed_entries)) blk: {
+            owned_ready_messages = try core.message.cloneMessages(self.alloc, ready.messages);
+            break :blk owned_ready_messages.?;
+        } else ready.messages;
+        if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
 
         if (try grp.applyCommittedConfChanges(ready.committed_entries)) {
             ready.conf_state = grp.status().conf_state;

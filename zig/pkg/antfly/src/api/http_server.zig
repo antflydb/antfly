@@ -1626,13 +1626,22 @@ pub const ApiHttpServer = struct {
         var statuses = (try self.localTableRuntimeStatusesWithSnapshot(table_name, snapshot)) orelse return null;
         defer statuses.deinit(self.alloc);
 
+        var status_by_group = std.AutoHashMapUnmanaged(u64, *const runtime_status.LocalTableRuntimeStatus).empty;
+        defer status_by_group.deinit(self.alloc);
+        try status_by_group.ensureTotalCapacity(
+            self.alloc,
+            std.math.cast(u32, statuses.items.len) orelse return error.TooManyRuntimeStatuses,
+        );
+        for (statuses.items) |*status| {
+            status_by_group.putAssumeCapacity(status.group_id, status);
+        }
+
         var stats: distributed_join.JoinTableStats = .{};
         for (snapshot.ranges) |range| {
             if (range.table_id != table.table_id) continue;
-            const status = for (statuses.items) |item| {
-                if (item.group_id == range.group_id and runtime_status.statusRuntimeFresh(item)) break item;
-            } else return null;
-            stats.row_count +|= status.stats.doc_count;
+            const status = status_by_group.get(range.group_id) orelse return null;
+            if (!runtime_status.statusRuntimeFresh(status.*) or !status.disk_bytes_known) return null;
+            stats.row_count +|= @max(status.stats.source_doc_count, status.stats.doc_count);
             stats.size_bytes +|= status.disk_bytes;
             stats.shard_count += 1;
         }
@@ -2068,6 +2077,7 @@ pub const ApiHttpServer = struct {
         return .{
             .group_id = report.group_id,
             .disk_bytes = report.disk_bytes,
+            .disk_bytes_known = report.disk_bytes_known,
             .created_at_millis = report.created_at_millis,
             .metadata = .{
                 .updated_at_ns = report.updated_at_ns,
@@ -2090,6 +2100,8 @@ pub const ApiHttpServer = struct {
                     .applied_sequence = report.enrichment_applied_sequence,
                     .retrying = report.enrichment_retrying,
                     .worker_failed = report.enrichment_worker_failed,
+                    .worker_started = report.enrichment_worker_started,
+                    .stalled = report.enrichment_stalled,
                 },
                 .async_indexing = .{
                     .startup = .{ .active = report.async_startup_active },
@@ -2200,28 +2212,90 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         table_name: []const u8,
     ) !?tables_api.TableStorageStatus {
-        var local_statuses = (try self.localTableRuntimeStatuses(table_name)) orelse return null;
+        return try self.bestEffortSingleTableStorageStatusWithSnapshot(table_name, null);
+    }
+
+    fn bestEffortSingleTableStorageStatusWithSnapshot(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+    ) !?tables_api.TableStorageStatus {
+        const table = if (snapshot) |value|
+            tables_api.findTableByName(value, table_name) orelse return null
+        else
+            null;
+        var expected_group_count: usize = 0;
+        if (snapshot) |value| {
+            for (value.ranges) |range| {
+                if (range.table_id == table.?.table_id) expected_group_count += 1;
+            }
+            if (expected_group_count == 0) return null;
+        }
+
+        var local_statuses = (try self.localTableRuntimeStatusesWithSnapshot(table_name, snapshot)) orelse return null;
         defer local_statuses.deinit(self.alloc);
 
         var doc_count: u64 = 0;
         var saw_fresh_doc_count = false;
-        for (local_statuses.items) |item| {
-            // Derived visibility may trail a weak-sync primary write. The
-            // runtime snapshot's identity-backed source count is the O(1)
-            // authority for whether the table contains documents; retain the
-            // derived count as a compatibility floor for older/remote status
-            // producers that do not publish source_doc_count yet.
-            doc_count +|= @max(item.stats.source_doc_count, item.stats.doc_count);
-            saw_fresh_doc_count = saw_fresh_doc_count or runtime_status.statusRuntimeFresh(item);
+        var fresh_group_count: usize = 0;
+        var disk_usage: u64 = 0;
+        var disk_usage_complete = snapshot != null;
+
+        var status_by_group = std.AutoHashMapUnmanaged(u64, *const runtime_status.LocalTableRuntimeStatus).empty;
+        defer status_by_group.deinit(self.alloc);
+        if (snapshot != null) {
+            try status_by_group.ensureTotalCapacity(
+                self.alloc,
+                std.math.cast(u32, local_statuses.items.len) orelse return error.TooManyRuntimeStatuses,
+            );
+            for (local_statuses.items) |*item| {
+                status_by_group.putAssumeCapacity(item.group_id, item);
+            }
+        }
+        if (snapshot) |value| {
+            for (value.ranges) |range| {
+                if (range.table_id != table.?.table_id) continue;
+                const item = status_by_group.get(range.group_id) orelse {
+                    disk_usage_complete = false;
+                    continue;
+                };
+                // Derived visibility may trail a weak-sync primary write. The
+                // identity-backed source count is the O(1) authority; retain
+                // the derived count as a compatibility floor.
+                doc_count +|= @max(item.stats.source_doc_count, item.stats.doc_count);
+                if (!runtime_status.statusRuntimeFresh(item.*)) {
+                    disk_usage_complete = false;
+                    continue;
+                }
+                fresh_group_count += 1;
+                if (!item.disk_bytes_known) {
+                    disk_usage_complete = false;
+                    continue;
+                }
+                disk_usage +|= item.disk_bytes;
+            }
+        } else {
+            for (local_statuses.items) |item| {
+                doc_count +|= @max(item.stats.source_doc_count, item.stats.doc_count);
+                saw_fresh_doc_count = saw_fresh_doc_count or runtime_status.statusRuntimeFresh(item);
+            }
         }
         // A nonzero cached count proves the table is non-empty even if the
         // observation has since gone stale. A zero from an opening/catching-up
         // placeholder proves nothing: omit this optional status rather than
         // advertising a populated table as empty during structural work.
-        if (doc_count == 0 and !saw_fresh_doc_count) return null;
+        const complete_fresh_doc_count = if (snapshot != null)
+            fresh_group_count == expected_group_count
+        else
+            saw_fresh_doc_count;
+        if (doc_count == 0 and !complete_fresh_doc_count) return null;
         return .{
             .table_name = table_name,
             .empty = doc_count == 0,
+            .disk_usage = if (disk_usage_complete and fresh_group_count == expected_group_count)
+                disk_usage
+            else
+                null,
             // This endpoint is catalog/status observability and must remain
             // available while structural maintenance owns the writer. The
             // runtime-status cache is published from the live DB and already
@@ -2268,9 +2342,10 @@ pub const ApiHttpServer = struct {
     pub fn bestEffortSingleTableStorageStatuses(
         self: *ApiHttpServer,
         table_name: []const u8,
+        snapshot: ?*const metadata_api.AdminSnapshot,
         storage_status_buf: *[1]tables_api.TableStorageStatus,
     ) !?[]const tables_api.TableStorageStatus {
-        const status = (try self.bestEffortSingleTableStorageStatus(table_name)) orelse return null;
+        const status = (try self.bestEffortSingleTableStorageStatusWithSnapshot(table_name, snapshot)) orelse return null;
         storage_status_buf[0] = status;
         return storage_status_buf[0..];
     }
@@ -5017,7 +5092,7 @@ pub const ApiHttpServer = struct {
                 var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
                 defer self.source.freeAdminSnapshot(&snapshot);
                 var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
-                const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &storage_status_buf);
+                const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf);
                 if (runtimeSchemaDebugRequested(uri_parts.query)) {
                     const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
                     defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
@@ -5270,7 +5345,7 @@ pub const ApiHttpServer = struct {
         var snapshot = (try self.source.adminSnapshot()) orelse return null;
         defer self.source.freeAdminSnapshot(&snapshot);
         var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
-        const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &storage_status_buf);
+        const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf);
         return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
     }
 
@@ -5348,7 +5423,7 @@ pub const ApiHttpServer = struct {
             if (prefix) |pfx| {
                 if (!std.mem.startsWith(u8, table.name, pfx)) continue;
             }
-            const status = (try self.bestEffortSingleTableStorageStatus(table.name)) orelse continue;
+            const status = (try self.bestEffortSingleTableStorageStatusWithSnapshot(table.name, snapshot)) orelse continue;
             try items.append(alloc, status);
         }
 
@@ -22643,7 +22718,7 @@ test "api http server reports table storage empty from read visibility" {
     try std.testing.expectEqualStrings("application/json", empty_resp.content_type.?);
     var parsed_empty = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, empty_resp.body, .{});
     defer parsed_empty.deinit();
-    try std.testing.expectEqual(@as(?i64, 0), parsed_empty.value.storage_status.disk_usage);
+    try std.testing.expectEqual(@as(?i64, null), parsed_empty.value.storage_status.disk_usage);
     try std.testing.expectEqual(@as(?bool, true), parsed_empty.value.storage_status.empty);
 
     try db.batch(.{
@@ -22659,7 +22734,7 @@ test "api http server reports table storage empty from read visibility" {
     try std.testing.expectEqualStrings("application/json", non_empty_resp.content_type.?);
     var parsed_non_empty = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, non_empty_resp.body, .{});
     defer parsed_non_empty.deinit();
-    try std.testing.expectEqual(@as(?i64, 0), parsed_non_empty.value.storage_status.disk_usage);
+    try std.testing.expectEqual(@as(?i64, null), parsed_non_empty.value.storage_status.disk_usage);
     try std.testing.expectEqual(@as(?bool, false), parsed_non_empty.value.storage_status.empty);
 
     var list_resp = try server.handle(.{
@@ -22672,7 +22747,7 @@ test "api http server reports table storage empty from read visibility" {
     var parsed_list = try std.json.parseFromSlice([]metadata_openapi.TableStatus, std.testing.allocator, list_resp.body, .{});
     defer parsed_list.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_list.value.len);
-    try std.testing.expectEqual(@as(?i64, 0), parsed_list.value[0].storage_status.disk_usage);
+    try std.testing.expectEqual(@as(?i64, null), parsed_list.value[0].storage_status.disk_usage);
     try std.testing.expectEqual(@as(?bool, false), parsed_list.value[0].storage_status.empty);
 }
 
@@ -24640,6 +24715,8 @@ test "remote runtime status reports replay debt separately from active catch-up"
         .freshness = "fresh",
         .doc_count = 56_250,
         .index_count = 1,
+        .enrichment_worker_started = true,
+        .enrichment_stalled = true,
         .async_dense_catch_up_active = false,
         .doc_identity = .{
             .namespace_table_id = 1,
@@ -24697,6 +24774,90 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(@as(u64, 3), status.stats.doc_set_planning.ordinal_list_count);
     try std.testing.expectEqual(@as(u64, 1), status.stats.doc_set_planning.missing_ordinal_coverage_count);
     try std.testing.expectEqual(@as(u64, 2), status.stats.doc_set_planning.stale_identity_generation_rejection_count);
+    try std.testing.expect(status.stats.enrichment.worker_started);
+    try std.testing.expect(status.stats.enrichment.stalled);
+}
+
+test "table storage status sums complete fresh shard disk usage" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+
+    var group_10 = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .table_id = 1,
+        .table_name = "docs",
+        .group_id = 10,
+        .store_id = 20,
+        .node_id = 30,
+        .source = "background_refresh",
+        .freshness = "fresh",
+        .doc_count = 4,
+        .disk_bytes = 4096,
+        .disk_bytes_known = true,
+        .doc_identity = .{ .live_ordinals = 5 },
+    }};
+    var group_11 = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .table_id = 1,
+        .table_name = "docs",
+        .group_id = 11,
+        .store_id = 21,
+        .node_id = 31,
+        .source = "background_refresh",
+        .freshness = "fresh",
+        .doc_count = 6,
+        .disk_bytes = 8192,
+        .disk_bytes_known = true,
+        .doc_identity = .{ .live_ordinals = 7 },
+    }};
+    var stores = [_]metadata_table_manager.StoreRecord{
+        .{ .store_id = 20, .node_id = 30, .runtime_statuses = group_10[0..] },
+        .{ .store_id = 21, .node_id = 31, .runtime_statuses = group_11[0..] },
+    };
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 1,
+            .name = "docs",
+            .indexes_json = tables_api.default_indexes_json,
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = "m" },
+            .{ .group_id = 11, .table_id = 1, .start_key = "m", .end_key = null },
+        })[0..]),
+        .stores = stores[0..],
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), null, null);
+
+    const complete = (try server.bestEffortSingleTableStorageStatusWithSnapshot("docs", &snapshot)).?;
+    try std.testing.expectEqual(false, complete.empty);
+    try std.testing.expectEqual(@as(?u64, 12_288), complete.disk_usage);
+
+    const join_stats = (try server.joinContext().localTableStats("docs", &snapshot)).?;
+    try std.testing.expect(join_stats.has_stats);
+    try std.testing.expectEqual(@as(u64, 12), join_stats.row_count);
+    try std.testing.expectEqual(@as(u64, 12_288), join_stats.size_bytes);
+    try std.testing.expectEqual(@as(usize, 2), join_stats.shard_count);
+
+    group_11[0].disk_bytes_known = false;
+    const incomplete = (try server.bestEffortSingleTableStorageStatusWithSnapshot("docs", &snapshot)).?;
+    try std.testing.expectEqual(@as(?u64, null), incomplete.disk_usage);
+
+    snapshot.ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]);
+    try std.testing.expect((try server.bestEffortSingleTableStorageStatusWithSnapshot("docs", &snapshot)) == null);
 }
 
 test "api index status ignores propagated runtime status from removed owner" {

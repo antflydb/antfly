@@ -9196,6 +9196,71 @@ export interface components {
             /** @description Whether coverage is complete under best_effort but includes terminal failures. */
             degraded: boolean;
         };
+        /** @description Runtime state for the durable embeddings enrichment worker. */
+        EnrichmentRuntimeStatus: {
+            enabled: boolean;
+            /** Format: uint64 */
+            target_sequence: number;
+            /** Format: uint64 */
+            applied_sequence: number;
+            /** Format: uint64 */
+            pending_sequence_count: number;
+            projection_checkpoint_status: string;
+            /** Format: uint64 */
+            projection_checkpoint_applied_sequence: number;
+            /** Format: uint64 */
+            projection_checkpoint_generation: number;
+            /** Format: uint64 */
+            projection_checkpoint_config_hash: number;
+            /** Format: uint64 */
+            checkpoint_replay_tail_sequence_count: number;
+            /** Format: uint64 */
+            processed_requests: number;
+            /** Format: uint64 */
+            error_count: number;
+            /** Format: uint64 */
+            retryable_error_count: number;
+            /** Format: uint64 */
+            fatal_error_count: number;
+            retrying: boolean;
+            worker_failed: boolean;
+            /** @description Whether the background enrichment worker is currently running. */
+            worker_started: boolean;
+            /** @description Whether work is pending with no running worker, retry, or terminal failure explaining the backlog. */
+            stalled: boolean;
+            /** Format: uint64 */
+            skip_by_hash_count: number;
+            /** Format: uint64 */
+            skipped_source_count: number;
+            /** Format: uint64 */
+            codec_decode_failures: number;
+            /** Format: uint64 */
+            embed_batches_started: number;
+            /** Format: uint64 */
+            embed_batches_completed: number;
+            /** Format: uint64 */
+            embed_items_started: number;
+            /** Format: uint64 */
+            embed_items_completed: number;
+            /** Format: uint64 */
+            active_embed_batch_items: number;
+            /** Format: uint64 */
+            active_embed_batch_bytes: number;
+            /** Format: uint64 */
+            active_embed_batch_max_bytes: number;
+            /** Format: uint64 */
+            active_embed_batch_started_ms: number;
+            /** Format: uint64 */
+            last_embed_batch_items: number;
+            /** Format: uint64 */
+            last_embed_batch_bytes: number;
+            /** Format: uint64 */
+            last_embed_batch_max_bytes: number;
+            /** Format: uint64 */
+            last_embed_batch_ns: number;
+            /** Format: uint64 */
+            total_embed_ns: number;
+        };
         /** @description Statistics for an embeddings index (dense or sparse) */
         EmbeddingsIndexStats: {
             /**
@@ -9288,13 +9353,7 @@ export interface components {
             catch_up_applied_sequence?: number;
             /** Format: uint64 */
             catch_up_target_sequence?: number;
-            /** @description Embedding enrichment worker runtime diagnostics. */
-            enrichment_runtime?: {
-                /** Format: uint64 */
-                pending_sequence_count?: number;
-            } & {
-                [key: string]: unknown;
-            };
+            enrichment_runtime?: components["schemas"]["EnrichmentRuntimeStatus"];
             hbc_cache?: {
                 [key: string]: unknown;
             };

@@ -186,6 +186,7 @@ fn runtimeStatusEqual(
         lhs.status_generation != rhs.status_generation or
         lhs.doc_count != rhs.doc_count or
         lhs.disk_bytes != rhs.disk_bytes or
+        lhs.disk_bytes_known != rhs.disk_bytes_known or
         lhs.created_at_millis != rhs.created_at_millis or
         lhs.index_count != rhs.index_count or
         lhs.enrichment_enabled != rhs.enrichment_enabled or
@@ -193,6 +194,8 @@ fn runtimeStatusEqual(
         lhs.enrichment_applied_sequence != rhs.enrichment_applied_sequence or
         lhs.enrichment_retrying != rhs.enrichment_retrying or
         lhs.enrichment_worker_failed != rhs.enrichment_worker_failed or
+        lhs.enrichment_worker_started != rhs.enrichment_worker_started or
+        lhs.enrichment_stalled != rhs.enrichment_stalled or
         lhs.async_indexing_active != rhs.async_indexing_active or
         lhs.async_startup_active != rhs.async_startup_active or
         lhs.async_dense_catch_up_active != rhs.async_dense_catch_up_active or

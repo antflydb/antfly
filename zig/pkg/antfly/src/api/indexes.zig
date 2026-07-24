@@ -2393,6 +2393,10 @@ test "enrichment index status encodes worker lifecycle diagnostics" {
 
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"worker_started\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"stalled\":true") != null);
+    var parsed = try std.json.parseFromSlice(indexes_openapi.EnrichmentRuntimeStatus, std.testing.allocator, encoded.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(false, parsed.value.worker_started);
+    try std.testing.expectEqual(true, parsed.value.stalled);
 }
 
 fn appendSingleIndexRuntimeStatus(

@@ -14891,11 +14891,13 @@ pub const DB = struct {
                 explicit_dense.deinit(alloc);
             }
             for (extracted.dense_embeddings) |embedding| {
-                try explicit_dense.append(alloc, .{
-                    .index_name = try alloc.dupe(u8, embedding.index_name),
-                    .doc_key = try alloc.dupe(u8, embedding.doc_key),
-                    .vector = try alloc.dupe(f32, embedding.vector),
-                });
+                try appendClonedExplicitDenseEmbedding(
+                    alloc,
+                    &explicit_dense,
+                    embedding.index_name,
+                    embedding.doc_key,
+                    embedding.vector,
+                );
             }
             var explicit_sparse = std.ArrayListUnmanaged(types.EnrichmentSparseEmbeddingWrite).empty;
             defer {
@@ -14903,12 +14905,14 @@ pub const DB = struct {
                 explicit_sparse.deinit(alloc);
             }
             for (extracted.sparse_embeddings) |embedding| {
-                try explicit_sparse.append(alloc, .{
-                    .index_name = try alloc.dupe(u8, embedding.index_name),
-                    .doc_key = try alloc.dupe(u8, embedding.doc_key),
-                    .indices = try alloc.dupe(u32, embedding.indices),
-                    .values = try alloc.dupe(f32, embedding.values),
-                });
+                try appendClonedExplicitSparseEmbedding(
+                    alloc,
+                    &explicit_sparse,
+                    embedding.index_name,
+                    embedding.doc_key,
+                    embedding.indices,
+                    embedding.values,
+                );
             }
 
             const generated = try self.core.planGeneratedEnrichments(
@@ -26643,6 +26647,60 @@ fn takeOwnedSlice(comptime T: type, alloc: Allocator, existing: []const T, incom
     return out;
 }
 
+fn appendClonedExplicitDenseEmbedding(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite),
+    index_name: []const u8,
+    doc_key: []const u8,
+    vector: []const f32,
+) !void {
+    const owned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(owned_index_name);
+    const owned_doc_key = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(owned_doc_key);
+    const owned_vector = try alloc.dupe(f32, vector);
+    errdefer alloc.free(owned_vector);
+    try out.append(alloc, .{
+        .index_name = owned_index_name,
+        .doc_key = owned_doc_key,
+        .vector = owned_vector,
+    });
+}
+
+fn appendClonedExplicitSparseEmbedding(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(types.EnrichmentSparseEmbeddingWrite),
+    index_name: []const u8,
+    doc_key: []const u8,
+    indices: []const u32,
+    values: []const f32,
+) !void {
+    const owned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(owned_index_name);
+    const owned_doc_key = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(owned_doc_key);
+    const owned_indices = try alloc.dupe(u32, indices);
+    errdefer alloc.free(owned_indices);
+    const owned_values = try alloc.dupe(f32, values);
+    errdefer alloc.free(owned_values);
+    try out.append(alloc, .{
+        .index_name = owned_index_name,
+        .doc_key = owned_doc_key,
+        .indices = owned_indices,
+        .values = owned_values,
+    });
+}
+
+fn appendGeneratedEnrichmentRef(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef),
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !void {
+    const ref = try enrichment_types.requestToRef(alloc, request);
+    errdefer enrichment_types.freeGeneratedRef(alloc, ref);
+    try out.append(alloc, ref);
+}
+
 fn prepareGeneratedEnrichments(
     self: *DB,
     req: types.BatchRequest,
@@ -26704,11 +26762,13 @@ fn prepareGeneratedEnrichments(
             explicit_dense.deinit(self.alloc);
         }
         for (extracted[i].dense_embeddings) |embedding| {
-            try explicit_dense.append(self.alloc, .{
-                .index_name = try self.alloc.dupe(u8, embedding.index_name),
-                .doc_key = try self.alloc.dupe(u8, embedding.doc_key),
-                .vector = try self.alloc.dupe(f32, embedding.vector),
-            });
+            try appendClonedExplicitDenseEmbedding(
+                self.alloc,
+                &explicit_dense,
+                embedding.index_name,
+                embedding.doc_key,
+                embedding.vector,
+            );
         }
 
         var explicit_sparse = std.ArrayListUnmanaged(types.EnrichmentSparseEmbeddingWrite).empty;
@@ -26717,12 +26777,14 @@ fn prepareGeneratedEnrichments(
             explicit_sparse.deinit(self.alloc);
         }
         for (extracted[i].sparse_embeddings) |embedding| {
-            try explicit_sparse.append(self.alloc, .{
-                .index_name = try self.alloc.dupe(u8, embedding.index_name),
-                .doc_key = try self.alloc.dupe(u8, embedding.doc_key),
-                .indices = try self.alloc.dupe(u32, embedding.indices),
-                .values = try self.alloc.dupe(f32, embedding.values),
-            });
+            try appendClonedExplicitSparseEmbedding(
+                self.alloc,
+                &explicit_sparse,
+                embedding.index_name,
+                embedding.doc_key,
+                embedding.indices,
+                embedding.values,
+            );
         }
 
         const generated = try self.core.planGeneratedEnrichments(
@@ -26745,7 +26807,7 @@ fn prepareGeneratedEnrichments(
 
         for (generated) |request| {
             if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) {
-                try planned.append(self.alloc, try enrichment_types.requestToRef(self.alloc, request));
+                try appendGeneratedEnrichmentRef(self.alloc, &planned, request);
                 continue;
             }
 
@@ -26765,11 +26827,11 @@ fn prepareGeneratedEnrichments(
                 ),
                 .chunk_text => try computeChunkRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &documents, &chunk_cache),
                 .dense_embedding => computeDenseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache) catch |err| switch (err) {
-                    error.MissingDenseEmbedder => try planned.append(self.alloc, try enrichment_types.requestToRef(self.alloc, request)),
+                    error.MissingDenseEmbedder => try appendGeneratedEnrichmentRef(self.alloc, &planned, request),
                     else => return err,
                 },
                 .sparse_embedding => computeSparseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &sparse_embeddings, &chunk_cache) catch |err| switch (err) {
-                    error.MissingSparseEmbedder => try planned.append(self.alloc, try enrichment_types.requestToRef(self.alloc, request)),
+                    error.MissingSparseEmbedder => try appendGeneratedEnrichmentRef(self.alloc, &planned, request),
                     else => return err,
                 },
             }
@@ -26778,14 +26840,15 @@ fn prepareGeneratedEnrichments(
 
     try flushPrecomputeAssetProducerBatch(self.alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents);
 
-    return .{
-        .artifact_writes = try artifact_writes.toOwnedSlice(self.alloc),
-        .artifact_delete_keys = try artifact_delete_keys.toOwnedSlice(self.alloc),
-        .documents = try documents.toOwnedSlice(self.alloc),
-        .dense_embeddings = try dense_embeddings.toOwnedSlice(self.alloc),
-        .sparse_embeddings = try sparse_embeddings.toOwnedSlice(self.alloc),
-        .generated_enrichment_refs = try planned.toOwnedSlice(self.alloc),
-    };
+    var result = PrecomputedGeneratedBatch{};
+    errdefer result.deinit(self.alloc);
+    result.artifact_writes = try artifact_writes.toOwnedSlice(self.alloc);
+    result.artifact_delete_keys = try artifact_delete_keys.toOwnedSlice(self.alloc);
+    result.documents = try documents.toOwnedSlice(self.alloc);
+    result.dense_embeddings = try dense_embeddings.toOwnedSlice(self.alloc);
+    result.sparse_embeddings = try sparse_embeddings.toOwnedSlice(self.alloc);
+    result.generated_enrichment_refs = try planned.toOwnedSlice(self.alloc);
+    return result;
 }
 
 fn renderSourceParts(
@@ -27182,6 +27245,7 @@ fn partitionRemoteArtifactWrites(
     writes: *[]types.BatchWrite,
     groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
 ) !void {
+    if (writes.*.len == 0) return;
     const destinations = try alloc.alloc(usize, writes.*.len);
     defer if (destinations.len > 0) alloc.free(destinations);
     for (writes.*, 0..) |write, i| {
@@ -27218,6 +27282,7 @@ fn partitionRemoteArtifactDeletes(
     keys: *[]const []const u8,
     groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
 ) !void {
+    if (keys.*.len == 0) return;
     const destinations = try alloc.alloc(usize, keys.*.len);
     defer if (destinations.len > 0) alloc.free(destinations);
     for (keys.*, 0..) |key, i| {
@@ -27254,6 +27319,7 @@ fn partitionRemoteDerivedDocuments(
     documents: *[]const derived_types.DerivedDocument,
     groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
 ) !void {
+    if (documents.*.len == 0) return;
     const destinations = try alloc.alloc(usize, documents.*.len);
     defer if (destinations.len > 0) alloc.free(destinations);
     for (documents.*, 0..) |doc, i| {
@@ -27290,6 +27356,7 @@ fn partitionRemoteDenseEmbeddings(
     embeddings: *[]const derived_types.DerivedDenseEmbeddingWrite,
     groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
 ) !void {
+    if (embeddings.*.len == 0) return;
     const destinations = try alloc.alloc(usize, embeddings.*.len);
     defer if (destinations.len > 0) alloc.free(destinations);
     for (embeddings.*, 0..) |embedding, i| {
@@ -27327,6 +27394,7 @@ fn partitionRemoteSparseEmbeddings(
     embeddings: *[]const derived_types.DerivedSparseEmbeddingWrite,
     groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
 ) !void {
+    if (embeddings.*.len == 0) return;
     const destinations = try alloc.alloc(usize, embeddings.*.len);
     defer if (destinations.len > 0) alloc.free(destinations);
     for (embeddings.*, 0..) |embedding, i| {
@@ -28389,11 +28457,13 @@ fn appendGeneratedEnrichments(
             explicit_dense.deinit(self.alloc);
         }
         for (extracted[i].dense_embeddings) |embedding| {
-            try explicit_dense.append(self.alloc, .{
-                .index_name = try self.alloc.dupe(u8, embedding.index_name),
-                .doc_key = try self.alloc.dupe(u8, embedding.doc_key),
-                .vector = try self.alloc.dupe(f32, embedding.vector),
-            });
+            try appendClonedExplicitDenseEmbedding(
+                self.alloc,
+                &explicit_dense,
+                embedding.index_name,
+                embedding.doc_key,
+                embedding.vector,
+            );
         }
         var explicit_sparse = std.ArrayListUnmanaged(types.EnrichmentSparseEmbeddingWrite).empty;
         defer {
@@ -28401,12 +28471,14 @@ fn appendGeneratedEnrichments(
             explicit_sparse.deinit(self.alloc);
         }
         for (extracted[i].sparse_embeddings) |embedding| {
-            try explicit_sparse.append(self.alloc, .{
-                .index_name = try self.alloc.dupe(u8, embedding.index_name),
-                .doc_key = try self.alloc.dupe(u8, embedding.doc_key),
-                .indices = try self.alloc.dupe(u32, embedding.indices),
-                .values = try self.alloc.dupe(f32, embedding.values),
-            });
+            try appendClonedExplicitSparseEmbedding(
+                self.alloc,
+                &explicit_sparse,
+                embedding.index_name,
+                embedding.doc_key,
+                embedding.indices,
+                embedding.values,
+            );
         }
         const generated = try self.core.planGeneratedEnrichments(
             self.alloc,
@@ -28419,7 +28491,7 @@ fn appendGeneratedEnrichments(
         for (generated) |request| {
             if (!generatedRequestMatchesForcedArtifact(force_generated_artifact_names, request)) continue;
             if (skip_terminally_covered and try generatedRequestHasTerminalCoverage(self, request)) continue;
-            try planned.append(self.alloc, try enrichment_types.requestToRef(self.alloc, request));
+            try appendGeneratedEnrichmentRef(self.alloc, &planned, request);
         }
     }
 
@@ -47149,6 +47221,78 @@ test "document child range partition preserves single ownership on allocation fa
             }
         }.run,
         .{remote_key},
+    );
+}
+
+test "generated enrichment preparation helpers release partial allocations" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator) !void {
+                var dense = std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite).empty;
+                defer {
+                    for (dense.items) |*embedding| embedding.deinit(failing_alloc);
+                    dense.deinit(failing_alloc);
+                }
+                try appendClonedExplicitDenseEmbedding(
+                    failing_alloc,
+                    &dense,
+                    "dense_v1",
+                    "doc:a",
+                    &.{ 1.0, 2.0, 3.0 },
+                );
+            }
+        }.run,
+        .{},
+    );
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator) !void {
+                var sparse = std.ArrayListUnmanaged(types.EnrichmentSparseEmbeddingWrite).empty;
+                defer {
+                    for (sparse.items) |*embedding| embedding.deinit(failing_alloc);
+                    sparse.deinit(failing_alloc);
+                }
+                try appendClonedExplicitSparseEmbedding(
+                    failing_alloc,
+                    &sparse,
+                    "sparse_v1",
+                    "doc:a",
+                    &.{ 2, 7 },
+                    &.{ 0.25, 0.75 },
+                );
+            }
+        }.run,
+        .{},
+    );
+
+    const request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "dense_v1",
+        .embedding_name = "body_embedding",
+        .doc_key = "doc:a",
+        .source_field = "body",
+    };
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(
+                failing_alloc: Allocator,
+                generated_request: enrichment_types.GeneratedEnrichmentRequest,
+            ) !void {
+                var refs = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
+                defer {
+                    for (refs.items) |ref| enrichment_types.freeGeneratedRef(failing_alloc, ref);
+                    refs.deinit(failing_alloc);
+                }
+                try appendGeneratedEnrichmentRef(failing_alloc, &refs, generated_request);
+            }
+        }.run,
+        .{request},
     );
 }
 

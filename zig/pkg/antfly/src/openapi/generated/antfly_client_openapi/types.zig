@@ -2618,8 +2618,7 @@ pub const EmbeddingsIndexStats = struct {
     catch_up_phase: ?[]const u8 = null,
     catch_up_applied_sequence: ?i64 = null,
     catch_up_target_sequence: ?i64 = null,
-    /// Embedding enrichment worker runtime diagnostics.
-    enrichment_runtime: ?std.json.Value = null,
+    enrichment_runtime: ?EnrichmentRuntimeStatus = null,
     hbc_cache: ?std.json.Value = null,
     hbc_posting: ?std.json.Value = null,
     async_indexing: ?std.json.Value = null,
@@ -2710,6 +2709,45 @@ pub const EnrichmentKind = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Runtime state for the durable embeddings enrichment worker.
+pub const EnrichmentRuntimeStatus = struct {
+    enabled: bool,
+    target_sequence: i64,
+    applied_sequence: i64,
+    pending_sequence_count: i64,
+    projection_checkpoint_status: []const u8,
+    projection_checkpoint_applied_sequence: i64,
+    projection_checkpoint_generation: i64,
+    projection_checkpoint_config_hash: i64,
+    checkpoint_replay_tail_sequence_count: i64,
+    processed_requests: i64,
+    error_count: i64,
+    retryable_error_count: i64,
+    fatal_error_count: i64,
+    retrying: bool,
+    worker_failed: bool,
+    /// Whether the background enrichment worker is currently running.
+    worker_started: bool,
+    /// Whether work is pending with no running worker, retry, or terminal failure explaining the backlog.
+    stalled: bool,
+    skip_by_hash_count: i64,
+    skipped_source_count: i64,
+    codec_decode_failures: i64,
+    embed_batches_started: i64,
+    embed_batches_completed: i64,
+    embed_items_started: i64,
+    embed_items_completed: i64,
+    active_embed_batch_items: i64,
+    active_embed_batch_bytes: i64,
+    active_embed_batch_max_bytes: i64,
+    active_embed_batch_started_ms: i64,
+    last_embed_batch_items: i64,
+    last_embed_batch_bytes: i64,
+    last_embed_batch_max_bytes: i64,
+    last_embed_batch_ns: i64,
+    total_embed_ns: i64,
 };
 
 pub const Error = struct {

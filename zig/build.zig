@@ -3073,6 +3073,10 @@ pub fn build(b: *std.Build) void {
         "linear merge request parser accepts raw payload value under public request cap",
         "http response uses its owning allocator",
         "public index contract exposes runtime status metadata",
+        "enrichment index status encodes worker lifecycle diagnostics",
+        "remote runtime status reports replay debt separately from active catch-up",
+        "table storage status sums complete fresh shard disk usage",
+        "metadata.table status encoder honors storage status overrides",
         "public openapi documents stable exact sort diagnostics",
         "artifact enrichment request permits asset full text routing",
         "provisioned read cache retirement is allocation-free after entry installation",
@@ -3361,6 +3365,7 @@ pub fn build(b: *std.Build) void {
             "multi raft drainReady continues async pipeline without starving peer",
             "multi raft drainReady does not retry a no-progress frontier",
             "multi raft drainReady reserves continuations for productive groups",
+            "multi raft backpressure rejects async ready before cloning messages",
         },
     });
     const run_raft_ready_continuation_tests = addFilteredTestRunArtifact(b, raft_ready_continuation_tests);
@@ -3610,6 +3615,7 @@ pub fn build(b: *std.Build) void {
         "data runtime treats metadata leadership churn as retryable bootstrap failure",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "idle cached runtime status stays fresh only for the published root generation",
+        "runtime status disk usage cache is scoped to one root generation",
         "data runtime stamps one producer generation on every reported group",
         "data runtime live writer source follows raft apply ownership",
         "placement topology promotes cutover-ready learners to voters",

@@ -1,37 +1,34 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="SecretStoreStatus")
+T = TypeVar("T", bound="RuntimeConfigStatus")
 
 
 @_attrs_define
-class SecretStoreStatus:
-    """Non-secret status for the local secrets file store, when one is available.
+class RuntimeConfigStatus:
+    """Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only
+    changes; startup-only changes remain stale until restart.
 
-    Attributes:
-        generation (int | Unset): Generation of the currently published secret-store snapshot.
-        supports_source_generation (bool | Unset): Whether this store can expose one exact opaque source-generation
-            acknowledgement. This remains true when a single loaded file predates the generation field, and is false for
-            layered stores whose served snapshot has multiple publication sources.
-        source_generation (None | str | Unset): Opaque, non-secret generation embedded by the control plane in the
-            currently applied secrets file. It is null for files without an acknowledgement generation and never derives
-            from secret values.
-        last_reload_failed (bool | Unset): Whether the latest observed replacement failed to load.
-        stale (bool | Unset): Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
-        reload_successes (int | Unset):
-        reload_failures (int | Unset):
+        Attributes:
+            generation (int | Unset): Generation of the fully validated and atomically published configuration.
+            hash_ (str | Unset): Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters
+                match the operator config-hash annotation.
+            last_reload_failed (bool | Unset): Whether the latest observed replacement failed loading, semantic validation,
+                or requires restart because startup-only fields changed.
+            stale (bool | Unset): Whether requests are using the last-known-good snapshot after a failed reload.
+            reload_successes (int | Unset):
+            reload_failures (int | Unset):
     """
 
     generation: int | Unset = UNSET
-    supports_source_generation: bool | Unset = UNSET
-    source_generation: None | str | Unset = UNSET
+    hash_: str | Unset = UNSET
     last_reload_failed: bool | Unset = UNSET
     stale: bool | Unset = UNSET
     reload_successes: int | Unset = UNSET
@@ -41,13 +38,7 @@ class SecretStoreStatus:
     def to_dict(self) -> dict[str, Any]:
         generation = self.generation
 
-        supports_source_generation = self.supports_source_generation
-
-        source_generation: None | str | Unset
-        if isinstance(self.source_generation, Unset):
-            source_generation = UNSET
-        else:
-            source_generation = self.source_generation
+        hash_ = self.hash_
 
         last_reload_failed = self.last_reload_failed
 
@@ -62,10 +53,8 @@ class SecretStoreStatus:
         field_dict.update({})
         if generation is not UNSET:
             field_dict["generation"] = generation
-        if supports_source_generation is not UNSET:
-            field_dict["supports_source_generation"] = supports_source_generation
-        if source_generation is not UNSET:
-            field_dict["source_generation"] = source_generation
+        if hash_ is not UNSET:
+            field_dict["hash"] = hash_
         if last_reload_failed is not UNSET:
             field_dict["last_reload_failed"] = last_reload_failed
         if stale is not UNSET:
@@ -82,16 +71,7 @@ class SecretStoreStatus:
         d = dict(src_dict)
         generation = d.pop("generation", UNSET)
 
-        supports_source_generation = d.pop("supports_source_generation", UNSET)
-
-        def _parse_source_generation(data: object) -> None | str | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(None | str | Unset, data)
-
-        source_generation = _parse_source_generation(d.pop("source_generation", UNSET))
+        hash_ = d.pop("hash", UNSET)
 
         last_reload_failed = d.pop("last_reload_failed", UNSET)
 
@@ -101,18 +81,17 @@ class SecretStoreStatus:
 
         reload_failures = d.pop("reload_failures", UNSET)
 
-        secret_store_status = cls(
+        runtime_config_status = cls(
             generation=generation,
-            supports_source_generation=supports_source_generation,
-            source_generation=source_generation,
+            hash_=hash_,
             last_reload_failed=last_reload_failed,
             stale=stale,
             reload_successes=reload_successes,
             reload_failures=reload_failures,
         )
 
-        secret_store_status.additional_properties = d
-        return secret_store_status
+        runtime_config_status.additional_properties = d
+        return runtime_config_status
 
     @property
     def additional_keys(self) -> list[str]:

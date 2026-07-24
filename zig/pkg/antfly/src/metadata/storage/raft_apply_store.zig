@@ -2938,7 +2938,7 @@ pub const RaftApplyStore = struct {
 };
 
 const transition_magic = "afmd1";
-const runtime_status_record_version: u16 = 7;
+const runtime_status_record_version: u16 = 8;
 const group_status_record_version: u16 = 2;
 
 const TransitionTag = enum(u8) {
@@ -3748,6 +3748,7 @@ fn appendRuntimeGroupStatusRecord(
     try appendInt(alloc, out, u64, record.status_generation);
     try appendInt(alloc, out, u64, record.doc_count);
     try appendInt(alloc, out, u64, record.disk_bytes);
+    try out.append(alloc, if (record.disk_bytes_known) 1 else 0);
     try appendInt(alloc, out, u64, record.created_at_millis);
     try appendInt(alloc, out, u32, record.index_count);
     try out.append(alloc, if (record.enrichment_enabled) 1 else 0);
@@ -3755,6 +3756,8 @@ fn appendRuntimeGroupStatusRecord(
     try appendInt(alloc, out, u64, record.enrichment_applied_sequence);
     try out.append(alloc, if (record.enrichment_retrying) 1 else 0);
     try out.append(alloc, if (record.enrichment_worker_failed) 1 else 0);
+    try out.append(alloc, if (record.enrichment_worker_started) 1 else 0);
+    try out.append(alloc, if (record.enrichment_stalled) 1 else 0);
     try out.append(alloc, if (record.async_indexing_active) 1 else 0);
     try out.append(alloc, if (record.async_startup_active) 1 else 0);
     try out.append(alloc, if (record.async_dense_catch_up_active) 1 else 0);
@@ -3771,7 +3774,7 @@ fn readRuntimeGroupStatusRecord(
     pos: *usize,
 ) !metadata.RuntimeGroupStatusReport {
     const version = try readInt(encoded, pos, u16);
-    if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != runtime_status_record_version) return error.InvalidMetadataTransitionEncoding;
+    if (version == 0 or version > runtime_status_record_version) return error.InvalidMetadataTransitionEncoding;
     const table_id = try readInt(encoded, pos, u64);
     const table_name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(table_name);
@@ -3788,6 +3791,12 @@ fn readRuntimeGroupStatusRecord(
     const status_generation = try readInt(encoded, pos, u64);
     const doc_count = try readInt(encoded, pos, u64);
     const disk_bytes = if (version >= 2) try readInt(encoded, pos, u64) else 0;
+    const disk_bytes_known = if (version >= 8) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const value = encoded[pos.*] != 0;
+        pos.* += 1;
+        break :blk value;
+    } else false;
     const created_at_millis = if (version >= 2) try readInt(encoded, pos, u64) else 0;
     const index_count = try readInt(encoded, pos, u32);
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
@@ -3795,11 +3804,22 @@ fn readRuntimeGroupStatusRecord(
     pos.* += 1;
     const enrichment_target_sequence = try readInt(encoded, pos, u64);
     const enrichment_applied_sequence = try readInt(encoded, pos, u64);
-    if (pos.* + 3 > encoded.len) return error.InvalidMetadataTransitionEncoding;
+    const enrichment_lifecycle_field_count: usize = if (version >= 8) 5 else 3;
+    if (pos.* + enrichment_lifecycle_field_count > encoded.len) return error.InvalidMetadataTransitionEncoding;
     const enrichment_retrying = encoded[pos.*] != 0;
     pos.* += 1;
     const enrichment_worker_failed = encoded[pos.*] != 0;
     pos.* += 1;
+    const enrichment_worker_started = if (version >= 8) blk: {
+        const value = encoded[pos.*] != 0;
+        pos.* += 1;
+        break :blk value;
+    } else false;
+    const enrichment_stalled = if (version >= 8) blk: {
+        const value = encoded[pos.*] != 0;
+        pos.* += 1;
+        break :blk value;
+    } else false;
     const async_indexing_active = encoded[pos.*] != 0;
     pos.* += 1;
     if (pos.* + 3 > encoded.len) return error.InvalidMetadataTransitionEncoding;
@@ -3835,6 +3855,7 @@ fn readRuntimeGroupStatusRecord(
         .status_generation = status_generation,
         .doc_count = doc_count,
         .disk_bytes = disk_bytes,
+        .disk_bytes_known = disk_bytes_known,
         .created_at_millis = created_at_millis,
         .index_count = index_count,
         .enrichment_enabled = enrichment_enabled,
@@ -3842,6 +3863,8 @@ fn readRuntimeGroupStatusRecord(
         .enrichment_applied_sequence = enrichment_applied_sequence,
         .enrichment_retrying = enrichment_retrying,
         .enrichment_worker_failed = enrichment_worker_failed,
+        .enrichment_worker_started = enrichment_worker_started,
+        .enrichment_stalled = enrichment_stalled,
         .async_indexing_active = async_indexing_active,
         .async_startup_active = async_startup_active,
         .async_dense_catch_up_active = async_dense_catch_up_active,
@@ -7346,6 +7369,10 @@ test "metadata raft apply store runtime status codec preserves document identity
         .node_id = 30,
         .source = "background_refresh",
         .freshness = "fresh",
+        .disk_bytes = 4096,
+        .disk_bytes_known = true,
+        .enrichment_worker_started = true,
+        .enrichment_stalled = true,
         .doc_identity = .{
             .namespace_table_id = 1,
             .namespace_shard_id = 10,
@@ -7398,6 +7425,10 @@ test "metadata raft apply store runtime status codec preserves document identity
 
     try std.testing.expectEqual(@as(usize, 1), decoded.runtime_statuses.len);
     const status = decoded.runtime_statuses[0];
+    try std.testing.expectEqual(@as(u64, 4096), status.disk_bytes);
+    try std.testing.expect(status.disk_bytes_known);
+    try std.testing.expect(status.enrichment_worker_started);
+    try std.testing.expect(status.enrichment_stalled);
     try std.testing.expectEqual(@as(u64, 1), status.doc_identity.namespace_table_id);
     try std.testing.expectEqual(@as(u64, 10), status.doc_identity.namespace_shard_id);
     try std.testing.expectEqual(@as(u64, 1001), status.doc_identity.namespace_range_id);
