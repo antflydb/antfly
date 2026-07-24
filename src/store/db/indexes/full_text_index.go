@@ -51,7 +51,49 @@ const (
 	fullTextMaxBatches        = 100
 	fullTextPartitionSize     = 100
 	fullTextBackfillBatchSize = 1_000
+
+	defaultFullTextMaxSegmentFileSize   int64 = 256 << 20
+	defaultFullTextSegmentsPerMergeTask       = 5
 )
+
+type bleveMergePlanOptions struct {
+	MaxSegmentFileSize   int64
+	SegmentsPerMergeTask int
+}
+
+func (c FullTextIndexConfig) normalizedBleveMergePlanOptions() bleveMergePlanOptions {
+	maxSegmentFileSize := c.MaxSegmentFileSize
+	if maxSegmentFileSize == 0 {
+		maxSegmentFileSize = defaultFullTextMaxSegmentFileSize
+	}
+	segmentsPerMergeTask := c.SegmentsPerMergeTask
+	if segmentsPerMergeTask == 0 {
+		segmentsPerMergeTask = defaultFullTextSegmentsPerMergeTask
+	}
+	return bleveMergePlanOptions{
+		MaxSegmentFileSize:   maxSegmentFileSize,
+		SegmentsPerMergeTask: segmentsPerMergeTask,
+	}
+}
+
+func (o bleveMergePlanOptions) validate() error {
+	if o.MaxSegmentFileSize < 1 {
+		return fmt.Errorf("max_segment_file_size must be positive, got %d", o.MaxSegmentFileSize)
+	}
+	if o.SegmentsPerMergeTask < 2 {
+		return fmt.Errorf("segments_per_merge_task must be at least 2, got %d", o.SegmentsPerMergeTask)
+	}
+	return nil
+}
+
+func (o bleveMergePlanOptions) runtimeConfig() map[string]any {
+	return map[string]any{
+		"scorchMergePlanOptions": map[string]any{
+			"maxSegmentFileSize":   o.MaxSegmentFileSize,
+			"segmentsPerMergeTask": o.SegmentsPerMergeTask,
+		},
+	}
+}
 
 var fullTextRateLimiter *rate.Limiter = rate.NewLimiter(
 	10_000,
@@ -298,6 +340,10 @@ func NewBleveIndexV2(
 			return nil, fmt.Errorf("parsing config: %w", err)
 		}
 	}
+	mergePlanOptions := c.normalizedBleveMergePlanOptions()
+	if err := mergePlanOptions.validate(); err != nil {
+		return nil, fmt.Errorf("validating Bleve merge plan options: %w", err)
+	}
 	indexPath := filepath.Join(dir, name)
 	bi := &BleveIndexV2{
 		logger:       logger,
@@ -322,6 +368,10 @@ func (bi *BleveIndexV2) Name() string {
 
 func (bi *BleveIndexV2) Type() IndexType {
 	return IndexTypeFullText
+}
+
+func (bi *BleveIndexV2) bleveRuntimeConfig() map[string]any {
+	return bi.conf.normalizedBleveMergePlanOptions().runtimeConfig()
 }
 
 // Open initializes or opens the Bleve index.
@@ -372,12 +422,17 @@ func (bi *BleveIndexV2) Open(
 		return fmt.Errorf("creating WALBuffer: %w", err)
 	}
 	if !bi.conf.MemOnly {
+		mergePlanOptions := bi.conf.normalizedBleveMergePlanOptions()
+		bi.logger.Info("Using Bleve merge plan options",
+			zap.Int64("max_segment_file_size", mergePlanOptions.MaxSegmentFileSize),
+			zap.Int("segments_per_merge_task", mergePlanOptions.SegmentsPerMergeTask))
+
 		foundExisting := false
 		bleveIndexPath := bi.indexPath + "/bleve"
 		_, statErr := os.Stat(bleveIndexPath)
 		if statErr == nil {
 			// Directory exists and not rebuilding, open existing index
-			bi.bidx, err = bleve.Open(bleveIndexPath)
+			bi.bidx, err = bleve.OpenUsing(bleveIndexPath, bi.bleveRuntimeConfig())
 			if err == nil {
 				bi.logger.Info("Opened existing Bleve index", zap.String("path", bleveIndexPath))
 				// No need to rebuild if we successfully opened existing index
@@ -422,7 +477,13 @@ func (bi *BleveIndexV2) Open(
 			bi.logger.Debug("Creating Bleve index with schema and mapping",
 				zap.Any("schema", tableSchema),
 				zap.Any("indexMapping", indexMapping))
-			bi.bidx, err = bleve.New(bleveIndexPath, indexMapping)
+			bi.bidx, err = bleve.NewUsing(
+				bleveIndexPath,
+				indexMapping,
+				bleve.Config.DefaultIndexType,
+				bleve.Config.DefaultKVStore,
+				bi.bleveRuntimeConfig(),
+			)
 			if err != nil {
 				return fmt.Errorf("creating bleve index at %s: %w", bleveIndexPath, err)
 			}
@@ -1087,12 +1148,12 @@ func (bi *BleveIndexV2) reloadMapping(newSchema *schema.TableSchema) error {
 
 	// Reopen with updated mapping
 	bleveIndexPath := bi.indexPath + "/bleve"
-	bi.bidx, err = bleve.OpenUsing(bleveIndexPath, map[string]any{
-		"updated_mapping": string(mappingBytes),
-	})
+	runtimeConfig := bi.bleveRuntimeConfig()
+	runtimeConfig["updated_mapping"] = string(mappingBytes)
+	bi.bidx, err = bleve.OpenUsing(bleveIndexPath, runtimeConfig)
 	if err != nil {
 		// Attempt to reopen without update on failure
-		bi.bidx, _ = bleve.Open(bleveIndexPath)
+		bi.bidx, _ = bleve.OpenUsing(bleveIndexPath, bi.bleveRuntimeConfig())
 		return fmt.Errorf("reopening index with updated mapping: %w", err)
 	}
 
