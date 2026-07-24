@@ -12,10 +12,13 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const std = @import("std");
 const runtime_loop = @import("raft/runtime_loop.zig");
 const hosted_shard_ops = @import("raft/hosted_shard_ops.zig");
+const transition_service = @import("raft/transition_service.zig");
 
 test {
     _ = runtime_loop;
     _ = hosted_shard_ops;
+    std.testing.refAllDecls(transition_service);
 }

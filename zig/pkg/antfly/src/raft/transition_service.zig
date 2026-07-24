@@ -730,6 +730,148 @@ test "transition service steps split and merge queues through runtime" {
     try std.testing.expect(merge.status.allow_doc_identity_reassignment);
 }
 
+test "transition service retries split bootstrap after leader recovery" {
+    const Clock = struct {
+        now_ms: u64 = 1_000,
+
+        fn source(self: *@This()) RetryClock {
+            return .{
+                .ptr = self,
+                .now_ms_fn = nowMs,
+            };
+        }
+
+        fn nowMs(ptr: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            return self.now_ms;
+        }
+    };
+
+    const Split = struct {
+        status: data.SplitTransitionStatus = .{
+            .phase = .bootstrap_peer,
+            .source_split_phase = .splitting,
+            .bootstrapped = false,
+            .replay_required = true,
+            .replay_caught_up = false,
+            .cutover_ready = false,
+            .destination_ready_for_reads = false,
+            .source_delta_sequence = 1,
+            .dest_delta_sequence = 0,
+        },
+        bootstrap_calls: usize = 0,
+        failures_remaining: usize = 2,
+
+        fn iface(self: *@This()) transition_runtime.SplitRuntime {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .observe_status = observeStatus,
+                    .prepare_source = prepareSource,
+                    .start_source = startSource,
+                    .bootstrap_destination = bootstrapDestination,
+                    .catch_up_destination = catchUpDestination,
+                    .finalize_source = finalizeSource,
+                    .rollback_source = rollbackSource,
+                },
+            };
+        }
+
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.status;
+        }
+
+        fn prepareSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+            return true;
+        }
+
+        fn startSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+            return true;
+        }
+
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.bootstrap_calls += 1;
+            if (self.failures_remaining > 0) {
+                self.failures_remaining -= 1;
+                return error.GroupLeaderUnavailable;
+            }
+            self.status.phase = .replay_deltas;
+            self.status.bootstrapped = true;
+            return true;
+        }
+
+        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.status.phase = .cutover_ready;
+            self.status.replay_caught_up = true;
+            self.status.cutover_ready = true;
+            self.status.destination_ready_for_reads = true;
+            self.status.dest_delta_sequence = self.status.source_delta_sequence;
+            return 1;
+        }
+
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.status.phase = .finalized;
+            self.status.source_split_phase = .none;
+            self.status.replay_required = false;
+            return true;
+        }
+
+        fn rollbackSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+            return true;
+        }
+    };
+
+    var clock = Clock{};
+    var split = Split{};
+    var svc = TransitionService.initWithRetryClock(
+        std.testing.allocator,
+        .{ .split = split.iface() },
+        clock.source(),
+    );
+    defer svc.deinit();
+    try svc.submitSplit(.{
+        .transition_id = 7,
+        .attempt_epoch = 1,
+        .source_group_id = 11,
+        .destination_group_id = 12,
+        .phase = .bootstrap_peer,
+    });
+
+    _ = try svc.stepPending();
+    try std.testing.expectEqual(@as(usize, 1), split.bootstrap_calls);
+    try std.testing.expectEqual(metadata.TransitionPhase.bootstrap_peer, svc.pending_split.items[0].phase);
+
+    clock.now_ms += transition_retry_initial_ms - 1;
+    _ = try svc.stepPending();
+    try std.testing.expectEqual(@as(usize, 1), split.bootstrap_calls);
+
+    clock.now_ms += 1;
+    _ = try svc.stepPending();
+    try std.testing.expectEqual(@as(usize, 2), split.bootstrap_calls);
+
+    clock.now_ms += transition_retry_initial_ms * 2 - 1;
+    _ = try svc.stepPending();
+    try std.testing.expectEqual(@as(usize, 2), split.bootstrap_calls);
+
+    clock.now_ms += 1;
+    _ = try svc.stepPending();
+    try std.testing.expectEqual(@as(usize, 3), split.bootstrap_calls);
+    try std.testing.expect(split.status.bootstrapped);
+    try std.testing.expectEqual(@as(usize, 1), svc.pending_split.items.len);
+    try std.testing.expectEqual(metadata.TransitionPhase.bootstrap_peer, svc.pending_split.items[0].phase);
+    try std.testing.expect(!svc.split_retries.contains(7));
+
+    _ = try svc.stepPending();
+    _ = try svc.stepPending();
+    _ = try svc.stepPending();
+    try std.testing.expectEqual(@as(usize, 0), svc.pending_split.items.len);
+    try std.testing.expectEqual(@as(usize, 1), svc.metrics.completed_split_transitions);
+}
+
 test "transition service upserts and removes queued transitions by id" {
     var svc = TransitionService.init(std.testing.allocator, .{});
     defer svc.deinit();

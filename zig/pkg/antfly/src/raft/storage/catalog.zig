@@ -503,7 +503,7 @@ pub const FileReplicaCatalog = struct {
         const header = (reader.interface.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => return error.InvalidReplicaCatalog,
             else => return err,
-        }) orelse return;
+        }) orelse return error.InvalidReplicaCatalog;
         if (!std.mem.eql(u8, header, replica_catalog_header))
             return error.InvalidReplicaCatalog;
 
@@ -923,6 +923,23 @@ test "file replica catalog rejects duplicate groups without leaking loaded recor
         \\{"group_id":21,"replica_id":3,"local_node_id":5,"bootstrap_mode":"persisted","metadata_version":10,"snapshot_bootstrap":null,"backup_restore_bootstrap":null}
         \\
         ,
+    });
+
+    try std.testing.expectError(
+        error.InvalidReplicaCatalog,
+        FileReplicaCatalog.init(std.testing.allocator, path),
+    );
+}
+
+test "file replica catalog rejects an existing truncated empty file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-empty", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "",
     });
 
     try std.testing.expectError(

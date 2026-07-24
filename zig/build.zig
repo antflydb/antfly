@@ -3326,6 +3326,7 @@ pub fn build(b: *std.Build) void {
         "managed raft progress driver stop interrupts a long cadence wait",
         "raft runtime cadence validates independent intervals",
         "transition destination requires a stable healthy voter set",
+        "transition service retries split bootstrap after leader recovery",
     };
     const raft_runtime_tests = b.addTest(.{
         .root_module = raft_runtime_test_mod,
@@ -3650,6 +3651,7 @@ pub fn build(b: *std.Build) void {
         "data raft apply store seeds pre-raft snapshots once at reserved index zero",
         "data raft apply store refuses stale snapshot projection regression",
         "data raft snapshot staging blocks only the target group",
+        "file replica catalog rejects an existing truncated empty file",
         "raft batch round trips internal split checkpoint",
         "raft batch round trips internal split replication identity",
         "group state range scan is allocation-failure safe",
