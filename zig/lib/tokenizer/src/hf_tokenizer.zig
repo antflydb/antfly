@@ -73,6 +73,14 @@ pub const HfTokenizer = struct {
     /// symbol lists and priority queues on every occurrence and keeps lock
     /// contention low when a tokenizer is shared by concurrent requests.
     bpe_cache: ?*BpeCache,
+    /// Opt-in cache profiling. Disabled on the normal hot path; benchmark
+    /// tooling enables it only after warmup.
+    bpe_profile_enabled: bool,
+    bpe_profile: BpeProfileCounters,
+    byte_level_direct_ids: ?*ByteLevelDirectIds,
+    parallel_workspace_mutex: std.atomic.Mutex,
+    parallel_workspace_free: ?*ParallelBpeWorkspace,
+    parallel_workspace_all: ?*ParallelBpeWorkspace,
     end_of_word_suffix: []const u8,
     byte_fallback: bool,
     // Unigram fields
@@ -102,6 +110,11 @@ pub const HfTokenizer = struct {
         result_id: i32,
     };
 
+    const ByteLevelDirectIds = struct {
+        single: [256]i32 = @splat(-1),
+        pair: [65536]i32 = @splat(-1),
+    };
+
     const bpe_cache_shard_count = 64;
     const bpe_cache_slots_per_shard = 2048;
     const bpe_cache_max_entries_per_shard = bpe_cache_slots_per_shard * 3 / 4;
@@ -123,6 +136,28 @@ pub const HfTokenizer = struct {
     const BpeCache = struct {
         shards: [bpe_cache_shard_count]BpeCacheShard =
             [_]BpeCacheShard{.{}} ** bpe_cache_shard_count,
+    };
+
+    pub const BpeProfile = struct {
+        hits: u64,
+        misses: u64,
+        probes: u64,
+        key_bytes: u64,
+        token_ids: u64,
+        key_len_histogram: [33]u64,
+        id_count_histogram: [9]u64,
+    };
+
+    const BpeProfileCounters = struct {
+        hits: std.atomic.Value(u64) = .init(0),
+        misses: std.atomic.Value(u64) = .init(0),
+        probes: std.atomic.Value(u64) = .init(0),
+        key_bytes: std.atomic.Value(u64) = .init(0),
+        token_ids: std.atomic.Value(u64) = .init(0),
+        key_len_histogram: [33]std.atomic.Value(u64) =
+            @splat(.{ .raw = 0 }),
+        id_count_histogram: [9]std.atomic.Value(u64) =
+            @splat(.{ .raw = 0 }),
     };
 
     /// Byte-indexed trie used for added-token matching. Each node stores its
@@ -337,6 +372,12 @@ pub const HfTokenizer = struct {
             .merge_ranks = .{},
             .merge_pairs = .{},
             .bpe_cache = null,
+            .bpe_profile_enabled = false,
+            .bpe_profile = .{},
+            .byte_level_direct_ids = null,
+            .parallel_workspace_mutex = .unlocked,
+            .parallel_workspace_free = null,
+            .parallel_workspace_all = null,
             .end_of_word_suffix = "",
             .byte_fallback = false,
             .unigram_vocab = .empty,
@@ -687,6 +728,18 @@ pub const HfTokenizer = struct {
 
     /// Parse vocab from a dict format: {"token": id, ...} (WordPiece and BPE)
     fn parseVocabDict(self: *HfTokenizer, obj: std.json.ObjectMap) !void {
+        var allocated_direct_ids = false;
+        if (self.pre_tokenizer_type == .byte_level and self.byte_level_direct_ids == null) {
+            const direct_ids = try self.allocator.create(ByteLevelDirectIds);
+            direct_ids.* = .{};
+            self.byte_level_direct_ids = direct_ids;
+            allocated_direct_ids = true;
+        }
+        errdefer if (allocated_direct_ids) {
+            self.allocator.destroy(self.byte_level_direct_ids.?);
+            self.byte_level_direct_ids = null;
+        };
+
         if (obj.get("vocab")) |vocab_val| {
             if (vocab_val == .object) {
                 var it = vocab_val.object.iterator();
@@ -702,6 +755,16 @@ pub const HfTokenizer = struct {
                         } else display_key;
                         try self.vocab.put(self.allocator, lookup_key, id);
                         try self.id_to_token.put(self.allocator, id, display_key);
+                        if (self.byte_level_direct_ids) |direct_ids| {
+                            if (lookup_key.len == 1) {
+                                direct_ids.single[lookup_key[0]] = id;
+                            } else if (lookup_key.len == 2) {
+                                const pair_key =
+                                    (@as(usize, lookup_key[0]) << 8) |
+                                    @as(usize, lookup_key[1]);
+                                direct_ids.pair[pair_key] = id;
+                            }
+                        }
                     }
                 }
             }
@@ -941,8 +1004,8 @@ pub const HfTokenizer = struct {
     const parallel_bpe_min_bytes = 256 * 1024;
 
     const ParallelBpeWorker = struct {
-        tokenizer: *HfTokenizer,
-        text: []const u8,
+        tokenizer: *HfTokenizer = undefined,
+        text: []const u8 = "",
         ids: std.ArrayListUnmanaged(i32) = .empty,
         failure: ?anyerror = null,
 
@@ -956,6 +1019,43 @@ pub const HfTokenizer = struct {
             };
         }
     };
+
+    const ParallelBpeWorkspace = struct {
+        next_free: ?*ParallelBpeWorkspace = null,
+        next_all: ?*ParallelBpeWorkspace = null,
+        workers: [64]ParallelBpeWorker =
+            [_]ParallelBpeWorker{.{}} ** 64,
+    };
+
+    fn acquireParallelBpeWorkspace(self: *HfTokenizer) !*ParallelBpeWorkspace {
+        while (!self.parallel_workspace_mutex.tryLock()) std.atomic.spinLoopHint();
+        if (self.parallel_workspace_free) |workspace| {
+            self.parallel_workspace_free = workspace.next_free;
+            workspace.next_free = null;
+            self.parallel_workspace_mutex.unlock();
+            return workspace;
+        }
+        self.parallel_workspace_mutex.unlock();
+
+        const workspace = try self.allocator.create(ParallelBpeWorkspace);
+        workspace.* = .{};
+
+        while (!self.parallel_workspace_mutex.tryLock()) std.atomic.spinLoopHint();
+        workspace.next_all = self.parallel_workspace_all;
+        self.parallel_workspace_all = workspace;
+        self.parallel_workspace_mutex.unlock();
+        return workspace;
+    }
+
+    fn releaseParallelBpeWorkspace(
+        self: *HfTokenizer,
+        workspace: *ParallelBpeWorkspace,
+    ) void {
+        while (!self.parallel_workspace_mutex.tryLock()) std.atomic.spinLoopHint();
+        workspace.next_free = self.parallel_workspace_free;
+        self.parallel_workspace_free = workspace;
+        self.parallel_workspace_mutex.unlock();
+    }
 
     fn isAsciiWhitespaceByte(byte: u8) bool {
         return byte == ' ' or (byte >= 9 and byte <= 13);
@@ -1002,39 +1102,38 @@ pub const HfTokenizer = struct {
         }
 
         const task_count = @min(requested_tasks, 64);
-        var boundaries = std.ArrayListUnmanaged(usize).empty;
-        defer boundaries.deinit(allocator);
-        try boundaries.ensureTotalCapacity(allocator, task_count + 1);
-        boundaries.appendAssumeCapacity(0);
+        var boundaries: [65]usize = undefined;
+        var boundary_count: usize = 1;
+        boundaries[0] = 0;
         for (1..task_count) |idx| {
             const target =
                 (text.len / task_count) * idx +
                 ((text.len % task_count) * idx) / task_count;
             const boundary = parallelBpeBoundary(text, target);
-            if (boundary > boundaries.items[boundaries.items.len - 1] and
+            if (boundary > boundaries[boundary_count - 1] and
                 boundary < text.len)
             {
-                boundaries.appendAssumeCapacity(boundary);
+                boundaries[boundary_count] = boundary;
+                boundary_count += 1;
             }
         }
-        boundaries.appendAssumeCapacity(text.len);
-        const worker_count = boundaries.items.len - 1;
+        boundaries[boundary_count] = text.len;
+        boundary_count += 1;
+        const worker_count = boundary_count - 1;
         if (worker_count <= 1) return self.encodeInto(allocator, text, ids);
 
-        const workers = try allocator.alloc(ParallelBpeWorker, worker_count);
-        defer {
-            for (workers) |*worker| worker.ids.deinit(self.allocator);
-            allocator.free(workers);
-        }
+        const workspace = try self.acquireParallelBpeWorkspace();
+        defer self.releaseParallelBpeWorkspace(workspace);
+        const workers = workspace.workers[0..worker_count];
         // The caller processes the final chunk while the other chunks run on
         // the caller's std.Io runtime, so requested_tasks is total concurrency.
         const background_count = worker_count - 1;
 
         for (workers, 0..) |*worker, idx| {
-            worker.* = .{
-                .tokenizer = self,
-                .text = text[boundaries.items[idx]..boundaries.items[idx + 1]],
-            };
+            worker.tokenizer = self;
+            worker.text = text[boundaries[idx]..boundaries[idx + 1]];
+            worker.ids.clearRetainingCapacity();
+            worker.failure = null;
         }
 
         var group: std.Io.Group = .init;
@@ -1528,8 +1627,8 @@ pub const HfTokenizer = struct {
         };
     }
 
-    fn lockBpeCacheShard(shard: *BpeCacheShard) void {
-        while (!shard.mutex.tryLock()) std.atomic.spinLoopHint();
+    fn lockBpeCacheMutex(mutex: *std.atomic.Mutex) void {
+        while (!mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
     fn bpeCacheShard(hash: u64) usize {
@@ -1540,6 +1639,10 @@ pub const HfTokenizer = struct {
         return @intCast((hash >> 6) & (bpe_cache_slots_per_shard - 1));
     }
 
+    fn bpeCacheHash(word: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, word);
+    }
+
     fn appendCachedBpe(
         self: *HfTokenizer,
         allocator: std.mem.Allocator,
@@ -1547,22 +1650,79 @@ pub const HfTokenizer = struct {
         ids: *std.ArrayListUnmanaged(i32),
     ) !bool {
         if (word.len == 0 or word.len > bpe_cache_max_key_bytes) return false;
-        const hash = std.hash.Wyhash.hash(0, word);
+        const hash = bpeCacheHash(word);
         const cache = self.bpe_cache orelse return false;
+        var probes: usize = 0;
         const shard = &cache.shards[bpeCacheShard(hash)];
-
         var slot_idx = bpeCacheSlot(hash);
         for (0..bpe_cache_slots_per_shard) |_| {
+            probes += 1;
             const raw = shard.slots[slot_idx].load(.acquire);
-            if (raw == 0) return false;
+            if (raw == 0) {
+                self.recordBpeCacheMiss(probes);
+                return false;
+            }
             const entry: *const BpeCacheEntry = @ptrFromInt(raw);
             if (entry.hash == hash and std.mem.eql(u8, entry.key, word)) {
-                try ids.appendSlice(allocator, entry.token_ids);
+                if (entry.token_ids.len == 1) {
+                    try ids.append(allocator, entry.token_ids[0]);
+                } else {
+                    try ids.appendSlice(allocator, entry.token_ids);
+                }
+                self.recordBpeCacheHit(word.len, entry.token_ids.len, probes);
                 return true;
             }
             slot_idx = (slot_idx + 1) & (bpe_cache_slots_per_shard - 1);
         }
+        self.recordBpeCacheMiss(probes);
         return false;
+    }
+
+    fn recordBpeCacheHit(
+        self: *HfTokenizer,
+        key_len: usize,
+        id_count: usize,
+        probes: usize,
+    ) void {
+        if (!self.bpe_profile_enabled) return;
+        _ = self.bpe_profile.hits.fetchAdd(1, .monotonic);
+        _ = self.bpe_profile.probes.fetchAdd(probes, .monotonic);
+        _ = self.bpe_profile.key_bytes.fetchAdd(key_len, .monotonic);
+        _ = self.bpe_profile.token_ids.fetchAdd(id_count, .monotonic);
+        _ = self.bpe_profile.key_len_histogram[@min(key_len, 32)].fetchAdd(1, .monotonic);
+        _ = self.bpe_profile.id_count_histogram[@min(id_count, 8)].fetchAdd(1, .monotonic);
+    }
+
+    fn recordBpeCacheMiss(self: *HfTokenizer, probes: usize) void {
+        if (!self.bpe_profile_enabled) return;
+        _ = self.bpe_profile.misses.fetchAdd(1, .monotonic);
+        _ = self.bpe_profile.probes.fetchAdd(probes, .monotonic);
+    }
+
+    pub fn setBpeProfiling(self: *HfTokenizer, enabled: bool) void {
+        self.bpe_profile_enabled = false;
+        self.bpe_profile = .{};
+        self.bpe_profile_enabled = enabled;
+    }
+
+    pub fn bpeProfileSnapshot(self: *const HfTokenizer) BpeProfile {
+        var key_len_histogram: [33]u64 = undefined;
+        for (&key_len_histogram, &self.bpe_profile.key_len_histogram) |*out, *counter| {
+            out.* = counter.load(.monotonic);
+        }
+        var id_count_histogram: [9]u64 = undefined;
+        for (&id_count_histogram, &self.bpe_profile.id_count_histogram) |*out, *counter| {
+            out.* = counter.load(.monotonic);
+        }
+        return .{
+            .hits = self.bpe_profile.hits.load(.monotonic),
+            .misses = self.bpe_profile.misses.load(.monotonic),
+            .probes = self.bpe_profile.probes.load(.monotonic),
+            .key_bytes = self.bpe_profile.key_bytes.load(.monotonic),
+            .token_ids = self.bpe_profile.token_ids.load(.monotonic),
+            .key_len_histogram = key_len_histogram,
+            .id_count_histogram = id_count_histogram,
+        };
     }
 
     /// Best-effort cache insertion. Tokenization must not fail merely because
@@ -1570,7 +1730,7 @@ pub const HfTokenizer = struct {
     fn cacheBpe(self: *HfTokenizer, word: []const u8, token_ids: []const i32) void {
         if (word.len == 0 or word.len > bpe_cache_max_key_bytes or token_ids.len == 0) return;
 
-        const hash = std.hash.Wyhash.hash(0, word);
+        const hash = bpeCacheHash(word);
         const cache = self.bpe_cache orelse return;
         const key_copy = self.allocator.dupe(u8, word) catch return;
         var own_key = true;
@@ -1588,7 +1748,7 @@ pub const HfTokenizer = struct {
         };
 
         const shard = &cache.shards[bpeCacheShard(hash)];
-        lockBpeCacheShard(shard);
+        lockBpeCacheMutex(&shard.mutex);
         defer shard.mutex.unlock();
         if (shard.count >= bpe_cache_max_entries_per_shard) return;
 
@@ -1610,6 +1770,19 @@ pub const HfTokenizer = struct {
     }
 
     fn bpeEncodeWord(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32)) !void {
+        if (self.byte_level_direct_ids) |direct_ids| {
+            const id = switch (word.len) {
+                1 => direct_ids.single[word[0]],
+                2 => direct_ids.pair[
+                    (@as(usize, word[0]) << 8) | @as(usize, word[1])
+                ],
+                else => -1,
+            };
+            if (id >= 0) {
+                try ids.append(allocator, id);
+                return;
+            }
+        }
         if (try self.appendCachedBpe(allocator, word, ids)) return;
         const output_start = ids.items.len;
         try self.bpeEncodeWordUncached(allocator, word, ids);
@@ -2410,6 +2583,14 @@ pub const HfTokenizer = struct {
                 }
             }
             allocator.destroy(cache);
+        }
+        if (self.byte_level_direct_ids) |direct_ids| allocator.destroy(direct_ids);
+        var workspace = self.parallel_workspace_all;
+        while (workspace) |current| {
+            const next = current.next_all;
+            for (&current.workers) |*worker| worker.ids.deinit(allocator);
+            allocator.destroy(current);
+            workspace = next;
         }
         self.unigram_vocab.deinit(allocator);
         self.unigram_trie.deinit(allocator);
@@ -3512,6 +3693,37 @@ test "byte-level BPE parallel encoding preserves serial token order" {
     try tok.tokenizer().encodeIntoParallel(std.testing.io, allocator, text.items, &parallel, 4);
 
     try std.testing.expectEqualSlices(i32, serial.items, parallel.items);
+    parallel.clearRetainingCapacity();
+    try tok.tokenizer().encodeIntoParallel(std.testing.io, allocator, text.items, &parallel, 4);
+    try std.testing.expectEqualSlices(i32, serial.items, parallel.items);
+}
+
+test "byte-level BPE direct-addresses exact two-byte vocabulary tokens" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"1": 1, "2": 2, "12": 12},
+        \\    "merges": []
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+
+    const direct_ids = tok.byte_level_direct_ids orelse
+        return error.TestExpectedByteLevelDirectIds;
+    try std.testing.expectEqual(
+        @as(i32, 12),
+        direct_ids.pair[(@as(usize, '1') << 8) | @as(usize, '2')],
+    );
+
+    const ids = try tok.encode(allocator, "12");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{12}, ids);
 }
 
 test "clip byte-level bpe honors split pretokenizer array merges and end suffix" {

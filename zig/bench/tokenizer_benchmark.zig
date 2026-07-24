@@ -23,11 +23,12 @@ const Config = struct {
     threads: usize = 1,
     internal_threads: usize = 1,
     repeat: usize = 1,
+    profile_bpe: bool = false,
 };
 
 fn usage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\usage: zig build bench-tokenizer -- <tokenizer.json> <corpus.txt> [--warmup N] [--iterations N] [--threads N] [--internal-threads N] [--repeat N]
+        \\usage: zig build bench-tokenizer -- <tokenizer.json> <corpus.txt> [--warmup N] [--iterations N] [--threads N] [--internal-threads N] [--repeat N] [--profile-bpe]
         \\
         \\Measures the native Zig HuggingFace tokenizer's steady-state encodeInto
         \\throughput. The tokenizer and reusable output buffer persist across all
@@ -91,6 +92,8 @@ fn parseArgs(io: std.Io, args_in: std.process.Args) !Config {
                 args.next() orelse return error.MissingArgument,
                 10,
             );
+        } else if (std.mem.eql(u8, arg, "--profile-bpe")) {
+            cfg.profile_bpe = true;
         } else {
             return error.UnknownArgument;
         }
@@ -192,6 +195,7 @@ pub fn main(init: std.process.Init) !void {
         ids.clearRetainingCapacity();
         try tokenizer.encodeIntoParallel(init.io, allocator, corpus, &ids, cfg.internal_threads);
     }
+    if (cfg.profile_bpe) hf.setBpeProfiling(true);
 
     const workers = try allocator.alloc(Worker, cfg.threads);
     defer allocator.free(workers);
@@ -252,5 +256,20 @@ pub fn main(init: std.process.Init) !void {
             mtok_per_second,
         },
     );
+    if (cfg.profile_bpe) {
+        const profile = hf.bpeProfileSnapshot();
+        try stdout.interface.print(
+            "bpe_profile hits={d} misses={d} probes={d} key_bytes={d} token_ids={d} key_len_histogram={any} id_count_histogram={any}\n",
+            .{
+                profile.hits,
+                profile.misses,
+                profile.probes,
+                profile.key_bytes,
+                profile.token_ids,
+                profile.key_len_histogram,
+                profile.id_count_histogram,
+            },
+        );
+    }
     try stdout.interface.flush();
 }

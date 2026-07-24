@@ -51,8 +51,11 @@ reports the token count and sequence hash so invalid performance results are
 visible. `--internal-threads N` emits up to N chunk tasks for one sufficiently
 large ByteLevel document and gathers the results in order. `--repeat N` repeats
 the corpus in memory before timing, which is useful for measuring internal
-parallelism without changing the fixture. No benchmark or tokenizer path
-creates an OS thread directly.
+parallelism without changing the fixture. `--profile-bpe` enables atomic
+cache-hit counters after warmup and reports key-length and result-size
+histograms. Profiling is for attribution rather than throughput measurement
+because the counters intentionally add work to the hot path. No benchmark or
+tokenizer path creates an OS thread directly.
 
 ## Baseline and current results
 
@@ -66,14 +69,14 @@ Measured on an Apple M4 Max. Throughput is decimal MB/s.
 | Added-token scan fast path | steady, 1 thread | 114.62 MB/s |
 | Lock-free open-address cache | steady, 1 thread | 121.62 MB/s |
 | Raw-byte vocab + ASCII vector scanner | cold, 1 task | 101.04 MB/s |
-| Current | steady, 1 task | 270.95 MB/s |
-| Current | steady, 14 concurrent `std.Io` tasks | 2.187 GB/s |
-| Current, 738 KiB corpus | cold, 14 internal tasks | 270.39 MB/s |
-| Current, 738 KiB corpus | steady, 14 internal tasks | 1.298 GB/s |
-| Current, 11.8 MB repeated corpus | cold, 14 internal tasks | 1.148 GB/s |
-| Current, 11.8 MB repeated corpus | steady, 14 internal tasks | 1.431 GB/s |
+| Current | steady, 1 task | 294–295 MB/s |
+| Current | steady, 14 concurrent `std.Io` tasks | 3.03–3.09 GB/s |
+| Current, 738 KiB corpus | cold, 14 internal tasks | 200.65 MB/s |
+| Current, 738 KiB corpus | steady, 14 internal tasks | 1.614 GB/s |
+| Current, 11.8 MB repeated corpus | cold, 14 internal tasks | 1.204 GB/s |
+| Current, 11.8 MB repeated corpus | steady, 14 internal tasks | 1.847 GB/s |
 
-The current implementation is approximately 15.3 times faster than the
+The current implementation is approximately 16.6 times faster than the
 original single-thread steady-state implementation while also correcting the
 original ByteLevel boundary behavior.
 
@@ -81,11 +84,11 @@ Gigatoken's published large-corpus M4 Max result is 8.79 GB/s. The measurements
 are not directly interchangeable: this benchmark includes complete BPE token
 ID generation and hashes the full output, while Gigatoken's headline workload
 differs. Moving dispatch to the application's persistent `std.Io` runtime
-removes per-call OS thread creation and materially helps the 738 KiB workload.
-The 11.8 MB steady result remains in the same 1.43–1.48 GB/s range as the
-spawn-per-call implementation, showing that worker startup is not the limiting
-factor at saturation. The remaining gap is principally in cache/BPE hit-path
-cost and memory traffic. See Gigatoken's
+removes per-call OS thread creation. Reusing the tokenizer's task workspaces
+then removes repeated chunk-output allocation and materially helps both the
+738 KiB and 11.8 MB internally parallel workloads. The remaining gap is
+principally in cache hashing, output copying, and BPE work on cold or uncommon
+pretokens. See Gigatoken's
 [design document](https://github.com/marcelroed/gigatoken/blob/main/design_doc.md)
 and
 [pretokenizer optimization log](https://github.com/marcelroed/gigatoken/blob/main/pretokenizer_optimization_log.md).
@@ -94,11 +97,12 @@ and
 
 1. Normalization and added-token segmentation.
 2. A 64-byte ASCII vector scan, falling back to a scalar exact-Unicode scanner.
-3. Pretoken-cache lookup on a borrowed raw input slice using one Wyhash and
-   open addressing.
-4. On a miss, BPE merge candidates use packed `(left_id, right_id)` keys.
-5. The final token IDs are published to the cache and appended to the caller's
-   reusable output buffer.
+3. Direct-address vocabulary lookup for one- and two-byte ByteLevel pretokens.
+4. Pretoken-cache lookup on longer borrowed raw input slices using one Wyhash
+   and open addressing.
+5. On a miss, BPE merge candidates use packed `(left_id, right_id)` keys.
+6. The final token IDs are published to the cache and appended to the caller's
+   reusable output buffer. Single-ID hits use a specialized append path.
 
 ByteLevel vocabulary and merge pieces are decoded from GPT-2's byte-to-Unicode
 alphabet once while loading `tokenizer.json`. The hot encoder therefore uses
@@ -199,6 +203,47 @@ storage package; `BackendRuntime.io()` is the layering boundary, just as it is
 for the Io-aware matrix multiplication path. A tokenizer used in parallel must
 still be constructed with an allocator safe for concurrent use.
 
+### Reusable parallel workspaces
+
+Each tokenizer retains a free list of parallel workspaces. A workspace contains
+the fixed worker records and their reusable token-ID buffers, so repeated
+`encodeIntoParallel` calls do not allocate and destroy chunk outputs. Chunk
+boundaries use a fixed stack array because internal parallelism is capped at 64
+tasks. Workspaces are acquired per concurrent call and returned after the
+`std.Io.Group` is joined; concurrent requests therefore do not share mutable
+output state.
+
+This changed the 738 KiB steady internally parallel result from about
+1.30 GB/s to 1.61 GB/s and the 11.8 MB result from about 1.43 GB/s to
+1.85 GB/s in the representative runs above.
+
+### ByteLevel direct-address IDs and single-result appends
+
+ByteLevel vocabularies build direct-address tables for all one- and two-byte
+raw keys while loading the tokenizer. The tables cost about 257 KiB and are
+allocated only for ByteLevel tokenizers. They bypass hashing, probing, and
+pointer chasing for these exact tokens.
+
+The remaining cache hit path directly appends its ID when the cached result has
+one token instead of entering the slice-copy path. Profiling the GPT-2 fixture
+after the direct maps showed 1,404,645 measured cache hits over ten iterations,
+no steady-state misses, and 1,243,847 single-ID results: approximately 88.6
+percent of the remaining hits.
+
+### Opt-in hit-path profiling
+
+`HfTokenizer.setBpeProfiling(true)` resets and enables atomic counters, and
+`bpeProfileSnapshot()` reads a consistent-enough diagnostic snapshot after
+workers finish. The benchmark exposes this through `--profile-bpe`. Counters
+cover cache hits, misses, probes, key bytes, emitted IDs, and bounded
+key-length/result-size histograms. They remain disabled by default so normal
+encoding pays only one predictable boolean check on cache hits and misses.
+
+CPU sampling before the direct maps attributed about 21 percent of observed
+stacks to Wyhash. After one- and two-byte keys bypassed the cache, that fell to
+about 13 percent. The result supports targeting key representation and
+avoidable lookups rather than replacing the proven hash with an ad hoc one.
+
 ## Rejected or inconclusive experiments
 
 ### Fixed-size inline cache entries
@@ -207,8 +252,11 @@ Both a larger hybrid entry and a true 32-byte entry were tested. The compact
 version stored an atomic tag, a 15-byte packed key, and up to four `u16` token
 IDs. Tables with 2,048 and 512 slots per shard measured roughly 149–151 MB/s
 steady state, below the pointer table's 158–163 MB/s at that stage, and were
-removed. Gigatoken's entry succeeds as part of an integrated table, probing,
-key, and value design; copying the layout alone did not help here.
+removed. A later integrated 40-byte design stored a 15-byte key and four
+`i32` IDs in each entry. At 256 slots per shard it regressed, and at 512 slots
+per shard it only tied the pointer table while reserving about 1.3 MiB. It was
+also removed. Gigatoken's entry succeeds as part of an integrated table,
+probing, key, and value design; copying the layout alone did not help here.
 
 ### Worker-local direct-mapped hot cache
 
@@ -218,16 +266,28 @@ compared with about 163 MB/s and 1.54 GB/s for the shared cache at that stage.
 The extra hash, packing, and lookup cost exceeded the avoided shared read
 traffic, so it was removed.
 
+### Specialized short-key hash
+
+A lightweight FNV-style hash for short cache keys replaced Wyhash in an
+experiment. Serial throughput fell from roughly 271 MB/s to 224 MB/s. The
+workload is dominated by short strings, but Wyhash remains a better hash for
+this table and target CPU. Direct-addressing the shortest exact keys provided
+the useful version of this optimization.
+
 ## Remaining work
 
-The five initially identified Gigatoken techniques have now been implemented
-or measured: vector ASCII scanning, compact inline cache entries, worker-local
-caching, ordered chunk parallelism, and packed exact Unicode classes. The
-application's persistent `std.Io` worker runtime now owns scheduling, so a
-tokenizer-private persistent thread pool is no longer desirable. The
-highest-value next experiments are reusable per-task output/scratch buffers,
-profiling the remaining BPE/cache cost on hits, and a cache design co-developed
-with its key/value encoding rather than transplanted in isolation.
+The initially identified Gigatoken techniques and the subsequent follow-ups
+have now been implemented or measured: vector ASCII scanning, compact inline
+cache entries, worker-local caching, ordered chunk parallelism, packed exact
+Unicode classes, reusable task workspaces, hit-path profiling, short-key
+specialization, and a cache layout co-designed with inline keys and values.
+The application's persistent `std.Io` worker runtime owns scheduling, so a
+tokenizer-private persistent thread pool is not desirable.
+
+Future profiling should focus on the remaining longer-key Wyhash cost, cache
+result memory traffic, and cold BPE merges. A different cache should replace
+the current table only when an end-to-end key/probe/value design beats it;
+smaller entries or a faster-looking hash are not sufficient in isolation.
 
 Any future parallel change must preserve pretoken and added-token boundaries
 and reproduce the exact serial token sequence before its throughput result is
@@ -251,6 +311,6 @@ zig build test-tokenizer
 zig build test-tokenizer-batch
 ```
 
-The Hugging Face tokenizer suite currently passes 26 tests with one optional
+The Hugging Face tokenizer suite currently passes 27 tests with one optional
 external-model test skipped. The SentencePiece and tokenizer-batch targets also
 pass.
