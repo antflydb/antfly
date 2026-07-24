@@ -5,7 +5,9 @@
 // the ELv2 at https://www.antfly.io/licensing/ELv2-license.
 
 const manifest_object_store = @import("serverless/manifest/object_store.zig");
+const object_storage = @import("storage/object_storage.zig");
 
 test {
     _ = manifest_object_store;
+    _ = object_storage;
 }

@@ -123,6 +123,17 @@ pub const HostedReplicaStatus = enum {
     failed,
 };
 
+pub const PreparedReplica = struct {
+    factory: ReplicaDescriptorFactory,
+    descriptor: raft_engine.runtime.ReplicaDescriptor,
+    bootstrap_prepared: bool,
+
+    pub fn deinit(self: *PreparedReplica, alloc: std.mem.Allocator) void {
+        self.factory.freeDescriptor(alloc, &self.descriptor);
+        self.* = undefined;
+    }
+};
+
 pub const BootstrapStatusKind = enum {
     backup_db_snapshot_restore,
 };
@@ -165,6 +176,9 @@ pub const HostMetrics = struct {
     runtime_pending_apply_bytes: usize = 0,
     runtime_transport_queue_denials: usize = 0,
     runtime_apply_queue_denials: usize = 0,
+    runtime_snapshot_compaction_completions: usize = 0,
+    runtime_snapshot_compaction_failures: usize = 0,
+    runtime_snapshot_compaction_candidates: usize = 0,
     backup_bootstrap_attempts: usize = 0,
     backup_bootstrap_failures: usize = 0,
     backup_bootstrap_successes: usize = 0,
@@ -294,52 +308,145 @@ pub const Host = struct {
     }
 
     pub fn ensureReplica(self: *Host, record: catalog.ReplicaRecord) !raft_engine.runtime.EnsureReplicaResult {
-        if (self.runtime_host.group(record.group_id) == null) {
-            if (record.backup_restore_bootstrap != null) {
-                self.noteBootstrapPreparing(record.group_id, .backup_db_snapshot_restore, record.backup_restore_bootstrap);
-                if (self.deps.backup_restore_bootstrapper) |bootstrapper| {
-                    bootstrapper.prepareBackupRestore(record) catch |err| {
-                        self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
-                        return err;
-                    };
-                } else if (self.cfg.replica_root_dir) |replica_root_dir| {
-                    backup_restore.applyBackupRestoreFromRecord(
-                        self.alloc,
-                        replica_root_dir,
-                        record.group_id,
-                        record.backup_restore_bootstrap.?,
-                    ) catch |err| {
-                        self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
-                        return err;
-                    };
-                } else {
-                    self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, error.MissingBackupRestoreBootstrapHandler, record.backup_restore_bootstrap);
-                    return error.MissingBackupRestoreBootstrapHandler;
-                }
+        const prepare_bootstrap = !self.hasReplica(record.group_id) and record.backup_restore_bootstrap != null;
+        if (prepare_bootstrap) self.noteReplicaBootstrapPreparing(record);
+        var prepared = self.prepareReplica(record, prepare_bootstrap) catch |err| {
+            if (prepare_bootstrap) self.noteReplicaBootstrapPreparationFailure(record, err);
+            return err;
+        };
+        defer prepared.deinit(self.alloc);
+        return try self.installPreparedReplica(record, &prepared);
+    }
+
+    pub fn hasReplica(self: *Host, group_id: u64) bool {
+        return self.runtime_host.group(group_id) != null;
+    }
+
+    /// Performs filesystem, descriptor, and catalog durability work without
+    /// mutating the live Raft runtime. Callers must serialize reconcile plans,
+    /// but Raft progress may continue concurrently while this method runs.
+    pub fn prepareReplica(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepare_bootstrap: bool,
+    ) !PreparedReplica {
+        return try self.prepareReplicaWithCatalog(record, prepare_bootstrap, true);
+    }
+
+    /// Builds a descriptor and any replacement filesystem generation without
+    /// publishing catalog admission. Reconciliation commits all catalog
+    /// mutations together after its desired-state epoch is revalidated.
+    pub fn prepareReplicaUnpublished(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepare_bootstrap: bool,
+    ) !PreparedReplica {
+        return try self.prepareReplicaWithCatalog(record, prepare_bootstrap, false);
+    }
+
+    fn prepareReplicaWithCatalog(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepare_bootstrap: bool,
+        persist_catalog: bool,
+    ) !PreparedReplica {
+        const should_prepare_bootstrap = prepare_bootstrap and record.backup_restore_bootstrap != null;
+        if (should_prepare_bootstrap) {
+            if (self.deps.backup_restore_bootstrapper) |bootstrapper| {
+                try bootstrapper.prepareBackupRestore(record);
+            } else if (self.cfg.replica_root_dir) |replica_root_dir| {
+                try backup_restore.applyBackupRestoreFromRecord(
+                    self.alloc,
+                    replica_root_dir,
+                    record.group_id,
+                    record.backup_restore_bootstrap.?,
+                );
+            } else {
+                return error.MissingBackupRestoreBootstrapHandler;
             }
         }
 
         const factory = self.deps.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;
-        var desc = try factory.buildDescriptor(record);
-        defer factory.freeDescriptor(self.alloc, &desc);
-
-        desc.group.raft_config.trace_logger = self.cfg.trace_logger orelse
+        var descriptor = try factory.buildDescriptor(record);
+        errdefer factory.freeDescriptor(self.alloc, &descriptor);
+        descriptor.group.raft_config.trace_logger = self.cfg.trace_logger orelse
             if (comptime build_options.with_tla) tracing.stderrRaftTraceLogger() else null;
 
-        const result = self.runtime_host.ensureReplica(desc) catch |err| {
-            if (record.backup_restore_bootstrap != null) {
+        // Persist admission before publication. A crash between these steps
+        // leaves a recoverable catalog entry instead of an untracked live group.
+        if (persist_catalog) if (self.deps.replica_catalog) |replica_catalog| {
+            try replica_catalog.upsertReplica(record);
+        };
+        return .{
+            .factory = factory,
+            .descriptor = descriptor,
+            .bootstrap_prepared = should_prepare_bootstrap,
+        };
+    }
+
+    /// Publishes a fully prepared descriptor into the single-owner runtime.
+    /// This method must execute under the runtime owner's serialization lock.
+    pub fn installPreparedReplica(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepared: *PreparedReplica,
+    ) !raft_engine.runtime.EnsureReplicaResult {
+        const result = self.runtime_host.ensureReplica(prepared.descriptor) catch |err| {
+            if (prepared.bootstrap_prepared) {
                 self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
             }
             return err;
         };
         self.metrics.ensure_replica_calls += 1;
-        if (record.backup_restore_bootstrap != null) {
+        if (prepared.bootstrap_prepared) {
             self.noteBootstrapSuccess(record.group_id, .backup_db_snapshot_restore, record.backup_restore_bootstrap);
         }
-        if (self.deps.replica_catalog) |replica_catalog| {
-            try replica_catalog.upsertReplica(record);
-        }
         return result;
+    }
+
+    pub fn noteReplicaBootstrapPreparing(self: *Host, record: catalog.ReplicaRecord) void {
+        if (record.backup_restore_bootstrap == null) return;
+        self.noteBootstrapPreparing(record.group_id, .backup_db_snapshot_restore, record.backup_restore_bootstrap);
+    }
+
+    pub fn noteReplicaBootstrapPreparationFailure(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        err: anyerror,
+    ) void {
+        if (record.backup_restore_bootstrap == null) return;
+        self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
+    }
+
+    pub fn cancelReplicaBootstrapPreparation(self: *Host, record: catalog.ReplicaRecord) void {
+        if (record.backup_restore_bootstrap == null or self.hasReplica(record.group_id)) return;
+        self.clearBootstrapStatus(record.group_id);
+    }
+
+    pub fn replicaCatalogRevision(self: *Host) ?u64 {
+        const replica_catalog = self.deps.replica_catalog orelse return null;
+        return replica_catalog.revision();
+    }
+
+    pub fn commitReplicaCatalog(
+        self: *Host,
+        expected_revision: ?u64,
+        upserts: []const catalog.ReplicaRecord,
+        removals: []const u64,
+    ) !void {
+        const replica_catalog = self.deps.replica_catalog orelse return;
+        try replica_catalog.applyBatch(
+            expected_revision orelse return error.MissingReplicaCatalogRevision,
+            upserts,
+            removals,
+        );
+    }
+
+    pub fn removePreparedReplica(self: *Host, group_id: u64) !void {
+        if (self.runtime_host.group(group_id) == null) return error.UnknownGroup;
+        try self.runtime_host.removeReplica(group_id);
+        self.metrics.remove_replica_calls += 1;
+        self.clearBootstrapStatus(group_id);
     }
 
     pub fn restoreReplicasFromCatalog(self: *Host, alloc: std.mem.Allocator) !usize {
@@ -359,12 +466,15 @@ pub const Host = struct {
     }
 
     pub fn removeReplica(self: *Host, group_id: u64) !void {
-        try self.runtime_host.removeReplica(group_id);
-        self.metrics.remove_replica_calls += 1;
-        self.clearBootstrapStatus(group_id);
+        if (self.runtime_host.group(group_id) == null) return error.UnknownGroup;
+        // Persist removal intent before tearing down the live owner. A catalog
+        // failure therefore remains retryable through normal reconciliation.
         if (self.deps.replica_catalog) |replica_catalog| {
             _ = try replica_catalog.removeReplica(group_id);
         }
+        try self.runtime_host.removeReplica(group_id);
+        self.metrics.remove_replica_calls += 1;
+        self.clearBootstrapStatus(group_id);
     }
 
     pub fn refreshPeerEndpoints(self: *Host, group_id: u64, node_id: u64) !usize {
@@ -486,6 +596,9 @@ pub const Host = struct {
         snapshot.runtime_pending_apply_bytes = runtime_metrics.pending_apply_bytes;
         snapshot.runtime_transport_queue_denials = runtime_metrics.transport_queue_denials;
         snapshot.runtime_apply_queue_denials = runtime_metrics.apply_queue_denials;
+        snapshot.runtime_snapshot_compaction_completions = runtime_metrics.snapshot_compaction_completions;
+        snapshot.runtime_snapshot_compaction_failures = runtime_metrics.snapshot_compaction_failures;
+        snapshot.runtime_snapshot_compaction_candidates = runtime_metrics.snapshot_compaction_candidates;
         return snapshot;
     }
 
@@ -1080,11 +1193,55 @@ test "host can ensure and remove a replica" {
         }
     };
 
+    const RemovalCatalog = struct {
+        fail_remove: bool = true,
+        remove_calls: usize = 0,
+
+        fn iface(self: *@This()) catalog.ReplicaCatalog {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .upsert_replica = upsertReplica,
+                    .remove_replica = removeReplica,
+                    .list_replicas = listReplicas,
+                    .revision = revision,
+                    .apply_batch = applyBatch,
+                },
+            };
+        }
+
+        fn upsertReplica(_: *anyopaque, _: catalog.ReplicaRecord) !void {}
+
+        fn removeReplica(ptr: *anyopaque, _: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.remove_calls += 1;
+            if (self.fail_remove) return error.InjectedCatalogRemovalFailure;
+            return true;
+        }
+
+        fn listReplicas(_: *anyopaque, alloc: std.mem.Allocator) ![]catalog.ReplicaRecord {
+            return try alloc.alloc(catalog.ReplicaRecord, 0);
+        }
+
+        fn revision(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn applyBatch(
+            _: *anyopaque,
+            _: u64,
+            _: []const catalog.ReplicaRecord,
+            _: []const u64,
+        ) !void {}
+    };
+
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
     var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+    var replica_catalog = RemovalCatalog{};
     var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
         .descriptor_factory = factory.iface(),
+        .replica_catalog = replica_catalog.iface(),
     });
     defer host.deinit();
 
@@ -1096,8 +1253,13 @@ test "host can ensure and remove a replica" {
     try std.testing.expectEqual(.active, host.status(41));
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().hosted_groups);
 
+    try std.testing.expectError(error.InjectedCatalogRemovalFailure, host.removeReplica(41));
+    try std.testing.expectEqual(.active, host.status(41));
+
+    replica_catalog.fail_remove = false;
     try host.removeReplica(41);
     try std.testing.expectEqual(.absent, host.status(41));
+    try std.testing.expectEqual(@as(usize, 2), replica_catalog.remove_calls);
 }
 
 test "host rejects live snapshot uploads addressed to another node" {

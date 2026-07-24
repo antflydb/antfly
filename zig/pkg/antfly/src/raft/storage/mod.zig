@@ -23,6 +23,8 @@ pub const file_snapshot_store = @import("file_snapshot_store.zig");
 pub const FileSnapshotStore = file_snapshot_store.FileSnapshotStore;
 pub const FileSnapshotStoreConfig = file_snapshot_store.FileSnapshotStoreConfig;
 pub const wal_replica_state = @import("wal_replica_state.zig");
+pub const snapshot_payload_store = @import("snapshot_payload_store.zig");
+pub const file_snapshot_artifact = @import("file_snapshot_artifact.zig");
 pub const WalReplicaState = wal_replica_state.WalReplicaState;
 pub const WalReplicaStateConfig = wal_replica_state.WalReplicaStateConfig;
 pub const replica_state = @import("replica_state.zig");
@@ -51,6 +53,23 @@ pub const ReplicaPathLayout = struct {
 
     pub fn initForReplica(alloc: std.mem.Allocator, base_dir: []const u8, group_id: u64, replica_id: u64) !ReplicaPathLayout {
         const root_dir = try std.fmt.allocPrint(alloc, "{s}/group-{d}/replica-{d}", .{ base_dir, group_id, replica_id });
+        errdefer alloc.free(root_dir);
+        const log_dir = try std.fmt.allocPrint(alloc, "{s}/raft-log", .{root_dir});
+        errdefer alloc.free(log_dir);
+        const snapshot_dir = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root_dir});
+        errdefer alloc.free(snapshot_dir);
+        return .{
+            .root_dir = root_dir,
+            .log_dir = log_dir,
+            .snapshot_dir = snapshot_dir,
+        };
+    }
+
+    /// Derives the durable owner path for a Raft peer. Placement replica IDs
+    /// are ordinals and may change when membership is reordered; the local
+    /// Raft node ID is the stable storage identity.
+    pub fn initForLocalNode(alloc: std.mem.Allocator, base_dir: []const u8, group_id: u64, local_node_id: u64) !ReplicaPathLayout {
+        const root_dir = try std.fmt.allocPrint(alloc, "{s}/group-{d}/node-{d}", .{ base_dir, group_id, local_node_id });
         errdefer alloc.free(root_dir);
         const log_dir = try std.fmt.allocPrint(alloc, "{s}/raft-log", .{root_dir});
         errdefer alloc.free(log_dir);
@@ -97,4 +116,13 @@ test "replica path layout derives stable directories" {
     try std.testing.expectEqualStrings("/tmp/antfly-raft/group-42/replica-7", layout.root_dir);
     try std.testing.expectEqualStrings("/tmp/antfly-raft/group-42/replica-7/raft-log", layout.log_dir);
     try std.testing.expectEqualStrings("/tmp/antfly-raft/group-42/replica-7/snapshots", layout.snapshot_dir);
+}
+
+test "raft peer path layout is stable across placement ordinals" {
+    var layout = try ReplicaPathLayout.initForLocalNode(std.testing.allocator, "/tmp/antfly-raft", 42, 101);
+    defer layout.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("/tmp/antfly-raft/group-42/node-101", layout.root_dir);
+    try std.testing.expectEqualStrings("/tmp/antfly-raft/group-42/node-101/raft-log", layout.log_dir);
+    try std.testing.expectEqualStrings("/tmp/antfly-raft/group-42/node-101/snapshots", layout.snapshot_dir);
 }

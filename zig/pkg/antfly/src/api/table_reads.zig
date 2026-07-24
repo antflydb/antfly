@@ -26,14 +26,12 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const asset_producer_runtime = @import("../asset_producer_runtime.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
 const ha_public_gate_state = @import("../storage/ha/public_gate_state.zig");
 const ha_read_gate_mod = @import("../storage/ha/read_gate.zig");
 const ha_standby_mod = @import("../storage/ha/standby.zig");
@@ -42,6 +40,8 @@ const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const db_query_search = @import("../storage/db/query/search_exec.zig");
+const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
+const introducer_mod = @import("../introducer.zig");
 const graph_mod = @import("../graph/graph.zig");
 const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
@@ -54,6 +54,34 @@ const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
+
+fn publishRuntimeStatusGroupForTest(
+    cache: *runtime_status.TableRuntimeSnapshotCache,
+    table_name: []const u8,
+    status: runtime_status.LocalTableRuntimeStatus,
+) !void {
+    const token = try cache.capturePublicationToken(table_name);
+    try std.testing.expectEqual(runtime_status.TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(token, table_name, status));
+}
+
+fn publishRuntimeStatusRefreshForTest(
+    cache: *runtime_status.TableRuntimeSnapshotCache,
+    snapshots: []runtime_status.TableRuntimeSnapshot,
+) !void {
+    var ownership_transferred = false;
+    errdefer if (!ownership_transferred) {
+        for (snapshots) |*snapshot_entry| snapshot_entry.deinit(cache.alloc);
+    };
+    const table_names = try cache.alloc.alloc([]const u8, snapshots.len);
+    defer cache.alloc.free(table_names);
+    for (snapshots, 0..) |snapshot_entry, i| table_names[i] = snapshot_entry.table_name;
+    var token = try cache.captureCatalogToken(cache.alloc, table_names, true);
+    defer token.deinit();
+    ownership_transferred = true;
+    var result = try cache.publishRefresh(&token, snapshots);
+    defer result.deinit();
+    try std.testing.expect(!result.hasRejectedTables());
+}
 const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const platform_time = @import("antfly_platform").time;
@@ -80,7 +108,8 @@ fn aggregationFullResultBudgetFromRaw(raw: ?[*:0]u8) u32 {
     const slice = std.mem.span(value);
     if (slice.len == 0) return default_aggregation_full_result_budget;
     const parsed = std.fmt.parseUnsigned(u32, slice, 10) catch return default_aggregation_full_result_budget;
-    return if (parsed == 0) std.math.maxInt(u32) else parsed;
+    if (parsed == 0) return default_aggregation_full_result_budget;
+    return @min(parsed, @as(u32, @intCast(db_mod.aggregations.max_aggregation_source_hits)));
 }
 
 fn aggregationFullResultBudget() u32 {
@@ -199,6 +228,7 @@ pub const ProvisionedTableReadCache = struct {
     // u64 + the name per distinct table ever read through this cache.
     table_epochs: std.StringHashMapUnmanaged(u64) = .empty,
     exclusive_table_access: std.StringHashMapUnmanaged(usize) = .empty,
+    exclusive_group_access: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     retired_entries: std.ArrayListUnmanaged(*Entry) = .empty,
     pending_opens: std.ArrayListUnmanaged(PendingOpen) = .empty,
@@ -275,6 +305,18 @@ pub const ProvisionedTableReadCache = struct {
         }
     };
 
+    pub const ExclusiveGroupAccess = struct {
+        cache: *ProvisionedTableReadCache,
+        group_id: u64,
+        active: bool = true,
+
+        pub fn deinit(self: *ExclusiveGroupAccess) void {
+            if (!self.active) return;
+            self.cache.endExclusiveGroupAccess(self.group_id);
+            self.active = false;
+        }
+    };
+
     const PendingOpen = struct {
         group_id: u64,
         identity_namespace: ?db_mod.DocIdentityNamespace = null,
@@ -314,6 +356,7 @@ pub const ProvisionedTableReadCache = struct {
         var exclusive_keys = self.exclusive_table_access.keyIterator();
         while (exclusive_keys.next()) |key| self.alloc.free(key.*);
         self.exclusive_table_access.deinit(self.alloc);
+        self.exclusive_group_access.deinit(self.alloc);
         self.mutex.unlock(io);
         self.threaded.deinit();
         self.* = undefined;
@@ -355,7 +398,7 @@ pub const ProvisionedTableReadCache = struct {
             // namespace would open (and cache) the wrong identity.
             const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
             self.mutex.lockUncancelable(io);
-            if (self.hasExclusiveTableAccessLocked(table_name)) {
+            if (self.hasExclusiveTableAccessLocked(table_name) or self.hasExclusiveGroupAccessLocked(group_id)) {
                 self.mutex.unlock(io);
                 const now_ns = platform_time.monotonicNs();
                 if (exclusive_wait_started_ns == 0) exclusive_wait_started_ns = now_ns;
@@ -365,7 +408,7 @@ pub const ProvisionedTableReadCache = struct {
                 continue;
             }
             exclusive_wait_started_ns = 0;
-            const open_epoch = self.epochForTableLocked(table_name) catch |err| {
+            const open_table_epoch = self.epochForTableLocked(table_name) catch |err| {
                 self.mutex.unlock(io);
                 return err;
             };
@@ -423,11 +466,11 @@ pub const ProvisionedTableReadCache = struct {
 
             self.mutex.lockUncancelable(io);
             self.removePendingOpenForNamespaceLocked(group_id, identity_namespace, table_name);
-            if ((self.table_epochs.get(table_name) orelse open_epoch +% 1) != open_epoch) {
-                // This table was invalidated while we were opening (dropped,
-                // recreated, or the writer published). Epochs are exact
-                // per-table, so this only fires under genuine same-table
-                // churn (catch-up, heal backfill). Retry a bounded number of
+            if ((self.table_epochs.get(table_name) orelse open_table_epoch +% 1) != open_table_epoch or
+                self.hasExclusiveGroupAccessLocked(group_id))
+            {
+                // The table or exact group was invalidated while this DB was
+                // opening. Retry a bounded number of
                 // times; if the table churns faster than an open completes,
                 // fail with TableReadChurn — classified as transient by the
                 // query layer, which retries with backoff — instead of
@@ -577,6 +620,36 @@ pub const ProvisionedTableReadCache = struct {
         };
     }
 
+    pub fn beginExclusiveGroupAccess(self: *ProvisionedTableReadCache, group_id: u64) !ExclusiveGroupAccess {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        errdefer self.mutex.unlock(io);
+
+        const gop = try self.exclusive_group_access.getOrPut(self.alloc, group_id);
+        if (gop.found_existing) {
+            gop.value_ptr.* = std.math.add(usize, gop.value_ptr.*, 1) catch return error.TooManyExclusiveReaders;
+        } else {
+            gop.value_ptr.* = 1;
+        }
+        self.removeEntriesForGroupLocked(group_id);
+        self.ready.broadcast(io);
+
+        const drain_started_ns = platform_time.monotonicNs();
+        while (self.hasPendingOpenForGroupLocked(group_id) or self.hasGroupLocked(group_id) or self.hasRetiredEntryForGroupLocked(group_id)) {
+            const waited_ns = platform_time.monotonicNs() -| drain_started_ns;
+            if (waited_ns >= exclusive_wait_timeout_ns) {
+                self.releaseExclusiveGroupAccessLocked(group_id);
+                self.ready.broadcast(io);
+                return error.TableReadDrainTimeout;
+            }
+            self.mutex.unlock(io);
+            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, exclusive_wait_timeout_ns - waited_ns)), .awake) catch {};
+            self.mutex.lockUncancelable(io);
+        }
+        self.mutex.unlock(io);
+        return .{ .cache = self, .group_id = group_id };
+    }
+
     pub fn invalidateTable(self: *ProvisionedTableReadCache, table_name: []const u8) void {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
@@ -676,6 +749,25 @@ pub const ProvisionedTableReadCache = struct {
         table_name: []const u8,
     ) bool {
         return self.exclusive_table_access.get(table_name) != null;
+    }
+
+    fn hasExclusiveGroupAccessLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
+        return self.exclusive_group_access.get(group_id) != null;
+    }
+
+    fn hasPendingOpenForGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
+        for (self.pending_opens.items) |pending| if (pending.group_id == group_id) return true;
+        return false;
+    }
+
+    fn hasGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
+        for (self.entries.items) |entry| if (entry.group_id == group_id) return true;
+        return false;
+    }
+
+    fn hasRetiredEntryForGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
+        for (self.retired_entries.items) |entry| if (entry.group_id == group_id) return true;
+        return false;
     }
 
     fn removePendingOpenLocked(
@@ -784,6 +876,18 @@ pub const ProvisionedTableReadCache = struct {
         }
     }
 
+    fn removeEntriesForGroupLocked(self: *ProvisionedTableReadCache, group_id: u64) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            if (self.entries.items[i].group_id != group_id) {
+                i += 1;
+                continue;
+            }
+            const removed = self.entries.orderedRemove(i);
+            self.retireEntryLocked(removed);
+        }
+    }
+
     fn snapshotRuntimeStatusesLocked(
         self: *ProvisionedTableReadCache,
         alloc: std.mem.Allocator,
@@ -847,6 +951,19 @@ pub const ProvisionedTableReadCache = struct {
 
         self.releaseExclusiveTableAccessLocked(table_name);
         self.ready.broadcast(io);
+    }
+
+    fn endExclusiveGroupAccess(self: *ProvisionedTableReadCache, group_id: u64) void {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.releaseExclusiveGroupAccessLocked(group_id);
+        self.ready.broadcast(io);
+    }
+
+    fn releaseExclusiveGroupAccessLocked(self: *ProvisionedTableReadCache, group_id: u64) void {
+        const count = self.exclusive_group_access.getPtr(group_id) orelse unreachable;
+        if (count.* > 1) count.* -= 1 else _ = self.exclusive_group_access.remove(group_id);
     }
 
     fn releaseExclusiveTableAccessLocked(self: *ProvisionedTableReadCache, table_name: []const u8) void {
@@ -938,12 +1055,43 @@ pub const backend_current_root_generation: u64 = 0;
 pub const GroupVisibleRootGenerationSource = struct {
     ptr: *anyopaque,
     visible_root_generation_for_group: *const fn (ptr: *anyopaque, group_id: u64) u64,
+    reserve_root_generation_for_group: ?*const fn (ptr: *anyopaque, group_id: u64) anyerror!void = null,
+    finish_root_generation_reservation: ?*const fn (ptr: *anyopaque, group_id: u64, advance: bool) void = null,
+
+    pub const Reservation = struct {
+        source: GroupVisibleRootGenerationSource,
+        group_id: u64,
+        active: bool = true,
+
+        pub fn advance(self: *Reservation) void {
+            if (!self.active) return;
+            self.source.finish_root_generation_reservation.?(self.source.ptr, self.group_id, true);
+            self.active = false;
+        }
+
+        pub fn deinit(self: *Reservation) void {
+            if (!self.active) return;
+            self.source.finish_root_generation_reservation.?(self.source.ptr, self.group_id, false);
+            self.active = false;
+        }
+    };
 
     /// Shared LSM/HBC cache namespace for the currently visible replica root.
     /// This is advanced when local root/catalog visibility is reconciled; it is
     /// not the storage engine's physical per-write generation.
     pub fn visibleRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) u64 {
         return self.visible_root_generation_for_group(self.ptr, group_id);
+    }
+
+    /// Reserves generation bookkeeping before a fallible publication starts.
+    pub fn reserveRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) !?Reservation {
+        const reserve = self.reserve_root_generation_for_group orelse {
+            if (self.finish_root_generation_reservation != null) return error.InvalidRootGenerationSource;
+            return null;
+        };
+        if (self.finish_root_generation_reservation == null) return error.InvalidRootGenerationSource;
+        try reserve(self.ptr, group_id);
+        return .{ .source = self, .group_id = group_id };
     }
 };
 
@@ -1005,10 +1153,46 @@ pub const ResidentDbSource = struct {
     }
 };
 
+const LocalQueryDbOwner = union(enum) {
+    resident: struct {
+        lease: ResidentDbLease,
+        alloc: std.mem.Allocator,
+    },
+    cached: ProvisionedTableReadCache.Lease,
+    owned: db_mod.DB,
+
+    fn db(self: *@This()) *db_mod.DB {
+        return switch (self.*) {
+            .resident => |*resident| resident.lease.db,
+            .cached => |*cached| cached.db,
+            .owned => |*owned| owned,
+        };
+    }
+
+    fn deinit(self: *@This()) void {
+        switch (self.*) {
+            .resident => |*resident| resident.lease.release(resident.alloc),
+            .cached => |*cached| cached.release(),
+            .owned => |*owned| owned.close(),
+        }
+        self.* = undefined;
+    }
+};
+
 const LocalQueryExecution = struct {
     request: db_mod.types.SearchRequest,
     result: db_mod.types.SearchResult,
     dense_profile: ?query_api.QueryResponseMeta.DenseSearchProfile = null,
+    db_owner: ?LocalQueryDbOwner = null,
+
+    fn db(self: *@This()) *db_mod.DB {
+        return self.db_owner.?.db();
+    }
+
+    fn releaseDb(self: *@This()) void {
+        if (self.db_owner) |*owner| owner.deinit();
+        self.db_owner = null;
+    }
 };
 
 const ProfiledDenseQuery = struct {
@@ -2860,7 +3044,8 @@ pub const ProvisionedTableReadSource = struct {
         if (group_ids.len > 1) try distributed_graph.rejectUnstampedResultRefs(req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
-            const execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, consistency);
+            var execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, consistency);
+            defer execution.releaseDb();
             try checkQueryDeadline(execution.request);
             var result = execution.result;
             defer result.deinit();
@@ -2871,7 +3056,8 @@ pub const ProvisionedTableReadSource = struct {
                 .dense_search = execution.dense_profile,
             };
             defer meta.deinit(alloc);
-            try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, consistency);
+            try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), consistency);
+            execution.releaseDb();
             try checkQueryDeadline(response_req);
             try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
@@ -2896,7 +3082,7 @@ pub const ProvisionedTableReadSource = struct {
                 .merged = true,
             };
             defer meta.deinit(alloc);
-            try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, consistency);
+            try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, consistency);
             try checkQueryDeadline(graph_req);
             try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
@@ -2910,7 +3096,7 @@ pub const ProvisionedTableReadSource = struct {
             .merged = group_ids.len > 1,
         };
         defer meta.deinit(alloc);
-        try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
+        try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, null, consistency);
         try checkQueryDeadline(req);
         try applyQueryPostProcessing(alloc, req, &merged, &meta, self.antfly_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
@@ -3047,7 +3233,8 @@ pub const ProvisionedTableReadSource = struct {
         var read_activity = self.beginPreparedRead(table_name, readPreparationKindForQuery(req));
         defer if (read_activity) |*activity| activity.deinit();
         const start_ns = platform_time.monotonicNs();
-        const execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency);
+        var execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency);
+        defer execution.releaseDb();
         var result = execution.result;
         defer result.deinit();
         const response_req = execution.request;
@@ -3057,7 +3244,8 @@ pub const ProvisionedTableReadSource = struct {
             .dense_search = execution.dense_profile,
         };
         defer meta.deinit(alloc);
-        try applyProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, consistency);
+        try applyProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), consistency);
+        execution.releaseDb();
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
     }
@@ -3645,7 +3833,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 }
                 return true;
             },
-            .planned, .bootstrapping, .replaying, .cutover_ready => return false,
+            .planned, .bootstrapping, .replaying, .cutover_ready, .retiring => return false,
         }
     }
 
@@ -3710,7 +3898,8 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
 
             if (route == .local) {
-                const execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+                var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+                defer execution.releaseDb();
                 try checkQueryDeadline(execution.request);
                 var result = execution.result;
                 defer result.deinit();
@@ -3721,7 +3910,8 @@ pub const HostedProvisionedTableReadSource = struct {
                     .dense_search = execution.dense_profile,
                 };
                 defer meta.deinit(alloc);
-                try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, consistency);
+                try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), consistency);
+                execution.releaseDb();
                 try checkQueryDeadline(response_req);
                 try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
                 return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
@@ -3747,7 +3937,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .merged = true,
             };
             defer meta.deinit(alloc);
-            try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, consistency);
+            try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, consistency);
             try checkQueryDeadline(graph_req);
             try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, null, null);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
@@ -3761,7 +3951,7 @@ pub const HostedProvisionedTableReadSource = struct {
             .merged = group_ids.len > 1,
         };
         defer meta.deinit(alloc);
-        try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
+        try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, null, consistency);
         try checkQueryDeadline(req);
         try applyQueryPostProcessing(alloc, req, &merged, &meta, null, null);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
@@ -3897,7 +4087,8 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const start_ns = platform_time.monotonicNs();
-        const execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+        var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+        defer execution.releaseDb();
         var result = execution.result;
         defer result.deinit();
         const response_req = execution.request;
@@ -3907,7 +4098,8 @@ pub const HostedProvisionedTableReadSource = struct {
             .dense_search = execution.dense_profile,
         };
         defer meta.deinit(alloc);
-        try applyHostedProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, consistency);
+        try applyHostedProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), consistency);
+        execution.releaseDb();
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
         return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
     }
@@ -5233,7 +5425,7 @@ fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrat
     const ctx = req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest;
     if (!ctx.namespace.eql(db.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
     const generation = try db.currentIdentityReadGenerationForRequest(req.identity_read_generation);
-    if (generation != ctx.identity_read_generation) return error.UnsupportedQueryRequest;
+    if (generation != ctx.identity_read_generation) return error.IdentityReadGenerationChanged;
 }
 
 fn graphHydrateResolvedDocFilterAllows(req: distributed_graph.GraphHydrateRequest, key: []const u8, ordinal: ?doc_set.DocOrdinal) bool {
@@ -5958,7 +6150,8 @@ fn queryLocal(
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.SearchResult {
-    const detailed = try queryLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency);
+    var detailed = try queryLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency);
+    defer detailed.releaseDb();
     var result = detailed.result;
     result.identity_read_generation = detailed.request.identity_read_generation;
     return result;
@@ -6118,25 +6311,28 @@ fn queryLocalDetailed(
     // structural maintenance from retiring the DB while search is executing.
     if (resident_db) |source| {
         if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease_value| {
-            var lease = lease_value;
-            defer lease.release(alloc);
-            try validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db);
-            return try queryDbDetailed(requester, alloc, group_id, lease.db, req, consistency);
+            validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease_value.db) catch |err| {
+                var lease = lease_value;
+                lease.release(alloc);
+                return err;
+            };
+            const owner: LocalQueryDbOwner = .{ .resident = .{
+                .lease = lease_value,
+                .alloc = alloc,
+            } };
+            return try queryDbDetailed(requester, alloc, group_id, owner, req, consistency);
         }
     }
 
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);
     if (cache) |cached| {
-        var db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
-        defer db_lease.release();
-        return try queryDbDetailed(requester, alloc, group_id, db_lease.db, req, consistency);
+        const db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
+        return try queryDbDetailed(requester, alloc, group_id, .{ .cached = db_lease }, req, consistency);
     } else {
         const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
-        var db = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, runtime_cfg, identity_namespace);
-        defer db.close();
-
-        return try queryDbDetailed(requester, alloc, group_id, &db, req, consistency);
+        const db = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, runtime_cfg, identity_namespace);
+        return try queryDbDetailed(requester, alloc, group_id, .{ .owned = db }, req, consistency);
     }
 }
 
@@ -6144,10 +6340,13 @@ fn queryDbDetailed(
     requester: raft_mod.ReadableLeaseRequester,
     alloc: std.mem.Allocator,
     group_id: u64,
-    db: *db_mod.DB,
+    db_owner: LocalQueryDbOwner,
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) !LocalQueryExecution {
+    var owner = db_owner;
+    errdefer owner.deinit();
+    const db = owner.db();
     var reads = raft_mod.FeatureDBReads.init(group_id, requester);
     try reads.reads.prepareSearchWithConsistency(group_id, req, consistency);
     const snapshot_req = try db.searchRequestAtCurrentIdentityGeneration(req);
@@ -6157,11 +6356,13 @@ fn queryDbDetailed(
             .request = snapshot_req,
             .result = profiled.result,
             .dense_profile = mapDenseSearchProfile(profiled.profile),
+            .db_owner = owner,
         };
     }
     return .{
         .request = snapshot_req,
         .result = try db.search(alloc, snapshot_req),
+        .db_owner = owner,
     };
 }
 
@@ -6530,7 +6731,8 @@ fn queryHostedLocal(
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.SearchResult {
-    const detailed = try queryHostedLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency);
+    var detailed = try queryHostedLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency);
+    defer detailed.releaseDb();
     return detailed.result;
 }
 
@@ -6660,104 +6862,22 @@ fn openProvisionedQueryDbForTableWithCache(
     };
     defer alloc.free(indexes_json);
 
-    const EnrichmentSet = struct {
-        dense: ?db_embedder.DenseEmbedder = null,
-        sparse: ?db_embedder.SparseEmbedder = null,
-        asset_runtime: ?*asset_producer_runtime.Runtime = null,
-        generated: bool = false,
-
-        fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-            if (self.dense) |owned| owned.deinit(allocator);
-            if (self.sparse) |owned| owned.deinit(allocator);
-            if (self.asset_runtime) |runtime| {
-                runtime.deinit();
-                allocator.destroy(runtime);
-            }
-        }
-
-        fn enabled(self: @This()) bool {
-            return self.dense != null or self.sparse != null or self.asset_runtime != null or self.generated;
-        }
-
-        fn config(self: @This()) db_mod.enrichment_runtime.Config {
-            return .{
-                .dense_embedder = self.dense,
-                .sparse_embedder = self.sparse,
-                .asset_producer = if (self.asset_runtime) |runtime| runtime.ownedProducer() else null,
-                .enable_without_producers = self.generated,
-            };
-        }
-
-        fn take(self: *@This()) void {
-            self.dense = null;
-            self.sparse = null;
-            self.asset_runtime = null;
-            self.generated = false;
-        }
-    };
-
-    const createEnrichments = struct {
-        fn run(
-            allocator: std.mem.Allocator,
-            raw_indexes_json: []const u8,
-            runtime_cfg_inner: ManagedReadRuntimeConfig,
-        ) !EnrichmentSet {
-            const asset_runtime = if (try indexesJsonNeedsAssetProducer(allocator, raw_indexes_json)) blk: {
-                const io = if (runtime_cfg_inner.backend_runtime) |backend| backend.io() orelse return error.MissingBackendRuntimeIo else return error.MissingBackendRuntimeIo;
-                break :blk try asset_producer_runtime.Runtime.createOwned(allocator, io, .{
-                    .antfly_provider = runtime_cfg_inner.antfly_provider,
-                    .secret_store = runtime_cfg_inner.secret_store,
-                });
-            } else null;
-            errdefer if (asset_runtime) |owned| {
-                owned.deinit();
-                allocator.destroy(owned);
-            };
-            return .{
-                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = runtime_cfg_inner.antfly_provider, .secret_store = runtime_cfg_inner.secret_store, .remote_content = runtime_cfg_inner.remote_content, .inference_api_url = runtime_cfg_inner.inference_api_url }),
-                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = runtime_cfg_inner.antfly_provider, .secret_store = runtime_cfg_inner.secret_store, .remote_content = runtime_cfg_inner.remote_content, .inference_api_url = runtime_cfg_inner.inference_api_url }),
-                .asset_runtime = asset_runtime,
-                .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
-            };
-        }
-    }.run;
-
-    var enrichments = try createEnrichments(alloc, indexes_json, runtime_cfg);
-    errdefer enrichments.deinit(alloc);
-    const enrichments_enabled = enrichments.enabled();
-
-    var db = if (enrichments_enabled) blk: {
-        const enrichment_cfg = enrichments.config();
-        const opened = try db_mod.DB.open(alloc, path, .{
-            .open_mode = .query_readonly,
-            .lsm_cache = lsm_cache,
-            .hbc_cache = hbc_cache,
-            .lsm_root_generation = lsm_root_generation,
-            .resource_manager = resource_manager,
-            .backend_runtime = runtime_cfg.backend_runtime,
-            .secret_store = runtime_cfg.secret_store,
-            .remote_content = runtime_cfg.remote_content,
-            .identity_namespace = identity_namespace,
-            .prefer_existing_identity_namespace = identity_namespace != null,
-            .enrichment = enrichment_cfg,
-        });
-        enrichments.take();
-        break :blk opened;
-    } else blk: {
-        const opened = try db_mod.DB.open(alloc, path, .{
-            .open_mode = .query_readonly,
-            .lsm_cache = lsm_cache,
-            .hbc_cache = hbc_cache,
-            .lsm_root_generation = lsm_root_generation,
-            .resource_manager = resource_manager,
-            .backend_runtime = runtime_cfg.backend_runtime,
-            .secret_store = runtime_cfg.secret_store,
-            .remote_content = runtime_cfg.remote_content,
-            .identity_namespace = identity_namespace,
-            .prefer_existing_identity_namespace = identity_namespace != null,
-        });
-        break :blk opened;
-    };
+    // Query-readonly DBs never initialize optional enrichment runtimes: those
+    // workers produce derived artifacts and are exclusively writer-owned.
+    // Constructing producer/embedder state here was therefore both wasted work
+    // and an ownership trap—the successful DB open could not consume it.
+    var db = try db_mod.DB.open(alloc, path, .{
+        .open_mode = .query_readonly,
+        .lsm_cache = lsm_cache,
+        .hbc_cache = hbc_cache,
+        .lsm_root_generation = lsm_root_generation,
+        .resource_manager = resource_manager,
+        .backend_runtime = runtime_cfg.backend_runtime,
+        .secret_store = runtime_cfg.secret_store,
+        .remote_content = runtime_cfg.remote_content,
+        .identity_namespace = identity_namespace,
+        .prefer_existing_identity_namespace = identity_namespace != null,
+    });
     errdefer db.close();
     try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
 
@@ -6781,76 +6901,58 @@ fn loadTableIndexesJson(
     return try alloc.dupe(u8, table.indexes_json);
 }
 
-fn indexesJsonNeedsAssetProducer(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
-    if (indexes_json.len == 0) return false;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-    return try jsonValueNeedsAssetProducer(alloc, parsed.value);
+fn catalogValueIsFullTextIndex(value: std.json.Value) !bool {
+    if (value != .object) return error.InvalidTableIndexMetadata;
+    const kind = value.object.get("type") orelse return true;
+    if (kind != .string) return error.InvalidTableIndexMetadata;
+    return std.mem.eql(u8, kind.string, "full_text");
 }
 
-fn indexesJsonHasGeneratedEnrichment(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
-    if (indexes_json.len == 0) return false;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-    return jsonValueHasGeneratedEnrichment(parsed.value);
-}
+fn loadTableAggregationTextAnalysis(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    requested_index_name: ?[]const u8,
+) !introducer_mod.TextAnalysisConfig {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
 
-fn jsonValueHasGeneratedEnrichment(value: std.json.Value) bool {
-    switch (value) {
-        .object => |object| {
-            if (object.get("kind")) |kind| {
-                if (kind == .string and (std.mem.eql(u8, kind.string, "asset") or std.mem.eql(u8, kind.string, "chunk"))) return true;
-            }
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (jsonValueHasGeneratedEnrichment(entry.value_ptr.*)) return true;
-            }
-            return false;
-        },
-        .array => |array| {
-            for (array.items) |item| {
-                if (jsonValueHasGeneratedEnrichment(item)) return true;
-            }
-            return false;
-        },
-        else => return false,
+    var parsed_indexes = try std.json.parseFromSlice(std.json.Value, alloc, table.indexes_json, .{});
+    defer parsed_indexes.deinit();
+    if (parsed_indexes.value != .object) return error.InvalidTableIndexMetadata;
+    const indexes = parsed_indexes.value.object;
+
+    var selected: ?std.json.Value = null;
+    if (requested_index_name) |name| {
+        if (indexes.get(name)) |value| {
+            if (try catalogValueIsFullTextIndex(value)) selected = value;
+        }
     }
-}
-
-fn jsonValueNeedsAssetProducer(alloc: std.mem.Allocator, value: std.json.Value) !bool {
-    switch (value) {
-        .object => |object| {
-            if (try objectIsModelBackedAssetEnrichment(alloc, object)) return true;
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (try jsonValueNeedsAssetProducer(alloc, entry.value_ptr.*)) return true;
-            }
-            return false;
-        },
-        .array => |array| {
-            for (array.items) |item| {
-                if (try jsonValueNeedsAssetProducer(alloc, item)) return true;
-            }
-            return false;
-        },
-        else => return false,
+    if (selected == null) {
+        if (indexes.get(tables_api.default_full_text_index_name)) |value| {
+            if (try catalogValueIsFullTextIndex(value)) selected = value;
+        }
     }
-}
+    if (selected == null) {
+        var it = indexes.iterator();
+        while (it.next()) |entry| {
+            if (!try catalogValueIsFullTextIndex(entry.value_ptr.*)) continue;
+            if (selected != null) return error.InvalidQueryRequest;
+            selected = entry.value_ptr.*;
+        }
+    }
+    const config_json = try std.json.Stringify.valueAlloc(alloc, selected orelse return error.IndexNotFound, .{});
+    defer alloc.free(config_json);
 
-fn objectIsModelBackedAssetEnrichment(alloc: std.mem.Allocator, object: std.json.ObjectMap) !bool {
-    const kind = object.get("kind") orelse return false;
-    if (kind != .string or !std.mem.eql(u8, kind.string, "asset")) return false;
-    const producer_value = object.get("producer_json") orelse return false;
-    const producer_json = switch (producer_value) {
-        .string => |raw| raw,
-        .object, .array => try std.json.Stringify.valueAlloc(alloc, producer_value, .{}),
-        else => return false,
-    };
-    const owns_producer_json = producer_value != .string;
-    defer if (owns_producer_json) alloc.free(@constCast(producer_json));
-    var producer_cfg = asset_producer_mod.parseProducerConfig(alloc, producer_json) catch return false;
-    defer producer_cfg.deinit(alloc);
-    return producer_cfg.type != .copy and producer_cfg.type != .document_extraction;
+    if (table.schema_json.len == 0) {
+        return try index_manager_mod.parseTextAnalysisForIndexConfig(alloc, config_json, null);
+    }
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, table.schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+    return try index_manager_mod.parseTextAnalysisForIndexConfig(alloc, config_json, runtime_schema);
 }
 
 fn loadTableIdentityNamespaceForGroup(
@@ -6899,6 +7001,33 @@ fn aggregationContextForDb(
     db: *db_mod.DB,
 ) !db_mod.aggregations.Context {
     const identity_read_generation = try currentIdentityReadGenerationForDb(req.identity_read_generation, db);
+    return .{
+        .index_manager = db.core.index_manager,
+        .doc_store = db.core.store,
+        .full_text_index_name = req.index_name,
+        .algebraic_index_name = req.index_name,
+        .algebraic_available = try algebraicIndexFreshEnoughForRequest(alloc, req, db),
+        .identity_read_generation = identity_read_generation,
+    };
+}
+
+fn aggregationContextForCapturedResultDb(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    db: *db_mod.DB,
+) !db_mod.aggregations.Context {
+    const identity_read_generation = currentIdentityReadGenerationForDb(req.identity_read_generation, db) catch |err| switch (err) {
+        // A complete result is already an immutable, exact aggregation input.
+        // If background derived work advanced the DB after that search, do not
+        // mix the captured rows with acceleration state from a newer identity
+        // generation. Stored-row aggregations can still execute exactly; any
+        // aggregation that requires index state remains unsupported and can be
+        // retried by the caller against one coherent generation.
+        error.IdentityReadGenerationChanged => return .{
+            .identity_read_generation = req.identity_read_generation,
+        },
+        else => return err,
+    };
     return .{
         .index_manager = db.core.index_manager,
         .doc_store = db.core.store,
@@ -9871,8 +10000,11 @@ fn aggregationCanUseCurrentResult(req: db_mod.types.SearchRequest, result: db_mo
 
 fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !u32 {
     try checkQueryDeadline(req);
-    if (result.total_hits_relation != .exact) return error.UnsupportedQueryRequest;
     const budget = aggregationFullResultBudget();
+    // An inexact first page is a lower bound, not a safe allocation size.
+    // Rerun up to the configured budget and require that execution to prove
+    // completeness before computing aggregations.
+    if (result.total_hits_relation != .exact) return budget;
     if (result.total_hits > budget) {
         std.log.warn("query aggregation full-result rerun budget exceeded operation={s} total_hits={d} budget={d}", .{
             operation,
@@ -9882,6 +10014,26 @@ fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.ty
         return error.QueryCandidateBudgetExceeded;
     }
     return result.total_hits;
+}
+
+fn requireCompleteAggregationFullResult(
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+    operation: []const u8,
+) !void {
+    try checkQueryDeadline(req);
+    if (aggregationCanUseCurrentResult(req, result)) return;
+    std.log.warn("query aggregation bounded full-result rerun remained incomplete operation={s} relation={s} total_hits={d} returned_hits={d} budget={d}", .{
+        operation,
+        @tagName(result.total_hits_relation),
+        result.total_hits,
+        result.hits.len,
+        aggregationFullResultBudget(),
+    });
+    if (result.total_hits_relation == .gte or result.total_hits >= aggregationFullResultBudget()) {
+        return error.QueryCandidateBudgetExceeded;
+    }
+    return error.UnsupportedQueryRequest;
 }
 
 fn aggregationFullResultRequest(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !db_mod.types.SearchRequest {
@@ -9927,7 +10079,7 @@ test "aggregation completeness requires exact total relation" {
         .total_hits = 1,
         .total_hits_relation = .gte,
     }));
-    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationFullResultLimit(.{}, .{
+    try std.testing.expectEqual(aggregationFullResultBudget(), try aggregationFullResultLimit(.{}, .{
         .alloc = std.testing.allocator,
         .hits = @constCast(hits[0..]),
         .total_hits = 1,
@@ -9977,13 +10129,65 @@ fn applyBoundQueryAggregations(
     if (req.aggregations_json.len == 0) return;
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
     if (aggregationCanUseCurrentResult(req, result.*)) {
-        return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, self.db), meta);
+        return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForCapturedResultDb(alloc, aggregation_req, self.db), meta);
     }
 
     const full_req = try aggregationFullResultRequest(req, result.*, "bound");
     var full_result = try self.reads.searchWithConsistency(alloc, self.db, full_req, consistency);
     defer full_result.deinit();
+    try requireCompleteAggregationFullResult(full_req, full_result, "bound");
     return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, self.db), meta);
+}
+
+fn applyCapturedDbQueryAggregations(
+    alloc: std.mem.Allocator,
+    requester: raft_mod.ReadableLeaseRequester,
+    group_id: u64,
+    table_name: []const u8,
+    scope: []const u8,
+    req: db_mod.types.SearchRequest,
+    result: *db_mod.types.SearchResult,
+    meta: *query_api.QueryResponseMeta,
+    db: *db_mod.DB,
+    consistency: raft_mod.ReadConsistency,
+) !void {
+    const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
+    if (aggregationCanUseCurrentResult(req, result.*)) {
+        return try applyAggregationResults(
+            alloc,
+            aggregation_req,
+            result.*,
+            try aggregationContextForCapturedResultDb(alloc, aggregation_req, db),
+            meta,
+        );
+    }
+
+    var reads = raft_mod.FeatureDBReads.init(group_id, requester);
+    const full_req = aggregationFullResultRequest(req, result.*, scope) catch |err| {
+        std.log.warn("local aggregation full-result planning failed table={s} relation={s} total_hits={d} request_generation={?d} result_generation={?d} err={s}", .{
+            table_name,
+            @tagName(result.total_hits_relation),
+            result.total_hits,
+            req.identity_read_generation,
+            result.identity_read_generation,
+            @errorName(err),
+        });
+        return err;
+    };
+    var full_result = reads.searchWithConsistency(alloc, db, full_req, consistency) catch |err| {
+        std.log.warn("local aggregation full-result search failed table={s} generation={?d} err={s}", .{ table_name, full_req.identity_read_generation, @errorName(err) });
+        return err;
+    };
+    defer full_result.deinit();
+    try requireCompleteAggregationFullResult(full_req, full_result, scope);
+    const aggregation_ctx = aggregationContextForDb(alloc, full_req, db) catch |err| {
+        std.log.warn("local aggregation context failed table={s} generation={?d} err={s}", .{ table_name, full_req.identity_read_generation, @errorName(err) });
+        return err;
+    };
+    return applyAggregationResults(alloc, full_req, full_result, aggregation_ctx, meta) catch |err| {
+        std.log.warn("local aggregation execution failed table={s} err={s}", .{ table_name, @errorName(err) });
+        return err;
+    };
 }
 
 fn applyProvisionedQueryAggregations(
@@ -9994,50 +10198,61 @@ fn applyProvisionedQueryAggregations(
     req: db_mod.types.SearchRequest,
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
+    captured_db: ?*db_mod.DB,
     consistency: raft_mod.ReadConsistency,
 ) !void {
     if (req.aggregations_json.len == 0) return;
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
     if (group_ids.len == 1) {
+        if (captured_db) |db| {
+            return try applyCapturedDbQueryAggregations(
+                alloc,
+                self.requester,
+                group_ids[0],
+                table_name,
+                "provisioned-local",
+                req,
+                result,
+                meta,
+                db,
+                consistency,
+            );
+        }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_ids[0]);
         defer alloc.free(path);
         var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
         defer db.close();
-
-        if (aggregationCanUseCurrentResult(req, result.*)) {
-            return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
-        }
-
-        var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
-        const full_req = try aggregationFullResultRequest(req, result.*, "provisioned-local");
-        var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
-        defer full_result.deinit();
-        return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, &db), meta);
+        return try applyCapturedDbQueryAggregations(alloc, self.requester, group_ids[0], table_name, "provisioned-local", req, result, meta, &db, consistency);
     }
 
     if (try tryApplyProvisionedAlgebraicDistributedAggregations(self, alloc, group_ids, table_name, aggregation_req, meta)) return;
 
-    const current_agg_stats = try collectProvisionedAggregationTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits);
+    var text_analysis = try loadTableAggregationTextAnalysis(alloc, self.catalog, table_name, aggregation_req.index_name);
+    defer introducer_mod.freeTextAnalysisConfig(alloc, text_analysis);
+    const current_agg_stats = try collectProvisionedAggregationTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, &text_analysis);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, current_agg_stats);
-    const current_bg_stats = try collectProvisionedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits);
+    const current_bg_stats = try collectProvisionedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, &text_analysis);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, current_bg_stats);
     if (aggregationCanUseCurrentResult(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, .{
             .distributed_text_stats = current_agg_stats,
             .distributed_background_text_stats = current_bg_stats,
+            .text_analysis = &text_analysis,
         }, meta);
     }
 
     const full_req = try aggregationFullResultRequest(req, result.*, "provisioned-distributed");
     var full_result = try queryProvisionedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
     defer full_result.deinit();
-    const full_agg_stats = try collectProvisionedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits);
+    try requireCompleteAggregationFullResult(full_req, full_result, "provisioned-distributed");
+    const full_agg_stats = try collectProvisionedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, &text_analysis);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, full_agg_stats);
-    const full_bg_stats = try collectProvisionedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits);
+    const full_bg_stats = try collectProvisionedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, &text_analysis);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, full_bg_stats);
     return try applyAggregationResults(alloc, full_req, full_result, .{
         .distributed_text_stats = full_agg_stats,
         .distributed_background_text_stats = full_bg_stats,
+        .text_analysis = &text_analysis,
     }, meta);
 }
 
@@ -10177,6 +10392,7 @@ fn applyHostedProvisionedQueryAggregations(
     req: db_mod.types.SearchRequest,
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
+    captured_db: ?*db_mod.DB,
     consistency: raft_mod.ReadConsistency,
 ) !void {
     if (req.aggregations_json.len == 0) return;
@@ -10187,20 +10403,15 @@ fn applyHostedProvisionedQueryAggregations(
 
         switch (route) {
             .local => {
+                if (captured_db) |db| {
+                    return try applyCapturedDbQueryAggregations(alloc, self.requester, group_ids[0], table_name, "hosted-local", req, result, meta, db, consistency);
+                }
                 const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_ids[0]);
                 defer alloc.free(path);
                 var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
                 defer db.close();
 
-                if (aggregationCanUseCurrentResult(req, result.*)) {
-                    return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
-                }
-
-                var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
-                const full_req = try aggregationFullResultRequest(req, result.*, "hosted-local");
-                var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
-                defer full_result.deinit();
-                return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, &db), meta);
+                return try applyCapturedDbQueryAggregations(alloc, self.requester, group_ids[0], table_name, "hosted-local", req, result, meta, &db, consistency);
             },
             .remote => {},
         }
@@ -10208,27 +10419,32 @@ fn applyHostedProvisionedQueryAggregations(
 
     if (try tryApplyHostedAlgebraicDistributedAggregations(self, alloc, group_ids, table_name, aggregation_req, meta, consistency)) return;
 
-    const current_agg_stats = try collectHostedAggregationTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, consistency);
+    var text_analysis = try loadTableAggregationTextAnalysis(alloc, self.catalog, table_name, aggregation_req.index_name);
+    defer introducer_mod.freeTextAnalysisConfig(alloc, text_analysis);
+    const current_agg_stats = try collectHostedAggregationTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, &text_analysis, consistency);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, current_agg_stats);
-    const current_bg_stats = try collectHostedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, consistency);
+    const current_bg_stats = try collectHostedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, &text_analysis, consistency);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, current_bg_stats);
     if (aggregationCanUseCurrentResult(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, .{
             .distributed_text_stats = current_agg_stats,
             .distributed_background_text_stats = current_bg_stats,
+            .text_analysis = &text_analysis,
         }, meta);
     }
 
     const full_req = try aggregationFullResultRequest(req, result.*, "hosted-distributed");
     var full_result = try queryHostedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
     defer full_result.deinit();
-    const full_agg_stats = try collectHostedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, consistency);
+    try requireCompleteAggregationFullResult(full_req, full_result, "hosted-distributed");
+    const full_agg_stats = try collectHostedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, &text_analysis, consistency);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, full_agg_stats);
-    const full_bg_stats = try collectHostedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, consistency);
+    const full_bg_stats = try collectHostedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, &text_analysis, consistency);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, full_bg_stats);
     return try applyAggregationResults(alloc, full_req, full_result, .{
         .distributed_text_stats = full_agg_stats,
         .distributed_background_text_stats = full_bg_stats,
+        .text_analysis = &text_analysis,
     }, meta);
 }
 
@@ -12018,6 +12234,7 @@ fn collectSignificantTermsFieldRequests(
     alloc: std.mem.Allocator,
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) ![]OwnedTextStatsFieldRequest {
     var grouped = std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)){};
     defer {
@@ -12031,7 +12248,7 @@ fn collectSignificantTermsFieldRequests(
         grouped.deinit(alloc);
     }
 
-    try collectSignificantTermsFieldRequestsRecursive(alloc, &grouped, requests, hits);
+    try collectSignificantTermsFieldRequestsRecursive(alloc, &grouped, requests, hits, text_analysis);
     if (grouped.count() == 0) return &.{};
 
     const out = try alloc.alloc(OwnedTextStatsFieldRequest, grouped.count());
@@ -12063,13 +12280,14 @@ fn collectSignificantTermsBackgroundFieldRequests(
     alloc: std.mem.Allocator,
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) ![]OwnedBackgroundTextStatsFieldRequest {
     var out = std.ArrayListUnmanaged(OwnedBackgroundTextStatsFieldRequest).empty;
     errdefer {
         for (out.items) |*item| item.deinit(alloc);
         out.deinit(alloc);
     }
-    try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, &out, requests, hits);
+    try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, &out, requests, hits, text_analysis);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -12078,16 +12296,19 @@ fn collectSignificantTermsBackgroundFieldRequestsRecursive(
     out: *std.ArrayListUnmanaged(OwnedBackgroundTextStatsFieldRequest),
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) !void {
     for (requests) |request| {
         if (std.mem.eql(u8, request.type, "significant_terms") and request.background_query != null) {
+            const candidate_limit = try db_mod.aggregations.significantTermsCandidateLimit(@intCast(if (request.size > 0) request.size else 10));
             var seen_terms = std.StringHashMapUnmanaged(void){};
             defer {
                 var term_it = seen_terms.keyIterator();
                 while (term_it.next()) |term| alloc.free(term.*);
                 seen_terms.deinit(alloc);
             }
-            try collectSignificantTermsFromHits(alloc, hits, request.field, &seen_terms);
+            const analyzer = try tableAggregationAnalyzerForField(text_analysis, request.field);
+            try collectSignificantTermsFromHits(alloc, hits, request.field, analyzer, candidate_limit, &seen_terms);
             if (seen_terms.count() > 0) {
                 const terms = try alloc.alloc([]const u8, seen_terms.count());
                 var term_index: usize = 0;
@@ -12104,7 +12325,7 @@ fn collectSignificantTermsBackgroundFieldRequestsRecursive(
                 });
             }
         }
-        try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, out, request.aggregations, hits);
+        try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, out, request.aggregations, hits, text_analysis);
     }
 }
 
@@ -12130,17 +12351,20 @@ fn collectSignificantTermsFieldRequestsRecursive(
     grouped: *std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)),
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) !void {
     for (requests) |request| {
         if (std.mem.eql(u8, request.type, "significant_terms") and request.background_query == null) {
+            const candidate_limit = try db_mod.aggregations.significantTermsCandidateLimit(@intCast(if (request.size > 0) request.size else 10));
             const gop = try grouped.getOrPut(alloc, request.field);
             if (!gop.found_existing) {
                 gop.key_ptr.* = try alloc.dupe(u8, request.field);
                 gop.value_ptr.* = .{};
             }
-            try collectSignificantTermsFromHits(alloc, hits, request.field, gop.value_ptr);
+            const analyzer = try tableAggregationAnalyzerForField(text_analysis, request.field);
+            try collectSignificantTermsFromHits(alloc, hits, request.field, analyzer, candidate_limit, gop.value_ptr);
         }
-        try collectSignificantTermsFieldRequestsRecursive(alloc, grouped, request.aggregations, hits);
+        try collectSignificantTermsFieldRequestsRecursive(alloc, grouped, request.aggregations, hits, text_analysis);
     }
 }
 
@@ -12148,33 +12372,41 @@ fn collectSignificantTermsFromHits(
     alloc: std.mem.Allocator,
     hits: []const db_mod.types.SearchHit,
     field: []const u8,
+    analyzer: *const @import("../search/analysis.zig").Analyzer,
+    candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
-    for (hits) |hit| try collectSignificantTermsFromStoredAlloc(alloc, hit.stored_data orelse continue, field, seen_terms);
+    for (hits) |hit| try collectSignificantTermsFromStoredAlloc(alloc, hit.stored_data orelse continue, field, analyzer, candidate_limit, seen_terms);
 }
 
 fn collectSignificantTermsFromStoredAlloc(
     alloc: std.mem.Allocator,
     stored: []const u8,
     field: []const u8,
+    analyzer: *const @import("../search/analysis.zig").Analyzer,
+    candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
     var parsed = (try parseJsonPathValueAlloc(alloc, stored, field)) orelse return;
     defer parsed.deinit();
-    try collectSignificantTermsFromValue(alloc, parsed.value, seen_terms);
+    try collectSignificantTermsFromValue(alloc, parsed.value, analyzer, candidate_limit, seen_terms);
 }
 
 fn collectSignificantTermsFromValue(
     alloc: std.mem.Allocator,
     value: std.json.Value,
+    analyzer: *const @import("../search/analysis.zig").Analyzer,
+    candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
     switch (value) {
-        .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(alloc, item, seen_terms),
+        .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(alloc, item, analyzer, candidate_limit, seen_terms),
         .string => {
-            const tokens = try @import("../search/analysis.zig").default_analyzer.analyze(alloc, value.string);
+            const tokens = try analyzer.analyze(alloc, value.string);
             defer @import("../search/analysis.zig").Analyzer.freeTokens(alloc, tokens);
             for (tokens) |tok| {
+                if (!seen_terms.contains(tok.term) and seen_terms.count() >= candidate_limit)
+                    return error.QueryCandidateBudgetExceeded;
                 const entry = try seen_terms.getOrPut(alloc, tok.term);
                 if (entry.found_existing) continue;
                 entry.key_ptr.* = try alloc.dupe(u8, tok.term);
@@ -12182,6 +12414,23 @@ fn collectSignificantTermsFromValue(
         },
         else => {},
     }
+}
+
+fn tableAggregationAnalyzerForField(
+    cfg: *const introducer_mod.TextAnalysisConfig,
+    field: []const u8,
+) !*const @import("../search/analysis.zig").Analyzer {
+    var analyzer_name: ?[]const u8 = null;
+    for (cfg.field_analyzers) |item| {
+        if (!std.mem.eql(u8, item.field_name, field)) continue;
+        if (analyzer_name) |existing| {
+            if (!std.mem.eql(u8, existing, item.analyzer_name)) return error.InvalidTableIndexMetadata;
+        } else {
+            analyzer_name = item.analyzer_name;
+        }
+    }
+    return introducer_mod.resolveAnalyzerName(analyzer_name orelse "standard", cfg.*) orelse
+        error.InvalidTableIndexMetadata;
 }
 
 fn extractJsonValueAtPath(value: std.json.Value, path: []const u8) ?std.json.Value {
@@ -12677,12 +12926,13 @@ fn collectProvisionedAggregationTextStats(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) ![]const distributed_stats_mod.TextFieldStats {
     if (group_ids.len <= 1 or req.aggregations_json.len == 0) return &.{};
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    const field_requests = try collectSignificantTermsFieldRequests(alloc, requests, hits);
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, requests, hits, text_analysis);
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -12713,12 +12963,13 @@ fn collectProvisionedAggregationBackgroundTextStats(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
 ) ![]const db_mod.aggregations.DistributedBackgroundTextStats {
     if (group_ids.len <= 1 or req.aggregations_json.len == 0) return &.{};
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    const field_requests = try collectSignificantTermsBackgroundFieldRequests(alloc, requests, hits);
+    const field_requests = try collectSignificantTermsBackgroundFieldRequests(alloc, requests, hits, text_analysis);
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -12749,13 +13000,14 @@ fn collectHostedAggregationTextStats(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
     consistency: raft_mod.ReadConsistency,
 ) ![]const distributed_stats_mod.TextFieldStats {
     if (group_ids.len <= 1 or req.aggregations_json.len == 0) return &.{};
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    const field_requests = try collectSignificantTermsFieldRequests(alloc, requests, hits);
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, requests, hits, text_analysis);
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -12791,13 +13043,14 @@ fn collectHostedAggregationBackgroundTextStats(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     hits: []const db_mod.types.SearchHit,
+    text_analysis: *const introducer_mod.TextAnalysisConfig,
     consistency: raft_mod.ReadConsistency,
 ) ![]const db_mod.aggregations.DistributedBackgroundTextStats {
     if (group_ids.len <= 1 or req.aggregations_json.len == 0) return &.{};
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    const field_requests = try collectSignificantTermsBackgroundFieldRequests(alloc, requests, hits);
+    const field_requests = try collectSignificantTermsBackgroundFieldRequests(alloc, requests, hits, text_analysis);
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -15404,6 +15657,7 @@ test "provisioned local query execution returns stamped identity request" {
         .{ .limit = 1 },
         .stale,
     );
+    defer execution.releaseDb();
     defer execution.result.deinit();
 
     try std.testing.expect(execution.request.identity_read_generation != null);
@@ -15479,12 +15733,15 @@ test "provisioned local query reuses resident generation without readonly open" 
         .{ .limit = 1 },
         .stale,
     );
+    defer execution.releaseDb();
     defer execution.result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), resident.leases);
-    try std.testing.expectEqual(@as(usize, 1), resident.releases);
+    try std.testing.expectEqual(@as(usize, 0), resident.releases);
     try std.testing.expectEqual(@as(u32, 1), execution.result.total_hits);
     try std.testing.expectEqualStrings("doc:a", execution.result.hits[0].id);
+    execution.releaseDb();
+    try std.testing.expectEqual(@as(usize, 1), resident.releases);
 }
 
 test "provisioned table read source managed runtime config carries inference url" {
@@ -16222,7 +16479,7 @@ test "provisioned table read source runtime status falls back to shared snapshot
         .table_name = try alloc.dupe(u8, "docs"),
         .statuses = .{ .items = items },
     };
-    snapshot_cache.replaceOwned(snapshots);
+    try publishRuntimeStatusRefreshForTest(&snapshot_cache, snapshots);
 
     var source = ProvisionedTableReadSource.init("/tmp/unused-antfly-runtime-snapshot", NoCatalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
     source.runtime_status_cache = &snapshot_cache;
@@ -16323,7 +16580,7 @@ test "provisioned table read source runtime status prefers shared snapshot cache
         },
     };
     defer status.deinit(alloc);
-    try snapshot_cache.upsertGroupStatus("docs", status);
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", status);
 
     var source = ProvisionedTableReadSource.init(path, NoCatalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
     source.cache = &cache;
@@ -16679,11 +16936,12 @@ test "distributed table reads reject stale doc identity before multigroup fanout
         .id = try alloc.dupe(u8, "doc:a"),
         .stored_data = try alloc.dupe(u8, "{\"body\":\"alpha beta\"}"),
     };
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
     try std.testing.expect((try collectProvisionedAlgebraicDistributedPartials(&healthy_source, alloc, group_ids[0..], "docs", resolved_explicit_req, "alg", &.{}, .{
         .output = .{ .input = 0 },
     })) == null);
-    try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_explicit_req, stats_hits));
-    try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationBackgroundTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_background_req, stats_hits));
+    try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_explicit_req, stats_hits, &text_analysis));
+    try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationBackgroundTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_background_req, stats_hits, &text_analysis));
 
     const rebuild_required = [_]metadata_reconciler.MergedGroupStatus{
         .{ .group_id = 7001, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7001, .namespace_range_id = 7001, .allocated_ordinals = 1 } },
@@ -16698,10 +16956,10 @@ test "distributed table reads reject stale doc identity before multigroup fanout
     }, "docs"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, collectProvisionedAggregationTextStats(&source, alloc, group_ids[0..], "docs", .{
         .aggregations_json = "unparsed because doc identity guard runs first",
-    }, &.{}));
+    }, &.{}, &text_analysis));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, collectProvisionedAggregationBackgroundTextStats(&source, alloc, group_ids[0..], "docs", .{
         .aggregations_json = "unparsed because doc identity guard runs first",
-    }, &.{}));
+    }, &.{}, &text_analysis));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, collectProvisionedAlgebraicDistributedPartials(&source, alloc, group_ids[0..], "docs", .{}, "alg", &.{}, .{
         .output = .{ .input = 0 },
     }));
@@ -17532,7 +17790,7 @@ test "explicit text stats requests reject stale identity generation" {
 
     var parsed_explicit = try parseTextStatsRequest(alloc, "docs", explicit_body);
     defer parsed_explicit.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedQueryRequest, collectTextStatsFromDbForRequest(alloc, &db, parsed_explicit));
+    try std.testing.expectError(error.IdentityReadGenerationChanged, collectTextStatsFromDbForRequest(alloc, &db, parsed_explicit));
 
     const background_body = try std.fmt.allocPrint(alloc,
         \\{{"_identity_read_generation":{d},"background_fields":[{{"aggregation_name":"sig","index_name":"text_v1","field":"body","terms":["alpha"],"background_query":{{"match_all":{{}}}}}}]}}
@@ -17541,7 +17799,7 @@ test "explicit text stats requests reject stale identity generation" {
 
     var parsed_background = try parseTextStatsRequest(alloc, "docs", background_body);
     defer parsed_background.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedQueryRequest, collectBackgroundTextStatsFromDbForRequest(alloc, &db, parsed_background));
+    try std.testing.expectError(error.IdentityReadGenerationChanged, collectBackgroundTextStatsFromDbForRequest(alloc, &db, parsed_background));
 }
 
 test "algebraic partial request preserves planner-owned materialization tensor programs" {
@@ -17623,9 +17881,21 @@ test "aggregation context rejects non-current identity generation" {
     const current = db.core.nextDerivedSequence();
     const ctx = try aggregationContextForDb(alloc, .{ .identity_read_generation = current }, &db);
     try std.testing.expectEqual(@as(?u64, current), ctx.identity_read_generation);
-    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationContextForDb(alloc, .{
+    try std.testing.expectError(error.IdentityReadGenerationChanged, aggregationContextForDb(alloc, .{
         .identity_read_generation = current + 1,
     }, &db));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"v\":2}" }},
+        .sync_level = .write,
+    });
+    const captured = try aggregationContextForCapturedResultDb(alloc, .{
+        .identity_read_generation = current,
+    }, &db);
+    try std.testing.expectEqual(@as(?u64, current), captured.identity_read_generation);
+    try std.testing.expect(captured.index_manager == null);
+    try std.testing.expect(captured.doc_store == null);
+    try std.testing.expect(!captured.algebraic_available);
 }
 
 test "aggregation full-result rerun can reuse snapped result identity generation" {
@@ -17957,6 +18227,9 @@ test "algebraic partial request fails closed when lifecycle is stale" {
     defer alloc.free(encoded);
     var parsed = try parseAlgebraicPartialsRequest(alloc, encoded);
     defer parsed.deinit(alloc);
+    // Fence the request to the current snapshot so this test isolates the
+    // planner lifecycle gate rather than conflating it with identity drift.
+    parsed.identity_read_generation = try db.currentIdentityReadGenerationForRequest(null);
     try std.testing.expectError(error.UnsupportedQueryRequest, collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed));
 }
 
@@ -18012,7 +18285,7 @@ test "algebraic partial request accepts current identity generation and rejects 
     var stale = try parseAlgebraicPartialsRequest(alloc, encoded);
     defer stale.deinit(alloc);
     stale.identity_read_generation = db.core.nextDerivedSequence() + 1;
-    try std.testing.expectError(error.UnsupportedQueryRequest, collectAlgebraicPartialsFromDbForRequest(alloc, &db, stale));
+    try std.testing.expectError(error.IdentityReadGenerationChanged, collectAlgebraicPartialsFromDbForRequest(alloc, &db, stale));
 }
 
 test "algebraic partial request accepts tensor program expression outputs" {
@@ -19035,7 +19308,8 @@ test "collect significant terms field requests gathers unique field terms from h
         },
     };
 
-    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits);
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits, &text_analysis);
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -19056,6 +19330,50 @@ test "collect significant terms field requests gathers unique field terms from h
     try std.testing.expectEqual(@as(usize, 2), nested.terms.len);
     try std.testing.expect(std.mem.eql(u8, nested.terms[0], "beta") or std.mem.eql(u8, nested.terms[1], "beta"));
     try std.testing.expect(std.mem.eql(u8, nested.terms[0], "gamma") or std.mem.eql(u8, nested.terms[1], "gamma"));
+}
+
+test "distributed significant terms candidates use configured analyzers and bounded memory" {
+    const alloc = std.testing.allocator;
+    var text_analysis = try introducer_mod.parseTextAnalysisConfig(
+        alloc,
+        "{\"analysis_config\":{\"field_analyzers\":{\"body\":\"keyword\"}}}",
+    );
+    defer introducer_mod.freeTextAnalysisConfig(alloc, text_analysis);
+
+    const hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    defer {
+        hits[0].deinit(alloc);
+        alloc.free(hits);
+    }
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .stored_data = try alloc.dupe(u8, "{\"body\":\"New York\"}"),
+    };
+    const requests = [_]db_mod.aggregations.SearchAggregationRequest{.{
+        .name = "sig_body",
+        .type = "significant_terms",
+        .field = "body",
+        .size = 1,
+    }};
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits, &text_analysis);
+    defer {
+        for (field_requests) |*item| item.deinit(alloc);
+        if (field_requests.len != 0) alloc.free(field_requests);
+    }
+    try std.testing.expectEqual(@as(usize, 1), field_requests.len);
+    try std.testing.expectEqual(@as(usize, 1), field_requests[0].terms.len);
+    try std.testing.expectEqualStrings("New York", field_requests[0].terms[0]);
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |term| alloc.free(term.*);
+        seen.deinit(alloc);
+    }
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        collectSignificantTermsFromValue(alloc, .{ .string = "alpha beta" }, &@import("../search/analysis.zig").default_analyzer, 1, &seen),
+    );
 }
 
 test "hosted textStatsGroupLocal serves only the local group" {
@@ -20065,7 +20383,7 @@ test "graph edge local read rejects stale identity generation" {
     defer req.deinit(alloc);
 
     var catalog_state = CatalogState{};
-    try std.testing.expectError(error.UnsupportedQueryRequest, graphGetEdgesLocal(
+    try std.testing.expectError(error.IdentityReadGenerationChanged, graphGetEdgesLocal(
         alloc,
         root,
         catalog_state.iface(),
@@ -20778,6 +21096,100 @@ test "provisioned read cache exclusive access drains active read leases" {
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
     try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
+}
+
+test "provisioned read cache group exclusive drains only the published group" {
+    const alloc = std.testing.allocator;
+    const root = "/tmp/antfly-api-provisioned-read-cache-group-exclusive";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .indexes_json = @import("tables.zig").default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const ExclusiveThread = struct {
+        cache: *ProvisionedTableReadCache,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var exclusive = self.cache.beginExclusiveGroupAccess(7001) catch |err| {
+                self.err = err;
+                return;
+            };
+            exclusive.deinit();
+        }
+    };
+
+    const path_one = try std.fmt.allocPrint(alloc, "{s}/group-7001", .{root});
+    defer alloc.free(path_one);
+    const path_two = try std.fmt.allocPrint(alloc, "{s}/group-7002", .{root});
+    defer alloc.free(path_two);
+    var lsm_cache = lsm_backend.Cache.init(alloc, lsm_backend.DefaultCacheSizeBytes);
+    defer lsm_cache.deinit();
+    var cache = ProvisionedTableReadCache.init(alloc);
+    defer cache.deinit();
+    cache.lsm_cache = &lsm_cache;
+
+    var lease_one = try cache.getOrOpen(path_one, FakeCatalog.iface(), 7001, 1, "docs");
+    var lease_two = try cache.getOrOpen(path_two, FakeCatalog.iface(), 7002, 1, "docs");
+    defer lease_two.release();
+    const table_epoch = cache.table_epochs.get("docs").?;
+
+    var ctx = ExclusiveThread{ .cache = &cache };
+    const thread = try std.Thread.spawn(.{}, ExclusiveThread.run, .{&ctx});
+    var observed = false;
+    for (0..100) |_| {
+        const io = cache.threaded.io();
+        cache.mutex.lockUncancelable(io);
+        observed = cache.hasExclusiveGroupAccessLocked(7001) and
+            cache.entries.items.len == 1 and cache.entries.items[0].group_id == 7002 and
+            cache.retired_entries.items.len == 1;
+        cache.mutex.unlock(io);
+        if (observed) break;
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    lease_one.release();
+    thread.join();
+    if (ctx.err) |err| return err;
+    try std.testing.expect(observed);
+    try std.testing.expectEqual(table_epoch, cache.table_epochs.get("docs").?);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 7002), cache.entries.items[0].group_id);
 }
 
 test "provisioned read cache retirement is allocation-free after entry installation" {

@@ -113,11 +113,14 @@ pub const DocumentTransform = struct {
 
 pub const SplitReplicationCheckpoint = struct {
     pub const Kind = enum {
-        destination,
+        destination_begin,
+        destination_complete,
         source_ack,
     };
 
     kind: Kind,
+    transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     range_start: []const u8 = "",
@@ -129,9 +132,23 @@ pub const SplitReplicationCheckpoint = struct {
 /// destination batch carries this context so all replicas create the physical
 /// DB with the same namespace before the destination range is catalog-visible.
 pub const SplitReplicationContext = struct {
+    pub const Operation = enum {
+        bootstrap_chunk,
+        delta,
+        checkpoint,
+    };
+
+    transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     identity_namespace: doc_identity_mod.Namespace,
+    /// Present only while streaming a baseline bootstrap. Catch-up deltas use
+    /// null and are fenced by the completed destination marker.
+    bootstrap_sequence: ?u64 = null,
+    operation: Operation = .bootstrap_chunk,
+    /// Source split-delta sequence. Zero for bootstrap chunks.
+    sequence: u64 = 0,
 };
 
 pub const SplitTransitionMutation = struct {
@@ -143,6 +160,8 @@ pub const SplitTransitionMutation = struct {
     };
 
     kind: Kind,
+    transition_id: u64,
+    attempt_epoch: u64,
     destination_group_id: u64,
     split_key: []const u8 = "",
 };

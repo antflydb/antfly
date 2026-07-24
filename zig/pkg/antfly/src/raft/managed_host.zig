@@ -25,6 +25,8 @@ const reconciler = @import("reconciler.zig");
 const state_machine = @import("state_machine/mod.zig");
 const storage = @import("storage/mod.zig");
 const backup_restore = @import("storage/backup_restore.zig");
+const background_runtime = @import("../storage/background_runtime.zig");
+const resource_manager = @import("../storage/resource_manager.zig");
 
 pub const ManagedHostConfig = struct {
     host: host_mod.HostConfig,
@@ -88,6 +90,7 @@ pub const ManagedHost = struct {
             cfg.wal_replica_state,
             cfg.wal_flush_on_deinit,
             false,
+            null,
             deps.host,
             deps.metadata_snapshot_builder,
             deps.data_snapshot_builder,
@@ -181,6 +184,10 @@ pub const ManagedHost = struct {
 
     pub fn reconcileOnce(self: *ManagedHost) !reconciler.ReconcileResult {
         return try self.reconciler_loop.reconcileOnce();
+    }
+
+    pub fn prepareReconcile(self: *ManagedHost) !reconciler.PreparedReconcile {
+        return try self.reconciler_loop.prepare();
     }
 
     pub fn replacePlacementIntents(self: *ManagedHost, intents: []const reconciler.PlacementIntent) !void {
@@ -305,6 +312,7 @@ pub const ManagedHttpHost = struct {
             cfg.wal_replica_state,
             cfg.wal_flush_on_deinit,
             cfg.replica_apply_store_no_sync,
+            deps.http.backend_runtime,
             deps.http.host,
             deps.metadata_snapshot_builder,
             deps.data_snapshot_builder,
@@ -413,8 +421,30 @@ pub const ManagedHttpHost = struct {
         return try self.reconciler_loop.reconcileOnce();
     }
 
+    pub fn prepareReconcile(self: *ManagedHttpHost) !reconciler.PreparedReconcile {
+        return try self.reconciler_loop.prepare();
+    }
+
     pub fn replacePlacementIntents(self: *ManagedHttpHost, intents: []const reconciler.PlacementIntent) !void {
         try self.view.replaceReplicaIntents(intents);
+    }
+
+    pub fn attachDataApplyStoreResourceManager(self: *ManagedHttpHost, manager: *resource_manager.ResourceManager) !void {
+        const store = self.owned_data_store orelse return;
+        try store.attachResourceManager(manager);
+    }
+
+    pub fn retainDataApplyGroups(self: *ManagedHttpHost, group_ids: []const u64) !void {
+        const store = self.owned_data_store orelse return;
+        try store.retainActiveGroups(group_ids);
+    }
+
+    pub fn beginDataApplyGroupTransition(
+        self: *ManagedHttpHost,
+        group_ids: []const u64,
+    ) !?data_storage.RaftApplyStore.ActiveGroupTransition {
+        const store = self.owned_data_store orelse return null;
+        return try store.beginActiveGroupTransition(group_ids);
     }
 
     pub fn applyBatch(self: *ManagedHttpHost, updates: []const metadata_view.MetadataUpdate) !void {
@@ -592,6 +622,7 @@ fn prepareHostDeps(
     wal_replica_state_cfg: storage.WalReplicaStateConfig,
     wal_flush_on_deinit: bool,
     replica_apply_store_no_sync: bool,
+    backend_runtime: ?*background_runtime.BackendRuntime,
     base: host_mod.HostDeps,
     metadata_snapshot_builder: ?state_machine.SnapshotBuilder,
     data_snapshot_builder: ?state_machine.SnapshotBuilder,
@@ -636,6 +667,7 @@ fn prepareHostDeps(
             owned_store.* = try data_storage.RaftApplyStore.init(alloc, .{
                 .root_dir = replica_root_dir,
                 .no_sync = replica_apply_store_no_sync,
+                .backend_runtime = backend_runtime,
             });
             prepared.owned_data_store = owned_store;
             effective_data_builder = owned_store.snapshotBuilder();

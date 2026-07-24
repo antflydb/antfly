@@ -27,6 +27,7 @@ const raft_state_machine = @import("state_machine/mod.zig");
 const shard_ops = @import("shard_ops.zig");
 const transition_runtime = @import("transition_runtime.zig");
 const transition_service = @import("transition_service.zig");
+const resource_manager = @import("../storage/resource_manager.zig");
 
 pub const ManagedServiceConfig = struct {
     max_inbound_messages: usize = host_mod.default_max_inbound_messages_per_round,
@@ -69,6 +70,15 @@ pub const ManagedServiceMetrics = struct {
     bootstrapping_merge_receiver: usize = 0,
     merge_replay_blocked: usize = 0,
     merge_ready_to_finalize: usize = 0,
+};
+
+const PendingUpdateLane = enum {
+    control,
+    raft,
+
+    fn deliversTransitions(self: PendingUpdateLane) bool {
+        return self == .control;
+    }
 };
 
 const TestSingleNodeFactory = struct {
@@ -219,6 +229,18 @@ pub const ManagedHostService = struct {
         return null;
     }
 
+    pub fn replaceTransitionOps(self: *ManagedHostService, ops: shard_ops.ShardOperationAdapter) !void {
+        if (self.transition_svc) |*transition_svc| transition_svc.deinit();
+        self.transition_svc = null;
+        self.transition_svc = transition_service.TransitionService.initWithRetryClock(self.alloc, ops, self.transition_retry_clock);
+        errdefer {
+            if (self.transition_svc) |*transition_svc| transition_svc.deinit();
+            self.transition_svc = null;
+        }
+        try self.seedTransitionsFromMetadataStore(self.host.host.cfg.metadata_group_id);
+        self.syncTransitionMetrics();
+    }
+
     pub fn prepareEnrichmentRead(
         self: *ManagedHostService,
         group_id: u64,
@@ -313,6 +335,18 @@ pub const ManagedHostService = struct {
         );
         self.metrics.sync_rounds += 1;
         _ = try self.stepTransitions();
+    }
+
+    /// Advances consensus without stepping transition executors. Runtime
+    /// owners serialize this with other Raft access and schedule transition
+    /// work in their control-round critical section.
+    pub fn runRaftRoundOnly(self: *ManagedHostService) !void {
+        _ = try self.host.runRoundBounded(
+            self.cfg.max_inbound_messages,
+            self.cfg.max_tick_groups,
+            self.cfg.max_ready_groups,
+        );
+        self.metrics.sync_rounds += 1;
     }
 
     pub fn stepTransitions(self: *ManagedHostService) !transition_service.TransitionStepResult {
@@ -496,6 +530,21 @@ pub const ManagedHttpHostService = struct {
         return try self.host.baseUri(alloc);
     }
 
+    pub fn attachDataApplyStoreResourceManager(self: *ManagedHttpHostService, manager: *resource_manager.ResourceManager) !void {
+        try self.host.attachDataApplyStoreResourceManager(manager);
+    }
+
+    pub fn retainDataApplyGroups(self: *ManagedHttpHostService, group_ids: []const u64) !void {
+        try self.host.retainDataApplyGroups(group_ids);
+    }
+
+    pub fn beginDataApplyGroupTransition(
+        self: *ManagedHttpHostService,
+        group_ids: []const u64,
+    ) !?data.RaftApplyStore.ActiveGroupTransition {
+        return try self.host.beginDataApplyGroupTransition(group_ids);
+    }
+
     pub fn replaceTransitionOps(self: *ManagedHttpHostService, ops: shard_ops.ShardOperationAdapter) !void {
         if (self.transition_svc) |*transition_svc| transition_svc.deinit();
         self.transition_svc = null;
@@ -633,11 +682,7 @@ pub const ManagedHttpHostService = struct {
             self.cfg.max_ready_groups,
         );
         self.last_runtime_round = result.runtime;
-        try self.enqueueTransitionUpdates(self.pending_updates.items);
-        self.metrics.applied_updates += self.pending_updates.items.len;
-        self.metrics.sync_rounds += 1;
-        self.clearPending();
-        self.metrics.queued_updates = 0;
+        try self.finishPendingSync(.control);
         _ = try self.stepTransitions();
         return result;
     }
@@ -650,11 +695,7 @@ pub const ManagedHttpHostService = struct {
             self.cfg.max_ready_groups,
         );
         self.last_runtime_round = result.runtime;
-        try self.enqueueTransitionUpdates(self.pending_updates.items);
-        self.metrics.applied_updates += self.pending_updates.items.len;
-        self.metrics.sync_rounds += 1;
-        self.clearPending();
-        self.metrics.queued_updates = 0;
+        try self.finishPendingSync(.raft);
         return result;
     }
 
@@ -742,6 +783,18 @@ pub const ManagedHttpHostService = struct {
     fn clearPending(self: *ManagedHttpHostService) void {
         for (self.pending_updates.items) |*update| update.deinit(self.alloc);
         self.pending_updates.clearRetainingCapacity();
+    }
+
+    fn finishPendingSync(self: *ManagedHttpHostService, lane: PendingUpdateLane) !void {
+        // The dedicated Raft lane owns consensus progress and durable
+        // projection only. Transition-controller state is hydrated from that
+        // projection by the control lane; mutating it here would introduce a
+        // second writer racing observation and step execution.
+        if (lane.deliversTransitions()) try self.enqueueTransitionUpdates(self.pending_updates.items);
+        self.metrics.applied_updates += self.pending_updates.items.len;
+        self.metrics.sync_rounds += 1;
+        self.clearPending();
+        self.metrics.queued_updates = 0;
     }
 
     fn requestReadableLeaseViaRequester(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
@@ -881,7 +934,7 @@ test "managed host service syncs queued metadata updates" {
     try std.testing.expectEqual(@as(usize, 1), svc.metrics.sync_rounds);
 }
 
-test "managed host service steps queued transitions during runtime rounds" {
+test "metadata service managed host steps queued transitions only during control rounds" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -952,19 +1005,19 @@ test "managed host service steps queued transitions during runtime rounds" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !@import("../data/mod.zig").SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !@import("../data/mod.zig").SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .prepare;
             self.status.source_split_phase = .prepare;
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .bootstrap_peer;
             self.status.source_split_phase = .splitting;
@@ -972,7 +1025,7 @@ test "managed host service steps queued transitions during runtime rounds" {
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .replay_deltas;
             self.status.bootstrapped = true;
@@ -980,7 +1033,7 @@ test "managed host service steps queued transitions during runtime rounds" {
             return true;
         }
 
-        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
+        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .cutover_ready;
             self.status.replay_caught_up = true;
@@ -990,7 +1043,7 @@ test "managed host service steps queued transitions during runtime rounds" {
             return 1;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .finalized;
             self.status.source_split_phase = .none;
@@ -998,7 +1051,7 @@ test "managed host service steps queued transitions during runtime rounds" {
             return true;
         }
 
-        fn rollbackSource(_: *anyopaque, _: u64, _: u64) !bool {
+        fn rollbackSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
     };
@@ -1018,9 +1071,14 @@ test "managed host service steps queued transitions during runtime rounds" {
 
     try svc.submitSplitTransition(.{
         .transition_id = 77,
+        .attempt_epoch = 1,
         .source_group_id = 7,
         .destination_group_id = 8,
     });
+
+    try svc.runRaftRoundOnly();
+    try std.testing.expectEqual(@as(usize, 1), svc.metrics.queued_split_transitions);
+    try std.testing.expectEqual(@as(usize, 0), svc.metrics.completed_split_transitions);
 
     try svc.runRound();
     try svc.runRound();
@@ -1030,6 +1088,11 @@ test "managed host service steps queued transitions during runtime rounds" {
 
     try std.testing.expectEqual(@as(usize, 0), svc.metrics.queued_split_transitions);
     try std.testing.expectEqual(@as(usize, 1), svc.metrics.completed_split_transitions);
+}
+
+test "raft-only rounds do not deliver transition updates to the controller" {
+    try std.testing.expect(!PendingUpdateLane.raft.deliversTransitions());
+    try std.testing.expect(PendingUpdateLane.control.deliversTransitions());
 }
 
 test "managed host service queues transition metadata updates after sync" {
@@ -1103,19 +1166,19 @@ test "managed host service queues transition metadata updates after sync" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !@import("../data/mod.zig").SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !@import("../data/mod.zig").SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .prepare;
             self.status.source_split_phase = .prepare;
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .bootstrap_peer;
             self.status.source_split_phase = .splitting;
@@ -1123,7 +1186,7 @@ test "managed host service queues transition metadata updates after sync" {
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .replay_deltas;
             self.status.bootstrapped = true;
@@ -1131,7 +1194,7 @@ test "managed host service queues transition metadata updates after sync" {
             return true;
         }
 
-        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
+        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .cutover_ready;
             self.status.replay_caught_up = true;
@@ -1141,7 +1204,7 @@ test "managed host service queues transition metadata updates after sync" {
             return 1;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .finalized;
             self.status.source_split_phase = .none;
@@ -1149,7 +1212,7 @@ test "managed host service queues transition metadata updates after sync" {
             return true;
         }
 
-        fn rollbackSource(_: *anyopaque, _: u64, _: u64) !bool {
+        fn rollbackSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
     };
@@ -1172,6 +1235,7 @@ test "managed host service queues transition metadata updates after sync" {
             .upsert = .{
                 .split = .{
                     .transition_id = 88,
+                    .attempt_epoch = 1,
                     .source_group_id = 8,
                     .destination_group_id = 9,
                 },
@@ -1263,19 +1327,19 @@ test "managed host service seeds queued transitions from projected metadata stor
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !@import("../data/mod.zig").SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !@import("../data/mod.zig").SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
 
-        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .prepare;
             self.status.source_split_phase = .prepare;
             return true;
         }
 
-        fn startSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn startSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .bootstrap_peer;
             self.status.source_split_phase = .splitting;
@@ -1283,7 +1347,7 @@ test "managed host service seeds queued transitions from projected metadata stor
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .replay_deltas;
             self.status.bootstrapped = true;
@@ -1291,7 +1355,7 @@ test "managed host service seeds queued transitions from projected metadata stor
             return true;
         }
 
-        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64) !usize {
+        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .cutover_ready;
             self.status.replay_caught_up = true;
@@ -1301,7 +1365,7 @@ test "managed host service seeds queued transitions from projected metadata stor
             return 1;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status.phase = .finalized;
             self.status.source_split_phase = .none;
@@ -1309,7 +1373,7 @@ test "managed host service seeds queued transitions from projected metadata stor
             return true;
         }
 
-        fn rollbackSource(_: *anyopaque, _: u64, _: u64) !bool {
+        fn rollbackSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
     };
@@ -1351,6 +1415,7 @@ test "managed host service seeds queued transitions from projected metadata stor
         const cmd = try metadata.encodeTransitionCommand(std.testing.allocator, .{
             .upsert_split_transition = .{
                 .transition_id = 901,
+                .attempt_epoch = 1,
                 .source_group_id = 1300,
                 .destination_group_id = 1301,
                 .phase = .prepare,
@@ -1417,7 +1482,7 @@ test "managed host service resumes real split transition after restart" {
             .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
             .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
             .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:1001:1:1702:doc:m") },
         });
         defer std.testing.allocator.free(prepare);
         try source.snapshotBuilder().applyBatch(.{
@@ -1456,6 +1521,7 @@ test "managed host service resumes real split transition after restart" {
         const cmd = try metadata.encodeTransitionCommand(std.testing.allocator, .{
             .upsert_split_transition = .{
                 .transition_id = 1001,
+                .attempt_epoch = 1,
                 .source_group_id = 1701,
                 .destination_group_id = 1702,
                 .phase = .prepare,
@@ -1468,6 +1534,8 @@ test "managed host service resumes real split transition after restart" {
 
     {
         var split = try transition_runtime.SplitCoordinatorRuntime.init(std.testing.allocator, .{
+            .transition_id = 1001,
+            .attempt_epoch = 1,
             .source_root_dir = src_root,
             .dest_root_dir = dst_root,
             .source_group_id = 1701,
@@ -1498,6 +1566,8 @@ test "managed host service resumes real split transition after restart" {
 
     {
         var split = try transition_runtime.SplitCoordinatorRuntime.init(std.testing.allocator, .{
+            .transition_id = 1001,
+            .attempt_epoch = 1,
             .source_root_dir = src_root,
             .dest_root_dir = dst_root,
             .source_group_id = 1701,
@@ -1710,7 +1780,7 @@ test "managed host service reports local leader roles in split observations" {
             };
         }
 
-        fn observeStatus(_: *anyopaque, _: u64, _: u64) !data.SplitTransitionStatus {
+        fn observeStatus(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
             return .{
                 .phase = .bootstrap_peer,
                 .source_split_phase = .splitting,
@@ -1724,27 +1794,27 @@ test "managed host service reports local leader roles in split observations" {
             };
         }
 
-        fn prepareSource(_: *anyopaque, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+        fn prepareSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
             return true;
         }
 
-        fn startSource(_: *anyopaque, _: u64, _: u64) !bool {
+        fn startSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
 
-        fn bootstrapDestination(_: *anyopaque, _: u64, _: u64) !bool {
+        fn bootstrapDestination(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
 
-        fn catchUpDestination(_: *anyopaque, _: u64, _: u64) !usize {
+        fn catchUpDestination(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
             return 0;
         }
 
-        fn finalizeSource(_: *anyopaque, _: u64, _: u64) !bool {
+        fn finalizeSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
 
-        fn rollbackSource(_: *anyopaque, _: u64, _: u64) !bool {
+        fn rollbackSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
             return true;
         }
     };
@@ -1790,6 +1860,7 @@ test "managed host service reports local leader roles in split observations" {
 
     try svc.submitSplitTransition(.{
         .transition_id = 2001,
+        .attempt_epoch = 1,
         .source_group_id = 1701,
         .destination_group_id = 1702,
         .phase = .bootstrap_peer,
@@ -2001,6 +2072,7 @@ test "managed host service preserves leader-routed observation roles from transi
 
     try svc.submitSplitTransition(.{
         .transition_id = 3001,
+        .attempt_epoch = 1,
         .source_group_id = 1901,
         .destination_group_id = 1902,
         .phase = .bootstrap_peer,

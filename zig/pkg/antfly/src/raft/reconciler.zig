@@ -21,7 +21,10 @@ const peer_resolver = @import("peer_resolver.zig");
 pub const PlacementIntent = struct {
     record: catalog.ReplicaRecord,
     store_id: u64 = 0,
+    /// Desired voting members. Relocation learners are represented
+    /// separately so they can receive state without being able to campaign.
     peer_node_ids: []const u64 = &.{},
+    learner_node_ids: []const u64 = &.{},
     serving_state: PlacementServingState = .serving,
     relocation_generation: u64 = 0,
     relocation_source_node_id: u64 = 0,
@@ -39,12 +42,26 @@ pub const PlacementServingState = enum(u8) {
     cutover_ready,
     serving,
     draining,
+    /// The replica remains hosted so it can observe and report the committed
+    /// final configuration, but it is excluded from membership and routing.
+    retiring,
 };
 
 pub fn placementMayServeClientReads(intent: PlacementIntent) bool {
     return switch (intent.serving_state) {
         .serving, .draining => true,
-        .planned, .bootstrapping, .replaying, .cutover_ready => false,
+        .planned, .bootstrapping, .replaying, .cutover_ready, .retiring => false,
+    };
+}
+
+/// Whether an existing placement may remain leader while a membership
+/// transition converges. A cutover-ready target is already a voting member, a
+/// draining source must finish expansion, and a retiring source owns orderly
+/// transfer until Raft elects or confirms its successor.
+pub fn placementMayLeadMembershipTransition(intent: PlacementIntent) bool {
+    return switch (intent.serving_state) {
+        .cutover_ready, .serving, .draining, .retiring => true,
+        .planned, .bootstrapping, .replaying => false,
     };
 }
 
@@ -62,7 +79,7 @@ pub fn placementReadableWithPeers(intents: []const PlacementIntent, intent: Plac
             }
             return true;
         },
-        .planned, .bootstrapping, .replaying, .cutover_ready => return false,
+        .planned, .bootstrapping, .replaying, .cutover_ready, .retiring => return false,
     }
 }
 
@@ -226,6 +243,119 @@ pub const ReconcileResult = struct {
     membership_proposals: usize = 0,
 };
 
+const PreparedEnsure = struct {
+    intent_index: usize,
+    intent_hash: u64,
+    prepare_bootstrap: bool,
+    replica: ?host_mod.PreparedReplica = null,
+};
+
+/// An immutable desired-state snapshot split into a blocking durability phase
+/// and a short live-runtime publication phase. The caller serializes plans and
+/// executes begin/commit while holding the Raft owner's lock; prepareDurable
+/// deliberately runs without that lock so consensus progress cannot be
+/// blocked by restore I/O, descriptor construction, or catalog fsync.
+pub const PreparedReconcile = struct {
+    owner: *Reconciler,
+    intents: []PlacementIntent,
+    ensures: []PreparedEnsure,
+    removals: []u64,
+    catalog_upserts: []catalog.ReplicaRecord,
+    catalog_revision: ?u64,
+    failed_ensure_index: ?usize = null,
+    durability_complete: bool = false,
+    committed: bool = false,
+    aborted: bool = false,
+
+    pub fn deinit(self: *PreparedReconcile) void {
+        for (self.ensures) |*entry| {
+            if (entry.replica) |*replica| replica.deinit(self.owner.alloc);
+        }
+        self.owner.alloc.free(self.ensures);
+        self.owner.alloc.free(self.removals);
+        self.owner.alloc.free(self.catalog_upserts);
+        freeIntentSlice(self.owner.alloc, self.intents);
+        self.* = undefined;
+    }
+
+    pub fn beginPreparation(self: *PreparedReconcile) void {
+        for (self.ensures) |entry| {
+            if (!entry.prepare_bootstrap) continue;
+            self.owner.host.noteReplicaBootstrapPreparing(self.intents[entry.intent_index].record);
+        }
+    }
+
+    pub fn prepareDurable(self: *PreparedReconcile) !void {
+        if (self.durability_complete or self.committed) return error.InvalidReconcilePhase;
+        for (self.ensures, 0..) |*entry, index| {
+            const record = self.intents[entry.intent_index].record;
+            entry.replica = self.owner.host.prepareReplicaUnpublished(record, entry.prepare_bootstrap) catch |err| {
+                self.failed_ensure_index = index;
+                return err;
+            };
+        }
+        self.durability_complete = true;
+    }
+
+    pub fn notePreparationFailure(self: *PreparedReconcile, err: anyerror) void {
+        const index = self.failed_ensure_index orelse return;
+        const entry = self.ensures[index];
+        if (!entry.prepare_bootstrap) return;
+        self.owner.host.noteReplicaBootstrapPreparationFailure(
+            self.intents[entry.intent_index].record,
+            err,
+        );
+    }
+
+    pub fn commit(self: *PreparedReconcile) !ReconcileResult {
+        if (!self.durability_complete or self.committed or self.aborted) return error.InvalidReconcilePhase;
+
+        if (self.catalog_upserts.len > 0 or self.removals.len > 0) {
+            try self.owner.host.commitReplicaCatalog(
+                self.catalog_revision,
+                self.catalog_upserts,
+                self.removals,
+            );
+        }
+        var result: ReconcileResult = .{};
+        for (self.ensures) |*entry| {
+            const intent = self.intents[entry.intent_index];
+            const prepared = if (entry.replica) |*replica| replica else return error.InvalidReconcilePhase;
+            _ = try self.owner.host.installPreparedReplica(intent.record, prepared);
+            result.ensured += 1;
+            result.refreshed_peers += try self.owner.refreshPeerEndpoints(intent);
+            try self.owner.last_intent_hashes.put(
+                self.owner.alloc,
+                intent.record.group_id,
+                entry.intent_hash,
+            );
+        }
+        for (self.intents) |intent| {
+            if (try self.owner.reconcileRaftMembership(intent)) result.membership_proposals += 1;
+        }
+        for (self.removals) |group_id| {
+            try self.owner.host.removePreparedReplica(group_id);
+            _ = self.owner.last_intent_hashes.remove(group_id);
+            result.removed += 1;
+        }
+        self.owner.host.metrics.reconcile_rounds += 1;
+        self.committed = true;
+        return result;
+    }
+
+    /// Discards unpublished descriptors after the caller observes a newer
+    /// desired-state epoch. Durable catalog state is untouched until commit.
+    pub fn abortDurable(self: *PreparedReconcile) !void {
+        if (!self.durability_complete or self.committed or self.aborted)
+            return error.InvalidReconcilePhase;
+        for (self.ensures) |entry| {
+            if (!entry.prepare_bootstrap) continue;
+            self.owner.host.cancelReplicaBootstrapPreparation(self.intents[entry.intent_index].record);
+        }
+        self.aborted = true;
+    }
+};
+
 pub const Reconciler = struct {
     alloc: std.mem.Allocator,
     host: *host_mod.Host,
@@ -237,17 +367,20 @@ pub const Reconciler = struct {
         self.last_intent_hashes = .empty;
     }
 
-    pub fn reconcileOnce(self: *Reconciler) !ReconcileResult {
+    pub fn prepare(self: *Reconciler) !PreparedReconcile {
         const intents = try self.provider.listLocalIntents(self.alloc, self.host.cfg.local_node_id);
-        defer freeIntentSlice(self.alloc, intents);
+        errdefer freeIntentSlice(self.alloc, intents);
         const existing = try self.host.listGroupIds(self.alloc);
         defer self.alloc.free(existing);
 
         var desired_group_ids = std.AutoHashMapUnmanaged(u64, void).empty;
         defer desired_group_ids.deinit(self.alloc);
+        var ensures = std.ArrayListUnmanaged(PreparedEnsure).empty;
+        errdefer ensures.deinit(self.alloc);
+        var removals = std.ArrayListUnmanaged(u64).empty;
+        errdefer removals.deinit(self.alloc);
 
-        var result: ReconcileResult = .{};
-        for (intents) |intent| {
+        for (intents, 0..) |intent, intent_index| {
             try desired_group_ids.put(self.alloc, intent.record.group_id, {});
 
             const intent_hash = hashIntent(intent);
@@ -259,32 +392,74 @@ pub const Reconciler = struct {
                 stored_hash.? != intent_hash;
 
             if (should_apply) {
-                _ = try self.host.ensureReplica(intent.record);
-                result.ensured += 1;
-                for (intent.peer_node_ids) |node_id| {
-                    if (node_id == self.host.cfg.local_node_id) continue;
-                    result.refreshed_peers += self.host.refreshPeerEndpoints(intent.record.group_id, node_id) catch |err| switch (err) {
-                        error.UnknownPeer => 0,
-                        else => return err,
-                    };
-                }
-                try self.last_intent_hashes.put(self.alloc, intent.record.group_id, intent_hash);
+                try ensures.append(self.alloc, .{
+                    .intent_index = intent_index,
+                    .intent_hash = intent_hash,
+                    .prepare_bootstrap = !self.host.hasReplica(intent.record.group_id) and
+                        intent.record.backup_restore_bootstrap != null,
+                });
             }
-            if (try self.reconcileRaftMembership(intent)) result.membership_proposals += 1;
         }
         for (existing) |group_id| {
             if (desired_group_ids.contains(group_id)) continue;
-            try self.host.removeReplica(group_id);
-            _ = self.last_intent_hashes.remove(group_id);
-            result.removed += 1;
+            try removals.append(self.alloc, group_id);
         }
-        self.host.metrics.reconcile_rounds += 1;
-        return result;
+        const owned_ensures = try ensures.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(owned_ensures);
+        const owned_removals = try removals.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(owned_removals);
+        const catalog_upserts = try self.alloc.alloc(catalog.ReplicaRecord, owned_ensures.len);
+        for (owned_ensures, 0..) |entry, index| {
+            catalog_upserts[index] = intents[entry.intent_index].record;
+        }
+        const catalog_revision = if (catalog_upserts.len > 0 or owned_removals.len > 0)
+            self.host.replicaCatalogRevision()
+        else
+            null;
+        return .{
+            .owner = self,
+            .intents = intents,
+            .ensures = owned_ensures,
+            .removals = owned_removals,
+            .catalog_upserts = catalog_upserts,
+            .catalog_revision = catalog_revision,
+        };
+    }
+
+    pub fn reconcileOnce(self: *Reconciler) !ReconcileResult {
+        var prepared = try self.prepare();
+        defer prepared.deinit();
+        prepared.beginPreparation();
+        prepared.prepareDurable() catch |err| {
+            prepared.notePreparationFailure(err);
+            return err;
+        };
+        return try prepared.commit();
+    }
+
+    fn refreshPeerEndpoints(self: *Reconciler, intent: PlacementIntent) !usize {
+        var refreshed: usize = 0;
+        for (intent.peer_node_ids) |node_id| {
+            if (node_id == self.host.cfg.local_node_id) continue;
+            refreshed += self.host.refreshPeerEndpoints(intent.record.group_id, node_id) catch |err| switch (err) {
+                error.UnknownPeer => 0,
+                else => return err,
+            };
+        }
+        for (intent.learner_node_ids) |node_id| {
+            if (node_id == self.host.cfg.local_node_id or containsNodeId(intent.peer_node_ids, node_id)) continue;
+            refreshed += self.host.refreshPeerEndpoints(intent.record.group_id, node_id) catch |err| switch (err) {
+                error.UnknownPeer => 0,
+                else => return err,
+            };
+        }
+        return refreshed;
     }
 
     fn reconcileRaftMembership(self: *Reconciler, intent: PlacementIntent) !bool {
         const status = self.host.raftStatus(intent.record.group_id) orelse return false;
         if (status.soft.role != .leader or status.soft.leader_id != status.id) return false;
+        if (!localNodeCanProposeMembership(status)) return false;
 
         // A new change cannot be proposed while joint consensus is active. Leave
         // the committed joint configuration first; the next reconcile round will
@@ -302,11 +477,19 @@ pub const Reconciler = struct {
             return true;
         }
 
-        const changes = try allocMembershipChanges(
+        if (retirementLeaderTransferTarget(status, intent)) |transferee| {
+            try self.host.transferLeader(intent.record.group_id, transferee);
+            return true;
+        }
+
+        const changes = try allocMembershipChangesWithLocalPolicy(
             self.alloc,
             status.conf_state.voters,
+            status.conf_state.learners,
             intent.record.local_node_id,
             intent.peer_node_ids,
+            intent.learner_node_ids,
+            intent.serving_state != .retiring,
         );
         defer self.alloc.free(changes);
         if (changes.len == 0) return false;
@@ -324,27 +507,103 @@ pub const Reconciler = struct {
     }
 };
 
+fn retirementLeaderTransferTarget(
+    status: raft_engine.core.Status,
+    intent: PlacementIntent,
+) ?u64 {
+    if (intent.serving_state != .retiring) return null;
+    if (!containsNodeId(status.conf_state.voters, status.id)) return null;
+    if (containsNodeId(intent.peer_node_ids, status.id)) return null;
+
+    var target: ?u64 = null;
+    for (intent.peer_node_ids) |node_id| {
+        if (!containsNodeId(status.conf_state.voters, node_id)) continue;
+        if (target == null or node_id < target.?) target = node_id;
+    }
+    return target;
+}
+
+fn localNodeCanProposeMembership(status: raft_engine.core.Status) bool {
+    return containsNodeId(status.conf_state.voters, status.id) or
+        containsNodeId(status.conf_state.voters_outgoing, status.id);
+}
+
 fn allocMembershipChanges(
     alloc: std.mem.Allocator,
     current_voters: []const u64,
+    current_learners: []const u64,
     local_node_id: u64,
-    peer_node_ids: []const u64,
+    voter_node_ids: []const u64,
+    learner_node_ids: []const u64,
 ) ![]raft_engine.core.ConfChangeSingle {
-    var desired = std.ArrayListUnmanaged(u64).empty;
-    defer desired.deinit(alloc);
-    try appendUniqueNodeId(alloc, &desired, local_node_id);
-    for (peer_node_ids) |node_id| try appendUniqueNodeId(alloc, &desired, node_id);
-    std.mem.sort(u64, desired.items, {}, std.sort.asc(u64));
+    return allocMembershipChangesWithLocalPolicy(
+        alloc,
+        current_voters,
+        current_learners,
+        local_node_id,
+        voter_node_ids,
+        learner_node_ids,
+        true,
+    );
+}
+
+fn allocMembershipChangesWithLocalPolicy(
+    alloc: std.mem.Allocator,
+    current_voters: []const u64,
+    current_learners: []const u64,
+    local_node_id: u64,
+    voter_node_ids: []const u64,
+    learner_node_ids: []const u64,
+    retain_local_voter: bool,
+) ![]raft_engine.core.ConfChangeSingle {
+    var desired_voters = std.ArrayListUnmanaged(u64).empty;
+    defer desired_voters.deinit(alloc);
+    var desired_learners = std.ArrayListUnmanaged(u64).empty;
+    defer desired_learners.deinit(alloc);
+    for (learner_node_ids) |node_id| {
+        // Raft membership is monotonic through relocation. Metadata can
+        // transiently replay an older learner intent after promotion, but an
+        // existing voter must never be demoted in place. Retain it as a voter;
+        // the next fresh intent will either confirm promotion or remove it
+        // through the ordinary contraction path.
+        if (containsNodeId(current_voters, node_id)) {
+            try appendUniqueNodeId(alloc, &desired_voters, node_id);
+        } else {
+            try appendUniqueNodeId(alloc, &desired_learners, node_id);
+        }
+    }
+    if (retain_local_voter and !containsNodeId(desired_learners.items, local_node_id))
+        try appendUniqueNodeId(alloc, &desired_voters, local_node_id);
+    for (voter_node_ids) |node_id| {
+        if (!containsNodeId(desired_learners.items, node_id))
+            try appendUniqueNodeId(alloc, &desired_voters, node_id);
+    }
+    std.mem.sort(u64, desired_voters.items, {}, std.sort.asc(u64));
+    std.mem.sort(u64, desired_learners.items, {}, std.sort.asc(u64));
 
     var changes = std.ArrayListUnmanaged(raft_engine.core.ConfChangeSingle).empty;
     errdefer changes.deinit(alloc);
-    for (desired.items) |node_id| {
+    for (desired_voters.items) |node_id| {
         if (!containsNodeId(current_voters, node_id)) {
             try changes.append(alloc, .{ .change_type = .add_node, .node_id = node_id });
         }
     }
+    for (desired_learners.items) |node_id| {
+        if (!containsNodeId(current_learners, node_id)) {
+            try changes.append(alloc, .{ .change_type = .add_learner_node, .node_id = node_id });
+        }
+    }
     for (current_voters) |node_id| {
-        if (!containsNodeId(desired.items, node_id)) {
+        if (!containsNodeId(desired_voters.items, node_id) and
+            !containsNodeId(desired_learners.items, node_id))
+        {
+            try changes.append(alloc, .{ .change_type = .remove_node, .node_id = node_id });
+        }
+    }
+    for (current_learners) |node_id| {
+        if (!containsNodeId(desired_voters.items, node_id) and
+            !containsNodeId(desired_learners.items, node_id))
+        {
             try changes.append(alloc, .{ .change_type = .remove_node, .node_id = node_id });
         }
     }
@@ -380,6 +639,8 @@ fn hashIntent(intent: PlacementIntent) u64 {
     hashU64(&hasher, intent.relocation_applied_sequence);
     hashU64(&hasher, @intCast(intent.peer_node_ids.len));
     for (intent.peer_node_ids) |node_id| hashU64(&hasher, node_id);
+    hashU64(&hasher, @intCast(intent.learner_node_ids.len));
+    for (intent.learner_node_ids) |node_id| hashU64(&hasher, node_id);
     if (intent.record.snapshot_bootstrap) |snapshot| {
         hashU64(&hasher, 1);
         hashU64(&hasher, snapshot.from_node_id);
@@ -408,10 +669,15 @@ fn hashU64(hasher: *std.hash.Wyhash, value: u64) void {
 fn cloneIntent(alloc: std.mem.Allocator, intent: PlacementIntent) !PlacementIntent {
     var cloned_record = try intent.record.clone(alloc);
     errdefer cloned_record.deinit(alloc);
+    const peer_node_ids = if (intent.peer_node_ids.len == 0) &.{} else try alloc.dupe(u64, intent.peer_node_ids);
+    errdefer if (peer_node_ids.len > 0) alloc.free(peer_node_ids);
+    const learner_node_ids = if (intent.learner_node_ids.len == 0) &.{} else try alloc.dupe(u64, intent.learner_node_ids);
+    errdefer if (learner_node_ids.len > 0) alloc.free(learner_node_ids);
     return .{
         .record = cloned_record,
         .store_id = intent.store_id,
-        .peer_node_ids = if (intent.peer_node_ids.len == 0) &.{} else try alloc.dupe(u64, intent.peer_node_ids),
+        .peer_node_ids = peer_node_ids,
+        .learner_node_ids = learner_node_ids,
         .serving_state = intent.serving_state,
         .relocation_generation = intent.relocation_generation,
         .relocation_source_node_id = intent.relocation_source_node_id,
@@ -431,6 +697,7 @@ fn freeIntent(alloc: std.mem.Allocator, intent: PlacementIntent) void {
     var record = intent.record;
     record.deinit(alloc);
     if (intent.peer_node_ids.len > 0) alloc.free(intent.peer_node_ids);
+    if (intent.learner_node_ids.len > 0) alloc.free(intent.learner_node_ids);
 }
 
 pub fn freeIntentOwned(alloc: std.mem.Allocator, intent: PlacementIntent) void {
@@ -440,6 +707,320 @@ pub fn freeIntentOwned(alloc: std.mem.Allocator, intent: PlacementIntent) void {
 fn freeIntentSlice(alloc: std.mem.Allocator, intents: []PlacementIntent) void {
     for (intents) |intent| freeIntent(alloc, intent);
     alloc.free(intents);
+}
+
+const StagedReconcileTestFactory = struct {
+    alloc: std.mem.Allocator,
+    stores: [2]*raft_engine.core.MemoryStorage,
+
+    fn iface(self: *@This()) host_mod.ReplicaDescriptorFactory {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .build_descriptor = buildDescriptor,
+                .free_descriptor = freeDescriptor,
+            },
+        };
+    }
+
+    fn buildDescriptor(ptr: *anyopaque, record: catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const store = if (record.group_id % 2 == 0) self.stores[0] else self.stores[1];
+        const peers = try self.alloc.dupe(
+            raft_engine.core.types.NodeId,
+            &[_]raft_engine.core.types.NodeId{record.local_node_id},
+        );
+        return .{
+            .group = .{
+                .group_id = record.group_id,
+                .local_node_id = record.local_node_id,
+                .raft_config = .{
+                    .id = record.local_node_id,
+                    .group_id = record.group_id,
+                    .peers = peers,
+                    .election_tick = 5,
+                    .heartbeat_tick = 1,
+                    .pre_vote = false,
+                },
+                .storage = store.storage(),
+            },
+            .bootstrap = .persisted,
+        };
+    }
+
+    fn freeDescriptor(ptr: *anyopaque, _: std.mem.Allocator, descriptor: *raft_engine.runtime.ReplicaDescriptor) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.alloc.free(descriptor.group.raft_config.peers);
+    }
+};
+
+test "prepared reconcile publishes catalog admission atomically before runtime publication" {
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var factory = StagedReconcileTestFactory{
+        .alloc = std.testing.allocator,
+        .stores = .{ &store_a, &store_b },
+    };
+    var replica_catalog = catalog.MemoryReplicaCatalog.init(std.testing.allocator);
+    defer replica_catalog.deinit();
+    var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .descriptor_factory = factory.iface(),
+        .replica_catalog = replica_catalog.catalog(),
+    });
+    defer host.deinit();
+    var provider = MemoryPlacementProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    try provider.replaceAll(&.{.{
+        .record = .{ .group_id = 502, .replica_id = 1, .local_node_id = 1 },
+    }});
+    var owner = Reconciler{
+        .alloc = std.testing.allocator,
+        .host = &host,
+        .provider = provider.provider(),
+    };
+    defer owner.deinit();
+
+    var prepared = try owner.prepare();
+    defer prepared.deinit();
+    prepared.beginPreparation();
+    try prepared.prepareDurable();
+
+    try std.testing.expectEqual(host_mod.HostedReplicaStatus.absent, host.status(502));
+    {
+        const records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+        defer catalog.freeReplicaRecords(std.testing.allocator, records);
+        try std.testing.expectEqual(@as(usize, 0), records.len);
+    }
+
+    const result = try prepared.commit();
+    try std.testing.expectEqual(@as(usize, 1), result.ensured);
+    try std.testing.expectEqual(host_mod.HostedReplicaStatus.active, host.status(502));
+    {
+        const records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+        defer catalog.freeReplicaRecords(std.testing.allocator, records);
+        try std.testing.expectEqual(@as(usize, 1), records.len);
+        try std.testing.expectEqual(@as(u64, 502), records[0].group_id);
+    }
+}
+
+test "prepared reconcile rejects catalog races without clobbering concurrent admissions" {
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var factory = StagedReconcileTestFactory{
+        .alloc = std.testing.allocator,
+        .stores = .{ &store_a, &store_b },
+    };
+    var replica_catalog = catalog.MemoryReplicaCatalog.init(std.testing.allocator);
+    defer replica_catalog.deinit();
+    try replica_catalog.catalog().upsertReplica(.{
+        .group_id = 501,
+        .replica_id = 1,
+        .local_node_id = 1,
+    });
+    var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .descriptor_factory = factory.iface(),
+        .replica_catalog = replica_catalog.catalog(),
+    });
+    defer host.deinit();
+    _ = try host.ensureReplica(.{
+        .group_id = 501,
+        .replica_id = 1,
+        .local_node_id = 1,
+    });
+    var provider = MemoryPlacementProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    try provider.replaceAll(&.{.{
+        .record = .{ .group_id = 502, .replica_id = 2, .local_node_id = 1 },
+    }});
+    var owner = Reconciler{
+        .alloc = std.testing.allocator,
+        .host = &host,
+        .provider = provider.provider(),
+    };
+    defer owner.deinit();
+
+    var prepared = try owner.prepare();
+    defer prepared.deinit();
+    prepared.beginPreparation();
+    try prepared.prepareDurable();
+    {
+        const staged = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+        defer catalog.freeReplicaRecords(std.testing.allocator, staged);
+        try std.testing.expectEqual(@as(usize, 1), staged.len);
+        try std.testing.expectEqual(@as(u64, 501), staged[0].group_id);
+    }
+
+    try replica_catalog.catalog().upsertReplica(.{
+        .group_id = 503,
+        .replica_id = 3,
+        .local_node_id = 1,
+    });
+    try std.testing.expectError(error.ReplicaCatalogRevisionChanged, prepared.commit());
+    try prepared.abortDurable();
+    {
+        const restored = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+        defer catalog.freeReplicaRecords(std.testing.allocator, restored);
+        try std.testing.expectEqual(@as(usize, 2), restored.len);
+        var saw_501 = false;
+        var saw_503 = false;
+        for (restored) |record| {
+            saw_501 = saw_501 or record.group_id == 501;
+            saw_503 = saw_503 or record.group_id == 503;
+            try std.testing.expect(record.group_id != 502);
+        }
+        try std.testing.expect(saw_501);
+        try std.testing.expect(saw_503);
+    }
+    try std.testing.expectEqual(host_mod.HostedReplicaStatus.active, host.status(501));
+    try std.testing.expectEqual(host_mod.HostedReplicaStatus.absent, host.status(502));
+    try std.testing.expectError(error.InvalidReconcilePhase, prepared.commit());
+}
+
+test "prepared reconcile failure never publishes an unprepared replica" {
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var factory = StagedReconcileTestFactory{
+        .alloc = std.testing.allocator,
+        .stores = .{ &store_a, &store_b },
+    };
+    var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .descriptor_factory = factory.iface(),
+    });
+    defer host.deinit();
+    var provider = MemoryPlacementProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    try provider.replaceAll(&.{.{
+        .record = .{
+            .group_id = 503,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .bootstrap_mode = .fetch_snapshot,
+            .backup_restore_bootstrap = .{
+                .backup_id = "backup-503",
+                .location = "file:///unused",
+                .snapshot_path = "backup-503/groups/503",
+            },
+        },
+    }});
+    var owner = Reconciler{
+        .alloc = std.testing.allocator,
+        .host = &host,
+        .provider = provider.provider(),
+    };
+    defer owner.deinit();
+
+    var prepared = try owner.prepare();
+    defer prepared.deinit();
+    prepared.beginPreparation();
+    const failure = prepared.prepareDurable();
+    try std.testing.expectError(error.MissingBackupRestoreBootstrapHandler, failure);
+    prepared.notePreparationFailure(error.MissingBackupRestoreBootstrapHandler);
+
+    try std.testing.expectEqual(host_mod.HostedReplicaStatus.failed, host.status(503));
+    try std.testing.expect(!host.hasReplica(503));
+    try std.testing.expectError(error.InvalidReconcilePhase, prepared.commit());
+}
+
+test "blocked reconcile preparation does not block existing raft progress" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const BlockingBootstrapper = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn iface(self: *@This()) host_mod.BackupRestoreBootstrapper {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .prepare_backup_restore = prepareBackupRestore },
+            };
+        }
+
+        fn prepareBackupRestore(ptr: *anyopaque, _: catalog.ReplicaRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    const PrepareThread = struct {
+        prepared: *PreparedReconcile,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.prepared.prepareDurable() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var factory = StagedReconcileTestFactory{
+        .alloc = std.testing.allocator,
+        .stores = .{ &store_a, &store_b },
+    };
+    var bootstrapper = BlockingBootstrapper{};
+    var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .descriptor_factory = factory.iface(),
+        .backup_restore_bootstrapper = bootstrapper.iface(),
+    });
+    defer host.deinit();
+    _ = try host.ensureReplica(.{ .group_id = 504, .replica_id = 1, .local_node_id = 1 });
+
+    var provider = MemoryPlacementProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    try provider.replaceAll(&.{.{
+        .record = .{
+            .group_id = 505,
+            .replica_id = 2,
+            .local_node_id = 1,
+            .bootstrap_mode = .fetch_snapshot,
+            .backup_restore_bootstrap = .{
+                .backup_id = "backup-505",
+                .location = "file:///unused",
+                .snapshot_path = "backup-505/groups/505",
+            },
+        },
+    }});
+    var owner = Reconciler{
+        .alloc = std.testing.allocator,
+        .host = &host,
+        .provider = provider.provider(),
+    };
+    defer owner.deinit();
+    var prepared = try owner.prepare();
+    defer prepared.deinit();
+    prepared.beginPreparation();
+
+    var prepare_thread = PrepareThread{ .prepared = &prepared };
+    const thread = try std.Thread.spawn(.{}, PrepareThread.run, .{&prepare_thread});
+    var thread_joined = false;
+    defer {
+        if (!thread_joined) {
+            bootstrapper.release.store(true, .release);
+            thread.join();
+        }
+    }
+    while (!bootstrapper.entered.load(.acquire)) std.Thread.yield() catch {};
+
+    const rounds_before = host.metricsSnapshot().runtime_rounds;
+    _ = try host.runRound(1, 1);
+    try std.testing.expectEqual(rounds_before + 1, host.metricsSnapshot().runtime_rounds);
+
+    bootstrapper.release.store(true, .release);
+    thread.join();
+    thread_joined = true;
+    try std.testing.expect(prepare_thread.failure == null);
+    const result = try prepared.commit();
+    try std.testing.expectEqual(@as(usize, 1), result.ensured);
+    try std.testing.expectEqual(@as(usize, 1), result.removed);
 }
 
 test "reconciler can ensure desired replicas and remove stale ones" {
@@ -536,6 +1117,7 @@ test "reconciler can ensure desired replicas and remove stale ones" {
                 .local_node_id = 1,
             },
             .peer_node_ids = &.{2},
+            .learner_node_ids = &.{ 2, 3 },
         },
     });
 
@@ -548,7 +1130,7 @@ test "reconciler can ensure desired replicas and remove stale ones" {
     const result = try reconciler.reconcileOnce();
     try std.testing.expectEqual(@as(usize, 1), result.ensured);
     try std.testing.expectEqual(@as(usize, 1), result.removed);
-    try std.testing.expectEqual(@as(usize, 1), result.refreshed_peers);
+    try std.testing.expectEqual(@as(usize, 2), result.refreshed_peers);
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.absent, host.status(301));
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.active, host.status(302));
 }
@@ -660,8 +1242,10 @@ test "membership reconciliation expands before removing obsolete voters" {
     const changes = try allocMembershipChanges(
         std.testing.allocator,
         &.{ 1, 2, 5 },
+        &.{},
         1,
         &.{ 1, 2, 3, 4 },
+        &.{},
     );
     defer std.testing.allocator.free(changes);
 
@@ -676,12 +1260,118 @@ test "membership reconciliation normalizes duplicate and missing local voters" {
     const changes = try allocMembershipChanges(
         std.testing.allocator,
         &.{ 7, 8 },
+        &.{},
         7,
         &.{ 8, 8 },
+        &.{},
     );
     defer std.testing.allocator.free(changes);
 
     try std.testing.expectEqual(@as(usize, 0), changes.len);
+}
+
+test "membership reconciliation removes a hosted retiring local voter" {
+    const changes = try allocMembershipChangesWithLocalPolicy(
+        std.testing.allocator,
+        &.{ 7, 8 },
+        &.{},
+        7,
+        &.{8},
+        &.{},
+        false,
+    );
+    defer std.testing.allocator.free(changes);
+
+    try std.testing.expectEqualSlices(raft_engine.core.ConfChangeSingle, &.{
+        .{ .change_type = .remove_node, .node_id = 7 },
+    }, changes);
+}
+
+test "membership reconciliation transfers a retiring leader to a retained voter" {
+    var status: raft_engine.core.Status = .{
+        .id = 7,
+        .group_id = 11,
+        .soft = .{ .leader_id = 7, .role = .leader },
+        .hard = .{},
+        .conf_state = .{ .voters = @constCast((&[_]u64{ 7, 8, 9 })[0..]) },
+    };
+    const retiring = PlacementIntent{
+        .record = .{ .group_id = 11, .replica_id = 7, .local_node_id = 7 },
+        .peer_node_ids = &.{ 9, 8 },
+        .serving_state = .retiring,
+    };
+
+    try std.testing.expectEqual(@as(?u64, 8), retirementLeaderTransferTarget(status, retiring));
+    status.conf_state.voters = @constCast((&[_]u64{7})[0..]);
+    try std.testing.expectEqual(@as(?u64, null), retirementLeaderTransferTarget(status, retiring));
+}
+
+test "membership reconciliation hydrates learners before voter promotion" {
+    const hydrate = try allocMembershipChanges(
+        std.testing.allocator,
+        &.{ 1, 2 },
+        &.{},
+        1,
+        &.{ 1, 2 },
+        &.{3},
+    );
+    defer std.testing.allocator.free(hydrate);
+    try std.testing.expectEqualSlices(raft_engine.core.ConfChangeSingle, &.{
+        .{ .change_type = .add_learner_node, .node_id = 3 },
+    }, hydrate);
+
+    const promote = try allocMembershipChanges(
+        std.testing.allocator,
+        &.{ 1, 2 },
+        &.{3},
+        1,
+        &.{ 1, 2, 3 },
+        &.{},
+    );
+    defer std.testing.allocator.free(promote);
+    try std.testing.expectEqualSlices(raft_engine.core.ConfChangeSingle, &.{
+        .{ .change_type = .add_node, .node_id = 3 },
+    }, promote);
+}
+
+test "membership reconciliation never demotes a voter from a stale learner intent" {
+    const changes = try allocMembershipChanges(
+        std.testing.allocator,
+        &.{ 1, 2, 3 },
+        &.{},
+        1,
+        &.{ 1, 2 },
+        &.{3},
+    );
+    defer std.testing.allocator.free(changes);
+
+    try std.testing.expectEqual(@as(usize, 0), changes.len);
+}
+
+test "membership reconciliation requires a local voter" {
+    const base: raft_engine.core.Status = .{
+        .id = 7,
+        .group_id = 11,
+        .soft = .{ .leader_id = 7, .role = .leader },
+        .hard = .{},
+        .conf_state = .{},
+        .last_index = 0,
+        .applied_index = 0,
+        .election_elapsed = 0,
+        .randomized_election_timeout = 0,
+        .votes_granted = 0,
+        .votes_rejected = 0,
+        .votes_unknown = 0,
+    };
+
+    var removed = base;
+    removed.conf_state.voters = @constCast((&[_]u64{ 8, 9 })[0..]);
+    try std.testing.expect(!localNodeCanProposeMembership(removed));
+
+    var outgoing = base;
+    outgoing.conf_state.voters = @constCast((&[_]u64{ 8, 9 })[0..]);
+    outgoing.conf_state.voters_outgoing = @constCast((&[_]u64{ 7, 8, 9 })[0..]);
+    try std.testing.expect(localNodeCanProposeMembership(outgoing));
 }
 
 test "reconciler module compiles" {
@@ -755,6 +1445,7 @@ test "cloneIntentOwned deep clones backup restore metadata" {
         },
         .store_id = 21,
         .peer_node_ids = try std.testing.allocator.dupe(u64, &.{ 9, 10 }),
+        .learner_node_ids = try std.testing.allocator.dupe(u64, &.{11}),
     };
     defer freeIntentOwned(std.testing.allocator, original);
 
@@ -766,4 +1457,5 @@ test "cloneIntentOwned deep clones backup restore metadata" {
     try std.testing.expect(cloned.record.backup_restore_bootstrap.?.location.ptr != original.record.backup_restore_bootstrap.?.location.ptr);
     try std.testing.expect(cloned.record.backup_restore_bootstrap.?.snapshot_path.ptr != original.record.backup_restore_bootstrap.?.snapshot_path.ptr);
     try std.testing.expect(cloned.peer_node_ids.ptr != original.peer_node_ids.ptr);
+    try std.testing.expect(cloned.learner_node_ids.ptr != original.learner_node_ids.ptr);
 }

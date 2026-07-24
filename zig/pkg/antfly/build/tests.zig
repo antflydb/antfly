@@ -28,9 +28,19 @@ pub fn chainLabeledRun(
     label: []const u8,
     previous: ?*std.Build.Step,
 ) *std.Build.Step {
+    return chainLabeledRunStep(b, b.addRunArtifact(artifact), label, previous);
+}
+
+/// Add a progress banner without discarding arguments, environment, or other
+/// policy already attached to a run artifact.
+pub fn chainLabeledRunStep(
+    b: *std.Build,
+    run: *std.Build.Step.Run,
+    label: []const u8,
+    previous: ?*std.Build.Step,
+) *std.Build.Step {
     const banner = addProgressBanner(b, label);
     if (previous) |step| banner.step.dependOn(step);
-    const run = b.addRunArtifact(artifact);
     run.step.dependOn(&banner.step);
     return &run.step;
 }

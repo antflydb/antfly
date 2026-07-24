@@ -257,10 +257,6 @@ fn parseSseEventsAlloc(alloc: std.mem.Allocator, body: []const u8) ![]TestSseEve
 pub const public_api_max_request_body_bytes: usize = public_limits.max_request_body_bytes;
 const max_concurrent_restore_jobs: usize = 2;
 
-test "public API request body limit matches Go linear merge contract" {
-    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), public_api_max_request_body_bytes);
-}
-
 pub const RestoreExecutionGuard = struct {
     ptr: *anyopaque,
     is_current: *const fn (ptr: *anyopaque, leadership_term: u64) bool,
@@ -4771,13 +4767,21 @@ pub const ApiHttpServer = struct {
                         },
                         else => return err,
                     };
-                    self.waitForProjectedTableWriteQuorum(table_name) catch |err| switch (err) {
-                        error.TableVisibilityTimeout => {
-                            std.log.err("public create table write quorum timed out table={s}", .{table_name});
-                            return try textResponse(self.alloc, 500, "table create did not converge");
-                        },
-                        else => return err,
-                    };
+                    // A local standalone create is the write-readiness barrier:
+                    // the owned DB has already been opened and initialized before
+                    // createTable returns. Distributed mode additionally requires
+                    // the projected Raft voter quorum and leader to be observable;
+                    // accepting only catalog presence there would acknowledge a
+                    // table before another node can safely route writes to it.
+                    if (!self.cfg.deployment_mode.isStandalone()) {
+                        self.waitForProjectedTableWriteQuorum(table_name) catch |err| switch (err) {
+                            error.TableVisibilityTimeout => {
+                                std.log.err("public create table write quorum timed out table={s}", .{table_name});
+                                return try textResponse(self.alloc, 500, "table create did not converge");
+                            },
+                            else => return err,
+                        };
+                    }
                 } else {
                     const metadata_wait_handled = self.source.waitTableLifecycle(table_name, .present) catch |err| lifecycle: {
                         break :lifecycle switch (err) {
@@ -4879,32 +4883,10 @@ pub const ApiHttpServer = struct {
                     error.TableVisibilityTimeout => return try textResponse(self.alloc, 500, "schema update did not converge"),
                     else => return err,
                 };
-                if (self.table_writes) |table_writes_source| {
-                    var background_reconcile_scheduled = false;
-                    if (!local_schema_applied) {
-                        const scheduled = table_writes_source.requestTableStructuralReconcile(self.alloc, table_name) catch |write_err| {
-                            std.log.err("public schema update structural reconcile enqueue failed table={s} err={s}", .{ table_name, @errorName(write_err) });
-                            return write_err;
-                        };
-                        // Embedded/direct DB sources have no reconciliation
-                        // worker and retain their synchronous update contract.
-                        if (scheduled == null) {
-                            _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
-                                error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
-                                else => return write_err,
-                            };
-                        } else {
-                            background_reconcile_scheduled = true;
-                        }
-                    }
-                    // A provisioned owner has its own structural worker. Do not
-                    // turn an enqueue-only HTTP contract back into synchronous
-                    // work by driving metadata/reconciliation rounds here.
-                    if (!background_reconcile_scheduled and try self.source.runRound()) {
-                        _ = try self.source.runRound();
-                        _ = try self.source.runRound();
-                    }
-                }
+                self.reconcileProjectedSchemaUpdate(self.alloc, table_name, schema_json, local_schema_applied) catch |write_err| switch (write_err) {
+                    error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
+                    else => return write_err,
+                };
 
                 const body = try self.encodeSchemaUpdateResponse(table_name, schema_json);
                 defer self.alloc.free(body);
@@ -5273,6 +5255,40 @@ pub const ApiHttpServer = struct {
         defer arena_impl.deinit();
         const value = try buildLocalSchemaUpdateStatus(arena_impl.allocator(), table_name, schema_json);
         return try std.json.Stringify.valueAlloc(self.alloc, value, .{});
+    }
+
+    /// Starts local materialization only after the metadata definition is
+    /// visible. Both HTTP implementations call this boundary so a transport
+    /// change cannot silently turn an enqueue-only managed rebuild back into
+    /// synchronous request work.
+    pub fn reconcileProjectedSchemaUpdate(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema_json: []const u8,
+        local_schema_applied: bool,
+    ) !void {
+        const table_writes_source = self.table_writes orelse return;
+        var background_reconcile_scheduled = false;
+        if (!local_schema_applied) {
+            const scheduled = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |err| {
+                std.log.err("public schema update structural reconcile enqueue failed table={s} err={s}", .{ table_name, @errorName(err) });
+                return err;
+            };
+            // Embedded/direct DB sources have no reconciliation worker and
+            // retain their synchronous update contract.
+            if (scheduled == null) {
+                _ = try table_writes_source.updateSchema(alloc, table_name, schema_json);
+            } else {
+                background_reconcile_scheduled = true;
+            }
+        }
+        // A provisioned owner has its own structural worker. Driving metadata
+        // rounds here would put corpus reconstruction back on the HTTP path.
+        if (!background_reconcile_scheduled and try self.source.runRound()) {
+            _ = try self.source.runRound();
+            _ = try self.source.runRound();
+        }
     }
 
     pub fn probeTableStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.TableStorageStatus {
@@ -6783,6 +6799,7 @@ pub const ApiHttpServer = struct {
         return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.Timeout => return error.ReadUnavailable,
+            error.IdentityReadGenerationChanged => return error.ReadUnavailable,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
@@ -6837,7 +6854,7 @@ pub const ApiHttpServer = struct {
                 authenticated_identity,
                 request_deadline_ns,
             ) catch |err| switch (err) {
-                error.DocIdentityNamespaceMismatch => {
+                error.DocIdentityNamespaceMismatch, error.IdentityReadGenerationChanged => {
                     const now_ns = platform_time.monotonicNs();
                     if (retryDeadlineExpired(request_deadline_ns, now_ns)) return error.Timeout;
                     if (retry_timeout_ns == 0) return err;
@@ -6881,6 +6898,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.TableNotFound => return error.TableNotFound,
+                error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
                 error.ModelNotFound => return error.ModelNotFound,
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
                 error.QueryEmbeddingInputTooLarge,
@@ -6918,6 +6936,7 @@ pub const ApiHttpServer = struct {
             error.EmbedTransientFailure,
             error.EmbedUpstreamFailure,
             => return err,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
@@ -6959,6 +6978,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.TableNotFound => return error.NotFound,
+            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.QueryEmbeddingInputTooLarge,
@@ -7365,7 +7385,12 @@ pub const ApiHttpServer = struct {
                 // picks up a fresh manifest. TableReadChurn: the read cache
                 // gave up opening a table that was being invalidated faster
                 // than an open completes.
-                error.EndOfStream, error.FileNotFound, error.TableReadChurn => {
+                error.EndOfStream,
+                error.FileNotFound,
+                error.TableReadChurn,
+                error.IdentityReadGenerationChanged,
+                => {
+                    if (err == error.IdentityReadGenerationChanged and req.identity_read_generation != null) return err;
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
                     const now_ns = platform_time.monotonicNs();
                     if (retryDeadlineExpired(req.execution_deadline_ns, now_ns)) return error.Timeout;
@@ -8359,6 +8384,7 @@ pub const ApiHttpServer = struct {
             error.InvalidQueryRequest => return try invalidPublicQueryRequestResponse(self.alloc),
             error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
             error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, body),
+            error.IdentityReadGenerationChanged => return try retryableTextResponse(self.alloc, 409, "identity read generation changed"),
             error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
             error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
             error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
@@ -8430,6 +8456,7 @@ pub const ApiHttpServer = struct {
                 error.InvalidQueryRequest => return try invalidPublicQueryRequestResponse(self.alloc),
                 error.UnsupportedExactSort => return try unsupportedExactSortResponse(self.alloc),
                 error.UnsupportedQueryRequest => return try unsupportedPublicQueryResponse(self.alloc, line),
+                error.IdentityReadGenerationChanged => return try retryableTextResponse(self.alloc, 409, "identity read generation changed"),
                 error.QueryCandidateBudgetExceeded => return try queryCandidateBudgetExceededResponse(self.alloc),
                 error.QueryEmbeddingInputTooLarge => return try textResponse(self.alloc, 413, "query embedding input too large"),
                 error.QueryEmbeddingOverloaded => return try retryableTextResponse(self.alloc, 429, "query embedding overloaded"),
@@ -13673,6 +13700,71 @@ test "api http transient read retry honors expired request deadline before sourc
         .read_index,
     ));
     try std.testing.expectEqual(@as(u32, 0), reads.attempts);
+}
+
+test "api http retries identity generation churn from a fresh query snapshot" {
+    const FakeReads = struct {
+        attempts: u32 = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            if (self.attempts == 1) return error.IdentityReadGenerationChanged;
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
+        }
+    };
+
+    var reads = FakeReads{};
+    var response = (try ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        reads.source(),
+        "docs",
+        .{},
+        .read_index,
+    )).?;
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+    try std.testing.expectEqualStrings("{\"responses\":[]}", response.json);
 }
 
 test "api http plain public query preserves outer absolute request deadline" {

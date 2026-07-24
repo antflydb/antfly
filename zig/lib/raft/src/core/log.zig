@@ -33,6 +33,8 @@ pub const RaftLog = struct {
 
         const first_index = try storage.firstIndex();
         const last_index = try storage.lastIndex();
+        const compacted_index = first_index - 1;
+        const compacted_term = if (compacted_index == 0) 0 else try storage.term(compacted_index);
 
         var loaded_entries = std.ArrayListUnmanaged(types.Entry).empty;
         errdefer {
@@ -49,8 +51,8 @@ pub const RaftLog = struct {
 
         return .{
             .alloc = alloc,
-            .snapshot_index = snapshot.metadata.index,
-            .snapshot_term = snapshot.metadata.term,
+            .snapshot_index = compacted_index,
+            .snapshot_term = compacted_term,
             .entries = loaded_entries,
             .stable_index = last_index,
             .persisting_index = last_index,
@@ -261,4 +263,29 @@ test "raft log replaces conflicting suffix" {
 
     try std.testing.expectEqual(@as(types.Term, 2), log.term(2).?);
     try std.testing.expectEqual(@as(types.Index, 3), log.lastIndex());
+}
+
+test "raft log restart separates applied snapshot from compaction boundary" {
+    var mem = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer mem.deinit();
+    try mem.append(&.{
+        .{ .index = 1, .term = 1 },
+        .{ .index = 2, .term = 1 },
+        .{ .index = 3, .term = 2 },
+        .{ .index = 4, .term = 2 },
+        .{ .index = 5, .term = 2 },
+    });
+    try mem.compactToSnapshot(.{
+        .metadata = .{ .index = 5, .term = 2 },
+        .data = @constCast("state-at-five"),
+    }, 3);
+
+    var log = try RaftLog.init(std.testing.allocator, mem.storage());
+    defer log.deinit();
+    try std.testing.expectEqual(@as(types.Index, 4), log.firstIndex());
+    try std.testing.expectEqual(@as(types.Index, 5), log.lastIndex());
+    try std.testing.expectEqual(@as(types.Term, 2), log.term(3).?);
+    try std.testing.expectEqual(@as(types.Term, 2), log.term(4).?);
+    try std.testing.expectEqual(@as(types.Index, 5), log.applied);
+    try std.testing.expectEqual(@as(types.Index, 5), log.committed);
 }

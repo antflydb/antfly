@@ -22,6 +22,7 @@ const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
+const internal_keys = @import("../storage/internal_keys.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const coverage_policy = @import("../api/coverage_policy.zig");
 const indexes_api = @import("../api/indexes.zig");
@@ -38,12 +39,27 @@ pub const ProvisionSummary = struct {
     dbs_opened: usize = 0,
     indexes_added: usize = 0,
     indexes_removed: usize = 0,
+    indexes_pending: usize = 0,
     enrichments_added: usize = 0,
     enrichments_updated: usize = 0,
     enrichments_removed: usize = 0,
     resolvers_added: usize = 0,
     resolvers_updated: usize = 0,
     resolvers_removed: usize = 0,
+
+    pub fn merge(self: *@This(), other: @This()) void {
+        self.groups_considered += other.groups_considered;
+        self.dbs_opened += other.dbs_opened;
+        self.indexes_added += other.indexes_added;
+        self.indexes_removed += other.indexes_removed;
+        self.indexes_pending += other.indexes_pending;
+        self.enrichments_added += other.enrichments_added;
+        self.enrichments_updated += other.enrichments_updated;
+        self.enrichments_removed += other.enrichments_removed;
+        self.resolvers_added += other.resolvers_added;
+        self.resolvers_updated += other.resolvers_updated;
+        self.resolvers_removed += other.resolvers_removed;
+    }
 
     pub fn indexManagerCatalogChanged(self: @This()) bool {
         return self.indexes_added > 0 or
@@ -183,14 +199,7 @@ pub fn reconcileReplicaRootWithOptions(
         defer db.close();
         summary.dbs_opened += 1;
         const index_summary = try reconcileDbIndexes(alloc, &db, table.indexes_json);
-        summary.indexes_removed += index_summary.indexes_removed;
-        summary.indexes_added += index_summary.indexes_added;
-        summary.enrichments_added += index_summary.enrichments_added;
-        summary.enrichments_updated += index_summary.enrichments_updated;
-        summary.enrichments_removed += index_summary.enrichments_removed;
-        summary.resolvers_added += index_summary.resolvers_added;
-        summary.resolvers_updated += index_summary.resolvers_updated;
-        summary.resolvers_removed += index_summary.resolvers_removed;
+        summary.merge(index_summary);
     }
     return summary;
 }
@@ -262,6 +271,7 @@ pub fn reconcileDbIndexesWithOptions(
         .dbs_opened = 0,
         .indexes_added = index_summary.added,
         .indexes_removed = indexes_removed,
+        .indexes_pending = index_summary.pending,
         .enrichments_added = enrichment_summary.added,
         .enrichments_updated = enrichment_summary.updated,
         .enrichments_removed = enrichments_removed,
@@ -348,6 +358,7 @@ pub fn collectLocalSchemaProgressWithOptions(
 pub fn collectLocalSchemaProgressFromRuntime(
     alloc: std.mem.Allocator,
     local_node_id: u64,
+    hosted_group_ids: []const u64,
     tables: []const table_manager.TableRecord,
     ranges: []const table_manager.RangeRecord,
     stores: []const table_manager.StoreRecord,
@@ -361,14 +372,18 @@ pub fn collectLocalSchemaProgressFromRuntime(
         const read_version = try schemaVersion(alloc, table.read_schema_json);
 
         var hosted_ranges: usize = 0;
-        var ready_ranges: usize = 0;
-        for (ranges) |range| {
+        var all_ready = true;
+        for (hosted_group_ids) |group_id| {
+            const range = findRange(ranges, group_id) orelse continue;
             if (range.table_id != table.table_id) continue;
-            const runtime = findLocalRuntimeStatus(stores, local_node_id, table.table_id, range.group_id) orelse continue;
             hosted_ranges += 1;
-            if (runtimeHasReadySchemaVersionIndex(runtime, version, read_version)) ready_ranges += 1;
+            const runtime = findLocalRuntimeStatus(stores, local_node_id, table.table_id, group_id) orelse {
+                all_ready = false;
+                continue;
+            };
+            all_ready = all_ready and runtimeHasReadySchemaVersionIndex(runtime, range, version, read_version);
         }
-        if (hosted_ranges == 0 or ready_ranges != hosted_ranges) continue;
+        if (hosted_ranges == 0 or !all_ready) continue;
         try out.append(alloc, .{
             .table_id = table.table_id,
             .node_id = local_node_id,
@@ -434,6 +449,88 @@ test "schema progress runtime coverage treats opening observations as authoritat
     stores[0].runtime_statuses = &runtimes;
     try std.testing.expect(localSchemaRuntimeCoverageComplete(3, &hosted, &tables, &ranges, &stores));
     try std.testing.expect(!localSchemaRuntimeCoverageComplete(4, &hosted, &tables, &ranges, &stores));
+}
+
+test "runtime schema progress requires every hosted range" {
+    const tables = [_]table_manager.TableRecord{.{
+        .table_id = 11,
+        .name = "docs",
+        .schema_json = "{\"version\":1}",
+        .read_schema_json = "{\"version\":0}",
+    }};
+    const ranges = [_]table_manager.RangeRecord{
+        .{ .group_id = 7, .table_id = 11, .start_key = "", .end_key = "m" },
+        .{ .group_id = 8, .table_id = 11, .start_key = "m" },
+    };
+    const hosted = [_]u64{ 7, 8 };
+    var indexes = [_]table_manager.RuntimeIndexStatusReport{.{
+        .name = "full_text_index_v1",
+        .kind = "full_text",
+        .doc_count = 1,
+        .replay_applied_sequence = 1,
+        .replay_target_sequence = 1,
+    }};
+    var runtimes = [_]table_manager.RuntimeGroupStatusReport{
+        .{
+            .table_id = 11,
+            .group_id = 7,
+            .node_id = 3,
+            .freshness = "fresh",
+            .doc_identity = .{
+                .namespace_table_id = 11,
+                .namespace_shard_id = 7,
+                .namespace_range_id = 7,
+                .next_ordinal = 2,
+                .allocated_ordinals = 1,
+                .live_ordinals = 1,
+            },
+            .indexes = &indexes,
+        },
+        .{
+            .table_id = 11,
+            .group_id = 8,
+            .node_id = 3,
+            .freshness = "fresh",
+            .doc_identity = .{
+                .namespace_table_id = 11,
+                .namespace_shard_id = 8,
+                .namespace_range_id = 8,
+                .next_ordinal = 2,
+                .allocated_ordinals = 1,
+                .live_ordinals = 1,
+            },
+            .indexes = &indexes,
+        },
+    };
+    var stores = [_]table_manager.StoreRecord{.{
+        .store_id = 5,
+        .node_id = 3,
+        .runtime_statuses = runtimes[0..1],
+    }};
+
+    const partial = try collectLocalSchemaProgressFromRuntime(
+        std.testing.allocator,
+        3,
+        &hosted,
+        &tables,
+        &ranges,
+        &stores,
+    );
+    defer std.testing.allocator.free(partial);
+    try std.testing.expectEqual(@as(usize, 0), partial.len);
+
+    stores[0].runtime_statuses = &runtimes;
+    const complete = try collectLocalSchemaProgressFromRuntime(
+        std.testing.allocator,
+        3,
+        &hosted,
+        &tables,
+        &ranges,
+        &stores,
+    );
+    defer std.testing.allocator.free(complete);
+    try std.testing.expectEqual(@as(usize, 1), complete.len);
+    try std.testing.expectEqual(@as(u32, 1), complete[0].schema_version);
 }
 
 pub fn collectLocalRestoreProgress(
@@ -574,6 +671,7 @@ fn removeMissingIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: 
 const IndexEnsureSummary = struct {
     added: usize = 0,
     removed: usize = 0,
+    pending: usize = 0,
 };
 
 fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !IndexEnsureSummary {
@@ -629,11 +727,18 @@ fn ensureIndexDefinition(
     else
         try extractIndexConfigJsonForKind(alloc, name, kind, config_value);
     defer alloc.free(config_json);
+    const configured_coverage_generation = coverage_policy.incarnation(config_value) orelse 0;
     const desired = db_mod.types.IndexConfig{
         .name = name,
         .kind = kind,
         .config_json = config_json,
-        .coverage_generation = coverage_policy.incarnation(config_value) orelse 0,
+        // The catalog persists the effective derived generation. Normalize
+        // desired state at the same boundary so a reopen cannot misclassify
+        // an unchanged vector index as a replacement.
+        .coverage_generation = if (kind == .dense_vector or kind == .sparse_vector)
+            internal_keys.derivedCoverageGenerationForConfig(configured_coverage_generation, config_json)
+        else
+            configured_coverage_generation,
     };
     const existing = findIndexConfig(current, name);
     if (existing) |existing_cfg| {
@@ -644,15 +749,49 @@ fn ensureIndexDefinition(
         }
     }
     if (existing) |existing_cfg| {
-        if (try indexConfigsEqual(alloc, existing_cfg, desired)) return;
-        if (try db.deleteIndex(desired.name)) summary.removed += 1;
+        if (try indexConfigsEqual(alloc, existing_cfg, desired)) {
+            if (desired.kind == .full_text) {
+                if (try db.materializeManagedIndexAdmission(alloc, desired.name) != null) {
+                    summary.pending += 1;
+                }
+            }
+            return;
+        }
+        if (try db.deleteIndex(desired.name)) {
+            summary.removed += 1;
+            summary.pending += 1;
+            // Retirement publishes a durable cleanup tombstone. Re-admitting
+            // the same artifact namespace in this pass would either race the
+            // owner or require an unbounded request-thread corpus scan. The
+            // cleanup owner advances the tombstone in bounded pages and the
+            // next idempotent reconcile admits the desired generation.
+            return;
+        }
     }
-    try db.addIndex(.{
+    const admitted = db_mod.types.IndexConfig{
         .name = desired.name,
         .kind = desired.kind,
         .config_json = desired.config_json,
         .coverage_generation = desired.coverage_generation,
-    });
+    };
+    if (desired.kind == .full_text) {
+        const repair_id = db.admitManagedFullTextIndex(admitted) catch |err| switch (err) {
+            error.IndexArtifactCleanupPending => {
+                summary.pending += 1;
+                return;
+            },
+            else => return err,
+        };
+        if (repair_id != null) summary.pending += 1;
+    } else {
+        db.addIndex(admitted) catch |err| switch (err) {
+            error.IndexArtifactCleanupPending => {
+                summary.pending += 1;
+                return;
+            },
+            else => return err,
+        };
+    }
     summary.added += 1;
 }
 
@@ -1082,15 +1221,28 @@ fn findLocalRuntimeStatus(
 
 fn runtimeHasReadySchemaVersionIndex(
     runtime: table_manager.RuntimeGroupStatusReport,
+    range: table_manager.RangeRecord,
     schema_version: u32,
     read_schema_version: u32,
 ) bool {
+    // Schema cutover must be driven by a current observation of the complete
+    // target projection. A catalog-only placeholder and a newly-created empty
+    // index both look idle, but neither proves that existing documents were
+    // rebuilt under the target schema. Identity mutations and their visibility
+    // summary commit atomically with every primary mutation, so the reconciled
+    // O(1) summary is the generation-owner proof. Requiring diagnostic
+    // `complete` here would turn migration progress into a corpus scan and let
+    // a later bounded status observation erase an otherwise valid proof.
+    if (!std.mem.eql(u8, runtime.freshness, "fresh")) return false;
+    if (!runtimeIdentitySummaryIsAuthoritative(runtime, range)) return false;
+
     var target_name_buf: [64]u8 = undefined;
     const target_name = if (schema_version == 0)
         @import("../api/tables.zig").default_full_text_index_name
     else
         std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version}) catch return false;
-    _ = findReadyRuntimeFullTextIndex(runtime.indexes, target_name) orelse return false;
+    const target = findReadyRuntimeFullTextIndex(runtime.indexes, target_name) orelse return false;
+    if (target.doc_count != runtime.doc_identity.live_ordinals) return false;
     if (schema_version == read_schema_version) return true;
 
     var read_name_buf: [64]u8 = undefined;
@@ -1099,6 +1251,24 @@ fn runtimeHasReadySchemaVersionIndex(
     else
         std.fmt.bufPrint(&read_name_buf, "full_text_index_v{d}", .{read_schema_version}) catch return false;
     _ = findReadyRuntimeFullTextIndex(runtime.indexes, read_name) orelse return true;
+    return true;
+}
+
+fn runtimeIdentitySummaryIsAuthoritative(
+    runtime: table_manager.RuntimeGroupStatusReport,
+    range: table_manager.RangeRecord,
+) bool {
+    const identity = runtime.doc_identity;
+    if (identity.ordinal_capacity_exhausted or identity.rebuild_required) return false;
+    if (runtime.table_id != range.table_id or runtime.group_id != range.group_id) return false;
+    if (identity.namespace_table_id != range.table_id or
+        identity.namespace_shard_id != table_manager.rangeDocIdentityShardId(range) or
+        identity.namespace_range_id != table_manager.rangeDocIdentityRangeId(range)) return false;
+    if (identity.next_ordinal == 0) return false;
+    if (@as(u64, identity.next_ordinal - 1) != identity.allocated_ordinals) return false;
+    const accounted = std.math.add(u64, identity.live_ordinals, identity.tombstone_ordinals) catch return false;
+    if (accounted != identity.allocated_ordinals) return false;
+
     return true;
 }
 
@@ -1374,6 +1544,66 @@ test "table provisioner materializes array-form metadata indexes" {
     try std.testing.expect(findIndexConfig(configs, "full_text_index_v0").?.kind == .full_text);
 }
 
+test "table provisioner durably enqueues existing corpus full text backfill" {
+    const path = "/tmp/antfly-metadata-table-provisioner-full-text-backfill";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(std.testing.allocator, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}";
+    const first = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
+    try std.testing.expectEqual(@as(usize, 1), first.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), first.indexes_pending);
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(std.testing.allocator));
+
+    var initial_state = try db.loadIndexRepairState(std.testing.allocator);
+    defer initial_state.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), initial_state.entries.items.len);
+    const repair_id = initial_state.entries.items[0].intent.repair_id;
+    try std.testing.expectEqualStrings("full_text_index_v1", initial_state.entries.items[0].intent.index_name);
+
+    // Reconciliation is an additional recovery trigger. Re-observing the
+    // admitted empty projection must adopt the same durable generation instead
+    // of dropping or duplicating it.
+    const second = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
+    try std.testing.expectEqual(@as(usize, 0), second.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), second.indexes_pending);
+    var repeated_state = try db.loadIndexRepairState(std.testing.allocator);
+    defer repeated_state.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), repeated_state.entries.items.len);
+    try std.testing.expectEqual(repair_id, repeated_state.entries.items[0].intent.repair_id);
+
+    var repaired = false;
+    for (0..16) |_| {
+        const step = try db.advanceIndexRepairIntent(std.testing.allocator, repair_id, .{});
+        if (step.repaired) {
+            repaired = true;
+            break;
+        }
+        try std.testing.expect(!step.terminal);
+    }
+    try std.testing.expect(repaired);
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(std.testing.allocator));
+
+    const complete = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
+    try std.testing.expectEqual(@as(usize, 0), complete.indexes_added);
+    try std.testing.expectEqual(@as(usize, 0), complete.indexes_pending);
+}
+
 test "table provisioner replaces embedding index when metadata incarnation changes" {
     const path = "/tmp/antfly-metadata-table-provisioner-coverage-incarnation";
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -1396,9 +1626,34 @@ test "table provisioner replaces embedding index when metadata incarnation chang
     const initial = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, first, .{});
     try std.testing.expectEqual(@as(usize, 1), initial.indexes_added);
 
-    const replaced = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, second, .{});
-    try std.testing.expectEqual(@as(usize, 1), replaced.indexes_removed);
-    try std.testing.expectEqual(@as(usize, 1), replaced.indexes_added);
+    const retired = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, second, .{});
+    try std.testing.expectEqual(@as(usize, 1), retired.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 0), retired.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), retired.indexes_pending);
+
+    // Replacement is intentionally a multi-pass desired-state transition:
+    // the durable owner retires the old artifact namespace before a later
+    // reconcile admits the new coverage incarnation.
+    var cleanup_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer cleanup_io.deinit();
+    var cleanup_pages: usize = 0;
+    var cleanup_attempts: usize = 0;
+    while (true) {
+        cleanup_attempts += 1;
+        try std.testing.expect(cleanup_attempts < 5_000);
+        switch (try db.advanceGeneratedArtifactCleanupPage("semantic_idx")) {
+            .idle => break,
+            .progressed => {
+                cleanup_pages += 1;
+                try std.testing.expect(cleanup_pages < 32);
+            },
+            .busy => cleanup_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {},
+        }
+    }
+    const admitted = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, second, .{});
+    try std.testing.expectEqual(@as(usize, 0), admitted.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 1), admitted.indexes_added);
+    try std.testing.expectEqual(@as(usize, 0), admitted.indexes_pending);
 
     const configs = try db.listIndexes(std.testing.allocator);
     defer db_mod.types.freeIndexConfigs(std.testing.allocator, configs);
@@ -2146,7 +2401,7 @@ test "table provisioner updates full text artifact mapping and cleans removed en
         }, &.{});
     }
 
-    const second_summary = try reconcileReplicaRoot(
+    const retired_summary = try reconcileReplicaRoot(
         alloc,
         path,
         100,
@@ -2163,10 +2418,40 @@ test "table provisioner updates full text artifact mapping and cleans removed en
             .end_key = "doc:z",
         }},
     );
-    try std.testing.expectEqual(@as(usize, 1), second_summary.indexes_added);
-    try std.testing.expectEqual(@as(usize, 1), second_summary.indexes_removed);
-    try std.testing.expectEqual(@as(usize, 2), second_summary.enrichments_added);
-    try std.testing.expectEqual(@as(usize, 2), second_summary.enrichments_removed);
+    try std.testing.expectEqual(@as(usize, 0), retired_summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), retired_summary.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 1), retired_summary.indexes_pending);
+    try std.testing.expectEqual(@as(usize, 2), retired_summary.enrichments_added);
+    try std.testing.expectEqual(@as(usize, 2), retired_summary.enrichments_removed);
+
+    {
+        const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+        defer alloc.free(db_path);
+        var db = try db_mod.DB.open(alloc, db_path, .{});
+        defer db.close();
+        db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    }
+
+    const admitted_summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 14,
+            .name = "docs",
+            .indexes_json = second_indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 14,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 1), admitted_summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 0), admitted_summary.indexes_removed);
+    try std.testing.expectEqual(@as(usize, 0), admitted_summary.indexes_pending);
 
     const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
     defer alloc.free(db_path);
@@ -2830,6 +3115,7 @@ test "table provisioner withholds schema progress when any local shard is missin
 }
 
 test "table provisioner accepts target schema index when retained read index has inflated doc count" {
+    const range = table_manager.RangeRecord{ .group_id = 7, .table_id = 11, .start_key = "" };
     const indexes = [_]table_manager.RuntimeIndexStatusReport{
         .{
             .name = "full_text_index_v0",
@@ -2847,7 +3133,72 @@ test "table provisioner accepts target schema index when retained read index has
         },
     };
     try std.testing.expect(runtimeHasReadySchemaVersionIndex(.{
-        .doc_count = 1000,
+        .table_id = range.table_id,
+        .group_id = range.group_id,
+        .freshness = "fresh",
+        .doc_count = 1500,
+        .doc_identity = .{
+            .namespace_table_id = range.table_id,
+            .namespace_shard_id = range.group_id,
+            .namespace_range_id = range.group_id,
+            .next_ordinal = 1001,
+            .allocated_ordinals = 1000,
+            .live_ordinals = 1000,
+        },
         .indexes = @constCast(indexes[0..]),
-    }, 1, 0));
+    }, range, 1, 0));
+}
+
+test "table provisioner runtime schema progress requires authoritative O(1) identity coverage" {
+    const range = table_manager.RangeRecord{ .group_id = 7, .table_id = 11, .start_key = "" };
+    var indexes = [_]table_manager.RuntimeIndexStatusReport{
+        .{
+            .name = "full_text_index_v0",
+            .kind = "full_text",
+            .doc_count = 1000,
+            .replay_applied_sequence = 7,
+            .replay_target_sequence = 7,
+        },
+        .{
+            .name = "full_text_index_v1",
+            .kind = "full_text",
+            .doc_count = 0,
+            .replay_applied_sequence = 7,
+            .replay_target_sequence = 7,
+        },
+    };
+    var runtime = table_manager.RuntimeGroupStatusReport{
+        .table_id = range.table_id,
+        .group_id = range.group_id,
+        .freshness = "fresh",
+        .doc_count = 1000,
+        .doc_identity = .{
+            .namespace_table_id = range.table_id,
+            .namespace_shard_id = range.group_id,
+            .namespace_range_id = range.group_id,
+            .next_ordinal = 1001,
+            .allocated_ordinals = 1000,
+            .live_ordinals = 1000,
+        },
+        .indexes = &indexes,
+    };
+
+    try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
+
+    indexes[1].doc_count = 1000;
+    try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
+
+    runtime.freshness = "stale";
+    try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
+
+    runtime.freshness = "fresh";
+    runtime.doc_identity.allocated_ordinals = 999;
+    try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
+
+    runtime.doc_identity.allocated_ordinals = 0;
+    runtime.doc_identity.next_ordinal = 1;
+    runtime.doc_count = 0;
+    runtime.doc_identity.live_ordinals = 0;
+    indexes[1].doc_count = 0;
+    try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
 }

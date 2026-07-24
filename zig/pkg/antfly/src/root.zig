@@ -260,6 +260,7 @@ test {
 
     // Raft integration
     _ = raft;
+    _ = @import("raft/reconciler.zig");
     _ = extensions;
     _ = metadata;
     _ = metadata_api;

@@ -104,7 +104,7 @@ class _ExtensionProcess:
             str(self.public_port),
             "--data-dir",
             str(self.root),
-            "--tick-ms",
+            "--control-tick-ms",
             "5",
             "--replica-root-dir",
             str(self.root / "replicas"),

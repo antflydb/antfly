@@ -22,6 +22,7 @@ const compaction_scheduler_mod = @import("compaction_scheduler.zig");
 const State = state_mod.State;
 const Run = repository_mod.Run;
 pub const max_remembered_compaction_run_ids = 64;
+pub const max_exact_l0_overlap_runs = 64;
 
 const CompactionWork = struct {
     score: u64,
@@ -916,13 +917,20 @@ fn selectCompactionPlanWithStats(
 ) ?CompactionPlan {
     if (runs.len < 2) return null;
     var best: ?ScoredCompactionPlan = null;
-    maybeAdoptBest(&best, selectL0OverlapCompactionCandidateWithStats(
-        runs,
-        l0_overlap_compact_threshold_runs,
-        @max(l0_overlap_compact_threshold_runs, l0_limit),
-        max_input_bytes,
-        selection_stats,
-    ));
+    const l0_count = countLeadingL0Runs(runs);
+    // Exact hotspot selection is quadratic. Once L0 exceeds its ordinary
+    // pressure limit, a linear pressure compaction is already eligible and
+    // exact overlap ranking cannot affect correctness. Skipping it here keeps
+    // compaction planning from monopolizing the backend mutex during bursts.
+    if (l0_limit > 0 and l0_count <= @min(l0_limit, max_exact_l0_overlap_runs)) {
+        maybeAdoptBest(&best, selectL0OverlapCompactionCandidateWithStats(
+            runs,
+            l0_overlap_compact_threshold_runs,
+            @max(l0_overlap_compact_threshold_runs, l0_limit),
+            max_input_bytes,
+            selection_stats,
+        ));
+    }
     maybeAdoptBest(&best, selectL0CompactionCandidateWithStats(runs, l0_limit, max_input_bytes, allow_oversized_single_job, selection_stats));
     maybeAdoptBest(&best, selectLowerLevelRepairCompactionCandidateWithStats(runs, max_input_bytes, allow_oversized_single_job, selection_stats));
     maybeAdoptBest(&best, selectLowerLevelPressureCompactionCandidateWithStats(

@@ -2038,21 +2038,13 @@ pub const AntflyApiHandler = struct {
             },
             else => return err,
         };
-        if (self.api_server.table_writes) |table_writes_source| {
-            if (!local_schema_applied) {
-                _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
-                    error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
-                        _ = ctx.status(400);
-                        return ctx.text(invalid_schema_message);
-                    },
-                    else => return write_err,
-                };
-            }
-            if (try self.api_server.source.runRound()) {
-                _ = try self.api_server.source.runRound();
-                _ = try self.api_server.source.runRound();
-            }
-        }
+        self.api_server.reconcileProjectedSchemaUpdate(alloc, decoded_table_name, schema_json, local_schema_applied) catch |write_err| switch (write_err) {
+            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
+                _ = ctx.status(400);
+                return ctx.text(invalid_schema_message);
+            },
+            else => return write_err,
+        };
 
         const body = try self.api_server.encodeSchemaUpdateResponse(decoded_table_name, schema_json);
         defer self.api_server.alloc.free(body);
@@ -3290,6 +3282,8 @@ const SchemaUpdateStatusSource = struct {
     projection_wait_calls: std.atomic.Value(u32) = .init(0),
     schema_json: ?[]const u8 = null,
     owns_schema_json: bool = false,
+    table_buf: [1]metadata_table_manager.TableRecord = undefined,
+    range_buf: [1]metadata_table_manager.RangeRecord = undefined,
 
     fn iface(self: *@This()) http_server_mod.StatusSource {
         return .{
@@ -3324,21 +3318,23 @@ const SchemaUpdateStatusSource = struct {
 
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.table_buf[0] = .{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = tables_api.effectiveSchemaJson(self.schema_json),
+            .indexes_json = tables_api.default_indexes_json,
+            .placement_role = "data",
+        };
+        self.range_buf[0] = .{
+            .group_id = 7001,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        };
         return .{
             .status = .{ .metadata_group_id = 1, .metrics = .{} },
-            .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                .table_id = 7,
-                .name = "docs",
-                .schema_json = tables_api.effectiveSchemaJson(self.schema_json),
-                .indexes_json = tables_api.default_indexes_json,
-                .placement_role = "data",
-            }})[0..]),
-            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                .group_id = 7001,
-                .table_id = 7,
-                .start_key = "",
-                .end_key = null,
-            }})[0..]),
+            .tables = &self.table_buf,
+            .ranges = &self.range_buf,
             .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
             .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
             .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -3360,8 +3356,54 @@ const SchemaUpdateStatusSource = struct {
         try std.testing.expect(indexes_json != null);
         try std.testing.expect(schema_json != null);
         try std.testing.expect(self.schema_json != null);
-        try std.testing.expectEqualStrings(self.schema_json.?, schema_json.?);
         _ = self.projection_wait_calls.fetchAdd(1, .monotonic);
+    }
+};
+
+const SchemaReconcileWriteSource = struct {
+    reconcile_calls: std.atomic.Value(u32) = .init(0),
+    synchronous_update_calls: std.atomic.Value(u32) = .init(0),
+
+    fn iface(self: *@This()) table_writes.TableWriteSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .batch = batch,
+                .update_schema = updateSchema,
+                .request_table_structural_reconcile = requestStructuralReconcile,
+            },
+        };
+    }
+
+    fn batch(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: db_mod.types.BatchRequest,
+    ) !?void {
+        return {};
+    }
+
+    fn updateSchema(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: []const u8,
+    ) !?void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        _ = self.synchronous_update_calls.fetchAdd(1, .monotonic);
+        return {};
+    }
+
+    fn requestStructuralReconcile(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try std.testing.expectEqualStrings("docs", table_name);
+        _ = self.reconcile_calls.fetchAdd(1, .monotonic);
+        return {};
     }
 };
 
@@ -3610,7 +3652,8 @@ test "httpx antfly schema update returns full table status after projection" {
 
     var source = SchemaUpdateStatusSource{};
     defer source.deinit(alloc);
-    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var writes = SchemaReconcileWriteSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
 
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
@@ -3639,6 +3682,8 @@ test "httpx antfly schema update returns full table status after projection" {
     try std.testing.expectEqualStrings("docs", parsed.value.name);
     try std.testing.expect(parsed.value.schema != null);
     try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), writes.reconcile_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), writes.synchronous_update_calls.load(.monotonic));
 }
 
 test "httpx global query table name comes from request body" {

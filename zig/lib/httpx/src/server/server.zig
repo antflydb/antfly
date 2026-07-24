@@ -24,10 +24,12 @@
 //! direct TLS support.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const array_list_writer_mod = @import("../util/array_list_writer.zig");
 const arrayListWriter = array_list_writer_mod.arrayListWriter;
 const serializeToSlice = array_list_writer_mod.serializeToSlice;
 const mem = std.mem;
+const posix = std.posix;
 const Allocator = mem.Allocator;
 const Io = std.Io;
 const milliTimestamp = @import("../util/common.zig").milliTimestamp;
@@ -693,9 +695,12 @@ pub const Server = struct {
     const ConnectionControl = struct {
         socket: *Socket,
         h2: ?*H2Connection = null,
-        closed: std.atomic.Value(bool) = .init(false),
+        interrupted: std.atomic.Value(bool) = .init(false),
 
-        fn close(self: *@This(), graceful: bool) void {
+        /// Interrupts in-flight I/O without releasing the descriptor. The
+        /// connection fiber is the sole descriptor owner and closes it after
+        /// its handler has unwound.
+        fn interrupt(self: *@This(), graceful: bool) void {
             if (graceful) {
                 if (self.h2) |h2| {
                     h2.write_mutex.lockUncancelable(h2.io);
@@ -703,9 +708,8 @@ pub const Server = struct {
                     h2.write_mutex.unlock(h2.io);
                 }
             }
-            if (!self.closed.swap(true, .acq_rel)) {
+            if (!self.interrupted.swap(true, .acq_rel)) {
                 self.socket.shutdown();
-                self.socket.close();
             }
         }
     };
@@ -854,8 +858,6 @@ pub const Server = struct {
             std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
         }
 
-        std.debug.print("Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
-
         while (self.running and self.shutdown_mode.load(.acquire) == 0) {
             // Block accept loop when at max concurrent connections.
             // Gate before accept so we don't hold open sockets while waiting.
@@ -903,7 +905,7 @@ pub const Server = struct {
             connection.socket = conn.socket;
             connection.control = .{ .socket = &connection.socket };
             self.registerConnection(&connection.control) catch {
-                connection.control.close(false);
+                connection.socket.close();
                 self.allocator.destroy(connection);
                 self.conn_semaphore.post(self.io);
                 continue;
@@ -1013,7 +1015,7 @@ pub const Server = struct {
         defer _ = self.active_connections.fetchSub(1, .acq_rel);
         defer self.conn_semaphore.post(self.io);
         defer self.allocator.destroy(connection);
-        defer connection.control.close(false);
+        defer connection.socket.close();
         defer self.unregisterConnection(&connection.control);
         var sock = connection.socket;
 
@@ -1849,7 +1851,7 @@ pub const Server = struct {
         self.lockConnectionControls();
         defer self.connection_controls_mutex.unlock();
         const graceful = self.shutdown_mode.load(.acquire) == 1;
-        for (self.connection_controls.items) |control| control.close(graceful);
+        for (self.connection_controls.items) |control| control.interrupt(graceful);
     }
 
     fn setH2Control(self: *Self, control: *ConnectionControl, h2: *H2Connection) void {
@@ -2849,6 +2851,26 @@ test "cross-thread graceful shutdown is listener-owned" {
     try std.testing.expect(!server.running);
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
     try std.testing.expect(elapsed < std.time.ns_per_s);
+}
+
+test "connection interruption preserves the fiber-owned descriptor" {
+    if (builtin.os.tag == .windows) return;
+
+    const io = std.testing.io;
+    const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var listener = try TcpListener.init(listen_addr, io);
+    defer listener.deinit();
+
+    var client = try Socket.connect(listener.getLocalAddress(), io);
+    defer client.close();
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+
+    var control = Server.ConnectionControl{ .socket = &accepted.socket };
+    control.interrupt(false);
+
+    const rc = posix.system.fcntl(accepted.socket.handle, posix.F.GETFD, @as(usize, 0));
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(rc));
 }
 
 test "immediate stop preempts graceful request drain" {

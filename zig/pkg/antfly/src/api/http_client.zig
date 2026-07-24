@@ -28,6 +28,8 @@ const test_contract_helpers = @import("test_contract_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 
+const transition_control_rpc_timeout_ms: u32 = 5_000;
+
 fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
     return try std.json.parseFromSlice(T, alloc, body, .{});
 }
@@ -2015,6 +2017,11 @@ pub const ApiHttpClient = struct {
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
+            // Transition RPCs run from a persistent control loop. A peer that
+            // accepts a connection but never responds must not monopolize that
+            // loop indefinitely; TransitionService retries idempotent actions
+            // with bounded backoff after this deadline.
+            .timeout_ms = transition_control_rpc_timeout_ms,
             .body = body,
         });
         defer resp.deinit(self.alloc);
@@ -2256,6 +2263,7 @@ const EncodedTransitionAction = struct {
         rollback_merge,
     },
     transition_id: u64,
+    attempt_epoch: u64 = 0,
     source_group_id: ?u64 = null,
     destination_group_id: ?u64 = null,
     donor_group_id: ?u64 = null,
@@ -2263,7 +2271,6 @@ const EncodedTransitionAction = struct {
     allow_doc_identity_reassignment: bool = false,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
-    destination_base_uri: ?[]const u8 = null,
 };
 
 fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.TransitionAction) ![]u8 {
@@ -2272,6 +2279,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
         .prepare_split_source => |op| .{
             .kind = .prepare_split_source,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
             .split_key = op.split_key,
@@ -2280,32 +2288,35 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
         .start_split_source => |op| .{
             .kind = .start_split_source,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
         },
         .bootstrap_split_destination => |op| .{
             .kind = .bootstrap_split_destination,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
-            .destination_base_uri = op.destination_base_uri,
         },
         .catch_up_split_destination => |op| .{
             .kind = .catch_up_split_destination,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
-            .destination_base_uri = op.destination_base_uri,
         },
         .finalize_split_source => |op| .{
             .kind = .finalize_split_source,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
         },
         .rollback_split => |op| .{
             .kind = .rollback_split,
             .transition_id = op.transition_id,
+            .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
         },
@@ -2469,6 +2480,8 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 fn remoteGroupConflictError(body: []const u8) anyerror {
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "TopologyChanged") or std.mem.eql(u8, body, "topology changed")) return error.TopologyChanged;
+    if (std.mem.eql(u8, body, "IdentityReadGenerationChanged") or
+        std.mem.eql(u8, body, "identity read generation changed")) return error.IdentityReadGenerationChanged;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "repair cancelled")) return error.Canceled;
     return error.UnexpectedHttpStatus;
@@ -2521,6 +2534,40 @@ pub fn expectGroupArtifactRepairRunMapsCancelUnavailableForTest() !void {
 
 test "api http client maps remote repair cancel unavailable" {
     try expectGroupArtifactRepairRunMapsCancelUnavailableForTest();
+}
+
+test "api http client bounds transition control RPCs" {
+    const TimeoutExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expectEqual(transition_control_rpc_timeout_ms, req.timeout_ms.?);
+            try std.testing.expect(std.mem.endsWith(
+                u8,
+                req.uri,
+                "/internal/v1/groups/7/shard-ops/observe-split",
+            ));
+            return error.Timeout;
+        }
+    };
+
+    var executor = TimeoutExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(error.Timeout, client.fetchGroupShardObserveSplit(
+        "http://127.0.0.1:1",
+        7,
+        .{
+            .transition_id = 77,
+            .attempt_epoch = 1,
+            .source_group_id = 7,
+            .destination_group_id = 8,
+        },
+    ));
 }
 
 test "api http client encodes table name for repair cancel callback" {
@@ -2593,6 +2640,10 @@ test "api http client preserves group doc identity conflicts" {
     conflict_executor.body = "topology changed";
     try std.testing.expectError(error.TopologyChanged, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.TopologyChanged, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
+
+    conflict_executor.body = "identity read generation changed";
+    try std.testing.expectError(error.IdentityReadGenerationChanged, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.IdentityReadGenerationChanged, client.fetchGroupGraphExpand(base_uri, 7, "docs", "{}"));
 
     conflict_executor.status = 503;
     conflict_executor.body = "write unavailable";

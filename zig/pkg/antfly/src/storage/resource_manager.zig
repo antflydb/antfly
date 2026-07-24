@@ -100,6 +100,7 @@ pub const Slice = enum(u8) {
     lite_docstore_snapshot_cache,
     inference_prompt_cache,
     dense_repair_working_set,
+    shard_transition_working_set,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -128,6 +129,7 @@ pub const Slice = enum(u8) {
             .lite_docstore_snapshot_cache => "lite.docstore_snapshot_cache",
             .inference_prompt_cache => "inference.prompt_cache",
             .dense_repair_working_set => "dense_repair.working_set",
+            .shard_transition_working_set => "shard_transition.working_set",
         };
     }
 };
@@ -237,6 +239,7 @@ pub const Options = struct {
             .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
         };
     }
 
@@ -266,6 +269,7 @@ pub const Options = struct {
             .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
             .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
             .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
         };
     }
@@ -770,6 +774,118 @@ pub const ResourceManager = struct {
         return .{ .manager = self, .slice = slice, .bytes = bytes };
     }
 
+    fn growReservationBoundedOversized(
+        self: *ResourceManager,
+        reservation: *Reservation,
+        additional_bytes: u64,
+        max_hard_limit_multiple: u64,
+    ) !void {
+        if (additional_bytes == 0) return;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const state = &self.slices[sliceIndex(reservation.slice)];
+        const next = std.math.add(u64, state.used_bytes, additional_bytes) catch {
+            state.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        };
+        const next_reservation = std.math.add(u64, reservation.bytes, additional_bytes) catch {
+            state.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        };
+        const hard_limit = state.budget.hard_limit_bytes;
+        if (hard_limit > 0 and next > hard_limit) {
+            const bounded_limit = std.math.mul(u64, hard_limit, max_hard_limit_multiple) catch std.math.maxInt(u64);
+            const reservation_is_sole_user = state.used_bytes == reservation.bytes;
+            if (max_hard_limit_multiple <= 1 or !reservation_is_sole_user or next_reservation > bounded_limit) {
+                state.hard_limit_rejections +|= 1;
+                return error.ResourceBudgetExceeded;
+            }
+            if (reservation.bytes <= hard_limit) state.oversized_single_grants +|= 1;
+        }
+        state.used_bytes = next;
+        reservation.bytes = next_reservation;
+        state.peak_bytes = @max(state.peak_bytes, next);
+        if (state.budget.soft_limit_bytes > 0 and next > state.budget.soft_limit_bytes) {
+            state.soft_limit_events +|= 1;
+        }
+        self.pressure_change.advance();
+    }
+
+    fn growReservationAmortized(
+        self: *ResourceManager,
+        reservation: *Reservation,
+        minimum_bytes: u64,
+        preferred_bytes: u64,
+        max_hard_limit_multiple: u64,
+    ) !u64 {
+        if (minimum_bytes == 0) return 0;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const state = &self.slices[sliceIndex(reservation.slice)];
+        const hard_limit = state.budget.hard_limit_bytes;
+        const bounded_limit = if (hard_limit == 0)
+            std.math.maxInt(u64)
+        else
+            std.math.mul(u64, hard_limit, max_hard_limit_multiple) catch std.math.maxInt(u64);
+        const reservation_is_sole_user = state.used_bytes == reservation.bytes;
+
+        const Candidate = struct {
+            fn allowed(
+                current_used: u64,
+                current_reservation: u64,
+                additional: u64,
+                hard: u64,
+                bounded: u64,
+                sole_user: bool,
+                multiple: u64,
+            ) bool {
+                const next = std.math.add(u64, current_used, additional) catch return false;
+                if (hard == 0 or next <= hard) return true;
+                if (multiple <= 1 or !sole_user) return false;
+                const next_reservation = std.math.add(u64, current_reservation, additional) catch return false;
+                return next_reservation <= bounded;
+            }
+        };
+
+        var granted = @max(minimum_bytes, preferred_bytes);
+        if (!Candidate.allowed(
+            state.used_bytes,
+            reservation.bytes,
+            granted,
+            hard_limit,
+            bounded_limit,
+            reservation_is_sole_user,
+            max_hard_limit_multiple,
+        )) {
+            granted = minimum_bytes;
+            if (!Candidate.allowed(
+                state.used_bytes,
+                reservation.bytes,
+                granted,
+                hard_limit,
+                bounded_limit,
+                reservation_is_sole_user,
+                max_hard_limit_multiple,
+            )) {
+                state.hard_limit_rejections +|= 1;
+                return error.ResourceBudgetExceeded;
+            }
+        }
+
+        const previous_reservation = reservation.bytes;
+        state.used_bytes += granted;
+        reservation.bytes += granted;
+        state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
+        if (hard_limit > 0 and state.used_bytes > hard_limit and previous_reservation <= hard_limit)
+            state.oversized_single_grants +|= 1;
+        if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
+            state.soft_limit_events +|= 1;
+        self.pressure_change.advance();
+        return granted;
+    }
+
     pub fn releaseBytes(self: *ResourceManager, slice: Slice, bytes: u64) void {
         if (bytes == 0) return;
         lockAtomic(&self.mutex);
@@ -818,7 +934,7 @@ pub const ResourceManager = struct {
         defer self.mutex.unlock();
 
         var stats: [slice_count]SliceStats = undefined;
-        inline for (.{ Slice.lsm_block_table_cache, Slice.lsm_compaction_work, Slice.lsm_table_builder_working_set, Slice.lsm_in_memory_state, Slice.lsm_wal_write_working_set, Slice.lsm_wal_retention, Slice.lsm_recovery_working_set, Slice.hbc_node_metadata_cache, Slice.dense_search_working_set, Slice.dense_apply_working_set, Slice.dense_routing_working_set, Slice.derived_replay_window, Slice.full_text_pending_segments, Slice.full_text_build_working_set, Slice.full_text_segment_residency, Slice.document_extraction_working_set, Slice.derived_backlog, Slice.text_merge_buffers, Slice.algebraic_tensor_accumulators, Slice.sparse_apply_working_set, Slice.lite_native_page_cache, Slice.lite_native_link_cache, Slice.lite_docstore_snapshot_cache, Slice.inference_prompt_cache, Slice.dense_repair_working_set }, 0..) |slice, i| {
+        inline for (.{ Slice.lsm_block_table_cache, Slice.lsm_compaction_work, Slice.lsm_table_builder_working_set, Slice.lsm_in_memory_state, Slice.lsm_wal_write_working_set, Slice.lsm_wal_retention, Slice.lsm_recovery_working_set, Slice.hbc_node_metadata_cache, Slice.dense_search_working_set, Slice.dense_apply_working_set, Slice.dense_routing_working_set, Slice.derived_replay_window, Slice.full_text_pending_segments, Slice.full_text_build_working_set, Slice.full_text_segment_residency, Slice.document_extraction_working_set, Slice.derived_backlog, Slice.text_merge_buffers, Slice.algebraic_tensor_accumulators, Slice.sparse_apply_working_set, Slice.lite_native_page_cache, Slice.lite_native_link_cache, Slice.lite_docstore_snapshot_cache, Slice.inference_prompt_cache, Slice.dense_repair_working_set, Slice.shard_transition_working_set }, 0..) |slice, i| {
             const state = self.slices[i];
             stats[i] = .{
                 .name = slice.name(),
@@ -851,6 +967,15 @@ pub const ResourceManager = struct {
     /// usage alone intentionally does not reject an allocation after the fact.
     pub fn pressureDecision(self: *ResourceManager, slice: Slice) PressureDecision {
         return self.admissionDecision(slice, 0);
+    }
+
+    /// Returns whether the configured policy requires background work to yield
+    /// at the slice's current pressure. Rejection is also a deferral signal for
+    /// maintenance: foreground admission owns the remaining capacity.
+    pub fn shouldDeferBackgroundWork(self: *ResourceManager, slice: Slice) bool {
+        const decision = self.pressureDecision(slice);
+        if (decision.pressure == .normal) return false;
+        return decision.action == .defer_background_work or decision.action == .reject_work;
     }
 
     /// Evaluates an allocation before it joins an externally accounted slice.
@@ -1087,6 +1212,178 @@ pub const Reservation = struct {
         self.manager.releaseBytes(self.slice, self.bytes);
         self.released = true;
     }
+
+    pub fn growBoundedOversized(
+        self: *Reservation,
+        additional_bytes: u64,
+        max_hard_limit_multiple: u64,
+    ) !void {
+        if (self.released) return error.ReservationReleased;
+        try self.manager.growReservationBoundedOversized(
+            self,
+            additional_bytes,
+            max_hard_limit_multiple,
+        );
+    }
+
+    pub fn shrink(self: *Reservation, bytes: u64) void {
+        if (self.released or bytes == 0) return;
+        const released_bytes = @min(bytes, self.bytes);
+        self.manager.releaseBytes(self.slice, released_bytes);
+        self.bytes -= released_bytes;
+    }
+};
+
+/// Accounts allocator-backed working sets before each allocation reaches the
+/// backing allocator. One operation may make bounded progress above the normal
+/// hard limit only while it is the slice's sole user.
+pub const BudgetedAllocator = struct {
+    backing: std.mem.Allocator,
+    reservation: Reservation,
+    max_hard_limit_multiple: u64,
+    live_bytes: u64 = 0,
+    credit_quantum: u64,
+    budget_denied: bool = false,
+
+    pub fn init(
+        manager: *ResourceManager,
+        slice: Slice,
+        backing: std.mem.Allocator,
+        max_hard_limit_multiple: u64,
+    ) BudgetedAllocator {
+        const stats = manager.sliceStats(slice);
+        const credit_quantum = if (stats.hard_limit_bytes == 0)
+            1024 * 1024
+        else
+            @max(@as(u64, 1), @min(@as(u64, 1024 * 1024), stats.hard_limit_bytes / 64));
+        return .{
+            .backing = backing,
+            .reservation = .{
+                .manager = manager,
+                .slice = slice,
+                .bytes = 0,
+            },
+            .max_hard_limit_multiple = max_hard_limit_multiple,
+            .credit_quantum = credit_quantum,
+        };
+    }
+
+    pub fn deinit(self: *BudgetedAllocator) void {
+        self.reservation.release();
+        self.* = undefined;
+    }
+
+    pub fn allocator(self: *BudgetedAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    pub fn denied(self: *const BudgetedAllocator) bool {
+        return self.budget_denied;
+    }
+
+    fn reserveGrowth(self: *BudgetedAllocator, bytes: usize) bool {
+        const amount = std.math.cast(u64, bytes) orelse {
+            self.budget_denied = true;
+            return false;
+        };
+        const next_live = std.math.add(u64, self.live_bytes, amount) catch {
+            self.budget_denied = true;
+            return false;
+        };
+        if (next_live > self.reservation.bytes) {
+            const minimum = next_live - self.reservation.bytes;
+            _ = self.reservation.manager.growReservationAmortized(
+                &self.reservation,
+                minimum,
+                @max(minimum, self.credit_quantum),
+                self.max_hard_limit_multiple,
+            ) catch {
+                self.budget_denied = true;
+                return false;
+            };
+        }
+        self.live_bytes = next_live;
+        return true;
+    }
+
+    fn releaseBytes(self: *BudgetedAllocator, bytes: usize) void {
+        const amount = std.math.cast(u64, bytes) orelse std.math.maxInt(u64);
+        self.live_bytes -|= amount;
+        if (self.live_bytes == 0) {
+            self.reservation.shrink(self.reservation.bytes);
+            return;
+        }
+        const spare = self.reservation.bytes -| self.live_bytes;
+        if (spare < self.credit_quantum *| 2) return;
+        const retained_spare = @min(self.credit_quantum, self.reservation.bytes);
+        const target = self.live_bytes +| retained_spare;
+        if (self.reservation.bytes > target)
+            self.reservation.shrink(self.reservation.bytes - target);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.reserveGrowth(len)) return null;
+        return self.backing.rawAlloc(len, alignment, ret_addr) orelse {
+            self.releaseBytes(len);
+            return null;
+        };
+    }
+
+    fn resize(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.reserveGrowth(growth)) return false;
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) {
+            if (growth > 0) self.releaseBytes(growth);
+            return false;
+        }
+        if (new_len < memory.len) self.releaseBytes(memory.len - new_len);
+        return true;
+    }
+
+    fn remap(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.reserveGrowth(growth)) return null;
+        const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse {
+            if (growth > 0) self.releaseBytes(growth);
+            return null;
+        };
+        if (new_len < memory.len) self.releaseBytes(memory.len - new_len);
+        return ptr;
+    }
+
+    fn free(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.releaseBytes(memory.len);
+    }
 };
 
 fn sliceIndex(slice: Slice) usize {
@@ -1297,6 +1594,29 @@ test "resource manager records soft and hard budget pressure" {
     try std.testing.expectEqual(@as(u64, 1), stats.slices[sliceIndex(.derived_backlog)].hard_limit_rejections);
 }
 
+test "resource manager background deferral follows slice policy" {
+    var budgets = Options.defaultBudgets();
+    var policies = Options.defaultPolicies();
+    budgets[sliceIndex(.lsm_compaction_work)] = .{
+        .soft_limit_bytes = 10,
+        .hard_limit_bytes = 20,
+    };
+    policies[sliceIndex(.lsm_compaction_work)] = .{
+        .soft_action = .defer_background_work,
+        .hard_action = .reject_work,
+    };
+    var manager = ResourceManager.init(.{ .budgets = budgets, .policies = policies });
+
+    var observed: u64 = 0;
+    try std.testing.expect(!manager.shouldDeferBackgroundWork(.lsm_compaction_work));
+    manager.observeUsage(.lsm_compaction_work, &observed, 11);
+    try std.testing.expect(manager.shouldDeferBackgroundWork(.lsm_compaction_work));
+    manager.observeUsage(.lsm_compaction_work, &observed, 21);
+    try std.testing.expect(manager.shouldDeferBackgroundWork(.lsm_compaction_work));
+    manager.observeUsage(.lsm_compaction_work, &observed, 0);
+    try std.testing.expect(!manager.shouldDeferBackgroundWork(.lsm_compaction_work));
+}
+
 test "resource manager bounds and serializes oversized minimum progress" {
     var budgets = Options.defaultBudgets();
     budgets[sliceIndex(.text_merge_buffers)] = .{
@@ -1483,6 +1803,83 @@ test "resource manager rejects an impossible projected admission without waiting
         error.ResourceBudgetExceeded,
         manager.awaitAdmission(.lsm_in_memory_state, 21),
     );
+}
+
+test "budgeted allocator admits before allocation and releases exact live bytes" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.shard_transition_working_set)] = .{
+        .soft_limit_bytes = 8,
+        .hard_limit_bytes = 16,
+    };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    var budgeted = BudgetedAllocator.init(
+        &manager,
+        .shard_transition_working_set,
+        std.testing.allocator,
+        2,
+    );
+    defer budgeted.deinit();
+    const alloc = budgeted.allocator();
+
+    const first = try alloc.alloc(u8, 12);
+    try std.testing.expectEqual(@as(u64, 12), manager.sliceStats(.shard_transition_working_set).used_bytes);
+    const oversized = try alloc.alloc(u8, 12);
+    try std.testing.expectEqual(@as(u64, 24), manager.sliceStats(.shard_transition_working_set).used_bytes);
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 9));
+    try std.testing.expect(budgeted.denied());
+    try std.testing.expectEqual(@as(u64, 24), manager.sliceStats(.shard_transition_working_set).used_bytes);
+
+    alloc.free(oversized);
+    alloc.free(first);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.shard_transition_working_set).used_bytes);
+}
+
+test "budgeted allocator allows concurrent operations within the shared hard limit" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.shard_transition_working_set)] = .{
+        .soft_limit_bytes = 12,
+        .hard_limit_bytes = 32,
+    };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    var first = BudgetedAllocator.init(&manager, .shard_transition_working_set, std.testing.allocator, 2);
+    defer first.deinit();
+    var second = BudgetedAllocator.init(&manager, .shard_transition_working_set, std.testing.allocator, 2);
+    defer second.deinit();
+
+    const first_bytes = try first.allocator().alloc(u8, 16);
+    defer first.allocator().free(first_bytes);
+    const second_bytes = try second.allocator().alloc(u8, 16);
+    defer second.allocator().free(second_bytes);
+    try std.testing.expectEqual(@as(u64, 32), manager.sliceStats(.shard_transition_working_set).used_bytes);
+    try std.testing.expectError(error.OutOfMemory, second.allocator().alloc(u8, 1));
+}
+
+test "budgeted allocator amortizes manager reservations and releases idle credit" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.shard_transition_working_set)] = .{
+        .soft_limit_bytes = 64 * 1024 * 1024,
+        .hard_limit_bytes = 128 * 1024 * 1024,
+    };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    var budgeted = BudgetedAllocator.init(
+        &manager,
+        .shard_transition_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer budgeted.deinit();
+    const alloc = budgeted.allocator();
+
+    const first = try alloc.alloc(u8, 1);
+    const reserved = manager.sliceStats(.shard_transition_working_set).used_bytes;
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), reserved);
+    const second = try alloc.alloc(u8, 4096);
+    try std.testing.expectEqual(reserved, manager.sliceStats(.shard_transition_working_set).used_bytes);
+
+    alloc.free(first);
+    try std.testing.expectEqual(reserved, manager.sliceStats(.shard_transition_working_set).used_bytes);
+    alloc.free(second);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.shard_transition_working_set).used_bytes);
 }
 
 test "resource manager records index repair activation pause separately from cleanup" {

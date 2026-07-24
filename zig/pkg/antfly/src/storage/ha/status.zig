@@ -217,9 +217,10 @@ pub fn primarySnapshot(
 }
 
 pub fn standbySnapshot(standby: *const standby_mod.Standby, upstream_lsn: ?u64) StandbySnapshot {
-    const progress = standby.currentProgress();
+    const snapshot = standby.snapshot();
+    const progress = snapshot.progress;
     return .{
-        .identity = standby.identity,
+        .identity = snapshot.identity,
         .received_lsn = progress.received_lsn,
         .applied_lsn = progress.applied_lsn,
         .safe_read_lsn = progress.safe_read_lsn,

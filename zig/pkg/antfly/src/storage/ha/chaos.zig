@@ -279,13 +279,13 @@ test "storage.ha chaos rejects noncontiguous records and follows timeline switch
         try std.testing.expectEqualStrings("one", capture.payloads.items[0]);
 
         try std.testing.expectEqual(@as(u64, 2), try standby.receive(timelineSwitchRecord(promoted_identity, 2, 1)));
-        try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+        try std.testing.expectEqual(@as(u64, 2), standby.identitySnapshot().timeline_id);
     }
 
     {
         var reopened = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
         defer reopened.close();
-        try std.testing.expectEqual(@as(u64, 2), reopened.identity.timeline_id);
+        try std.testing.expectEqual(@as(u64, 2), reopened.identitySnapshot().timeline_id);
         try std.testing.expectEqual(@as(u64, 2), reopened.currentProgress().applied_lsn);
         try std.testing.expectError(error.WrongTimeline, reopened.receive(baseRecord(identity, 3, "old-timeline")));
 
@@ -624,7 +624,7 @@ test "storage.ha chaos network partition requires fence before standby promotion
     const promoted = try standby.promote(receipt.promotionRequest());
     try std.testing.expect(promoted.forced);
     try std.testing.expect(promoted.data_loss_possible);
-    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), standby.identitySnapshot().timeline_id);
     try std.testing.expectEqual(@as(u64, 2), standby.currentProgress().applied_lsn);
 
     const rejoin_blocked = rejoin.assessFormerPrimary(.{

@@ -1732,10 +1732,17 @@ const DistributedRightJoinGroups = struct {
     ) !?DistributedRightJoinGroups {
         var snapshot = (try ctx.adminSnapshot()) orelse return null;
         errdefer ctx.freeAdminSnapshot(&snapshot);
-        const right_table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+        const right_table = tables_api.findTableByName(&snapshot, table_name) orelse {
+            ctx.freeAdminSnapshot(&snapshot);
+            return null;
+        };
         const group_ids = try rightJoinGroupIdsFromSnapshot(alloc, &snapshot, right_table.table_id);
         errdefer alloc.free(group_ids);
-        if (group_ids.len < min_group_count) return null;
+        if (group_ids.len < min_group_count) {
+            alloc.free(group_ids);
+            ctx.freeAdminSnapshot(&snapshot);
+            return null;
+        }
         try validateDistributedJoinDocIdentityReady(&snapshot, right_table.table_id);
         return .{
             .ctx = ctx,
@@ -1986,7 +1993,10 @@ const StatefulDistributedShuffleEngine = struct {
         const right_table = tables_api.findTableByName(&snapshot, self.join.right_table) orelse return error.TableNotFound;
         const worker_group_ids = try rightJoinGroupIdsFromSnapshot(self.alloc, &snapshot, right_table.table_id);
         errdefer self.alloc.free(worker_group_ids);
-        if (worker_group_ids.len <= 1) return null;
+        if (worker_group_ids.len <= 1) {
+            self.alloc.free(worker_group_ids);
+            return null;
+        }
         try validateDistributedJoinDocIdentityReady(&snapshot, right_table.table_id);
         return worker_group_ids;
     }
@@ -4451,12 +4461,20 @@ pub fn mergeJoinedRightHitsAlloc(
 
         const left_value = extractJoinValueFromHit(hit_value, join.left_field) orelse {
             stats.rows_unmatched_left += 1;
-            if (join.join_type == .left) try joined_hits.append(joined_hit);
+            if (join.join_type == .left) {
+                try joined_hits.append(joined_hit);
+            } else {
+                deinitJsonValue(alloc, &joined_hit);
+            }
             continue;
         };
         const matched_right = findFirstMatchingRightHit(join, left_value, right_hits) orelse {
             stats.rows_unmatched_left += 1;
-            if (join.join_type == .left) try joined_hits.append(joined_hit);
+            if (join.join_type == .left) {
+                try joined_hits.append(joined_hit);
+            } else {
+                deinitJsonValue(alloc, &joined_hit);
+            }
             continue;
         };
 
@@ -4772,7 +4790,7 @@ fn buildRightJoinQueryValue(
     const filter_query_value = blk: {
         if (join.join_type == .right) {
             if (join.right_filters) |filters| {
-                if (filters.filter_query) |filter_query| break :blk try cloneJsonValue(alloc, filter_query);
+                if (filters.filter_query) |filter_query| break :blk try normalizePublicJoinFilterValueAlloc(alloc, filter_query);
             }
             break :blk null;
         }
@@ -4885,13 +4903,22 @@ fn buildCombinedRightFilterQueryValue(
             for (conjuncts.items) |*item| deinitJsonValue(alloc, item);
             conjuncts.deinit();
         }
-        try conjuncts.append(try cloneJsonValue(alloc, filter_query));
+        try conjuncts.append(try normalizePublicJoinFilterValueAlloc(alloc, filter_query));
         try conjuncts.append(join_filter);
         var obj = std.json.ObjectMap.empty;
         try obj.put(alloc, try alloc.dupe(u8, "conjuncts"), .{ .array = conjuncts });
         return .{ .object = obj };
     }
     return join_filter;
+}
+
+fn normalizePublicJoinFilterValueAlloc(
+    alloc: std.mem.Allocator,
+    filter_query: std.json.Value,
+) !std.json.Value {
+    const normalized_json = try query_contract.normalizePublicFilterQueryJsonAlloc(alloc, filter_query, 10);
+    defer alloc.free(normalized_json);
+    return try json_helpers.parseOwnedJsonValueAlloc(alloc, normalized_json);
 }
 
 fn buildMatchAllQueryValue(alloc: std.mem.Allocator) !std.json.Value {
@@ -4959,9 +4986,17 @@ fn buildJoinEqualityQuery(
     var query_obj = std.json.ObjectMap.empty;
     switch (value) {
         .string => |text| {
-            var term_obj = std.json.ObjectMap.empty;
-            try term_obj.put(alloc, try alloc.dupe(u8, field_name), .{ .string = try alloc.dupe(u8, text) });
-            try query_obj.put(alloc, try alloc.dupe(u8, "term"), .{ .object = term_obj });
+            if (std.mem.eql(u8, field_name, "_id")) {
+                var ids = std.json.Array.init(alloc);
+                try ids.append(.{ .string = try alloc.dupe(u8, text) });
+                var doc_id_obj = std.json.ObjectMap.empty;
+                try doc_id_obj.put(alloc, try alloc.dupe(u8, "ids"), .{ .array = ids });
+                try query_obj.put(alloc, try alloc.dupe(u8, "doc_id"), .{ .object = doc_id_obj });
+            } else {
+                var term_obj = std.json.ObjectMap.empty;
+                try term_obj.put(alloc, try alloc.dupe(u8, field_name), .{ .string = try alloc.dupe(u8, text) });
+                try query_obj.put(alloc, try alloc.dupe(u8, "term"), .{ .object = term_obj });
+            }
         },
         .integer => |number| {
             var range_obj = std.json.ObjectMap.empty;
@@ -5544,6 +5579,42 @@ test "distributed join applies auth row filter to right table filter query" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"conjuncts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tier\":\"premium\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tenant_id\":\"acme\"") != null);
+}
+
+test "distributed join uses the native document identity query for _id equality" {
+    const alloc = std.testing.allocator;
+
+    var id_query = try buildJoinEqualityQuery(alloc, "_id", .{ .string = "cust:a" });
+    defer deinitJsonValue(alloc, &id_query);
+    const id_json = try stringifyJsonValueAlloc(alloc, id_query);
+    defer alloc.free(id_json);
+    try std.testing.expectEqualStrings("{\"doc_id\":{\"ids\":[\"cust:a\"]}}", id_json);
+
+    var field_query = try buildJoinEqualityQuery(alloc, "customer_id", .{ .string = "cust:a" });
+    defer deinitJsonValue(alloc, &field_query);
+    const field_json = try stringifyJsonValueAlloc(alloc, field_query);
+    defer alloc.free(field_json);
+    try std.testing.expectEqualStrings("{\"term\":{\"customer_id\":\"cust:a\"}}", field_json);
+}
+
+test "distributed inner join releases cloned unmatched rows" {
+    const alloc = std.testing.allocator;
+
+    var join = SupportedJoinRequest{
+        .right_table = try alloc.dupe(u8, "customers"),
+        .join_type = .inner,
+        .left_field = try alloc.dupe(u8, "id"),
+        .right_field = try alloc.dupe(u8, "_id"),
+    };
+    defer join.deinit(alloc);
+
+    var left_hit = try testJoinHitAlloc(alloc, "doc:a", 1, "cust:missing");
+    defer deinitJsonValue(alloc, &left_hit);
+    var result = try mergeJoinedRightHitsAlloc(alloc, &.{left_hit}, join, &.{}, &.{}, false);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(i64, 1), result.stats.rows_unmatched_left);
 }
 
 /// Ordered comparison of two JSON values. Returns -1 (less), 0 (equal), or

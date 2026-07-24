@@ -131,10 +131,11 @@ pub const Server = struct {
         if (req.method == .GET and std.mem.eql(u8, path, Routes.health)) {
             return try textResponse(self.alloc, 200, "ok");
         }
-        if (self.auth.state_mutex) |mutex| {
+        const state_mutex = self.auth.state_mutex;
+        if (state_mutex) |mutex| {
             platform_sync.lockYielding(mutex);
-            defer mutex.unlock();
         }
+        defer if (state_mutex) |mutex| mutex.unlock();
         defer if (self.auth.state_changed) |hook| hook.run();
         switch (req.method) {
             .GET => {
@@ -2637,7 +2638,7 @@ test "storage.ha http admin serves health and command endpoint" {
     defer unfenced_promote.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), unfenced_promote.status);
     try expectContains(unfenced_promote.body, "FenceReceiptMissing");
-    try std.testing.expectEqual(@as(u64, 1), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 1), standby.identitySnapshot().timeline_id);
 
     var typed_fence = try server.handle(.{
         .method = .POST,
@@ -2764,6 +2765,42 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2");
 }
 
+test "storage.ha http admin holds state lock through mutation hook" {
+    const Observation = struct {
+        mutex: *std.atomic.Mutex,
+        hook_ran: bool = false,
+        hook_observed_lock: bool = false,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.hook_ran = true;
+            if (self.mutex.tryLock()) {
+                self.mutex.unlock();
+                return;
+            }
+            self.hook_observed_lock = true;
+        }
+    };
+
+    var mutex: std.atomic.Mutex = .unlocked;
+    var observation = Observation{ .mutex = &mutex };
+    var server = Server.initWithOptions(std.testing.allocator, .{}, .{
+        .state_mutex = &mutex,
+        .state_changed = .{
+            .ptr = &observation,
+            .run_fn = Observation.run,
+        },
+    });
+
+    var response = try server.handle(.{ .method = .GET, .uri = Routes.ready });
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expect(observation.hook_ran);
+    try std.testing.expect(observation.hook_observed_lock);
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+}
+
 test "storage.ha http admin reports unsafe promotion as conflict" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "unsafe-promote-conflict");
@@ -2798,7 +2835,7 @@ test "storage.ha http admin reports unsafe promotion as conflict" {
     defer unsafe_promote.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), unsafe_promote.status);
     try expectContains(unsafe_promote.body, "PromotionNotAllowed");
-    try std.testing.expectEqual(@as(u64, 1), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 1), standby.identitySnapshot().timeline_id);
     try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().received_lsn);
 }
 
@@ -3030,7 +3067,7 @@ test "storage.ha http admin accepts whole instance identity" {
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":2");
     try expectContains(typed_promote.body, "\"node_id\":\"standby-a\"");
     try expectContains(typed_promote.body, "\"forced\":true");
-    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), standby.identitySnapshot().timeline_id);
 }
 
 test "storage.ha http admin promotes from operation-specific fence request body" {
@@ -3066,7 +3103,7 @@ test "storage.ha http admin promotes from operation-specific fence request body"
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":2");
     try expectContains(typed_promote.body, "\"forced\":true");
     try expectContains(typed_promote.body, "\"data_loss_possible\":true");
-    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), standby.identitySnapshot().timeline_id);
 }
 
 test "storage.ha http admin serves typed base backup seed endpoints" {

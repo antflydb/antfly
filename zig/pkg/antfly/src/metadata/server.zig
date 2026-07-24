@@ -85,6 +85,10 @@ pub const MetadataServer = struct {
                 metadataStoreGroupRouter(svc),
                 metadataDataBearingStoreGroupRouter(svc),
                 svc.raft.host.http_host.request_executor,
+                .{
+                    .ptr = svc,
+                    .is_ready = metadataGroupTransitionReady,
+                },
                 local_ops,
             );
             try svc.raft.replaceTransitionOps(hosted_ops.adapter());
@@ -217,6 +221,11 @@ pub const MetadataServer = struct {
         };
     }
 
+    fn metadataGroupTransitionReady(ptr: *anyopaque, group_id: u64) !bool {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try svc.groupTransitionReady(group_id);
+    }
+
     pub fn deinit(self: *MetadataServer) void {
         self.stopRestoreSupervisor();
         if (self.owned_admin_listener) |listener| {
@@ -342,6 +351,14 @@ pub const MetadataServer = struct {
         try self.svc.runRound();
     }
 
+    pub fn runRaftRoundOnly(self: *MetadataServer) !void {
+        try self.svc.runRaftRoundOnly();
+    }
+
+    pub fn runControlRoundOnly(self: *MetadataServer) !void {
+        try self.svc.runControlRoundOnly();
+    }
+
     pub fn runCdcRound(self: *MetadataServer) !void {
         try self.svc.runCdcRound();
     }
@@ -376,6 +393,14 @@ pub const MetadataServer = struct {
 
     pub fn adminSnapshot(self: *MetadataServer) !@import("api.zig").AdminSnapshot {
         return try self.svc.adminSnapshot();
+    }
+
+    pub fn validatePublication(self: *MetadataServer, contract: @import("api.zig").CatalogPublicationContract) !bool {
+        return try self.svc.validatePublication(contract);
+    }
+
+    pub fn validateTablePublication(self: *MetadataServer, contract: @import("api.zig").CatalogTablePublicationContract) !bool {
+        return try self.svc.validateTablePublication(contract);
     }
 
     pub fn freeAdminSnapshot(self: *MetadataServer, snapshot: *@import("api.zig").AdminSnapshot) void {

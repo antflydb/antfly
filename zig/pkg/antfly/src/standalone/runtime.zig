@@ -29,6 +29,16 @@ const http_common = antfly.common.http;
 const public_api_max_requests_per_connection: u32 = 64;
 const public_api_max_body_size: usize = antfly.common.http.default_max_request_bytes;
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
+
+const LocalSchemaProgressProvider = struct {
+    ptr: *anyopaque,
+    collect: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const antfly.metadata.TableRecord,
+        ranges: []const antfly.metadata.RangeRecord,
+    ) anyerror!antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot,
+};
 const default_public_port: u16 = 8080;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
 const standalone_session_ttl_ns: u64 = std.time.ns_per_hour;
@@ -84,7 +94,7 @@ const CliConfig = struct {
     bind_port: ?u16 = null,
     health_enabled: ?bool = null,
     health_port: ?u16 = null,
-    tick_ms: ?u64 = null,
+    control_tick_ms: u64 = antfly.raft.RuntimeCadence.default_control_tick_ms,
     local_node_id: ?u64 = null,
     auth_enabled: ?bool = null,
     ard_base_url: ?[]const u8 = null,
@@ -328,6 +338,7 @@ const LocalStandaloneMetadata = struct {
     storage_engine: antfly.common.config.StorageEngine = .local,
     epoch: u64 = 1,
     last_schema_migration_finalize_at_ms: u64 = 0,
+    local_schema_progress_provider: ?LocalSchemaProgressProvider = null,
 
     const PersistedCatalog = struct {
         epoch: u64 = 1,
@@ -981,19 +992,33 @@ const LocalStandaloneMetadata = struct {
         defer self.alloc.free(hosted_group_ids);
         for (snapshot.ranges, 0..) |range, i| hosted_group_ids[i] = range.group_id;
 
-        const progress = try antfly.metadata.table_provisioner.collectLocalSchemaProgressWithOptions(
-            self.alloc,
-            self.replica_root_dir,
-            group_ids.main_metadata_group_id,
-            self.local_node_id,
-            hosted_group_ids,
-            snapshot.tables,
-            snapshot.ranges,
-            .{
-                .backend_runtime = self.backend_runtime,
-            },
-        );
-        defer self.alloc.free(progress);
+        var runtime_progress: ?antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot = null;
+        defer if (runtime_progress) |*progress| progress.deinit(self.alloc);
+        var filesystem_progress: ?[]antfly.metadata.SchemaProgressRecord = null;
+        defer if (filesystem_progress) |progress| self.alloc.free(progress);
+        const progress: []const antfly.metadata.SchemaProgressRecord = progress: {
+            if (self.local_schema_progress_provider) |provider| {
+                runtime_progress = try provider.collect(provider.ptr, self.alloc, snapshot.tables, snapshot.ranges);
+                if (runtime_progress.?.records.len != 0) break :progress runtime_progress.?.records;
+                // A complete runtime observation is authoritative even while
+                // not ready. Do not contend with its live writer by reopening
+                // the same root through the filesystem fallback.
+                if (runtime_progress.?.runtime_coverage_complete) return;
+            }
+            filesystem_progress = try antfly.metadata.table_provisioner.collectLocalSchemaProgressWithOptions(
+                self.alloc,
+                self.replica_root_dir,
+                group_ids.main_metadata_group_id,
+                self.local_node_id,
+                hosted_group_ids,
+                snapshot.tables,
+                snapshot.ranges,
+                .{
+                    .backend_runtime = self.backend_runtime,
+                },
+            );
+            break :progress filesystem_progress.?;
+        };
         if (progress.len == 0) return;
 
         lockAtomic(&self.mutex);
@@ -1497,6 +1522,7 @@ pub fn runFromIterator(
 
     // Initialize API server (wires caches + sources) without binding a listener.
     try data_server.initApiServer();
+    local_metadata.local_schema_progress_provider = localSchemaProgressProvider(&data_server);
     const api_server = &data_server.http_server.?;
     if (lite_backend) |*backend| {
         try api_server.attachRestoreJobRuntimeStore(try backend.runtimeStoreForNamespace("system/api-restore-jobs"));
@@ -1577,7 +1603,11 @@ pub fn runFromIterator(
     // Print only after the public listener has successfully bound.
     std.debug.print("standalone local metadata enabled (raft disabled)\n", .{});
 
-    const tick_ms = cli.tick_ms orelse 100;
+    const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
+        antfly.raft.RuntimeCadence.default_raft_tick_ms,
+        cli.control_tick_ms,
+    ) catch return error.InvalidArguments;
+    const tick_ms = @divExact(runtime_cadence.control_tick_ns, std.time.ns_per_ms);
     var req = std.posix.timespec{
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
@@ -2555,6 +2585,23 @@ fn localReplicaRootReconcileHook(data_server: *antfly.data.runtime.DataServer) a
     };
 }
 
+fn localSchemaProgressProvider(data_server: *antfly.data.runtime.DataServer) LocalSchemaProgressProvider {
+    return .{
+        .ptr = data_server,
+        .collect = collectLocalSchemaProgress,
+    };
+}
+
+fn collectLocalSchemaProgress(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    tables: []const antfly.metadata.TableRecord,
+    ranges: []const antfly.metadata.RangeRecord,
+) !antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot {
+    const data_server: *antfly.data.runtime.DataServer = @ptrCast(@alignCast(ptr));
+    return try data_server.collectLocalSchemaProgressSnapshot(alloc, tables, ranges);
+}
+
 fn localReplicaRootReconcilePermitHook(data_server: *antfly.data.runtime.DataServer) antfly.metadata_service.LocalReplicaRootReconcilePermitHook {
     return .{
         .ptr = data_server,
@@ -2564,9 +2611,17 @@ fn localReplicaRootReconcilePermitHook(data_server: *antfly.data.runtime.DataSer
     };
 }
 
-fn runLocalReplicaRootReconcileHook(ptr: *anyopaque) !void {
+fn runLocalReplicaRootReconcileHook(
+    ptr: *anyopaque,
+    request: antfly.metadata_service.LocalReplicaRootReconcileHook.Request,
+) !antfly.metadata.table_provisioner.ProvisionSummary {
     const data_server: *antfly.data.runtime.DataServer = @ptrCast(@alignCast(ptr));
-    try data_server.reconcileVisibleProvisionedReplicaState();
+    return try data_server.reconcileVisibleProvisionedReplicaStateFromSnapshot(
+        request.metadata_group_id,
+        request.group_ids,
+        request.tables,
+        request.ranges,
+    );
 }
 
 fn runLocalReplicaRootReconcilePermitHook(ptr: *anyopaque) bool {
@@ -2788,8 +2843,8 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.health_enabled = parseBoolFlag(arg["--health=".len..]) orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--tick-ms")) {
-            cfg.tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--control-tick-ms")) {
+            cfg.control_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--auth")) {
@@ -3604,7 +3659,7 @@ fn printUsage() void {
         \\  --ard-publisher-domain <name>         ARD did:web publisher domain (default: antfly.local)
         \\  --ard-display-name <name>             ARD catalog host display name (default: Antfly)
         \\  --ard-public-catalog <bool>           Publish anonymous /.well-known ARD bootstrap when auth is enabled
-        \\  --tick-ms <ms>                        Sleep interval while serving (default: 25)
+        \\  --control-tick-ms <ms>                Control scheduling interval, 1-60000 (default: 100)
         \\  --models-dir <path>                   Embedded AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <path>                       Embedded Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --inference-host-budget-mb <n>        Embedded inference native generation host budget override
@@ -3876,7 +3931,7 @@ test "standalone bridge shared adapter preserves protocol headers and absent bod
     try std.testing.expectEqualStrings("", req.body);
 }
 
-test "standalone runtime local replica reconcile permit stays blocked while startup debt is unresolved" {
+test "standalone runtime local replica reconcile permit blocks only active startup catch-up" {
     var data_server = antfly.data.runtime.DataServer{
         .alloc = std.testing.allocator,
         .provisioned_storage = undefined,
@@ -3895,7 +3950,7 @@ test "standalone runtime local replica reconcile permit stays blocked while star
     try std.testing.expect(runLocalReplicaRootReconcilePermitHook(&data_server));
 
     data_server.last_provision_metadata_epoch = 17;
-    try std.testing.expect(!runLocalReplicaRootReconcilePermitHook(&data_server));
+    try std.testing.expect(runLocalReplicaRootReconcilePermitHook(&data_server));
 
     data_server.last_provision_fingerprint = 99;
     try std.testing.expect(runLocalReplicaRootReconcilePermitHook(&data_server));
@@ -5161,6 +5216,65 @@ test "standalone metadata rolls back an undurable catalog mutation" {
     }
     try std.testing.expectEqual(@as(u64, 1), metadata.epoch);
     try std.testing.expect(metadata.findTableByNameLocked("docs") == null);
+}
+
+test "standalone metadata finalizes schema migration from resident runtime evidence" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, catalog_path),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(.{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":1}",
+        .read_schema_json = "{\"version\":0}",
+        .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+    });
+    try metadata.manager.upsertRange(.{
+        .group_id = 70,
+        .table_id = 7,
+        .start_key = "",
+    });
+
+    const Provider = struct {
+        fn collect(
+            _: *anyopaque,
+            provider_alloc: std.mem.Allocator,
+            _: []const antfly.metadata.TableRecord,
+            _: []const antfly.metadata.RangeRecord,
+        ) !antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot {
+            const records = try provider_alloc.alloc(antfly.metadata.SchemaProgressRecord, 1);
+            records[0] = .{ .table_id = 7, .node_id = 1, .schema_version = 1 };
+            return .{ .records = records, .runtime_coverage_complete = true };
+        }
+    };
+    metadata.local_schema_progress_provider = .{
+        .ptr = undefined,
+        .collect = Provider.collect,
+    };
+
+    try metadata.finalizeReadySchemaMigrations();
+    const table = metadata.findTableByNameLocked("docs") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", table.read_schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v1") != null);
 }
 
 test "standalone unified server lifecycle propagates startup failure" {
