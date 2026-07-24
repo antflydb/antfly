@@ -65,7 +65,7 @@ require (
 	github.com/RaduBerinde/btreemap v0.0.0-20260105202824-d3184786f603 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.16.0 // indirect
 	github.com/a2aproject/a2a-go v0.3.12 // indirect
-	github.com/ajroetker/go-highway v0.0.13-0.20260309234436-8d249c4caa48 // indirect
+	github.com/ajroetker/go-highway v0.0.13-0.20260528204430-c3b5b59834b1 // indirect
 	github.com/ajroetker/go-jpeg2000 v0.0.2 // indirect
 	github.com/ajroetker/pdf v0.0.1-antfly001 // indirect
 	github.com/ajroetker/pdf/render v0.0.1-antfly003 // indirect

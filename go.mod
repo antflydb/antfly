@@ -45,7 +45,7 @@ require (
 	cloud.google.com/go/speech v1.30.0
 	codeberg.org/readeck/go-readability/v2 v2.1.1
 	github.com/a2aproject/a2a-go v0.3.12
-	github.com/ajroetker/go-highway v0.0.13-0.20260309234436-8d249c4caa48
+	github.com/ajroetker/go-highway v0.0.13-0.20260528204430-c3b5b59834b1
 	github.com/ajroetker/pdf v0.0.1-antfly001
 	github.com/ajroetker/pdf/render v0.0.1-antfly003
 	github.com/alpkeskin/gotoon v0.1.1
