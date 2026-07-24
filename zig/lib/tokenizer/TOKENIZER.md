@@ -126,10 +126,13 @@ the tokenizer is deinitialized.
 `BpeCacheConfig.resource_budget` optionally supplies cold-path `try_reserve`
 and `release` callbacks. Antfly standalone connects these callbacks to the
 node `ResourceManager`'s `inference.tokenizer_cache` slice, which enforces a
-128 MiB aggregate hard limit across loaded tokenizers. Cache hits never call
-the manager. A rejected fixed-table reservation disables the optional cache;
-a rejected entry reservation simply leaves that pretoken uncached, so resource
-pressure never makes tokenization fail.
+64 MiB aggregate soft target and a 128 MiB emergency hard limit across loaded
+tokenizers. The standalone adapter stops admitting optional cache growth when
+the projected allocation reaches the slice's `shrink_cache` pressure state;
+the atomic hard guard closes races between producers. Cache hits never call the
+manager. A rejected or failed fixed-table allocation disables the optional
+cache; a rejected entry reservation simply leaves that pretoken uncached, so
+resource pressure never makes model loading or tokenization fail.
 
 ## Accepted optimizations
 

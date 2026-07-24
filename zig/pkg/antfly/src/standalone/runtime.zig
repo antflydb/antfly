@@ -1722,6 +1722,13 @@ fn tokenizerCacheResourceBudget(
 fn reserveTokenizerCacheBytes(context: *anyopaque, bytes: usize) bool {
     const manager: *antfly.resource_manager.ResourceManager =
         @ptrCast(@alignCast(context));
+    // Cache growth is optional: honor the slice's shrink policy at the soft
+    // boundary by declining new entries/workspace retention. reserve() below
+    // remains the atomic hard guard if another producer wins the race.
+    if (manager.admissionDecision(
+        .inference_tokenizer_cache,
+        @intCast(bytes),
+    ).action == .shrink_cache) return false;
     var reservation = manager.reserve(
         .inference_tokenizer_cache,
         @intCast(bytes),

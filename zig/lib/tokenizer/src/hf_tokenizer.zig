@@ -432,11 +432,14 @@ pub const HfTokenizer = struct {
             }
         }
         if (self.model_type == .bpe) {
-            const cache = try allocator.create(BpeCache);
-            cache.* = .{};
-            cache.used_bytes.store(@sizeOf(BpeCache), .monotonic);
-            self.bpe_cache = cache;
-            errdefer allocator.destroy(cache);
+            // The pretoken cache is optional. Model loading and correct
+            // tokenization remain available when process memory pressure
+            // prevents allocating its fixed table.
+            if (allocator.create(BpeCache)) |cache| {
+                cache.* = .{};
+                cache.used_bytes.store(@sizeOf(BpeCache), .monotonic);
+                self.bpe_cache = cache;
+            } else |_| {}
         }
 
         // Parse pre-tokenizer
