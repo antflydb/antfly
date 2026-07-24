@@ -847,6 +847,19 @@ pub const MultiRaft = struct {
 
         const ready_pressure = summarizeReady(group_id, ready);
         const async_storage_writes = grp.asyncStorageWrites();
+        // Applying a committed configuration change mutates Raft progress and
+        // can append to (and reallocate) the node's message buffer. Ready's
+        // message slice aliases that buffer, so preserve it before applying a
+        // configuration change. Async handling also steps local messages and
+        // therefore always needs an owned copy.
+        const clone_messages_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+        var owned_ready_messages: ?[]core.Message = null;
+        defer if (owned_ready_messages) |messages| core.message.freeMessages(self.alloc, messages);
+        const ready_messages = if (async_storage_writes or containsConfChange(ready.committed_entries)) blk: {
+            owned_ready_messages = try core.message.cloneMessages(self.alloc, ready.messages);
+            break :blk owned_ready_messages.?;
+        } else ready.messages;
+        if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
         if (diagnostics) |diag| {
             diag.message_count = ready_pressure.message_count;
             diag.message_bytes = ready_pressure.message_bytes;
@@ -949,14 +962,14 @@ pub const MultiRaft = struct {
 
         if (async_storage_writes) {
             const async_ready_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-            try self.handleAsyncReady(group_id, grp, ready, outbox, flush_apply_queue, diagnostics);
+            try self.handleAsyncReady(group_id, grp, ready, ready_messages, outbox, flush_apply_queue, diagnostics);
             if (diagnostics) |diag| diag.async_ready_elapsed_ns = clock.elapsedSinceNs(async_ready_start_ns);
         } else {
             const enqueue_apply_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             try self.enqueueApply(group_id, ready.snapshot, ready.committed_entries, ready.read_states, grp.status().conf_state);
             if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
             const outbox_append_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-            try outbox.appendMessages(self.alloc, group_id, ready.messages);
+            try outbox.appendMessages(self.alloc, group_id, ready_messages);
             if (diagnostics) |diag| diag.outbox_append_elapsed_ns = clock.elapsedSinceNs(outbox_append_start_ns);
             const advance_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             grp.advance(ready);
@@ -982,20 +995,24 @@ pub const MultiRaft = struct {
         return true;
     }
 
+    fn containsConfChange(entries: []const core.Entry) bool {
+        for (entries) |entry| switch (entry.entry_type) {
+            .conf_change, .conf_change_v2 => return true,
+            else => {},
+        };
+        return false;
+    }
+
     fn handleAsyncReady(
         self: *MultiRaft,
         group_id: core.types.GroupId,
         grp: *group_mod.Group,
         ready: core.Ready,
+        ready_messages: []const core.Message,
         outbox: *TransportOutbox,
         flush_apply_queue: bool,
         diagnostics: ?*ReadyGroupDiagnostics,
     ) !void {
-        const clone_messages_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        const messages = try core.message.cloneMessages(self.alloc, ready.messages);
-        defer core.message.freeMessages(self.alloc, messages);
-        if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
-
         const enqueue_apply_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         try self.enqueueApply(group_id, ready.snapshot, ready.committed_entries, ready.read_states, grp.status().conf_state);
         if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
@@ -1006,7 +1023,7 @@ pub const MultiRaft = struct {
         }
 
         const async_message_loop_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        for (messages) |msg| {
+        for (ready_messages) |msg| {
             switch (msg.msg_type) {
                 .storage_append => try self.handleLocalStorageAppend(group_id, grp, msg, outbox),
                 .storage_apply => try self.handleLocalStorageApply(group_id, grp, msg, outbox),

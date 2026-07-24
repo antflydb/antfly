@@ -1485,24 +1485,24 @@ const MembershipTransitionIndex = struct {
 
         // A removed member is not guaranteed to apply the configuration entry
         // that removes it: the surviving quorum may commit and stop replication
-        // first. Its stale self-report therefore cannot veto finalization. The
-        // exact final-set reports below are the authoritative proof: every
-        // survivor agrees on the stable voter fingerprint and one is leader.
-        var final_leader_proved = false;
+        // first. A surviving follower can likewise lag the committed entry.
+        // Neither stale report can veto finalization: applying the exact stable
+        // final set on the live leader proves that the removal committed.
         for (final_peers) |node_id| {
             const intent = self.currentIntent(source.record.group_id, node_id) orelse return false;
             const store = self.storeForIntent(intent) orelse continue;
             if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) continue;
             const status = self.statusForStore(source.record.group_id, store.store_id) orelse continue;
+            if (!status.local_leader) continue;
             if (!status.local_voter or status.joint_consensus or status.transition_pending or
                 !status.voter_set_known or @as(usize, status.voter_count) != state.latched_voter_count or
                 !std.mem.eql(u8, &status.voter_set_fingerprint, &state.latched_fingerprint.?))
             {
                 return false;
             }
-            final_leader_proved = final_leader_proved or status.local_leader;
+            return true;
         }
-        return final_leader_proved;
+        return false;
     }
 };
 
@@ -3863,7 +3863,7 @@ test "metadata reconciler latches final membership across planner churn" {
     try std.testing.expect(!membership_index.preserveCurrentPlacement(2233, 101));
 }
 
-test "metadata reconciler retires a stale source after exact final leader proof" {
+test "metadata reconciler retires after exact final leader proof despite stale follower" {
     const current = [_]raft_reconciler.PlacementIntent{
         .{
             .record = .{ .group_id = 2234, .replica_id = 1, .local_node_id = 101 },
@@ -3926,9 +3926,9 @@ test "metadata reconciler retires a stale source after exact final leader proof"
             .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
                 .group_id = 2234,
                 .local_voter = true,
-                .voter_count = 2,
+                .voter_count = 3,
                 .voter_set_known = true,
-                .voter_set_fingerprint = final_fingerprint,
+                .voter_set_fingerprint = stale_fingerprint,
             }})[0..]),
         },
     };
