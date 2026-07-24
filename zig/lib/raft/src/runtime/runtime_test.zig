@@ -17,6 +17,10 @@ const core = @import("../core/mod.zig");
 const runtime = @import("mod.zig");
 const clock = @import("clock.zig");
 
+fn sleepOneMillisecond() void {
+    std.testing.io.sleep(.fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
+}
+
 const StorageRecorder = struct {
     alloc: std.mem.Allocator,
     stores: std.AutoHashMapUnmanaged(core.types.GroupId, *core.MemoryStorage) = .empty,
@@ -894,7 +898,7 @@ test "multi raft compacts active applied log after retained entry window" {
     const completion_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
     while (host.group(63).?.raw_node.raft.log.firstIndex() < 8 and clock.monotonicNs() < completion_deadline) {
         _ = try host.drainReady(0);
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepOneMillisecond();
     }
 
     const grp = host.group(63) orelse return error.UnknownGroup;
@@ -957,7 +961,7 @@ test "multi raft applies an incoming snapshot before stale compaction maintenanc
                 .term = 2,
                 .conf_state = .{ .voters = peers[0..] },
             },
-            .data = "incoming-state",
+            .data = @constCast("incoming-state"),
         },
     });
 
@@ -1000,7 +1004,7 @@ test "multi raft cancels and drops a snapshot from a retired group incarnation" 
 
     const start_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
     while (!apply_recorder.snapshot_materialization_started.load(.acquire) and clock.monotonicNs() < start_deadline) {
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepOneMillisecond();
     }
     try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
     try std.testing.expect(host.removeGroup(64));
@@ -1011,7 +1015,7 @@ test "multi raft cancels and drops a snapshot from a retired group incarnation" 
     const stale_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
     while (host.metricsSnapshot().snapshot_compaction_stale_drops == 0 and clock.monotonicNs() < stale_deadline) {
         _ = try host.drainReady(0);
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepOneMillisecond();
     }
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().snapshot_compaction_stale_drops);
     try std.testing.expectEqual(@as(usize, 0), storage_recorder.persisted_snapshots);
@@ -1044,7 +1048,7 @@ test "multi raft retries a failed snapshot build without requiring another write
     var attempts: usize = 0;
     while (host.metricsSnapshot().snapshot_compaction_completions == 0 and attempts < 5_000) : (attempts += 1) {
         _ = try host.drainReady(0);
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepOneMillisecond();
     }
     const metrics = host.metricsSnapshot();
     try std.testing.expectEqual(@as(usize, 1), metrics.snapshot_compaction_failures);
@@ -1126,7 +1130,7 @@ test "multi raft yields a repeatedly failing snapshot publish to queued groups" 
     var attempts: usize = 0;
     while (host.metricsSnapshot().snapshot_compaction_completions < 2 and attempts < 5_000) : (attempts += 1) {
         _ = try host.drainReady(0);
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepOneMillisecond();
     }
     try std.testing.expectEqual(@as(usize, 2), host.metricsSnapshot().snapshot_compaction_completions);
     try std.testing.expectEqual(@as(core.types.GroupId, 69), storage_recorder.compacted_groups[0]);
@@ -1162,7 +1166,7 @@ test "multi raft shutdown cancels a blocked snapshot materialization" {
 
     const start_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
     while (!apply_recorder.snapshot_materialization_started.load(.acquire) and clock.monotonicNs() < start_deadline) {
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepOneMillisecond();
     }
     try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
 
@@ -1206,7 +1210,7 @@ test "multi raft snapshot scheduling is fair when a hot group requeues" {
 
     const start_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
     while (!apply_recorder.snapshot_materialization_started.load(.acquire) and clock.monotonicNs() < start_deadline) {
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepOneMillisecond();
     }
     try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
     try host.propose(67, "cold");
@@ -1221,7 +1225,7 @@ test "multi raft snapshot scheduling is fair when a hot group requeues" {
     const completion_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
     while (apply_recorder.snapshot_materializations.load(.acquire) < 3 and clock.monotonicNs() < completion_deadline) {
         _ = try host.drainReady(0);
-        std.Thread.sleep(std.time.ns_per_ms);
+        sleepOneMillisecond();
     }
     try std.testing.expect(apply_recorder.snapshot_materializations.load(.acquire) >= 3);
     try std.testing.expectEqual(@as(core.types.GroupId, 66), apply_recorder.materialized_groups[0].load(.acquire));

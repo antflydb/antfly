@@ -180,9 +180,19 @@ pub const PlacementPlanner = struct {
                 protect_current_members,
             );
             defer self.alloc.free(preserved);
+            var selection_exclusions = std.ArrayListUnmanaged(u64).empty;
+            defer selection_exclusions.deinit(self.alloc);
             for (preserved) |node_id| {
                 if (selected.items.len >= replica_count) break;
                 try selected.append(self.alloc, node_id);
+                try selection_exclusions.append(self.alloc, node_id);
+            }
+            for (current_intents) |intent| {
+                if (intent.record.group_id != range.group_id or
+                    containsNode(selection_exclusions.items, intent.record.local_node_id))
+                    continue;
+                if (replicaIdExistsOnSelectedNode(current_intents, range.group_id, intent.record.replica_id, selected.items))
+                    try selection_exclusions.append(self.alloc, intent.record.local_node_id);
             }
 
             const start = @as(usize, @intCast(range.group_id % candidate_node_ids.len));
@@ -192,9 +202,10 @@ pub const PlacementPlanner = struct {
                 try orderCandidates(self.alloc, candidate_node_ids, candidate_domains, start, &load_by_node);
             defer self.alloc.free(ordered);
             while (selected.items.len < replica_count) {
-                const node_id = chooseNextCandidate(ordered, selected.items, &pair_by_nodes, candidate_domains, table.placement_role) orelse break;
+                const node_id = chooseNextCandidate(ordered, selection_exclusions.items, &pair_by_nodes, candidate_domains, table.placement_role) orelse break;
                 if (containsNode(selected.items, node_id)) break;
                 try selected.append(self.alloc, node_id);
+                try selection_exclusions.append(self.alloc, node_id);
             }
 
             const dropped_sources = try collectDroppedCurrentPeers(self.alloc, current_intents, range.group_id, selected.items);
@@ -203,6 +214,8 @@ pub const PlacementPlanner = struct {
 
             const peers = try self.alloc.dupe(u64, selected.items);
             defer self.alloc.free(peers);
+            var assigned_replica_ids = std.ArrayListUnmanaged(u64).empty;
+            defer assigned_replica_ids.deinit(self.alloc);
             for (peers) |node_id| {
                 const entry = try load_by_node.getOrPut(self.alloc, node_id);
                 if (!entry.found_existing) entry.value_ptr.* = 0;
@@ -241,12 +254,17 @@ pub const PlacementPlanner = struct {
                     .bootstrapping
                 else
                     .serving;
-                const replica_id = if (existing_intent) |existing|
+                const preferred_replica_id = if (existing_intent) |existing|
                     existing.record.replica_id
                 else if (replacement_source) |source|
                     source.record.replica_id
                 else
                     @as(u64, @intCast(replica_index + 1));
+                const replica_id = if (!containsNode(assigned_replica_ids.items, preferred_replica_id))
+                    preferred_replica_id
+                else
+                    firstUnusedReplicaId(assigned_replica_ids.items, replica_count);
+                try assigned_replica_ids.append(self.alloc, replica_id);
                 try out.append(self.alloc, .{
                     .record = .{
                         .group_id = range.group_id,
@@ -580,6 +598,14 @@ fn collectCurrentPeers(
         }
     }.lessThan);
 
+    var unique_count: usize = 0;
+    for (peers.items) |peer| {
+        if (unique_count > 0 and peers.items[unique_count - 1].replica_id == peer.replica_id) continue;
+        peers.items[unique_count] = peer;
+        unique_count += 1;
+    }
+    peers.items.len = unique_count;
+
     const out = try alloc.alloc(u64, peers.items.len);
     for (peers.items, 0..) |peer, i| out[i] = peer.node_id;
     peers.deinit(alloc);
@@ -635,6 +661,28 @@ fn findCurrentIntent(
     return null;
 }
 
+fn replicaIdExistsOnSelectedNode(
+    current_intents: []const raft_reconciler.PlacementIntent,
+    group_id: u64,
+    replica_id: u64,
+    selected_nodes: []const u64,
+) bool {
+    for (current_intents) |intent| {
+        if (intent.record.group_id == group_id and
+            intent.record.replica_id == replica_id and
+            containsNode(selected_nodes, intent.record.local_node_id))
+            return true;
+    }
+    return false;
+}
+
+fn firstUnusedReplicaId(used_replica_ids: []const u64, replica_count: usize) u64 {
+    for (1..replica_count + 1) |candidate| {
+        if (!containsNode(used_replica_ids, @intCast(candidate))) return @intCast(candidate);
+    }
+    unreachable;
+}
+
 fn load_byNode(load_by_node: *const std.AutoHashMapUnmanaged(u64, usize), node_id: u64) usize {
     return load_by_node.get(node_id) orelse 0;
 }
@@ -687,11 +735,16 @@ fn groupNeedsMembershipRepair(
     candidate_domains: []const CandidateDomain,
     placement_role: []const u8,
 ) bool {
-    for (current_intents) |intent| {
+    for (current_intents, 0..) |intent, i| {
         if (intent.record.group_id != group_id) continue;
         if (!containsNode(candidate_node_ids, intent.record.local_node_id) or
             !candidateSelectable(candidate_domains, intent.record.local_node_id, placement_role))
             return true;
+        for (current_intents[i + 1 ..]) |other| {
+            if (other.record.group_id == group_id and
+                other.record.replica_id == intent.record.replica_id)
+                return true;
+        }
     }
     return false;
 }
@@ -1136,4 +1189,48 @@ test "placement planner keeps the most advanced duplicate replacement member" {
     try std.testing.expect(findCurrentIntent(intents, 15201, 104) != null);
     try std.testing.expect(findCurrentIntent(intents, 15201, 103) == null);
     try std.testing.expect(findCurrentIntent(intents, 15201, 105) == null);
+}
+
+test "placement planner repairs quota-full duplicate replica ids" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 153, .name = "docs", .desired_replica_count = 3 });
+    try manager.upsertRange(.{
+        .group_id = 15301,
+        .table_id = 153,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 15301, .replica_id = 1, .local_node_id = 101 }, .peer_node_ids = &.{ 101, 102, 103 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 15301, .replica_id = 2, .local_node_id = 102 }, .peer_node_ids = &.{ 101, 102, 103 }, .serving_state = .planned, .relocation_generation = 10 },
+        .{ .record = .{ .group_id = 15301, .replica_id = 2, .local_node_id = 103 }, .peer_node_ids = &.{ 101, 102, 103 }, .serving_state = .serving, .relocation_generation = 11 },
+    };
+    const candidates = [_]CandidateDomain{
+        .{ .node_id = 101, .role = "data", .failure_domain = "" },
+        .{ .node_id = 102, .role = "data", .failure_domain = "" },
+        .{ .node_id = 103, .role = "data", .failure_domain = "" },
+        .{ .node_id = 104, .role = "data", .failure_domain = "" },
+    };
+
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const intents = try planner.planAllIntentsWithConstraints(
+        &manager,
+        &.{ 101, 102, 103, 104 },
+        &current,
+        &candidates,
+        &.{},
+        &.{15301},
+    );
+    defer planner.freeIntents(std.testing.allocator, intents);
+
+    try std.testing.expectEqual(@as(usize, 3), intents.len);
+    try std.testing.expect(findCurrentIntent(intents, 15301, 101) != null);
+    try std.testing.expect(findCurrentIntent(intents, 15301, 103) != null);
+    try std.testing.expect(findCurrentIntent(intents, 15301, 102) == null);
+    var replica_ids: [3]u64 = undefined;
+    for (intents, 0..) |intent, i| replica_ids[i] = intent.record.replica_id;
+    std.mem.sort(u64, &replica_ids, {}, std.sort.asc(u64));
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, &replica_ids);
 }

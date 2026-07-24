@@ -366,7 +366,12 @@ pub const FileReplicaCatalog = struct {
             alloc.free(self.path);
             self.io_impl.deinit();
         }
-        try self.load();
+        if (try self.load()) {
+            // Rewrite a successfully decoded legacy catalog immediately. The
+            // atomic durable writer leaves the old self-contained format in
+            // place if migration cannot be committed.
+            try self.persist();
+        }
         return self;
     }
 
@@ -486,12 +491,12 @@ pub const FileReplicaCatalog = struct {
         self.current_revision = next_revision;
     }
 
-    fn load(self: *FileReplicaCatalog) !void {
+    fn load(self: *FileReplicaCatalog) !bool {
         var file = (if (std.fs.path.isAbsolute(self.path))
             std.Io.Dir.openFileAbsolute(self.io(), self.path, .{})
         else
             std.Io.Dir.cwd().openFile(self.io(), self.path, .{})) catch |err| switch (err) {
-            error.FileNotFound => return,
+            error.FileNotFound => return false,
             else => return err,
         };
         defer file.close(self.io());
@@ -504,14 +509,18 @@ pub const FileReplicaCatalog = struct {
             error.StreamTooLong => return error.InvalidReplicaCatalog,
             else => return err,
         }) orelse return error.InvalidReplicaCatalog;
-        if (!std.mem.eql(u8, header, replica_catalog_header))
-            return error.InvalidReplicaCatalog;
+        const legacy = !std.mem.eql(u8, header, replica_catalog_header);
+        if (legacy) try self.loadLegacyRecord(header);
 
         while ((reader.interface.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => return error.ReplicaCatalogRecordTooLarge,
             else => return err,
         })) |line| {
             if (line.len == 0) continue;
+            if (legacy) {
+                try self.loadLegacyRecord(line);
+                continue;
+            }
             if (line.len > max_replica_catalog_record_bytes)
                 return error.ReplicaCatalogRecordTooLarge;
             var parsed = std.json.parseFromSlice(ReplicaRecord, self.alloc, line, .{
@@ -525,6 +534,94 @@ pub const FileReplicaCatalog = struct {
                 return error.InvalidReplicaCatalog;
             try self.records.put(self.alloc, record.group_id, record);
         }
+        return legacy;
+    }
+
+    fn loadLegacyRecord(self: *FileReplicaCatalog, line: []const u8) !void {
+        if (line.len == 0 or line.len > max_replica_catalog_record_bytes)
+            return error.InvalidReplicaCatalog;
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const group_id = std.fmt.parseInt(u64, fields.next() orelse return error.InvalidReplicaCatalog, 10) catch
+            return error.InvalidReplicaCatalog;
+        const replica_id = std.fmt.parseInt(u64, fields.next() orelse return error.InvalidReplicaCatalog, 10) catch
+            return error.InvalidReplicaCatalog;
+        const local_node_id = std.fmt.parseInt(u64, fields.next() orelse return error.InvalidReplicaCatalog, 10) catch
+            return error.InvalidReplicaCatalog;
+        const bootstrap_raw = fields.next() orelse return error.InvalidReplicaCatalog;
+        const metadata_version = std.fmt.parseInt(u64, fields.next() orelse return error.InvalidReplicaCatalog, 10) catch
+            return error.InvalidReplicaCatalog;
+        const bootstrap_mode = std.meta.stringToEnum(ReplicaBootstrapMode, bootstrap_raw) orelse
+            return error.InvalidReplicaCatalog;
+
+        var snapshot_bootstrap: ?SnapshotBootstrapRecord = null;
+        errdefer if (snapshot_bootstrap) |*snapshot| snapshot.deinit(self.alloc);
+        var backup_restore_bootstrap: ?BackupRestoreBootstrapRecord = null;
+        errdefer if (backup_restore_bootstrap) |*backup| backup.deinit(self.alloc);
+        if (fields.next()) |source_tag| {
+            if (std.mem.eql(u8, source_tag, "raft")) {
+                const from_node_id = std.fmt.parseInt(u64, fields.next() orelse return error.InvalidReplicaCatalog, 10) catch
+                    return error.InvalidReplicaCatalog;
+                const term = std.fmt.parseInt(u64, fields.next() orelse return error.InvalidReplicaCatalog, 10) catch
+                    return error.InvalidReplicaCatalog;
+                const snapshot_id = fields.next() orelse return error.InvalidReplicaCatalog;
+                var snapshot = SnapshotBootstrapRecord{
+                    .from_node_id = from_node_id,
+                    .term = term,
+                    .snapshot_id = try self.alloc.dupe(u8, snapshot_id),
+                    .uri = "",
+                };
+                errdefer if (snapshot_bootstrap == null) self.alloc.free(snapshot.snapshot_id);
+                snapshot.uri = try self.alloc.dupe(u8, fields.next() orelse "");
+                snapshot_bootstrap = snapshot;
+            } else if (std.mem.eql(u8, source_tag, "backup")) {
+                const backup_id = fields.next() orelse return error.InvalidReplicaCatalog;
+                const location = fields.next() orelse return error.InvalidReplicaCatalog;
+                const snapshot_path = fields.next() orelse return error.InvalidReplicaCatalog;
+                var backup = BackupRestoreBootstrapRecord{
+                    .backup_id = "",
+                    .location = "",
+                    .snapshot_path = "",
+                };
+                backup.backup_id = try self.alloc.dupe(u8, backup_id);
+                errdefer if (backup_restore_bootstrap == null) self.alloc.free(backup.backup_id);
+                backup.location = try self.alloc.dupe(u8, location);
+                errdefer if (backup_restore_bootstrap == null) self.alloc.free(backup.location);
+                backup.snapshot_path = try self.alloc.dupe(u8, snapshot_path);
+                backup_restore_bootstrap = backup;
+            } else if (bootstrap_mode == .fetch_snapshot) {
+                const from_node_id = std.fmt.parseInt(u64, source_tag, 10) catch
+                    return error.InvalidReplicaCatalog;
+                const term = std.fmt.parseInt(u64, fields.next() orelse return error.InvalidReplicaCatalog, 10) catch
+                    return error.InvalidReplicaCatalog;
+                const snapshot_id = fields.next() orelse return error.InvalidReplicaCatalog;
+                var snapshot = SnapshotBootstrapRecord{
+                    .from_node_id = from_node_id,
+                    .term = term,
+                    .snapshot_id = try self.alloc.dupe(u8, snapshot_id),
+                    .uri = "",
+                };
+                errdefer if (snapshot_bootstrap == null) self.alloc.free(snapshot.snapshot_id);
+                snapshot.uri = try self.alloc.dupe(u8, fields.next() orelse "");
+                snapshot_bootstrap = snapshot;
+            } else {
+                return error.InvalidReplicaCatalog;
+            }
+        }
+
+        var record = ReplicaRecord{
+            .group_id = group_id,
+            .replica_id = replica_id,
+            .local_node_id = local_node_id,
+            .bootstrap_mode = bootstrap_mode,
+            .metadata_version = metadata_version,
+            .snapshot_bootstrap = snapshot_bootstrap,
+            .backup_restore_bootstrap = backup_restore_bootstrap,
+        };
+        snapshot_bootstrap = null;
+        backup_restore_bootstrap = null;
+        errdefer record.deinit(self.alloc);
+        if (self.records.contains(group_id)) return error.InvalidReplicaCatalog;
+        try self.records.put(self.alloc, group_id, record);
     }
 
     fn persist(self: *FileReplicaCatalog) !void {
@@ -789,6 +886,44 @@ test "file replica catalog persists records across reopen" {
         try std.testing.expectEqual(@as(u64, 7), records[0].snapshot_bootstrap.?.term);
         try std.testing.expectEqualStrings("snap-21", records[0].snapshot_bootstrap.?.snapshot_id);
     }
+}
+
+test "file replica catalog migrates the legacy line format atomically" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-legacy", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data =
+        \\21 2 5 persisted 9
+        \\22 3 5 fetch_snapshot 10 raft 4 7 snap-22 http://node/snap-22
+        \\23 4 5 fetch_snapshot 11 backup backup-23 gs://bucket snapshots/23
+        \\
+        ,
+    });
+
+    {
+        var migrated = try FileReplicaCatalog.init(std.testing.allocator, path);
+        defer migrated.deinit();
+        const records = try migrated.catalog().listReplicas(std.testing.allocator);
+        defer freeReplicaRecords(std.testing.allocator, records);
+        try std.testing.expectEqual(@as(usize, 3), records.len);
+        try std.testing.expectEqual(@as(u64, 2), migrated.records.get(21).?.replica_id);
+        try std.testing.expectEqualStrings("snap-22", migrated.records.get(22).?.snapshot_bootstrap.?.snapshot_id);
+        try std.testing.expectEqualStrings("backup-23", migrated.records.get(23).?.backup_restore_bootstrap.?.backup_id);
+    }
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, replica_catalog_header ++ "\n"));
+
+    var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);
+    defer reopened.deinit();
+    const records = try reopened.catalog().listReplicas(std.testing.allocator);
+    defer freeReplicaRecords(std.testing.allocator, records);
+    try std.testing.expectEqual(@as(usize, 3), records.len);
 }
 
 test "file replica catalog reopens catalogs larger than one MiB" {

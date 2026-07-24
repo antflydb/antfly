@@ -930,11 +930,10 @@ test "public api smoke e2e creates table inserts and queries documents" {
     const join_hits = join_response.hits.?.hits.?;
     try std.testing.expectEqual(@as(usize, 2), join_hits.len);
     const base_join_profile = join_response.profile.?.object.get("join").?.object;
-    try std.testing.expectEqualStrings("broadcast", base_join_profile.get("strategy_used").?.string);
-    // Shared provisioned storage publishes writer-owned runtime cardinalities
-    // even in this embedded fixture, so the planner can make the same
-    // statistics-aware broadcast decision as a production data server.
-    try std.testing.expect(base_join_profile.get("planner_used_stats").?.bool);
+    try std.testing.expectEqualStrings("index_lookup", base_join_profile.get("strategy_used").?.string);
+    // The equality join targets the right table's primary key, so the planner
+    // can select direct lookups without requiring runtime cardinality stats.
+    try std.testing.expect(!base_join_profile.get("planner_used_stats").?.bool);
     try std.testing.expect(!base_join_profile.get("shuffle_candidate").?.bool);
     try std.testing.expect(!base_join_profile.get("forced_broadcast_fallback").?.bool);
 

@@ -3318,6 +3318,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_raft_unit_tests = addFilteredTestRunArtifact(b, raft_unit_tests);
 
+    // The Antfly-rooted Raft tests below cover integration call sites but do
+    // not collect tests declared by the raft library's own root module.
+    const raft_library_tests = b.addTest(.{
+        .root_module = raft_engine_mod,
+    });
+    const run_raft_library_tests = b.addRunArtifact(raft_library_tests);
+    const raft_library_test_step = b.step("lib-raft-test", "Run standalone raft library tests");
+    raft_library_test_step.dependOn(&run_raft_library_tests.step);
+
     const raft_runtime_default_filters = [_][]const u8{
         "managed raft progress driver advances independently and joins on stop",
         "managed raft progress driver publishes source failure",
@@ -5561,6 +5570,7 @@ pub fn build(b: *std.Build) void {
     const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
     raft_test_step.dependOn(&run_raft_runtime_tests.step);
+    raft_test_step.dependOn(&run_raft_library_tests.step);
 
     const raft_runtime_test_step = b.step("raft-runtime-test", "Run focused managed Raft runtime tests");
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
@@ -5569,6 +5579,7 @@ pub fn build(b: *std.Build) void {
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
 
     unit_test_step.dependOn(&run_lib_regex_tests.step);
+    unit_test_step.dependOn(&run_raft_library_tests.step);
     unit_test_step.dependOn(&run_lib_jsonschema_tests.step);
     unit_test_step.dependOn(&run_lib_generating_tests.step);
     unit_test_step.dependOn(&run_lib_embeddings_tests.step);
