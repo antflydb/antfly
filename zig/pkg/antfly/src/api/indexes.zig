@@ -1577,6 +1577,8 @@ fn aggregateEnrichmentStats(dst: *db_mod.types.EnrichmentStats, src: db_mod.type
     dst.fatal_error_count += src.fatal_error_count;
     dst.retrying = dst.retrying or src.retrying;
     dst.worker_failed = dst.worker_failed or src.worker_failed;
+    dst.worker_started = dst.worker_started or src.worker_started;
+    dst.stalled = dst.stalled or src.stalled;
     dst.skip_by_hash_count += src.skip_by_hash_count;
     dst.skipped_source_count += src.skipped_source_count;
     dst.codec_decode_failures += src.codec_decode_failures;
@@ -2243,6 +2245,10 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try out.appendSlice(alloc, if (stats.retrying) "true" else "false");
     try out.appendSlice(alloc, ",\"worker_failed\":");
     try out.appendSlice(alloc, if (stats.worker_failed) "true" else "false");
+    try out.appendSlice(alloc, ",\"worker_started\":");
+    try out.appendSlice(alloc, if (stats.worker_started) "true" else "false");
+    try out.appendSlice(alloc, ",\"stalled\":");
+    try out.appendSlice(alloc, if (stats.stalled) "true" else "false");
     try out.appendSlice(alloc, ",\"skip_by_hash_count\":");
     try appendIntValue(alloc, out, stats.skip_by_hash_count);
     try out.appendSlice(alloc, ",\"skipped_source_count\":");
@@ -2276,6 +2282,22 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try out.appendSlice(alloc, ",\"total_embed_ns\":");
     try appendIntValue(alloc, out, stats.total_embed_ns);
     try out.append(alloc, '}');
+}
+
+test "enrichment index status encodes worker lifecycle diagnostics" {
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+
+    try appendEnrichmentRuntimeStatus(std.testing.allocator, &encoded, .{
+        .enabled = true,
+        .target_sequence = 5,
+        .applied_sequence = 1,
+        .worker_started = false,
+        .stalled = true,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"worker_started\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"stalled\":true") != null);
 }
 
 fn appendSingleIndexRuntimeStatus(

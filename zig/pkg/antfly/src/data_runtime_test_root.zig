@@ -14,8 +14,14 @@
 
 const runtime = @import("data/runtime.zig");
 const runtime_status = @import("api/runtime_status.zig");
+const indexes = @import("api/indexes.zig");
+const table_writes = @import("api/table_writes.zig");
+const enrichment_runtime = @import("storage/db/enrichment/enrichment_runtime.zig");
 
 test {
     _ = runtime;
     _ = runtime_status;
+    _ = indexes;
+    _ = table_writes;
+    _ = enrichment_runtime;
 }

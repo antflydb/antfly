@@ -114,6 +114,34 @@ Antfly inference models can be used in index and query configurations:
 }
 ```
 
+## Troubleshooting an enrichment backlog
+
+Inspect an embeddings index while enrichment is pending:
+
+```bash
+curl http://localhost:8080/db/v1/tables/TABLE/indexes/INDEX
+```
+
+The `enrichment_runtime` object reports sequence progress, retry and failure
+counters, active batch information, and worker lifecycle state.
+`worker_started` says whether the background worker is running. `stalled` is
+the narrower condition where work is pending but no worker is running and no
+retry or terminal failure already explains the backlog.
+
+For exact keys that have reached Antfly's durable artifact or index repair
+queues, use the bounded operator endpoint:
+
+```bash
+curl -X POST http://localhost:8080/db/v1/tables/TABLE/repair/issues \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"artifact","limit":100}'
+```
+
+This repair endpoint does not enumerate every document in the pending
+enrichment tail. If pending work is reported but no durable repair issue is
+listed, use the runtime counters and server logs to distinguish a worker
+lifecycle problem from retrying inference.
+
 ## API Reference
 
 See the [Inference API documentation](/inference/api) for details on the HTTP endpoints.
