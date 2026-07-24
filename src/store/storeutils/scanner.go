@@ -119,6 +119,30 @@ type EnrichmentScanOptions struct {
 	ProcessBatch BatchProcessor
 }
 
+func decodeEnrichmentHashID(enrichmentSuffix, value []byte) uint64 {
+	switch {
+	case bytes.HasSuffix(enrichmentSuffix, EmbeddingSuffix):
+		// Embeddings contain a hash ID (8 bytes), a dimension (uint32), and
+		// vector data (4 bytes per dimension).
+		if len(value) < 12 {
+			return 0
+		}
+	case bytes.HasSuffix(enrichmentSuffix, SummarySuffix):
+		// Summaries contain a hash ID (8 bytes) followed by text.
+		if len(value) < 8 {
+			return 0
+		}
+	default:
+		return 0
+	}
+
+	_, hashID, err := encoding.DecodeUint64Ascending(value)
+	if err != nil {
+		return 0
+	}
+	return hashID
+}
+
 // ScanForEnrichment scans for items (documents or summaries) that need enrichment,
 // processing them in batches. This is more efficient than collecting all results and
 // then processing, as it can stream through large datasets.
@@ -197,6 +221,32 @@ func ScanForEnrichment(ctx context.Context, db *pebble.DB, opts EnrichmentScanOp
 			!bytes.HasSuffix(userKey, opts.EnrichmentSuffix)
 	}
 
+	refreshBoundaryEnrichment := func(itemKey []byte) error {
+		itemKeyStr := string(itemKey)
+		delete(seenEnrichments, itemKeyStr)
+		delete(seenEnrichmentHashIDs, itemKeyStr)
+
+		enrichmentKey := append(bytes.Clone(itemKey), opts.EnrichmentSuffix...)
+		value, closer, getErr := db.Get(enrichmentKey)
+		if errors.Is(getErr, pebble.ErrNotFound) {
+			return nil
+		}
+		if getErr != nil {
+			return fmt.Errorf("getting boundary enrichment for %s: %w", itemKey, getErr)
+		}
+
+		if !IsDudEnrichment(value) {
+			seenEnrichments[itemKeyStr] = true
+			if hashID := decodeEnrichmentHashID(opts.EnrichmentSuffix, value); hashID != 0 {
+				seenEnrichmentHashIDs[itemKeyStr] = hashID
+			}
+		}
+		if closeErr := closer.Close(); closeErr != nil {
+			return fmt.Errorf("closing boundary enrichment for %s: %w", itemKey, closeErr)
+		}
+		return nil
+	}
+
 	// ProcessBatch (network I/O in the enricher backfills) must never run
 	// under a live iterator: an open pebble iterator pins the version it was
 	// created against, so sstables obsoleted by concurrent flushes and
@@ -209,6 +259,7 @@ func ScanForEnrichment(ctx context.Context, db *pebble.DB, opts EnrichmentScanOp
 	lower := opts.ByteRange[0]
 	for {
 		var resumeKey []byte
+		var refreshBoundaryKey []byte
 		err = Scan(ctx, db, ScanOptions{
 			LowerBound: lower,
 			UpperBound: opts.ByteRange[1],
@@ -226,23 +277,16 @@ func ScanForEnrichment(ctx context.Context, db *pebble.DB, opts EnrichmentScanOp
 
 				itemKey := key[:len(key)-len(primarySuffix)]
 
-				// Batch full: cut the window at this primary key. Resume at the
-				// earlier of the primary and its enrichment key. Some pipelines
-				// scan summaries (:s) whose embeddings (:e) sort before the
-				// primary. Rewinding to :e makes an enrichment inserted or
-				// deleted while ProcessBatch runs visible to the next window.
-				// For the usual document-primary case, the primary already sorts
-				// first and remains the exact resume point.
+				// Batch full: cut the window at this exact primary key. Some
+				// pipelines scan summaries (:s) whose embeddings (:e) sort before
+				// the primary. Revalidate that exact enrichment after ProcessBatch
+				// instead of rewinding the scan across potentially interleaved
+				// primary keys.
 				if len(batch) >= opts.BatchSize {
 					resumeKey = append([]byte(nil), key...)
 					enrichmentKey := append(bytes.Clone(itemKey), opts.EnrichmentSuffix...)
 					if bytes.Compare(enrichmentKey, resumeKey) < 0 {
-						resumeKey = enrichmentKey
-						// The next window will reconstruct this boundary item's
-						// state from the fresh iterator.
-						itemKeyStr := string(itemKey)
-						delete(seenEnrichments, itemKeyStr)
-						delete(seenEnrichmentHashIDs, itemKeyStr)
+						refreshBoundaryKey = bytes.Clone(itemKey)
 					}
 					return false, nil
 				}
@@ -308,23 +352,7 @@ func ScanForEnrichment(ctx context.Context, db *pebble.DB, opts EnrichmentScanOp
 					matchKey = docKey
 				}
 
-				// Extract hash ID from the value
-				var hashID uint64
-				if bytes.HasSuffix(opts.EnrichmentSuffix, EmbeddingSuffix) {
-					// For embeddings: hashID (8 bytes) + dimension (uint32) + vector data (4*dimension bytes)
-					if len(value) >= 12 { // At least hashID + dimension encoding
-						// Decode hashID first
-						_, hashID, err = encoding.DecodeUint64Ascending(value)
-						if err != nil {
-							hashID = 0 // Reset on error
-						}
-					}
-				} else if bytes.HasSuffix(opts.EnrichmentSuffix, SummarySuffix) {
-					// For summaries: hashID (8 bytes) followed by text
-					if len(value) >= 8 {
-						_, hashID, _ = encoding.DecodeUint64Ascending(value)
-					}
-				}
+				hashID := decodeEnrichmentHashID(opts.EnrichmentSuffix, value)
 
 				if IsDudEnrichment(value) {
 					// Dud enrichment: the item was previously unenrichable.
@@ -363,6 +391,11 @@ func ScanForEnrichment(ctx context.Context, db *pebble.DB, opts EnrichmentScanOp
 		}
 		if resumeKey == nil {
 			return nil
+		}
+		if refreshBoundaryKey != nil {
+			if err := refreshBoundaryEnrichment(refreshBoundaryKey); err != nil {
+				return err
+			}
 		}
 		lower = resumeKey
 		// currentDoc was finalized at the cut; seenEnrichments carries

@@ -17,6 +17,7 @@ package storeutils
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -169,6 +170,44 @@ func TestScanForEnrichment_WindowCutPrefixInterleavedKeys(t *testing.T) {
 		require.ElementsMatch(t, docKeys, emitted,
 			"batchSize=%d: every doc exactly once, no boundary dup or loss", batchSize)
 	}
+}
+
+func TestScanForEnrichment_SummaryBoundaryWithInterleavedPrimaryAdvances(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := t.Context()
+	sumSuffix := []byte(":i:myindex:s")
+	embSuffix := []byte(":i:myindex:e")
+	docKeys := [][]byte{
+		[]byte("a"),
+		[]byte("user"),
+		[]byte("user:i:myindex:f"),
+	}
+	for _, key := range docKeys {
+		insertDocument(t, db, key, []byte(`{"v": true}`), nil,
+			map[string]string{"myindex": string(key) + "-summary"})
+	}
+
+	errScanDidNotAdvance := errors.New("scan did not advance")
+	var emitted [][]byte
+	err := ScanForEnrichment(ctx, db, EnrichmentScanOptions{
+		ByteRange:        [2][]byte{[]byte("a"), []byte("z")},
+		PrimarySuffix:    sumSuffix,
+		EnrichmentSuffix: embSuffix,
+		BatchSize:        1,
+		ProcessBatch: func(ctx context.Context, batch []DocumentScanState) error {
+			for _, state := range batch {
+				emitted = append(emitted, bytes.Clone(state.CurrentDocKey))
+			}
+			if len(emitted) > len(docKeys) {
+				return errScanDidNotAdvance
+			}
+			return nil
+		},
+	})
+
+	require.NoError(t, err)
+	require.ElementsMatch(t, docKeys, emitted)
+	require.Len(t, emitted, len(docKeys))
 }
 
 // TestScanForBackfill_WindowCutPreservesSummaries proves a window cut at a
