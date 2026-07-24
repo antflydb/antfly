@@ -200,8 +200,8 @@ github.com/andybalholm/cascadia v1.3.3 h1:AG2YHrzJIm4BZ19iwJ/DAua6Btl3IwJX+VI4kk
 github.com/andybalholm/cascadia v1.3.3/go.mod h1:xNd9bqTn98Ln4DwST8/nG+H0yuB8Hmgu1YHNnWw0GeA=
 github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be h1:9AeTilPcZAjCFIImctFaOjnTIavg87rW78vTPkQqLI8=
 github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be/go.mod h1:ySMOLuWl6zY27l47sB3qLNK6tF2fkHG55UZxx8oIVo4=
-github.com/antflydb/bleve/v2 v2.5.8-antfly003 h1:20eub9c3JaAYABZcZoFbL+r2/vx5t4KZcF00pj9BJPo=
-github.com/antflydb/bleve/v2 v2.5.8-antfly003/go.mod h1:nnAd/6gGfLQXE5MBwd6sbX+HwI4xVRFQsWiskvnnbBU=
+github.com/antflydb/bleve/v2 v2.5.8-antfly004 h1:0p4e8BFdg/NkIZTEzP+friH0eEQW2pTQ+VaPUEFQXM0=
+github.com/antflydb/bleve/v2 v2.5.8-antfly004/go.mod h1:nnAd/6gGfLQXE5MBwd6sbX+HwI4xVRFQsWiskvnnbBU=
 github.com/antflydb/imaging v1.8.21-antfly001 h1:C87ErwwF6qsT1IZ+SwIXHzTulL2P/KzZgbckW6CN4hU=
 github.com/antflydb/imaging v1.8.21-antfly001/go.mod h1:X1MZgjqhKafuqgyoZIOcOxJqC7UplRgw/tFkIR0s/uw=
 github.com/antflydb/zapx/v17 v17.0.2-antfly006 h1:tE40FCdCJzPP6i6aOc4A45mU4zQ+s+YPKRPAOLb/h/w=

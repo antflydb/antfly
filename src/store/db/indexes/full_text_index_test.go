@@ -65,27 +65,27 @@ func TestBleveMergePlanOptions(t *testing.T) {
 			name:   "defaults",
 			config: FullTextIndexConfig{},
 			want: bleveMergePlanOptions{
-				MaxSegmentFileSize:   defaultFullTextMaxSegmentFileSize,
-				SegmentsPerMergeTask: defaultFullTextSegmentsPerMergeTask,
+				MaxMergePlanInputSize: defaultFullTextMaxMergePlanInputSize,
+				SegmentsPerMergeTask:  defaultFullTextSegmentsPerMergeTask,
 			},
 		},
 		{
 			name: "custom",
 			config: FullTextIndexConfig{
-				MaxSegmentFileSize:   512 << 20,
-				SegmentsPerMergeTask: 7,
+				MaxMergePlanInputSize: 512 << 20,
+				SegmentsPerMergeTask:  7,
 			},
 			want: bleveMergePlanOptions{
-				MaxSegmentFileSize:   512 << 20,
-				SegmentsPerMergeTask: 7,
+				MaxMergePlanInputSize: 512 << 20,
+				SegmentsPerMergeTask:  7,
 			},
 		},
 		{
-			name: "negative max segment file size",
+			name: "negative max merge plan input size",
 			config: FullTextIndexConfig{
-				MaxSegmentFileSize: -1,
+				MaxMergePlanInputSize: -1,
 			},
-			wantErr: "max_segment_file_size must be positive",
+			wantErr: "max_merge_plan_input_size must be positive",
 		},
 		{
 			name: "single segment merge task",
@@ -110,7 +110,7 @@ func TestBleveMergePlanOptions(t *testing.T) {
 			runtimeConfig := got.runtimeConfig()
 			scorchOptions, ok := runtimeConfig["scorchMergePlanOptions"].(map[string]any)
 			require.True(t, ok)
-			require.Equal(t, got.MaxSegmentFileSize, scorchOptions["maxSegmentFileSize"])
+			require.Equal(t, got.MaxMergePlanInputSize, scorchOptions["maxMergePlanInputSize"])
 			require.Equal(t, got.SegmentsPerMergeTask, scorchOptions["segmentsPerMergeTask"])
 		})
 	}
@@ -119,12 +119,12 @@ func TestBleveMergePlanOptions(t *testing.T) {
 func TestFullTextIndexConfigEqualNormalizesMergePlanDefaults(t *testing.T) {
 	implicitDefaults := FullTextIndexConfig{}
 	explicitDefaults := FullTextIndexConfig{
-		MaxSegmentFileSize:   defaultFullTextMaxSegmentFileSize,
-		SegmentsPerMergeTask: defaultFullTextSegmentsPerMergeTask,
+		MaxMergePlanInputSize: defaultFullTextMaxMergePlanInputSize,
+		SegmentsPerMergeTask:  defaultFullTextSegmentsPerMergeTask,
 	}
 	custom := FullTextIndexConfig{
-		MaxSegmentFileSize:   512 << 20,
-		SegmentsPerMergeTask: 7,
+		MaxMergePlanInputSize: 512 << 20,
+		SegmentsPerMergeTask:  7,
 	}
 
 	require.True(t, implicitDefaults.Equal(explicitDefaults))
@@ -142,11 +142,11 @@ func TestNewBleveIndexV2RejectsInvalidMergePlanOptions(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name: "negative max segment file size",
+			name: "negative max merge plan input size",
 			config: FullTextIndexConfig{
-				MaxSegmentFileSize: -1,
+				MaxMergePlanInputSize: -1,
 			},
-			wantErr: "max_segment_file_size must be positive",
+			wantErr: "max_merge_plan_input_size must be positive",
 		},
 		{
 			name: "single segment merge task",

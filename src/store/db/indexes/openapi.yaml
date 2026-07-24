@@ -72,12 +72,12 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether to use memory-only storage"
-        max_segment_file_size:
+        max_merge_plan_input_size:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: int64
           minimum: 1
-          description: "Maximum summed persisted input size, in bytes, for a Bleve vector-segment merge task. Defaults to 256 MiB."
+          description: "Maximum summed persisted input size, in bytes, across output-producing tasks in one Bleve merge plan. Defaults to 256 MiB."
         segments_per_merge_task:
           x-go-type-skip-optional-pointer: true
           type: integer

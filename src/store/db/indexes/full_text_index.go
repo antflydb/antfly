@@ -52,33 +52,33 @@ const (
 	fullTextPartitionSize     = 100
 	fullTextBackfillBatchSize = 1_000
 
-	defaultFullTextMaxSegmentFileSize   int64 = 256 << 20
-	defaultFullTextSegmentsPerMergeTask       = 5
+	defaultFullTextMaxMergePlanInputSize int64 = 256 << 20
+	defaultFullTextSegmentsPerMergeTask        = 5
 )
 
 type bleveMergePlanOptions struct {
-	MaxSegmentFileSize   int64
-	SegmentsPerMergeTask int
+	MaxMergePlanInputSize int64
+	SegmentsPerMergeTask  int
 }
 
 func (c FullTextIndexConfig) normalizedBleveMergePlanOptions() bleveMergePlanOptions {
-	maxSegmentFileSize := c.MaxSegmentFileSize
-	if maxSegmentFileSize == 0 {
-		maxSegmentFileSize = defaultFullTextMaxSegmentFileSize
+	maxMergePlanInputSize := c.MaxMergePlanInputSize
+	if maxMergePlanInputSize == 0 {
+		maxMergePlanInputSize = defaultFullTextMaxMergePlanInputSize
 	}
 	segmentsPerMergeTask := c.SegmentsPerMergeTask
 	if segmentsPerMergeTask == 0 {
 		segmentsPerMergeTask = defaultFullTextSegmentsPerMergeTask
 	}
 	return bleveMergePlanOptions{
-		MaxSegmentFileSize:   maxSegmentFileSize,
-		SegmentsPerMergeTask: segmentsPerMergeTask,
+		MaxMergePlanInputSize: maxMergePlanInputSize,
+		SegmentsPerMergeTask:  segmentsPerMergeTask,
 	}
 }
 
 func (o bleveMergePlanOptions) validate() error {
-	if o.MaxSegmentFileSize < 1 {
-		return fmt.Errorf("max_segment_file_size must be positive, got %d", o.MaxSegmentFileSize)
+	if o.MaxMergePlanInputSize < 1 {
+		return fmt.Errorf("max_merge_plan_input_size must be positive, got %d", o.MaxMergePlanInputSize)
 	}
 	if o.SegmentsPerMergeTask < 2 {
 		return fmt.Errorf("segments_per_merge_task must be at least 2, got %d", o.SegmentsPerMergeTask)
@@ -89,8 +89,8 @@ func (o bleveMergePlanOptions) validate() error {
 func (o bleveMergePlanOptions) runtimeConfig() map[string]any {
 	return map[string]any{
 		"scorchMergePlanOptions": map[string]any{
-			"maxSegmentFileSize":   o.MaxSegmentFileSize,
-			"segmentsPerMergeTask": o.SegmentsPerMergeTask,
+			"maxMergePlanInputSize": o.MaxMergePlanInputSize,
+			"segmentsPerMergeTask":  o.SegmentsPerMergeTask,
 		},
 	}
 }
@@ -424,7 +424,7 @@ func (bi *BleveIndexV2) Open(
 	if !bi.conf.MemOnly {
 		mergePlanOptions := bi.conf.normalizedBleveMergePlanOptions()
 		bi.logger.Info("Using Bleve merge plan options",
-			zap.Int64("max_segment_file_size", mergePlanOptions.MaxSegmentFileSize),
+			zap.Int64("max_merge_plan_input_size", mergePlanOptions.MaxMergePlanInputSize),
 			zap.Int("segments_per_merge_task", mergePlanOptions.SegmentsPerMergeTask))
 
 		foundExisting := false
