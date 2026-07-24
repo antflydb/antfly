@@ -1493,6 +1493,11 @@ pub fn runFromIterator(
     defer data_server.deinit();
 
     antfly_node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(&data_server.provisioned_storage.resource_manager);
+    try antfly_node.configureTokenizerCaches(.{
+        .resource_budget = tokenizerCacheResourceBudget(
+            &data_server.provisioned_storage.resource_manager,
+        ),
+    });
     data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.
@@ -1702,6 +1707,34 @@ fn promptCacheResourceUsageObserver(manager: *antfly.resource_manager.ResourceMa
 fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) void {
     const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
     manager.observeUsage(.inference_prompt_cache, current, next);
+}
+
+fn tokenizerCacheResourceBudget(
+    manager: *antfly.resource_manager.ResourceManager,
+) inference.hf_tokenizer.HfTokenizer.BpeCacheResourceBudget {
+    return .{
+        .context = manager,
+        .try_reserve = reserveTokenizerCacheBytes,
+        .release = releaseTokenizerCacheBytes,
+    };
+}
+
+fn reserveTokenizerCacheBytes(context: *anyopaque, bytes: usize) bool {
+    const manager: *antfly.resource_manager.ResourceManager =
+        @ptrCast(@alignCast(context));
+    var reservation = manager.reserve(
+        .inference_tokenizer_cache,
+        @intCast(bytes),
+    ) catch return false;
+    // The tokenizer owns the reservation until its entry/cache is released.
+    reservation.released = true;
+    return true;
+}
+
+fn releaseTokenizerCacheBytes(context: *anyopaque, bytes: usize) void {
+    const manager: *antfly.resource_manager.ResourceManager =
+        @ptrCast(@alignCast(context));
+    manager.releaseBytes(.inference_tokenizer_cache, @intCast(bytes));
 }
 
 fn localAntflyListModelsJson(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {

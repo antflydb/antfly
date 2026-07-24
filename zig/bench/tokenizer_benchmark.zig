@@ -234,13 +234,14 @@ pub fn main(init: std.process.Init) !void {
     const total_bytes = corpus.len * cfg.iterations * cfg.threads;
     const mb_per_second = @as(f64, @floatFromInt(total_bytes)) / seconds / 1_000_000.0;
     const mtok_per_second = @as(f64, @floatFromInt(token_total)) / seconds / 1_000_000.0;
+    const cache_stats = hf.bpeCacheStats();
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
     try stdout.interface.print(
         "runtime=std_io tokenizer_bytes={d} corpus_bytes={d} repeat={d} warmup_iterations={d} iterations={d} threads={d} internal_threads={d} " ++
             "tokens_per_iteration={d} token_hash={x} elapsed_seconds={d:.6} mb_per_second={d:.3} " ++
-            "mtokens_per_second={d:.3}\n",
+            "mtokens_per_second={d:.3} cache_entries={d} cache_bytes={d} cache_limit_bytes={d} cache_rejected_reservations={d}\n",
         .{
             tokenizer_json.len,
             corpus.len,
@@ -254,6 +255,10 @@ pub fn main(init: std.process.Init) !void {
             seconds,
             mb_per_second,
             mtok_per_second,
+            cache_stats.entries,
+            cache_stats.used_bytes,
+            cache_stats.max_bytes,
+            cache_stats.rejected_reservations,
         },
     );
     if (cfg.profile_bpe) {

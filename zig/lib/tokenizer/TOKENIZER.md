@@ -57,7 +57,8 @@ parallelism without changing the fixture. `--profile-bpe` enables atomic
 cache-hit counters after warmup and reports key-length and result-size
 histograms. Profiling is for attribution rather than throughput measurement
 because the counters intentionally add work to the hot path. No benchmark or
-tokenizer path creates an OS thread directly.
+tokenizer path creates an OS thread directly. Every run also reports live cache
+entries, accounted bytes, the local byte limit, and rejected reservations.
 
 ## Baseline and current results
 
@@ -74,9 +75,9 @@ Measured on an Apple M4 Max. Throughput is decimal MB/s.
 | Current | steady, 1 task | 291–295 MB/s |
 | Current | steady, 14 concurrent `std.Io` tasks | 2.86–3.09 GB/s |
 | Current, 738 KiB corpus | cold, 14 internal tasks | 497.04 MB/s |
-| Current, 738 KiB corpus | steady, 14 internal tasks | 2.34–2.47 GB/s |
+| Current, 738 KiB corpus | steady, 14 internal tasks | 2.46 GB/s |
 | Current, 11.8 MB repeated corpus | cold, 14 internal tasks | 1.642 GB/s |
-| Current, 11.8 MB repeated corpus | steady, 14 internal tasks | 2.61–2.85 GB/s |
+| Current, 11.8 MB repeated corpus | steady, 14 internal tasks | 3.01 GB/s |
 
 The current implementation is approximately 16.4–16.6 times faster than the
 original single-thread steady-state implementation while also correcting the
@@ -117,8 +118,18 @@ strings for decoding.
 The pretoken cache has 64 shards and 2,048 slots per shard. Reads are lock-free;
 only insertion takes a shard lock. Each shard stops inserting at 75 percent load
 to preserve bounded probe lengths, for a maximum of 98,304 cached pretokens.
-Entries are immutable after publication and are freed when the tokenizer is
-deinitialized.
+The fixed table and immutable entries also share a 64 MiB per-tokenizer hard
+byte limit, so variable-length keys and results cannot exceed the intended
+memory envelope before the slot-count bound is reached. Entries are freed when
+the tokenizer is deinitialized.
+
+`BpeCacheConfig.resource_budget` optionally supplies cold-path `try_reserve`
+and `release` callbacks. Antfly standalone connects these callbacks to the
+node `ResourceManager`'s `inference.tokenizer_cache` slice, which enforces a
+128 MiB aggregate hard limit across loaded tokenizers. Cache hits never call
+the manager. A rejected fixed-table reservation disables the optional cache;
+a rejected entry reservation simply leaves that pretoken uncached, so resource
+pressure never makes tokenization fail.
 
 ## Accepted optimizations
 
@@ -216,7 +227,12 @@ repeated `encodeIntoParallel` calls do not allocate and destroy chunk state.
 Chunk boundaries use a fixed stack array because internal chunking is capped at
 64. Workspaces are acquired per concurrent call and returned after the
 `std.Io.Group` is joined; concurrent requests therefore do not share mutable
-output state.
+output state. The free list retains at most four workspaces, and only
+workspaces whose complete retained capacity is at most 64 MiB. Larger
+large-corpus workspaces and excess burst-concurrency workspaces are destroyed
+on return instead of pinning the process high-water mark. When a resource
+budget is configured, retained workspaces use the same cold-path admission
+interface as BPE entries.
 
 This changed the 738 KiB steady internally parallel result from about
 1.30 GB/s to 1.61 GB/s and the 11.8 MB result from about 1.43 GB/s to
@@ -247,13 +263,15 @@ pulling.
 
 ### Overlapped ordered gather
 
-The caller reserves a conservative one-token-per-input-byte output bound before
+The caller reserves a one-token-per-three-input-bytes density estimate before
 launch. Completed chunks publish a release flag, and whichever queue consumer
-can acquire the commit mutex copies the longest completed prefix directly into
-the caller's output. The final caller-side commit drains any residual suffix
-after joining. This preserves source order while overlapping most result copies
-with remaining encoding and removes the old post-join allocate-and-gather tail.
-Errors roll the caller's output length back to its entry value.
+can acquire the commit mutex copies the longest completed prefix that fits
+without allocation. After joining, the caller computes the exact residual
+token count, grows once if needed, and drains the suffix. Typical GPT-2 text
+keeps the fully overlapped path, while worst-case byte-per-token input allocates
+only the output capacity it actually needs instead of reserving four output
+bytes for every input byte. Source order is preserved and errors roll the
+caller's output length back to its entry value.
 
 On Linux, newly grown output allocations of at least 2 MiB receive a
 best-effort `MADV_HUGEPAGE` hint over their page-aligned interior before first
@@ -261,6 +279,11 @@ touch. It is a no-op on macOS and other targets. The hint is applied to the
 large contiguous output where it is safe and useful; the current sharded cache
 contains allocator-owned objects and is not falsely treated as one huge-page
 allocation.
+
+Post-hardening validation retained the complete hashes and measured 2.46 GB/s
+for ten iterations of the 738 KiB internal-task workload and 3.01 GB/s for five
+iterations of the 11.8 MB workload. Both reported 9,571 live entries, 1,576,232
+accounted cache bytes, and zero rejected reservations.
 
 ### ByteLevel direct-address IDs and single-result appends
 
@@ -277,7 +300,8 @@ percent of the remaining hits.
 
 ### Opt-in hit-path profiling
 
-`HfTokenizer.setBpeProfiling(true)` resets and enables atomic counters, and
+`HfTokenizer.setBpeProfiling(true)` atomically disables, resets, and re-enables
+the counters, and
 `bpeProfileSnapshot()` reads a consistent-enough diagnostic snapshot after
 workers finish. The benchmark exposes this through `--profile-bpe`. Counters
 cover cache hits, misses, probes, key bytes, emitted IDs, and bounded
@@ -402,6 +426,9 @@ zig build test-tokenizer
 zig build test-tokenizer-batch
 ```
 
-The Hugging Face tokenizer suite currently passes 27 tests with one optional
+The Hugging Face tokenizer suite currently passes 29 tests with one optional
 external-model test skipped. The SentencePiece and tokenizer-batch targets also
-pass.
+pass. `zig build inference-test` passes 2,023 tests with 11 skips, and
+`zig build root-test` passes all 222 root compile/unit tests. The focused
+`zig build resource-budget-test` gate passes both filesystem tests and all 28
+resource-manager tests without leaks.

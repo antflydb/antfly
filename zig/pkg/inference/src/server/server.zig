@@ -28,6 +28,7 @@ const extracting_api = @import("antfly_extracting");
 const scraping = @import("antfly_scraping");
 const jsonschema = @import("antfly_jsonschema");
 const lib_chunker = @import("inference_chunker");
+const hf_tokenizer_mod = @import("inference_hf_tokenizer");
 const backends_mod = @import("../backends/backends.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const registry_mod = @import("../registry/registry.zig");
@@ -190,6 +191,7 @@ pub const NodeConfig = struct {
     generation_budget_overrides: BudgetOverrides = .{},
     prompt_cache: PromptCacheConfig = .{},
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
+    tokenizer_cache: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig = .{},
 };
 
 pub const WarmModelKind = enum {
@@ -652,8 +654,18 @@ pub const Node = struct {
             .metrics = metrics_mod.Metrics.default,
             .request_queue = request_queue_mod.RequestQueue.init(config.max_concurrent_requests),
         };
+        node.model_manager.tokenizer_cache_config = config.tokenizer_cache;
         node.updateQueueMetrics();
         return node;
+    }
+
+    /// Attach process-wide tokenizer-cache admission before loading models.
+    pub fn configureTokenizerCaches(
+        self: *Node,
+        config: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig,
+    ) !void {
+        try self.model_manager.configureTokenizerCaches(config);
+        self.config.tokenizer_cache = config;
     }
 
     pub fn deinit(self: *Node) void {

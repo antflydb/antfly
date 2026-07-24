@@ -1021,6 +1021,7 @@ pub const ModelManager = struct {
     session_manager: backends.SessionManager,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
+    tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
 
     pub fn init(allocator: std.mem.Allocator, session_manager: backends.SessionManager) ModelManager {
         return .{
@@ -1029,6 +1030,17 @@ pub const ModelManager = struct {
             .loaded = std.StringHashMapUnmanaged(*LoadedModel){},
             .loaded_aliases = std.StringHashMapUnmanaged(*LoadedModel){},
         };
+    }
+
+    /// Configure tokenizer-cache admission before any model is loaded. The
+    /// same process-wide budget may be shared by every loaded tokenizer.
+    pub fn configureTokenizerCaches(
+        self: *ModelManager,
+        config: hf_tokenizer.HfTokenizer.BpeCacheConfig,
+    ) !void {
+        if (self.loaded.count() != 0)
+            return error.TokenizerCacheConfigAfterModelLoad;
+        self.tokenizer_cache_config = config;
     }
 
     pub fn deinit(self: *ModelManager) void {
@@ -1146,6 +1158,7 @@ pub const ModelManager = struct {
         switch (tokenizer_type) {
             .huggingface => {
                 hf_tok = try loadHuggingFaceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
+                try hf_tok.?.configureBpeCache(self.tokenizer_cache_config);
             },
             .sentencepiece => {
                 const sp = try loadSentencePieceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);

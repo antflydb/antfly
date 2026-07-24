@@ -1402,6 +1402,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.lite_native_link_cache,
         resource_manager_mod.Slice.lite_docstore_snapshot_cache,
         resource_manager_mod.Slice.inference_prompt_cache,
+        resource_manager_mod.Slice.inference_tokenizer_cache,
         resource_manager_mod.Slice.dense_repair_working_set,
     }) |slice| {
         const stats = snapshot.slices[@intFromEnum(slice)];

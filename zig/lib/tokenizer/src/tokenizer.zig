@@ -96,7 +96,10 @@ pub const Tokenizer = struct {
     /// the backend can split the input without changing tokenizer semantics.
     /// A backend may create more chunks than consumers for load balancing.
     /// Parallel work composes with the caller's persistent std.Io runtime;
-    /// callers without an Io should use encodeInto's serial path.
+    /// callers without an Io should use encodeInto's serial path. The
+    /// tokenizer's construction allocator must remain alive and be safe for
+    /// concurrent use until deinitTokenizer; `out` and its allocator remain
+    /// exclusively owned by the calling task for the duration of this call.
     pub fn encodeIntoParallel(
         self: Tokenizer,
         io: std.Io,
