@@ -1774,6 +1774,13 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, lib_test_mod, true, true);
 
+    const raft_sim_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft_sim_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, raft_sim_test_mod, true, true);
+
     const introducer_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/introducer.zig"),
         .target = target,
@@ -3369,7 +3376,7 @@ pub fn build(b: *std.Build) void {
         "cluster simulation drives merge transition actions deterministically",
     };
     const lib_raft_sim_tests = b.addTest(.{
-        .root_module = lib_test_mod,
+        .root_module = raft_sim_test_mod,
         .filters = &lib_raft_sim_default_filters,
     });
     const run_lib_raft_sim_tests = addFilteredTestRunArtifact(b, lib_raft_sim_tests);
