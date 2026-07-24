@@ -607,6 +607,7 @@ pub const MultiRaft = struct {
     pub fn tickGroup(self: *MultiRaft, group_id: core.types.GroupId) !void {
         const grp = self.group(group_id) orelse return error.UnknownGroup;
         grp.tick();
+        if (grp.hasReady()) self.scheduler.noteReady(group_id);
     }
 
     pub fn tickBatch(self: *MultiRaft, alloc: std.mem.Allocator) ![]core.types.GroupId {

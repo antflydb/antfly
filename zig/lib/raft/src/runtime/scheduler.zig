@@ -31,6 +31,7 @@ pub const Scheduler = struct {
     cfg: SchedulerConfig,
     time: VirtualTime = .{},
     group_ids: std.ArrayListUnmanaged(core.types.GroupId) = .empty,
+    registered: std.AutoHashMapUnmanaged(core.types.GroupId, void) = .empty,
     quiesced: std.AutoHashMapUnmanaged(core.types.GroupId, void) = .empty,
     priority: std.AutoHashMapUnmanaged(core.types.GroupId, u8) = .empty,
     cursor: usize = 0,
@@ -45,23 +46,26 @@ pub const Scheduler = struct {
 
     pub fn deinit(self: *Scheduler) void {
         self.group_ids.deinit(self.alloc);
+        self.registered.deinit(self.alloc);
         self.quiesced.deinit(self.alloc);
         self.priority.deinit(self.alloc);
         self.* = undefined;
     }
 
     pub fn registerGroup(self: *Scheduler, group_id: core.types.GroupId) !void {
-        for (self.group_ids.items) |existing| {
-            if (existing == group_id) return error.GroupAlreadyRegistered;
-        }
+        if (self.registered.contains(group_id)) return error.GroupAlreadyRegistered;
         try self.group_ids.append(self.alloc, group_id);
+        errdefer _ = self.group_ids.pop();
+        try self.registered.putNoClobber(self.alloc, group_id, {});
     }
 
     pub fn unregisterGroup(self: *Scheduler, group_id: core.types.GroupId) bool {
         for (self.group_ids.items, 0..) |existing, i| {
             if (existing != group_id) continue;
             _ = self.group_ids.orderedRemove(i);
+            _ = self.registered.remove(group_id);
             _ = self.quiesced.remove(group_id);
+            _ = self.priority.remove(group_id);
             if (self.group_ids.items.len == 0) {
                 self.cursor = 0;
                 self.ready_cursor = 0;
@@ -79,11 +83,14 @@ pub const Scheduler = struct {
     }
 
     pub fn nextTickGroup(self: *Scheduler) ?core.types.GroupId {
-        return self.nextGroup(&self.cursor);
+        // Consensus timeouts are wall-clock obligations. Ready-work priority
+        // must not let a busy group consume another group's election or
+        // heartbeat tick in the same bounded host round.
+        return self.nextRoundRobinGroup(&self.cursor);
     }
 
     pub fn nextReadyGroup(self: *Scheduler) ?core.types.GroupId {
-        return self.nextGroup(&self.ready_cursor);
+        return self.nextPriorityGroup(&self.ready_cursor);
     }
 
     pub fn quiesceGroup(self: *Scheduler, group_id: core.types.GroupId) !void {
@@ -142,10 +149,7 @@ pub const Scheduler = struct {
     }
 
     fn isRegistered(self: *const Scheduler, group_id: core.types.GroupId) bool {
-        for (self.group_ids.items) |existing| {
-            if (existing == group_id) return true;
-        }
-        return false;
+        return self.registered.contains(group_id);
     }
 
     fn boostGroup(self: *Scheduler, group_id: core.types.GroupId, amount: u8) void {
@@ -156,7 +160,19 @@ pub const Scheduler = struct {
         gop.value_ptr.* = std.math.add(u8, current, amount) catch std.math.maxInt(u8);
     }
 
-    fn nextGroup(self: *Scheduler, cursor: *usize) ?core.types.GroupId {
+    fn nextRoundRobinGroup(self: *Scheduler, cursor: *usize) ?core.types.GroupId {
+        if (self.group_ids.items.len == 0) return null;
+
+        var checked: usize = 0;
+        while (checked < self.group_ids.items.len) : (checked += 1) {
+            const group_id = self.group_ids.items[cursor.*];
+            cursor.* = (cursor.* + 1) % self.group_ids.items.len;
+            if (!self.isQuiesced(group_id)) return group_id;
+        }
+        return null;
+    }
+
+    fn nextPriorityGroup(self: *Scheduler, cursor: *usize) ?core.types.GroupId {
         if (self.group_ids.items.len == 0) return null;
 
         var checked: usize = 0;
@@ -164,12 +180,12 @@ pub const Scheduler = struct {
             const group_id = self.group_ids.items[cursor.*];
             cursor.* = (cursor.* + 1) % self.group_ids.items.len;
             if (self.isQuiesced(group_id)) continue;
-            if (self.priority.get(group_id)) |score| {
-                if (score > 0) {
-                    if (score == 1) {
+            if (self.priority.getPtr(group_id)) |score| {
+                if (score.* > 0) {
+                    if (score.* == 1) {
                         _ = self.priority.remove(group_id);
                     } else {
-                        self.priority.put(self.alloc, group_id, score - 1) catch {};
+                        score.* -= 1;
                     }
                     return group_id;
                 }

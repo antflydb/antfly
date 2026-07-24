@@ -748,7 +748,7 @@ test "transition service retries split bootstrap after leader recovery" {
     };
 
     const Split = struct {
-        status: data.SplitTransitionStatus = .{
+        recovering_status: data.SplitTransitionStatus = .{
             .phase = .bootstrap_peer,
             .source_split_phase = .splitting,
             .bootstrapped = false,
@@ -759,7 +759,19 @@ test "transition service retries split bootstrap after leader recovery" {
             .source_delta_sequence = 1,
             .dest_delta_sequence = 0,
         },
+        healthy_status: data.SplitTransitionStatus = .{
+            .phase = .cutover_ready,
+            .source_split_phase = .splitting,
+            .bootstrapped = true,
+            .replay_required = true,
+            .replay_caught_up = true,
+            .cutover_ready = true,
+            .destination_ready_for_reads = true,
+            .source_delta_sequence = 1,
+            .dest_delta_sequence = 1,
+        },
         bootstrap_calls: usize = 0,
+        healthy_finalize_calls: usize = 0,
         failures_remaining: usize = 2,
 
         fn iface(self: *@This()) transition_runtime.SplitRuntime {
@@ -777,9 +789,13 @@ test "transition service retries split bootstrap after leader recovery" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, transition_id: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.status;
+            return switch (transition_id) {
+                7 => self.recovering_status,
+                8 => self.healthy_status,
+                else => error.UnknownGroup,
+            };
         }
 
         fn prepareSource(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
@@ -790,33 +806,43 @@ test "transition service retries split bootstrap after leader recovery" {
             return true;
         }
 
-        fn bootstrapDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn bootstrapDestination(ptr: *anyopaque, transition_id: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (transition_id != 7) return error.UnknownGroup;
             self.bootstrap_calls += 1;
             if (self.failures_remaining > 0) {
                 self.failures_remaining -= 1;
                 return error.GroupLeaderUnavailable;
             }
-            self.status.phase = .replay_deltas;
-            self.status.bootstrapped = true;
+            self.recovering_status.phase = .replay_deltas;
+            self.recovering_status.bootstrapped = true;
             return true;
         }
 
-        fn catchUpDestination(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
+        fn catchUpDestination(ptr: *anyopaque, transition_id: u64, _: u64, _: u64, _: u64) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.status.phase = .cutover_ready;
-            self.status.replay_caught_up = true;
-            self.status.cutover_ready = true;
-            self.status.destination_ready_for_reads = true;
-            self.status.dest_delta_sequence = self.status.source_delta_sequence;
+            if (transition_id != 7) return error.UnknownGroup;
+            self.recovering_status.phase = .cutover_ready;
+            self.recovering_status.replay_caught_up = true;
+            self.recovering_status.cutover_ready = true;
+            self.recovering_status.destination_ready_for_reads = true;
+            self.recovering_status.dest_delta_sequence = self.recovering_status.source_delta_sequence;
             return 1;
         }
 
-        fn finalizeSource(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+        fn finalizeSource(ptr: *anyopaque, transition_id: u64, _: u64, _: u64, _: u64) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.status.phase = .finalized;
-            self.status.source_split_phase = .none;
-            self.status.replay_required = false;
+            const status = switch (transition_id) {
+                7 => &self.recovering_status,
+                8 => blk: {
+                    self.healthy_finalize_calls += 1;
+                    break :blk &self.healthy_status;
+                },
+                else => return error.UnknownGroup,
+            };
+            status.phase = .finalized;
+            status.source_split_phase = .none;
+            status.replay_required = false;
             return true;
         }
 
@@ -840,10 +866,24 @@ test "transition service retries split bootstrap after leader recovery" {
         .destination_group_id = 12,
         .phase = .bootstrap_peer,
     });
+    try svc.submitSplit(.{
+        .transition_id = 8,
+        .attempt_epoch = 1,
+        .source_group_id = 21,
+        .destination_group_id = 22,
+        .phase = .cutover_pending,
+    });
 
     _ = try svc.stepPending();
     try std.testing.expectEqual(@as(usize, 1), split.bootstrap_calls);
+    try std.testing.expectEqual(@as(usize, 1), split.healthy_finalize_calls);
+    try std.testing.expectEqual(@as(usize, 2), svc.pending_split.items.len);
+
+    _ = try svc.stepPending();
+    try std.testing.expectEqual(@as(usize, 1), split.bootstrap_calls);
+    try std.testing.expectEqual(@as(usize, 1), svc.pending_split.items.len);
     try std.testing.expectEqual(metadata.TransitionPhase.bootstrap_peer, svc.pending_split.items[0].phase);
+    try std.testing.expectEqual(@as(usize, 1), svc.metrics.completed_split_transitions);
 
     clock.now_ms += transition_retry_initial_ms - 1;
     _ = try svc.stepPending();
@@ -860,7 +900,7 @@ test "transition service retries split bootstrap after leader recovery" {
     clock.now_ms += 1;
     _ = try svc.stepPending();
     try std.testing.expectEqual(@as(usize, 3), split.bootstrap_calls);
-    try std.testing.expect(split.status.bootstrapped);
+    try std.testing.expect(split.recovering_status.bootstrapped);
     try std.testing.expectEqual(@as(usize, 1), svc.pending_split.items.len);
     try std.testing.expectEqual(metadata.TransitionPhase.bootstrap_peer, svc.pending_split.items[0].phase);
     try std.testing.expect(!svc.split_retries.contains(7));
@@ -869,7 +909,7 @@ test "transition service retries split bootstrap after leader recovery" {
     _ = try svc.stepPending();
     _ = try svc.stepPending();
     try std.testing.expectEqual(@as(usize, 0), svc.pending_split.items.len);
-    try std.testing.expectEqual(@as(usize, 1), svc.metrics.completed_split_transitions);
+    try std.testing.expectEqual(@as(usize, 2), svc.metrics.completed_split_transitions);
 }
 
 test "transition service upserts and removes queued transitions by id" {

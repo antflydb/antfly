@@ -26,6 +26,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 import requests
@@ -182,6 +183,8 @@ class EmbeddedInferenceStandaloneServer:
             "5",
             "--models-dir",
             str(self.models_dir),
+            "--data-dir",
+            str(self.root),
             "--replica-root-dir",
             str(self.root / "replicas"),
             "--replica-catalog-path",
@@ -205,12 +208,12 @@ class EmbeddedInferenceStandaloneServer:
             cwd=REPO_ROOT,
         )
         if not _wait_for_server(self.url):
-            self.stop()
             logs = _read_log_tail(self.log_path)
+            self.stop()
             raise RuntimeError(f"Standalone API server failed to start at {self.url}\n{logs}")
         if not _wait_for_server(self.inference_api_url, timeout_s=120.0, path="/models"):
-            self.stop()
             logs = _read_log_tail(self.log_path)
+            self.stop()
             raise RuntimeError(f"Embedded inference server failed to start at {self.inference_api_url}\n{logs}")
 
     def debug_logs(self) -> str:
@@ -286,18 +289,21 @@ def embedded_standalone_runtime():
         model_name,
         inference_budget_mb=inference_budget_mb,
     )
-    _warm_inference_generator(server.inference_api_url, model_name)
-    yield {
-        "base_url": server.url,
-        "public_url": server.public_url,
-        "health_url": server.health_url,
-        "inference_api_url": server.inference_api_url,
-        "model": model_name,
-        "models_dir": str(models_dir),
-        "inference_budget_mb": inference_budget_mb,
-        "logs": server.debug_logs,
-    }
-    server.stop()
+    try:
+        if not _integration_enabled("ANTFLY_INFERENCE_STANDALONE_SKIP_GENERATOR_WARMUP"):
+            _warm_inference_generator(server.inference_api_url, model_name)
+        yield {
+            "base_url": server.url,
+            "public_url": server.public_url,
+            "health_url": server.health_url,
+            "inference_api_url": server.inference_api_url,
+            "model": model_name,
+            "models_dir": str(models_dir),
+            "inference_budget_mb": inference_budget_mb,
+            "logs": server.debug_logs,
+        }
+    finally:
+        server.stop()
 
 
 @pytest.fixture(scope="function")
@@ -343,6 +349,33 @@ def embedded_standalone_api(embedded_standalone_runtime):
                 response = self.s.post(
                     f"{self.url}/tables/{table_name}",
                     json={"num_shards": num_shards},
+                    timeout=30,
+                )
+            return self._check(response)
+
+        def list_tables(self) -> list[dict]:
+            with self._request_lock:
+                response = self.s.get(f"{self.url}/tables", timeout=30)
+            return self._check(response)
+
+        def create_index(self, table_name: str, index_name: str, config: dict[str, object]) -> dict:
+            with self._request_lock:
+                response = self.s.post(
+                    f"{self.url}/tables/{table_name}/indexes/{index_name}",
+                    json=config,
+                    timeout=30,
+                )
+            return self._check(response)
+
+        def delete_table(self, table_name: str) -> dict:
+            with self._request_lock:
+                response = self.s.delete(f"{self.url}/tables/{table_name}", timeout=30)
+            return self._check(response)
+
+        def lookup_key(self, table_name: str, key: str) -> dict:
+            with self._request_lock:
+                response = self.s.get(
+                    f"{self.url}/tables/{table_name}/documents/{quote(key, safe='')}",
                     timeout=30,
                 )
             return self._check(response)
@@ -458,6 +491,89 @@ def test_standalone_health_endpoints(embedded_standalone_runtime):
 
     unknown = requests.get(f"{health_url}/does-not-exist", timeout=5)
     assert unknown.status_code == 404
+
+
+def test_standalone_drop_tables_with_pending_embedded_embeddings(
+    embedded_standalone_api,
+    embedded_standalone_runtime,
+):
+    hot_tables = [f"standalone_drop_hot_{time.time_ns()}_{i}" for i in range(6)]
+    survivor = f"standalone_drop_survivor_{time.time_ns()}"
+    created_tables: set[str] = set()
+    try:
+        for table_name in [*hot_tables, survivor]:
+            created = embedded_standalone_api.create_table(table_name, num_shards=1)
+            created_tables.add(table_name)
+            assert created["name"] == table_name
+            assert (
+                embedded_standalone_api.create_index(
+                    table_name,
+                    "semantic_idx",
+                    {
+                        "name": "semantic_idx",
+                        "type": "embeddings",
+                        "template": "{{title}}",
+                        "dimension": 384,
+                        "embedder": {
+                            "provider": "antfly",
+                            "model": "BAAI/bge-small-en-v1.5",
+                        },
+                    },
+                )
+                == {}
+            )
+
+        docs = {
+            f"doc-{i:02d}": {
+                "title": (
+                    f"Document {i} has enough distinct words to keep the embedded "
+                    "inference queue active while its table is retired."
+                )
+            }
+            for i in range(50)
+        }
+        for table_name in hot_tables:
+            batch = embedded_standalone_api.batch_write(table_name, inserts=docs)
+            assert batch["inserted"] == len(docs)
+
+        for table_name in hot_tables:
+            embedded_standalone_api.delete_table(table_name)
+            created_tables.discard(table_name)
+
+        def dropped_tables_are_absent() -> bool:
+            try:
+                names = {table["name"] for table in embedded_standalone_api.list_tables()}
+            except requests.RequestException:
+                return False
+            return not names.intersection(hot_tables)
+
+        if not wait_until(
+            lambda: True if dropped_tables_are_absent() else None,
+            timeout_s=30.0,
+            interval_s=0.1,
+        ):
+            raise AssertionError(
+                "dropped standalone tables remained catalog-visible\n"
+                f"server logs:\n{embedded_standalone_runtime['logs']()}"
+            )
+
+        survivor_batch = embedded_standalone_api.batch_write(
+            survivor,
+            inserts={"doc:survivor": {"title": "surviving table remains writable"}},
+            sync_level="write",
+        )
+        assert survivor_batch["inserted"] == 1
+        survivor_doc = embedded_standalone_api.lookup_key(survivor, "doc:survivor")
+        assert survivor_doc["title"] == "surviving table remains writable"
+
+        response = requests.get(f"{embedded_standalone_runtime['base_url']}/status", timeout=30)
+        response.raise_for_status()
+    finally:
+        for table_name in created_tables:
+            try:
+                embedded_standalone_api.delete_table(table_name)
+            except (requests.RequestException, ValueError):
+                pass
 
 
 def test_standalone_retrieval_generation_with_live_inference(embedded_standalone_api, embedded_standalone_runtime):

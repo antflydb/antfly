@@ -3327,6 +3327,7 @@ pub fn build(b: *std.Build) void {
         "raft runtime cadence validates independent intervals",
         "transition destination requires a stable healthy voter set",
         "transition service retries split bootstrap after leader recovery",
+        "raft scheduler ready priority cannot starve consensus ticks",
     };
     const raft_runtime_tests = b.addTest(.{
         .root_module = raft_runtime_test_mod,
@@ -3536,8 +3537,6 @@ pub fn build(b: *std.Build) void {
         "store capacity reporting preserves the last good observation on probe failure",
         "data server repair owner cancels and drains through backend runtime",
         "data server rejects replicated transition admission after owner shutdown",
-        "replicated transition snapshot working set is single flight",
-        "split handoff working set accounts payload bytes",
         "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime local group status does not open roots owned by transitions",
@@ -3654,6 +3653,8 @@ pub fn build(b: *std.Build) void {
         "file replica catalog rejects an existing truncated empty file",
         "raft batch round trips internal split checkpoint",
         "raft batch round trips internal split replication identity",
+        "paged authoritative reconciliation removes stale out-of-range documents before publication",
+        "paged authoritative reconciliation is allocation-failure safe",
         "group state range scan is allocation-failure safe",
         "shard state store persists split lifecycle and ownership",
         "shard state store decodes legacy split acknowledgement layouts",
