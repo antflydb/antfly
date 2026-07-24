@@ -173,7 +173,7 @@ pub const Primary = struct {
         errdefer slots.close();
         try standby.lockExclusive();
         defer standby.unlockExclusive();
-        if (!std.meta.eql(standby.identity, handoff.identity)) return error.InvalidPromotionHandoff;
+        if (!std.meta.eql(standby.snapshotLocked().identity, handoff.identity)) return error.InvalidPromotionHandoff;
         try validatePromotedLog(alloc, &standby.receive_log, handoff);
 
         const log = standby.consumePromotedReceiveLogLocked();

@@ -628,7 +628,7 @@ test "internal batch parser owns and round trips split checkpoint" {
 
 test "internal batch parser requires source acknowledgements to be metadata-only" {
     const mixed =
-        \\{"inserts":{"doc:m":{}},"_split_checkpoint":{"kind":"source_ack","transition_id":40,"source_group_id":41,"destination_group_id":42,"delta_sequence":7}}
+        \\{"inserts":{"doc:m":{}},"_split_checkpoint":{"kind":"source_ack","transition_id":40,"attempt_epoch":1,"source_group_id":41,"destination_group_id":42,"delta_sequence":7}}
     ;
     try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(std.testing.allocator, mixed));
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(std.testing.allocator, .{
@@ -646,7 +646,7 @@ test "internal batch parser requires source acknowledgements to be metadata-only
 
 test "internal batch parser rejects public split replication identity" {
     const body =
-        \\{"inserts":{"doc:m":{}},"_split_replication":{"transition_id":40,"source_group_id":41,"destination_group_id":42,"namespace_table_id":7,"namespace_shard_id":41,"namespace_range_id":4100,"operation":"bootstrap_chunk","sequence":0}}
+        \\{"inserts":{"doc:m":{}},"_split_replication":{"transition_id":40,"attempt_epoch":1,"source_group_id":41,"destination_group_id":42,"namespace_table_id":7,"namespace_shard_id":41,"namespace_range_id":4100,"operation":"bootstrap_chunk","sequence":0}}
     ;
     try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, body));
 
@@ -654,6 +654,7 @@ test "internal batch parser rejects public split replication identity" {
     defer owned.deinit(std.testing.allocator);
     const replication = owned.req.split_replication orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 40), replication.transition_id);
+    try std.testing.expectEqual(@as(u64, 1), replication.attempt_epoch);
     try std.testing.expectEqual(@as(u64, 41), replication.source_group_id);
     try std.testing.expectEqual(@as(u64, 42), replication.destination_group_id);
     try std.testing.expectEqual(@as(u64, 4100), replication.identity_namespace.range_id);
@@ -691,7 +692,7 @@ test "internal batch split identity round trips the full u64 id space" {
 
 test "internal batch parser owns and round trips split transition" {
     const body =
-        \\{"_split_transition":{"kind":"start","transition_id":40,"destination_group_id":42,"split_key":"doc:m"}}
+        \\{"_split_transition":{"kind":"start","transition_id":40,"attempt_epoch":1,"destination_group_id":42,"split_key":"doc:m"}}
     ;
     try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, body));
 
@@ -700,6 +701,7 @@ test "internal batch parser owns and round trips split transition" {
     const transition = owned.req.split_transition orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(db_mod.types.SplitTransitionMutation.Kind.start, transition.kind);
     try std.testing.expectEqual(@as(u64, 40), transition.transition_id);
+    try std.testing.expectEqual(@as(u64, 1), transition.attempt_epoch);
     try std.testing.expectEqual(@as(u64, 42), transition.destination_group_id);
     try std.testing.expectEqualStrings("doc:m", transition.split_key);
 
@@ -712,7 +714,7 @@ test "internal batch parser owns and round trips split transition" {
 
 test "internal batch parser rejects mixed split transition commands" {
     const body =
-        \\{"inserts":{"doc:m":{}},"_split_transition":{"kind":"prepare","transition_id":40,"destination_group_id":42,"split_key":"doc:m"}}
+        \\{"inserts":{"doc:m":{}},"_split_transition":{"kind":"prepare","transition_id":40,"attempt_epoch":1,"destination_group_id":42,"split_key":"doc:m"}}
     ;
     try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(std.testing.allocator, body));
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(std.testing.allocator, .{

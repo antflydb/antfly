@@ -5211,6 +5211,7 @@ pub fn build(b: *std.Build) void {
         "resource manager background deferral follows slice policy",
         "budgeted allocator admits before allocation and releases exact live bytes",
         "budgeted allocator allows concurrent operations within the shared hard limit",
+        "budgeted allocator amortizes manager reservations and releases idle credit",
     };
     // Retain the API declaration walk that owns provisioned_storage. Zig
     // compile filters otherwise prune that module before the exact runtime

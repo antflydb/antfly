@@ -840,8 +840,8 @@ test "storage.ha fencing receipt drives standby promotion" {
     {
         var recovered = try standby_mod.Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
         defer recovered.close();
-        try std.testing.expectEqual(@as(u64, 2), recovered.identity.timeline_id);
-        try std.testing.expectEqual(@as(u64, 2), recovered.identity.epoch);
+        try std.testing.expectEqual(@as(u64, 2), recovered.identitySnapshot().timeline_id);
+        try std.testing.expectEqual(@as(u64, 2), recovered.identitySnapshot().epoch);
         try std.testing.expectEqual(@as(u64, 3), recovered.currentProgress().received_lsn);
         try std.testing.expectEqual(@as(u64, 3), recovered.currentProgress().applied_lsn);
         try std.testing.expectEqual(@as(u64, 3), recovered.currentProgress().safe_read_lsn);

@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const backend_erased = @import("../../storage/backend_erased.zig");
 const docstore = @import("../../storage/docstore.zig");
 const internal_keys = @import("../../storage/internal_keys.zig");
 const range_state = @import("../../storage/db/range_state.zig");
@@ -41,6 +42,22 @@ pub const SplitHandoff = struct {
     split_state: AppliedSplitState,
     base_delta_sequence: u64,
     entries: []AppliedDataKV,
+};
+
+pub const SplitHandoffMetadata = struct {
+    byte_range: AppliedDataRange,
+    split_state: AppliedSplitState,
+    base_delta_sequence: u64,
+};
+
+pub const GroupStatePage = struct {
+    entries: []AppliedDataKV,
+    exhausted: bool,
+
+    pub fn deinit(self: *GroupStatePage, alloc: std.mem.Allocator) void {
+        freeGroupStateEntries(alloc, self.entries);
+        self.* = undefined;
+    }
 };
 
 pub const DataOperation = union(enum) {
@@ -338,6 +355,11 @@ pub fn freeHandoff(alloc: std.mem.Allocator, handoff: SplitHandoff) void {
     freeGroupStateEntries(alloc, handoff.entries);
 }
 
+pub fn freeHandoffMetadata(alloc: std.mem.Allocator, handoff: SplitHandoffMetadata) void {
+    range_state.freeRange(alloc, handoff.byte_range);
+    freeSplitState(alloc, handoff.split_state);
+}
+
 pub fn currentSplitDeltaSequence(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) !u64 {
     const key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
     defer alloc.free(key);
@@ -391,6 +413,22 @@ pub fn freeSplitTerminal(alloc: std.mem.Allocator, terminal: AppliedSplitTermina
 }
 
 pub fn captureSplitHandoff(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) !SplitHandoff {
+    const metadata = try captureSplitHandoffMetadata(store, alloc, group_id);
+    errdefer freeHandoffMetadata(alloc, metadata);
+    const entries = try groupStateInRange(store, alloc, group_id, metadata.byte_range);
+    return .{
+        .byte_range = metadata.byte_range,
+        .split_state = metadata.split_state,
+        .base_delta_sequence = metadata.base_delta_sequence,
+        .entries = entries,
+    };
+}
+
+pub fn captureSplitHandoffMetadata(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+) !SplitHandoffMetadata {
     const split_state = (try currentSplitState(store, alloc, group_id)) orelse return error.SplitInProgress;
     errdefer freeSplitState(alloc, split_state);
 
@@ -408,21 +446,33 @@ pub fn captureSplitHandoff(store: *docstore.DocStore, alloc: std.mem.Allocator, 
     };
     errdefer range_state.freeRange(alloc, byte_range);
 
-    const entries = try groupStateInRange(store, alloc, group_id, byte_range);
-    errdefer freeGroupStateEntries(alloc, entries);
-
     return .{
         .byte_range = byte_range,
         .split_state = split_state,
         .base_delta_sequence = try currentSplitDeltaSequence(store, alloc, group_id),
-        .entries = entries,
     };
 }
 
 pub fn listDeltasAfter(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64, after_seq: u64) ![]SplitDelta {
+    return try listDeltasPage(store, alloc, group_id, after_seq, std.math.maxInt(u64), std.math.maxInt(usize), std.math.maxInt(usize));
+}
+
+pub fn listDeltasPage(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    after_seq: u64,
+    through_seq: u64,
+    max_entries: usize,
+    max_bytes: usize,
+) ![]SplitDelta {
+    if (max_entries == 0 or max_bytes == 0 or after_seq >= through_seq)
+        return try alloc.alloc(SplitDelta, 0);
     const prefix = try groupSplitDeltaPrefixAlloc(alloc, group_id);
     defer alloc.free(prefix);
-    const all = try store.scanPrefix(alloc, prefix);
+    const after_key = if (after_seq == 0) null else try groupSplitDeltaKeyAlloc(alloc, group_id, after_seq);
+    defer if (after_key) |key| alloc.free(key);
+    const all = try store.scanPrefixPage(alloc, prefix, after_key, max_entries);
     defer {
         for (all) |kv| {
             alloc.free(kv.key);
@@ -437,10 +487,22 @@ pub fn listDeltasAfter(store: *docstore.DocStore, alloc: std.mem.Allocator, grou
         results.deinit(alloc);
     }
 
+    var used_bytes: usize = 0;
     for (all) |kv| {
         const seq = parseSplitDeltaSeq(group_id, kv.key) orelse continue;
         if (seq <= after_seq) continue;
-        try results.append(alloc, try shard_mod.decodeSplitDeltaAlloc(alloc, seq, kv.value));
+        if (seq > through_seq) break;
+        const encoded_bytes = std.math.add(usize, kv.key.len, kv.value.len) catch return error.OutOfMemory;
+        if (results.items.len > 0 and encoded_bytes > max_bytes -| used_bytes)
+            break;
+        const decoded = try shard_mod.decodeSplitDeltaAlloc(alloc, seq, kv.value);
+        errdefer {
+            var cleanup = decoded;
+            shard_mod.freeDelta(alloc, &cleanup);
+        }
+        try results.append(alloc, decoded);
+        used_bytes +|= encoded_bytes;
+        if (results.items.len >= max_entries) break;
     }
     return try results.toOwnedSlice(alloc);
 }
@@ -1208,6 +1270,252 @@ fn groupStateInRange(
     defer if (upper) |bound| alloc.free(bound);
 
     return try collectGroupDocumentsInPhysicalRange(store, alloc, group_id, lower, if (upper) |bound| bound else "");
+}
+
+pub fn groupStatePageInRange(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    byte_range: AppliedDataRange,
+    after_key: ?[]const u8,
+    max_entries: usize,
+    max_bytes: usize,
+) !GroupStatePage {
+    if (max_entries == 0 or max_bytes == 0)
+        return .{ .entries = try alloc.alloc(AppliedDataKV, 0), .exhausted = false };
+
+    const lower = if (after_key) |key|
+        try groupDocumentStoreKeyAlloc(alloc, group_id, key)
+    else
+        try groupDocumentLowerBoundAlloc(alloc, group_id, byte_range.start);
+    defer alloc.free(lower);
+    const upper = try groupDocumentUpperBoundAlloc(alloc, group_id, byte_range.end);
+    defer if (upper) |bound| alloc.free(bound);
+
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    cursor.setUpperBound(upper);
+
+    var entries = std.ArrayListUnmanaged(AppliedDataKV).empty;
+    errdefer {
+        for (entries.items) |entry| {
+            alloc.free(@constCast(entry.key));
+            alloc.free(@constCast(entry.value));
+        }
+        entries.deinit(alloc);
+    }
+
+    var used_bytes: usize = 0;
+    var exhausted = true;
+    var entry = try cursor.seekAtOrAfter(lower);
+    while (entry) |kv| : (entry = try cursor.next()) {
+        if (upper) |bound| if (std.mem.order(u8, kv.key, bound) != .lt) break;
+        if (!internal_keys.isPrimaryDocumentKey(kv.key)) continue;
+        const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
+        defer alloc.free(logical_key);
+        const raw_key = try stripGroupDocumentPrefixAlloc(alloc, logical_key, group_id);
+        errdefer alloc.free(raw_key);
+        if (after_key) |after| {
+            if (std.mem.order(u8, raw_key, after) != .gt) {
+                alloc.free(raw_key);
+                continue;
+            }
+        }
+        const entry_bytes = std.math.add(usize, raw_key.len, kv.value.len) catch return error.OutOfMemory;
+        if (entries.items.len > 0 and
+            (entries.items.len >= max_entries or entry_bytes > max_bytes -| used_bytes))
+        {
+            alloc.free(raw_key);
+            exhausted = false;
+            break;
+        }
+        const value = try alloc.dupe(u8, kv.value);
+        errdefer alloc.free(value);
+        try entries.append(alloc, .{ .key = raw_key, .value = value });
+        used_bytes +|= entry_bytes;
+        if (entries.items.len >= max_entries or used_bytes >= max_bytes) {
+            exhausted = false;
+            break;
+        }
+    }
+    return .{
+        .entries = try entries.toOwnedSlice(alloc),
+        .exhausted = exhausted,
+    };
+}
+
+fn nextPrimaryRawKeyAlloc(
+    cursor: *backend_erased.Cursor,
+    entry: *?backend_erased.Entry,
+    alloc: std.mem.Allocator,
+    group_id: ?u64,
+) !?[]u8 {
+    while (entry.*) |kv| {
+        if (!internal_keys.isPrimaryDocumentKey(kv.key)) {
+            entry.* = try cursor.next();
+            continue;
+        }
+        const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse {
+            entry.* = try cursor.next();
+            continue;
+        };
+        defer alloc.free(logical_key);
+        const raw_key = if (group_id) |id|
+            try stripGroupDocumentPrefixAlloc(alloc, logical_key, id)
+        else
+            try alloc.dupe(u8, logical_key);
+        entry.* = try cursor.next();
+        return raw_key;
+    }
+    return null;
+}
+
+fn sourceContainsProjectedDocuments(
+    projected: *docstore.DocStore,
+    source: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    byte_range: AppliedDataRange,
+) !bool {
+    const projected_lower = try groupDocumentLowerBoundAlloc(alloc, group_id, byte_range.start);
+    defer alloc.free(projected_lower);
+    const projected_upper = try groupDocumentUpperBoundAlloc(alloc, group_id, byte_range.end);
+    defer if (projected_upper) |bound| alloc.free(bound);
+    const source_lower = try internal_keys.documentRangeLowerAlloc(alloc, byte_range.start);
+    defer alloc.free(source_lower);
+    const source_upper = if (byte_range.end.len > 0)
+        try internal_keys.documentRangeLowerAlloc(alloc, byte_range.end)
+    else
+        null;
+    defer if (source_upper) |bound| alloc.free(bound);
+
+    var projected_txn = try projected.beginReadTxn();
+    defer projected_txn.abort();
+    var projected_cursor = try projected_txn.openCursor();
+    defer projected_cursor.close();
+    projected_cursor.setUpperBound(projected_upper);
+    var projected_entry = try projected_cursor.seekAtOrAfter(projected_lower);
+
+    var source_txn = try source.beginReadTxn();
+    defer source_txn.abort();
+    var source_cursor = try source_txn.openCursor();
+    defer source_cursor.close();
+    source_cursor.setUpperBound(source_upper);
+    var source_entry = try source_cursor.seekAtOrAfter(source_lower);
+    var source_key = try nextPrimaryRawKeyAlloc(&source_cursor, &source_entry, alloc, null);
+    defer if (source_key) |key| alloc.free(key);
+
+    while (try nextPrimaryRawKeyAlloc(&projected_cursor, &projected_entry, alloc, group_id)) |projected_key| {
+        defer alloc.free(projected_key);
+        while (source_key) |candidate| {
+            switch (std.mem.order(u8, candidate, projected_key)) {
+                .lt => {
+                    alloc.free(candidate);
+                    source_key = try nextPrimaryRawKeyAlloc(&source_cursor, &source_entry, alloc, null);
+                },
+                .eq => break,
+                .gt => return false,
+            }
+        }
+        if (source_key == null) return false;
+    }
+    return true;
+}
+
+/// Reconciles an authoritative DB into the Raft projection without destructive
+/// intermediate states. The caller excludes Raft apply for this group. Existing
+/// projected keys are validated as a subset first; page commits can therefore
+/// only move the projection toward the authoritative root and are safe to retry
+/// after any interruption. The root marker is committed only with the final page.
+pub fn reconcileAuthoritativeGroupDocumentsPaged(
+    projected: *docstore.DocStore,
+    source: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    byte_range: AppliedDataRange,
+    final_metadata_writes: []const docstore.KVPair,
+    max_page_entries: usize,
+    max_page_bytes: usize,
+) !void {
+    if (max_page_entries == 0 or max_page_bytes == 0) return error.InvalidArgument;
+    if (!try sourceContainsProjectedDocuments(projected, source, alloc, group_id, byte_range))
+        return error.SplitSourceProjectionNotReady;
+
+    const source_lower = try internal_keys.documentRangeLowerAlloc(alloc, byte_range.start);
+    defer alloc.free(source_lower);
+    const source_upper = if (byte_range.end.len > 0)
+        try internal_keys.documentRangeLowerAlloc(alloc, byte_range.end)
+    else
+        null;
+    defer if (source_upper) |bound| alloc.free(bound);
+
+    var source_txn = try source.beginReadTxn();
+    defer source_txn.abort();
+    var source_cursor = try source_txn.openCursor();
+    defer source_cursor.close();
+    source_cursor.setUpperBound(source_upper);
+    var entry = try source_cursor.seekAtOrAfter(source_lower);
+    while (entry != null) {
+        var write_txn = try projected.beginWriteTxn();
+        errdefer write_txn.abort();
+        var page_entries: usize = 0;
+        var page_bytes: usize = 0;
+        while (entry) |kv| {
+            if (source_upper) |bound| if (std.mem.order(u8, kv.key, bound) != .lt) {
+                entry = null;
+                break;
+            };
+            if (!internal_keys.isPrimaryDocumentKey(kv.key)) {
+                entry = try source_cursor.next();
+                continue;
+            }
+            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse {
+                entry = try source_cursor.next();
+                continue;
+            };
+            defer alloc.free(raw_key);
+            const projected_key = try groupDocumentStoreKeyAlloc(alloc, group_id, raw_key);
+            defer alloc.free(projected_key);
+            const entry_bytes = std.math.add(usize, projected_key.len, kv.value.len) catch return error.OutOfMemory;
+            if (page_entries > 0 and
+                (page_entries >= max_page_entries or entry_bytes > max_page_bytes -| page_bytes))
+            {
+                break;
+            }
+            try write_txn.put(projected_key, kv.value);
+            page_entries += 1;
+            page_bytes +|= entry_bytes;
+            entry = try source_cursor.next();
+            if (page_entries >= max_page_entries or page_bytes >= max_page_bytes) break;
+        }
+        if (page_entries == 0) {
+            write_txn.abort();
+            if (entry == null) break;
+            continue;
+        }
+        try write_txn.commit();
+    }
+
+    const active_split = try currentSplitState(projected, alloc, group_id);
+    defer if (active_split) |state| freeSplitState(alloc, state);
+    const replacement_range: AppliedDataRange = if (active_split != null)
+        try currentRange(projected, alloc, group_id)
+    else
+        .{
+            .start = try alloc.dupe(u8, byte_range.start),
+            .end = try alloc.dupe(u8, byte_range.end),
+        };
+    defer range_state.freeRange(alloc, replacement_range);
+    const range_key = try groupRangeKeyAlloc(alloc, group_id);
+    defer alloc.free(range_key);
+    var range_buf: [1024]u8 = undefined;
+    var final_txn = try projected.beginWriteTxn();
+    errdefer final_txn.abort();
+    try final_txn.put(range_key, try range_state.encodeRange(replacement_range, &range_buf));
+    for (final_metadata_writes) |write| try final_txn.put(write.key, write.value);
+    try final_txn.commit();
 }
 
 fn collectGroupDocumentsInPhysicalRange(
@@ -2800,6 +3108,33 @@ test "shard state store captures right-hand split handoff and filters delta catc
     try std.testing.expectEqualStrings("doc:z", handoff.byte_range.end);
     try std.testing.expectEqual(@as(u64, 1), handoff.base_delta_sequence);
     try std.testing.expectEqual(@as(usize, 2), handoff.entries.len);
+
+    const metadata = try captureSplitHandoffMetadata(&src, std.testing.allocator, 51);
+    defer freeHandoffMetadata(std.testing.allocator, metadata);
+    var first_page = try groupStatePageInRange(
+        &src,
+        std.testing.allocator,
+        51,
+        metadata.byte_range,
+        null,
+        1,
+        1,
+    );
+    defer first_page.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), first_page.entries.len);
+    try std.testing.expect(!first_page.exhausted);
+    var second_page = try groupStatePageInRange(
+        &src,
+        std.testing.allocator,
+        51,
+        metadata.byte_range,
+        first_page.entries[0].key,
+        1,
+        1,
+    );
+    defer second_page.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), second_page.entries.len);
+    try std.testing.expectEqualStrings("doc:u", second_page.entries[0].key);
     try applyHandoff(&dst, std.testing.allocator, 52, handoff);
 
     const initial_range = try currentRange(&dst, std.testing.allocator, 52);
@@ -2822,6 +3157,18 @@ test "shard state store captures right-hand split handoff and filters delta catc
     const catchup = try listDeltasAfter(&src, std.testing.allocator, 51, handoff.base_delta_sequence);
     defer shard_mod.freeDeltas(std.testing.allocator, catchup);
     try std.testing.expectEqual(@as(usize, 1), catchup.len);
+    const catchup_page = try listDeltasPage(
+        &src,
+        std.testing.allocator,
+        51,
+        handoff.base_delta_sequence,
+        catchup[0].sequence,
+        1,
+        1,
+    );
+    defer shard_mod.freeDeltas(std.testing.allocator, catchup_page);
+    try std.testing.expectEqual(@as(usize, 1), catchup_page.len);
+    try std.testing.expectEqual(catchup[0].sequence, catchup_page[0].sequence);
     try applyDeltas(&dst, std.testing.allocator, 52, catchup);
 
     const dst_state = try groupState(&dst, std.testing.allocator, 52);

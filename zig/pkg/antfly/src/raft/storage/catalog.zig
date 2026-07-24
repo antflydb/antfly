@@ -484,15 +484,23 @@ pub const FileReplicaCatalog = struct {
     }
 
     fn load(self: *FileReplicaCatalog) !void {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io(), self.path, self.alloc, .limited(1 << 20)) catch |err| switch (err) {
+        var file = (if (std.fs.path.isAbsolute(self.path))
+            std.Io.Dir.openFileAbsolute(self.io(), self.path, .{})
+        else
+            std.Io.Dir.cwd().openFile(self.io(), self.path, .{})) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
-        defer self.alloc.free(bytes);
-        if (bytes.len == 0) return;
+        defer file.close(self.io());
 
-        var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
-        while (lines.next()) |line| {
+        // Total catalog size is unbounded by design, but one malformed record
+        // cannot force an unbounded allocation during startup.
+        var read_buffer: [64 * 1024]u8 = undefined;
+        var reader = file.reader(self.io(), &read_buffer);
+        while ((reader.interface.takeDelimiter('\n') catch |err| switch (err) {
+            error.StreamTooLong => return error.ReplicaCatalogRecordTooLarge,
+            else => return err,
+        })) |line| {
             if (line.len == 0) continue;
             var fields = std.mem.tokenizeScalar(u8, line, ' ');
             const group_id = std.fmt.parseInt(u64, fields.next() orelse return error.InvalidReplicaCatalog, 10) catch return error.InvalidReplicaCatalog;
@@ -562,52 +570,18 @@ pub const FileReplicaCatalog = struct {
         const parent_dir = std.fs.path.dirname(self.path);
         if (parent_dir) |dir| try fs_paths.createDirPathPortable(self.io(), dir);
 
-        const records = try self.listOwned(self.alloc);
-        defer freeReplicaRecords(self.alloc, records);
-        std.mem.sort(ReplicaRecord, records, {}, struct {
-            fn lessThan(_: void, lhs: ReplicaRecord, rhs: ReplicaRecord) bool {
+        const records = try self.alloc.alloc(*const ReplicaRecord, self.records.count());
+        defer self.alloc.free(records);
+        var values = self.records.valueIterator();
+        var count: usize = 0;
+        while (values.next()) |record| : (count += 1) records[count] = record;
+        std.debug.assert(count == records.len);
+        std.mem.sort(*const ReplicaRecord, records, {}, struct {
+            fn lessThan(_: void, lhs: *const ReplicaRecord, rhs: *const ReplicaRecord) bool {
                 return lhs.group_id < rhs.group_id;
             }
         }.lessThan);
-        var encoded = std.ArrayListUnmanaged(u8).empty;
-        defer encoded.deinit(self.alloc);
-        for (records) |record| {
-            const line = if (record.snapshot_bootstrap) |snapshot|
-                try std.fmt.allocPrint(self.alloc, "{d} {d} {d} {s} {d} raft {d} {d} {s} {s}\n", .{
-                    record.group_id,
-                    record.replica_id,
-                    record.local_node_id,
-                    @tagName(record.bootstrap_mode),
-                    record.metadata_version,
-                    snapshot.from_node_id,
-                    snapshot.term,
-                    snapshot.snapshot_id,
-                    snapshot.uri,
-                })
-            else if (record.backup_restore_bootstrap) |backup|
-                try std.fmt.allocPrint(self.alloc, "{d} {d} {d} {s} {d} backup {s} {s} {s}\n", .{
-                    record.group_id,
-                    record.replica_id,
-                    record.local_node_id,
-                    @tagName(record.bootstrap_mode),
-                    record.metadata_version,
-                    backup.backup_id,
-                    backup.location,
-                    backup.snapshot_path,
-                })
-            else
-                try std.fmt.allocPrint(self.alloc, "{d} {d} {d} {s} {d}\n", .{
-                    record.group_id,
-                    record.replica_id,
-                    record.local_node_id,
-                    @tagName(record.bootstrap_mode),
-                    record.metadata_version,
-                });
-            defer self.alloc.free(line);
-            try encoded.appendSlice(self.alloc, line);
-        }
-
-        try writeFileAtomicallyDurable(self.alloc, self.io(), self.path, encoded.items);
+        try writeCatalogAtomicallyDurable(self.alloc, self.io(), self.path, records);
     }
 
     fn io(self: *FileReplicaCatalog) std.Io {
@@ -690,11 +664,11 @@ fn deinitReplicaMap(
     records.* = .empty;
 }
 
-fn writeFileAtomicallyDurable(
+fn writeCatalogAtomicallyDurable(
     alloc: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    contents: []const u8,
+    records: []const *const ReplicaRecord,
 ) !void {
     // A process-local counter can collide with a temp file left by a crash
     // after restart. A 128-bit random suffix keeps stale files harmless while
@@ -728,7 +702,40 @@ fn writeFileAtomicallyDurable(
             defer file.close(io);
             var buf: [4096]u8 = undefined;
             var writer = file.writer(io, &buf);
-            try writer.interface.writeAll(contents);
+            for (records) |record| {
+                if (record.snapshot_bootstrap) |snapshot| {
+                    try writer.interface.print("{d} {d} {d} {s} {d} raft {d} {d} {s} {s}\n", .{
+                        record.group_id,
+                        record.replica_id,
+                        record.local_node_id,
+                        @tagName(record.bootstrap_mode),
+                        record.metadata_version,
+                        snapshot.from_node_id,
+                        snapshot.term,
+                        snapshot.snapshot_id,
+                        snapshot.uri,
+                    });
+                } else if (record.backup_restore_bootstrap) |backup| {
+                    try writer.interface.print("{d} {d} {d} {s} {d} backup {s} {s} {s}\n", .{
+                        record.group_id,
+                        record.replica_id,
+                        record.local_node_id,
+                        @tagName(record.bootstrap_mode),
+                        record.metadata_version,
+                        backup.backup_id,
+                        backup.location,
+                        backup.snapshot_path,
+                    });
+                } else {
+                    try writer.interface.print("{d} {d} {d} {s} {d}\n", .{
+                        record.group_id,
+                        record.replica_id,
+                        record.local_node_id,
+                        @tagName(record.bootstrap_mode),
+                        record.metadata_version,
+                    });
+                }
+            }
             try writer.end();
             try file.sync(io);
         }
@@ -838,6 +845,47 @@ test "file replica catalog persists records across reopen" {
         try std.testing.expectEqual(@as(u64, 7), records[0].snapshot_bootstrap.?.term);
         try std.testing.expectEqualStrings("snap-21", records[0].snapshot_bootstrap.?.snapshot_id);
     }
+}
+
+test "file replica catalog reopens catalogs larger than one MiB" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-large", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const uri = try std.testing.allocator.alloc(u8, 1100);
+    defer std.testing.allocator.free(uri);
+    @memset(uri, 'x');
+    const upserts = try std.testing.allocator.alloc(ReplicaRecord, 1000);
+    defer std.testing.allocator.free(upserts);
+    for (upserts, 0..) |*record, i| {
+        record.* = .{
+            .group_id = @intCast(i + 1),
+            .replica_id = @intCast(i + 1001),
+            .local_node_id = 5,
+            .bootstrap_mode = .fetch_snapshot,
+            .snapshot_bootstrap = .{
+                .from_node_id = 4,
+                .term = 7,
+                .snapshot_id = "snapshot",
+                .uri = uri,
+            },
+        };
+    }
+
+    {
+        var replica_catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
+        defer replica_catalog.deinit();
+        const iface = replica_catalog.catalog();
+        try iface.applyBatch(iface.revision(), upserts, &.{});
+    }
+
+    var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);
+    defer reopened.deinit();
+    const records = try reopened.catalog().listReplicas(std.testing.allocator);
+    defer freeReplicaRecords(std.testing.allocator, records);
+    try std.testing.expectEqual(upserts.len, records.len);
+    for (records) |record| try std.testing.expectEqual(uri.len, record.snapshot_bootstrap.?.uri.len);
 }
 
 test "file replica catalog rejects duplicate groups without leaking loaded records" {

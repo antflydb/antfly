@@ -54,6 +54,8 @@ pub const AppliedDataKV = shard_state_store.AppliedDataKV;
 pub const AppliedDataRange = shard_state_store.AppliedDataRange;
 pub const AppliedSplitState = shard_state_store.AppliedSplitState;
 pub const SplitHandoff = shard_state_store.SplitHandoff;
+pub const SplitHandoffMetadata = shard_state_store.SplitHandoffMetadata;
+pub const GroupStatePage = shard_state_store.GroupStatePage;
 
 pub const SplitControlObservation = struct {
     state: ?AppliedSplitState = null,
@@ -826,6 +828,81 @@ pub const RaftApplyStore = struct {
         return true;
     }
 
+    pub fn seedGroupSnapshotFromAuthoritativeStoreIfAbsent(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        root_incarnation: u128,
+        byte_range: AppliedDataRange,
+        source: *docstore.DocStore,
+        max_page_entries: usize,
+        max_page_bytes: usize,
+    ) !bool {
+        if (root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
+        const encoded = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{
+            .term = 0,
+            .index = 0,
+            .entry_type = .normal,
+            .data = @constCast("snapshot_seed"),
+        }});
+        defer alloc.free(encoded);
+        var key_buf: [128]u8 = undefined;
+        const batch_key = try keyForGroup(&key_buf, group_id);
+        const batch_value = try alloc.alloc(u8, @sizeOf(u64) + encoded.len);
+        defer alloc.free(batch_value);
+        std.mem.writeInt(u64, batch_value[0..8], 0, .little);
+        @memcpy(batch_value[8..], encoded);
+        const marker_key = try projectionRootIncarnationKeyAlloc(alloc, group_id);
+        defer alloc.free(marker_key);
+        var marker_value: [16]u8 = undefined;
+        std.mem.writeInt(u128, &marker_value, root_incarnation, .little);
+
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        const group_store = prepare: {
+            shard.mutex.lockUncancelable(io);
+            defer shard.mutex.unlock(io);
+            try self.waitForGenerationPreparationLocked(shard, group_id);
+            if ((try self.ensureLoaded(shard, group_id)) != null) return false;
+            try shard.generation_preparations.ensureUnusedCapacity(self.alloc, 1);
+            try shard.batches.ensureUnusedCapacity(self.alloc, 1);
+            const store = try self.writableGroupStoreLocked(shard, group_id);
+            shard.generation_preparations.putAssumeCapacity(group_id, {});
+            break :prepare store;
+        };
+
+        var preparation_active = true;
+        defer if (preparation_active) self.cancelGenerationPreparation(group_id);
+        try shard_state_store.reconcileAuthoritativeGroupDocumentsPaged(
+            &group_store.store,
+            source,
+            alloc,
+            group_id,
+            byte_range,
+            &.{
+                .{ .key = batch_key, .value = batch_value },
+                .{ .key = marker_key, .value = &marker_value },
+            },
+            max_page_entries,
+            max_page_bytes,
+        );
+
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        if ((try self.ensureLoaded(shard, group_id)) == null)
+            return error.SplitSourceProjectionNotReady;
+        var summary = try summarizeEntries(alloc, encoded);
+        summary.commit_index = 0;
+        if (shard.batches.getPtr(group_id)) |existing| {
+            existing.* = summary;
+        } else {
+            shard.batches.putAssumeCapacity(group_id, summary);
+        }
+        self.finishGenerationPreparationLocked(shard, group_id);
+        preparation_active = false;
+        return true;
+    }
+
     /// Reconciles the split projection from the authoritative document DB only
     /// while Raft remains at the caller's observed watermark. This is the
     /// generation-handoff counterpart to `seedGroupSnapshotIfAbsent`: replica
@@ -856,6 +933,65 @@ pub const RaftApplyStore = struct {
             entries,
             root_incarnation,
         );
+    }
+
+    /// Reconciles an authoritative document root with bounded memory while
+    /// excluding Raft apply only for this group. Page commits are additive and
+    /// retry-safe; the root marker is the final commit, so readers never mistake
+    /// an interrupted import for a complete projection.
+    pub fn reconcileGroupSnapshotFromAuthoritativeStoreAtRootIncarnation(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        expected: AppliedDataBatch,
+        root_incarnation: u128,
+        byte_range: AppliedDataRange,
+        source: *docstore.DocStore,
+        max_page_entries: usize,
+        max_page_bytes: usize,
+    ) !bool {
+        if (root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        const group_store = prepare: {
+            shard.mutex.lockUncancelable(io);
+            defer shard.mutex.unlock(io);
+            try self.waitForGenerationPreparationLocked(shard, group_id);
+            const current = (try self.ensureLoaded(shard, group_id)) orelse
+                return false;
+            if (!batchIdentityEqual(current.*, expected)) return false;
+            try shard.generation_preparations.ensureUnusedCapacity(self.alloc, 1);
+            const store = try self.writableGroupStoreLocked(shard, group_id);
+            shard.generation_preparations.putAssumeCapacity(group_id, {});
+            break :prepare store;
+        };
+
+        var preparation_active = true;
+        defer if (preparation_active) self.cancelGenerationPreparation(group_id);
+        const marker_key = try projectionRootIncarnationKeyAlloc(alloc, group_id);
+        defer alloc.free(marker_key);
+        var marker_value: [16]u8 = undefined;
+        std.mem.writeInt(u128, &marker_value, root_incarnation, .little);
+        try shard_state_store.reconcileAuthoritativeGroupDocumentsPaged(
+            &group_store.store,
+            source,
+            alloc,
+            group_id,
+            byte_range,
+            &.{.{ .key = marker_key, .value = &marker_value }},
+            max_page_entries,
+            max_page_bytes,
+        );
+
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        const published = (try self.ensureLoaded(shard, group_id)) orelse
+            return error.SplitSourceProjectionNotReady;
+        if (!batchIdentityEqual(published.*, expected))
+            return error.SplitSourceProjectionNotReady;
+        self.finishGenerationPreparationLocked(shard, group_id);
+        preparation_active = false;
+        return true;
     }
 
     /// Publishes an authoritative document projection and derives its split
@@ -917,6 +1053,33 @@ pub const RaftApplyStore = struct {
         defer alloc.free(marker);
         if (marker.len != 16 or std.mem.readInt(u128, marker[0..16], .little) != root_incarnation) return null;
         return try shard_state_store.captureSplitHandoff(&group_store.store, alloc, group_id);
+    }
+
+    pub fn captureVerifiedSplitHandoffMetadataAtRootIncarnation(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        expected: AppliedDataBatch,
+        root_incarnation: u128,
+    ) !?SplitHandoffMetadata {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.requireTransitionReadyLocked(shard, group_id);
+        const current = (try self.ensureLoaded(shard, group_id)) orelse return null;
+        if (!batchIdentityEqual(current.*, expected)) return null;
+        const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return null;
+        if (root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
+        const marker_key = try projectionRootIncarnationKeyAlloc(alloc, group_id);
+        defer alloc.free(marker_key);
+        const marker = group_store.store.get(alloc, marker_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(marker);
+        if (marker.len != 16 or std.mem.readInt(u128, marker[0..16], .little) != root_incarnation) return null;
+        return try shard_state_store.captureSplitHandoffMetadata(&group_store.store, alloc, group_id);
     }
 
     fn reconcileGroupSnapshotAtWatermarkLocked(
@@ -1066,6 +1229,60 @@ pub const RaftApplyStore = struct {
         try self.waitForGenerationPreparationLocked(shard, group_id);
         const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return try alloc.alloc(shard_state_store.SplitDelta, 0);
         return try shard_state_store.listDeltasAfter(&group_store.store, alloc, group_id, after_seq);
+    }
+
+    pub fn listSplitDeltasPage(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        after_seq: u64,
+        through_seq: u64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) ![]shard_state_store.SplitDelta {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
+        const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse
+            return try alloc.alloc(shard_state_store.SplitDelta, 0);
+        return try shard_state_store.listDeltasPage(
+            &group_store.store,
+            alloc,
+            group_id,
+            after_seq,
+            through_seq,
+            max_entries,
+            max_bytes,
+        );
+    }
+
+    pub fn groupStatePageInRange(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        byte_range: AppliedDataRange,
+        after_key: ?[]const u8,
+        max_entries: usize,
+        max_bytes: usize,
+    ) !GroupStatePage {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
+        const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse
+            return .{ .entries = try alloc.alloc(AppliedDataKV, 0), .exhausted = true };
+        return try shard_state_store.groupStatePageInRange(
+            &group_store.store,
+            alloc,
+            group_id,
+            byte_range,
+            after_key,
+            max_entries,
+            max_bytes,
+        );
     }
 
     pub fn applySplitHandoff(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, handoff: SplitHandoff) !void {

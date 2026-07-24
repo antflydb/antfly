@@ -812,6 +812,80 @@ pub const ResourceManager = struct {
         self.pressure_change.advance();
     }
 
+    fn growReservationAmortized(
+        self: *ResourceManager,
+        reservation: *Reservation,
+        minimum_bytes: u64,
+        preferred_bytes: u64,
+        max_hard_limit_multiple: u64,
+    ) !u64 {
+        if (minimum_bytes == 0) return 0;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const state = &self.slices[sliceIndex(reservation.slice)];
+        const hard_limit = state.budget.hard_limit_bytes;
+        const bounded_limit = if (hard_limit == 0)
+            std.math.maxInt(u64)
+        else
+            std.math.mul(u64, hard_limit, max_hard_limit_multiple) catch std.math.maxInt(u64);
+        const reservation_is_sole_user = state.used_bytes == reservation.bytes;
+
+        const Candidate = struct {
+            fn allowed(
+                current_used: u64,
+                current_reservation: u64,
+                additional: u64,
+                hard: u64,
+                bounded: u64,
+                sole_user: bool,
+                multiple: u64,
+            ) bool {
+                const next = std.math.add(u64, current_used, additional) catch return false;
+                if (hard == 0 or next <= hard) return true;
+                if (multiple <= 1 or !sole_user) return false;
+                const next_reservation = std.math.add(u64, current_reservation, additional) catch return false;
+                return next_reservation <= bounded;
+            }
+        };
+
+        var granted = @max(minimum_bytes, preferred_bytes);
+        if (!Candidate.allowed(
+            state.used_bytes,
+            reservation.bytes,
+            granted,
+            hard_limit,
+            bounded_limit,
+            reservation_is_sole_user,
+            max_hard_limit_multiple,
+        )) {
+            granted = minimum_bytes;
+            if (!Candidate.allowed(
+                state.used_bytes,
+                reservation.bytes,
+                granted,
+                hard_limit,
+                bounded_limit,
+                reservation_is_sole_user,
+                max_hard_limit_multiple,
+            )) {
+                state.hard_limit_rejections +|= 1;
+                return error.ResourceBudgetExceeded;
+            }
+        }
+
+        const previous_reservation = reservation.bytes;
+        state.used_bytes += granted;
+        reservation.bytes += granted;
+        state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
+        if (hard_limit > 0 and state.used_bytes > hard_limit and previous_reservation <= hard_limit)
+            state.oversized_single_grants +|= 1;
+        if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
+            state.soft_limit_events +|= 1;
+        self.pressure_change.advance();
+        return granted;
+    }
+
     pub fn releaseBytes(self: *ResourceManager, slice: Slice, bytes: u64) void {
         if (bytes == 0) return;
         lockAtomic(&self.mutex);
@@ -1167,6 +1241,8 @@ pub const BudgetedAllocator = struct {
     backing: std.mem.Allocator,
     reservation: Reservation,
     max_hard_limit_multiple: u64,
+    live_bytes: u64 = 0,
+    credit_quantum: u64,
     budget_denied: bool = false,
 
     pub fn init(
@@ -1175,6 +1251,11 @@ pub const BudgetedAllocator = struct {
         backing: std.mem.Allocator,
         max_hard_limit_multiple: u64,
     ) BudgetedAllocator {
+        const stats = manager.sliceStats(slice);
+        const credit_quantum = if (stats.hard_limit_bytes == 0)
+            1024 * 1024
+        else
+            @max(@as(u64, 1), @min(@as(u64, 1024 * 1024), stats.hard_limit_bytes / 64));
         return .{
             .backing = backing,
             .reservation = .{
@@ -1183,6 +1264,7 @@ pub const BudgetedAllocator = struct {
                 .bytes = 0,
             },
             .max_hard_limit_multiple = max_hard_limit_multiple,
+            .credit_quantum = credit_quantum,
         };
     }
 
@@ -1212,15 +1294,39 @@ pub const BudgetedAllocator = struct {
             self.budget_denied = true;
             return false;
         };
-        self.reservation.growBoundedOversized(amount, self.max_hard_limit_multiple) catch {
+        const next_live = std.math.add(u64, self.live_bytes, amount) catch {
             self.budget_denied = true;
             return false;
         };
+        if (next_live > self.reservation.bytes) {
+            const minimum = next_live - self.reservation.bytes;
+            _ = self.reservation.manager.growReservationAmortized(
+                &self.reservation,
+                minimum,
+                @max(minimum, self.credit_quantum),
+                self.max_hard_limit_multiple,
+            ) catch {
+                self.budget_denied = true;
+                return false;
+            };
+        }
+        self.live_bytes = next_live;
         return true;
     }
 
     fn releaseBytes(self: *BudgetedAllocator, bytes: usize) void {
-        self.reservation.shrink(std.math.cast(u64, bytes) orelse std.math.maxInt(u64));
+        const amount = std.math.cast(u64, bytes) orelse std.math.maxInt(u64);
+        self.live_bytes -|= amount;
+        if (self.live_bytes == 0) {
+            self.reservation.shrink(self.reservation.bytes);
+            return;
+        }
+        const spare = self.reservation.bytes -| self.live_bytes;
+        if (spare < self.credit_quantum *| 2) return;
+        const retained_spare = @min(self.credit_quantum, self.reservation.bytes);
+        const target = self.live_bytes +| retained_spare;
+        if (self.reservation.bytes > target)
+            self.reservation.shrink(self.reservation.bytes - target);
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
@@ -1746,6 +1852,34 @@ test "budgeted allocator allows concurrent operations within the shared hard lim
     defer second.allocator().free(second_bytes);
     try std.testing.expectEqual(@as(u64, 32), manager.sliceStats(.shard_transition_working_set).used_bytes);
     try std.testing.expectError(error.OutOfMemory, second.allocator().alloc(u8, 1));
+}
+
+test "budgeted allocator amortizes manager reservations and releases idle credit" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.shard_transition_working_set)] = .{
+        .soft_limit_bytes = 64 * 1024 * 1024,
+        .hard_limit_bytes = 128 * 1024 * 1024,
+    };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    var budgeted = BudgetedAllocator.init(
+        &manager,
+        .shard_transition_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer budgeted.deinit();
+    const alloc = budgeted.allocator();
+
+    const first = try alloc.alloc(u8, 1);
+    const reserved = manager.sliceStats(.shard_transition_working_set).used_bytes;
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), reserved);
+    const second = try alloc.alloc(u8, 4096);
+    try std.testing.expectEqual(reserved, manager.sliceStats(.shard_transition_working_set).used_bytes);
+
+    alloc.free(first);
+    try std.testing.expectEqual(reserved, manager.sliceStats(.shard_transition_working_set).used_bytes);
+    alloc.free(second);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.shard_transition_working_set).used_bytes);
 }
 
 test "resource manager records index repair activation pause separately from cleanup" {
