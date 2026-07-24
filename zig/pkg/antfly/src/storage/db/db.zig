@@ -4378,6 +4378,7 @@ pub const DB = struct {
     pub fn snapshotAsyncIndexingStats(self: *DB) types.AsyncIndexingStats {
         var async_stats = self.async_context.stats.snapshot();
         async_stats.bulk_coalescing = self.bulk_ingest_coalescer.stats.snapshot();
+        async_stats.derived_workers = self.executor.snapshotStats();
         return async_stats;
     }
 

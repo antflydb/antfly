@@ -50,7 +50,7 @@ const Worker = struct {
     replay_cursor_open_sequence: u64 = 0,
     catch_up_active: bool = false,
     last_replay_tail_records: u64 = 0,
-    pressure_retry_backoff: catch_up_policy.PressureRetryBackoff = .{},
+    recoverable_retry_backoff: catch_up_policy.RecoverableRetryBackoff = .{},
 };
 
 const PersistSnapshot = struct {
@@ -147,6 +147,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return null;
     }
 
+    pub fn snapshotStats(_: *@This()) types.DerivedWorkerStats {
+        return .{};
+    }
+
     pub fn notifySequence(self: *@This(), sequence: u64) void {
         _ = self;
         _ = sequence;
@@ -218,6 +222,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     last_notified_sequence: u64 = 0,
     truncates_in_flight: usize = 0,
     backlog: backlog_tracker_mod.Tracker,
+    recoverable_retry_counters: catch_up_policy.RecoverableRetryCounters = .{},
 
     pub fn init(
         alloc: Allocator,
@@ -432,6 +437,28 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             if (std.mem.eql(u8, worker.name, name)) return worker.applied_sequence;
         }
         return null;
+    }
+
+    pub fn snapshotStats(self: *DerivedRuntime) types.DerivedWorkerStats {
+        const io = self.ioContext();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var stats = types.DerivedWorkerStats{
+            .workers = @intCast(self.workers.items.len),
+        };
+        for (self.workers.items) |worker| {
+            const lag = worker.target_sequence -| worker.applied_sequence;
+            if (lag > 0) stats.workers_with_replay_debt += 1;
+            stats.max_replay_lag_sequences = @max(stats.max_replay_lag_sequences, lag);
+        }
+        const retries = self.recoverable_retry_counters.snapshot();
+        stats.recoverable_retries = retries.total;
+        stats.writer_locked_retries = retries.writer_locked;
+        stats.resource_budget_retries = retries.resource_budget;
+        stats.replay_document_not_visible_retries = retries.replay_document_not_visible;
+        stats.artifact_repair_required_retries = retries.artifact_repair_required;
+        stats.not_found_retries = retries.not_found;
+        return stats;
     }
 
     pub fn notifySequence(self: *DerivedRuntime, sequence: u64) void {
@@ -744,7 +771,7 @@ fn workerMain(worker: *Worker) void {
                     runtime.recordError(io, worker.name, "idle_persist", err);
                     return;
                 };
-                worker.pressure_retry_backoff.reset();
+                worker.recoverable_retry_backoff.reset();
                 if (!persisted) io.sleep(Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
                 runtime.mutex.lockUncancelable(io);
                 continue;
@@ -955,7 +982,7 @@ fn workerMain(worker: *Worker) void {
         if (applied_sequence_advanced) if (runtime.applied_sequence_advanced_fn) |callback| {
             callback(runtime.ctx, worker.name, caught_up_sequence);
         };
-        worker.pressure_retry_backoff.reset();
+        worker.recoverable_retry_backoff.reset();
 
         if (shouldRefreshReplayCursor(worker, caught_up_sequence)) {
             closeWorkerReplayCursor(runtime, worker);
@@ -1088,16 +1115,15 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
 }
 
 fn sleepAfterRecoverableCatchUpError(worker: *Worker, err: anyerror, io: Io) void {
-    if (err != error.ResourceBudgetExceeded) {
-        worker.pressure_retry_backoff.reset();
-        io.sleep(Io.Duration.zero, .awake) catch {};
-        return;
-    }
-    const delay_ns = worker.pressure_retry_backoff.nextDelayNs();
-    if (worker.pressure_retry_backoff.shouldLog()) {
+    const delay_ns = catch_up_policy.recordRecoverableRetry(
+        &worker.runtime.recoverable_retry_counters,
+        &worker.recoverable_retry_backoff,
+        err,
+    );
+    if (worker.recoverable_retry_backoff.shouldLog()) {
         std.log.warn(
-            "derived worker resource admission deferred worker={s} failures={} retry_ms={}",
-            .{ worker.name, worker.pressure_retry_backoff.failures, delay_ns / std.time.ns_per_ms },
+            "derived worker retrying recoverable failure worker={s} error={s} failures={} retry_ms={}",
+            .{ worker.name, @errorName(err), worker.recoverable_retry_backoff.failures, delay_ns / std.time.ns_per_ms },
         );
     }
     io.sleep(Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch {};

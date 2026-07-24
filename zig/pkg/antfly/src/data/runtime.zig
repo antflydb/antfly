@@ -1543,6 +1543,16 @@ const AsyncMutexMetricField = enum {
 };
 
 fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.AsyncIndexingStats) !void {
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_workers", "gauge", "Derived-index workers running across cached writable tables", stats.derived_workers.workers);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_workers_with_replay_debt", "gauge", "Derived-index workers whose target sequence is ahead of their applied sequence", stats.derived_workers.workers_with_replay_debt);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_max_replay_lag_sequences", "gauge", "Largest target-minus-applied sequence lag across derived-index workers", stats.derived_workers.max_replay_lag_sequences);
+    try health_metrics.appendPromMetricHeader(writer, "antfly_async_index_recoverable_retries_total", "counter", "Derived-index worker retries after recoverable failures, labeled by reason");
+    try appendDerivedRetrySample(writer, "writer_locked", stats.derived_workers.writer_locked_retries);
+    try appendDerivedRetrySample(writer, "resource_budget_exceeded", stats.derived_workers.resource_budget_retries);
+    try appendDerivedRetrySample(writer, "replay_document_not_visible", stats.derived_workers.replay_document_not_visible_retries);
+    try appendDerivedRetrySample(writer, "artifact_repair_required", stats.derived_workers.artifact_repair_required_retries);
+    try appendDerivedRetrySample(writer, "not_found", stats.derived_workers.not_found_retries);
+
     try writeAsyncMutexMetricFamily(writer, stats, .lock_calls, "antfly_async_index_mutex_lock_calls_total", "counter", "Async indexing mutex lock attempts");
     try writeAsyncMutexMetricFamily(writer, stats, .contended_calls, "antfly_async_index_mutex_contended_calls_total", "counter", "Async indexing mutex lock attempts that encountered contention");
     try writeAsyncMutexMetricFamily(writer, stats, .max_waiters, "antfly_async_index_mutex_max_waiters", "gauge", "Maximum concurrent waiters observed for each async indexing mutex");
@@ -1653,6 +1663,12 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_manifest_ns_total", "counter", "Manifest write nanoseconds observed during dense catch-up finish", stats.dense_catch_up.manifest_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_write_pressure_compactions_total", "counter", "Write-pressure compactions observed during dense catch-up finish", stats.dense_catch_up.write_pressure_compactions);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_dense_catch_up_write_pressure_ns_total", "counter", "Write-pressure compaction nanoseconds observed during dense catch-up finish", stats.dense_catch_up.write_pressure_ns);
+}
+
+fn appendDerivedRetrySample(writer: *std.Io.Writer, reason: []const u8, count: u64) !void {
+    try health_metrics.appendPromSampleLabeled(writer, "antfly_async_index_recoverable_retries_total", &.{
+        .{ .name = "reason", .value = reason },
+    }, count);
 }
 
 fn writeAsyncMutexMetricFamily(
@@ -1812,6 +1828,16 @@ fn writeLsmNativeStorageMetrics(writer: *std.Io.Writer, stats: ?lsm_backend_mod.
 }
 
 fn writeProcessMemoryMetrics(writer: *std.Io.Writer, stats: process_memory_mod.Stats) !void {
+    try health_metrics.appendPromMetric(writer, "antfly_process_cpu_available", "gauge", "Whether process CPU metrics are available on this platform", if (stats.cpu_available) 1 else 0);
+    if (stats.cpu_available) {
+        try health_metrics.appendPromMetricHeader(writer, "antfly_process_cpu_ns_total", "counter", "Process CPU time in nanoseconds, labeled by mode");
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_process_cpu_ns_total", &.{
+            .{ .name = "mode", .value = "user" },
+        }, stats.user_cpu_ns);
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_process_cpu_ns_total", &.{
+            .{ .name = "mode", .value = "system" },
+        }, stats.system_cpu_ns);
+    }
     try health_metrics.appendPromMetric(writer, "antfly_process_memory_available", "gauge", "Whether process memory metrics are available on this platform", if (stats.available) 1 else 0);
     if (!stats.available) return;
     try health_metrics.appendPromMetric(writer, "antfly_process_resident_bytes", "gauge", "Process resident bytes reported by the operating system", stats.resident_bytes);
@@ -20313,6 +20339,9 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
 
     writer = .fixed(&writer_buf);
     try writeProcessMemoryMetrics(&writer, .{
+        .cpu_available = true,
+        .user_cpu_ns = 1_500_000_000,
+        .system_cpu_ns = 250_000_000,
         .available = true,
         .resident_bytes = 11,
         .anonymous_bytes = 12,
@@ -20325,6 +20354,9 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .malloc_zone_bytes = 31,
     });
     const process_memory_output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_cpu_available 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_cpu_ns_total{mode=\"user\"} 1500000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_cpu_ns_total{mode=\"system\"} 250000000") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_memory_available 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_anonymous_bytes 12") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_private_dirty_bytes 17") != null);
@@ -20622,6 +20654,17 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
             .index_count = 2,
             .indexes = try std.testing.allocator.alloc(antfly.db.types.DBIndexStats, 2),
             .async_indexing = .{
+                .derived_workers = .{
+                    .workers = 2,
+                    .workers_with_replay_debt = 1,
+                    .max_replay_lag_sequences = 3,
+                    .recoverable_retries = 11,
+                    .writer_locked_retries = 7,
+                    .resource_budget_retries = 1,
+                    .replay_document_not_visible_retries = 1,
+                    .artifact_repair_required_retries = 1,
+                    .not_found_retries = 1,
+                },
                 .startup = .{
                     .active = true,
                     .phase = .opening_db,
@@ -20820,6 +20863,11 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_append_records_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_sync_ns_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lsm_wal_resets_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_workers 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_workers_with_replay_debt 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_max_replay_lag_sequences 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_recoverable_retries_total{reason=\"writer_locked\"} 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_recoverable_retries_total{reason=\"resource_budget_exceeded\"} 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_active 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_retained_segments 4") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_retained_bytes 99") != null);

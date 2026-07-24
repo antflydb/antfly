@@ -2759,6 +2759,19 @@ pub const AsyncIndexingStats = struct {
     startup: StartupCatchUpStats = .{},
     dense_catch_up: DenseCatchUpStats = .{},
     bulk_coalescing: BulkCoalescingStats = .{},
+    derived_workers: DerivedWorkerStats = .{},
+};
+
+pub const DerivedWorkerStats = struct {
+    workers: u64 = 0,
+    workers_with_replay_debt: u64 = 0,
+    max_replay_lag_sequences: u64 = 0,
+    recoverable_retries: u64 = 0,
+    writer_locked_retries: u64 = 0,
+    resource_budget_retries: u64 = 0,
+    replay_document_not_visible_retries: u64 = 0,
+    artifact_repair_required_retries: u64 = 0,
+    not_found_retries: u64 = 0,
 };
 
 pub const BulkCoalescingStats = struct {
@@ -2896,6 +2909,15 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.bulk_coalescing.stage_transforms += src.bulk_coalescing.stage_transforms;
     dst.bulk_coalescing.flush_calls += src.bulk_coalescing.flush_calls;
     dst.bulk_coalescing.flushed_keys += src.bulk_coalescing.flushed_keys;
+    dst.derived_workers.workers += src.derived_workers.workers;
+    dst.derived_workers.workers_with_replay_debt += src.derived_workers.workers_with_replay_debt;
+    dst.derived_workers.max_replay_lag_sequences = @max(dst.derived_workers.max_replay_lag_sequences, src.derived_workers.max_replay_lag_sequences);
+    dst.derived_workers.recoverable_retries += src.derived_workers.recoverable_retries;
+    dst.derived_workers.writer_locked_retries += src.derived_workers.writer_locked_retries;
+    dst.derived_workers.resource_budget_retries += src.derived_workers.resource_budget_retries;
+    dst.derived_workers.replay_document_not_visible_retries += src.derived_workers.replay_document_not_visible_retries;
+    dst.derived_workers.artifact_repair_required_retries += src.derived_workers.artifact_repair_required_retries;
+    dst.derived_workers.not_found_retries += src.derived_workers.not_found_retries;
 }
 
 pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {
