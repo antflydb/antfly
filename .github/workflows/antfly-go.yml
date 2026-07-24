@@ -5,7 +5,7 @@ name: Go
 
 on:
   push:
-    branches: ["main"]
+    branches: ["v0.1.x"]
     paths-ignore:
       - "*.md"
       - "docs/**"
@@ -19,7 +19,7 @@ on:
       - ".github/workflows/antfly-container.yml"
       - ".github/workflows/trigger-docs-build.yml"
   pull_request:
-    branches: ["main"]
+    branches: ["v0.1.x"]
     paths-ignore:
       - "*.md"
       - "docs/**"
@@ -32,6 +32,7 @@ on:
       - ".github/workflows/antfly-operator-*.yml"
       - ".github/workflows/antfly-container.yml"
       - ".github/workflows/trigger-docs-build.yml"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
