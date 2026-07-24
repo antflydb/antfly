@@ -79,13 +79,14 @@ pub const Scheduler = struct {
     }
 
     pub fn nextTickGroup(self: *Scheduler) ?core.types.GroupId {
-        // Consensus timeouts require strict fairness: a busy group must not
-        // consume another group's election or heartbeat ticks.
         return self.nextRoundRobinGroup(&self.cursor);
     }
 
     pub fn nextReadyGroup(self: *Scheduler) ?core.types.GroupId {
-        return self.nextPriorityGroup(&self.ready_cursor);
+        // A Ready scan is bounded by group count. Returning one busy group
+        // more than once can therefore leave another group's vote or
+        // heartbeat messages undrained for the entire round.
+        return self.nextRoundRobinGroup(&self.ready_cursor);
     }
 
     pub fn quiesceGroup(self: *Scheduler, group_id: core.types.GroupId) !void {
@@ -169,35 +170,6 @@ pub const Scheduler = struct {
         }
         return null;
     }
-
-    fn nextPriorityGroup(self: *Scheduler, cursor: *usize) ?core.types.GroupId {
-        if (self.group_ids.items.len == 0) return null;
-
-        var checked: usize = 0;
-        while (checked < self.group_ids.items.len) : (checked += 1) {
-            const group_id = self.group_ids.items[cursor.*];
-            cursor.* = (cursor.* + 1) % self.group_ids.items.len;
-            if (self.isQuiesced(group_id)) continue;
-            if (self.priority.get(group_id)) |score| {
-                if (score > 0) {
-                    if (score == 1) {
-                        _ = self.priority.remove(group_id);
-                    } else {
-                        self.priority.put(self.alloc, group_id, score - 1) catch {};
-                    }
-                    return group_id;
-                }
-            }
-        }
-
-        checked = 0;
-        while (checked < self.group_ids.items.len) : (checked += 1) {
-            const group_id = self.group_ids.items[cursor.*];
-            cursor.* = (cursor.* + 1) % self.group_ids.items.len;
-            if (!self.isQuiesced(group_id)) return group_id;
-        }
-        return null;
-    }
 };
 
 test "scheduler round-robins groups" {
@@ -233,7 +205,7 @@ test "scheduler skips quiesced groups" {
     try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextTickGroup());
 }
 
-test "scheduler boosts active groups ahead of plain round robin" {
+test "scheduler activity does not disturb fair consensus work" {
     var scheduler = Scheduler.init(std.testing.allocator, .{ .priority_boost = 2 });
     defer scheduler.deinit();
 
@@ -241,34 +213,17 @@ test "scheduler boosts active groups ahead of plain round robin" {
     try scheduler.registerGroup(2);
     try scheduler.registerGroup(3);
 
-    scheduler.noteActivity(3);
-    try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup());
-    try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup());
-    try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup());
-}
-
-test "scheduler activity priority cannot starve raft ticks" {
-    var scheduler = Scheduler.init(std.testing.allocator, .{ .priority_boost = 8 });
-    defer scheduler.deinit();
-
-    try scheduler.registerGroup(1);
-    try scheduler.registerGroup(2);
-    try scheduler.registerGroup(3);
-
-    scheduler.noteActivity(1);
-    scheduler.noteActivity(2);
-    try std.testing.expectEqualSlices(
-        core.types.GroupId,
-        &.{ 1, 2, 3, 1, 2, 3 },
-        &.{
-            scheduler.nextTickGroup().?,
-            scheduler.nextTickGroup().?,
-            scheduler.nextTickGroup().?,
-            scheduler.nextTickGroup().?,
-            scheduler.nextTickGroup().?,
-            scheduler.nextTickGroup().?,
-        },
-    );
+    var round: usize = 0;
+    while (round < 8) : (round += 1) {
+        scheduler.noteActivity(3);
+        scheduler.noteReady(3);
+        try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextTickGroup());
+        try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextTickGroup());
+        try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextTickGroup());
+        try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup());
+        try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextReadyGroup());
+        try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup());
+    }
 }
 
 test "scheduler unregister normalizes ready cursor independently" {
