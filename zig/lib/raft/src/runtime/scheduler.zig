@@ -79,11 +79,13 @@ pub const Scheduler = struct {
     }
 
     pub fn nextTickGroup(self: *Scheduler) ?core.types.GroupId {
-        return self.nextGroup(&self.cursor);
+        // Consensus timeouts require strict fairness: a busy group must not
+        // consume another group's election or heartbeat ticks.
+        return self.nextRoundRobinGroup(&self.cursor);
     }
 
     pub fn nextReadyGroup(self: *Scheduler) ?core.types.GroupId {
-        return self.nextGroup(&self.ready_cursor);
+        return self.nextPriorityGroup(&self.ready_cursor);
     }
 
     pub fn quiesceGroup(self: *Scheduler, group_id: core.types.GroupId) !void {
@@ -156,7 +158,19 @@ pub const Scheduler = struct {
         gop.value_ptr.* = std.math.add(u8, current, amount) catch std.math.maxInt(u8);
     }
 
-    fn nextGroup(self: *Scheduler, cursor: *usize) ?core.types.GroupId {
+    fn nextRoundRobinGroup(self: *Scheduler, cursor: *usize) ?core.types.GroupId {
+        if (self.group_ids.items.len == 0) return null;
+
+        var checked: usize = 0;
+        while (checked < self.group_ids.items.len) : (checked += 1) {
+            const group_id = self.group_ids.items[cursor.*];
+            cursor.* = (cursor.* + 1) % self.group_ids.items.len;
+            if (!self.isQuiesced(group_id)) return group_id;
+        }
+        return null;
+    }
+
+    fn nextPriorityGroup(self: *Scheduler, cursor: *usize) ?core.types.GroupId {
         if (self.group_ids.items.len == 0) return null;
 
         var checked: usize = 0;
@@ -231,6 +245,30 @@ test "scheduler boosts active groups ahead of plain round robin" {
     try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup());
     try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup());
     try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup());
+}
+
+test "scheduler activity priority cannot starve raft ticks" {
+    var scheduler = Scheduler.init(std.testing.allocator, .{ .priority_boost = 8 });
+    defer scheduler.deinit();
+
+    try scheduler.registerGroup(1);
+    try scheduler.registerGroup(2);
+    try scheduler.registerGroup(3);
+
+    scheduler.noteActivity(1);
+    scheduler.noteActivity(2);
+    try std.testing.expectEqualSlices(
+        core.types.GroupId,
+        &.{ 1, 2, 3, 1, 2, 3 },
+        &.{
+            scheduler.nextTickGroup().?,
+            scheduler.nextTickGroup().?,
+            scheduler.nextTickGroup().?,
+            scheduler.nextTickGroup().?,
+            scheduler.nextTickGroup().?,
+            scheduler.nextTickGroup().?,
+        },
+    );
 }
 
 test "scheduler unregister normalizes ready cursor independently" {
