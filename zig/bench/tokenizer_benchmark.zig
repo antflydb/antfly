@@ -31,7 +31,8 @@ fn usage(writer: *std.Io.Writer) !void {
         \\
         \\Measures the native Zig HuggingFace tokenizer's steady-state encodeInto
         \\throughput. The tokenizer and reusable output buffer persist across all
-        \\iterations. Multiple threads share the tokenizer and its concurrent cache.
+        \\iterations. Concurrent tasks use the process std.Io runtime and share the
+        \\tokenizer and its concurrent cache.
         \\
     );
 }
@@ -107,43 +108,31 @@ fn parseArgs(io: std.Io, args_in: std.process.Args) !Config {
     return cfg;
 }
 
-fn nowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
-        .SUCCESS => {},
-        else => unreachable,
-    }
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s +
-        @as(u64, @intCast(ts.nsec));
-}
-
 const Worker = struct {
     tokenizer: tokenizer_mod.Tokenizer,
+    io: std.Io,
     corpus: []const u8,
     iterations: usize,
     internal_threads: usize,
-    ready: *std.atomic.Value(u32),
-    start: *std.atomic.Value(bool),
     token_total: usize = 0,
     failure: ?anyerror = null,
 
-    fn run(self: *Worker) void {
+    fn run(self: *Worker) std.Io.Cancelable!void {
         const allocator = std.heap.c_allocator;
         var ids: std.ArrayListUnmanaged(i32) = .empty;
         defer ids.deinit(allocator);
 
-        _ = self.ready.fetchAdd(1, .acq_rel);
-        while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
-
         for (0..self.iterations) |_| {
             ids.clearRetainingCapacity();
             self.tokenizer.encodeIntoParallel(
+                self.io,
                 allocator,
                 self.corpus,
                 &ids,
                 self.internal_threads,
             ) catch |err| {
                 self.failure = err;
+                if (err == error.Canceled) return error.Canceled;
                 return;
             };
             self.token_total +%= ids.items.len;
@@ -201,41 +190,34 @@ pub fn main(init: std.process.Init) !void {
     defer ids.deinit(allocator);
     for (0..cfg.warmup_iterations) |_| {
         ids.clearRetainingCapacity();
-        try tokenizer.encodeIntoParallel(allocator, corpus, &ids, cfg.internal_threads);
+        try tokenizer.encodeIntoParallel(init.io, allocator, corpus, &ids, cfg.internal_threads);
     }
 
     const workers = try allocator.alloc(Worker, cfg.threads);
     defer allocator.free(workers);
-    const threads = try allocator.alloc(std.Thread, cfg.threads);
-    defer allocator.free(threads);
-    var ready = std.atomic.Value(u32).init(0);
-    var start = std.atomic.Value(bool).init(false);
-    var spawned: usize = 0;
-    errdefer {
-        start.store(true, .release);
-        for (threads[0..spawned]) |thread| thread.join();
-    }
-    for (workers, 0..) |*worker, idx| {
+    for (workers) |*worker| {
         worker.* = .{
             .tokenizer = tokenizer,
+            .io = init.io,
             .corpus = corpus,
             .iterations = cfg.iterations,
             .internal_threads = cfg.internal_threads,
-            .ready = &ready,
-            .start = &start,
         };
-        threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{worker});
-        spawned += 1;
     }
-    while (ready.load(.acquire) != cfg.threads) std.Thread.yield() catch {};
 
-    const start_ns = nowNs();
-    start.store(true, .release);
-    for (threads) |thread| thread.join();
-    const elapsed_ns = nowNs() - start_ns;
+    const started_at = std.Io.Timestamp.now(init.io, .awake);
+    var group: std.Io.Group = .init;
+    errdefer group.cancel(init.io);
+    for (workers[0 .. workers.len - 1]) |*worker| {
+        group.async(init.io, Worker.run, .{worker});
+    }
+    try workers[workers.len - 1].run();
+    try group.await(init.io);
+    const finished_at = std.Io.Timestamp.now(init.io, .awake);
+    const elapsed_ns = std.Io.Timestamp.durationTo(started_at, finished_at).nanoseconds;
 
     ids.clearRetainingCapacity();
-    try tokenizer.encodeIntoParallel(allocator, corpus, &ids, cfg.internal_threads);
+    try tokenizer.encodeIntoParallel(init.io, allocator, corpus, &ids, cfg.internal_threads);
     const token_hash = hashTokenIds(ids.items);
 
     var token_total: usize = 0;
@@ -252,7 +234,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
     try stdout.interface.print(
-        "tokenizer_bytes={d} corpus_bytes={d} repeat={d} warmup_iterations={d} iterations={d} threads={d} internal_threads={d} " ++
+        "runtime=std_io tokenizer_bytes={d} corpus_bytes={d} repeat={d} warmup_iterations={d} iterations={d} threads={d} internal_threads={d} " ++
             "tokens_per_iteration={d} token_hash={x} elapsed_seconds={d:.6} mb_per_second={d:.3} " ++
             "mtokens_per_second={d:.3}\n",
         .{

@@ -946,7 +946,7 @@ pub const HfTokenizer = struct {
         ids: std.ArrayListUnmanaged(i32) = .empty,
         failure: ?anyerror = null,
 
-        fn run(self: *ParallelBpeWorker) void {
+        fn run(self: *ParallelBpeWorker) std.Io.Cancelable!void {
             self.tokenizer.encodeBpeByteLevel(
                 self.tokenizer.allocator,
                 self.text,
@@ -979,12 +979,13 @@ pub const HfTokenizer = struct {
     /// serial path because those transforms can cross a proposed boundary.
     fn encodeIntoParallel(
         self: *HfTokenizer,
+        io: std.Io,
         allocator: std.mem.Allocator,
         text: []const u8,
         ids: *std.ArrayListUnmanaged(i32),
-        requested_threads: usize,
+        requested_tasks: usize,
     ) !void {
-        if (requested_threads <= 1 or
+        if (requested_tasks <= 1 or
             text.len < parallel_bpe_min_bytes or
             self.model_type != .bpe or
             self.pre_tokenizer_type != .byte_level or
@@ -1000,15 +1001,15 @@ pub const HfTokenizer = struct {
             return self.encodeInto(allocator, text, ids);
         }
 
-        const thread_count = @min(requested_threads, 64);
+        const task_count = @min(requested_tasks, 64);
         var boundaries = std.ArrayListUnmanaged(usize).empty;
         defer boundaries.deinit(allocator);
-        try boundaries.ensureTotalCapacity(allocator, thread_count + 1);
+        try boundaries.ensureTotalCapacity(allocator, task_count + 1);
         boundaries.appendAssumeCapacity(0);
-        for (1..thread_count) |idx| {
+        for (1..task_count) |idx| {
             const target =
-                (text.len / thread_count) * idx +
-                ((text.len % thread_count) * idx) / thread_count;
+                (text.len / task_count) * idx +
+                ((text.len % task_count) * idx) / task_count;
             const boundary = parallelBpeBoundary(text, target);
             if (boundary > boundaries.items[boundaries.items.len - 1] and
                 boundary < text.len)
@@ -1025,12 +1026,9 @@ pub const HfTokenizer = struct {
             for (workers) |*worker| worker.ids.deinit(self.allocator);
             allocator.free(workers);
         }
-        // The caller processes the final chunk while the other chunks run in
-        // background threads, so requested_threads is the total concurrency
-        // rather than the number of spawned threads.
+        // The caller processes the final chunk while the other chunks run on
+        // the caller's std.Io runtime, so requested_tasks is total concurrency.
         const background_count = worker_count - 1;
-        const threads = try allocator.alloc(std.Thread, background_count);
-        defer allocator.free(threads);
 
         for (workers, 0..) |*worker, idx| {
             worker.* = .{
@@ -1038,15 +1036,14 @@ pub const HfTokenizer = struct {
                 .text = text[boundaries.items[idx]..boundaries.items[idx + 1]],
             };
         }
-        var spawned: usize = 0;
-        errdefer for (threads[0..spawned]) |thread| thread.join();
-        for (workers[0..background_count], 0..) |*worker, idx| {
-            threads[idx] = try std.Thread.spawn(.{}, ParallelBpeWorker.run, .{worker});
-            spawned += 1;
+
+        var group: std.Io.Group = .init;
+        errdefer group.cancel(io);
+        for (workers[0..background_count]) |*worker| {
+            group.async(io, ParallelBpeWorker.run, .{worker});
         }
-        workers[background_count].run();
-        for (threads) |thread| thread.join();
-        spawned = 0;
+        try workers[background_count].run();
+        try group.await(io);
 
         var token_count: usize = 0;
         for (workers) |worker| {
@@ -3512,7 +3509,7 @@ test "byte-level BPE parallel encoding preserves serial token order" {
 
     var parallel = std.ArrayListUnmanaged(i32).empty;
     defer parallel.deinit(allocator);
-    try tok.tokenizer().encodeIntoParallel(allocator, text.items, &parallel, 4);
+    try tok.tokenizer().encodeIntoParallel(std.testing.io, allocator, text.items, &parallel, 4);
 
     try std.testing.expectEqualSlices(i32, serial.items, parallel.items);
 }

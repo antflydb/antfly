@@ -65,7 +65,8 @@ pub const Tokenizer = struct {
         encodeInto: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) anyerror!void,
         /// Optional internally parallel encoder for large documents. Backends
         /// without a safe chunking strategy use the serial encodeInto path.
-        encodeIntoParallel: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32), thread_count: usize) anyerror!void = null,
+        /// Work is scheduled through the caller's std.Io runtime.
+        encodeIntoParallel: ?*const fn (ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32), max_tasks: usize) anyerror!void = null,
         /// Encode text with model wrapping such as [CLS]/[SEP], optionally including offsets.
         encodeForModel: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!EncodeResult,
         /// Encode text for causal generation, optionally with BOS-aware start-of-sequence semantics.
@@ -91,18 +92,21 @@ pub const Tokenizer = struct {
         return self.vtable.encodeInto(self.ptr, allocator, text, out);
     }
 
-    /// Append token IDs using up to `thread_count` internal workers when the
+    /// Append token IDs using up to `max_tasks` concurrent chunks when the
     /// backend can split the input without changing tokenizer semantics.
+    /// Parallel work composes with the caller's persistent std.Io runtime;
+    /// callers without an Io should use encodeInto's serial path.
     pub fn encodeIntoParallel(
         self: Tokenizer,
+        io: std.Io,
         allocator: std.mem.Allocator,
         text: []const u8,
         out: *std.ArrayListUnmanaged(i32),
-        thread_count: usize,
+        max_tasks: usize,
     ) !void {
-        if (thread_count > 1) {
+        if (max_tasks > 1) {
             if (self.vtable.encodeIntoParallel) |parallel| {
-                return parallel(self.ptr, allocator, text, out, thread_count);
+                return parallel(self.ptr, io, allocator, text, out, max_tasks);
             }
         }
         return self.encodeInto(allocator, text, out);

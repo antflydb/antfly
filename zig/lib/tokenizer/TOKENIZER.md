@@ -46,12 +46,13 @@ zig build bench-tokenizer -- /path/to/tokenizer.json /path/to/corpus.txt \
 ```
 
 Use `--warmup 0 --iterations 1` for a cold first pass. `--threads N` runs
-concurrent callers against the same tokenizer and cache. The benchmark reports
-the token count and sequence hash so invalid performance results are visible.
-`--internal-threads N` splits one sufficiently large ByteLevel document at
-pretoken-safe boundaries and gathers the results in order. `--repeat N` repeats
+concurrent `std.Io` tasks against the same tokenizer and cache. The benchmark
+reports the token count and sequence hash so invalid performance results are
+visible. `--internal-threads N` emits up to N chunk tasks for one sufficiently
+large ByteLevel document and gathers the results in order. `--repeat N` repeats
 the corpus in memory before timing, which is useful for measuring internal
-parallelism without changing the fixture.
+parallelism without changing the fixture. No benchmark or tokenizer path
+creates an OS thread directly.
 
 ## Baseline and current results
 
@@ -64,23 +65,27 @@ Measured on an Apple M4 Max. Throughput is decimal MB/s.
 | Streaming ByteLevel pretokens | steady, 1 thread | 98.34 MB/s |
 | Added-token scan fast path | steady, 1 thread | 114.62 MB/s |
 | Lock-free open-address cache | steady, 1 thread | 121.62 MB/s |
-| Raw-byte vocab + ASCII vector scanner | cold, 1 thread | 93.82 MB/s |
-| Current | steady, 1 thread | 268.92 MB/s |
-| Current | steady, 8 concurrent callers | 1.982 GB/s |
-| Current | steady, 14 concurrent callers | 2.482 GB/s |
-| Current, 11.8 MB repeated corpus | cold, 14 internal workers | 1.109 GB/s |
-| Current, 11.8 MB repeated corpus | steady, 14 internal workers | 1.478 GB/s |
+| Raw-byte vocab + ASCII vector scanner | cold, 1 task | 101.04 MB/s |
+| Current | steady, 1 task | 270.95 MB/s |
+| Current | steady, 14 concurrent `std.Io` tasks | 2.187 GB/s |
+| Current, 738 KiB corpus | cold, 14 internal tasks | 270.39 MB/s |
+| Current, 738 KiB corpus | steady, 14 internal tasks | 1.298 GB/s |
+| Current, 11.8 MB repeated corpus | cold, 14 internal tasks | 1.148 GB/s |
+| Current, 11.8 MB repeated corpus | steady, 14 internal tasks | 1.431 GB/s |
 
-The current implementation is approximately 15.2 times faster than the
+The current implementation is approximately 15.3 times faster than the
 original single-thread steady-state implementation while also correcting the
 original ByteLevel boundary behavior.
 
 Gigatoken's published large-corpus M4 Max result is 8.79 GB/s. The measurements
 are not directly interchangeable: this benchmark includes complete BPE token
 ID generation and hashes the full output, while Gigatoken's headline workload
-and its persistent worker runtime differ. The remaining gap is real enough to
-keep profiling, especially around internal worker startup and cache layout.
-See Gigatoken's
+differs. Moving dispatch to the application's persistent `std.Io` runtime
+removes per-call OS thread creation and materially helps the 738 KiB workload.
+The 11.8 MB steady result remains in the same 1.43–1.48 GB/s range as the
+spawn-per-call implementation, showing that worker startup is not the limiting
+factor at saturation. The remaining gap is principally in cache/BPE hit-path
+cost and memory traffic. See Gigatoken's
 [design document](https://github.com/marcelroed/gigatoken/blob/main/design_doc.md)
 and
 [pretokenizer optimization log](https://github.com/marcelroed/gigatoken/blob/main/pretokenizer_optimization_log.md).
@@ -171,9 +176,28 @@ zig fmt lib/tokenizer/src/unicode_classes.zig
 ByteLevel BPE splits documents of at least 256 KiB at safe ASCII whitespace
 boundaries, encodes chunks concurrently, and gathers IDs in source order.
 Normalization and inputs containing added tokens remain serial because their
-semantics may cross chunk boundaries. Worker creation currently happens on
-every call, so the measured throughput includes thread startup. A tokenizer
-used this way must be constructed with an allocator safe for concurrent use.
+semantics may cross chunk boundaries.
+
+Parallel chunks are submitted with `std.Io.Group.async`; the final chunk runs
+on the calling task before the group is awaited. This is the same composition
+pattern used by `lib/linalg`: production callers pass their long-lived runtime
+Io, while callers without an Io retain the serial `encodeInto` escape hatch.
+For Antfly's backend runtime:
+
+```zig
+if (backend_runtime.io()) |io| {
+    try tokenizer.encodeIntoParallel(io, allocator, text, &ids, max_tasks);
+} else {
+    try tokenizer.encodeInto(allocator, text, &ids);
+}
+```
+
+This avoids a tokenizer-owned thread pool, respects runtime scheduling and
+cancellation, and prevents independent subsystems from oversubscribing the
+machine. `lib/tokenizer` deliberately depends only on `std.Io`, not Antfly's
+storage package; `BackendRuntime.io()` is the layering boundary, just as it is
+for the Io-aware matrix multiplication path. A tokenizer used in parallel must
+still be constructed with an allocator safe for concurrent use.
 
 ## Rejected or inconclusive experiments
 
@@ -199,9 +223,11 @@ traffic, so it was removed.
 The five initially identified Gigatoken techniques have now been implemented
 or measured: vector ASCII scanning, compact inline cache entries, worker-local
 caching, ordered chunk parallelism, and packed exact Unicode classes. The
-highest-value next experiments are a persistent internal worker pool, profiling
-the remaining BPE/cache cost on hits, and a cache design co-developed with its
-key/value encoding rather than transplanted in isolation.
+application's persistent `std.Io` worker runtime now owns scheduling, so a
+tokenizer-private persistent thread pool is no longer desirable. The
+highest-value next experiments are reusable per-task output/scratch buffers,
+profiling the remaining BPE/cache cost on hits, and a cache design co-developed
+with its key/value encoding rather than transplanted in isolation.
 
 Any future parallel change must preserve pretoken and added-token boundaries
 and reproduce the exact serial token sequence before its throughput result is
