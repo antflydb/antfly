@@ -7869,6 +7869,13 @@ pub const DataServer = struct {
                 };
                 continue;
             }
+            // Bootstrap is an edge-triggered nudge after the authoritative
+            // placement has been admitted. Re-campaigning a follower on every
+            // metadata sync bypasses Raft's randomized election backoff and
+            // can keep a newly placed three-voter group in synchronized
+            // elections indefinitely. After this first attempt, the Raft
+            // progress driver owns retries and their jitter.
+            if (!placement_changed) continue;
             if (!localIntentPreferredCampaigner(intent, registration.node_id)) continue;
             if (!localRaftStatusShouldBootstrapCampaign(status, registration.node_id)) continue;
             raft.host.http_host.campaignGroup(intent.record.group_id) catch |err| {

@@ -182,6 +182,8 @@ class EmbeddedInferenceStandaloneServer:
             "5",
             "--models-dir",
             str(self.models_dir),
+            "--data-dir",
+            str(self.root),
             "--replica-root-dir",
             str(self.root / "replicas"),
             "--replica-catalog-path",
@@ -205,12 +207,12 @@ class EmbeddedInferenceStandaloneServer:
             cwd=REPO_ROOT,
         )
         if not _wait_for_server(self.url):
-            self.stop()
             logs = _read_log_tail(self.log_path)
+            self.stop()
             raise RuntimeError(f"Standalone API server failed to start at {self.url}\n{logs}")
         if not _wait_for_server(self.inference_api_url, timeout_s=120.0, path="/models"):
-            self.stop()
             logs = _read_log_tail(self.log_path)
+            self.stop()
             raise RuntimeError(f"Embedded inference server failed to start at {self.inference_api_url}\n{logs}")
 
     def debug_logs(self) -> str:
@@ -286,7 +288,8 @@ def embedded_standalone_runtime():
         model_name,
         inference_budget_mb=inference_budget_mb,
     )
-    _warm_inference_generator(server.inference_api_url, model_name)
+    if not _integration_enabled("ANTFLY_INFERENCE_STANDALONE_SKIP_GENERATOR_WARMUP"):
+        _warm_inference_generator(server.inference_api_url, model_name)
     yield {
         "base_url": server.url,
         "public_url": server.public_url,
@@ -367,6 +370,20 @@ def embedded_standalone_api(embedded_standalone_runtime):
                 payload["sync_level"] = sync_level
             with self._request_lock:
                 response = self.s.post(f"{self.url}/tables/{table_name}/batch", json=payload, timeout=30)
+            return self._check(response)
+
+        def create_index(self, table_name: str, index_name: str, config: dict[str, object]) -> dict:
+            with self._request_lock:
+                response = self.s.post(
+                    f"{self.url}/tables/{table_name}/indexes/{index_name}",
+                    json=config,
+                    timeout=30,
+                )
+            return self._check(response)
+
+        def delete_table(self, table_name: str) -> dict:
+            with self._request_lock:
+                response = self.s.delete(f"{self.url}/tables/{table_name}", timeout=30)
             return self._check(response)
 
     yield Api(session, base_url)
@@ -458,6 +475,52 @@ def test_standalone_health_endpoints(embedded_standalone_runtime):
 
     unknown = requests.get(f"{health_url}/does-not-exist", timeout=5)
     assert unknown.status_code == 404
+
+
+def test_standalone_drop_tables_with_pending_embedded_embeddings(
+    embedded_standalone_api,
+    embedded_standalone_runtime,
+):
+    table_names = [f"standalone_drop_hot_{time.time_ns()}_{i}" for i in range(7)]
+    for table_name in table_names:
+        created = embedded_standalone_api.create_table(table_name, num_shards=1)
+        assert created["name"] == table_name
+        assert (
+            embedded_standalone_api.create_index(
+                table_name,
+                "semantic_idx",
+                {
+                    "name": "semantic_idx",
+                    "type": "embeddings",
+                    "template": "{{title}}",
+                    "dimension": 384,
+                    "embedder": {
+                        "provider": "antfly",
+                        "model": "BAAI/bge-small-en-v1.5",
+                    },
+                },
+            )
+            == {}
+        )
+
+    docs = {
+        f"doc-{i:02d}": {
+            "title": (
+                f"Document {i} has enough distinct words to keep the embedded "
+                "inference queue active while its table is retired."
+            )
+        }
+        for i in range(50)
+    }
+    for table_name in table_names[:-1]:
+        batch = embedded_standalone_api.batch_write(table_name, inserts=docs)
+        assert batch["inserted"] == len(docs)
+
+    for table_name in table_names[:-1]:
+        embedded_standalone_api.delete_table(table_name)
+
+    response = requests.get(f"{embedded_standalone_runtime['base_url']}/status", timeout=30)
+    response.raise_for_status()
 
 
 def test_standalone_retrieval_generation_with_live_inference(embedded_standalone_api, embedded_standalone_runtime):
