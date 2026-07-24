@@ -54,6 +54,120 @@ func setupTestDB(t *testing.T) (*pebble.DB, string, func()) {
 	return db, tempDir, cleanup
 }
 
+func TestBleveMergePlanOptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  FullTextIndexConfig
+		want    bleveMergePlanOptions
+		wantErr string
+	}{
+		{
+			name:   "defaults",
+			config: FullTextIndexConfig{},
+			want: bleveMergePlanOptions{
+				MaxSegmentFileSize:   defaultFullTextMaxSegmentFileSize,
+				SegmentsPerMergeTask: defaultFullTextSegmentsPerMergeTask,
+			},
+		},
+		{
+			name: "custom",
+			config: FullTextIndexConfig{
+				MaxSegmentFileSize:   512 << 20,
+				SegmentsPerMergeTask: 7,
+			},
+			want: bleveMergePlanOptions{
+				MaxSegmentFileSize:   512 << 20,
+				SegmentsPerMergeTask: 7,
+			},
+		},
+		{
+			name: "negative max segment file size",
+			config: FullTextIndexConfig{
+				MaxSegmentFileSize: -1,
+			},
+			wantErr: "max_segment_file_size must be positive",
+		},
+		{
+			name: "single segment merge task",
+			config: FullTextIndexConfig{
+				SegmentsPerMergeTask: 1,
+			},
+			wantErr: "segments_per_merge_task must be at least 2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.config.normalizedBleveMergePlanOptions()
+			err := got.validate()
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+
+			runtimeConfig := got.runtimeConfig()
+			scorchOptions, ok := runtimeConfig["scorchMergePlanOptions"].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, got.MaxSegmentFileSize, scorchOptions["maxSegmentFileSize"])
+			require.Equal(t, got.SegmentsPerMergeTask, scorchOptions["segmentsPerMergeTask"])
+		})
+	}
+}
+
+func TestFullTextIndexConfigEqualNormalizesMergePlanDefaults(t *testing.T) {
+	implicitDefaults := FullTextIndexConfig{}
+	explicitDefaults := FullTextIndexConfig{
+		MaxSegmentFileSize:   defaultFullTextMaxSegmentFileSize,
+		SegmentsPerMergeTask: defaultFullTextSegmentsPerMergeTask,
+	}
+	custom := FullTextIndexConfig{
+		MaxSegmentFileSize:   512 << 20,
+		SegmentsPerMergeTask: 7,
+	}
+
+	require.True(t, implicitDefaults.Equal(explicitDefaults))
+	require.False(t, implicitDefaults.Equal(custom))
+}
+
+func TestNewBleveIndexV2RejectsInvalidMergePlanOptions(t *testing.T) {
+	logger := zaptest.NewLogger(t).Sugar().Desugar()
+	db, tempDir, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	tests := []struct {
+		name    string
+		config  FullTextIndexConfig
+		wantErr string
+	}{
+		{
+			name: "negative max segment file size",
+			config: FullTextIndexConfig{
+				MaxSegmentFileSize: -1,
+			},
+			wantErr: "max_segment_file_size must be positive",
+		},
+		{
+			name: "single segment merge task",
+			config: FullTextIndexConfig{
+				SegmentsPerMergeTask: 1,
+			},
+			wantErr: "segments_per_merge_task must be at least 2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config, err := NewIndexConfig("test_index", tt.config)
+			require.NoError(t, err)
+
+			_, err = NewBleveIndexV2(logger, nil, db, tempDir, "test_index", config, nil)
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
 func TestNewBleveIndexV2(t *testing.T) {
 	logger := zaptest.NewLogger(t).Sugar().Desugar()
 	db, tempDir, cleanup := setupTestDB(t)

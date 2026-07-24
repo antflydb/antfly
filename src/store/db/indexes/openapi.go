@@ -75,7 +75,8 @@ func NewFullTextIndexConfig(name string, memOnly bool) *IndexConfig {
 }
 
 func (bc FullTextIndexConfig) Equal(oc FullTextIndexConfig) bool {
-	return bc.MemOnly == oc.MemOnly
+	return bc.MemOnly == oc.MemOnly &&
+		bc.normalizedBleveMergePlanOptions() == oc.normalizedBleveMergePlanOptions()
 }
 
 // normalizeDistanceMetric treats the zero value ("") as the default "l2_squared"
