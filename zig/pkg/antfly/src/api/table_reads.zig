@@ -2455,6 +2455,10 @@ pub const BoundTableReadSource = struct {
         const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
         items[0] = .{
             .group_id = self.reads.group_id,
+            .metadata = .{
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+            },
             .stats = try self.db.runtimeStatusStatsConsistent(alloc),
         };
         return .{ .items = items };

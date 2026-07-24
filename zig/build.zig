@@ -4232,6 +4232,7 @@ pub fn build(b: *std.Build) void {
         "api index status reports missing remote shard as not ready",
         "single embeddings index encoder keeps backfill active while enrichment replay lags",
         "api http server serves local index runtime backfill status",
+        "api http server join planner uses complete fresh local stats before metadata publication",
         "api http server serves provisioned index runtime backfill status across shards",
         "api http server serves table create and drop",
         "api http server serves table metadata routes against real metadata service",

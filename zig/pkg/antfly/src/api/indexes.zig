@@ -4378,6 +4378,7 @@ test "single embeddings index encoder scopes isolated enrichment failure to one 
     defer alloc.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 1,
             .index_count = 2,
@@ -4441,6 +4442,7 @@ test "single embeddings index encoder keeps published visibility separate from r
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 3,
             .index_count = 1,
@@ -4493,6 +4495,7 @@ test "single embeddings index encoder keeps backfill active while enrichment rep
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 3,
             .index_count = 1,
@@ -4828,6 +4831,7 @@ test "embeddings index status ignores inactive stale catch-up progress once dens
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 217_500,
             .index_count = 1,

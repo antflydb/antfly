@@ -1596,6 +1596,7 @@ pub const ApiHttpServer = struct {
     const join_context_vtable = distributed_join.JoinContext.VTable{
         .admin_snapshot = joinCtxAdminSnapshot,
         .free_admin_snapshot = joinCtxFreeAdminSnapshot,
+        .local_table_stats = joinCtxLocalTableStats,
         .get_join_shuffle_lease = joinCtxGetJoinShuffleLease,
         .upsert_join_shuffle_lease = joinCtxUpsertJoinShuffleLease,
         .remove_join_shuffle_lease = joinCtxRemoveJoinShuffleLease,
@@ -1613,6 +1614,31 @@ pub const ApiHttpServer = struct {
     fn joinCtxFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         self.source.freeAdminSnapshot(snapshot);
+    }
+
+    fn joinCtxLocalTableStats(
+        ptr: *anyopaque,
+        table_name: []const u8,
+        snapshot: *const metadata_api.AdminSnapshot,
+    ) anyerror!?distributed_join.JoinTableStats {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const table = tables_api.findTableByName(snapshot, table_name) orelse return null;
+        var statuses = (try self.localTableRuntimeStatusesWithSnapshot(table_name, snapshot)) orelse return null;
+        defer statuses.deinit(self.alloc);
+
+        var stats: distributed_join.JoinTableStats = .{};
+        for (snapshot.ranges) |range| {
+            if (range.table_id != table.table_id) continue;
+            const status = for (statuses.items) |item| {
+                if (item.group_id == range.group_id and runtime_status.statusRuntimeFresh(item)) break item;
+            } else return null;
+            stats.row_count +|= status.stats.doc_count;
+            stats.size_bytes +|= status.disk_bytes;
+            stats.shard_count += 1;
+        }
+        if (stats.shard_count == 0) return null;
+        stats.has_stats = true;
+        return stats;
     }
 
     fn joinCtxGetJoinShuffleLease(ptr: *anyopaque, job_id: u64) anyerror!?metadata_table_manager.ShuffleJoinLeaseRecord {
@@ -27375,6 +27401,122 @@ test "api http server join planner uses snapshot stats for low-selectivity looku
     try std.testing.expect(plan.used_stats);
     try std.testing.expect(!plan.shuffle_candidate);
     try std.testing.expect(plan.estimated_cost > 0);
+}
+
+test "api http server join planner uses complete fresh local stats before metadata publication" {
+    const FakeSource = struct {
+        snapshot: metadata_api.AdminSnapshot,
+
+        fn status(ptr: *anyopaque) !metadata_api.MetadataStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.snapshot.status;
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.snapshot;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .local_runtime_statuses = localRuntimeStatuses,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn localRuntimeStatuses(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) !?runtime_status.LocalTableRuntimeStatuses {
+            const group_id: u64 = if (std.mem.eql(u8, table_name, "docs"))
+                101
+            else if (std.mem.eql(u8, table_name, "customers"))
+                201
+            else
+                return null;
+            const doc_count: u64 = if (group_id == 101) 2 else 3;
+            const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            items[0] = .{
+                .group_id = group_id,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+                .disk_bytes = 1024,
+                .stats = .{ .doc_count = doc_count },
+            };
+            return .{ .items = items };
+        }
+    };
+
+    var tables = [_]metadata_table_manager.TableRecord{
+        .{ .table_id = 1, .name = "docs", .placement_role = "data" },
+        .{ .table_id = 2, .name = "customers", .placement_role = "data" },
+    };
+    var ranges = [_]metadata_table_manager.RangeRecord{
+        .{ .group_id = 101, .table_id = 1, .start_key = "", .end_key = null },
+        .{ .group_id = 201, .table_id = 2, .start_key = "", .end_key = null },
+    };
+    var fake = FakeSource{
+        .snapshot = .{
+            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .tables = tables[0..],
+            .ranges = ranges[0..],
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+            .merged_group_statuses = &.{},
+        },
+    };
+    var reads = FakeReads{};
+
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, .{
+        .ptr = &fake,
+        .vtable = &.{
+            .status = FakeSource.status,
+            .admin_snapshot = FakeSource.adminSnapshot,
+            .free_admin_snapshot = FakeSource.freeAdminSnapshot,
+        },
+    }, reads.source(), null);
+    defer server.deinit();
+
+    var parsed_hits = try parseTestQueryHitsAlloc(std.testing.allocator,
+        \\[
+        \\  {"_id":"doc:1","_source":{"customer_id":"cust:1"}},
+        \\  {"_id":"doc:2","_source":{"customer_id":"cust:2"}}
+        \\]
+    );
+    defer parsed_hits.deinit(std.testing.allocator);
+
+    const join: ApiHttpServer.SupportedJoinRequest = .{
+        .right_table = @constCast("customers"),
+        .join_type = .inner,
+        .left_field = @constCast("customer_id"),
+        .right_field = @constCast("_id"),
+    };
+    const plan = try server.planSupportedJoinExecution(std.testing.allocator, "docs", join, parsed_hits.values, .{});
+    try std.testing.expectEqual(ApiHttpServer.RightJoinQueryResult.StrategyUsed.broadcast, plan.strategy);
+    try std.testing.expect(plan.used_stats);
 }
 
 test "api http server join planner uses foreign source statistics" {
