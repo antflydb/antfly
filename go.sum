@@ -165,8 +165,8 @@ github.com/aclements/go-perfevent v0.0.0-20240301234650-f7843625020f h1:JjxwchlO
 github.com/aclements/go-perfevent v0.0.0-20240301234650-f7843625020f/go.mod h1:tMDTce/yLLN/SK8gMOxQfnyeMeCg8KGzp0D1cbECEeo=
 github.com/agnivade/levenshtein v1.2.1 h1:EHBY3UOn1gwdy/VbFwgo4cxecRznFk7fKWN1KOX7eoM=
 github.com/agnivade/levenshtein v1.2.1/go.mod h1:QVVI16kDrtSuwcpd0p1+xMC6Z/VfhtCyDIjcwga4/DU=
-github.com/ajroetker/go-highway v0.0.13-0.20260309234436-8d249c4caa48 h1:Q7rlCp02ZQ6YQ6cYx4X8cI6l1LRtIEmRRYB389X8msM=
-github.com/ajroetker/go-highway v0.0.13-0.20260309234436-8d249c4caa48/go.mod h1:un7fcrwix7UOHJrr18Lgh5eeF+1yaZiGWdTw3FbfDv4=
+github.com/ajroetker/go-highway v0.0.13-0.20260528204430-c3b5b59834b1 h1:PAEA9KYpE58upyfgLfokJa8Gt8sph52bytdCqomEHV4=
+github.com/ajroetker/go-highway v0.0.13-0.20260528204430-c3b5b59834b1/go.mod h1:un7fcrwix7UOHJrr18Lgh5eeF+1yaZiGWdTw3FbfDv4=
 github.com/ajroetker/go-jpeg2000 v0.0.2 h1:ni8brffZrci4Kacx3nM5d92ipmTDfak84KgHYi6IxFw=
 github.com/ajroetker/go-jpeg2000 v0.0.2/go.mod h1:7ld88W47lZy0x8gRQesRGAonDPOpr6ev8rckjCAfbzE=
 github.com/ajroetker/gomlx v0.0.0-antfly011 h1:t0BZSBrYuJIwTiZplB9vxsVQy6OaP8+pMjCHaWUI3iY=
