@@ -92,8 +92,9 @@ pub const Tokenizer = struct {
         return self.vtable.encodeInto(self.ptr, allocator, text, out);
     }
 
-    /// Append token IDs using up to `max_tasks` concurrent chunks when the
-    /// backend can split the input without changing tokenizer semantics.
+    /// Append token IDs using up to `max_tasks` concurrent consumers when
+    /// the backend can split the input without changing tokenizer semantics.
+    /// A backend may create more chunks than consumers for load balancing.
     /// Parallel work composes with the caller's persistent std.Io runtime;
     /// callers without an Io should use encodeInto's serial path.
     pub fn encodeIntoParallel(

@@ -48,9 +48,11 @@ zig build bench-tokenizer -- /path/to/tokenizer.json /path/to/corpus.txt \
 Use `--warmup 0 --iterations 1` for a cold first pass. `--threads N` runs
 concurrent `std.Io` tasks against the same tokenizer and cache. The benchmark
 reports the token count and sequence hash so invalid performance results are
-visible. `--internal-threads N` emits up to N chunk tasks for one sufficiently
-large ByteLevel document and gathers the results in order. `--repeat N` repeats
-the corpus in memory before timing, which is useful for measuring internal
+visible. `--internal-threads N` permits up to N active queue consumers for one
+sufficiently large ByteLevel document. The encoder creates 4–8 chunks per
+consumer, capped at 64, so runtime tasks can pull another chunk when work is
+uneven without exceeding the requested concurrency. `--repeat N` repeats the
+corpus in memory before timing, which is useful for measuring internal
 parallelism without changing the fixture. `--profile-bpe` enables atomic
 cache-hit counters after warmup and reports key-length and result-size
 histograms. Profiling is for attribution rather than throughput measurement
@@ -69,14 +71,14 @@ Measured on an Apple M4 Max. Throughput is decimal MB/s.
 | Added-token scan fast path | steady, 1 thread | 114.62 MB/s |
 | Lock-free open-address cache | steady, 1 thread | 121.62 MB/s |
 | Raw-byte vocab + ASCII vector scanner | cold, 1 task | 101.04 MB/s |
-| Current | steady, 1 task | 294–295 MB/s |
-| Current | steady, 14 concurrent `std.Io` tasks | 3.03–3.09 GB/s |
-| Current, 738 KiB corpus | cold, 14 internal tasks | 200.65 MB/s |
-| Current, 738 KiB corpus | steady, 14 internal tasks | 1.614 GB/s |
-| Current, 11.8 MB repeated corpus | cold, 14 internal tasks | 1.204 GB/s |
-| Current, 11.8 MB repeated corpus | steady, 14 internal tasks | 1.847 GB/s |
+| Current | steady, 1 task | 291–295 MB/s |
+| Current | steady, 14 concurrent `std.Io` tasks | 2.86–3.09 GB/s |
+| Current, 738 KiB corpus | cold, 14 internal tasks | 497.04 MB/s |
+| Current, 738 KiB corpus | steady, 14 internal tasks | 2.34–2.47 GB/s |
+| Current, 11.8 MB repeated corpus | cold, 14 internal tasks | 1.642 GB/s |
+| Current, 11.8 MB repeated corpus | steady, 14 internal tasks | 2.61–2.85 GB/s |
 
-The current implementation is approximately 16.6 times faster than the
+The current implementation is approximately 16.4–16.6 times faster than the
 original single-thread steady-state implementation while also correcting the
 original ByteLevel boundary behavior.
 
@@ -85,10 +87,13 @@ are not directly interchangeable: this benchmark includes complete BPE token
 ID generation and hashes the full output, while Gigatoken's headline workload
 differs. Moving dispatch to the application's persistent `std.Io` runtime
 removes per-call OS thread creation. Reusing the tokenizer's task workspaces
-then removes repeated chunk-output allocation and materially helps both the
-738 KiB and 11.8 MB internally parallel workloads. The remaining gap is
-principally in cache hashing, output copying, and BPE work on cold or uncommon
-pretokens. See Gigatoken's
+removes repeated chunk-output allocation. Pull scheduling and an ordered
+overlapped gather further reduce runtime imbalance and the serial copy tail.
+The 8.79 GB/s result is still about 3.1–3.4 times the 11.8 MB internally
+parallel result here, but Gigatoken measures an 11.9 GB OpenWebText
+input—roughly one thousand times larger—using a cache designed for about
+1.3 million unique pretokens per worker. The remaining gap is principally in
+large-corpus cache capacity and DRAM-latency hiding. See Gigatoken's
 [design document](https://github.com/marcelroed/gigatoken/blob/main/design_doc.md)
 and
 [pretokenizer optimization log](https://github.com/marcelroed/gigatoken/blob/main/pretokenizer_optimization_log.md).
@@ -182,8 +187,8 @@ boundaries, encodes chunks concurrently, and gathers IDs in source order.
 Normalization and inputs containing added tokens remain serial because their
 semantics may cross chunk boundaries.
 
-Parallel chunks are submitted with `std.Io.Group.async`; the final chunk runs
-on the calling task before the group is awaited. This is the same composition
+Queue-consumer tasks are submitted with `std.Io.Group.async`; the calling task
+is also a consumer before the group is awaited. This is the same composition
 pattern used by `lib/linalg`: production callers pass their long-lived runtime
 Io, while callers without an Io retain the serial `encodeInto` escape hatch.
 For Antfly's backend runtime:
@@ -206,16 +211,56 @@ still be constructed with an allocator safe for concurrent use.
 ### Reusable parallel workspaces
 
 Each tokenizer retains a free list of parallel workspaces. A workspace contains
-the fixed worker records and their reusable token-ID buffers, so repeated
-`encodeIntoParallel` calls do not allocate and destroy chunk outputs. Chunk
-boundaries use a fixed stack array because internal parallelism is capped at 64
-tasks. Workspaces are acquired per concurrent call and returned after the
+the fixed chunk records and their reusable token-ID and BPE-merge buffers, so
+repeated `encodeIntoParallel` calls do not allocate and destroy chunk state.
+Chunk boundaries use a fixed stack array because internal chunking is capped at
+64. Workspaces are acquired per concurrent call and returned after the
 `std.Io.Group` is joined; concurrent requests therefore do not share mutable
 output state.
 
 This changed the 738 KiB steady internally parallel result from about
 1.30 GB/s to 1.61 GB/s and the 11.8 MB result from about 1.43 GB/s to
 1.85 GB/s in the representative runs above.
+
+### Reusable BPE merge scratch
+
+Each serial encode call and persistent parallel chunk owns reusable symbol-list
+and priority-queue storage. Cache misses clear these buffers while retaining
+capacity instead of allocating both structures for every previously unseen
+pretoken. The priority queue is initialized lazily, so a fully warm call does
+not allocate unused miss-path state. This principally improves cold encoding;
+the representative cold 738 KiB internal result is now about 497 MB/s.
+
+### Bounded pull scheduling
+
+Large documents are divided into 4 chunks per requested consumer below 4 MiB
+and 8 above it, capped at 64 chunks. At most `max_tasks` `std.Io` consumers
+pull indices from one atomic queue. This keeps the public concurrency limit
+meaningful while allowing a fast consumer to take more work instead of waiting
+for the slowest fixed partition.
+
+Combined with the reusable workspace, this moves steady internal throughput to
+about 2.34–2.47 GB/s for 738 KiB and 2.61–2.85 GB/s for 11.8 MB. An
+experimental descending-size LPT layout was slower than uniform chunks on the
+M4 Max, so the accepted scheduler uses uniform byte targets and dynamic
+pulling.
+
+### Overlapped ordered gather
+
+The caller reserves a conservative one-token-per-input-byte output bound before
+launch. Completed chunks publish a release flag, and whichever queue consumer
+can acquire the commit mutex copies the longest completed prefix directly into
+the caller's output. The final caller-side commit drains any residual suffix
+after joining. This preserves source order while overlapping most result copies
+with remaining encoding and removes the old post-join allocate-and-gather tail.
+Errors roll the caller's output length back to its entry value.
+
+On Linux, newly grown output allocations of at least 2 MiB receive a
+best-effort `MADV_HUGEPAGE` hint over their page-aligned interior before first
+touch. It is a no-op on macOS and other targets. The hint is applied to the
+large contiguous output where it is safe and useful; the current sharded cache
+contains allocator-owned objects and is not falsely treated as one huge-page
+allocation.
 
 ### ByteLevel direct-address IDs and single-result appends
 
@@ -266,6 +311,43 @@ compared with about 163 MB/s and 1.54 GB/s for the shared cache at that stage.
 The extra hash, packing, and lookup cost exceeded the avoided shared read
 traffic, so it was removed.
 
+A later persistent pointer-cache variant used the reusable `std.Io` workspace
+and held either 4,096 or 32,768 entry pointers per chunk. The 11.8 MB internal
+result fell to 1.64 GB/s and 1.81 GB/s respectively, versus approximately
+2.0–2.2 GB/s for the shared-cache path at that experiment stage. Shared hits
+already require no lock; an additional table lookup did not repay the atomic
+pointer load it avoided.
+
+### Two-phase cache prefetch pipeline
+
+A 256-pretoken pipeline separated span discovery/hash computation from cache
+probe and emission, prefetched home entries during discovery, and prefetched
+token-ID storage twelve probes ahead. It reproduced the full token hash but
+reduced serial throughput from 291 MB/s to 259 MB/s and concurrent throughput
+from 2.86 GB/s to 2.55 GB/s on the Pride fixture. Its approximately 9,700-entry
+working set is already cache-resident, so the extra span materialization and
+second pass cannot hide a DRAM stall that is not present.
+
+Gigatoken's pipeline addresses a roughly 64 MiB, 1.3-million-entry table where
+tail probes are random DRAM accesses. Reconsider prefetching only together with
+a scalable large-corpus cache and an OpenWebText-sized benchmark.
+
+### Multi-cursor pretoken scanning
+
+Gigatoken's historical optimization log reports a dual-cursor gain for
+pretoken *counting*. Its current production r50k scanner says the windowed
+2–4-cursor streaming variants measured 0.80–0.95 times the single cursor due
+to queue traffic and interleaved branch history. The Zig encoder already uses
+a 64-byte boundary mask and consumes its bits without per-token classifier
+dispatch, so no multi-cursor variant was retained.
+
+### Descending LPT chunk sizes
+
+An 80-percent large-head/20-percent small-tail layout, modeled on Gigatoken's
+asymmetric-core tail mitigation, reduced the 11.8 MB result from about
+2.69 GB/s to 2.40 GB/s and the 738 KiB result from 2.34 GB/s to 2.08 GB/s.
+Dynamic pulling over uniform chunks balances this much smaller workload better.
+
 ### Specialized short-key hash
 
 A lightweight FNV-style hash for short cache keys replaced Wyhash in an
@@ -276,18 +358,27 @@ the useful version of this optimization.
 
 ## Remaining work
 
-The initially identified Gigatoken techniques and the subsequent follow-ups
-have now been implemented or measured: vector ASCII scanning, compact inline
-cache entries, worker-local caching, ordered chunk parallelism, packed exact
-Unicode classes, reusable task workspaces, hit-path profiling, short-key
-specialization, and a cache layout co-designed with inline keys and values.
-The application's persistent `std.Io` worker runtime owns scheduling, so a
-tokenizer-private persistent thread pool is not desirable.
+The Gigatoken-derived checklist now has these outcomes:
 
-Future profiling should focus on the remaining longer-key Wyhash cost, cache
-result memory traffic, and cold BPE merges. A different cache should replace
-the current table only when an end-to-end key/probe/value design beats it;
-smaller entries or a faster-looking hash are not sufficient in isolation.
+- Implemented: persistent `std.Io` scheduling, reusable chunk outputs, reusable
+  BPE merge scratch, over-decomposed pull scheduling, overlapped ordered gather,
+  Linux output huge-page advice, SIMD boundary masks, compact Unicode classes,
+  direct short-key IDs, and packed merge-pair lookup.
+- Measured and rejected on the current workload: inline shared entries,
+  worker-local caches, short-key hash replacement, two-phase prefetching,
+  multi-cursor streaming, and descending LPT chunk sizes.
+- Still open: an apples-to-apples 11.9 GB OpenWebText benchmark and a scalable
+  cache that can retain roughly one million long-tail pretokens without making
+  the small hot table exceed cache. That design likely needs a small shared
+  front table plus a bulk-only, prefetchable backing tier rather than simply
+  increasing the current fixed table.
+
+The 4.4 GB compressed OpenWebText fixture is intentionally not a normal unit or
+CI dependency. Before adding a bulk cache tier, benchmark it with the same
+Gigatoken input and report cold/warm memory usage, cache hit rate, output token
+count, and complete output hash. A different cache should replace or augment
+the current table only when its end-to-end key/probe/value design wins both the
+738 KiB regression fixture and the large corpus.
 
 Any future parallel change must preserve pretoken and added-token boundaries
 and reproduce the exact serial token sequence before its throughput result is
