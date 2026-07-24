@@ -160,6 +160,16 @@ pub const PlacementPlanner = struct {
 
             var selected = std.ArrayListUnmanaged(u64).empty;
             defer selected.deinit(self.alloc);
+            const membership_repair = groupNeedsMembershipRepair(
+                current_intents,
+                range.group_id,
+                candidate_node_ids,
+                candidate_domains,
+                table.placement_role,
+            );
+            const protect_current_members =
+                std.sort.binarySearch(u64, protected_group_ids, range.group_id, compareNodeId) != null or
+                membership_repair;
             const preserved = try collectCurrentPeers(
                 self.alloc,
                 current_intents,
@@ -167,7 +177,7 @@ pub const PlacementPlanner = struct {
                 candidate_node_ids,
                 candidate_domains,
                 table.placement_role,
-                std.sort.binarySearch(u64, protected_group_ids, range.group_id, compareNodeId) != null,
+                protect_current_members,
             );
             defer self.alloc.free(preserved);
             for (preserved) |node_id| {
@@ -176,7 +186,10 @@ pub const PlacementPlanner = struct {
             }
 
             const start = @as(usize, @intCast(range.group_id % candidate_node_ids.len));
-            const ordered = try orderCandidates(self.alloc, candidate_node_ids, candidate_domains, start, &load_by_node);
+            const ordered = if (membership_repair)
+                try orderRepairCandidates(self.alloc, candidate_node_ids, range.group_id)
+            else
+                try orderCandidates(self.alloc, candidate_node_ids, candidate_domains, start, &load_by_node);
             defer self.alloc.free(ordered);
             while (selected.items.len < replica_count) {
                 const node_id = chooseNextCandidate(ordered, selected.items, &pair_by_nodes, candidate_domains, table.placement_role) orelse break;
@@ -484,6 +497,39 @@ fn orderCandidates(
     return out;
 }
 
+fn orderRepairCandidates(
+    alloc: std.mem.Allocator,
+    candidate_node_ids: []const u64,
+    group_id: u64,
+) ![]u64 {
+    const Candidate = struct {
+        node_id: u64,
+        repair_order: u64,
+    };
+
+    const ranked = try alloc.alloc(Candidate, candidate_node_ids.len);
+    defer alloc.free(ranked);
+    for (candidate_node_ids, 0..) |node_id, i| {
+        ranked[i] = .{
+            .node_id = node_id,
+            // Membership repair must choose the same replacement from a stale
+            // projection retry. Live load and capacity signals are deliberately
+            // excluded; they can change between otherwise identical plans.
+            .repair_order = (node_id *% 0x9e3779b97f4a7c15) ^ group_id,
+        };
+    }
+    std.mem.sort(Candidate, ranked, {}, struct {
+        fn lessThan(_: void, a: Candidate, b: Candidate) bool {
+            if (a.repair_order != b.repair_order) return a.repair_order < b.repair_order;
+            return a.node_id < b.node_id;
+        }
+    }.lessThan);
+
+    const out = try alloc.alloc(u64, candidate_node_ids.len);
+    for (ranked, 0..) |candidate, i| out[i] = candidate.node_id;
+    return out;
+}
+
 fn collectCurrentPeers(
     alloc: std.mem.Allocator,
     current_intents: []const raft_reconciler.PlacementIntent,
@@ -632,6 +678,22 @@ fn candidateRetentionAllowed(candidate_domains: []const CandidateDomain, node_id
         }
     }
     return true;
+}
+
+fn groupNeedsMembershipRepair(
+    current_intents: []const raft_reconciler.PlacementIntent,
+    group_id: u64,
+    candidate_node_ids: []const u64,
+    candidate_domains: []const CandidateDomain,
+    placement_role: []const u8,
+) bool {
+    for (current_intents) |intent| {
+        if (intent.record.group_id != group_id) continue;
+        if (!containsNode(candidate_node_ids, intent.record.local_node_id) or
+            !candidateSelectable(candidate_domains, intent.record.local_node_id, placement_role))
+            return true;
+    }
+    return false;
 }
 
 fn containsNode(nodes: []const u64, node_id: u64) bool {
@@ -943,14 +1005,17 @@ test "placement planner tags replacement with the dropped current peer as source
         .{ .record = .{ .group_id = 1501, .replica_id = 3, .local_node_id = 102, .bootstrap_mode = .persisted }, .store_id = 102, .peer_node_ids = &.{ 105, 101, 102 }, .serving_state = .serving },
     };
     const candidate_domains = [_]CandidateDomain{
+        .{ .node_id = 101, .store_id = 101, .role = "data", .failure_domain = "rack-a", .status_tag = .excluded, .retain_current = false },
         .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b" },
         .{ .node_id = 103, .store_id = 103, .role = "data", .failure_domain = "rack-c" },
         .{ .node_id = 104, .store_id = 104, .role = "data", .failure_domain = "rack-d" },
-        .{ .node_id = 105, .store_id = 105, .role = "data", .failure_domain = "rack-e" },
+        // A load rebalance request must not move this healthy survivor in the
+        // same plan that replaces the excluded member.
+        .{ .node_id = 105, .store_id = 105, .role = "data", .failure_domain = "rack-e", .retain_current = false },
     };
 
     var planner = PlacementPlanner.init(std.testing.allocator);
-    const intents = try planner.planAllIntentsWithCurrentAndDomains(&manager, &.{ 102, 103, 104, 105 }, &current, &candidate_domains);
+    const intents = try planner.planAllIntentsWithCurrentAndDomains(&manager, &.{ 101, 102, 103, 104, 105 }, &current, &candidate_domains);
     defer planner.freeIntents(std.testing.allocator, intents);
 
     var replacement: ?raft_reconciler.PlacementIntent = null;
@@ -965,6 +1030,26 @@ test "placement planner tags replacement with the dropped current peer as source
     try std.testing.expectEqual(raft_reconciler.PlacementServingState.bootstrapping, target.serving_state);
     try std.testing.expectEqual(@as(u64, 1), findCurrentIntent(intents, 1501, 105).?.record.replica_id);
     try std.testing.expectEqual(@as(u64, 3), findCurrentIntent(intents, 1501, 102).?.record.replica_id);
+
+    const changed_candidates = [_]CandidateDomain{
+        .{ .node_id = 105, .store_id = 105, .role = "data", .failure_domain = "rack-e", .retain_current = false, .read_load = 999 },
+        .{ .node_id = 104, .store_id = 104, .role = "data", .failure_domain = "rack-d", .available_bytes = 1 },
+        .{ .node_id = 103, .store_id = 103, .role = "data", .failure_domain = "rack-c", .write_load = 999 },
+        .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b", .available_bytes = std.math.maxInt(u64) },
+        .{ .node_id = 101, .store_id = 101, .role = "data", .failure_domain = "rack-a", .status_tag = .excluded, .retain_current = false },
+    };
+    const retried = try planner.planAllIntentsWithCurrentAndDomains(
+        &manager,
+        &.{ 105, 104, 103, 102, 101 },
+        &current,
+        &changed_candidates,
+    );
+    defer planner.freeIntents(std.testing.allocator, retried);
+    var retried_target: ?raft_reconciler.PlacementIntent = null;
+    for (retried) |intent| {
+        if (findCurrentIntent(&current, 1501, intent.record.local_node_id) == null) retried_target = intent;
+    }
+    try std.testing.expectEqual(target.record.local_node_id, retried_target.?.record.local_node_id);
 }
 
 test "placement planner preserves protected unconverged members during forced rebalance" {
