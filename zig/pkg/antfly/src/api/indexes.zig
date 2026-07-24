@@ -2000,7 +2000,7 @@ test "derived coverage aggregation rejects stale index incarnations" {
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"projection_checkpoint_generation\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"projection_checkpoint_config_hash\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"checkpoint_replay_tail_sequence_count\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"repair_degraded\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"repair_degraded\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"repair_issue_count\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"repair_summary_ready\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"repair_issue_count_estimated\":true") != null);
@@ -2678,7 +2678,7 @@ fn appendSingleIndexRuntimeStatus(
     }
     if (@hasField(@TypeOf(item), "repair_degraded")) {
         try out.appendSlice(alloc, ",\"repair_degraded\":");
-        try out.appendSlice(alloc, if (embeddings_materialization_current and item.repair_degraded) "true" else "false");
+        try out.appendSlice(alloc, if (!embeddings_materialization_current or item.repair_degraded) "true" else "false");
     }
     if (@hasField(@TypeOf(item), "repair_issue_count")) {
         try out.appendSlice(alloc, ",\"repair_issue_count\":");
