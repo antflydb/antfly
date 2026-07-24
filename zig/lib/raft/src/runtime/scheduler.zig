@@ -26,23 +26,36 @@ pub const VirtualTime = struct {
 };
 
 pub const Scheduler = struct {
+    const QueueLinks = struct {
+        prev: ?core.types.GroupId = null,
+        next: ?core.types.GroupId = null,
+        queued: bool = false,
+    };
+
     const GroupState = struct {
         quiesced: bool = false,
-        ready_queued: bool = false,
         ready_visit_epoch: u64 = 0,
+        fair_ready: QueueLinks = .{},
+        continuation_ready: QueueLinks = .{},
+    };
+
+    const ReadyQueue = struct {
+        head: ?core.types.GroupId = null,
+        tail: ?core.types.GroupId = null,
+        len: usize = 0,
     };
 
     pub const ReadyPassKind = enum {
         /// Prioritize queued hints, then audit every registered group once.
         fair,
-        /// Consume only hints present when the pass begins.
-        queued_only,
+        /// Consume only productive continuation hints present at pass start.
+        continuation,
     };
 
     pub const ReadyPass = struct {
         kind: ReadyPassKind,
         epoch: u64,
-        priority_end: usize,
+        priority_remaining: usize,
         fallback_checked: usize = 0,
     };
 
@@ -51,8 +64,8 @@ pub const Scheduler = struct {
     time: VirtualTime = .{},
     group_ids: std.ArrayListUnmanaged(core.types.GroupId) = .empty,
     groups: std.AutoHashMapUnmanaged(core.types.GroupId, GroupState) = .empty,
-    ready_queue: std.ArrayListUnmanaged(core.types.GroupId) = .empty,
-    ready_queue_head: usize = 0,
+    fair_ready: ReadyQueue = .{},
+    continuation_ready: ReadyQueue = .{},
     active_group_count: usize = 0,
     ready_epoch: u64 = 0,
     ready_pass_active: bool = false,
@@ -69,7 +82,6 @@ pub const Scheduler = struct {
     pub fn deinit(self: *Scheduler) void {
         self.group_ids.deinit(self.alloc);
         self.groups.deinit(self.alloc);
-        self.ready_queue.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -78,11 +90,6 @@ pub const Scheduler = struct {
         if (self.groups.contains(group_id)) return error.GroupAlreadyRegistered;
 
         try self.group_ids.ensureUnusedCapacity(self.alloc, 1);
-        // At most one hint per group exists between passes. During a pass,
-        // every visited group may append one hint for the following pass.
-        const queue_capacity = std.math.mul(usize, self.group_ids.items.len + 1, 2) catch
-            return error.OutOfMemory;
-        try self.ready_queue.ensureTotalCapacity(self.alloc, queue_capacity);
         try self.groups.putNoClobber(self.alloc, group_id, .{});
         self.group_ids.appendAssumeCapacity(group_id);
         self.active_group_count += 1;
@@ -93,10 +100,10 @@ pub const Scheduler = struct {
         const state = self.groups.get(group_id) orelse return false;
         for (self.group_ids.items, 0..) |existing, i| {
             if (existing != group_id) continue;
+            self.removeQueuedGroup(group_id);
             _ = self.group_ids.orderedRemove(i);
             _ = self.groups.remove(group_id);
             if (!state.quiesced) self.active_group_count -= 1;
-            self.removeQueuedGroup(group_id);
             if (self.group_ids.items.len == 0) {
                 self.cursor = 0;
                 self.ready_cursor = 0;
@@ -133,7 +140,7 @@ pub const Scheduler = struct {
         return .{
             .kind = kind,
             .epoch = self.ready_epoch,
-            .priority_end = self.ready_queue.items.len,
+            .priority_remaining = self.queueFor(kind).len,
         };
     }
 
@@ -141,12 +148,10 @@ pub const Scheduler = struct {
         std.debug.assert(self.ready_pass_active);
         std.debug.assert(pass.epoch == self.ready_epoch);
 
-        while (self.ready_queue_head < pass.priority_end) {
-            const group_id = self.ready_queue.items[self.ready_queue_head];
-            self.ready_queue_head += 1;
+        while (pass.priority_remaining > 0) {
+            pass.priority_remaining -= 1;
+            const group_id = self.popReady(pass.kind) orelse break;
             const state = self.groups.getPtr(group_id) orelse continue;
-            if (!state.ready_queued) continue;
-            state.ready_queued = false;
             if (state.quiesced or state.ready_visit_epoch == pass.epoch) continue;
             state.ready_visit_epoch = pass.epoch;
             return group_id;
@@ -171,22 +176,13 @@ pub const Scheduler = struct {
     pub fn finishReadyPass(self: *Scheduler, pass: *ReadyPass) void {
         std.debug.assert(self.ready_pass_active);
         std.debug.assert(pass.epoch == self.ready_epoch);
-        const remaining = self.ready_queue.items.len - self.ready_queue_head;
-        std.mem.copyForwards(
-            core.types.GroupId,
-            self.ready_queue.items[0..remaining],
-            self.ready_queue.items[self.ready_queue_head..],
-        );
-        self.ready_queue.items.len = remaining;
-        self.ready_queue_head = 0;
         self.ready_pass_active = false;
         pass.* = undefined;
     }
 
-    pub fn hasQueuedReady(self: *const Scheduler) bool {
+    pub fn hasQueuedContinuation(self: *const Scheduler) bool {
         std.debug.assert(!self.ready_pass_active);
-        std.debug.assert(self.ready_queue_head == 0);
-        return self.ready_queue.items.len > 0;
+        return self.continuation_ready.len > 0;
     }
 
     pub fn quiesceGroup(self: *Scheduler, group_id: core.types.GroupId) !void {
@@ -194,7 +190,6 @@ pub const Scheduler = struct {
         const state = self.groups.getPtr(group_id) orelse return error.UnknownGroup;
         if (state.quiesced) return;
         state.quiesced = true;
-        state.ready_queued = false;
         self.active_group_count -= 1;
         self.removeQueuedGroup(group_id);
     }
@@ -248,31 +243,96 @@ pub const Scheduler = struct {
     }
 
     pub fn noteReady(self: *Scheduler, group_id: core.types.GroupId) void {
-        self.enqueueReady(group_id);
+        self.enqueueReady(group_id, .fair);
     }
 
     pub fn noteActivity(self: *Scheduler, group_id: core.types.GroupId) void {
-        self.enqueueReady(group_id);
+        self.enqueueReady(group_id, .fair);
     }
 
-    fn enqueueReady(self: *Scheduler, group_id: core.types.GroupId) void {
+    /// Defers a denied Ready frontier until the next fair host round.
+    pub fn deferReady(self: *Scheduler, group_id: core.types.GroupId) void {
+        self.unlinkReady(group_id, .continuation);
+        self.enqueueReady(group_id, .fair);
+    }
+
+    /// Publishes the result of one successful Ready step. Only a frontier
+    /// proven to have advanced may enter the same-round continuation queue.
+    pub fn completeReady(self: *Scheduler, group_id: core.types.GroupId, has_more: bool) void {
+        self.unlinkReady(group_id, .fair);
+        self.unlinkReady(group_id, .continuation);
+        if (has_more) self.enqueueReady(group_id, .continuation);
+    }
+
+    fn enqueueReady(self: *Scheduler, group_id: core.types.GroupId, kind: ReadyPassKind) void {
         const state = self.groups.getPtr(group_id) orelse return;
-        if (state.quiesced or state.ready_queued) return;
-        std.debug.assert(self.ready_queue.items.len < self.ready_queue.capacity);
-        self.ready_queue.appendAssumeCapacity(group_id);
-        state.ready_queued = true;
+        if (state.quiesced) return;
+        const links = linksFor(state, kind);
+        if (links.queued) return;
+
+        const queue = self.queueFor(kind);
+        links.* = .{
+            .prev = queue.tail,
+            .queued = true,
+        };
+        if (queue.tail) |tail_id| {
+            const tail_state = self.groups.getPtr(tail_id) orelse unreachable;
+            linksFor(tail_state, kind).next = group_id;
+        } else {
+            queue.head = group_id;
+        }
+        queue.tail = group_id;
+        queue.len += 1;
     }
 
     fn removeQueuedGroup(self: *Scheduler, group_id: core.types.GroupId) void {
         std.debug.assert(!self.ready_pass_active);
-        std.debug.assert(self.ready_queue_head == 0);
-        var retained: usize = 0;
-        for (self.ready_queue.items) |queued| {
-            if (queued == group_id) continue;
-            self.ready_queue.items[retained] = queued;
-            retained += 1;
+        self.unlinkReady(group_id, .fair);
+        self.unlinkReady(group_id, .continuation);
+    }
+
+    fn popReady(self: *Scheduler, kind: ReadyPassKind) ?core.types.GroupId {
+        const group_id = self.queueFor(kind).head orelse return null;
+        self.unlinkReady(group_id, kind);
+        return group_id;
+    }
+
+    fn unlinkReady(self: *Scheduler, group_id: core.types.GroupId, kind: ReadyPassKind) void {
+        const state = self.groups.getPtr(group_id) orelse return;
+        const links = linksFor(state, kind);
+        if (!links.queued) return;
+
+        const prev = links.prev;
+        const next = links.next;
+        const queue = self.queueFor(kind);
+        if (prev) |prev_id| {
+            const prev_state = self.groups.getPtr(prev_id) orelse unreachable;
+            linksFor(prev_state, kind).next = next;
+        } else {
+            queue.head = next;
         }
-        self.ready_queue.items.len = retained;
+        if (next) |next_id| {
+            const next_state = self.groups.getPtr(next_id) orelse unreachable;
+            linksFor(next_state, kind).prev = prev;
+        } else {
+            queue.tail = prev;
+        }
+        queue.len -= 1;
+        links.* = .{};
+    }
+
+    fn queueFor(self: *Scheduler, kind: ReadyPassKind) *ReadyQueue {
+        return switch (kind) {
+            .fair => &self.fair_ready,
+            .continuation => &self.continuation_ready,
+        };
+    }
+
+    fn linksFor(state: *GroupState, kind: ReadyPassKind) *QueueLinks {
+        return switch (kind) {
+            .fair => &state.fair_ready,
+            .continuation => &state.continuation_ready,
+        };
     }
 
     fn nextRoundRobinGroup(self: *Scheduler, cursor: *usize) ?core.types.GroupId {
@@ -337,13 +397,13 @@ test "scheduler prioritizes each ready group once per pass" {
     for (0..8) |_| scheduler.noteActivity(3);
     var first_pass = scheduler.beginReadyPass(.fair);
     try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup(&first_pass));
-    scheduler.noteReady(3);
+    scheduler.completeReady(3, true);
     try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextReadyGroup(&first_pass));
     try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextReadyGroup(&first_pass));
     try std.testing.expectEqual(@as(?core.types.GroupId, null), scheduler.nextReadyGroup(&first_pass));
     scheduler.finishReadyPass(&first_pass);
 
-    var second_pass = scheduler.beginReadyPass(.queued_only);
+    var second_pass = scheduler.beginReadyPass(.continuation);
     defer scheduler.finishReadyPass(&second_pass);
     try std.testing.expectEqual(@as(?core.types.GroupId, 3), scheduler.nextReadyGroup(&second_pass));
 }

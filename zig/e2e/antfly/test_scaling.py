@@ -854,9 +854,44 @@ class MultiNodeScalingCluster:
             f"{self.debug_logs()}"
         )
 
-    def finalize_node_shutdown(self, node_id: int) -> None:
-        response = self.delete_metadata(f"/internal/v1/nodes/{node_id}")
-        response.raise_for_status()
+    def finalize_node_shutdown(self, node_id: int, *, timeout_s: float = 30.0) -> None:
+        last_error: str | None = None
+
+        def finalized_visible_on_all_metadata_nodes() -> dict[str, Any] | None:
+            nonlocal last_error
+            try:
+                snapshots = [self.metadata_snapshot(index) for index in range(len(self.metadata_urls))]
+            except (AssertionError, requests.RequestException) as exc:
+                last_error = repr(exc)
+                return None
+            for snapshot in snapshots:
+                nodes = [node for node in snapshot.get("nodes", []) if isinstance(node, dict)]
+                stores = [store for store in snapshot.get("stores", []) if isinstance(store, dict)]
+                if any(int(node.get("node_id", 0)) == node_id for node in nodes):
+                    return None
+                if any(int(store.get("node_id", 0)) == node_id for store in stores):
+                    return None
+            return snapshots[0]
+
+        def finalize_until_visible() -> dict[str, Any] | None:
+            nonlocal last_error
+            if visible := finalized_visible_on_all_metadata_nodes():
+                return visible
+            try:
+                response = self.delete_metadata(f"/internal/v1/nodes/{node_id}")
+                response.raise_for_status()
+            except (AssertionError, requests.RequestException) as exc:
+                last_error = repr(exc)
+                return None
+            return finalized_visible_on_all_metadata_nodes()
+
+        finalized = wait_until(finalize_until_visible, timeout_s=timeout_s, interval_s=0.5)
+        assert finalized is not None, (
+            f"node shutdown finalization did not become visible on all metadata nodes for {node_id}: {last_error}\n"
+            f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
+            f"snapshot: {self.metadata_snapshot()}\n"
+            f"{self.debug_logs()}"
+        )
 
     def trigger_reallocate(self) -> None:
         response = self.post_metadata("/internal/v1/reallocate")

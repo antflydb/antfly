@@ -72,7 +72,7 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
     if (round.elapsed_ns <= metadata_run_round_slow_phase_threshold_ns) return;
     const ready = round.slowest_ready_group;
     std.log.warn(
-        "metadata raft round slow elapsed_ms={d} inbound_ms={d} tick_ms={d} drain_ready_ms={d} drain_scan_ms={d} persist_begin_ms={d} persist_finish_ms={d} outbox_drain_ms={d} apply_flush_ms={d} transport_flush_ms={d} transport_advance_ms={d} ticked_groups={d} processed_groups={d} virtual_round={d} virtual_time_ms={d} ready_group_id={d} ready_group_ms={d}",
+        "metadata raft round slow elapsed_ms={d} inbound_ms={d} tick_ms={d} drain_ready_ms={d} drain_scan_ms={d} persist_begin_ms={d} persist_finish_ms={d} outbox_drain_ms={d} apply_flush_ms={d} transport_flush_ms={d} transport_advance_ms={d} ticked_groups={d} processed_groups={d} processed_ready_steps={d} virtual_round={d} virtual_time_ms={d} ready_group_id={d} ready_group_ms={d}",
         .{
             @divTrunc(round.elapsed_ns, std.time.ns_per_ms),
             @divTrunc(round.inbound_drain_elapsed_ns, std.time.ns_per_ms),
@@ -87,6 +87,7 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
             @divTrunc(round.transport_advance_elapsed_ns, std.time.ns_per_ms),
             round.ticked_groups,
             round.processed_groups,
+            round.processed_ready_steps,
             round.virtual_round,
             round.virtual_time_ms,
             ready.group_id,
@@ -419,7 +420,7 @@ pub const MetadataServiceConfig = struct {
     raft: raft_service.ManagedServiceConfig = .{
         .max_inbound_messages = 128,
         .max_tick_groups = 8,
-        .max_ready_groups = 8,
+        .max_ready_steps = 8,
     },
     reconcile_lease: metadata_reconcile_lease.Config = .{},
     observe_local_replica_root: bool = true,
@@ -3708,7 +3709,7 @@ pub const MetadataHttpService = struct {
     ) void {
         const ready = slowest_round.slowest_ready_group;
         std.log.warn(
-            "metadata linearizable read timeout request_id={d} group_id={d} attempts={d} not_leader={d} raft_rounds={d} pending_updates={d} node_id={d} role={s} has_leader={} leader_id={d} term={d} commit_index={d} applied_index={d} last_index={d} election_elapsed={d} slowest_round_ms={d} slowest_inbound_ms={d} slowest_tick_ms={d} slowest_drain_ready_ms={d} slowest_drain_scan_ms={d} slowest_apply_flush_ms={d} slowest_transport_flush_ms={d} slowest_transport_advance_ms={d} slowest_ticked_groups={d} slowest_processed_groups={d} slowest_ready_group_id={d} slowest_ready_group_ms={d}",
+            "metadata linearizable read timeout request_id={d} group_id={d} attempts={d} not_leader={d} raft_rounds={d} pending_updates={d} node_id={d} role={s} has_leader={} leader_id={d} term={d} commit_index={d} applied_index={d} last_index={d} election_elapsed={d} slowest_round_ms={d} slowest_inbound_ms={d} slowest_tick_ms={d} slowest_drain_ready_ms={d} slowest_drain_scan_ms={d} slowest_apply_flush_ms={d} slowest_transport_flush_ms={d} slowest_transport_advance_ms={d} slowest_ticked_groups={d} slowest_processed_groups={d} slowest_processed_ready_steps={d} slowest_ready_group_id={d} slowest_ready_group_ms={d}",
             .{
                 request_id,
                 self.metadata_group_id,
@@ -3735,6 +3736,7 @@ pub const MetadataHttpService = struct {
                 @divTrunc(slowest_round.transport_advance_elapsed_ns, std.time.ns_per_ms),
                 slowest_round.ticked_groups,
                 slowest_round.processed_groups,
+                slowest_round.processed_ready_steps,
                 ready.group_id,
                 @divTrunc(ready.elapsed_ns, std.time.ns_per_ms),
             },

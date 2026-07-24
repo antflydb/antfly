@@ -1328,7 +1328,7 @@ fn aggregateIndexStatusIndexed(
 ) ?AggregatedIndexStatus {
     var aggregate: AggregatedIndexStatus = .{ .coverage_config_hash = coverage_config_hash };
     var found = false;
-    var runtime_count: usize = 0;
+    var materialization_count: usize = 0;
     var active_count: usize = 0;
     var active_progress_sum: f64 = 0.0;
 
@@ -1344,15 +1344,8 @@ fn aggregateIndexStatusIndexed(
             findIndexStatus(runtime.stats.indexes, index_name) orelse continue;
         found = true;
         if (aggregate.kind == null) aggregate.kind = item.kind;
-        if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
-        if (publicIndexRepairState(item)) |state| {
-            if (aggregate.repair_state == null or repairStateRank(state) > repairStateRank(aggregate.repair_state.?)) {
-                aggregate.repair_state = state;
-            }
-        }
         const runtime_present = runtime_status.statusHasRuntimeFacts(runtime);
         if (!runtime_present) continue;
-        runtime_count += 1;
         aggregate.reported_group_count += 1;
         aggregate.runtime_present = true;
         if (statusFreshnessCountsAsFresh(runtime.metadata)) {
@@ -1365,12 +1358,14 @@ fn aggregateIndexStatusIndexed(
         } else {
             aggregate.stale_group_count += 1;
         }
+        const observation_current = statusFreshnessCountsAsFresh(runtime.metadata) and
+            coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
         // Coverage is projected only from current observations. Stale groups
         // remain visible in diagnostics but cannot contribute cardinality or
         // outcomes to a complete aggregate.
         if (statusFreshnessCountsAsFresh(runtime.metadata)) {
             aggregate.table_doc_count +|= runtime.stats.source_doc_count;
-            if (!coverageIdentityMatches(item, coverage_generation, coverage_config_hash)) {
+            if (!observation_current) {
                 aggregate.coverage_config_mismatch_count += 1;
             } else if (!item.coverage_summary_ready) {
                 aggregate.coverage_summary_ready = false;
@@ -1380,11 +1375,28 @@ fn aggregateIndexStatusIndexed(
                 aggregate.coverage_terminal_failed_count +|= item.coverage_terminal_failed_count;
             }
         }
+        // Materialization and replay facts are scoped to the index
+        // incarnation. Retaining an old runtime observation is useful for
+        // diagnostics, but publishing its counts as the new index would make
+        // delete/recreate and schema replacement appear query-ready before
+        // repair has produced the replacement artifact.
+        if (!observation_current) {
+            aggregate.backfill_active = true;
+            aggregate.replay_catch_up_required = true;
+            continue;
+        }
+        materialization_count += 1;
+        if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
+        if (publicIndexRepairState(item)) |state| {
+            if (aggregate.repair_state == null or repairStateRank(state) > repairStateRank(aggregate.repair_state.?)) {
+                aggregate.repair_state = state;
+            }
+        }
         aggregate.doc_count += item.doc_count;
         aggregate.term_count += item.term_count;
         aggregate.edge_count += item.edge_count;
         aggregate.node_count += item.node_count;
-        aggregate.root_node = if (runtime_count == 1) item.root_node else 0;
+        aggregate.root_node = if (materialization_count == 1) item.root_node else 0;
         aggregate.replay_applied_sequence += item.replay_applied_sequence;
         aggregate.replay_target_sequence += item.replay_target_sequence;
         if (item.replay_catch_up_required) aggregate.replay_catch_up_required = true;
@@ -1900,10 +1912,16 @@ test "derived coverage aggregation rejects stale index incarnations" {
     var indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "visual",
         .kind = .dense_vector,
+        .doc_count = 7,
+        .term_count = 11,
+        .node_count = 9,
+        .root_node = 3,
         .coverage_produced_count = 1,
         .coverage_generation = 41,
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
+        .replay_applied_sequence = 8,
+        .replay_target_sequence = 8,
     }};
     const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 1,
@@ -1912,9 +1930,46 @@ test "derived coverage aggregation rejects stale index incarnations" {
     }};
 
     const aggregate = aggregateIndexStatusIndexed(&runtimes, "visual", &.{1}, 42, 99, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), aggregate.table_doc_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.doc_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.node_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.root_node);
     try std.testing.expectEqual(@as(u64, 0), aggregate.coverage_produced_count);
     try std.testing.expectEqual(@as(u64, 1), aggregate.coverage_config_mismatch_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.replay_applied_sequence);
+    try std.testing.expect(aggregate.replay_catch_up_required);
+    try std.testing.expect(aggregate.backfill_active);
     try std.testing.expect(aggregateRuntimeCoverageIncomplete(aggregate, 42, 99));
+
+    var shard_status = std.ArrayListUnmanaged(u8).empty;
+    defer shard_status.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &shard_status,
+        .embeddings,
+        indexes[0],
+        1,
+        .strict,
+        false,
+        42,
+        99,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        runtimes[0].metadata,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"total_indexed\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"query_visible_doc_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"published_node_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"dense_replay_applied_sequence\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"dense_publish_pending\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"observation_incomplete_reasons\":[\"config_mismatch\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"config_mismatch_group_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shard_status.items, "\"produced\":0") != null);
 }
 
 test "derived coverage rejects unknown freshness for aggregate and shard views" {
@@ -1985,18 +2040,20 @@ test "derived coverage semantic fingerprint ignores execution policy" {
 }
 
 fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: EmbeddingsCoveragePolicy, sparse: bool, coverage_generation: u64, coverage_config_hash: u64, enrichment: ?db_mod.types.EnrichmentStats, runtime_present: bool) EmbeddingsRuntimeView {
+    const observation_current = runtime_present and
+        coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
     var view: EmbeddingsRuntimeView = .{
-        .backfill_active = item.backfill_active,
-        .backfill_progress = item.backfill_progress,
-        .replay_applied_sequence = item.replay_applied_sequence,
-        .replay_target_sequence = item.replay_target_sequence,
-        .replay_catch_up_required = item.replay_catch_up_required,
+        .backfill_active = if (observation_current) item.backfill_active else true,
+        .backfill_progress = if (observation_current) item.backfill_progress else 0.0,
+        .replay_applied_sequence = if (observation_current) item.replay_applied_sequence else 0,
+        .replay_target_sequence = if (observation_current) item.replay_target_sequence else 0,
+        .replay_catch_up_required = if (observation_current) item.replay_catch_up_required else true,
     };
-    const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
-    const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
-    const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
+    const produced_count = if (observation_current and @hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
+    const skipped_count = if (observation_current and @hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
+    const terminal_failed_count = if (observation_current and @hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
     const replay_current = coverageReplayCurrent(view.replay_applied_sequence, view.replay_target_sequence, view.replay_catch_up_required);
-    const coverage_incomplete = !runtime_present or
+    const coverage_incomplete = !observation_current or
         aggregateRuntimeCoverageIncomplete(item, coverage_generation, coverage_config_hash) or
         !coverageCountersValid(table_doc_count, produced_count, skipped_count, terminal_failed_count);
     const coverage = evaluateCoverage(
@@ -2019,7 +2076,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         !coverage_incomplete and replay_current
     else
         dense_coverage_complete;
-    if (enrichment) |stats| {
+    if (if (observation_current) enrichment else null) |stats| {
         const index_applied_sequence = view.replay_applied_sequence;
         const index_target_sequence = view.replay_target_sequence;
         view.replay_target_sequence = @max(index_target_sequence, stats.target_sequence);
@@ -2042,7 +2099,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
             if (view.backfill_progress >= 1.0) view.backfill_progress = 0.999;
         }
     }
-    const enrichment_pending = if (enrichment) |stats|
+    const enrichment_pending = if (if (observation_current) enrichment else null) |stats|
         stats.enabled and (stats.worker_failed or stats.retrying or stats.applied_sequence < stats.target_sequence)
     else
         false;
@@ -2056,7 +2113,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
     const replay_ready = view.replay_target_sequence > 0 and
         view.replay_target_sequence <= view.replay_applied_sequence and
         !(if (enrichment) |stats| stats.retrying or stats.worker_failed else false);
-    const artifact_visible = embeddingsArtifactPublishComplete(item, sparse, table_doc_count);
+    const artifact_visible = observation_current and embeddingsArtifactPublishComplete(item, sparse, table_doc_count);
     if (replay_ready and !artifact_visible and view.replay_target_sequence > 0) {
         view.backfill_active = true;
         view.backfill_progress = 0.0;
@@ -2298,10 +2355,18 @@ fn appendSingleIndexRuntimeStatus(
     runtime_present: bool,
 ) !void {
     const coverage_runtime_present = runtime_present and (metadata == null or metadata.?.freshness == .fresh);
+    const embeddings_materialization_current = index_type != .embeddings or
+        (coverage_runtime_present and coverageIdentityMatches(item, coverage_generation, coverage_config_hash));
+    const visible_doc_count = if (embeddings_materialization_current) item.doc_count else 0;
+    const visible_term_count = if (embeddings_materialization_current) item.term_count else 0;
+    const visible_edge_count = if (embeddings_materialization_current) item.edge_count else 0;
+    const visible_node_count = if (embeddings_materialization_current) item.node_count else 0;
+    const visible_root_node = if (embeddings_materialization_current) item.root_node else 0;
     const embeddings_view = if (index_type == .embeddings)
         embeddingsRuntimeView(item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, enrichment, coverage_runtime_present)
     else
         null;
+    const visible_enrichment = if (embeddings_materialization_current) enrichment else null;
     var backfill_active = if (embeddings_view) |view| view.backfill_active else item.backfill_active;
     var backfill_progress = if (embeddings_view) |view| view.backfill_progress else item.backfill_progress;
     // Replay watermarks describe the managed index worker's real ledger.
@@ -2310,27 +2375,30 @@ fn appendSingleIndexRuntimeStatus(
     // converged index watermark into synthetic replay debt. Older snapshots
     // that contain no index replay facts can still derive a compatibility
     // view from enrichment status.
-    const index_replay_present = item.replay_applied_sequence != 0 or
-        item.replay_target_sequence != 0 or item.replay_catch_up_required;
+    const visible_item_replay_applied_sequence = if (embeddings_materialization_current) item.replay_applied_sequence else 0;
+    const visible_item_replay_target_sequence = if (embeddings_materialization_current) item.replay_target_sequence else 0;
+    const visible_item_replay_catch_up_required = if (embeddings_materialization_current) item.replay_catch_up_required else index_type == .embeddings;
+    const index_replay_present = visible_item_replay_applied_sequence != 0 or
+        visible_item_replay_target_sequence != 0 or visible_item_replay_catch_up_required;
     var replay_applied_sequence = if (index_replay_present or embeddings_view == null)
-        item.replay_applied_sequence
+        visible_item_replay_applied_sequence
     else
         embeddings_view.?.replay_applied_sequence;
     var replay_target_sequence = if (index_replay_present or embeddings_view == null)
-        item.replay_target_sequence
+        visible_item_replay_target_sequence
     else
         embeddings_view.?.replay_target_sequence;
     var replay_catch_up_required = if (index_replay_present or embeddings_view == null)
-        item.replay_catch_up_required
+        visible_item_replay_catch_up_required
     else
         embeddings_view.?.replay_catch_up_required;
     const dense_catch_up = async_indexing.dense_catch_up;
-    var catch_up_active = item.catch_up_active;
-    var catch_up_phase = item.catch_up_phase;
-    var catch_up_applied_sequence = item.catch_up_applied_sequence;
-    var catch_up_target_sequence = item.catch_up_target_sequence;
+    var catch_up_active = if (embeddings_materialization_current) item.catch_up_active else false;
+    var catch_up_phase = if (embeddings_materialization_current) item.catch_up_phase else .idle;
+    var catch_up_applied_sequence = if (embeddings_materialization_current) item.catch_up_applied_sequence else 0;
+    var catch_up_target_sequence = if (embeddings_materialization_current) item.catch_up_target_sequence else 0;
     if (index_type == .embeddings) {
-        if (dense_catch_up.active) {
+        if (embeddings_materialization_current and dense_catch_up.active) {
             catch_up_active = true;
             catch_up_phase = dense_catch_up.phase;
             catch_up_applied_sequence = @max(catch_up_applied_sequence, dense_catch_up.current_sequence);
@@ -2363,12 +2431,12 @@ fn appendSingleIndexRuntimeStatus(
     }
     if (catch_up_active and catch_up_phase == .idle and replay_catch_up_required) catch_up_phase = .replay;
 
-    const repair_state = publicIndexRepairState(item);
+    const repair_state = if (embeddings_materialization_current) publicIndexRepairState(item) else null;
     // A load failure with no durable automatic repair remains a terminal
     // operator-visible error. Once a repair intent exists, the compact repair
     // state is authoritative; exposing the quarantined root's raw load error
     // at the same time would incorrectly tell clients to drop/recreate.
-    const raw_load_error: ?[]const u8 = if (@hasField(@TypeOf(item), "load_error")) item.load_error else null;
+    const raw_load_error: ?[]const u8 = if (embeddings_materialization_current and @hasField(@TypeOf(item), "load_error")) item.load_error else null;
     const load_error: ?[]const u8 = if (repair_state == null) raw_load_error else null;
     if (load_error != null) {
         backfill_active = false;
@@ -2391,18 +2459,18 @@ fn appendSingleIndexRuntimeStatus(
     switch (index_type) {
         .full_text, .embeddings, .algebraic => {
             try out.appendSlice(alloc, ",\"total_indexed\":");
-            try appendIntValue(alloc, out, item.doc_count);
+            try appendIntValue(alloc, out, visible_doc_count);
         },
         .graph => {
             try out.appendSlice(alloc, ",\"total_edges\":");
-            try appendIntValue(alloc, out, item.edge_count);
+            try appendIntValue(alloc, out, visible_edge_count);
         },
     }
     if (index_type == .embeddings) {
         try out.appendSlice(alloc, ",\"total_terms\":");
-        try appendIntValue(alloc, out, item.term_count);
+        try appendIntValue(alloc, out, visible_term_count);
         try out.appendSlice(alloc, ",\"total_nodes\":");
-        try appendIntValue(alloc, out, item.node_count);
+        try appendIntValue(alloc, out, visible_node_count);
     }
     try out.append(alloc, ',');
     try appendJsonString(alloc, out, "backfill_active");
@@ -2419,7 +2487,7 @@ fn appendSingleIndexRuntimeStatus(
     } else if (repair_state != null and std.mem.eql(u8, repair_state.?, "waiting")) {
         try appendJsonString(alloc, out, "retrying");
     } else {
-        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, item.enrichment_failed, replay_applied_sequence, replay_target_sequence, enrichment));
+        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, embeddings_materialization_current and item.enrichment_failed, replay_applied_sequence, replay_target_sequence, visible_enrichment));
     }
     if (load_error) |err_name| {
         const msg = try std.fmt.allocPrint(alloc, "load failed: {s}", .{err_name});
@@ -2435,17 +2503,17 @@ fn appendSingleIndexRuntimeStatus(
         try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, ",\"doc_count\":");
-    try appendIntValue(alloc, out, item.doc_count);
+    try appendIntValue(alloc, out, visible_doc_count);
     try out.appendSlice(alloc, ",\"term_count\":");
-    try appendIntValue(alloc, out, item.term_count);
+    try appendIntValue(alloc, out, visible_term_count);
     try out.appendSlice(alloc, ",\"edge_count\":");
-    try appendIntValue(alloc, out, item.edge_count);
+    try appendIntValue(alloc, out, visible_edge_count);
     try out.appendSlice(alloc, ",\"node_count\":");
-    try appendIntValue(alloc, out, item.node_count);
+    try appendIntValue(alloc, out, visible_node_count);
     if (index_type == .embeddings) {
-        const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
-        const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
-        const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
+        const skipped_count = if (embeddings_materialization_current and @hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
+        const terminal_failed_count = if (embeddings_materialization_current and @hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
+        const produced_count = if (embeddings_materialization_current and @hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
         const counters_valid = coverageCountersValid(table_doc_count, produced_count, skipped_count, terminal_failed_count);
         const replay_current = coverageReplayCurrent(replay_applied_sequence, replay_target_sequence, replay_catch_up_required);
         const observation_complete = coverage_runtime_present and
@@ -2461,19 +2529,20 @@ fn appendSingleIndexRuntimeStatus(
             replay_current,
         );
         const coverage_complete = coverage.complete;
-        const artifact_publish_pending = replay_target_sequence > 0 and
-            !embeddingsArtifactPublishComplete(item, embeddings_sparse, table_doc_count) and
-            !coverage_complete;
+        const artifact_publish_pending = !embeddings_materialization_current or
+            (replay_target_sequence > 0 and
+                !embeddingsArtifactPublishComplete(item, embeddings_sparse, table_doc_count) and
+                !coverage_complete);
         try out.appendSlice(alloc, ",\"query_visible_doc_count\":");
-        try appendIntValue(alloc, out, item.doc_count);
+        try appendIntValue(alloc, out, visible_doc_count);
         try out.appendSlice(alloc, ",\"published_doc_count\":");
-        try appendIntValue(alloc, out, item.doc_count);
+        try appendIntValue(alloc, out, visible_doc_count);
         try out.appendSlice(alloc, ",\"published_node_count\":");
-        try appendIntValue(alloc, out, item.node_count);
+        try appendIntValue(alloc, out, visible_node_count);
         try out.appendSlice(alloc, ",\"root_node\":");
-        try appendIntValue(alloc, out, item.root_node);
+        try appendIntValue(alloc, out, visible_root_node);
         try out.appendSlice(alloc, ",\"published_root_node\":");
-        try appendIntValue(alloc, out, item.root_node);
+        try appendIntValue(alloc, out, visible_root_node);
         try out.appendSlice(alloc, ",\"dense_replay_applied_sequence\":");
         try appendIntValue(alloc, out, replay_applied_sequence);
         try out.appendSlice(alloc, ",\"dense_replay_target_sequence\":");
@@ -2491,10 +2560,10 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"config_fingerprint\":");
         try appendCoverageFingerprint(alloc, out, coverage_config_hash);
         try out.appendSlice(alloc, ",\"summary_ready\":");
-        const coverage_summary_ready = coverage_runtime_present and if (@hasField(@TypeOf(item), "coverage_summary_ready")) item.coverage_summary_ready else false;
+        const coverage_summary_ready = embeddings_materialization_current and if (@hasField(@TypeOf(item), "coverage_summary_ready")) item.coverage_summary_ready else false;
         try out.appendSlice(alloc, if (coverage_summary_ready) "true" else "false");
         try out.appendSlice(alloc, ",\"config_mismatch_group_count\":");
-        const config_mismatch_group_count = if (@hasField(@TypeOf(item), "coverage_config_mismatch_count")) item.coverage_config_mismatch_count else @intFromBool(coverage_runtime_present and @hasField(@TypeOf(item), "coverage_config_hash") and item.coverage_config_hash != coverage_config_hash);
+        const config_mismatch_group_count = if (@hasField(@TypeOf(item), "coverage_config_mismatch_count")) item.coverage_config_mismatch_count else @intFromBool(coverage_runtime_present and !coverageIdentityMatches(item, coverage_generation, coverage_config_hash));
         try appendIntValue(alloc, out, config_mismatch_group_count);
         try out.appendSlice(alloc, ",\"source_total\":");
         try appendIntValue(alloc, out, table_doc_count);
@@ -4428,6 +4497,11 @@ test "single embeddings index encoder keeps backfill active while enrichment rep
 }
 
 test "single embeddings index encoder keeps retrying coverage gaps catch-up coherent" {
+    const config_json = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "semantic_idx", parsed_config.value);
+
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -4435,6 +4509,10 @@ test "single embeddings index encoder keeps retrying coverage gaps catch-up cohe
         .kind = .dense_vector,
         .doc_count = 1,
         .node_count = 1,
+        .coverage_produced_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 34,
         .replay_target_sequence = 34,
         .replay_catch_up_required = false,
@@ -4445,7 +4523,9 @@ test "single embeddings index encoder keeps retrying coverage gaps catch-up cohe
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
+            .source_doc_count = 3,
             .doc_count = 3,
             .index_count = 1,
             .indexes = indexes,
@@ -4465,7 +4545,7 @@ test "single embeddings index encoder keeps retrying coverage gaps catch-up cohe
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .indexes_json = "{\"semantic_idx\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -4478,7 +4558,7 @@ test "single embeddings index encoder keeps retrying coverage gaps catch-up cohe
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.333") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":34") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":34") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);

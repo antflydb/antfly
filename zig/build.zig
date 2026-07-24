@@ -3344,6 +3344,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "multi raft drainReady continues async pipeline without starving peer",
             "multi raft drainReady does not retry a no-progress frontier",
+            "multi raft drainReady reserves continuations for productive groups",
         },
     });
     const run_raft_ready_continuation_tests = addFilteredTestRunArtifact(b, raft_ready_continuation_tests);
@@ -4568,7 +4569,7 @@ pub fn build(b: *std.Build) void {
             "remote simple vector query uses vector worker route",
             "encode query request serializes internal resolved doc filters with wire context",
             "simple vector shard request carries serializable resolved doc filter",
-            "api http server maps public query doc identity mismatch to unavailable",
+            "api http server preserves public query availability errors",
             "api http server maps retrieval agent doc identity mismatch to unavailable",
             "api http server query builder maps doc identity mismatch to unavailable",
             "api http server surfaces structured doc identity conflicts for transaction commits",
@@ -4882,6 +4883,7 @@ pub fn build(b: *std.Build) void {
             "cached all-skipped coverage observation is a runtime fact",
             "table runtime snapshot cache clones stored status",
             "table runtime snapshot cache batch publication is table epoch atomic",
+            "table runtime snapshot cache lifecycle transition replaces and fences observations",
             "table runtime snapshot cache batch preserves newer group observations",
             "runtime status cache stable absence removal retires the old table epoch",
             "partial coverage embeddings readiness counts skipped source units",
@@ -4891,6 +4893,7 @@ pub fn build(b: *std.Build) void {
             "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
             "managed embeddings coverage debt does not fabricate replay debt",
             "external embeddings index readiness does not require table doc coverage",
+            "api http server preserves public query availability errors",
             "api http server create index waits for exact target config projection",
         },
         .test_runner = .{
@@ -4950,6 +4953,7 @@ pub fn build(b: *std.Build) void {
             "managed repair visibility edges retire cached readers and runtime status",
             "table runtime snapshot cache invalidation fences a stale observed publisher",
             "runtime status hook orders completed observation without crossing invalidation",
+            "structural repair publication advances the table lifecycle epoch",
             "table runtime snapshot cache live publication does not starve structural refresh",
             "table runtime snapshot cache preserves live completion over regressing persisted projection",
             "table runtime snapshot cache table fences isolate unrelated invalidations",

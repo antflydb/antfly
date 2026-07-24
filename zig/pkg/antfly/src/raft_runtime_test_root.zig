@@ -39,13 +39,13 @@ test "raft scheduler ready priority cannot starve consensus ticks" {
 
     var ready_pass = scheduler.beginReadyPass(.fair);
     try std.testing.expectEqual(@as(?u64, 1), scheduler.nextReadyGroup(&ready_pass));
-    scheduler.noteReady(1);
+    scheduler.completeReady(1, true);
     try std.testing.expectEqual(@as(?u64, 2), scheduler.nextReadyGroup(&ready_pass));
     try std.testing.expectEqual(@as(?u64, 3), scheduler.nextReadyGroup(&ready_pass));
     try std.testing.expectEqual(@as(?u64, null), scheduler.nextReadyGroup(&ready_pass));
     scheduler.finishReadyPass(&ready_pass);
 
-    var requeued_pass = scheduler.beginReadyPass(.queued_only);
+    var requeued_pass = scheduler.beginReadyPass(.continuation);
     defer scheduler.finishReadyPass(&requeued_pass);
     try std.testing.expectEqual(@as(?u64, 1), scheduler.nextReadyGroup(&requeued_pass));
 
@@ -69,33 +69,33 @@ test "raft scheduler ready priority cannot starve consensus ticks" {
         for (0..group_count) |index| {
             const group_id: u64 = @intCast(index + 1);
             try bounded.registerGroup(group_id);
-            bounded.noteReady(group_id);
+            bounded.completeReady(group_id, true);
         }
 
-        // Requeue every group while consuming the original frontier. This
-        // reaches the exact 2N physical queue bound before compaction.
-        var full_pass = bounded.beginReadyPass(.queued_only);
+        // Requeue every group while consuming the original snapshot. Newly
+        // produced continuation hints must remain behind that snapshot.
+        var full_pass = bounded.beginReadyPass(.continuation);
         for (0..group_count) |index| {
             const group_id: u64 = @intCast(index + 1);
             try std.testing.expectEqual(@as(?u64, group_id), bounded.nextReadyGroup(&full_pass));
-            bounded.noteReady(group_id);
+            bounded.completeReady(group_id, true);
         }
         try std.testing.expectEqual(@as(?u64, null), bounded.nextReadyGroup(&full_pass));
         bounded.finishReadyPass(&full_pass);
-        try std.testing.expect(bounded.hasQueuedReady());
+        try std.testing.expect(bounded.hasQueuedContinuation());
 
-        // Stop partway through the compacted frontier and verify that both
-        // unconsumed and newly requeued hints retain deterministic FIFO order.
+        // Stop partway through the next frontier and verify that unconsumed
+        // and newly requeued hints retain deterministic FIFO order.
         const partial_count = 7;
-        var partial_pass = bounded.beginReadyPass(.queued_only);
+        var partial_pass = bounded.beginReadyPass(.continuation);
         for (0..partial_count) |index| {
             const group_id: u64 = @intCast(index + 1);
             try std.testing.expectEqual(@as(?u64, group_id), bounded.nextReadyGroup(&partial_pass));
-            bounded.noteReady(group_id);
+            bounded.completeReady(group_id, true);
         }
         bounded.finishReadyPass(&partial_pass);
 
-        var compacted_pass = bounded.beginReadyPass(.queued_only);
+        var compacted_pass = bounded.beginReadyPass(.continuation);
         for (partial_count..group_count) |index| {
             const group_id: u64 = @intCast(index + 1);
             try std.testing.expectEqual(@as(?u64, group_id), bounded.nextReadyGroup(&compacted_pass));
@@ -106,7 +106,7 @@ test "raft scheduler ready priority cannot starve consensus ticks" {
         }
         try std.testing.expectEqual(@as(?u64, null), bounded.nextReadyGroup(&compacted_pass));
         bounded.finishReadyPass(&compacted_pass);
-        try std.testing.expect(!bounded.hasQueuedReady());
+        try std.testing.expect(!bounded.hasQueuedContinuation());
     }
 
     const Register = struct {

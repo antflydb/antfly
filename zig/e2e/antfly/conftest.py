@@ -216,12 +216,21 @@ def ready_index_status(index_info: dict[str, Any], *, require_query_fresh: bool 
         return None
     if status.get("rebuilding", status.get("backfill_active", False)):
         return None
+    if isinstance(status.get("repair"), dict):
+        return None
     if status.get("dense_publish_pending", False):
         return None
     if status.get("replay_catch_up_required", False):
         return None
     if status.get("catch_up_active", False):
         return None
+    coverage = status.get("coverage")
+    if isinstance(coverage, dict):
+        if coverage.get("observation_complete") is not True:
+            return None
+        mismatch_count = coverage.get("config_mismatch_group_count")
+        if type(mismatch_count) is not int or mismatch_count != 0:
+            return None
     if require_query_fresh:
         expected_groups = status.get("expected_groups")
         fresh_groups = status.get("fresh_groups")

@@ -606,20 +606,20 @@ pub const Host = struct {
         return try self.runtime_host.listGroupIds(alloc);
     }
 
-    pub fn runRound(self: *Host, max_tick_groups: usize, max_ready_groups: usize) !raft_engine.runtime.multi_raft.HostRound {
-        return try self.runRoundBounded(default_max_inbound_messages_per_round, max_tick_groups, max_ready_groups);
+    pub fn runRound(self: *Host, max_tick_groups: usize, max_ready_steps: usize) !raft_engine.runtime.multi_raft.HostRound {
+        return try self.runRoundBounded(default_max_inbound_messages_per_round, max_tick_groups, max_ready_steps);
     }
 
     pub fn runRoundBounded(
         self: *Host,
         max_inbound_messages: usize,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !raft_engine.runtime.multi_raft.HostRound {
         const inbound_start_ns = platform_time.monotonicNs();
         _ = try self.drainInboundMessages(max_inbound_messages);
         const inbound_elapsed_ns = platform_time.monotonicNs() -| inbound_start_ns;
-        var round = try self.runtime_host.runRound(max_tick_groups, max_ready_groups);
+        var round = try self.runtime_host.runRound(max_tick_groups, max_ready_steps);
         round.inbound_drain_elapsed_ns = inbound_elapsed_ns;
         round.elapsed_ns += round.inbound_drain_elapsed_ns;
         return round;
@@ -1077,17 +1077,17 @@ pub const HttpHost = struct {
         return try self.host.removePeerRoute(group_id, node_id);
     }
 
-    pub fn runRound(self: *HttpHost, max_tick_groups: usize, max_ready_groups: usize) !raft_engine.runtime.multi_raft.HostRound {
-        return try self.host.runRound(max_tick_groups, max_ready_groups);
+    pub fn runRound(self: *HttpHost, max_tick_groups: usize, max_ready_steps: usize) !raft_engine.runtime.multi_raft.HostRound {
+        return try self.host.runRound(max_tick_groups, max_ready_steps);
     }
 
     pub fn runRoundBounded(
         self: *HttpHost,
         max_inbound_messages: usize,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !raft_engine.runtime.multi_raft.HostRound {
-        return try self.host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_groups);
+        return try self.host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
     }
 
     pub fn campaignGroup(self: *HttpHost, group_id: u64) !void {

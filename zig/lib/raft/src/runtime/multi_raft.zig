@@ -93,6 +93,7 @@ pub const ReadyGroupDiagnostics = struct {
 pub const HostRound = struct {
     ticked_groups: usize = 0,
     processed_groups: usize = 0,
+    processed_ready_steps: usize = 0,
     virtual_round: u64 = 0,
     virtual_time_ms: u64 = 0,
     elapsed_ns: u64 = 0,
@@ -107,6 +108,11 @@ pub const HostRound = struct {
     transport_flush_elapsed_ns: u64 = 0,
     transport_advance_elapsed_ns: u64 = 0,
     slowest_ready_group: ReadyGroupDiagnostics = .{},
+};
+
+pub const DrainReadyResult = struct {
+    processed_groups: usize = 0,
+    processed_ready_steps: usize = 0,
 };
 
 pub const DrainReadyDiagnostics = struct {
@@ -631,7 +637,7 @@ pub const MultiRaft = struct {
         }
     }
 
-    pub fn runRound(self: *MultiRaft, max_tick_groups: usize, max_ready_groups: usize) !HostRound {
+    pub fn runRound(self: *MultiRaft, max_tick_groups: usize, max_ready_steps: usize) !HostRound {
         const round_start_ns = clock.monotonicNs();
         const virtual_time = self.scheduler.advanceVirtualTime();
         var ticked_groups: usize = 0;
@@ -646,12 +652,13 @@ pub const MultiRaft = struct {
 
         var drain_diag = DrainReadyDiagnostics{};
         const drain_ready_start_ns = clock.monotonicNs();
-        const processed_groups = try self.drainReadyWithDiagnostics(max_ready_groups, &drain_diag);
+        const ready_result = try self.drainReadyWithDiagnostics(max_ready_steps, &drain_diag);
         const drain_ready_elapsed_ns = clock.elapsedSinceNs(drain_ready_start_ns);
 
         var round: HostRound = .{
             .ticked_groups = ticked_groups,
-            .processed_groups = processed_groups,
+            .processed_groups = ready_result.processed_groups,
+            .processed_ready_steps = ready_result.processed_ready_steps,
             .virtual_round = virtual_time.round,
             .virtual_time_ms = virtual_time.now_ms,
             .tick_elapsed_ns = tick_elapsed_ns,
@@ -763,12 +770,16 @@ pub const MultiRaft = struct {
         return processed;
     }
 
-    pub fn drainReady(self: *MultiRaft, max_groups: usize) !usize {
-        return try self.drainReadyWithDiagnostics(max_groups, null);
+    pub fn drainReady(self: *MultiRaft, max_ready_steps: usize) !DrainReadyResult {
+        return try self.drainReadyWithDiagnostics(max_ready_steps, null);
     }
 
-    fn drainReadyWithDiagnostics(self: *MultiRaft, max_groups: usize, diagnostics: ?*DrainReadyDiagnostics) !usize {
-        var processed: usize = 0;
+    fn drainReadyWithDiagnostics(
+        self: *MultiRaft,
+        max_ready_steps: usize,
+        diagnostics: ?*DrainReadyDiagnostics,
+    ) !DrainReadyResult {
+        var result = DrainReadyResult{};
         var outbox = TransportOutbox{};
         defer outbox.deinit(self.alloc);
         const persist_batch_begin_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
@@ -787,10 +798,11 @@ pub const MultiRaft = struct {
             var ready_pass = self.scheduler.beginReadyPass(.fair);
             defer self.scheduler.finishReadyPass(&ready_pass);
             while (fair_attempts < scan_limit) : (fair_attempts += 1) {
-                if (processed >= max_groups) break;
+                if (result.processed_ready_steps >= max_ready_steps) break;
                 const group_id = self.scheduler.nextReadyGroup(&ready_pass) orelse break;
                 if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics)) {
-                    processed += 1;
+                    result.processed_groups += 1;
+                    result.processed_ready_steps += 1;
                 }
             }
         }
@@ -799,23 +811,25 @@ pub const MultiRaft = struct {
         // Spend that budget only on hints produced while useful work advanced.
         // A no-progress pass stops retries so backpressure cannot busy-spin.
         var continuation_attempts: usize = 0;
-        const continuation_attempt_limit = max_groups - processed;
-        while (processed > 0 and
-            processed < max_groups and
+        const continuation_attempt_limit = max_ready_steps - result.processed_ready_steps;
+        while (result.processed_ready_steps > 0 and
+            result.processed_ready_steps < max_ready_steps and
             continuation_attempts < continuation_attempt_limit and
-            self.scheduler.hasQueuedReady())
+            self.scheduler.hasQueuedContinuation())
         {
             var attempted_this_pass: usize = 0;
             var progressed_this_pass: usize = 0;
             {
-                var ready_pass = self.scheduler.beginReadyPass(.queued_only);
+                var ready_pass = self.scheduler.beginReadyPass(.continuation);
                 defer self.scheduler.finishReadyPass(&ready_pass);
-                while (processed < max_groups and continuation_attempts < continuation_attempt_limit) {
+                while (result.processed_ready_steps < max_ready_steps and
+                    continuation_attempts < continuation_attempt_limit)
+                {
                     const group_id = self.scheduler.nextReadyGroup(&ready_pass) orelse break;
                     continuation_attempts += 1;
                     attempted_this_pass += 1;
                     if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics)) {
-                        processed += 1;
+                        result.processed_ready_steps += 1;
                         progressed_this_pass += 1;
                     }
                 }
@@ -843,7 +857,7 @@ pub const MultiRaft = struct {
             if (diagnostics) |diag| diag.persist_batch_finish_elapsed_ns = clock.elapsedSinceNs(persist_batch_finish_start_ns);
         }
         self.refreshQueueMetrics();
-        return processed;
+        return result;
     }
 
     fn processReadyCandidate(
@@ -891,12 +905,18 @@ pub const MultiRaft = struct {
         diagnostics: ?*ReadyGroupDiagnostics,
     ) !bool {
         const grp = self.group(group_id) orelse return error.UnknownGroup;
-        if (!grp.hasReady()) return false;
+        if (!grp.hasReady()) {
+            self.scheduler.completeReady(group_id, false);
+            return false;
+        }
 
         const ready_build_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         var ready = grp.ready();
         if (diagnostics) |diag| diag.ready_build_elapsed_ns = clock.elapsedSinceNs(ready_build_start_ns);
-        if (ready.isEmpty()) return false;
+        if (ready.isEmpty()) {
+            self.scheduler.completeReady(group_id, false);
+            return false;
+        }
 
         const ready_pressure = summarizeReady(group_id, ready);
         const async_storage_writes = grp.asyncStorageWrites();
@@ -920,7 +940,7 @@ pub const MultiRaft = struct {
             if (!allowed) {
                 if (diagnostics) |diag| diag.denied_by_backpressure = true;
                 self.metrics.backpressure_denials += 1;
-                self.scheduler.noteReady(group_id);
+                self.scheduler.deferReady(group_id);
                 return false;
             }
         }
@@ -935,7 +955,7 @@ pub const MultiRaft = struct {
                 diag.denied_by_transport_capacity = true;
             }
             self.metrics.transport_queue_denials += 1;
-            self.scheduler.noteReady(group_id);
+            self.scheduler.deferReady(group_id);
             return false;
         }
         if (!self.hasApplyCapacity(
@@ -947,7 +967,7 @@ pub const MultiRaft = struct {
                 diag.denied_by_apply_capacity = true;
             }
             self.metrics.apply_queue_denials += 1;
-            self.scheduler.noteReady(group_id);
+            self.scheduler.deferReady(group_id);
             return false;
         }
         if (diagnostics) |diag| diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
@@ -962,7 +982,7 @@ pub const MultiRaft = struct {
                         diag.denied_by_snapshot_throttle = true;
                     }
                     self.metrics.snapshot_throttle_denials += 1;
-                    self.scheduler.noteReady(group_id);
+                    self.scheduler.deferReady(group_id);
                     return false;
                 }
                 break :blk true;
@@ -1031,7 +1051,7 @@ pub const MultiRaft = struct {
         }
         const has_more_ready = grp.hasReady();
         if (diagnostics) |diag| diag.has_more_ready = has_more_ready;
-        if (has_more_ready) self.scheduler.noteReady(group_id);
+        self.scheduler.completeReady(group_id, has_more_ready);
         return true;
     }
 

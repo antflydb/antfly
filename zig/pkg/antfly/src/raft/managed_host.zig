@@ -203,8 +203,8 @@ pub const ManagedHost = struct {
         return try self.reconcileOnce();
     }
 
-    pub fn runRound(self: *ManagedHost, max_tick_groups: usize, max_ready_groups: usize) !raft_engine.runtime.multi_raft.HostRound {
-        const round = try self.host.runRound(max_tick_groups, max_ready_groups);
+    pub fn runRound(self: *ManagedHost, max_tick_groups: usize, max_ready_steps: usize) !raft_engine.runtime.multi_raft.HostRound {
+        const round = try self.host.runRound(max_tick_groups, max_ready_steps);
         _ = try self.pollLeadership();
         return round;
     }
@@ -213,9 +213,9 @@ pub const ManagedHost = struct {
         self: *ManagedHost,
         max_inbound_messages: usize,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !raft_engine.runtime.multi_raft.HostRound {
-        const round = try self.host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_groups);
+        const round = try self.host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
         _ = try self.pollLeadership();
         return round;
     }
@@ -236,10 +236,10 @@ pub const ManagedHost = struct {
         self: *ManagedHost,
         updates: []const metadata_view.MetadataUpdate,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !ManagedSyncResult {
         const reconcile_result = try self.applyAndReconcile(updates);
-        const runtime_round = try self.runRound(max_tick_groups, max_ready_groups);
+        const runtime_round = try self.runRound(max_tick_groups, max_ready_steps);
         return .{
             .reconcile = reconcile_result,
             .runtime = runtime_round,
@@ -251,10 +251,10 @@ pub const ManagedHost = struct {
         updates: []const metadata_view.MetadataUpdate,
         max_inbound_messages: usize,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !ManagedSyncResult {
         const reconcile_result = try self.applyAndReconcile(updates);
-        const runtime_round = try self.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_groups);
+        const runtime_round = try self.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
         return .{
             .reconcile = reconcile_result,
             .runtime = runtime_round,
@@ -456,8 +456,8 @@ pub const ManagedHttpHost = struct {
         return try self.reconcileOnce();
     }
 
-    pub fn runRound(self: *ManagedHttpHost, max_tick_groups: usize, max_ready_groups: usize) !raft_engine.runtime.multi_raft.HostRound {
-        const round = try self.http_host.runRound(max_tick_groups, max_ready_groups);
+    pub fn runRound(self: *ManagedHttpHost, max_tick_groups: usize, max_ready_steps: usize) !raft_engine.runtime.multi_raft.HostRound {
+        const round = try self.http_host.runRound(max_tick_groups, max_ready_steps);
         _ = try self.pollLeadership();
         return round;
     }
@@ -466,9 +466,9 @@ pub const ManagedHttpHost = struct {
         self: *ManagedHttpHost,
         max_inbound_messages: usize,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !raft_engine.runtime.multi_raft.HostRound {
-        const round = try self.http_host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_groups);
+        const round = try self.http_host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
         _ = try self.pollLeadership();
         return round;
     }
@@ -489,10 +489,10 @@ pub const ManagedHttpHost = struct {
         self: *ManagedHttpHost,
         updates: []const metadata_view.MetadataUpdate,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !ManagedSyncResult {
         const reconcile_result = try self.applyAndReconcile(updates);
-        const runtime_round = try self.runRound(max_tick_groups, max_ready_groups);
+        const runtime_round = try self.runRound(max_tick_groups, max_ready_steps);
         return .{
             .reconcile = reconcile_result,
             .runtime = runtime_round,
@@ -504,10 +504,10 @@ pub const ManagedHttpHost = struct {
         updates: []const metadata_view.MetadataUpdate,
         max_inbound_messages: usize,
         max_tick_groups: usize,
-        max_ready_groups: usize,
+        max_ready_steps: usize,
     ) !ManagedSyncResult {
         const reconcile_result = try self.applyAndReconcile(updates);
-        const runtime_round = try self.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_groups);
+        const runtime_round = try self.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
         return .{
             .reconcile = reconcile_result,
             .runtime = runtime_round,

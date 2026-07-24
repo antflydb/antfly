@@ -149,15 +149,41 @@ def _pack_f32_le(values: list[float]) -> str:
 
 def _ready_index(stateful_api, table_name: str, index_name: str, *, expected_docs: int) -> dict | None:
     try:
-        stats = _index_stats(stateful_api.get_index(table_name, index_name))
+        index_info = stateful_api.get_index(table_name, index_name)
     except Exception:
         return None
-    if stats.get("rebuilding", stats.get("backfill_active", False)):
+    stats = ready_index_status(index_info, require_query_fresh=True)
+    if stats is None:
         return None
     total_indexed = stats.get("total_indexed", stats.get("doc_count", 0))
     if total_indexed < expected_docs:
         return None
     return stats
+
+
+def test_ready_index_status_requires_current_coverage_observation():
+    ready_status = {
+        "status": {
+            "rebuilding": False,
+            "dense_publish_pending": False,
+            "replay_catch_up_required": False,
+            "catch_up_active": False,
+            "coverage": {
+                "observation_complete": True,
+                "config_mismatch_group_count": 0,
+            },
+        }
+    }
+    assert ready_index_status(ready_status) is ready_status["status"]
+
+    stale_incarnation = json.loads(json.dumps(ready_status))
+    stale_incarnation["status"]["coverage"]["observation_complete"] = False
+    stale_incarnation["status"]["coverage"]["config_mismatch_group_count"] = 1
+    assert ready_index_status(stale_incarnation) is None
+
+    rebuilding = json.loads(json.dumps(ready_status))
+    rebuilding["status"]["repair"] = {"state": "rebuilding", "action_required": False}
+    assert ready_index_status(rebuilding) is None
 
 
 def _retrying_partial_index(stateful_api, table_name: str, index_name: str, *, expected_docs: int) -> dict | None:
