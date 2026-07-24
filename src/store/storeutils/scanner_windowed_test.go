@@ -61,6 +61,77 @@ func TestScanForEnrichment_WindowedIteratorReleased(t *testing.T) {
 		"doc:2 was enriched between windows and must not be emitted")
 }
 
+func TestScanForEnrichment_SummaryEnrichedBetweenWindows(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := t.Context()
+	sumSuffix := []byte(":i:myindex:s")
+	embSuffix := []byte(":i:myindex:e")
+
+	insertDocument(t, db, []byte("doc:1"), []byte(`{"id": 1}`), nil,
+		map[string]string{"myindex": "one"})
+	insertDocument(t, db, []byte("doc:2"), []byte(`{"id": 2}`), nil,
+		map[string]string{"myindex": "two"})
+
+	var emitted [][]byte
+	err := ScanForEnrichment(ctx, db, EnrichmentScanOptions{
+		ByteRange:        [2][]byte{[]byte("doc:"), []byte("doc;")},
+		PrimarySuffix:    sumSuffix,
+		EnrichmentSuffix: embSuffix,
+		BatchSize:        1,
+		ProcessBatch: func(ctx context.Context, batch []DocumentScanState) error {
+			for _, state := range batch {
+				emitted = append(emitted, bytes.Clone(state.CurrentDocKey))
+			}
+			if bytes.Equal(batch[0].CurrentDocKey, []byte("doc:1")) {
+				encoded := encodeEmbedding(t, []float32{1, 2}, 7)
+				require.NoError(t, db.Set(
+					append([]byte("doc:2"), embSuffix...), encoded, pebble.Sync))
+			}
+			return nil
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("doc:1")}, emitted,
+		"the fresh window must observe doc:2's newly inserted embedding")
+}
+
+func TestScanForEnrichment_SummaryEnrichmentDeletedBetweenWindows(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := t.Context()
+	sumSuffix := []byte(":i:myindex:s")
+	embSuffix := []byte(":i:myindex:e")
+
+	insertDocument(t, db, []byte("doc:1"), []byte(`{"id": 1}`), nil,
+		map[string]string{"myindex": "one"})
+	insertDocument(t, db, []byte("doc:2"), []byte(`{"id": 2}`), nil,
+		map[string]string{"myindex": "two"})
+	doc2EmbeddingKey := append([]byte("doc:2"), embSuffix...)
+	require.NoError(t, db.Set(doc2EmbeddingKey,
+		encodeEmbedding(t, []float32{1, 2}, 7), pebble.Sync))
+
+	var emitted [][]byte
+	err := ScanForEnrichment(ctx, db, EnrichmentScanOptions{
+		ByteRange:        [2][]byte{[]byte("doc:"), []byte("doc;")},
+		PrimarySuffix:    sumSuffix,
+		EnrichmentSuffix: embSuffix,
+		BatchSize:        1,
+		ProcessBatch: func(ctx context.Context, batch []DocumentScanState) error {
+			for _, state := range batch {
+				emitted = append(emitted, bytes.Clone(state.CurrentDocKey))
+			}
+			if bytes.Equal(batch[0].CurrentDocKey, []byte("doc:1")) {
+				require.NoError(t, db.Delete(doc2EmbeddingKey, pebble.Sync))
+			}
+			return nil
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("doc:1"), []byte("doc:2")}, emitted,
+		"the fresh window must not retain doc:2's deleted embedding state")
+}
+
 // TestScanForEnrichment_WindowCutPrefixInterleavedKeys pins the resume-key
 // choice: doc keys that are prefixes of one another interleave their key
 // groups in raw byte order ("user:10:*" sorts inside the span between

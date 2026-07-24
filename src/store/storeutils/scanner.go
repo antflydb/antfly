@@ -226,15 +226,24 @@ func ScanForEnrichment(ctx context.Context, db *pebble.DB, opts EnrichmentScanOp
 
 				itemKey := key[:len(key)-len(primarySuffix)]
 
-				// Batch full: cut the window at this primary key. Every key
-				// strictly before it has been consumed, so resuming at exactly
-				// this key (inclusive lower bound) neither re-emits nor skips
-				// items, even when doc keys are prefixes of one another and
-				// their groups interleave. Enrichment keys that sort before a
-				// not-yet-reached primary stay parked in seenEnrichments
-				// across windows, same as within a single pass.
+				// Batch full: cut the window at this primary key. Resume at the
+				// earlier of the primary and its enrichment key. Some pipelines
+				// scan summaries (:s) whose embeddings (:e) sort before the
+				// primary. Rewinding to :e makes an enrichment inserted or
+				// deleted while ProcessBatch runs visible to the next window.
+				// For the usual document-primary case, the primary already sorts
+				// first and remains the exact resume point.
 				if len(batch) >= opts.BatchSize {
 					resumeKey = append([]byte(nil), key...)
+					enrichmentKey := append(bytes.Clone(itemKey), opts.EnrichmentSuffix...)
+					if bytes.Compare(enrichmentKey, resumeKey) < 0 {
+						resumeKey = enrichmentKey
+						// The next window will reconstruct this boundary item's
+						// state from the fresh iterator.
+						itemKeyStr := string(itemKey)
+						delete(seenEnrichments, itemKeyStr)
+						delete(seenEnrichmentHashIDs, itemKeyStr)
+					}
 					return false, nil
 				}
 
