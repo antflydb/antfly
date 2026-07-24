@@ -6440,6 +6440,24 @@ pub fn build(b: *std.Build) void {
     const json_bench_step = b.step("json-bench", "Benchmark std.json vs antfly-json parsing");
     json_bench_step.dependOn(&run_json_bench.step);
 
+    const tokenizer_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/tokenizer_benchmark.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    tokenizer_bench_mod.addImport("inference_tokenizer", inference_graph.inference_tokenizer_mod);
+    const tokenizer_bench = b.addExecutable(.{
+        .name = "tokenizer_benchmark",
+        .root_module = tokenizer_bench_mod,
+    });
+    const run_tokenizer_bench = b.addRunArtifact(tokenizer_bench);
+    if (b.args) |args| {
+        run_tokenizer_bench.addArgs(args);
+    }
+    const tokenizer_bench_step = b.step("bench-tokenizer", "Benchmark the native Zig HuggingFace tokenizer");
+    tokenizer_bench_step.dependOn(&run_tokenizer_bench.step);
+
     // Benchmark executable
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/bench.zig"),

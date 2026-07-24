@@ -62,6 +62,16 @@ pub const HfTokenizer = struct {
     /// priority). Drives the priority-queue BPE merger in O(symbols log
     /// symbols) instead of an O(merges * symbols) sweep.
     merge_ranks: std.StringHashMapUnmanaged(u32),
+    /// Hot-path merge table keyed by two packed vocabulary IDs. Unlike
+    /// `merge_ranks`, lookups do not compose and hash "left right" strings.
+    /// The string table remains as a compatibility fallback for unusual
+    /// tokenizer.json merges whose components are absent from the vocab.
+    merge_pairs: std.AutoHashMapUnmanaged(u64, PackedBpeMerge),
+    /// Persistent, sharded pretoken cache. BPE inputs are highly repetitive
+    /// in natural language; retaining their final token IDs avoids rebuilding
+    /// symbol lists and priority queues on every occurrence and keeps lock
+    /// contention low when a tokenizer is shared by concurrent requests.
+    bpe_cache: ?*BpeCache,
     end_of_word_suffix: []const u8,
     byte_fallback: bool,
     // Unigram fields
@@ -86,11 +96,42 @@ pub const HfTokenizer = struct {
         id: i32,
     };
 
+    const PackedBpeMerge = struct {
+        rank: u32,
+        result_id: i32,
+    };
+
+    const bpe_cache_shard_count = 64;
+    const bpe_cache_slots_per_shard = 2048;
+    const bpe_cache_max_entries_per_shard = bpe_cache_slots_per_shard * 3 / 4;
+    const bpe_cache_max_key_bytes = 256;
+
+    const BpeCacheEntry = struct {
+        hash: u64,
+        key: []const u8,
+        token_ids: []const i32,
+    };
+
+    const BpeCacheShard = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        slots: [bpe_cache_slots_per_shard]std.atomic.Value(usize) =
+            @splat(.{ .raw = 0 }),
+        count: usize = 0,
+    };
+
+    const BpeCache = struct {
+        shards: [bpe_cache_shard_count]BpeCacheShard =
+            [_]BpeCacheShard{.{}} ** bpe_cache_shard_count,
+    };
+
     /// Byte-indexed trie used for added-token matching. Each node stores its
     /// children in a HashMap keyed by the next byte; final nodes hold the
     /// token id and length.
     const AddedTokenTrie = struct {
         nodes: std.ArrayListUnmanaged(Node) = .empty,
+        root_bytes: [256]bool = @splat(false),
+        root_byte_count: u16 = 0,
+        single_root_byte: u8 = 0,
 
         const Node = struct {
             children: std.AutoHashMapUnmanaged(u8, u32) = .{},
@@ -112,6 +153,11 @@ pub const HfTokenizer = struct {
 
         fn insert(self: *AddedTokenTrie, allocator: std.mem.Allocator, token: []const u8, id: i32) !void {
             if (token.len == 0) return;
+            if (!self.root_bytes[token[0]]) {
+                self.root_byte_count += 1;
+                self.single_root_byte = token[0];
+            }
+            self.root_bytes[token[0]] = true;
             var cur: u32 = 0;
             for (token) |b| {
                 const entry = try self.nodes.items[cur].children.getOrPut(allocator, b);
@@ -128,7 +174,7 @@ pub const HfTokenizer = struct {
 
         /// Longest added-token match starting at `text[0]`, if any.
         fn longestPrefixMatch(self: *const AddedTokenTrie, text: []const u8) ?AddedTokenMatch {
-            if (self.nodes.items.len == 0) return null;
+            if (self.nodes.items.len == 0 or text.len == 0 or !self.root_bytes[text[0]]) return null;
             var best: ?AddedTokenMatch = null;
             var cur: u32 = 0;
             for (text) |b| {
@@ -154,6 +200,9 @@ pub const HfTokenizer = struct {
             // transitions for bytes that begin some added token.
             var i = start;
             while (i < text.len) : (i += 1) {
+                if (self.root_byte_count == 1) {
+                    i = std.mem.indexOfScalarPos(u8, text, i, self.single_root_byte) orelse return null;
+                } else if (!self.root_bytes[text[i]]) continue;
                 var cur: u32 = 0;
                 var j: usize = i;
                 while (j < text.len) : (j += 1) {
@@ -284,6 +333,8 @@ pub const HfTokenizer = struct {
             .continuing_prefix = "##",
             .max_input_chars_per_word = 100,
             .merge_ranks = .{},
+            .merge_pairs = .{},
+            .bpe_cache = null,
             .end_of_word_suffix = "",
             .byte_fallback = false,
             .unigram_vocab = .empty,
@@ -302,6 +353,12 @@ pub const HfTokenizer = struct {
             if (model == .object) {
                 self.model_type = inferModelType(model.object);
             }
+        }
+        if (self.model_type == .bpe) {
+            const cache = try allocator.create(BpeCache);
+            cache.* = .{};
+            self.bpe_cache = cache;
+            errdefer allocator.destroy(cache);
         }
 
         // Parse pre-tokenizer
@@ -504,11 +561,17 @@ pub const HfTokenizer = struct {
             if (merges_val == .array) {
                 var rank: u32 = 0;
                 for (merges_val.array.items) |item| {
+                    var left_piece: []const u8 = undefined;
+                    var right_piece: []const u8 = undefined;
                     const raw_key = if (item == .string) blk: {
-                        if (std.mem.indexOfScalar(u8, item.string, ' ') == null) continue;
+                        const split = std.mem.indexOfScalar(u8, item.string, ' ') orelse continue;
+                        left_piece = item.string[0..split];
+                        right_piece = item.string[split + 1 ..];
                         break :blk item.string;
                     } else if (item == .array and item.array.items.len >= 2 and item.array.items[0] == .string and item.array.items[1] == .string) blk: {
-                        break :blk try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ item.array.items[0].string, item.array.items[1].string });
+                        left_piece = item.array.items[0].string;
+                        right_piece = item.array.items[1].string;
+                        break :blk try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ left_piece, right_piece });
                     } else continue;
                     defer if (item == .array) self.allocator.free(raw_key);
                     const key = try self.allocator.dupe(u8, raw_key);
@@ -516,9 +579,43 @@ pub const HfTokenizer = struct {
                     // Earlier merges win ties because getOrPut is no-op on existing.
                     const gop = try self.merge_ranks.getOrPut(self.allocator, key);
                     if (!gop.found_existing) gop.value_ptr.* = rank;
+                    try self.insertPackedBpeMerge(left_piece, right_piece, rank);
                     rank += 1;
                 }
             }
+        }
+    }
+
+    fn insertPackedBpeMerge(
+        self: *HfTokenizer,
+        left_piece: []const u8,
+        right_piece: []const u8,
+        rank: u32,
+    ) !void {
+        const left_id = self.vocab.get(left_piece) orelse return;
+        const right_id = self.vocab.get(right_piece) orelse return;
+        const pair_key = bpePairKey(left_id, right_id) orelse return;
+
+        var stack_buf: [256]u8 = undefined;
+        var heap_buf: ?[]u8 = null;
+        defer if (heap_buf) |buf| self.allocator.free(buf);
+        const total = left_piece.len + right_piece.len;
+        const merged = if (total <= stack_buf.len) blk: {
+            @memcpy(stack_buf[0..left_piece.len], left_piece);
+            @memcpy(stack_buf[left_piece.len..total], right_piece);
+            break :blk stack_buf[0..total];
+        } else blk: {
+            const owned = try self.allocator.alloc(u8, total);
+            heap_buf = owned;
+            @memcpy(owned[0..left_piece.len], left_piece);
+            @memcpy(owned[left_piece.len..], right_piece);
+            break :blk owned;
+        };
+        const result_id = self.vocab.get(merged) orelse return;
+
+        const gop = try self.merge_pairs.getOrPut(self.allocator, pair_key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .rank = rank, .result_id = result_id };
         }
     }
 
@@ -1118,15 +1215,7 @@ pub const HfTokenizer = struct {
     ) !void {
         switch (self.pre_tokenizer_type) {
             .byte_level => {
-                // ByteLevel: convert bytes to unicode chars, split on whitespace/punct regex
-                const words = try byteLevelPreTokenize(allocator, text);
-                defer {
-                    for (words) |w| allocator.free(w);
-                    allocator.free(words);
-                }
-                for (words) |word| {
-                    try self.bpeEncodeWord(allocator, word, ids);
-                }
+                try self.encodeBpeByteLevel(allocator, text, ids);
             },
             .byte_level_split => {
                 const words = try byteLevelSplitPreTokenize(allocator, text);
@@ -1169,12 +1258,36 @@ pub const HfTokenizer = struct {
         }
     }
 
+    /// Stream GPT-2-style whitespace pieces through one reusable byte-level
+    /// encoding buffer. The previous implementation allocated every encoded
+    /// pretoken plus an outer slice before BPE could begin, even when the
+    /// persistent cache immediately hit.
+    fn encodeBpeByteLevel(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        ids: *std.ArrayListUnmanaged(i32),
+    ) !void {
+        var encoded = std.ArrayListUnmanaged(u8).empty;
+        defer encoded.deinit(allocator);
+
+        try ids.ensureUnusedCapacity(allocator, (text.len / 3) + 8);
+        var start: usize = 0;
+        while (start < text.len) {
+            const end = gpt2PreTokenEnd(text, start);
+            try byteLevelEncodeInto(allocator, text[start..end], &encoded);
+            try self.bpeEncodeWord(allocator, encoded.items, ids);
+            start = end;
+        }
+    }
+
     /// Symbol represented as a (start, end) index pair into the working byte
     /// buffer, which lets us merge two symbols by simply extending the left
     /// range — no allocation per merge.
     const BpeSymbol = struct {
         start: u32,
         end: u32,
+        token_id: i32 = -1,
         prev: i32 = -1,
         next: i32 = -1,
         alive: bool = true,
@@ -1221,7 +1334,133 @@ pub const HfTokenizer = struct {
         return self.merge_ranks.get(heap_buf);
     }
 
+    fn bpePairKey(left_id: i32, right_id: i32) ?u64 {
+        if (left_id < 0 or right_id < 0) return null;
+        return (@as(u64, @intCast(left_id)) << 32) | @as(u64, @intCast(right_id));
+    }
+
+    fn bpeMerge(
+        self: *const HfTokenizer,
+        allocator: std.mem.Allocator,
+        left_id: i32,
+        right_id: i32,
+        left_bytes: []const u8,
+        right_bytes: []const u8,
+    ) !?PackedBpeMerge {
+        if (bpePairKey(left_id, right_id)) |key| {
+            if (self.merge_pairs.get(key)) |merge| return merge;
+        }
+
+        const rank = (try self.bpeMergeRank(allocator, left_bytes, right_bytes)) orelse return null;
+        var stack_buf: [256]u8 = undefined;
+        var heap_buf: ?[]u8 = null;
+        defer if (heap_buf) |buf| allocator.free(buf);
+        const total = left_bytes.len + right_bytes.len;
+        const merged = if (total <= stack_buf.len) blk: {
+            @memcpy(stack_buf[0..left_bytes.len], left_bytes);
+            @memcpy(stack_buf[left_bytes.len..total], right_bytes);
+            break :blk stack_buf[0..total];
+        } else blk: {
+            const owned = try allocator.alloc(u8, total);
+            heap_buf = owned;
+            @memcpy(owned[0..left_bytes.len], left_bytes);
+            @memcpy(owned[left_bytes.len..], right_bytes);
+            break :blk owned;
+        };
+        return .{
+            .rank = rank,
+            .result_id = self.vocab.get(merged) orelse -1,
+        };
+    }
+
+    fn lockBpeCacheShard(shard: *BpeCacheShard) void {
+        while (!shard.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn bpeCacheShard(hash: u64) usize {
+        return @intCast(hash & (bpe_cache_shard_count - 1));
+    }
+
+    fn bpeCacheSlot(hash: u64) usize {
+        return @intCast((hash >> 6) & (bpe_cache_slots_per_shard - 1));
+    }
+
+    fn appendCachedBpe(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        word: []const u8,
+        ids: *std.ArrayListUnmanaged(i32),
+    ) !bool {
+        if (word.len == 0 or word.len > bpe_cache_max_key_bytes) return false;
+        const hash = std.hash.Wyhash.hash(0, word);
+        const cache = self.bpe_cache orelse return false;
+        const shard = &cache.shards[bpeCacheShard(hash)];
+        var slot_idx = bpeCacheSlot(hash);
+        for (0..bpe_cache_slots_per_shard) |_| {
+            const raw = shard.slots[slot_idx].load(.acquire);
+            if (raw == 0) return false;
+            const entry: *const BpeCacheEntry = @ptrFromInt(raw);
+            if (entry.hash == hash and std.mem.eql(u8, entry.key, word)) {
+                try ids.appendSlice(allocator, entry.token_ids);
+                return true;
+            }
+            slot_idx = (slot_idx + 1) & (bpe_cache_slots_per_shard - 1);
+        }
+        return false;
+    }
+
+    /// Best-effort cache insertion. Tokenization must not fail merely because
+    /// the optional cache cannot grow, so allocation failures are ignored.
+    fn cacheBpe(self: *HfTokenizer, word: []const u8, token_ids: []const i32) void {
+        if (word.len == 0 or word.len > bpe_cache_max_key_bytes or token_ids.len == 0) return;
+
+        const hash = std.hash.Wyhash.hash(0, word);
+        const cache = self.bpe_cache orelse return;
+        const key_copy = self.allocator.dupe(u8, word) catch return;
+        var own_key = true;
+        defer if (own_key) self.allocator.free(key_copy);
+        const ids_copy = self.allocator.dupe(i32, token_ids) catch return;
+        var own_ids = true;
+        defer if (own_ids) self.allocator.free(ids_copy);
+        const new_entry = self.allocator.create(BpeCacheEntry) catch return;
+        var own_entry = true;
+        defer if (own_entry) self.allocator.destroy(new_entry);
+        new_entry.* = .{
+            .hash = hash,
+            .key = key_copy,
+            .token_ids = ids_copy,
+        };
+
+        const shard = &cache.shards[bpeCacheShard(hash)];
+        lockBpeCacheShard(shard);
+        defer shard.mutex.unlock();
+        if (shard.count >= bpe_cache_max_entries_per_shard) return;
+
+        var slot_idx = bpeCacheSlot(hash);
+        for (0..bpe_cache_slots_per_shard) |_| {
+            const raw = shard.slots[slot_idx].load(.acquire);
+            if (raw == 0) {
+                shard.slots[slot_idx].store(@intFromPtr(new_entry), .release);
+                shard.count += 1;
+                own_key = false;
+                own_ids = false;
+                own_entry = false;
+                return;
+            }
+            const entry: *const BpeCacheEntry = @ptrFromInt(raw);
+            if (entry.hash == hash and std.mem.eql(u8, entry.key, word)) return;
+            slot_idx = (slot_idx + 1) & (bpe_cache_slots_per_shard - 1);
+        }
+    }
+
     fn bpeEncodeWord(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32)) !void {
+        if (try self.appendCachedBpe(allocator, word, ids)) return;
+        const output_start = ids.items.len;
+        try self.bpeEncodeWordUncached(allocator, word, ids);
+        self.cacheBpe(word, ids.items[output_start..]);
+    }
+
+    fn bpeEncodeWordUncached(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32)) !void {
         if (word.len == 0) return;
 
         // Check added tokens first
@@ -1276,6 +1515,7 @@ pub const HfTokenizer = struct {
             try symbols.append(allocator, .{
                 .start = @intCast(pos),
                 .end = @intCast(end),
+                .token_id = self.vocab.get(work[pos..end]) orelse -1,
                 .prev = idx - 1,
                 .next = idx + 1,
             });
@@ -1286,6 +1526,8 @@ pub const HfTokenizer = struct {
             // Extend the last symbol's range over the suffix.
             if (self.end_of_word_suffix.len > 0) {
                 symbols.items[symbols.items.len - 1].end = @intCast(work.len);
+                const last = &symbols.items[symbols.items.len - 1];
+                last.token_id = self.vocab.get(work[last.start..last.end]) orelse -1;
             }
         }
 
@@ -1297,8 +1539,14 @@ pub const HfTokenizer = struct {
             const right_idx: u32 = @intCast(next);
             const a = work[symbols.items[i].start..symbols.items[i].end];
             const b = work[symbols.items[right_idx].start..symbols.items[right_idx].end];
-            if (try self.bpeMergeRank(allocator, a, b)) |rank| {
-                try pq.insert(.{ .rank = rank, .left = @intCast(i), .right = right_idx });
+            if (try self.bpeMerge(
+                allocator,
+                symbols.items[i].token_id,
+                symbols.items[right_idx].token_id,
+                a,
+                b,
+            )) |merge| {
+                try pq.insert(.{ .rank = merge.rank, .left = @intCast(i), .right = right_idx });
             }
         }
 
@@ -1312,13 +1560,20 @@ pub const HfTokenizer = struct {
 
             const a = work[left.start..left.end];
             const b = work[right.start..right.end];
-            const cur_rank = (try self.bpeMergeRank(allocator, a, b)) orelse continue;
-            if (cur_rank != cand.rank) continue;
+            const current_merge = (try self.bpeMerge(
+                allocator,
+                left.token_id,
+                right.token_id,
+                a,
+                b,
+            )) orelse continue;
+            if (current_merge.rank != cand.rank) continue;
 
             // Merge: extend left's range over right, splice right out of the
             // doubly-linked list. No allocation, since the bytes are already
             // contiguous in `work`.
             left.end = right.end;
+            left.token_id = current_merge.result_id;
             const new_next = right.next;
             left.next = new_next;
             if (new_next >= 0) symbols.items[@intCast(new_next)].prev = @intCast(cand.left);
@@ -1328,15 +1583,27 @@ pub const HfTokenizer = struct {
             if (left.prev >= 0) {
                 const prev_idx: u32 = @intCast(left.prev);
                 const pa = work[symbols.items[prev_idx].start..symbols.items[prev_idx].end];
-                if (try self.bpeMergeRank(allocator, pa, left_bytes)) |r| {
-                    try pq.insert(.{ .rank = r, .left = prev_idx, .right = cand.left });
+                if (try self.bpeMerge(
+                    allocator,
+                    symbols.items[prev_idx].token_id,
+                    left.token_id,
+                    pa,
+                    left_bytes,
+                )) |merge| {
+                    try pq.insert(.{ .rank = merge.rank, .left = prev_idx, .right = cand.left });
                 }
             }
             if (left.next >= 0) {
                 const next_idx: u32 = @intCast(left.next);
                 const nb = work[symbols.items[next_idx].start..symbols.items[next_idx].end];
-                if (try self.bpeMergeRank(allocator, left_bytes, nb)) |r| {
-                    try pq.insert(.{ .rank = r, .left = cand.left, .right = next_idx });
+                if (try self.bpeMerge(
+                    allocator,
+                    left.token_id,
+                    symbols.items[next_idx].token_id,
+                    left_bytes,
+                    nb,
+                )) |merge| {
+                    try pq.insert(.{ .rank = merge.rank, .left = cand.left, .right = next_idx });
                 }
             }
         }
@@ -1347,7 +1614,9 @@ pub const HfTokenizer = struct {
             const sym = symbols.items[@intCast(idx)];
             if (sym.alive) {
                 const bytes = work[sym.start..sym.end];
-                if (self.vocab.get(bytes)) |id| {
+                if (sym.token_id >= 0) {
+                    try ids.append(allocator, sym.token_id);
+                } else if (self.vocab.get(bytes)) |id| {
                     try ids.append(allocator, id);
                 } else if (self.byte_fallback) {
                     for (bytes) |byte| {
@@ -1968,6 +2237,21 @@ pub const HfTokenizer = struct {
         self.added_tokens.deinit(allocator);
         self.added_trie.deinit(allocator);
         self.merge_ranks.deinit(allocator);
+        self.merge_pairs.deinit(allocator);
+        if (self.bpe_cache) |cache| {
+            for (&cache.shards) |*shard| {
+                for (&shard.slots) |*slot| {
+                    const raw = slot.load(.monotonic);
+                    if (raw != 0) {
+                        const entry: *BpeCacheEntry = @ptrFromInt(raw);
+                        allocator.free(entry.key);
+                        allocator.free(entry.token_ids);
+                        allocator.destroy(entry);
+                    }
+                }
+            }
+            allocator.destroy(cache);
+        }
         self.unigram_vocab.deinit(allocator);
         self.unigram_trie.deinit(allocator);
         if (self.bpe_direct_trie) |*t| t.deinit(allocator);
@@ -2217,6 +2501,106 @@ const unicode_to_byte = initUnicodeToByte();
 
 const unicode_to_byte_len: u21 = 324;
 
+const Gpt2CharClass = enum {
+    letter,
+    number,
+    whitespace,
+    other,
+};
+
+const Gpt2Char = struct {
+    class: Gpt2CharClass,
+    len: usize,
+};
+
+fn gpt2ContractionLen(text: []const u8) ?usize {
+    const contractions = [_][]const u8{ "'s", "'t", "'re", "'ve", "'m", "'ll", "'d" };
+    for (contractions) |suffix| {
+        if (std.mem.startsWith(u8, text, suffix)) return suffix.len;
+    }
+    return null;
+}
+
+fn isUnicodeWhitespace(cp: u21) bool {
+    return cp == 0x0085 or
+        cp == 0x00A0 or
+        cp == 0x1680 or
+        (cp >= 0x2000 and cp <= 0x200A) or
+        cp == 0x2028 or
+        cp == 0x2029 or
+        cp == 0x202F or
+        cp == 0x205F or
+        cp == 0x3000;
+}
+
+/// Classify a UTF-8 codepoint for the GPT-2 pretokenizer. ASCII is the hot
+/// path. The non-ASCII punctuation/symbol blocks cover the separators that
+/// occur in natural-language corpora; other non-ASCII codepoints are treated
+/// as letters so scripts such as CJK, Cyrillic, and Arabic remain grouped.
+fn gpt2CharAt(text: []const u8, pos: usize) Gpt2Char {
+    const first = text[pos];
+    if (first < 0x80) {
+        const class: Gpt2CharClass = if (std.ascii.isAlphabetic(first))
+            .letter
+        else if (std.ascii.isDigit(first))
+            .number
+        else if (std.ascii.isWhitespace(first))
+            .whitespace
+        else
+            .other;
+        return .{ .class = class, .len = 1 };
+    }
+
+    const len = @min(utf8CodepointLen(first), text.len - pos);
+    const cp = std.unicode.utf8Decode(text[pos .. pos + len]) catch
+        return .{ .class = .other, .len = 1 };
+    if (isUnicodeWhitespace(cp)) return .{ .class = .whitespace, .len = len };
+
+    const is_other =
+        (cp >= 0x2000 and cp <= 0x206F) or // General punctuation
+        (cp >= 0x20A0 and cp <= 0x20CF) or // Currency symbols
+        (cp >= 0x2190 and cp <= 0x2BFF) or // Arrows, math, technical symbols
+        (cp >= 0x2E00 and cp <= 0x2E7F) or // Supplemental punctuation
+        (cp >= 0x3001 and cp <= 0x303F) or // CJK punctuation
+        (cp >= 0x1F000 and cp <= 0x1FAFF) or // Emoji and pictographs
+        cp == 0x00B7;
+    return .{
+        .class = if (is_other) .other else .letter,
+        .len = len,
+    };
+}
+
+fn gpt2PreTokenEnd(text: []const u8, start: usize) usize {
+    if (gpt2ContractionLen(text[start..])) |contraction_len| {
+        return start + contraction_len;
+    }
+
+    // GPT-2's regex permits one literal ASCII space before a letter, number,
+    // or punctuation run.
+    var content_start = start;
+    if (text[start] == ' ' and start + 1 < text.len) {
+        const next = gpt2CharAt(text, start + 1);
+        if (next.class != .whitespace) content_start += 1;
+    }
+
+    const first = gpt2CharAt(text, content_start);
+    var end = content_start + first.len;
+    while (end < text.len) {
+        const next = gpt2CharAt(text, end);
+        if (next.class != first.class) break;
+        end += next.len;
+    }
+
+    // For a multi-codepoint whitespace run followed by content,
+    // `\s+(?!\S)` emits all but the last codepoint. A trailing ASCII space
+    // can then prefix content; other whitespace is emitted alone by `\s+`.
+    if (first.class == .whitespace and end < text.len) {
+        const last_start = prevCodepointBoundary(text, end);
+        if (last_start > start) end = last_start;
+    }
+    return end;
+}
+
 fn initByteToUnicode() [256]u21 {
     var table: [256]u21 = undefined;
     var n: u21 = 256;
@@ -2239,44 +2623,6 @@ fn initUnicodeToByte() [unicode_to_byte_len]?u8 {
         if (cp < unicode_to_byte_len) table[cp] = @intCast(idx);
     }
     return table;
-}
-
-/// ByteLevel pre-tokenizer: map bytes to unicode and split on whitespace boundaries.
-fn byteLevelPreTokenize(allocator: std.mem.Allocator, text: []const u8) ![][]const u8 {
-    // Simple approach: split on whitespace, then byte-encode each word
-    var words = std.ArrayListUnmanaged([]const u8).empty;
-    var start: usize = 0;
-
-    for (text, 0..) |c, i| {
-        if (std.ascii.isWhitespace(c)) {
-            if (i > start) {
-                const encoded = try byteLevelEncode(allocator, text[start..i]);
-                try words.append(allocator, encoded);
-            }
-            // Encode the whitespace too (GPT-2 includes leading space)
-            const ws = try byteLevelEncode(allocator, text[i .. i + 1]);
-            // Check if next word exists, if so prepend space to it
-            if (i + 1 < text.len and !std.ascii.isWhitespace(text[i + 1])) {
-                // Find end of next word
-                var end = i + 1;
-                while (end < text.len and !std.ascii.isWhitespace(text[end])) : (end += 1) {}
-                const next_encoded = try byteLevelEncode(allocator, text[i..end]);
-                allocator.free(ws);
-                try words.append(allocator, next_encoded);
-                start = end;
-            } else {
-                try words.append(allocator, ws);
-                start = i + 1;
-            }
-        }
-    }
-
-    if (start < text.len) {
-        const encoded = try byteLevelEncode(allocator, text[start..]);
-        try words.append(allocator, encoded);
-    }
-
-    return try words.toOwnedSlice(allocator);
 }
 
 fn byteLevelSplitPreTokenize(allocator: std.mem.Allocator, text: []const u8) ![][]const u8 {
@@ -2335,13 +2681,24 @@ fn clipContractionLen(text: []const u8) usize {
 
 fn byteLevelEncode(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
+    errdefer buf.deinit(allocator);
+    try byteLevelEncodeInto(allocator, text, &buf);
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn byteLevelEncodeInto(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    buf: *std.ArrayListUnmanaged(u8),
+) !void {
+    buf.clearRetainingCapacity();
+    try buf.ensureTotalCapacity(allocator, text.len * 2);
     for (text) |byte| {
         const cp = byte_to_unicode[byte];
         var utf8_buf: [4]u8 = undefined;
         const len = std.unicode.utf8Encode(cp, &utf8_buf) catch 1;
-        try buf.appendSlice(allocator, utf8_buf[0..len]);
+        buf.appendSliceAssumeCapacity(utf8_buf[0..len]);
     }
-    return try buf.toOwnedSlice(allocator);
 }
 
 fn appendByteDecoded(result: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, token: []const u8) !void {
@@ -2621,7 +2978,7 @@ test "encode for model handles splade wordpiece tokenizer fixture" {
     defer if (std.c.getenv("ANTFLY_INFERENCE_MODELS_DIR") == null) allocator.free(models_dir);
     const path = try std.fs.path.join(allocator, &.{ models_dir, "sparse-encoder-testing", "splade-bert-tiny-nq-onnx", "tokenizer.json" });
     defer allocator.free(path);
-    const bytes = std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024) catch |err| switch (err) {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };
@@ -2657,10 +3014,53 @@ test "bert pre-tokenizer" {
     try std.testing.expectEqualStrings(".", words[5]);
 }
 
+test "gpt2 pre-tokenizer matches regex boundaries" {
+    const text = "Hello, world! I'm sure.  12345\n\n\nNext “déjà”";
+    const expected = [_][]const u8{
+        "Hello",
+        ",",
+        " world",
+        "!",
+        " I",
+        "'m",
+        " sure",
+        ".",
+        " ",
+        " 12345",
+        "\n\n",
+        "\n",
+        "Next",
+        " “",
+        "déjà",
+        "”",
+    };
+
+    var start: usize = 0;
+    for (expected) |piece| {
+        const end = gpt2PreTokenEnd(text, start);
+        try std.testing.expectEqualStrings(piece, text[start..end]);
+        start = end;
+    }
+    try std.testing.expectEqual(text.len, start);
+}
+
 test "real tokenizer.json golden values" {
     const allocator = std.testing.allocator;
 
-    var tok = try HfTokenizer.loadFromDir(allocator, std.Io.Dir.cwd(), std.testing.io, "testdata/embedder/tokenizer.json");
+    var tok = HfTokenizer.loadFromDir(
+        allocator,
+        std.Io.Dir.cwd(),
+        std.testing.io,
+        "lib/tokenizer/testdata/embedder/tokenizer.json",
+    ) catch |err| switch (err) {
+        error.FileNotFound => try HfTokenizer.loadFromDir(
+            allocator,
+            std.Io.Dir.cwd(),
+            std.testing.io,
+            "testdata/embedder/tokenizer.json",
+        ),
+        else => return err,
+    };
     defer tok.deinitSelf();
 
     const Case = struct { text: []const u8, expected: []const i32 };
