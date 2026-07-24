@@ -21,11 +21,13 @@ const Config = struct {
     warmup_iterations: usize = 2,
     iterations: usize = 5,
     threads: usize = 1,
+    internal_threads: usize = 1,
+    repeat: usize = 1,
 };
 
 fn usage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\usage: zig build bench-tokenizer -- <tokenizer.json> <corpus.txt> [--warmup N] [--iterations N] [--threads N]
+        \\usage: zig build bench-tokenizer -- <tokenizer.json> <corpus.txt> [--warmup N] [--iterations N] [--threads N] [--internal-threads N] [--repeat N]
         \\
         \\Measures the native Zig HuggingFace tokenizer's steady-state encodeInto
         \\throughput. The tokenizer and reusable output buffer persist across all
@@ -76,11 +78,32 @@ fn parseArgs(io: std.Io, args_in: std.process.Args) !Config {
                 args.next() orelse return error.MissingArgument,
                 10,
             );
+        } else if (std.mem.eql(u8, arg, "--internal-threads")) {
+            cfg.internal_threads = try std.fmt.parseInt(
+                usize,
+                args.next() orelse return error.MissingArgument,
+                10,
+            );
+        } else if (std.mem.eql(u8, arg, "--repeat")) {
+            cfg.repeat = try std.fmt.parseInt(
+                usize,
+                args.next() orelse return error.MissingArgument,
+                10,
+            );
         } else {
             return error.UnknownArgument;
         }
     }
-    if (cfg.iterations == 0 or cfg.threads == 0 or cfg.threads > 256) return error.InvalidConfiguration;
+    if (cfg.iterations == 0 or
+        cfg.threads == 0 or
+        cfg.threads > 256 or
+        cfg.internal_threads == 0 or
+        cfg.internal_threads > 64 or
+        cfg.repeat == 0 or
+        cfg.repeat > 4096)
+    {
+        return error.InvalidConfiguration;
+    }
     return cfg;
 }
 
@@ -98,6 +121,7 @@ const Worker = struct {
     tokenizer: tokenizer_mod.Tokenizer,
     corpus: []const u8,
     iterations: usize,
+    internal_threads: usize,
     ready: *std.atomic.Value(u32),
     start: *std.atomic.Value(bool),
     token_total: usize = 0,
@@ -113,7 +137,12 @@ const Worker = struct {
 
         for (0..self.iterations) |_| {
             ids.clearRetainingCapacity();
-            self.tokenizer.encodeInto(allocator, self.corpus, &ids) catch |err| {
+            self.tokenizer.encodeIntoParallel(
+                allocator,
+                self.corpus,
+                &ids,
+                self.internal_threads,
+            ) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -142,13 +171,27 @@ pub fn main(init: std.process.Init) !void {
         .limited(256 * 1024 * 1024),
     );
     defer allocator.free(tokenizer_json);
-    const corpus = try std.Io.Dir.cwd().readFileAlloc(
+    const corpus_file = try std.Io.Dir.cwd().readFileAlloc(
         init.io,
         cfg.corpus_path,
         allocator,
         .limited(16 * 1024 * 1024 * 1024),
     );
-    defer allocator.free(corpus);
+    defer allocator.free(corpus_file);
+    const repeated_corpus: ?[]u8 = if (cfg.repeat == 1)
+        null
+    else blk: {
+        if (corpus_file.len != 0 and cfg.repeat > std.math.maxInt(usize) / corpus_file.len)
+            return error.CorpusSizeOverflow;
+        const repeated_len = corpus_file.len * cfg.repeat;
+        const repeated = try allocator.alloc(u8, repeated_len);
+        for (0..cfg.repeat) |idx| {
+            @memcpy(repeated[idx * corpus_file.len ..][0..corpus_file.len], corpus_file);
+        }
+        break :blk repeated;
+    };
+    defer if (repeated_corpus) |repeated| allocator.free(repeated);
+    const corpus: []const u8 = repeated_corpus orelse corpus_file;
 
     const hf = try tokenizer_mod.hf.HfTokenizer.loadFromBytes(allocator, tokenizer_json);
     defer hf.deinitSelf();
@@ -158,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
     defer ids.deinit(allocator);
     for (0..cfg.warmup_iterations) |_| {
         ids.clearRetainingCapacity();
-        try tokenizer.encodeInto(allocator, corpus, &ids);
+        try tokenizer.encodeIntoParallel(allocator, corpus, &ids, cfg.internal_threads);
     }
 
     const workers = try allocator.alloc(Worker, cfg.threads);
@@ -177,6 +220,7 @@ pub fn main(init: std.process.Init) !void {
             .tokenizer = tokenizer,
             .corpus = corpus,
             .iterations = cfg.iterations,
+            .internal_threads = cfg.internal_threads,
             .ready = &ready,
             .start = &start,
         };
@@ -191,7 +235,7 @@ pub fn main(init: std.process.Init) !void {
     const elapsed_ns = nowNs() - start_ns;
 
     ids.clearRetainingCapacity();
-    try tokenizer.encodeInto(allocator, corpus, &ids);
+    try tokenizer.encodeIntoParallel(allocator, corpus, &ids, cfg.internal_threads);
     const token_hash = hashTokenIds(ids.items);
 
     var token_total: usize = 0;
@@ -208,15 +252,17 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
     try stdout.interface.print(
-        "tokenizer_bytes={d} corpus_bytes={d} warmup_iterations={d} iterations={d} threads={d} " ++
+        "tokenizer_bytes={d} corpus_bytes={d} repeat={d} warmup_iterations={d} iterations={d} threads={d} internal_threads={d} " ++
             "tokens_per_iteration={d} token_hash={x} elapsed_seconds={d:.6} mb_per_second={d:.3} " ++
             "mtokens_per_second={d:.3}\n",
         .{
             tokenizer_json.len,
             corpus.len,
+            cfg.repeat,
             cfg.warmup_iterations,
             cfg.iterations,
             cfg.threads,
+            cfg.internal_threads,
             token_total / cfg.iterations / cfg.threads,
             token_hash,
             seconds,

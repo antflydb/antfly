@@ -23,6 +23,7 @@ const std = @import("std");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const SpecialTokens = @import("tokenizer.zig").SpecialTokens;
 const PriorityQueue = @import("priority_queue.zig").PriorityQueue;
+const unicode_classes = @import("unicode_classes.zig");
 
 const ModelType = enum { word_piece, bpe, unigram };
 
@@ -256,6 +257,7 @@ pub const HfTokenizer = struct {
     const vtable = Tokenizer.VTable{
         .encode = @ptrCast(&encode),
         .encodeInto = @ptrCast(&encodeInto),
+        .encodeIntoParallel = @ptrCast(&encodeIntoParallel),
         .encodeForModel = @ptrCast(&encodeForModel),
         .encodeGeneration = @ptrCast(&encodeGeneration),
         .decode = @ptrCast(&decode),
@@ -561,19 +563,37 @@ pub const HfTokenizer = struct {
             if (merges_val == .array) {
                 var rank: u32 = 0;
                 for (merges_val.array.items) |item| {
-                    var left_piece: []const u8 = undefined;
-                    var right_piece: []const u8 = undefined;
-                    const raw_key = if (item == .string) blk: {
+                    const json_left: []const u8, const json_right: []const u8 = if (item == .string) blk: {
                         const split = std.mem.indexOfScalar(u8, item.string, ' ') orelse continue;
-                        left_piece = item.string[0..split];
-                        right_piece = item.string[split + 1 ..];
-                        break :blk item.string;
+                        break :blk .{ item.string[0..split], item.string[split + 1 ..] };
                     } else if (item == .array and item.array.items.len >= 2 and item.array.items[0] == .string and item.array.items[1] == .string) blk: {
-                        left_piece = item.array.items[0].string;
-                        right_piece = item.array.items[1].string;
-                        break :blk try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ left_piece, right_piece });
+                        break :blk .{ item.array.items[0].string, item.array.items[1].string };
                     } else continue;
-                    defer if (item == .array) self.allocator.free(raw_key);
+
+                    var left_owned: ?[]u8 = null;
+                    defer if (left_owned) |piece| self.allocator.free(piece);
+                    var right_owned: ?[]u8 = null;
+                    defer if (right_owned) |piece| self.allocator.free(piece);
+                    const left_piece = if (self.pre_tokenizer_type == .byte_level) blk: {
+                        const raw = try byteLevelDecodeTokenAlloc(self.allocator, json_left);
+                        left_owned = raw;
+                        break :blk raw;
+                    } else json_left;
+                    const right_piece = if (self.pre_tokenizer_type == .byte_level) blk: {
+                        const raw = try byteLevelDecodeTokenAlloc(self.allocator, json_right);
+                        right_owned = raw;
+                        break :blk raw;
+                    } else json_right;
+
+                    var raw_key_owned: ?[]u8 = null;
+                    defer if (raw_key_owned) |raw| self.allocator.free(raw);
+                    const raw_key = if (self.pre_tokenizer_type != .byte_level and item == .string)
+                        item.string
+                    else blk: {
+                        const composed = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ left_piece, right_piece });
+                        raw_key_owned = composed;
+                        break :blk composed;
+                    };
                     const key = try self.allocator.dupe(u8, raw_key);
                     try self.arena_strings.append(self.allocator, key);
                     // Earlier merges win ties because getOrPut is no-op on existing.
@@ -667,24 +687,21 @@ pub const HfTokenizer = struct {
 
     /// Parse vocab from a dict format: {"token": id, ...} (WordPiece and BPE)
     fn parseVocabDict(self: *HfTokenizer, obj: std.json.ObjectMap) !void {
-        if (obj.get("unk_token")) |v| {
-            if (v == .string) {
-                if (self.vocab.get(v.string)) |id| {
-                    self.special.unk_id = id;
-                }
-            }
-        }
-
         if (obj.get("vocab")) |vocab_val| {
             if (vocab_val == .object) {
                 var it = vocab_val.object.iterator();
                 while (it.next()) |entry| {
                     if (entry.value_ptr.* == .integer) {
                         const id: i32 = @intCast(entry.value_ptr.integer);
-                        const key = try self.allocator.dupe(u8, entry.key_ptr.*);
-                        try self.arena_strings.append(self.allocator, key);
-                        try self.vocab.put(self.allocator, key, id);
-                        try self.id_to_token.put(self.allocator, id, key);
+                        const display_key = try self.allocator.dupe(u8, entry.key_ptr.*);
+                        try self.arena_strings.append(self.allocator, display_key);
+                        const lookup_key = if (self.pre_tokenizer_type == .byte_level) blk: {
+                            const raw = try byteLevelDecodeTokenAlloc(self.allocator, display_key);
+                            try self.arena_strings.append(self.allocator, raw);
+                            break :blk raw;
+                        } else display_key;
+                        try self.vocab.put(self.allocator, lookup_key, id);
+                        try self.id_to_token.put(self.allocator, id, display_key);
                     }
                 }
             }
@@ -693,7 +710,14 @@ pub const HfTokenizer = struct {
         // Resolve unk_token after vocab is loaded
         if (obj.get("unk_token")) |v| {
             if (v == .string) {
-                if (self.vocab.get(v.string)) |id| {
+                var raw_unk: ?[]u8 = null;
+                defer if (raw_unk) |raw| self.allocator.free(raw);
+                const lookup = if (self.pre_tokenizer_type == .byte_level) blk: {
+                    const raw = try byteLevelDecodeTokenAlloc(self.allocator, v.string);
+                    raw_unk = raw;
+                    break :blk raw;
+                } else v.string;
+                if (self.vocab.get(lookup)) |id| {
                     self.special.unk_id = id;
                 }
             }
@@ -912,6 +936,125 @@ pub const HfTokenizer = struct {
         }
 
         return self.encodeWithAddedTokens(allocator, normalized, ids);
+    }
+
+    const parallel_bpe_min_bytes = 256 * 1024;
+
+    const ParallelBpeWorker = struct {
+        tokenizer: *HfTokenizer,
+        text: []const u8,
+        ids: std.ArrayListUnmanaged(i32) = .empty,
+        failure: ?anyerror = null,
+
+        fn run(self: *ParallelBpeWorker) void {
+            self.tokenizer.encodeBpeByteLevel(
+                self.tokenizer.allocator,
+                self.text,
+                &self.ids,
+            ) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+
+    fn isAsciiWhitespaceByte(byte: u8) bool {
+        return byte == ' ' or (byte >= 9 and byte <= 13);
+    }
+
+    fn parallelBpeBoundary(text: []const u8, target: usize) usize {
+        var pos = target;
+        while (pos < text.len) : (pos += 1) {
+            if (isAsciiWhitespaceByte(text[pos]) and
+                (pos == 0 or !isAsciiWhitespaceByte(text[pos - 1])))
+            {
+                return pos;
+            }
+        }
+        return text.len;
+    }
+
+    /// Parallelize one large GPT-2 ByteLevel document at pretoken-safe
+    /// whitespace boundaries, then gather worker outputs in source order.
+    /// Inputs requiring normalization or added-token segmentation stay on the
+    /// serial path because those transforms can cross a proposed boundary.
+    fn encodeIntoParallel(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        ids: *std.ArrayListUnmanaged(i32),
+        requested_threads: usize,
+    ) !void {
+        if (requested_threads <= 1 or
+            text.len < parallel_bpe_min_bytes or
+            self.model_type != .bpe or
+            self.pre_tokenizer_type != .byte_level or
+            self.do_lowercase or
+            self.replace_space_with != null)
+        {
+            return self.encodeInto(allocator, text, ids);
+        }
+        if (self.added_tokens.count() != 0 and
+            (self.matchAddedTokenAt(text) != null or
+                self.findNextAddedToken(text, 0) != null))
+        {
+            return self.encodeInto(allocator, text, ids);
+        }
+
+        const thread_count = @min(requested_threads, 64);
+        var boundaries = std.ArrayListUnmanaged(usize).empty;
+        defer boundaries.deinit(allocator);
+        try boundaries.ensureTotalCapacity(allocator, thread_count + 1);
+        boundaries.appendAssumeCapacity(0);
+        for (1..thread_count) |idx| {
+            const target =
+                (text.len / thread_count) * idx +
+                ((text.len % thread_count) * idx) / thread_count;
+            const boundary = parallelBpeBoundary(text, target);
+            if (boundary > boundaries.items[boundaries.items.len - 1] and
+                boundary < text.len)
+            {
+                boundaries.appendAssumeCapacity(boundary);
+            }
+        }
+        boundaries.appendAssumeCapacity(text.len);
+        const worker_count = boundaries.items.len - 1;
+        if (worker_count <= 1) return self.encodeInto(allocator, text, ids);
+
+        const workers = try allocator.alloc(ParallelBpeWorker, worker_count);
+        defer {
+            for (workers) |*worker| worker.ids.deinit(self.allocator);
+            allocator.free(workers);
+        }
+        // The caller processes the final chunk while the other chunks run in
+        // background threads, so requested_threads is the total concurrency
+        // rather than the number of spawned threads.
+        const background_count = worker_count - 1;
+        const threads = try allocator.alloc(std.Thread, background_count);
+        defer allocator.free(threads);
+
+        for (workers, 0..) |*worker, idx| {
+            worker.* = .{
+                .tokenizer = self,
+                .text = text[boundaries.items[idx]..boundaries.items[idx + 1]],
+            };
+        }
+        var spawned: usize = 0;
+        errdefer for (threads[0..spawned]) |thread| thread.join();
+        for (workers[0..background_count], 0..) |*worker, idx| {
+            threads[idx] = try std.Thread.spawn(.{}, ParallelBpeWorker.run, .{worker});
+            spawned += 1;
+        }
+        workers[background_count].run();
+        for (threads) |thread| thread.join();
+        spawned = 0;
+
+        var token_count: usize = 0;
+        for (workers) |worker| {
+            if (worker.failure) |err| return err;
+            token_count += worker.ids.items.len;
+        }
+        try ids.ensureUnusedCapacity(allocator, token_count);
+        for (workers) |worker| ids.appendSliceAssumeCapacity(worker.ids.items);
     }
 
     fn encodeWithAddedTokens(
@@ -1268,15 +1411,30 @@ pub const HfTokenizer = struct {
         text: []const u8,
         ids: *std.ArrayListUnmanaged(i32),
     ) !void {
-        var encoded = std.ArrayListUnmanaged(u8).empty;
-        defer encoded.deinit(allocator);
-
         try ids.ensureUnusedCapacity(allocator, (text.len / 3) + 8);
         var start: usize = 0;
         while (start < text.len) {
+            if (gpt2AsciiBoundaryMask(text, start)) |boundary_mask| {
+                var remaining = boundary_mask & ~@as(u64, 1);
+                var piece_start: usize = 0;
+                while (remaining != 0) {
+                    const piece_end: usize = @intCast(@ctz(remaining));
+                    try self.bpeEncodeWord(
+                        allocator,
+                        text[start + piece_start .. start + piece_end],
+                        ids,
+                    );
+                    piece_start = piece_end;
+                    remaining &= remaining - 1;
+                }
+                if (piece_start != 0) {
+                    start += piece_start;
+                    continue;
+                }
+            }
+
             const end = gpt2PreTokenEnd(text, start);
-            try byteLevelEncodeInto(allocator, text[start..end], &encoded);
-            try self.bpeEncodeWord(allocator, encoded.items, ids);
+            try self.bpeEncodeWord(allocator, text[start..end], ids);
             start = end;
         }
     }
@@ -1395,6 +1553,7 @@ pub const HfTokenizer = struct {
         const hash = std.hash.Wyhash.hash(0, word);
         const cache = self.bpe_cache orelse return false;
         const shard = &cache.shards[bpeCacheShard(hash)];
+
         var slot_idx = bpeCacheSlot(hash);
         for (0..bpe_cache_slots_per_shard) |_| {
             const raw = shard.slots[slot_idx].load(.acquire);
@@ -1509,7 +1668,10 @@ pub const HfTokenizer = struct {
         // One symbol per UTF-8 codepoint of `word`.
         var pos: usize = 0;
         while (pos < word.len) {
-            const cp_len = utf8CodepointLen(word[pos]);
+            const cp_len = if (self.pre_tokenizer_type == .byte_level)
+                1
+            else
+                utf8CodepointLen(word[pos]);
             const end = @min(pos + cp_len, word.len);
             const idx: i32 = @intCast(symbols.items.len);
             try symbols.append(allocator, .{
@@ -2521,22 +2683,9 @@ fn gpt2ContractionLen(text: []const u8) ?usize {
     return null;
 }
 
-fn isUnicodeWhitespace(cp: u21) bool {
-    return cp == 0x0085 or
-        cp == 0x00A0 or
-        cp == 0x1680 or
-        (cp >= 0x2000 and cp <= 0x200A) or
-        cp == 0x2028 or
-        cp == 0x2029 or
-        cp == 0x202F or
-        cp == 0x205F or
-        cp == 0x3000;
-}
-
 /// Classify a UTF-8 codepoint for the GPT-2 pretokenizer. ASCII is the hot
-/// path. The non-ASCII punctuation/symbol blocks cover the separators that
-/// occur in natural-language corpora; other non-ASCII codepoints are treated
-/// as letters so scripts such as CJK, Cyrillic, and Arabic remain grouped.
+/// path. Non-ASCII codepoints use a compact generated Unicode table matching
+/// the `\p{L}`, `\p{N}`, and `\s` classes in the reference regex.
 fn gpt2CharAt(text: []const u8, pos: usize) Gpt2Char {
     const first = text[pos];
     if (first < 0x80) {
@@ -2554,18 +2703,13 @@ fn gpt2CharAt(text: []const u8, pos: usize) Gpt2Char {
     const len = @min(utf8CodepointLen(first), text.len - pos);
     const cp = std.unicode.utf8Decode(text[pos .. pos + len]) catch
         return .{ .class = .other, .len = 1 };
-    if (isUnicodeWhitespace(cp)) return .{ .class = .whitespace, .len = len };
-
-    const is_other =
-        (cp >= 0x2000 and cp <= 0x206F) or // General punctuation
-        (cp >= 0x20A0 and cp <= 0x20CF) or // Currency symbols
-        (cp >= 0x2190 and cp <= 0x2BFF) or // Arrows, math, technical symbols
-        (cp >= 0x2E00 and cp <= 0x2E7F) or // Supplemental punctuation
-        (cp >= 0x3001 and cp <= 0x303F) or // CJK punctuation
-        (cp >= 0x1F000 and cp <= 0x1FAFF) or // Emoji and pictographs
-        cp == 0x00B7;
     return .{
-        .class = if (is_other) .other else .letter,
+        .class = switch (unicode_classes.classify(cp)) {
+            .letter => .letter,
+            .number => .number,
+            .whitespace => .whitespace,
+            .other => .other,
+        },
         .len = len,
     };
 }
@@ -2599,6 +2743,83 @@ fn gpt2PreTokenEnd(text: []const u8, start: usize) usize {
         if (last_start > start) end = last_start;
     }
     return end;
+}
+
+/// Find every GPT-2 pretoken start in the next 64 ASCII bytes. The returned
+/// mask always contains bit zero; bit N means `text[start + N]` begins a
+/// pretoken. null routes batches containing Unicode, edge contractions, or
+/// insufficient lookahead through the scalar ground-truth scanner.
+fn gpt2AsciiBoundaryMask(text: []const u8, start: usize) ?u64 {
+    const batch_len = 64;
+    if (text.len - start <= batch_len) return null;
+
+    const ByteVector = @Vector(batch_len, u8);
+    const BoolVector = @Vector(batch_len, bool);
+    const block: [batch_len]u8 = text[start..][0..batch_len].*;
+    const bytes: ByteVector = block;
+    const lower = bytes | @as(ByteVector, @splat(0x20));
+
+    const letters_vec: BoolVector =
+        (lower >= @as(ByteVector, @splat('a'))) &
+        (lower <= @as(ByteVector, @splat('z')));
+    const digits_vec: BoolVector =
+        (bytes >= @as(ByteVector, @splat('0'))) &
+        (bytes <= @as(ByteVector, @splat('9')));
+    const spaces_vec: BoolVector = bytes == @as(ByteVector, @splat(' '));
+    const control_ws_vec: BoolVector =
+        (bytes >= @as(ByteVector, @splat(9))) &
+        (bytes <= @as(ByteVector, @splat(13)));
+    const high_vec: BoolVector = bytes >= @as(ByteVector, @splat(0x80));
+    const apostrophe_vec: BoolVector = bytes == @as(ByteVector, @splat('\''));
+
+    const letters: u64 = @bitCast(letters_vec);
+    const digits: u64 = @bitCast(digits_vec);
+    const spaces: u64 = @bitCast(spaces_vec);
+    const whitespace: u64 = spaces | @as(u64, @bitCast(control_ws_vec));
+    if (@as(u64, @bitCast(high_vec)) != 0) return null;
+    const apostrophes: u64 = @bitCast(apostrophe_vec);
+    const other = ~(letters | digits | whitespace);
+
+    const continue_same =
+        (letters & (letters << 1)) |
+        (digits & (digits << 1)) |
+        (other & (other << 1));
+    const after_space = spaces << 1;
+    const non_whitespace_boundaries = ~whitespace & ~continue_same & ~after_space;
+
+    var split_whitespace = whitespace & (~whitespace >> 1);
+    if ((whitespace & (@as(u64, 1) << 63)) != 0 and
+        gpt2CharAt(text, start + batch_len).class != .whitespace)
+    {
+        split_whitespace |= @as(u64, 1) << 63;
+    }
+    const previous_whitespace = whitespace << 1;
+    const whitespace_boundaries =
+        whitespace & (~previous_whitespace | split_whitespace);
+    var boundaries = non_whitespace_boundaries | whitespace_boundaries | 1;
+
+    // Regex contractions override the normal punctuation/letter boundary:
+    // "'s", "'t", "'re", "'ve", "'m", "'ll", and "'d".
+    var candidates = apostrophes & boundaries;
+    while (candidates != 0) {
+        const rel: usize = @intCast(@ctz(candidates));
+        candidates &= candidates - 1;
+        if (rel >= 61) return null;
+        const contraction_len: usize = switch (text[start + rel + 1]) {
+            's', 'd', 'm', 't' => 2,
+            'l' => if (text[start + rel + 2] == 'l') 3 else 0,
+            'v' => if (text[start + rel + 2] == 'e') 3 else 0,
+            'r' => if (text[start + rel + 2] == 'e') 3 else 0,
+            else => 0,
+        };
+        if (contraction_len != 0) {
+            boundaries &= ~(@as(u64, 1) << @intCast(rel + 1));
+            if (rel + contraction_len < batch_len) {
+                boundaries |= @as(u64, 1) << @intCast(rel + contraction_len);
+            }
+        }
+    }
+    return boundaries;
 }
 
 fn initByteToUnicode() [256]u21 {
@@ -2684,6 +2905,38 @@ fn byteLevelEncode(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     errdefer buf.deinit(allocator);
     try byteLevelEncodeInto(allocator, text, &buf);
     return try buf.toOwnedSlice(allocator);
+}
+
+/// Decode one tokenizer.json ByteLevel vocabulary/merge piece to the raw
+/// bytes that it represents. Doing this once during tokenizer loading lets
+/// the hot GPT-2 path hash and merge borrowed input slices directly.
+fn byteLevelDecodeTokenAlloc(
+    allocator: std.mem.Allocator,
+    token: []const u8,
+) ![]u8 {
+    var raw = std.ArrayListUnmanaged(u8).empty;
+    errdefer raw.deinit(allocator);
+    try raw.ensureTotalCapacity(allocator, token.len);
+
+    var pos: usize = 0;
+    while (pos < token.len) {
+        const cp_len = @min(utf8CodepointLen(token[pos]), token.len - pos);
+        const cp = std.unicode.utf8Decode(token[pos .. pos + cp_len]) catch {
+            raw.appendAssumeCapacity(token[pos]);
+            pos += 1;
+            continue;
+        };
+        if (cp < unicode_to_byte_len) {
+            if (unicode_to_byte[cp]) |byte| {
+                raw.appendAssumeCapacity(byte);
+                pos += cp_len;
+                continue;
+            }
+        }
+        raw.appendSliceAssumeCapacity(token[pos .. pos + cp_len]);
+        pos += cp_len;
+    }
+    return try raw.toOwnedSlice(allocator);
 }
 
 fn byteLevelEncodeInto(
@@ -3044,6 +3297,69 @@ test "gpt2 pre-tokenizer matches regex boundaries" {
     try std.testing.expectEqual(text.len, start);
 }
 
+test "gpt2 pre-tokenizer uses exact Unicode classes" {
+    const text = "A ١2 e\u{301} 😀\u{a0}Z";
+    const expected = [_][]const u8{
+        "A",
+        " ١2",
+        " e",
+        "\u{301}",
+        " 😀",
+        "\u{a0}",
+        "Z",
+    };
+
+    var start: usize = 0;
+    for (expected) |piece| {
+        const end = gpt2PreTokenEnd(text, start);
+        try std.testing.expectEqualStrings(piece, text[start..end]);
+        start = end;
+    }
+    try std.testing.expectEqual(text.len, start);
+}
+
+test "gpt2 ASCII vector scanner matches scalar boundaries" {
+    const allocator = std.testing.allocator;
+    const phrase = "Hello, world! I'm testing 12345.\n\nDon't split contractions; keep  spaces. ";
+    var text = std.ArrayListUnmanaged(u8).empty;
+    defer text.deinit(allocator);
+    for (0..32) |_| try text.appendSlice(allocator, phrase);
+
+    var scalar = std.ArrayListUnmanaged(usize).empty;
+    defer scalar.deinit(allocator);
+    try scalar.append(allocator, 0);
+    var scalar_start: usize = 0;
+    while (scalar_start < text.items.len) {
+        scalar_start = gpt2PreTokenEnd(text.items, scalar_start);
+        if (scalar_start < text.items.len) try scalar.append(allocator, scalar_start);
+    }
+
+    var vectorized = std.ArrayListUnmanaged(usize).empty;
+    defer vectorized.deinit(allocator);
+    try vectorized.append(allocator, 0);
+    var vector_start: usize = 0;
+    while (vector_start < text.items.len) {
+        if (gpt2AsciiBoundaryMask(text.items, vector_start)) |boundary_mask| {
+            var remaining = boundary_mask & ~@as(u64, 1);
+            var piece_start: usize = 0;
+            while (remaining != 0) {
+                const piece_end: usize = @intCast(@ctz(remaining));
+                try vectorized.append(allocator, vector_start + piece_end);
+                piece_start = piece_end;
+                remaining &= remaining - 1;
+            }
+            if (piece_start != 0) {
+                vector_start += piece_start;
+                continue;
+            }
+        }
+        vector_start = gpt2PreTokenEnd(text.items, vector_start);
+        if (vector_start < text.items.len) try vectorized.append(allocator, vector_start);
+    }
+
+    try std.testing.expectEqualSlices(usize, scalar.items, vectorized.items);
+}
+
 test "real tokenizer.json golden values" {
     const allocator = std.testing.allocator;
 
@@ -3162,6 +3478,43 @@ test "infer byte-level bpe when model type is omitted" {
     const ids = try tok.encode(allocator, "What does");
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i32, &.{ 1, 2 }, ids);
+}
+
+test "byte-level BPE parallel encoding preserves serial token order" {
+    const allocator = std.heap.c_allocator;
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "vocab": {
+        \\      "W": 10, "h": 11, "a": 12, "t": 13,
+        \\      "d": 14, "o": 15, "e": 16, "s": 17, "Ġ": 18,
+        \\      "Wh": 19, "Wha": 20, "What": 1,
+        \\      "Ġd": 21, "Ġdo": 22, "Ġdoe": 23, "Ġdoes": 2
+        \\    },
+        \\    "merges": ["W h", "Wh a", "Wha t", "Ġ d", "Ġd o", "Ġdo e", "Ġdoe s"]
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true}
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+
+    const phrase = "What does ";
+    var text = std.ArrayListUnmanaged(u8).empty;
+    defer text.deinit(allocator);
+    try text.ensureTotalCapacity(allocator, phrase.len * 30_000);
+    for (0..30_000) |_| text.appendSliceAssumeCapacity(phrase);
+
+    var serial = std.ArrayListUnmanaged(i32).empty;
+    defer serial.deinit(allocator);
+    try tok.tokenizer().encodeInto(allocator, text.items, &serial);
+
+    var parallel = std.ArrayListUnmanaged(i32).empty;
+    defer parallel.deinit(allocator);
+    try tok.tokenizer().encodeIntoParallel(allocator, text.items, &parallel, 4);
+
+    try std.testing.expectEqualSlices(i32, serial.items, parallel.items);
 }
 
 test "clip byte-level bpe honors split pretokenizer array merges and end suffix" {

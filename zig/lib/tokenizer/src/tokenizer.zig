@@ -63,6 +63,9 @@ pub const Tokenizer = struct {
         /// hot ingest paths reuse a single ArrayList across many encode
         /// calls instead of allocating and freeing per call.
         encodeInto: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) anyerror!void,
+        /// Optional internally parallel encoder for large documents. Backends
+        /// without a safe chunking strategy use the serial encodeInto path.
+        encodeIntoParallel: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32), thread_count: usize) anyerror!void = null,
         /// Encode text with model wrapping such as [CLS]/[SEP], optionally including offsets.
         encodeForModel: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!EncodeResult,
         /// Encode text for causal generation, optionally with BOS-aware start-of-sequence semantics.
@@ -86,6 +89,23 @@ pub const Tokenizer = struct {
     /// to encode a fresh sequence or skip clearing to concatenate sequences.
     pub fn encodeInto(self: Tokenizer, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) !void {
         return self.vtable.encodeInto(self.ptr, allocator, text, out);
+    }
+
+    /// Append token IDs using up to `thread_count` internal workers when the
+    /// backend can split the input without changing tokenizer semantics.
+    pub fn encodeIntoParallel(
+        self: Tokenizer,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        out: *std.ArrayListUnmanaged(i32),
+        thread_count: usize,
+    ) !void {
+        if (thread_count > 1) {
+            if (self.vtable.encodeIntoParallel) |parallel| {
+                return parallel(self.ptr, allocator, text, out, thread_count);
+            }
+        }
+        return self.encodeInto(allocator, text, out);
     }
 
     pub fn decode(self: Tokenizer, allocator: std.mem.Allocator, ids: []const i32) ![]u8 {
