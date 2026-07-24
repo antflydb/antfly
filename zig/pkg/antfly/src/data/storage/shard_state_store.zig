@@ -1443,6 +1443,123 @@ fn sourceContainsProjectedDocuments(
     return true;
 }
 
+const DeletePhysicalRangePage = struct {
+    next_after_key: ?[]u8,
+    exhausted: bool,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.next_after_key) |key| alloc.free(key);
+        self.* = undefined;
+    }
+};
+
+fn deleteGroupDocumentPhysicalRangePage(
+    projected: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    logical_prefix: []const u8,
+    lower: []const u8,
+    upper: []const u8,
+    after_key: ?[]const u8,
+    max_page_entries: usize,
+    max_page_bytes: usize,
+) !DeletePhysicalRangePage {
+    if (std.mem.order(u8, lower, upper) != .lt) return .{
+        .next_after_key = null,
+        .exhausted = true,
+    };
+    var deletes = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (deletes.items) |key| alloc.free(key);
+        deletes.deinit(alloc);
+    }
+
+    var next_after_key: ?[]u8 = null;
+    errdefer if (next_after_key) |key| alloc.free(key);
+    var exhausted = true;
+    {
+        var read_txn = try projected.beginReadTxn();
+        defer read_txn.abort();
+        var cursor = try read_txn.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(upper);
+
+        var scanned_entries: usize = 0;
+        var scanned_bytes: usize = 0;
+        var entry = try cursor.seekAtOrAfter(after_key orelse lower);
+        while (entry) |kv| : (entry = try cursor.next()) {
+            if (std.mem.order(u8, kv.key, upper) != .lt) break;
+            if (after_key) |key| {
+                if (std.mem.order(u8, kv.key, key) != .gt) continue;
+            }
+            if (scanned_entries > 0 and
+                (scanned_entries >= max_page_entries or kv.key.len > max_page_bytes -| scanned_bytes))
+            {
+                exhausted = false;
+                break;
+            }
+
+            const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse
+                return error.InvalidAppliedDataRange;
+            defer alloc.free(logical_key);
+            if (!std.mem.startsWith(u8, logical_key, logical_prefix))
+                return error.InvalidAppliedDataRange;
+            try deletes.append(alloc, try alloc.dupe(u8, kv.key));
+            if (next_after_key) |key| alloc.free(key);
+            next_after_key = try alloc.dupe(u8, kv.key);
+            scanned_entries += 1;
+            scanned_bytes +|= kv.key.len;
+            if (scanned_entries >= max_page_entries or scanned_bytes >= max_page_bytes) {
+                exhausted = false;
+                break;
+            }
+        }
+    }
+
+    if (deletes.items.len > 0) {
+        var write_txn = try projected.beginWriteTxn();
+        errdefer write_txn.abort();
+        for (deletes.items) |key| try write_txn.delete(key);
+        try write_txn.commit();
+    }
+
+    if (!exhausted and next_after_key == null) return error.InvalidAppliedDataRange;
+    return .{
+        .next_after_key = next_after_key,
+        .exhausted = exhausted,
+    };
+}
+
+fn deleteGroupDocumentPhysicalRangePaged(
+    projected: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    logical_prefix: []const u8,
+    lower: []const u8,
+    upper: []const u8,
+    max_page_entries: usize,
+    max_page_bytes: usize,
+) !void {
+    var after_key: ?[]u8 = null;
+    defer if (after_key) |key| alloc.free(key);
+    while (true) {
+        var page = try deleteGroupDocumentPhysicalRangePage(
+            projected,
+            alloc,
+            logical_prefix,
+            lower,
+            upper,
+            after_key,
+            max_page_entries,
+            max_page_bytes,
+        );
+        defer page.deinit(alloc);
+        if (page.exhausted) break;
+        const next_after_key = page.next_after_key orelse return error.InvalidAppliedDataRange;
+        const retained = try alloc.dupe(u8, next_after_key);
+        if (after_key) |key| alloc.free(key);
+        after_key = retained;
+    }
+}
+
 fn deleteGroupDocumentsOutsideRangePaged(
     projected: *docstore.DocStore,
     alloc: std.mem.Allocator,
@@ -1453,78 +1570,38 @@ fn deleteGroupDocumentsOutsideRangePaged(
 ) !void {
     const logical_prefix = try groupDocumentPrefixAlloc(alloc, group_id);
     defer alloc.free(logical_prefix);
-    const lower = try internal_keys.documentRangeLowerAlloc(alloc, logical_prefix);
-    defer alloc.free(lower);
-    const upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse
+    const group_lower = try internal_keys.documentRangeLowerAlloc(alloc, logical_prefix);
+    defer alloc.free(group_lower);
+    const group_upper = (try internal_keys.documentRangeUpperAlloc(alloc, logical_prefix)) orelse
         return error.InvalidAppliedDataRange;
-    defer alloc.free(upper);
+    defer alloc.free(group_upper);
 
-    var after_key = std.ArrayListUnmanaged(u8).empty;
-    defer after_key.deinit(alloc);
-    var next_after_key = std.ArrayListUnmanaged(u8).empty;
-    defer next_after_key.deinit(alloc);
-    var deletes = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (deletes.items) |key| alloc.free(key);
-        deletes.deinit(alloc);
+    if (byte_range.start.len > 0) {
+        const retained_lower = try groupDocumentLowerBoundAlloc(alloc, group_id, byte_range.start);
+        defer alloc.free(retained_lower);
+        try deleteGroupDocumentPhysicalRangePaged(
+            projected,
+            alloc,
+            logical_prefix,
+            group_lower,
+            retained_lower,
+            max_page_entries,
+            max_page_bytes,
+        );
     }
-    while (true) {
-        for (deletes.items) |key| alloc.free(key);
-        deletes.clearRetainingCapacity();
-        next_after_key.clearRetainingCapacity();
-        var exhausted = true;
-        {
-            var read_txn = try projected.beginReadTxn();
-            defer read_txn.abort();
-            var cursor = try read_txn.openCursor();
-            defer cursor.close();
-            cursor.setUpperBound(upper);
-
-            var scanned_entries: usize = 0;
-            var scanned_bytes: usize = 0;
-            var entry = try cursor.seekAtOrAfter(if (after_key.items.len > 0) after_key.items else lower);
-            while (entry) |kv| : (entry = try cursor.next()) {
-                if (std.mem.order(u8, kv.key, upper) != .lt) break;
-                if (after_key.items.len > 0 and
-                    std.mem.order(u8, kv.key, after_key.items) != .gt) continue;
-                if (scanned_entries > 0 and
-                    (scanned_entries >= max_page_entries or kv.key.len > max_page_bytes -| scanned_bytes))
-                {
-                    exhausted = false;
-                    break;
-                }
-
-                const logical_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse
-                    return error.InvalidAppliedDataRange;
-                defer alloc.free(logical_key);
-                if (!std.mem.startsWith(u8, logical_key, logical_prefix))
-                    return error.InvalidAppliedDataRange;
-                const raw_key = logical_key[logical_prefix.len..];
-                if (!byte_range.contains(raw_key)) {
-                    try deletes.append(alloc, try alloc.dupe(u8, kv.key));
-                }
-
-                next_after_key.clearRetainingCapacity();
-                try next_after_key.appendSlice(alloc, kv.key);
-                scanned_entries += 1;
-                scanned_bytes +|= kv.key.len;
-                if (scanned_entries >= max_page_entries or scanned_bytes >= max_page_bytes) {
-                    exhausted = false;
-                    break;
-                }
-            }
-        }
-
-        if (deletes.items.len > 0) {
-            var write_txn = try projected.beginWriteTxn();
-            errdefer write_txn.abort();
-            for (deletes.items) |key| try write_txn.delete(key);
-            try write_txn.commit();
-        }
-
-        if (exhausted) break;
-        if (next_after_key.items.len == 0) return error.InvalidAppliedDataRange;
-        std.mem.swap(std.ArrayListUnmanaged(u8), &after_key, &next_after_key);
+    if (byte_range.end.len > 0) {
+        const retained_upper = (try groupDocumentUpperBoundAlloc(alloc, group_id, byte_range.end)) orelse
+            return error.InvalidAppliedDataRange;
+        defer alloc.free(retained_upper);
+        try deleteGroupDocumentPhysicalRangePaged(
+            projected,
+            alloc,
+            logical_prefix,
+            retained_upper,
+            group_upper,
+            max_page_entries,
+            max_page_bytes,
+        );
     }
 }
 
@@ -1544,6 +1621,11 @@ pub fn reconcileAuthoritativeGroupDocumentsPaged(
     max_page_bytes: usize,
 ) !void {
     if (max_page_entries == 0 or max_page_bytes == 0) return error.InvalidArgument;
+    if (byte_range.start.len > 0 and byte_range.end.len > 0 and
+        std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
+    {
+        return error.InvalidAppliedDataRange;
+    }
     if (!try sourceContainsProjectedDocuments(projected, source, alloc, group_id, byte_range))
         return error.SplitSourceProjectionNotReady;
 
@@ -1605,8 +1687,10 @@ pub fn reconcileAuthoritativeGroupDocumentsPaged(
     // A replacement generation may narrow the authoritative range. Keys beyond
     // that boundary are not part of the subset comparison, but retaining them
     // would make a later Raft snapshot inconsistent with its declared range.
-    // Cleanup is bounded and retry-safe; the completion marker is still absent
-    // until every stale key has been removed.
+    // Scan only the two excluded physical intervals so work is proportional to
+    // stale documents rather than the retained corpus. Cleanup is bounded and
+    // retry-safe; the completion marker remains absent until every stale key
+    // has been removed.
     try deleteGroupDocumentsOutsideRangePaged(
         projected,
         alloc,
@@ -1742,6 +1826,50 @@ test "paged authoritative reconciliation removes stale out-of-range documents be
     }
 
     const marker_key = "\x00\x00__metadata__:paged-reconcile-complete";
+    try std.testing.expectError(
+        error.InvalidAppliedDataRange,
+        reconcileAuthoritativeGroupDocumentsPaged(
+            &projected,
+            &source,
+            alloc,
+            61,
+            .{ .start = "doc:m", .end = "doc:a" },
+            &.{.{ .key = marker_key, .value = "complete" }},
+            1,
+            1,
+        ),
+    );
+    const state_after_invalid_range = try groupState(&projected, alloc, 61);
+    defer freeGroupStateEntries(alloc, state_after_invalid_range);
+    try std.testing.expectEqual(@as(usize, 3), state_after_invalid_range.len);
+    try std.testing.expectError(error.NotFound, projected.get(alloc, marker_key));
+
+    const logical_prefix = try groupDocumentPrefixAlloc(alloc, 61);
+    defer alloc.free(logical_prefix);
+    const group_lower = try internal_keys.documentRangeLowerAlloc(alloc, logical_prefix);
+    defer alloc.free(group_lower);
+    const retained_lower = try groupDocumentLowerBoundAlloc(alloc, 61, "doc:a");
+    defer alloc.free(retained_lower);
+    var interrupted_cleanup = try deleteGroupDocumentPhysicalRangePage(
+        &projected,
+        alloc,
+        logical_prefix,
+        group_lower,
+        retained_lower,
+        null,
+        1,
+        1,
+    );
+    defer interrupted_cleanup.deinit(alloc);
+    try std.testing.expect(!interrupted_cleanup.exhausted);
+    try std.testing.expect(interrupted_cleanup.next_after_key != null);
+    try std.testing.expectError(error.NotFound, projected.get(alloc, marker_key));
+    const interrupted_state = try groupState(&projected, alloc, 61);
+    defer freeGroupStateEntries(alloc, interrupted_state);
+    try std.testing.expectEqual(@as(usize, 2), interrupted_state.len);
+    try std.testing.expectEqualStrings("doc:b", interrupted_state[0].key);
+    try std.testing.expectEqualStrings("doc:z", interrupted_state[1].key);
+
     for (0..2) |_| {
         try reconcileAuthoritativeGroupDocumentsPaged(
             &projected,
