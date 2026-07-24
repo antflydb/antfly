@@ -96,6 +96,14 @@ pub fn saveProjectionCheckpoint(store: anytype, scope: []const u8, checkpoint: P
 }
 
 fn decodeProjectionCheckpoint(raw: []const u8) !ProjectionCheckpoint {
+    // Releases before the structured checkpoint format persisted only the
+    // applied sequence as a little-endian u64. Treat that value as a clean
+    // checkpoint; the next save naturally upgrades it to the current format.
+    if (raw.len == @sizeOf(u64)) {
+        return .{
+            .applied_sequence = std.mem.readInt(u64, raw[0..@sizeOf(u64)], .little),
+        };
+    }
     if (raw.len != checkpoint_magic.len + 4 + 8 + 1 + 8 + 8) return error.InvalidEnrichmentState;
     if (!std.mem.eql(u8, raw[0..checkpoint_magic.len], checkpoint_magic)) return error.InvalidEnrichmentState;
     var pos: usize = checkpoint_magic.len;
@@ -276,6 +284,50 @@ test "enrichment projection checkpoint persists status and identity fields" {
     try std.testing.expectEqual(@as(u64, 5), checkpoint.generation);
     try std.testing.expectEqual(@as(u64, 0x309), checkpoint.config_hash);
     try std.testing.expectEqual(@as(u64, 41), try loadAppliedSequence(std.testing.allocator, runtime, "generated"));
+}
+
+test "enrichment projection checkpoint upgrades legacy applied sequence" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    const key = try appliedSequenceKey(std.testing.allocator, "generated");
+    defer std.testing.allocator.free(key);
+    var legacy: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &legacy, 41, .little);
+    var write_txn = try runtime.beginWrite();
+    errdefer write_txn.abort();
+    try write_txn.put(key, &legacy);
+    try write_txn.commit();
+
+    const checkpoint = try loadProjectionCheckpoint(std.testing.allocator, runtime, "generated");
+    try std.testing.expectEqual(@as(u64, 41), checkpoint.applied_sequence);
+    try std.testing.expectEqual(ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expectEqual(@as(u64, 0), checkpoint.generation);
+    try std.testing.expectEqual(@as(u64, 0), checkpoint.config_hash);
+
+    try saveProjectionCheckpoint(runtime, "generated", checkpoint);
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+    const upgraded = try probe.get(key);
+    try std.testing.expectEqual(@as(usize, 37), upgraded.len);
+    try std.testing.expect(std.mem.eql(u8, upgraded[0..checkpoint_magic.len], checkpoint_magic));
+    const reloaded = try decodeProjectionCheckpoint(upgraded);
+    try std.testing.expectEqualDeep(checkpoint, reloaded);
+}
+
+test "enrichment projection checkpoint rejects malformed structured state" {
+    try std.testing.expectError(error.InvalidEnrichmentState, decodeProjectionCheckpoint("short"));
+
+    var encoded = encodeProjectionCheckpoint(.{ .applied_sequence = 7 });
+    encoded[0] = 'X';
+    try std.testing.expectError(error.InvalidEnrichmentState, decodeProjectionCheckpoint(&encoded));
+
+    encoded = encodeProjectionCheckpoint(.{ .applied_sequence = 7 });
+    encoded[checkpoint_magic.len] = 2;
+    try std.testing.expectError(error.InvalidEnrichmentState, decodeProjectionCheckpoint(&encoded));
 }
 
 test "enrichment state lsm point loads do not clone mutable snapshot" {
