@@ -1056,7 +1056,9 @@ fn buildTableStatus(
         .replication_sources = try parseReplicationSources(alloc, snapshot, table, include_replication_runtime),
         .field_capabilities = try generatedFieldCapabilitiesAlloc(alloc, table, storage_status),
         .storage_status = .{
-            .disk_usage = 0,
+            // Report persisted LSM run bytes when live runtime statistics are
+            // available; unknown is more accurate than a hardcoded zero.
+            .disk_usage = if (lsm_status) |lsm| lsm.run_bytes else null,
             .empty = empty,
             .lsm = lsm_status,
         },
@@ -2877,6 +2879,7 @@ test "metadata.table status encoder emits antfly-style shard map" {
 
     const encoded = (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "docs")).?;
     defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"disk_usage\"") == null);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
@@ -3034,7 +3037,7 @@ test "metadata.table status encoder honors storage status overrides" {
 
     const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true,\"lsm\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":44,\"empty\":true,\"lsm\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"run_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"l0_bytes\":33") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lower_level_run_count\":2") != null);

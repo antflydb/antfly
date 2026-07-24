@@ -82,6 +82,7 @@ import {
   generateSearchableFields,
   type SearchableField,
 } from "../utils/fieldUtils";
+import { buildTableQueryRequest } from "./table-query";
 
 const formatBytes = (bytes: number, decimals = 2) => {
   if (bytes === 0) return "0 Bytes";
@@ -274,50 +275,29 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   }, [indexes, queryIndexes.length]);
 
   const semanticQueryRequestString = useMemo(() => {
-    const queryRequest: QueryRequest = {};
-    if (hasSemanticQuery) {
-      queryRequest.indexes = queryIndexes;
-      queryRequest.semantic_search = query || "";
-    }
-    if (selectedFields.length > 0) {
-      queryRequest.fields = selectedFields;
-    }
-    try {
-      const semanticQueryObject = JSON.parse(semanticQuery);
-      queryRequest.aggregations = semanticQueryObject.aggregations;
-      // Use explicit limit if set, otherwise default to 10
-      queryRequest.limit = semanticQueryObject.limit ?? 10;
-      // Only include offset if semantic search is disabled
-      if (!hasSemanticQuery && semanticQueryObject.offset !== undefined) {
-        queryRequest.offset = semanticQueryObject.offset;
-      }
-    } catch (e) {
-      // ignore invalid json - still use default limit
-      queryRequest.limit = 10;
-      console.error("Invalid semantic query JSON:", e);
-    }
-    if (hasFilterQuery) {
-      try {
-        queryRequest.filter_query = JSON.parse(filterQuery);
-      } catch (e) {
-        // ignore invalid json
-        console.error("Invalid filter query JSON:", e);
-      }
-    }
-    queryRequest.profile = includeProfile;
-    return JSON.stringify(queryRequest, null, 2);
-  }, [
-    query,
-    queryIndexes,
-    filterQuery,
-    semanticQuery,
-    hasSemanticQuery,
-    hasFilterQuery,
-    selectedFields,
-    includeProfile,
-  ]);
+    return JSON.stringify(
+      buildTableQueryRequest({
+        query,
+        queryIndexes,
+        selectedFields,
+        semanticQuery,
+        filterQuery,
+        includeProfile,
+      }),
+      null,
+      2
+    );
+  }, [query, queryIndexes, filterQuery, semanticQuery, selectedFields, includeProfile]);
 
   const [queryJsonString, setQueryJsonString] = useState(semanticQueryRequestString);
+  const isJsonQueryValid = useMemo(() => {
+    try {
+      JSON.parse(queryJsonString);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [queryJsonString]);
 
   const semanticQueryRequest = useMemo(() => {
     try {
@@ -721,8 +701,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                 <CardContent>
                   <div className="text-2xl font-semibold">{documentCountLabel}</div>
                   <p className="text-xs text-muted-foreground">
-                    {storageStatus?.disk_usage !== undefined
-                      ? `${formatBytes(storageStatus.disk_usage)} stored`
+                    {storageStatus?.disk_usage != null
+                      ? `${formatBytes(storageStatus.disk_usage)} persisted in LSM runs`
                       : "data count from query API"}
                   </p>
                 </CardContent>
@@ -1191,7 +1171,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
             <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
               <Button
                 onClick={handleRunQuery}
-                disabled={!hasSemanticQuery && !hasFilterQuery}
+                disabled={queryMode === "json" && !isJsonQueryValid}
                 size="lg"
               >
                 Run Query
@@ -1203,7 +1183,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                     ? "Running semantic search"
                     : hasFilterQuery
                       ? "Running full-text search"
-                      : "Enter a query to search"}
+                      : "Browsing all documents"}
               </span>
             </DashboardToolbar>
 
