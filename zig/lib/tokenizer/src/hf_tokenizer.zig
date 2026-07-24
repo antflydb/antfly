@@ -385,15 +385,13 @@ pub const HfTokenizer = struct {
         if (root != .object) return error.InvalidTokenizerJson;
 
         const self = try allocator.create(HfTokenizer);
-        errdefer allocator.destroy(self);
-
         self.* = .{
             .allocator = allocator,
             .model_type = .word_piece,
             .vocab = .{},
             .id_to_token = .{},
             .added_tokens = .{},
-            .added_trie = try AddedTokenTrie.init(allocator),
+            .added_trie = .{},
             .special = .{},
             .pad_token_seen = false,
             .do_lowercase = false,
@@ -416,13 +414,16 @@ pub const HfTokenizer = struct {
             .byte_fallback = false,
             .unigram_vocab = .empty,
             .unigram_unk_id = 0,
-            .unigram_trie = try VocabTrie.init(allocator),
+            .unigram_trie = .{},
             .bpe_direct_trie = null,
             .metaspace_prepend_scheme = .always,
             .metaspace_split = true,
             .metaspace_replacement = "\xe2\x96\x81", // ▁ (U+2581) in UTF-8
             .arena_strings = .empty,
         };
+        errdefer self.deinitSelf();
+        self.added_trie = try AddedTokenTrie.init(allocator);
+        self.unigram_trie = try VocabTrie.init(allocator);
 
         // Detect model type first. Some Hugging Face tokenizer.json files omit
         // `model.type`, so infer from the model payload shape when necessary.
@@ -495,6 +496,19 @@ pub const HfTokenizer = struct {
         }
 
         return self;
+    }
+
+    fn adoptArenaString(self: *HfTokenizer, owned: []u8) ![]const u8 {
+        errdefer self.allocator.free(owned);
+        try self.arena_strings.append(self.allocator, owned);
+        return owned;
+    }
+
+    fn dupeArenaString(
+        self: *HfTokenizer,
+        bytes: []const u8,
+    ) ![]const u8 {
+        return self.adoptArenaString(try self.allocator.dupe(u8, bytes));
     }
 
     // =====================================================================
@@ -594,9 +608,7 @@ pub const HfTokenizer = struct {
     fn parseWordPieceModel(self: *HfTokenizer, obj: std.json.ObjectMap) !void {
         if (obj.get("continuing_subword_prefix")) |v| {
             if (v == .string) {
-                const s = try self.allocator.dupe(u8, v.string);
-                try self.arena_strings.append(self.allocator, s);
-                self.continuing_prefix = s;
+                self.continuing_prefix = try self.dupeArenaString(v.string);
             }
         }
         if (obj.get("max_input_chars_per_word")) |v| {
@@ -617,9 +629,7 @@ pub const HfTokenizer = struct {
 
         if (obj.get("end_of_word_suffix")) |v| {
             if (v == .string and v.string.len > 0) {
-                const s = try self.allocator.dupe(u8, v.string);
-                try self.arena_strings.append(self.allocator, s);
-                self.end_of_word_suffix = s;
+                self.end_of_word_suffix = try self.dupeArenaString(v.string);
             }
         }
         if (obj.get("byte_fallback")) |v| {
@@ -627,9 +637,7 @@ pub const HfTokenizer = struct {
         }
         if (obj.get("continuing_subword_prefix")) |v| {
             if (v == .string) {
-                const s = try self.allocator.dupe(u8, v.string);
-                try self.arena_strings.append(self.allocator, s);
-                self.continuing_prefix = s;
+                self.continuing_prefix = try self.dupeArenaString(v.string);
             }
         }
 
@@ -673,8 +681,7 @@ pub const HfTokenizer = struct {
                         raw_key_owned = composed;
                         break :blk composed;
                     };
-                    const key = try self.allocator.dupe(u8, raw_key);
-                    try self.arena_strings.append(self.allocator, key);
+                    const key = try self.dupeArenaString(raw_key);
                     // Earlier merges win ties because getOrPut is no-op on existing.
                     const gop = try self.merge_ranks.getOrPut(self.allocator, key);
                     if (!gop.found_existing) gop.value_ptr.* = rank;
@@ -740,8 +747,7 @@ pub const HfTokenizer = struct {
                                 else => 0.0,
                             };
                             const id: i32 = @intCast(idx);
-                            const token = try self.allocator.dupe(u8, token_val.string);
-                            try self.arena_strings.append(self.allocator, token);
+                            const token = try self.dupeArenaString(token_val.string);
                             try self.unigram_vocab.append(self.allocator, .{
                                 .token = token,
                                 .score = score,
@@ -784,12 +790,14 @@ pub const HfTokenizer = struct {
                 while (it.next()) |entry| {
                     if (entry.value_ptr.* == .integer) {
                         const id: i32 = @intCast(entry.value_ptr.integer);
-                        const display_key = try self.allocator.dupe(u8, entry.key_ptr.*);
-                        try self.arena_strings.append(self.allocator, display_key);
+                        const display_key = try self.dupeArenaString(entry.key_ptr.*);
                         const lookup_key = if (self.pre_tokenizer_type == .byte_level) blk: {
-                            const raw = try byteLevelDecodeTokenAlloc(self.allocator, display_key);
-                            try self.arena_strings.append(self.allocator, raw);
-                            break :blk raw;
+                            break :blk try self.adoptArenaString(
+                                try byteLevelDecodeTokenAlloc(
+                                    self.allocator,
+                                    display_key,
+                                ),
+                            );
                         } else display_key;
                         try self.vocab.put(self.allocator, lookup_key, id);
                         try self.id_to_token.put(self.allocator, id, display_key);
@@ -890,8 +898,7 @@ pub const HfTokenizer = struct {
             if (content != .string or id_val != .integer) continue;
 
             const id: i32 = @intCast(id_val.integer);
-            const key = try self.allocator.dupe(u8, content.string);
-            try self.arena_strings.append(self.allocator, key);
+            const key = try self.dupeArenaString(content.string);
             try self.added_tokens.put(self.allocator, key, id);
             try self.added_trie.insert(self.allocator, key, id);
 
@@ -1893,7 +1900,13 @@ pub const HfTokenizer = struct {
     /// disables the optional cache rather than failing tokenizer loading.
     pub fn configureBpeCache(self: *HfTokenizer, config: BpeCacheConfig) !void {
         if (self.parallel_workspace_all != null) return error.BpeCacheAlreadyPopulated;
-        const cache = self.bpe_cache orelse return;
+        const cache = self.bpe_cache orelse {
+            // Parallel BPE remains available when the optional fixed cache
+            // table could not be allocated. Its retained workspaces still
+            // participate in the caller's process-wide resource budget.
+            self.cache_resource_budget = config.resource_budget;
+            return;
+        };
         for (&cache.shards) |*shard| {
             if (shard.count.load(.acquire) != 0) return error.BpeCacheAlreadyPopulated;
         }
@@ -4192,6 +4205,89 @@ test "BPE cache obeys local and external byte budgets" {
 
     tok.deinitSelf();
     try std.testing.expectEqual(@as(usize, 0), budget.used_bytes.load(.acquire));
+}
+
+test "parallel workspaces remain resource-accounted without a BPE cache table" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 1},
+        \\    "merges": []
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+
+    const Budget = struct {
+        used_bytes: std.atomic.Value(usize) = .init(0),
+
+        fn tryReserve(context: *anyopaque, bytes: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = self.used_bytes.fetchAdd(bytes, .acq_rel);
+            return true;
+        }
+
+        fn release(context: *anyopaque, bytes: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const previous = self.used_bytes.fetchSub(bytes, .acq_rel);
+            std.debug.assert(previous >= bytes);
+        }
+    };
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    const cache = tok.bpe_cache orelse return error.TestExpectedBpeCache;
+    allocator.destroy(cache);
+    tok.bpe_cache = null;
+
+    var budget: Budget = .{};
+    try tok.configureBpeCache(.{
+        .resource_budget = .{
+            .context = &budget,
+            .try_reserve = Budget.tryReserve,
+            .release = Budget.release,
+        },
+    });
+    const workspace = try tok.acquireParallelBpeWorkspace();
+    tok.releaseParallelBpeWorkspace(workspace);
+    try std.testing.expect(budget.used_bytes.load(.acquire) > 0);
+
+    tok.deinitSelf();
+    try std.testing.expectEqual(@as(usize, 0), budget.used_bytes.load(.acquire));
+}
+
+test "BPE tokenizer loading cleans up every allocation failure" {
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 1, "b": 2, "ab": 3},
+        \\    "merges": ["a b"]
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+
+    var fail_index: usize = 0;
+    while (fail_index < 1024) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        const result = HfTokenizer.loadFromBytes(failing.allocator(), json_str);
+        if (result) |tok| {
+            tok.deinitSelf();
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        try std.testing.expectEqual(
+            failing.allocated_bytes,
+            failing.freed_bytes,
+        );
+        if (!failing.has_induced_failure) break;
+    }
+    try std.testing.expect(fail_index < 1024);
 }
 
 test "parallel workspace free list is bounded" {

@@ -444,28 +444,113 @@ fn estimateTextsTokens(texts: []const []const u8) usize {
     return total;
 }
 
-fn countTokenizerTokens(allocator: std.mem.Allocator, tokenizer: anytype, text: []const u8) !usize {
-    const ids = try tokenizer.encode(allocator, text);
-    defer allocator.free(ids);
-    return ids.len;
+// std.Io owns the actual worker pool, so this bounds queued tokenizer
+// consumers without creating or oversubscribing OS threads. Sixteen gives the
+// encoder enough pull-scheduled chunks for heterogeneous server CPUs while its
+// 256 KiB threshold keeps normal request prompts on the serial path.
+const tokenizer_parallel_max_tasks = 16;
+
+fn countTokenizerTokens(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    tokenizer: anytype,
+    text: []const u8,
+) !usize {
+    var ids: std.ArrayListUnmanaged(i32) = .empty;
+    defer ids.deinit(allocator);
+    if (io) |runtime_io| {
+        try tokenizer.encodeIntoParallel(
+            runtime_io,
+            allocator,
+            text,
+            &ids,
+            tokenizer_parallel_max_tasks,
+        );
+    } else {
+        try tokenizer.encodeInto(allocator, text, &ids);
+    }
+    return ids.items.len;
 }
 
-fn countTokenizerTexts(allocator: std.mem.Allocator, tokenizer: anytype, texts: []const []const u8) !usize {
+fn countTokenizerTexts(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    tokenizer: anytype,
+    texts: []const []const u8,
+) !usize {
     var total: usize = 0;
-    for (texts) |text| total += try countTokenizerTokens(allocator, tokenizer, text);
+    for (texts) |text| total += try countTokenizerTokens(allocator, io, tokenizer, text);
     return total;
 }
 
 fn countParsedDenseEmbedTextTokens(
     allocator: std.mem.Allocator,
+    io: ?std.Io,
     tokenizer: anytype,
     inputs: *const ParsedDenseEmbedInputs,
 ) usize {
     var total: usize = 0;
     for (inputs.texts.items) |item| {
-        total += countTokenizerTokens(allocator, tokenizer, item.text) catch estimateTextTokens(item.text);
+        total += countTokenizerTokens(allocator, io, tokenizer, item.text) catch estimateTextTokens(item.text);
     }
     return total;
+}
+
+test "token counting uses the attached std.Io tokenizer path" {
+    const ProbeTokenizer = struct {
+        serial_calls: *usize,
+        parallel_calls: *usize,
+
+        pub fn encodeInto(
+            self: @This(),
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            ids: *std.ArrayListUnmanaged(i32),
+        ) !void {
+            self.serial_calls.* += 1;
+            try ids.append(allocator, 1);
+        }
+
+        pub fn encodeIntoParallel(
+            self: @This(),
+            _: std.Io,
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            ids: *std.ArrayListUnmanaged(i32),
+            max_tasks: usize,
+        ) !void {
+            try std.testing.expectEqual(tokenizer_parallel_max_tasks, max_tasks);
+            self.parallel_calls.* += 1;
+            try ids.appendSlice(allocator, &.{ 1, 2 });
+        }
+    };
+
+    var serial_calls: usize = 0;
+    var parallel_calls: usize = 0;
+    const tokenizer = ProbeTokenizer{
+        .serial_calls = &serial_calls,
+        .parallel_calls = &parallel_calls,
+    };
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        try countTokenizerTokens(
+            std.testing.allocator,
+            std.testing.io,
+            tokenizer,
+            "parallel",
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countTokenizerTokens(
+            std.testing.allocator,
+            null,
+            tokenizer,
+            "serial",
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), parallel_calls);
+    try std.testing.expectEqual(@as(usize, 1), serial_calls);
 }
 
 fn estimateParsedDenseEmbedPromptTokens(inputs: *const ParsedDenseEmbedInputs) usize {
@@ -1751,7 +1836,7 @@ pub const Node = struct {
 
             var arena = std.heap.ArenaAllocator.init(ctx.allocator);
             defer arena.deinit();
-            const prompt_tokens = countTokenizerTexts(ctx.allocator, model.getTokenizer(), sparse_texts) catch estimateTextsTokens(sparse_texts);
+            const prompt_tokens = countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), sparse_texts) catch estimateTextsTokens(sparse_texts);
             const response = try buildEmbedSparseResponse(arena.allocator(), request.model, sparse_vecs, prompt_tokens);
             return ctx.json(response);
         }
@@ -1790,7 +1875,7 @@ pub const Node = struct {
         defer arena.deinit();
         const response_build_start = embedTimingStart();
         const prompt_tokens = if (inputs.texts.items.len > 0)
-            countParsedDenseEmbedTextTokens(ctx.allocator, model.getTokenizer(), &inputs)
+            countParsedDenseEmbedTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), &inputs)
         else
             estimateParsedDenseEmbedPromptTokens(&inputs);
 
@@ -1958,8 +2043,8 @@ pub const Node = struct {
         defer ctx.allocator.free(scores);
 
         const prompt_tokens =
-            (countTokenizerTokens(ctx.allocator, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * body.prompts.len +
-            (countTokenizerTexts(ctx.allocator, model.getTokenizer(), body.prompts) catch estimateTextsTokens(body.prompts));
+            (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * body.prompts.len +
+            (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.prompts) catch estimateTextsTokens(body.prompts));
         return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
     }
 
@@ -2015,8 +2100,8 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
             defer ctx.allocator.free(scores);
             const prompt_tokens =
-                (countTokenizerTokens(ctx.allocator, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * flat_texts.len +
-                (countTokenizerTexts(ctx.allocator, model.getTokenizer(), flat_texts) catch estimateTextsTokens(flat_texts));
+                (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * flat_texts.len +
+                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), flat_texts) catch estimateTextsTokens(flat_texts));
             return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
         }
 
@@ -2086,8 +2171,8 @@ pub const Node = struct {
         defer ctx.allocator.free(doc_texts);
         for (parsed_docs.items, 0..) |doc, idx| doc_texts[idx] = doc.text;
         const prompt_tokens =
-            (countTokenizerTokens(ctx.allocator, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * doc_texts.len +
-            (countTokenizerTexts(ctx.allocator, model.getTokenizer(), doc_texts) catch estimateTextsTokens(doc_texts));
+            (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * doc_texts.len +
+            (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), doc_texts) catch estimateTextsTokens(doc_texts));
         return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
     }
 
@@ -4555,8 +4640,8 @@ pub const Node = struct {
             }
 
             const prompt_tokens =
-                (countTokenizerTexts(ctx.allocator, model.getTokenizer(), body.texts) catch estimateTextsTokens(body.texts)) +
-                (countTokenizerTexts(ctx.allocator, model.getTokenizer(), body.labels) catch estimateTextsTokens(body.labels));
+                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.texts) catch estimateTextsTokens(body.texts)) +
+                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.labels) catch estimateTextsTokens(body.labels));
             return buildClassificationResponse(ctx, body.model, all_results, prompt_tokens);
         } else |_| {}
 
@@ -4581,8 +4666,8 @@ pub const Node = struct {
             }
 
             const prompt_tokens =
-                (countTokenizerTexts(ctx.allocator, model.getTokenizer(), body.texts) catch estimateTextsTokens(body.texts)) +
-                (countTokenizerTexts(ctx.allocator, model.getTokenizer(), body.labels) catch estimateTextsTokens(body.labels));
+                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.texts) catch estimateTextsTokens(body.texts)) +
+                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.labels) catch estimateTextsTokens(body.labels));
             return buildClassificationResponse(ctx, body.model, all_results, prompt_tokens);
         } else |_| {}
 
@@ -4928,7 +5013,7 @@ pub const Node = struct {
             const inner = try ctx.allocator.alloc([]const u8, 1);
             errdefer ctx.allocator.free(inner);
             inner[0] = try ctx.allocator.dupe(u8, result.text);
-            completion_tokens += countTokenizerTokens(ctx.allocator, hf_tok.tokenizer(), result.text) catch estimateTextTokens(result.text);
+            completion_tokens += countTokenizerTokens(ctx.allocator, self.session_manager.io, hf_tok.tokenizer(), result.text) catch estimateTextTokens(result.text);
             data[i] = .{
                 .object = "rewrite",
                 .index = @intCast(i),
@@ -4937,7 +5022,7 @@ pub const Node = struct {
             filled = i + 1;
         }
 
-        const prompt_tokens = countTokenizerTexts(ctx.allocator, hf_tok.tokenizer(), body.inputs) catch estimateTextsTokens(body.inputs);
+        const prompt_tokens = countTokenizerTexts(ctx.allocator, self.session_manager.io, hf_tok.tokenizer(), body.inputs) catch estimateTextsTokens(body.inputs);
         return ctx.json(api.RewriteResponse{
             .object = "list",
             .data = data,
@@ -5255,7 +5340,7 @@ pub const Node = struct {
             .object = "list",
             .data = &data,
             .model = model_str,
-            .usage = tokenUsage(0, countTokenizerTokens(ctx.allocator, tokenizer, result.text) catch estimateTextTokens(result.text)),
+            .usage = tokenUsage(0, countTokenizerTokens(ctx.allocator, self.session_manager.io, tokenizer, result.text) catch estimateTextTokens(result.text)),
         });
     }
 

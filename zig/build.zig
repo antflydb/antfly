@@ -1608,6 +1608,25 @@ pub fn build(b: *std.Build) void {
     const inference_chunker_mod = inference_graph.inference_chunker_mod;
     const inference_server_mod = inference_graph.inference_mod;
 
+    const hf_tokenizer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/tokenizer/src/hf_tokenizer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    hf_tokenizer_tests.root_module.addImport(
+        "sentencepiece_proto",
+        sentencepiece_proto_mod,
+    );
+    const run_hf_tokenizer_tests = b.addRunArtifact(hf_tokenizer_tests);
+    const hf_tokenizer_test_step = b.step(
+        "hf-tokenizer-test",
+        "Run Hugging Face tokenizer tests",
+    );
+    hf_tokenizer_test_step.dependOn(&run_hf_tokenizer_tests.step);
+
     const transcribing_mod = b.createModule(.{
         .root_source_file = b.path("lib/transcribing/src/mod.zig"),
         .target = target,
@@ -5323,6 +5342,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
+    unit_test_step.dependOn(&run_hf_tokenizer_tests.step);
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);

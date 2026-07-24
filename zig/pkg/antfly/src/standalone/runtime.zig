@@ -1315,8 +1315,11 @@ pub fn runFromIterator(
         if (cfg.inference.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
-    defer antfly_node.deinit();
-    try antfly_node.warmConfiguredModels(alloc);
+    // Until DataServer exists, error cleanup is owned here. Once its
+    // ResourceManager is attached below, the regular defer is registered
+    // after DataServer's so tokenizer budget callbacks are torn down first.
+    var antfly_node_needs_errdeinit = true;
+    errdefer if (antfly_node_needs_errdeinit) antfly_node.deinit();
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -1491,6 +1494,8 @@ pub fn runFromIterator(
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
     defer data_server.deinit();
+    antfly_node_needs_errdeinit = false;
+    defer antfly_node.deinit();
 
     antfly_node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(&data_server.provisioned_storage.resource_manager);
     try antfly_node.configureTokenizerCaches(.{
@@ -1498,6 +1503,8 @@ pub fn runFromIterator(
             &data_server.provisioned_storage.resource_manager,
         ),
     });
+    if (node_backend_runtime.ptr().io()) |io| antfly_node.attachIo(io);
+    try antfly_node.warmConfiguredModels(alloc);
     data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.

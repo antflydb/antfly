@@ -842,8 +842,21 @@ pub fn build(b: *std.Build) void {
     });
     tok_tests.root_module.addImport("sentencepiece_proto", sentencepiece_proto_mod);
     const run_tok_tests = b.addRunArtifact(tok_tests);
+
+    const hf_tok_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/tokenizer/src/hf_tokenizer.zig", .{shared_lib_root})),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    hf_tok_tests.root_module.addImport("sentencepiece_proto", sentencepiece_proto_mod);
+    const run_hf_tok_tests = b.addRunArtifact(hf_tok_tests);
+
     const tok_test_step = b.step("test-tokenizer", "Run tokenizer tests");
     tok_test_step.dependOn(&run_tok_tests.step);
+    tok_test_step.dependOn(&run_hf_tok_tests.step);
 
     const audio_tests = b.addTest(.{
         .root_module = b.createModule(.{

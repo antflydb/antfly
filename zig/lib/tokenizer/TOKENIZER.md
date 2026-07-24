@@ -75,9 +75,9 @@ Measured on an Apple M4 Max. Throughput is decimal MB/s.
 | Current | steady, 1 task | 291–295 MB/s |
 | Current | steady, 14 concurrent `std.Io` tasks | 2.86–3.09 GB/s |
 | Current, 738 KiB corpus | cold, 14 internal tasks | 497.04 MB/s |
-| Current, 738 KiB corpus | steady, 14 internal tasks | 2.46 GB/s |
+| Current, 738 KiB corpus | steady, 16 internal tasks | 2.72 GB/s |
 | Current, 11.8 MB repeated corpus | cold, 14 internal tasks | 1.642 GB/s |
-| Current, 11.8 MB repeated corpus | steady, 14 internal tasks | 3.01 GB/s |
+| Current, 11.8 MB repeated corpus | steady, 16 internal tasks | 3.16 GB/s |
 
 The current implementation is approximately 16.4–16.6 times faster than the
 original single-thread steady-state implementation while also correcting the
@@ -90,7 +90,7 @@ differs. Moving dispatch to the application's persistent `std.Io` runtime
 removes per-call OS thread creation. Reusing the tokenizer's task workspaces
 removes repeated chunk-output allocation. Pull scheduling and an ordered
 overlapped gather further reduce runtime imbalance and the serial copy tail.
-The 8.79 GB/s result is still about 3.1–3.4 times the 11.8 MB internally
+The 8.79 GB/s result is still about 2.8 times the 11.8 MB internally
 parallel result here, but Gigatoken measures an 11.9 GB OpenWebText
 input—roughly one thousand times larger—using a cache designed for about
 1.3 million unique pretokens per worker. The remaining gap is principally in
@@ -132,7 +132,14 @@ the projected allocation reaches the slice's `shrink_cache` pressure state;
 the atomic hard guard closes races between producers. Cache hits never call the
 manager. A rejected or failed fixed-table allocation disables the optional
 cache; a rejected entry reservation simply leaves that pretoken uncached, so
-resource pressure never makes model loading or tokenization fail.
+resource pressure never makes model loading or tokenization fail. Parallel
+workspace retention uses the same budget even when the optional fixed cache
+table could not be allocated.
+
+Standalone installs the budget before warming configured models and destroys
+the inference node before the `DataServer` that owns the manager. This ordering
+is part of the callback lifetime contract: every tokenizer reservation is
+released while its manager context is still alive.
 
 ## Accepted optimizations
 
@@ -222,6 +229,14 @@ storage package; `BackendRuntime.io()` is the layering boundary, just as it is
 for the Io-aware matrix multiplication path. A tokenizer used in parallel must
 still be constructed with an allocator safe for concurrent use.
 
+Antfly standalone attaches its inference node to the shared
+`BackendRuntime.io()` before model warmup. Production API token accounting
+uses `encodeIntoParallel` with at most sixteen queued consumers when this Io is
+available. The tokenizer's 256 KiB semantic threshold keeps normal prompts on
+the allocation-reusing serial path; the shared Io worker pool bounds actual
+CPU concurrency for large documents without creating or oversubscribing an
+independent thread pool.
+
 ### Reusable parallel workspaces
 
 Each tokenizer retains a free list of parallel workspaces. A workspace contains
@@ -259,7 +274,7 @@ meaningful while allowing a fast consumer to take more work instead of waiting
 for the slowest fixed partition.
 
 Combined with the reusable workspace, this moves steady internal throughput to
-about 2.34–2.47 GB/s for 738 KiB and 2.61–2.85 GB/s for 11.8 MB. An
+about 2.72 GB/s for 738 KiB and 3.16 GB/s for 11.8 MB. An
 experimental descending-size LPT layout was slower than uniform chunks on the
 M4 Max, so the accepted scheduler uses uniform byte targets and dynamic
 pulling.
@@ -283,8 +298,8 @@ large contiguous output where it is safe and useful; the current sharded cache
 contains allocator-owned objects and is not falsely treated as one huge-page
 allocation.
 
-Post-hardening validation retained the complete hashes and measured 2.46 GB/s
-for ten iterations of the 738 KiB internal-task workload and 3.01 GB/s for five
+Post-hardening validation retained the complete hashes and measured 2.72 GB/s
+for ten iterations of the 738 KiB internal-task workload and 3.16 GB/s for five
 iterations of the 11.8 MB workload. Both reported 9,571 live entries, 1,576,232
 accounted cache bytes, and zero rejected reservations.
 
@@ -416,22 +431,15 @@ accepted.
 Focused validation commands:
 
 ```sh
-cd zig
-zig test -OReleaseFast \
-  --dep sentencepiece_proto \
-  -Mroot=lib/tokenizer/src/hf_tokenizer.zig \
-  --dep protobuf \
-  -Msentencepiece_proto=/path/to/generated/sentencepiece_proto/root.zig \
-  -Mprotobuf=lib/protobuf/src/root.zig -lc
-
-cd pkg/inference
+cd zig/pkg/inference
 zig build test-tokenizer
 zig build test-tokenizer-batch
 ```
 
-The Hugging Face tokenizer suite currently passes 29 tests with one optional
-external-model test skipped. The SentencePiece and tokenizer-batch targets also
-pass. `zig build inference-test` passes 2,023 tests with 11 skips, and
+`test-tokenizer` runs both implementations: the Hugging Face suite currently
+passes 31 tests with one optional external-model test skipped, and the
+SentencePiece suite passes all 18 tests. The tokenizer-batch target also passes.
+`zig build inference-test` passes 2,024 tests with 11 skips, and
 `zig build root-test` passes all 222 root compile/unit tests. The focused
 `zig build resource-budget-test` gate passes both filesystem tests and all 28
 resource-manager tests without leaks.
