@@ -14,6 +14,10 @@ CONSTANTS
     BuggyMergeAllowsActiveReassignment = FALSE
     BuggyRestoreAcceptsNamespaceMismatch = FALSE
     BuggyRestoreClearsBeforeRepair = FALSE
+    BuggyRestoreAcceptsMismatchedArtifact = FALSE
+    BuggyRestoreClearsAfterOneReplica = FALSE
+    BuggyRestoreReadyEarly = FALSE
+    BuggySplitWhileRestorePending = FALSE
 
 INVARIANTS
     TypeOK
@@ -24,6 +28,9 @@ INVARIANTS
     StrictRestoreRejectsNamespaceMismatch
     RuntimeRepairRequiresRecoveredPrimaryImport
     RestoreIntentClearsOnlyAfterRepairComplete
+    RestoreProgressMatchesCommittedArtifact
+    RestorePendingGroupsAreNotReady
+    RestorePendingGroupsDoNotSplit
     Safety
 
 ==== BadMergeActiveReassign
@@ -40,6 +47,10 @@ CONSTANTS
     BuggyMergeAllowsActiveReassignment = TRUE
     BuggyRestoreAcceptsNamespaceMismatch = FALSE
     BuggyRestoreClearsBeforeRepair = FALSE
+    BuggyRestoreAcceptsMismatchedArtifact = FALSE
+    BuggyRestoreClearsAfterOneReplica = FALSE
+    BuggyRestoreReadyEarly = FALSE
+    BuggySplitWhileRestorePending = FALSE
 
 INVARIANTS
     MergeReassignmentRequiresOptInAndHealthyStatus
@@ -58,6 +69,10 @@ CONSTANTS
     BuggyMergeAllowsActiveReassignment = FALSE
     BuggyRestoreAcceptsNamespaceMismatch = FALSE
     BuggyRestoreClearsBeforeRepair = FALSE
+    BuggyRestoreAcceptsMismatchedArtifact = FALSE
+    BuggyRestoreClearsAfterOneReplica = FALSE
+    BuggyRestoreReadyEarly = FALSE
+    BuggySplitWhileRestorePending = FALSE
 
 INVARIANTS
     MergeRequiresCompatibleIdentityStatus
@@ -76,6 +91,10 @@ CONSTANTS
     BuggyMergeAllowsActiveReassignment = FALSE
     BuggyRestoreAcceptsNamespaceMismatch = FALSE
     BuggyRestoreClearsBeforeRepair = TRUE
+    BuggyRestoreAcceptsMismatchedArtifact = FALSE
+    BuggyRestoreClearsAfterOneReplica = FALSE
+    BuggyRestoreReadyEarly = FALSE
+    BuggySplitWhileRestorePending = FALSE
 
 INVARIANTS
     RestoreIntentClearsOnlyAfterRepairComplete
@@ -94,6 +113,10 @@ CONSTANTS
     BuggyMergeAllowsActiveReassignment = FALSE
     BuggyRestoreAcceptsNamespaceMismatch = TRUE
     BuggyRestoreClearsBeforeRepair = FALSE
+    BuggyRestoreAcceptsMismatchedArtifact = FALSE
+    BuggyRestoreClearsAfterOneReplica = FALSE
+    BuggyRestoreReadyEarly = FALSE
+    BuggySplitWhileRestorePending = FALSE
 
 INVARIANTS
     StrictRestoreRejectsNamespaceMismatch
@@ -112,6 +135,10 @@ CONSTANTS
     BuggyMergeAllowsActiveReassignment = FALSE
     BuggyRestoreAcceptsNamespaceMismatch = FALSE
     BuggyRestoreClearsBeforeRepair = FALSE
+    BuggyRestoreAcceptsMismatchedArtifact = FALSE
+    BuggyRestoreClearsAfterOneReplica = FALSE
+    BuggyRestoreReadyEarly = FALSE
+    BuggySplitWhileRestorePending = FALSE
 
 INVARIANTS
     SplitDestinationStatusMatchesExpectedNamespace
@@ -131,6 +158,85 @@ CONSTANTS
     BuggyMergeAllowsActiveReassignment = FALSE
     BuggyRestoreAcceptsNamespaceMismatch = FALSE
     BuggyRestoreClearsBeforeRepair = FALSE
+    BuggyRestoreAcceptsMismatchedArtifact = FALSE
+    BuggyRestoreClearsAfterOneReplica = FALSE
+    BuggyRestoreReadyEarly = FALSE
+    BuggySplitWhileRestorePending = FALSE
 
 INVARIANTS
     SplitRequiresHealthySource
+
+==== heavy-liveness tier=heavy
+SPECIFICATION FairSpec
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = FALSE
+    BuggySplitAcceptsStaleDestNamespace = FALSE
+    BuggyMergeAllowsMismatchWithoutOptIn = FALSE
+    BuggyMergeAllowsActiveReassignment = FALSE
+    BuggyRestoreAcceptsNamespaceMismatch = FALSE
+    BuggyRestoreClearsBeforeRepair = FALSE
+    BuggyRestoreAcceptsMismatchedArtifact = FALSE
+    BuggyRestoreClearsAfterOneReplica = FALSE
+    BuggyRestoreReadyEarly = FALSE
+    BuggySplitWhileRestorePending = FALSE
+PROPERTY RestoreEventuallyReady
+
+==== BadRestoreArtifactMismatch
+SPECIFICATION Spec
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = FALSE
+    BuggySplitAcceptsStaleDestNamespace = FALSE
+    BuggyMergeAllowsMismatchWithoutOptIn = FALSE
+    BuggyMergeAllowsActiveReassignment = FALSE
+    BuggyRestoreAcceptsNamespaceMismatch = FALSE
+    BuggyRestoreClearsBeforeRepair = FALSE
+    BuggyRestoreAcceptsMismatchedArtifact = TRUE
+    BuggyRestoreClearsAfterOneReplica = FALSE
+    BuggyRestoreReadyEarly = FALSE
+    BuggySplitWhileRestorePending = FALSE
+INVARIANT RestoreProgressMatchesCommittedArtifact
+
+==== BadRestoreClearsAfterOneReplica
+SPECIFICATION Spec
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = FALSE
+    BuggySplitAcceptsStaleDestNamespace = FALSE
+    BuggyMergeAllowsMismatchWithoutOptIn = FALSE
+    BuggyMergeAllowsActiveReassignment = FALSE
+    BuggyRestoreAcceptsNamespaceMismatch = FALSE
+    BuggyRestoreClearsBeforeRepair = FALSE
+    BuggyRestoreAcceptsMismatchedArtifact = FALSE
+    BuggyRestoreClearsAfterOneReplica = TRUE
+    BuggyRestoreReadyEarly = FALSE
+    BuggySplitWhileRestorePending = FALSE
+INVARIANT RestoreIntentClearsOnlyAfterRepairComplete
+
+==== BadRestoreReadyEarly
+SPECIFICATION Spec
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = FALSE
+    BuggySplitAcceptsStaleDestNamespace = FALSE
+    BuggyMergeAllowsMismatchWithoutOptIn = FALSE
+    BuggyMergeAllowsActiveReassignment = FALSE
+    BuggyRestoreAcceptsNamespaceMismatch = FALSE
+    BuggyRestoreClearsBeforeRepair = FALSE
+    BuggyRestoreAcceptsMismatchedArtifact = FALSE
+    BuggyRestoreClearsAfterOneReplica = FALSE
+    BuggyRestoreReadyEarly = TRUE
+    BuggySplitWhileRestorePending = FALSE
+INVARIANT RestorePendingGroupsAreNotReady
+
+==== BadSplitDuringRestore
+SPECIFICATION Spec
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = FALSE
+    BuggySplitAcceptsStaleDestNamespace = FALSE
+    BuggyMergeAllowsMismatchWithoutOptIn = FALSE
+    BuggyMergeAllowsActiveReassignment = FALSE
+    BuggyRestoreAcceptsNamespaceMismatch = FALSE
+    BuggyRestoreClearsBeforeRepair = FALSE
+    BuggyRestoreAcceptsMismatchedArtifact = FALSE
+    BuggyRestoreClearsAfterOneReplica = FALSE
+    BuggyRestoreReadyEarly = FALSE
+    BuggySplitWhileRestorePending = TRUE
+INVARIANT RestorePendingGroupsDoNotSplit

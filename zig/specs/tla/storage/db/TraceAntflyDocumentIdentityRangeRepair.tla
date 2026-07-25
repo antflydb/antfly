@@ -66,7 +66,6 @@ InitValue(name, default) ==
 TraceInit ==
     /\ l = 1
     /\ pl = 0
-    /\ Init
     /\ sourceStatus = InitValue("sourceStatus", "healthyA")
     /\ donorStatus = InitValue("donorStatus", "healthyA")
     /\ receiverStatus = InitValue("receiverStatus", "healthyA")
@@ -83,6 +82,16 @@ TraceInit ==
     /\ runtimeRepairNeeded = InitValue("runtimeRepairNeeded", FALSE)
     /\ runtimeRepairComplete = InitValue("runtimeRepairComplete", FALSE)
     /\ restoreIntentCleared = InitValue("restoreIntentCleared", FALSE)
+    \* Existing fixtures trace one replica. Treat the other placement's
+    \* matching progress as already observed at this abstraction boundary.
+    /\ expectedArtifact = "bound"
+    /\ reportedArtifact = [n \in Replicas |->
+        IF n = "n2" THEN "bound" ELSE "none"]
+    /\ replicaRepairComplete = {"n2"}
+    /\ acceptedMismatchedArtifact = FALSE
+    /\ restorePending = TRUE
+    /\ groupReady = FALSE
+    /\ splitStarted = FALSE
 
 logline == TraceLog[l]
 event == logline.event

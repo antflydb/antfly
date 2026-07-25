@@ -29,10 +29,13 @@ CONSTANTS
     BuggyActivateBeforeRestoreComplete,
     BuggyRemoveKeepsRoute,
     BuggyRestartRevivesRemoved,
-    BuggyRestoreNotCancelled
+    BuggyRestoreNotCancelled,
+    BuggyAcceptMismatchedArtifact,
+    BuggyCatalogLosesArtifactBinding
 
 Groups == {"metadata", "data"}
 BootstrapStatuses == {"none", "preparing", "succeeded", "failed"}
+Artifacts == {"none", "bound", "other"}
 
 VARIABLES
     desired,
@@ -43,10 +46,17 @@ VARIABLES
     replicaCatalog,
     restoreIntent,
     bootstrapStatus,
-    restartCount
+    restartCount,
+    expectedArtifact,
+    preparedArtifact,
+    artifactVerified,
+    catalogArtifact,
+    activatedWithWrongArtifact
 
 vars == <<desired, hosted, active, routes, durableApplyStore, replicaCatalog,
-          restoreIntent, bootstrapStatus, restartCount>>
+          restoreIntent, bootstrapStatus, restartCount, expectedArtifact,
+          preparedArtifact, artifactVerified, catalogArtifact,
+          activatedWithWrongArtifact>>
 
 Init ==
     /\ desired = {}
@@ -58,13 +68,20 @@ Init ==
     /\ restoreIntent = {}
     /\ bootstrapStatus = [g \in Groups |-> "none"]
     /\ restartCount = 0
+    /\ expectedArtifact = [g \in Groups |-> "none"]
+    /\ preparedArtifact = [g \in Groups |-> "none"]
+    /\ artifactVerified = {}
+    /\ catalogArtifact = [g \in Groups |-> "none"]
+    /\ activatedWithWrongArtifact = FALSE
 
 MetadataAdds(g) ==
     /\ g \in Groups
     /\ g \notin desired
     /\ desired' = desired \cup {g}
     /\ UNCHANGED <<hosted, active, routes, durableApplyStore, replicaCatalog,
-                  restoreIntent, bootstrapStatus, restartCount>>
+                  restoreIntent, bootstrapStatus, restartCount,
+                  expectedArtifact, preparedArtifact, artifactVerified,
+                  catalogArtifact, activatedWithWrongArtifact>>
 
 MetadataRemoves(g) ==
     /\ g \in desired
@@ -78,9 +95,22 @@ MetadataRemoves(g) ==
             bootstrapStatus
         ELSE
             [bootstrapStatus EXCEPT ![g] = "none"]
+    /\ expectedArtifact' =
+        IF BuggyRestoreNotCancelled THEN expectedArtifact
+        ELSE [expectedArtifact EXCEPT ![g] = "none"]
+    /\ preparedArtifact' =
+        IF BuggyRestoreNotCancelled THEN preparedArtifact
+        ELSE [preparedArtifact EXCEPT ![g] = "none"]
+    /\ artifactVerified' =
+        IF BuggyRestoreNotCancelled THEN artifactVerified
+        ELSE artifactVerified \ {g}
     /\ replicaCatalog' =
         IF BuggyRestartRevivesRemoved THEN replicaCatalog ELSE replicaCatalog \ {g}
-    /\ UNCHANGED <<hosted, durableApplyStore, restartCount>>
+    /\ catalogArtifact' =
+        IF BuggyRestartRevivesRemoved THEN catalogArtifact
+        ELSE [catalogArtifact EXCEPT ![g] = "none"]
+    /\ UNCHANGED <<hosted, durableApplyStore, restartCount,
+                  activatedWithWrongArtifact>>
 
 EnsureFreshReplica(g) ==
     /\ g \in desired
@@ -91,7 +121,9 @@ EnsureFreshReplica(g) ==
     /\ routes' = routes \cup {g}
     /\ durableApplyStore' = durableApplyStore \cup {g}
     /\ replicaCatalog' = replicaCatalog \cup {g}
-    /\ UNCHANGED <<desired, restoreIntent, bootstrapStatus, restartCount>>
+    /\ UNCHANGED <<desired, restoreIntent, bootstrapStatus, restartCount,
+                  expectedArtifact, preparedArtifact, artifactVerified,
+                  catalogArtifact, activatedWithWrongArtifact>>
 
 StartBackupRestore(g) ==
     /\ g \in desired
@@ -99,6 +131,9 @@ StartBackupRestore(g) ==
     /\ g \notin restoreIntent
     /\ restoreIntent' = restoreIntent \cup {g}
     /\ bootstrapStatus' = [bootstrapStatus EXCEPT ![g] = "preparing"]
+    /\ expectedArtifact' = [expectedArtifact EXCEPT ![g] = "bound"]
+    /\ preparedArtifact' = [preparedArtifact EXCEPT ![g] = "none"]
+    /\ artifactVerified' = artifactVerified \ {g}
     /\ IF BuggyActivateBeforeRestoreComplete THEN
           /\ hosted' = hosted \cup {g}
           /\ active' = active \cup {g}
@@ -107,26 +142,53 @@ StartBackupRestore(g) ==
           /\ replicaCatalog' = replicaCatalog
        ELSE
           /\ UNCHANGED <<hosted, active, routes, durableApplyStore, replicaCatalog>>
-    /\ UNCHANGED <<desired, restartCount>>
+    /\ UNCHANGED <<desired, restartCount, catalogArtifact,
+                  activatedWithWrongArtifact>>
+
+PrepareRestoreArtifact(g, artifact) ==
+    /\ g \in restoreIntent
+    /\ bootstrapStatus[g] = "preparing"
+    /\ artifact \in Artifacts \ {"none"}
+    /\ preparedArtifact' = [preparedArtifact EXCEPT ![g] = artifact]
+    /\ artifactVerified' =
+        IF artifact = expectedArtifact[g] \/ BuggyAcceptMismatchedArtifact
+        THEN artifactVerified \cup {g}
+        ELSE artifactVerified \ {g}
+    /\ activatedWithWrongArtifact' =
+        (activatedWithWrongArtifact \/
+            (artifact # expectedArtifact[g] /\ BuggyAcceptMismatchedArtifact))
+    /\ UNCHANGED <<desired, hosted, active, routes, durableApplyStore,
+                  replicaCatalog, restoreIntent, bootstrapStatus, restartCount,
+                  expectedArtifact, catalogArtifact>>
 
 CompleteBackupRestore(g) ==
     /\ g \in restoreIntent
     /\ bootstrapStatus[g] = "preparing"
     /\ g \in desired
+    /\ g \in artifactVerified
     /\ hosted' = hosted \cup {g}
     /\ active' = active \cup {g}
     /\ routes' = routes \cup {g}
     /\ durableApplyStore' = durableApplyStore \cup {g}
     /\ replicaCatalog' = replicaCatalog \cup {g}
+    /\ catalogArtifact' =
+        [catalogArtifact EXCEPT ![g] =
+            IF BuggyCatalogLosesArtifactBinding
+            THEN "none"
+            ELSE preparedArtifact[g]]
     /\ bootstrapStatus' = [bootstrapStatus EXCEPT ![g] = "succeeded"]
-    /\ UNCHANGED <<desired, restoreIntent, restartCount>>
+    /\ UNCHANGED <<desired, restoreIntent, restartCount, expectedArtifact,
+                  preparedArtifact, artifactVerified,
+                  activatedWithWrongArtifact>>
 
 FailBackupRestore(g) ==
     /\ g \in restoreIntent
     /\ bootstrapStatus[g] = "preparing"
     /\ bootstrapStatus' = [bootstrapStatus EXCEPT ![g] = "failed"]
     /\ UNCHANGED <<desired, hosted, active, routes, durableApplyStore,
-                  replicaCatalog, restoreIntent, restartCount>>
+                  replicaCatalog, restoreIntent, restartCount,
+                  expectedArtifact, preparedArtifact, artifactVerified,
+                  catalogArtifact, activatedWithWrongArtifact>>
 
 RemoveUndesiredReplica(g) ==
     /\ g \in hosted
@@ -136,20 +198,28 @@ RemoveUndesiredReplica(g) ==
     /\ routes' = routes \ {g}
     /\ replicaCatalog' =
         IF BuggyRestartRevivesRemoved THEN replicaCatalog ELSE replicaCatalog \ {g}
+    /\ catalogArtifact' =
+        IF BuggyRestartRevivesRemoved THEN catalogArtifact
+        ELSE [catalogArtifact EXCEPT ![g] = "none"]
     /\ UNCHANGED <<desired, durableApplyStore, restoreIntent, bootstrapStatus,
-                  restartCount>>
+                  restartCount, expectedArtifact, preparedArtifact,
+                  artifactVerified, activatedWithWrongArtifact>>
 
 RestartHost ==
     /\ restartCount = 0
     /\ restartCount' = 1
-    /\ hosted' = replicaCatalog \cap desired
-    /\ active' = replicaCatalog \cap desired
-    /\ routes' = replicaCatalog \cap desired
+    /\ hosted' =
+        {g \in replicaCatalog \cap desired:
+            catalogArtifact[g] \in {"none", expectedArtifact[g]}}
+    /\ active' = hosted'
+    /\ routes' = hosted'
     /\ restoreIntent' = restoreIntent \cap desired
     /\ bootstrapStatus' =
         [g \in Groups |->
             IF g \in desired THEN bootstrapStatus[g] ELSE "none"]
-    /\ UNCHANGED <<desired, durableApplyStore, replicaCatalog>>
+    /\ UNCHANGED <<desired, durableApplyStore, replicaCatalog,
+                  expectedArtifact, preparedArtifact, artifactVerified,
+                  catalogArtifact, activatedWithWrongArtifact>>
 
 Next ==
     \/ RestartHost
@@ -158,6 +228,8 @@ Next ==
         \/ MetadataRemoves(g)
         \/ EnsureFreshReplica(g)
         \/ StartBackupRestore(g)
+        \/ PrepareRestoreArtifact(g, expectedArtifact[g])
+        \/ PrepareRestoreArtifact(g, "other")
         \/ CompleteBackupRestore(g)
         \/ FailBackupRestore(g)
         \/ RemoveUndesiredReplica(g)
@@ -174,6 +246,11 @@ TypeOK ==
     /\ restoreIntent \subseteq Groups
     /\ bootstrapStatus \in [Groups -> BootstrapStatuses]
     /\ restartCount \in 0..1
+    /\ expectedArtifact \in [Groups -> Artifacts]
+    /\ preparedArtifact \in [Groups -> Artifacts]
+    /\ artifactVerified \subseteq Groups
+    /\ catalogArtifact \in [Groups -> Artifacts]
+    /\ activatedWithWrongArtifact \in BOOLEAN
 
 ActiveReplicasAreHosted ==
     active \subseteq hosted
@@ -209,6 +286,23 @@ RestartRestoresOnlyCatalogedDesiredReplicas ==
         /\ active \subseteq replicaCatalog
         /\ routes \subseteq replicaCatalog
 
+VerifiedRestoreUsesCommittedArtifact ==
+    /\ ~activatedWithWrongArtifact
+    /\ \A g \in artifactVerified:
+        preparedArtifact[g] = expectedArtifact[g]
+
+RestoredCatalogRetainsArtifactBinding ==
+    \A g \in Groups:
+        bootstrapStatus[g] = "succeeded" /\ g \in replicaCatalog =>
+            /\ expectedArtifact[g] # "none"
+            /\ catalogArtifact[g] = expectedArtifact[g]
+
+RestoredActivationRequiresVerifiedArtifact ==
+    \A g \in Groups:
+        bootstrapStatus[g] = "succeeded" /\ g \in active =>
+            /\ g \in artifactVerified
+            /\ preparedArtifact[g] = expectedArtifact[g]
+
 Safety ==
     /\ TypeOK
     /\ ActiveReplicasAreHosted
@@ -220,5 +314,8 @@ Safety ==
     /\ RestoreBootstrapRequiresDesiredGroup
     /\ RestoreDoesNotActivateBeforeSuccess
     /\ RestartRestoresOnlyCatalogedDesiredReplicas
+    /\ VerifiedRestoreUsesCommittedArtifact
+    /\ RestoredCatalogRetainsArtifactBinding
+    /\ RestoredActivationRequiresVerifiedArtifact
 
 =============================================================================

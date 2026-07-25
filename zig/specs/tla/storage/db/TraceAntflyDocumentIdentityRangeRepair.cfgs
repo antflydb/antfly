@@ -12,6 +12,10 @@ CONSTANTS
     BuggyMergeAllowsActiveReassignment = FALSE
     BuggyRestoreAcceptsNamespaceMismatch = FALSE
     BuggyRestoreClearsBeforeRepair = FALSE
+    BuggyRestoreAcceptsMismatchedArtifact = FALSE
+    BuggyRestoreClearsAfterOneReplica = FALSE
+    BuggyRestoreReadyEarly = FALSE
+    BuggySplitWhileRestorePending = FALSE
 
 VIEW TraceView
 

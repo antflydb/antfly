@@ -12,6 +12,8 @@ CONSTANTS
     BuggyRemoveKeepsRoute = FALSE
     BuggyRestartRevivesRemoved = FALSE
     BuggyRestoreNotCancelled = FALSE
+    BuggyAcceptMismatchedArtifact = FALSE
+    BuggyCatalogLosesArtifactBinding = FALSE
 
 INVARIANTS
     TypeOK
@@ -24,6 +26,9 @@ INVARIANTS
     RestoreBootstrapRequiresDesiredGroup
     RestoreDoesNotActivateBeforeSuccess
     RestartRestoresOnlyCatalogedDesiredReplicas
+    VerifiedRestoreUsesCommittedArtifact
+    RestoredCatalogRetainsArtifactBinding
+    RestoredActivationRequiresVerifiedArtifact
     Safety
 
 ==== BadPrematureRestore
@@ -38,6 +43,8 @@ CONSTANTS
     BuggyRemoveKeepsRoute = FALSE
     BuggyRestartRevivesRemoved = FALSE
     BuggyRestoreNotCancelled = FALSE
+    BuggyAcceptMismatchedArtifact = FALSE
+    BuggyCatalogLosesArtifactBinding = FALSE
 
 INVARIANTS
     RestoreDoesNotActivateBeforeSuccess
@@ -54,6 +61,8 @@ CONSTANTS
     BuggyRemoveKeepsRoute = FALSE
     BuggyRestartRevivesRemoved = FALSE
     BuggyRestoreNotCancelled = TRUE
+    BuggyAcceptMismatchedArtifact = FALSE
+    BuggyCatalogLosesArtifactBinding = FALSE
 
 INVARIANTS
     RestoreBootstrapRequiresDesiredGroup
@@ -70,6 +79,8 @@ CONSTANTS
     BuggyRemoveKeepsRoute = FALSE
     BuggyRestartRevivesRemoved = TRUE
     BuggyRestoreNotCancelled = FALSE
+    BuggyAcceptMismatchedArtifact = FALSE
+    BuggyCatalogLosesArtifactBinding = FALSE
 
 INVARIANTS
     CatalogOnlyForDesiredReplica
@@ -86,6 +97,30 @@ CONSTANTS
     BuggyRemoveKeepsRoute = TRUE
     BuggyRestartRevivesRemoved = FALSE
     BuggyRestoreNotCancelled = FALSE
+    BuggyAcceptMismatchedArtifact = FALSE
+    BuggyCatalogLosesArtifactBinding = FALSE
 
 INVARIANTS
     NoUndesiredRoute
+
+==== BadMismatchedRestoreArtifact
+SPECIFICATION Spec
+CONSTANTS
+    BuggyActivateBeforeRestoreComplete = FALSE
+    BuggyRemoveKeepsRoute = FALSE
+    BuggyRestartRevivesRemoved = FALSE
+    BuggyRestoreNotCancelled = FALSE
+    BuggyAcceptMismatchedArtifact = TRUE
+    BuggyCatalogLosesArtifactBinding = FALSE
+INVARIANT VerifiedRestoreUsesCommittedArtifact
+
+==== BadCatalogArtifactBinding
+SPECIFICATION Spec
+CONSTANTS
+    BuggyActivateBeforeRestoreComplete = FALSE
+    BuggyRemoveKeepsRoute = FALSE
+    BuggyRestartRevivesRemoved = FALSE
+    BuggyRestoreNotCancelled = FALSE
+    BuggyAcceptMismatchedArtifact = FALSE
+    BuggyCatalogLosesArtifactBinding = TRUE
+INVARIANT RestoredCatalogRetainsArtifactBinding

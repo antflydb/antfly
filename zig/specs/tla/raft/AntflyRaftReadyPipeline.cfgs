@@ -1,0 +1,169 @@
+==== positive tier=fast
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    MaxReadySteps = 4
+    BuggyRepeatHot = FALSE
+    BuggyDeniedContinuation = FALSE
+    BuggyEarlyContinuation = FALSE
+    BuggyOverBudget = FALSE
+    BuggyCloneBeforeAdmission = FALSE
+    BuggyApplyBeforeOwnership = FALSE
+    BuggyAliasMessages = FALSE
+    BuggyUseLiveMembership = FALSE
+SPECIFICATION Spec
+INVARIANTS
+    NoDuplicateFairVisit
+    FairCoverageBeforeContinuation
+    ContinuationRequiresProductiveAdvance
+    ReadyStepBudgetBounded
+    DeniedReadyDoesNotOwnMessages
+    ConfigurationApplyRequiresOwnedMessages
+    ReadyMessagesPreserved
+    SnapshotMembershipMatchesAppliedIndex
+
+==== heavy-liveness tier=heavy
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    MaxReadySteps = 4
+    BuggyRepeatHot = FALSE
+    BuggyDeniedContinuation = FALSE
+    BuggyEarlyContinuation = FALSE
+    BuggyOverBudget = FALSE
+    BuggyCloneBeforeAdmission = FALSE
+    BuggyApplyBeforeOwnership = FALSE
+    BuggyAliasMessages = FALSE
+    BuggyUseLiveMembership = FALSE
+SPECIFICATION FairSpec
+PROPERTIES
+    MembershipEventuallyApplied
+    MessagesEventuallySent
+
+==== BadRepeatHot
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    MaxReadySteps = 4
+    BuggyRepeatHot = TRUE
+    BuggyDeniedContinuation = FALSE
+    BuggyEarlyContinuation = FALSE
+    BuggyOverBudget = FALSE
+    BuggyCloneBeforeAdmission = FALSE
+    BuggyApplyBeforeOwnership = FALSE
+    BuggyAliasMessages = FALSE
+    BuggyUseLiveMembership = FALSE
+SPECIFICATION Spec
+INVARIANT NoDuplicateFairVisit
+
+==== BadDeniedContinuation
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    MaxReadySteps = 4
+    BuggyRepeatHot = FALSE
+    BuggyDeniedContinuation = TRUE
+    BuggyEarlyContinuation = FALSE
+    BuggyOverBudget = FALSE
+    BuggyCloneBeforeAdmission = FALSE
+    BuggyApplyBeforeOwnership = FALSE
+    BuggyAliasMessages = FALSE
+    BuggyUseLiveMembership = FALSE
+SPECIFICATION Spec
+INVARIANT ContinuationRequiresProductiveAdvance
+
+==== BadEarlyContinuation
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    MaxReadySteps = 4
+    BuggyRepeatHot = FALSE
+    BuggyDeniedContinuation = FALSE
+    BuggyEarlyContinuation = TRUE
+    BuggyOverBudget = FALSE
+    BuggyCloneBeforeAdmission = FALSE
+    BuggyApplyBeforeOwnership = FALSE
+    BuggyAliasMessages = FALSE
+    BuggyUseLiveMembership = FALSE
+SPECIFICATION Spec
+INVARIANT FairCoverageBeforeContinuation
+
+==== BadOverBudget
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    MaxReadySteps = 4
+    BuggyRepeatHot = FALSE
+    BuggyDeniedContinuation = FALSE
+    BuggyEarlyContinuation = FALSE
+    BuggyOverBudget = TRUE
+    BuggyCloneBeforeAdmission = FALSE
+    BuggyApplyBeforeOwnership = FALSE
+    BuggyAliasMessages = FALSE
+    BuggyUseLiveMembership = FALSE
+SPECIFICATION Spec
+INVARIANT ReadyStepBudgetBounded
+
+==== BadCloneBeforeAdmission
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    MaxReadySteps = 4
+    BuggyRepeatHot = FALSE
+    BuggyDeniedContinuation = FALSE
+    BuggyEarlyContinuation = FALSE
+    BuggyOverBudget = FALSE
+    BuggyCloneBeforeAdmission = TRUE
+    BuggyApplyBeforeOwnership = FALSE
+    BuggyAliasMessages = FALSE
+    BuggyUseLiveMembership = FALSE
+SPECIFICATION Spec
+INVARIANT DeniedReadyDoesNotOwnMessages
+
+==== BadApplyBeforeOwnership
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    MaxReadySteps = 4
+    BuggyRepeatHot = FALSE
+    BuggyDeniedContinuation = FALSE
+    BuggyEarlyContinuation = FALSE
+    BuggyOverBudget = FALSE
+    BuggyCloneBeforeAdmission = FALSE
+    BuggyApplyBeforeOwnership = TRUE
+    BuggyAliasMessages = FALSE
+    BuggyUseLiveMembership = FALSE
+SPECIFICATION Spec
+INVARIANT ConfigurationApplyRequiresOwnedMessages
+
+==== BadAliasedMessages
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    MaxReadySteps = 4
+    BuggyRepeatHot = FALSE
+    BuggyDeniedContinuation = FALSE
+    BuggyEarlyContinuation = FALSE
+    BuggyOverBudget = FALSE
+    BuggyCloneBeforeAdmission = FALSE
+    BuggyApplyBeforeOwnership = FALSE
+    BuggyAliasMessages = TRUE
+    BuggyUseLiveMembership = FALSE
+SPECIFICATION Spec
+INVARIANT ReadyMessagesPreserved
+
+==== BadLiveMembership
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    MaxReadySteps = 4
+    BuggyRepeatHot = FALSE
+    BuggyDeniedContinuation = FALSE
+    BuggyEarlyContinuation = FALSE
+    BuggyOverBudget = FALSE
+    BuggyCloneBeforeAdmission = FALSE
+    BuggyApplyBeforeOwnership = FALSE
+    BuggyAliasMessages = FALSE
+    BuggyUseLiveMembership = TRUE
+SPECIFICATION Spec
+INVARIANT SnapshotMembershipMatchesAppliedIndex

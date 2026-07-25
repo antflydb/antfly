@@ -128,7 +128,7 @@ Formal verification of allocator-failure safety for Zig LSM cleanup ownership ha
 
 ### Focused Lower-Level Models
 
-These specs are intentionally separate bounded models. They cover implementation-level contracts that are too specific to fold into one monolithic system model, while keeping each model check independently runnable.
+These specs are bounded around cohesive protocols and lifecycles, not individual bugs or source files. Behaviors that mutate the same authoritative state and whose ordering creates bugs belong in one semantic module, with fast projection configs and heavier composed configs. Split models when their state/fairness assumptions are independent; use an explicit refinement bridge for a critical boundary rather than a monolith.
 
 - `AntflyHAGates.tla` -- Exhaustive HA gate decision table for commit/read/write/owner-job/background-runtime behavior across role, fence, handoff, consistency, LSN, commit-mode, and failure-policy inputs.
 - `AntflyHAGatesBadStandbyRuntime` -- Expected-failure standby mutating background runtime mutant used by `bash ../scripts/tla-check.sh negative`.
@@ -176,11 +176,22 @@ These specs are intentionally separate bounded models. They cover implementation
 - `AntflySnapshotContent.tla` -- Snapshot content/index provenance model.
 - `AntflySnapshotContentBadWrongContent` -- Expected-failure wrong-content-for-index mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflySnapshotContentBadGcNeededContent` -- Expected-failure GC-of-needed-content mutant used by `bash ../scripts/tla-check.sh negative`.
+- `AntflyRaftSchedulerFairness.tla` -- Bounded round-robin tick and Ready selection, including no hot-group starvation.
+- `AntflyRaftSchedulerFairnessBadTickHot` -- Expected-failure activity-priority tick starvation mutant used by `bash ../scripts/tla-check.sh negative`.
+- `AntflyRaftSchedulerFairnessBadReadyHot` -- Expected-failure repeated-hot-group Ready scan mutant used by `bash ../scripts/tla-check.sh negative`.
+- `AntflyRaftReadyPipeline.tla` -- Cohesive Ready lifecycle: fair admission, denied-work deferral, message ownership, configuration apply, exact-index snapshot membership, outbox preservation, continuations, and budgets.
+- Its Bad* checks cover repeated-hot visits, denied/early continuations, budget overflow, clone-before-admission, apply-before-ownership, aliased messages, and live-membership snapshot capture.
 - `AntflyLsmReserveCleanup.tla` -- Explicit LSM reserve/fail/cleanup ownership model.
 - `AntflyLsmReserveCleanupBadPublishWithoutReserve` -- Expected-failure publish-without-cleanup-reserve mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyLsmReserveCleanupBadFailureLeaksTemp` -- Expected-failure failure-leaks-temp mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyQueryCompleteness.tla` -- Split query routing completeness model for no missing or duplicate docs during route/serving transitions.
 - `AntflyNodeDrainLifecycle.tla` -- Node drain/scale-down lifecycle: drain/store-flag raft-transaction consistency, finalize preconditions, safe_to_terminate debt gate, registration-preserves-drain, and drain-eventually-safe liveness.
+- `AntflyPlacementRepair.tla` -- Cohesive placement repair from duplicate-id recovery through stable replacement, expanded membership, latched final peers, authoritative leader proof, contraction, and source retirement.
+- `AntflyPlacementRepairBadLoadSensitiveRetry` -- Expected-failure changing-load-selects-a-new-replacement mutant used by `bash ../scripts/tla-check.sh negative`.
+- `AntflyPlacementRepairBadReplicaRenumber` -- Expected-failure survivor-identity-renumbering mutant used by `bash ../scripts/tla-check.sh negative`.
+- `AntflyPlacementRepairBadRepairWithRebalance` -- Expected-failure mandatory-repair-plus-optional-rebalance mutant used by `bash ../scripts/tla-check.sh negative`.
+- `AntflyPlacementRepairBadDuplicateReplicaIds` -- Expected-failure duplicate-declared-replica-id mutant used by `bash ../scripts/tla-check.sh negative`.
+- `AntflyRuntimeStatusReconciliation.tla` -- Runtime observation precedence and storage-root provenance composed with complete join statistics, schema-migration progress, old-read-schema retention, and standby availability.
 - `AntflyTableLifecycle.tla` -- Table create/drop lifecycle: in-memory desired vs raft-committed topology, per-command applies, crash rebuilding desired from committed, planner scope, and convergence liveness.
 - `AntflyHARetentionReseed.tla` -- WAL retention floor vs per-slot reseed marking vs truncation, plus backup slots as retention pins with fail-closed backup end; no-permanent-unmarked-lag liveness.
 - `AntflyPromotionOwnerHandoff.tla` -- Entity promotion single-owner handoff across split/merge: detach-before-transfer-before-attach, non-durable attachment with crash/reattach, isLocalOwner promotion gate, handoff-completes liveness. Sketch-tier authority guardrail; intentionally collapses raft leadership and runtime detail.

@@ -1,0 +1,31 @@
+==== positive tier=fast
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    BuggyTickHot = FALSE
+    BuggyReadyHot = FALSE
+SPECIFICATION FairSpec
+INVARIANTS
+    BoundedTickGap
+    BoundedReadyGap
+PROPERTIES
+    TickEventuallyEach
+    ReadyEventuallyEach
+
+==== BadTickHot
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    BuggyTickHot = TRUE
+    BuggyReadyHot = FALSE
+SPECIFICATION Spec
+INVARIANT BoundedTickGap
+
+==== BadReadyHot
+CONSTANTS
+    GroupCount = 3
+    HotGroup = 1
+    BuggyTickHot = FALSE
+    BuggyReadyHot = TRUE
+SPECIFICATION Spec
+INVARIANT BoundedReadyGap

@@ -1,0 +1,218 @@
+==== positive tier=fast
+CONSTANTS
+    BuggyLoadSensitive = FALSE
+    BuggyRenumber = FALSE
+    BuggyCombineRebalance = FALSE
+    BuggyDuplicateIds = FALSE
+    BuggyDropAdvancedDuplicate = FALSE
+    BuggyRelatchFinal = FALSE
+    BuggyAcceptWrongStore = FALSE
+    BuggyAcceptWrongSet = FALSE
+    BuggyAcceptNonLeader = FALSE
+    BuggyPrematureRetire = FALSE
+    BuggyWaitForAllFollowers = FALSE
+SPECIFICATION Spec
+INVARIANTS
+    ReplacementTargetLatched
+    SurvivorReplicaIdentityPreserved
+    MandatoryRepairIsSerialized
+    DeclaredReplicaIdsUnique
+    AdvancedDuplicateIsRetained
+    PlacementCountPreserved
+    FinalMembershipIsLatched
+    AcceptedProofIsAuthoritative
+    SourceRetirementRequiresFinalLeaderProof
+
+==== heavy-liveness tier=heavy
+CONSTANTS
+    BuggyLoadSensitive = FALSE
+    BuggyRenumber = FALSE
+    BuggyCombineRebalance = FALSE
+    BuggyDuplicateIds = FALSE
+    BuggyDropAdvancedDuplicate = FALSE
+    BuggyRelatchFinal = FALSE
+    BuggyAcceptWrongStore = FALSE
+    BuggyAcceptWrongSet = FALSE
+    BuggyAcceptNonLeader = FALSE
+    BuggyPrematureRetire = FALSE
+    BuggyWaitForAllFollowers = FALSE
+SPECIFICATION FairSpec
+PROPERTIES
+    RepairEventuallyApplies
+    SourceEventuallyRetires
+
+==== BadLoadSensitiveRetry
+CONSTANTS
+    BuggyLoadSensitive = TRUE
+    BuggyRenumber = FALSE
+    BuggyCombineRebalance = FALSE
+    BuggyDuplicateIds = FALSE
+    BuggyDropAdvancedDuplicate = FALSE
+    BuggyRelatchFinal = FALSE
+    BuggyAcceptWrongStore = FALSE
+    BuggyAcceptWrongSet = FALSE
+    BuggyAcceptNonLeader = FALSE
+    BuggyPrematureRetire = FALSE
+    BuggyWaitForAllFollowers = FALSE
+SPECIFICATION Spec
+INVARIANT ReplacementTargetLatched
+
+==== BadReplicaRenumber
+CONSTANTS
+    BuggyLoadSensitive = FALSE
+    BuggyRenumber = TRUE
+    BuggyCombineRebalance = FALSE
+    BuggyDuplicateIds = FALSE
+    BuggyDropAdvancedDuplicate = FALSE
+    BuggyRelatchFinal = FALSE
+    BuggyAcceptWrongStore = FALSE
+    BuggyAcceptWrongSet = FALSE
+    BuggyAcceptNonLeader = FALSE
+    BuggyPrematureRetire = FALSE
+    BuggyWaitForAllFollowers = FALSE
+SPECIFICATION Spec
+INVARIANT SurvivorReplicaIdentityPreserved
+
+==== BadRepairWithRebalance
+CONSTANTS
+    BuggyLoadSensitive = FALSE
+    BuggyRenumber = FALSE
+    BuggyCombineRebalance = TRUE
+    BuggyDuplicateIds = FALSE
+    BuggyDropAdvancedDuplicate = FALSE
+    BuggyRelatchFinal = FALSE
+    BuggyAcceptWrongStore = FALSE
+    BuggyAcceptWrongSet = FALSE
+    BuggyAcceptNonLeader = FALSE
+    BuggyPrematureRetire = FALSE
+    BuggyWaitForAllFollowers = FALSE
+SPECIFICATION Spec
+INVARIANT MandatoryRepairIsSerialized
+
+==== BadDuplicateReplicaIds
+CONSTANTS
+    BuggyLoadSensitive = FALSE
+    BuggyRenumber = FALSE
+    BuggyCombineRebalance = FALSE
+    BuggyDuplicateIds = TRUE
+    BuggyDropAdvancedDuplicate = FALSE
+    BuggyRelatchFinal = FALSE
+    BuggyAcceptWrongStore = FALSE
+    BuggyAcceptWrongSet = FALSE
+    BuggyAcceptNonLeader = FALSE
+    BuggyPrematureRetire = FALSE
+    BuggyWaitForAllFollowers = FALSE
+SPECIFICATION Spec
+INVARIANT DeclaredReplicaIdsUnique
+
+==== BadDropAdvancedDuplicate
+CONSTANTS
+    BuggyLoadSensitive = FALSE
+    BuggyRenumber = FALSE
+    BuggyCombineRebalance = FALSE
+    BuggyDuplicateIds = FALSE
+    BuggyDropAdvancedDuplicate = TRUE
+    BuggyRelatchFinal = FALSE
+    BuggyAcceptWrongStore = FALSE
+    BuggyAcceptWrongSet = FALSE
+    BuggyAcceptNonLeader = FALSE
+    BuggyPrematureRetire = FALSE
+    BuggyWaitForAllFollowers = FALSE
+SPECIFICATION Spec
+INVARIANT AdvancedDuplicateIsRetained
+
+==== BadRelatchFinal
+CONSTANTS
+    BuggyLoadSensitive = FALSE
+    BuggyRenumber = FALSE
+    BuggyCombineRebalance = FALSE
+    BuggyDuplicateIds = FALSE
+    BuggyDropAdvancedDuplicate = FALSE
+    BuggyRelatchFinal = TRUE
+    BuggyAcceptWrongStore = FALSE
+    BuggyAcceptWrongSet = FALSE
+    BuggyAcceptNonLeader = FALSE
+    BuggyPrematureRetire = FALSE
+    BuggyWaitForAllFollowers = FALSE
+SPECIFICATION Spec
+INVARIANT FinalMembershipIsLatched
+
+==== BadWrongStoreProof
+CONSTANTS
+    BuggyLoadSensitive = FALSE
+    BuggyRenumber = FALSE
+    BuggyCombineRebalance = FALSE
+    BuggyDuplicateIds = FALSE
+    BuggyDropAdvancedDuplicate = FALSE
+    BuggyRelatchFinal = FALSE
+    BuggyAcceptWrongStore = TRUE
+    BuggyAcceptWrongSet = FALSE
+    BuggyAcceptNonLeader = FALSE
+    BuggyPrematureRetire = FALSE
+    BuggyWaitForAllFollowers = FALSE
+SPECIFICATION Spec
+INVARIANT AcceptedProofIsAuthoritative
+
+==== BadWrongMembershipProof
+CONSTANTS
+    BuggyLoadSensitive = FALSE
+    BuggyRenumber = FALSE
+    BuggyCombineRebalance = FALSE
+    BuggyDuplicateIds = FALSE
+    BuggyDropAdvancedDuplicate = FALSE
+    BuggyRelatchFinal = FALSE
+    BuggyAcceptWrongStore = FALSE
+    BuggyAcceptWrongSet = TRUE
+    BuggyAcceptNonLeader = FALSE
+    BuggyPrematureRetire = FALSE
+    BuggyWaitForAllFollowers = FALSE
+SPECIFICATION Spec
+INVARIANT AcceptedProofIsAuthoritative
+
+==== BadNonLeaderProof
+CONSTANTS
+    BuggyLoadSensitive = FALSE
+    BuggyRenumber = FALSE
+    BuggyCombineRebalance = FALSE
+    BuggyDuplicateIds = FALSE
+    BuggyDropAdvancedDuplicate = FALSE
+    BuggyRelatchFinal = FALSE
+    BuggyAcceptWrongStore = FALSE
+    BuggyAcceptWrongSet = FALSE
+    BuggyAcceptNonLeader = TRUE
+    BuggyPrematureRetire = FALSE
+    BuggyWaitForAllFollowers = FALSE
+SPECIFICATION Spec
+INVARIANT AcceptedProofIsAuthoritative
+
+==== BadPrematureRetirement
+CONSTANTS
+    BuggyLoadSensitive = FALSE
+    BuggyRenumber = FALSE
+    BuggyCombineRebalance = FALSE
+    BuggyDuplicateIds = FALSE
+    BuggyDropAdvancedDuplicate = FALSE
+    BuggyRelatchFinal = FALSE
+    BuggyAcceptWrongStore = FALSE
+    BuggyAcceptWrongSet = FALSE
+    BuggyAcceptNonLeader = FALSE
+    BuggyPrematureRetire = TRUE
+    BuggyWaitForAllFollowers = FALSE
+SPECIFICATION Spec
+INVARIANT SourceRetirementRequiresFinalLeaderProof
+
+==== BadWaitForAllFollowers
+CONSTANTS
+    BuggyLoadSensitive = FALSE
+    BuggyRenumber = FALSE
+    BuggyCombineRebalance = FALSE
+    BuggyDuplicateIds = FALSE
+    BuggyDropAdvancedDuplicate = FALSE
+    BuggyRelatchFinal = FALSE
+    BuggyAcceptWrongStore = FALSE
+    BuggyAcceptWrongSet = FALSE
+    BuggyAcceptNonLeader = FALSE
+    BuggyPrematureRetire = FALSE
+    BuggyWaitForAllFollowers = TRUE
+SPECIFICATION FairSpec
+PROPERTY SourceEventuallyRetires

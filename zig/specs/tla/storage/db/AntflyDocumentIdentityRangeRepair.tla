@@ -47,10 +47,16 @@ CONSTANTS
     BuggyMergeAllowsMismatchWithoutOptIn,
     BuggyMergeAllowsActiveReassignment,
     BuggyRestoreAcceptsNamespaceMismatch,
-    BuggyRestoreClearsBeforeRepair
+    BuggyRestoreClearsBeforeRepair,
+    BuggyRestoreAcceptsMismatchedArtifact,
+    BuggyRestoreClearsAfterOneReplica,
+    BuggyRestoreReadyEarly,
+    BuggySplitWhileRestorePending
 
 Namespaces == 1..2
 ExpectedDestNamespace == 2
+Replicas == {"n1", "n2"}
+Artifacts == {"bound", "other", "none"}
 
 StatusKinds ==
     {"healthyA", "healthyB", "oldNoRows", "active", "conflict", "rebuild", "exhausted"}
@@ -71,14 +77,23 @@ VARIABLES
     importRecovered,
     runtimeRepairNeeded,
     runtimeRepairComplete,
-    restoreIntentCleared
+    restoreIntentCleared,
+    expectedArtifact,
+    reportedArtifact,
+    replicaRepairComplete,
+    acceptedMismatchedArtifact,
+    restorePending,
+    groupReady,
+    splitStarted
 
 vars ==
     <<sourceStatus, donorStatus, receiverStatus, destStoredNamespace, mergeOptIn,
       restoreSourceNamespace, restoreTargetNamespace, splitAccepted,
       splitStatusAccepted, mergeAccepted, receiverReassigned,
       strictRestoreAccepted, importRecovered, runtimeRepairNeeded,
-      runtimeRepairComplete, restoreIntentCleared>>
+      runtimeRepairComplete, restoreIntentCleared, expectedArtifact,
+      reportedArtifact, replicaRepairComplete, acceptedMismatchedArtifact,
+      restorePending, groupReady, splitStarted>>
 
 Init ==
     /\ sourceStatus \in StatusKinds
@@ -97,6 +112,13 @@ Init ==
     /\ runtimeRepairNeeded = FALSE
     /\ runtimeRepairComplete = FALSE
     /\ restoreIntentCleared = FALSE
+    /\ expectedArtifact = "bound"
+    /\ reportedArtifact = [n \in Replicas |-> "none"]
+    /\ replicaRepairComplete = {}
+    /\ acceptedMismatchedArtifact = FALSE
+    /\ restorePending = TRUE
+    /\ groupReady = FALSE
+    /\ splitStarted = FALSE
 
 StatusNamespace(s) ==
     CASE s = "healthyB" -> 2
@@ -134,7 +156,9 @@ ValidateSplit ==
                   restoreTargetNamespace, splitStatusAccepted, mergeAccepted,
                   receiverReassigned, strictRestoreAccepted, importRecovered,
                   runtimeRepairNeeded, runtimeRepairComplete,
-                  restoreIntentCleared>>
+                  restoreIntentCleared, expectedArtifact, reportedArtifact,
+                  replicaRepairComplete, acceptedMismatchedArtifact,
+                  restorePending, groupReady, splitStarted>>
 
 ObserveSplitDestinationStatus ==
     /\ splitStatusAccepted' =
@@ -146,7 +170,9 @@ ObserveSplitDestinationStatus ==
                   restoreTargetNamespace, splitAccepted, mergeAccepted,
                   receiverReassigned, strictRestoreAccepted, importRecovered,
                   runtimeRepairNeeded, runtimeRepairComplete,
-                  restoreIntentCleared>>
+                  restoreIntentCleared, expectedArtifact, reportedArtifact,
+                  replicaRepairComplete, acceptedMismatchedArtifact,
+                  restorePending, groupReady, splitStarted>>
 
 ValidateMerge ==
     /\ mergeAccepted' =
@@ -158,7 +184,9 @@ ValidateMerge ==
                   restoreTargetNamespace, splitAccepted, splitStatusAccepted,
                   receiverReassigned, strictRestoreAccepted, importRecovered,
                   runtimeRepairNeeded, runtimeRepairComplete,
-                  restoreIntentCleared>>
+                  restoreIntentCleared, expectedArtifact, reportedArtifact,
+                  replicaRepairComplete, acceptedMismatchedArtifact,
+                  restorePending, groupReady, splitStarted>>
 
 ReassignReceiverNamespace ==
     /\ receiverReassigned' =
@@ -170,7 +198,9 @@ ReassignReceiverNamespace ==
                   restoreTargetNamespace, splitAccepted, splitStatusAccepted,
                   mergeAccepted, strictRestoreAccepted, importRecovered,
                   runtimeRepairNeeded, runtimeRepairComplete,
-                  restoreIntentCleared>>
+                  restoreIntentCleared, expectedArtifact, reportedArtifact,
+                  replicaRepairComplete, acceptedMismatchedArtifact,
+                  restorePending, groupReady, splitStarted>>
 
 StrictDeferredRestore ==
     /\ strictRestoreAccepted' =
@@ -182,7 +212,9 @@ StrictDeferredRestore ==
                   restoreTargetNamespace, splitAccepted, splitStatusAccepted,
                   mergeAccepted, receiverReassigned, importRecovered,
                   runtimeRepairNeeded, runtimeRepairComplete,
-                  restoreIntentCleared>>
+                  restoreIntentCleared, expectedArtifact, reportedArtifact,
+                  replicaRepairComplete, acceptedMismatchedArtifact,
+                  restorePending, groupReady, splitStarted>>
 
 RecoverIncompleteImport ==
     /\ importRecovered' = TRUE
@@ -191,28 +223,95 @@ RecoverIncompleteImport ==
                   destStoredNamespace, mergeOptIn, restoreSourceNamespace,
                   restoreTargetNamespace, splitAccepted, splitStatusAccepted,
                   mergeAccepted, receiverReassigned, strictRestoreAccepted,
-                  runtimeRepairComplete, restoreIntentCleared>>
+                  runtimeRepairComplete, restoreIntentCleared, expectedArtifact, reportedArtifact,
+                  replicaRepairComplete, acceptedMismatchedArtifact,
+                  restorePending, groupReady, splitStarted>>
 
 RunRuntimeRepair ==
     /\ importRecovered
     /\ runtimeRepairNeeded
     /\ runtimeRepairComplete' = TRUE
+    /\ reportedArtifact' =
+        [reportedArtifact EXCEPT !["n1"] = expectedArtifact]
+    /\ replicaRepairComplete' = replicaRepairComplete \cup {"n1"}
     /\ UNCHANGED <<sourceStatus, donorStatus, receiverStatus,
                   destStoredNamespace, mergeOptIn, restoreSourceNamespace,
                   restoreTargetNamespace, splitAccepted, splitStatusAccepted,
                   mergeAccepted, receiverReassigned, strictRestoreAccepted,
-                  importRecovered, runtimeRepairNeeded, restoreIntentCleared>>
+                  importRecovered, runtimeRepairNeeded, restoreIntentCleared,
+                  expectedArtifact, acceptedMismatchedArtifact,
+                  restorePending, groupReady, splitStarted>>
+
+ReportReplicaRepair(n, artifact) ==
+    /\ importRecovered
+    /\ runtimeRepairNeeded
+    /\ n \in Replicas
+    /\ artifact \in Artifacts \ {"none"}
+    /\ reportedArtifact' =
+        IF artifact = expectedArtifact \/ BuggyRestoreAcceptsMismatchedArtifact
+        THEN [reportedArtifact EXCEPT ![n] = artifact]
+        ELSE reportedArtifact
+    /\ replicaRepairComplete' =
+        IF artifact = expectedArtifact \/ BuggyRestoreAcceptsMismatchedArtifact
+        THEN replicaRepairComplete \cup {n}
+        ELSE replicaRepairComplete
+    /\ acceptedMismatchedArtifact' =
+        (acceptedMismatchedArtifact \/
+            (artifact # expectedArtifact /\
+             BuggyRestoreAcceptsMismatchedArtifact))
+    /\ runtimeRepairComplete' =
+        (runtimeRepairComplete \/ (n = "n1" /\ artifact = expectedArtifact))
+    /\ UNCHANGED <<sourceStatus, donorStatus, receiverStatus,
+                  destStoredNamespace, mergeOptIn, restoreSourceNamespace,
+                  restoreTargetNamespace, splitAccepted, splitStatusAccepted,
+                  mergeAccepted, receiverReassigned, strictRestoreAccepted,
+                  importRecovered, runtimeRepairNeeded, restoreIntentCleared,
+                  expectedArtifact, restorePending, groupReady, splitStarted>>
 
 ClearRestoreIntent ==
     /\ restoreIntentCleared' =
         IF BuggyRestoreClearsBeforeRepair
         THEN TRUE
-        ELSE importRecovered /\ runtimeRepairNeeded /\ runtimeRepairComplete
+        ELSE /\ importRecovered
+             /\ runtimeRepairNeeded
+             /\ runtimeRepairComplete
+             /\ IF BuggyRestoreClearsAfterOneReplica
+                THEN replicaRepairComplete # {}
+                ELSE replicaRepairComplete = Replicas
+    /\ restorePending' = ~restoreIntentCleared'
     /\ UNCHANGED <<sourceStatus, donorStatus, receiverStatus,
                   destStoredNamespace, mergeOptIn, restoreSourceNamespace,
                   restoreTargetNamespace, splitAccepted, splitStatusAccepted,
                   mergeAccepted, receiverReassigned, strictRestoreAccepted,
-                  importRecovered, runtimeRepairNeeded, runtimeRepairComplete>>
+                  importRecovered, runtimeRepairNeeded, runtimeRepairComplete,
+                  expectedArtifact, reportedArtifact, replicaRepairComplete,
+                  acceptedMismatchedArtifact, groupReady, splitStarted>>
+
+UpdateRestoreReadiness ==
+    /\ ~groupReady
+    /\ ~restorePending \/ BuggyRestoreReadyEarly
+    /\ groupReady' = TRUE
+    /\ UNCHANGED <<sourceStatus, donorStatus, receiverStatus,
+                  destStoredNamespace, mergeOptIn, restoreSourceNamespace,
+                  restoreTargetNamespace, splitAccepted, splitStatusAccepted,
+                  mergeAccepted, receiverReassigned, strictRestoreAccepted,
+                  importRecovered, runtimeRepairNeeded, runtimeRepairComplete,
+                  restoreIntentCleared, expectedArtifact, reportedArtifact,
+                  replicaRepairComplete, acceptedMismatchedArtifact,
+                  restorePending, splitStarted>>
+
+StartSplitDuringRestore ==
+    /\ ~splitStarted
+    /\ ~restorePending \/ BuggySplitWhileRestorePending
+    /\ splitStarted' = TRUE
+    /\ UNCHANGED <<sourceStatus, donorStatus, receiverStatus,
+                  destStoredNamespace, mergeOptIn, restoreSourceNamespace,
+                  restoreTargetNamespace, splitAccepted, splitStatusAccepted,
+                  mergeAccepted, receiverReassigned, strictRestoreAccepted,
+                  importRecovered, runtimeRepairNeeded, runtimeRepairComplete,
+                  restoreIntentCleared, expectedArtifact, reportedArtifact,
+                  replicaRepairComplete, acceptedMismatchedArtifact,
+                  restorePending, groupReady>>
 
 Next ==
     \/ ValidateSplit
@@ -222,9 +321,21 @@ Next ==
     \/ StrictDeferredRestore
     \/ RecoverIncompleteImport
     \/ RunRuntimeRepair
+    \/ \E n \in Replicas:
+        \/ ReportReplicaRepair(n, expectedArtifact)
+        \/ ReportReplicaRepair(n, "other")
     \/ ClearRestoreIntent
+    \/ UpdateRestoreReadiness
+    \/ StartSplitDuringRestore
 
 Spec == Init /\ [][Next]_vars
+
+FairSpec ==
+    /\ Spec
+    /\ WF_vars(RecoverIncompleteImport)
+    /\ \A n \in Replicas: WF_vars(ReportReplicaRepair(n, expectedArtifact))
+    /\ WF_vars(ClearRestoreIntent)
+    /\ WF_vars(UpdateRestoreReadiness)
 
 TypeOK ==
     /\ sourceStatus \in StatusKinds
@@ -243,6 +354,13 @@ TypeOK ==
     /\ runtimeRepairNeeded \in BOOLEAN
     /\ runtimeRepairComplete \in BOOLEAN
     /\ restoreIntentCleared \in BOOLEAN
+    /\ expectedArtifact \in Artifacts
+    /\ reportedArtifact \in [Replicas -> Artifacts]
+    /\ replicaRepairComplete \subseteq Replicas
+    /\ acceptedMismatchedArtifact \in BOOLEAN
+    /\ restorePending \in BOOLEAN
+    /\ groupReady \in BOOLEAN
+    /\ splitStarted \in BOOLEAN
 
 SplitRequiresHealthySource ==
     splitAccepted => SplitCompatible(sourceStatus)
@@ -267,6 +385,21 @@ RestoreIntentClearsOnlyAfterRepairComplete ==
         /\ importRecovered
         /\ runtimeRepairNeeded
         /\ runtimeRepairComplete
+        /\ replicaRepairComplete = Replicas
+
+RestoreProgressMatchesCommittedArtifact ==
+    /\ ~acceptedMismatchedArtifact
+    /\ \A n \in replicaRepairComplete:
+        reportedArtifact[n] = expectedArtifact
+
+RestorePendingGroupsAreNotReady ==
+    restorePending => ~groupReady
+
+RestorePendingGroupsDoNotSplit ==
+    restorePending => ~splitStarted
+
+RestoreEventuallyReady ==
+    <>groupReady
 
 Safety ==
     /\ TypeOK
@@ -277,5 +410,8 @@ Safety ==
     /\ StrictRestoreRejectsNamespaceMismatch
     /\ RuntimeRepairRequiresRecoveredPrimaryImport
     /\ RestoreIntentClearsOnlyAfterRepairComplete
+    /\ RestoreProgressMatchesCommittedArtifact
+    /\ RestorePendingGroupsAreNotReady
+    /\ RestorePendingGroupsDoNotSplit
 
 =============================================================================

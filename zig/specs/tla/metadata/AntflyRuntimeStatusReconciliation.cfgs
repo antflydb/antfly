@@ -1,0 +1,135 @@
+==== positive tier=fast
+CONSTANTS
+    BuggyOlderStatusWins = FALSE
+    BuggyRemovedOwnerWins = FALSE
+    BuggyCrossRootDiskReuse = FALSE
+    BuggyUnknownZeroIsKnown = FALSE
+    BuggyPartialJoinStats = FALSE
+    BuggyPartialSchemaFinalize = FALSE
+    BuggyStaleSchemaProgress = FALSE
+    BuggyDropOldReadSchema = FALSE
+SPECIFICATION Spec
+INVARIANTS
+    NewerAuthoritativeStatusIsStable
+    RemovedOwnersAreIgnored
+    KnownDiskFactsMatchStorageRoot
+    JoinUsesCompleteFreshFacts
+    SchemaFinalizesWithCompleteCurrentCoverage
+    ReadSchemaAvailableOnEveryServingReplica
+
+==== heavy-liveness tier=heavy
+CONSTANTS
+    BuggyOlderStatusWins = FALSE
+    BuggyRemovedOwnerWins = FALSE
+    BuggyCrossRootDiskReuse = FALSE
+    BuggyUnknownZeroIsKnown = FALSE
+    BuggyPartialJoinStats = FALSE
+    BuggyPartialSchemaFinalize = FALSE
+    BuggyStaleSchemaProgress = FALSE
+    BuggyDropOldReadSchema = FALSE
+SPECIFICATION FairSpec
+PROPERTY MigrationEventuallyFinalizes
+
+==== BadOlderStatusWins
+CONSTANTS
+    BuggyOlderStatusWins = TRUE
+    BuggyRemovedOwnerWins = FALSE
+    BuggyCrossRootDiskReuse = FALSE
+    BuggyUnknownZeroIsKnown = FALSE
+    BuggyPartialJoinStats = FALSE
+    BuggyPartialSchemaFinalize = FALSE
+    BuggyStaleSchemaProgress = FALSE
+    BuggyDropOldReadSchema = FALSE
+SPECIFICATION Spec
+INVARIANT NewerAuthoritativeStatusIsStable
+
+==== BadRemovedOwnerWins
+CONSTANTS
+    BuggyOlderStatusWins = FALSE
+    BuggyRemovedOwnerWins = TRUE
+    BuggyCrossRootDiskReuse = FALSE
+    BuggyUnknownZeroIsKnown = FALSE
+    BuggyPartialJoinStats = FALSE
+    BuggyPartialSchemaFinalize = FALSE
+    BuggyStaleSchemaProgress = FALSE
+    BuggyDropOldReadSchema = FALSE
+SPECIFICATION Spec
+INVARIANT RemovedOwnersAreIgnored
+
+==== BadCrossRootDiskReuse
+CONSTANTS
+    BuggyOlderStatusWins = FALSE
+    BuggyRemovedOwnerWins = FALSE
+    BuggyCrossRootDiskReuse = TRUE
+    BuggyUnknownZeroIsKnown = FALSE
+    BuggyPartialJoinStats = FALSE
+    BuggyPartialSchemaFinalize = FALSE
+    BuggyStaleSchemaProgress = FALSE
+    BuggyDropOldReadSchema = FALSE
+SPECIFICATION Spec
+INVARIANT KnownDiskFactsMatchStorageRoot
+
+==== BadUnknownZeroIsKnown
+CONSTANTS
+    BuggyOlderStatusWins = FALSE
+    BuggyRemovedOwnerWins = FALSE
+    BuggyCrossRootDiskReuse = FALSE
+    BuggyUnknownZeroIsKnown = TRUE
+    BuggyPartialJoinStats = FALSE
+    BuggyPartialSchemaFinalize = FALSE
+    BuggyStaleSchemaProgress = FALSE
+    BuggyDropOldReadSchema = FALSE
+SPECIFICATION Spec
+INVARIANT KnownDiskFactsMatchStorageRoot
+
+==== BadPartialJoinStats
+CONSTANTS
+    BuggyOlderStatusWins = FALSE
+    BuggyRemovedOwnerWins = FALSE
+    BuggyCrossRootDiskReuse = FALSE
+    BuggyUnknownZeroIsKnown = FALSE
+    BuggyPartialJoinStats = TRUE
+    BuggyPartialSchemaFinalize = FALSE
+    BuggyStaleSchemaProgress = FALSE
+    BuggyDropOldReadSchema = FALSE
+SPECIFICATION Spec
+INVARIANT JoinUsesCompleteFreshFacts
+
+==== BadPartialSchemaFinalize
+CONSTANTS
+    BuggyOlderStatusWins = FALSE
+    BuggyRemovedOwnerWins = FALSE
+    BuggyCrossRootDiskReuse = FALSE
+    BuggyUnknownZeroIsKnown = FALSE
+    BuggyPartialJoinStats = FALSE
+    BuggyPartialSchemaFinalize = TRUE
+    BuggyStaleSchemaProgress = FALSE
+    BuggyDropOldReadSchema = FALSE
+SPECIFICATION Spec
+INVARIANT SchemaFinalizesWithCompleteCurrentCoverage
+
+==== BadStaleSchemaProgress
+CONSTANTS
+    BuggyOlderStatusWins = FALSE
+    BuggyRemovedOwnerWins = FALSE
+    BuggyCrossRootDiskReuse = FALSE
+    BuggyUnknownZeroIsKnown = FALSE
+    BuggyPartialJoinStats = FALSE
+    BuggyPartialSchemaFinalize = FALSE
+    BuggyStaleSchemaProgress = TRUE
+    BuggyDropOldReadSchema = FALSE
+SPECIFICATION Spec
+INVARIANT SchemaFinalizesWithCompleteCurrentCoverage
+
+==== BadDropOldReadSchema
+CONSTANTS
+    BuggyOlderStatusWins = FALSE
+    BuggyRemovedOwnerWins = FALSE
+    BuggyCrossRootDiskReuse = FALSE
+    BuggyUnknownZeroIsKnown = FALSE
+    BuggyPartialJoinStats = FALSE
+    BuggyPartialSchemaFinalize = FALSE
+    BuggyStaleSchemaProgress = FALSE
+    BuggyDropOldReadSchema = TRUE
+SPECIFICATION Spec
+INVARIANT ReadSchemaAvailableOnEveryServingReplica
