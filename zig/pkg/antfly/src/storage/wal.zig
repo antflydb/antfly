@@ -2819,6 +2819,45 @@ test "wal modeled storage survives crash before close after acknowledged append"
     try std.testing.expectEqualStrings("committed-before-crash", entries[0].data);
 }
 
+test "wal modeled storage preserves acknowledged append across segment rotation crash" {
+    var runtime = storage_sim.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+
+    var device_model = storage_sim.ModeledDevice.init(std.testing.allocator);
+    defer device_model.deinit();
+
+    const path: [*:0]const u8 = "/wal-modeled-rotation-crash";
+    const opts = WalOptions{
+        .backend = .lsm,
+        .storage = device_model.storage(),
+        .clock = runtime.clock(),
+        .commit_scheduler = runtime.completionScheduler(),
+        .model_commit_backend_completions = true,
+        .lsm_options = .{ .wal_segment_bytes = 32 },
+    };
+
+    var crashed_wal = try WAL.open(path, opts);
+    try std.testing.expectEqual(@as(u64, 1), try crashed_wal.append("first-segment-record"));
+    try std.testing.expectEqual(@as(u64, 2), try crashed_wal.append("rotated-segment-record"));
+    try std.testing.expect((try device_model.fileSize("/wal-modeled-rotation-crash/wal/00000000000000000002.log")) > 0);
+
+    try device_model.device().crash();
+    crashed_wal.abandonAfterModeledCrash();
+
+    var reopened = try WAL.open(path, opts);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 3), reopened.next_lsn);
+
+    const entries = try reopened.iterateFrom(std.testing.allocator, 1);
+    defer {
+        for (entries) |entry| std.testing.allocator.free(entry.data);
+        std.testing.allocator.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("first-segment-record", entries[0].data);
+    try std.testing.expectEqualStrings("rotated-segment-record", entries[1].data);
+}
+
 test "wal lsm sync boundary failures recover a valid acknowledged prefix" {
     const sync_failure_needles = [_][]const u8{
         "/wal/00000000000000000001.log",
@@ -2844,6 +2883,11 @@ test "wal lsm sync boundary failures recover a valid acknowledged prefix" {
             .storage = device_model.storage(),
             .clock = runtime.clock(),
             .commit_scheduler = runtime.completionScheduler(),
+            .lsm_options = .{
+                // Index publication is segment-scoped, so force the index
+                // boundary case through a real rotation.
+                .wal_segment_bytes = if (case_index == 1) 32 else 64 * 1024 * 1024,
+            },
         };
 
         var crashed_wal = try WAL.open(path, opts);
@@ -4036,7 +4080,7 @@ test "wal full durability does not repeat an already durable lsm commit" {
     const after = wal.statsSnapshot();
 
     try std.testing.expectEqual(@as(u64, 1), after.inner_segment_syncs - before.inner_segment_syncs);
-    try std.testing.expectEqual(@as(u64, 1), after.inner_index_syncs - before.inner_index_syncs);
+    try std.testing.expectEqual(@as(u64, 0), after.inner_index_syncs - before.inner_index_syncs);
     try std.testing.expectEqual(@as(u64, 0), after.post_commit_segment_syncs - before.post_commit_segment_syncs);
     try std.testing.expectEqual(@as(u64, 0), after.post_commit_index_syncs - before.post_commit_index_syncs);
 }
@@ -4061,7 +4105,7 @@ test "wal retains post commit sync when lsm commit is not durable" {
     const after = wal.statsSnapshot();
 
     try std.testing.expectEqual(@as(u64, 0), after.inner_segment_syncs - before.inner_segment_syncs);
-    try std.testing.expectEqual(@as(u64, 1), after.inner_index_syncs - before.inner_index_syncs);
+    try std.testing.expectEqual(@as(u64, 0), after.inner_index_syncs - before.inner_index_syncs);
     try std.testing.expectEqual(@as(u64, 1), after.post_commit_segment_syncs - before.post_commit_segment_syncs);
     try std.testing.expectEqual(@as(u64, 1), after.post_commit_index_syncs - before.post_commit_index_syncs);
 }

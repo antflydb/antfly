@@ -218,6 +218,17 @@ pub const TablesResponse = struct {
     }
 };
 
+pub const LoadBalancedTablesResponse = struct {
+    body: []u8,
+    endpoint_index: usize,
+    attempts: usize,
+
+    pub fn deinit(self: *LoadBalancedTablesResponse, alloc: std.mem.Allocator) void {
+        alloc.free(self.body);
+        self.* = undefined;
+    }
+};
+
 pub const EmptyResponse = struct {
     pub fn deinit(_: *EmptyResponse, _: std.mem.Allocator) void {}
 };
@@ -428,6 +439,41 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         if (resp.status != 200) return error.UnexpectedHttpStatus;
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
+    /// Tries each endpoint at most once, advancing only when an endpoint
+    /// explicitly reports the retry-safe metadata-leader-unavailable response.
+    /// Other failures are returned immediately so a POST is never replayed
+    /// after an ambiguous transport or application failure.
+    pub fn fetchClusterBackupFromEndpoints(
+        self: *ApiHttpClient,
+        base_uris: []const []const u8,
+        body: []const u8,
+    ) !LoadBalancedTablesResponse {
+        if (base_uris.len == 0) return error.NoApiEndpoints;
+        const path = routes.Routes.backup;
+
+        for (base_uris, 0..) |base_uri, endpoint_index| {
+            const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+            defer self.alloc.free(uri);
+
+            var resp = try self.executor.execute(self.alloc, .{
+                .method = .POST,
+                .uri = uri,
+                .content_type = "application/json",
+                .body = body,
+            });
+            defer resp.deinit(self.alloc);
+            if (resp.status == 200) {
+                return .{
+                    .body = try self.alloc.dupe(u8, resp.body),
+                    .endpoint_index = endpoint_index,
+                    .attempts = endpoint_index + 1,
+                };
+            }
+            if (!isRetryableMetadataLeaderResponse(resp)) return error.UnexpectedHttpStatus;
+        }
+        return error.MetadataLeaderUnavailable;
     }
 
     pub fn fetchClusterRestore(
@@ -2485,6 +2531,18 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "repair cancelled")) return error.Canceled;
     return error.UnexpectedHttpStatus;
+}
+
+fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {
+    if (resp.status != 503) return false;
+    for (resp.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header) and
+            std.ascii.eqlIgnoreCase(header.value, http_common.metadata_not_leader_value))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {

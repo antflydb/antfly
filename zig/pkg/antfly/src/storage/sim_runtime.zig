@@ -481,6 +481,7 @@ const modeled_storage_vtable: lsm_storage.Storage.VTable = .{
     .file_size = modeledFileSize,
     .read_file_trailer_alloc = modeledReadFileTrailerAlloc,
     .write_file_absolute = modeledWriteFileAbsolute,
+    .sync_file_absolute = modeledSyncFileAbsolute,
     .rename_absolute = modeledRenameAbsolute,
     .delete_file_absolute = modeledDeleteFileAbsolute,
     .delete_tree = modeledDeleteTree,
@@ -528,6 +529,11 @@ fn modeledWriteFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const
     try device.truncate(path, 0);
     try device.write(path, 0, contents);
     try device.sync(path);
+}
+
+fn modeledSyncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+    const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
+    try self.device().sync(path);
 }
 
 fn modeledRenameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {

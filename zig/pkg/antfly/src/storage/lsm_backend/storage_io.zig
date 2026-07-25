@@ -570,6 +570,9 @@ const BufferedAtomicWriteSink = struct {
             self.storage.deleteFileAbsolute(self.tmp_path) catch {};
             return err;
         };
+        // Atomic replacement is not durable until both the replacement file and
+        // the directory entry created by rename have reached stable storage.
+        try self.storage.syncFileAbsolute(self.final_path);
     }
 
     fn abort(ptr: *anyopaque) void {
@@ -2041,6 +2044,7 @@ const NativeBufferedAtomicWriteSink = struct {
             deleteFilePathWithIo(io_impl.io(), self.tmp_path) catch {};
             return err;
         };
+        try syncFilePathWithIo(io_impl.io(), self.final_path);
     }
 
     fn abort(ptr: *anyopaque) void {
@@ -2155,6 +2159,7 @@ const NativeAtomicWriteSink = struct {
             deleteFilePathPosix(self.tmp_path) catch {};
             return err;
         };
+        try syncParentDirectoryPosix(self.final_path);
     }
 
     fn abort(ptr: *anyopaque) void {
@@ -2174,6 +2179,17 @@ const native_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
     .finish = NativeAtomicWriteSink.finish,
     .abort = NativeAtomicWriteSink.abort,
 };
+
+fn syncParentDirectoryPosix(path: []const u8) !void {
+    const parent_path = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
+    const parent_fd = try std.posix.openat(std.posix.AT.FDCWD, parent_path, .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    defer closeFd(parent_fd);
+    try fs_paths.syncFdPortable(parent_fd);
+}
 
 pub const MemoryStorage = struct {
     allocator: Allocator,

@@ -252,11 +252,6 @@ pub fn appendStateWithOptionsResult(
         },
         else => return err,
     };
-    current_size += record.len;
-    if (!current.index_exists or current.segment != segment or current.size != current_size) {
-        try writeCurrentSegment(storage, allocator, root_dir, segment, current_size);
-        index_syncs += 1;
-    }
     allocator.free(segment_path);
     segment_path_owned = false;
     return .{
@@ -1512,15 +1507,20 @@ const CheckpointIndex = struct {
 };
 
 fn readCurrentSegment(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !CurrentSegment {
-    const segment = readCurrentSegmentIfPresent(storage, allocator, root_dir) catch |err| switch (err) {
+    var segment = readCurrentSegmentIfPresent(storage, allocator, root_dir) catch |err| switch (err) {
         error.FileNotFound => return .{ .segment = 1, .size = 0, .index_exists = false },
         else => return err,
     };
-    return .{
-        .segment = segment.segment,
-        .size = segment.size,
-        .index_exists = true,
+    // The index's size field is advisory for backwards compatibility. Derive
+    // the active size from the segment itself so a normal append needs only the
+    // segment fsync; the atomic index is published only when the segment changes.
+    const segment_path = try segmentPathAlloc(allocator, root_dir, segment.segment);
+    defer allocator.free(segment_path);
+    segment.size = storage.fileSize(segment_path) catch |err| switch (err) {
+        error.FileNotFound => 0,
+        else => return err,
     };
+    return segment;
 }
 
 fn readCurrentSegmentIfPresent(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !CurrentSegment {
@@ -1936,7 +1936,7 @@ test "lsm wal rotates small segments and replays all records" {
     try std.testing.expectEqualStrings("B", try replayed.get(.{ .name = "docs" }, "b"));
 }
 
-test "lsm wal current segment index stores cached segment size" {
+test "lsm wal derives current segment size without republishing the index" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
     const root_dir = "/wal-current-segment-size-test";
@@ -1957,6 +1957,10 @@ test "lsm wal current segment index stores cached segment size" {
     const current = try readCurrentSegment(storage.storage(), std.testing.allocator, root_dir);
     try std.testing.expectEqual(@as(u64, 1), current.segment);
     try std.testing.expectEqual(try storage.storage().fileSize(segment_path), current.size);
+
+    const raw_index = try storage.storage().readFileAlloc(std.testing.allocator, index_path, 16);
+    defer std.testing.allocator.free(raw_index);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, raw_index[8..16], .little));
 }
 
 test "lsm wal retention snapshot counts replayed segment debt and reset clears it" {

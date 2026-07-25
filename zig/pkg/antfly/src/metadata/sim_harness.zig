@@ -28,6 +28,7 @@ const metadata_table_workflow = @import("table_workflow.zig");
 const api_http_client = @import("../api/http_client.zig");
 const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
+const backups_api = @import("../api/backups.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
 const api_table_router = @import("../api/table_router.zig");
@@ -51,9 +52,11 @@ const data_mod = @import("../data/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+const common_config = @import("../common/config.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
+const storage_sim = @import("../storage/sim_runtime.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const usermgr = @import("../usermgr/mod.zig");
@@ -4454,6 +4457,7 @@ const PublicApiStatusSource = struct {
                 .status = status,
                 .admin_snapshot = adminSnapshot,
                 .cached_admin_snapshot = cachedAdminSnapshot,
+                .ensure_linearizable_read = ensureLinearizableRead,
                 .free_admin_snapshot = freeAdminSnapshot,
                 .create_table = createTable,
                 .drop_table = dropTable,
@@ -4476,6 +4480,18 @@ const PublicApiStatusSource = struct {
 
     fn cachedAdminSnapshot(ptr: *anyopaque) !?metadata_api.AdminSnapshot {
         return try adminSnapshot(ptr);
+    }
+
+    fn ensureLinearizableRead(ptr: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = self.metadataNode();
+        const leader_index = self.node.cluster.currentMetadataLeaderIndex() orelse
+            return error.MetadataLinearizableReadTimeout;
+        if (target.index != leader_index) return error.NotLeader;
+
+        const raft_status = target.sim().raftStatus(self.node.cluster.metadata_group_id) orelse
+            return error.MetadataLinearizableReadTimeout;
+        if (raft_status.soft.role != .leader) return error.NotLeader;
     }
 
     fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -10964,6 +10980,41 @@ test "metadata http cluster simulation transfers reconcile lease on leader resta
 }
 
 test "metadata http cluster simulation recovers from a ready persistence stall without term churn" {
+    const PersistenceStall = struct {
+        cluster: ?*MetadataHttpClusterSimulation = null,
+        node_index: usize,
+        armed: bool = false,
+        fired: bool = false,
+        peer_rounds: usize = 12,
+
+        fn scheduler(self: *@This()) storage_sim.CompletionScheduler {
+            return .{
+                .ctx = self,
+                .wait_ns_fn = waitNs,
+            };
+        }
+
+        fn waitNs(ptr: ?*anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (!self.armed) return;
+            self.armed = false;
+            self.fired = true;
+
+            const cluster = self.cluster orelse return error.PersistenceStallClusterUnavailable;
+            const node_id = cluster.cluster.configs[self.node_index].host.http.host.local_node_id;
+            try cluster.virtual_network.partitionNode(node_id);
+            defer cluster.virtual_network.healNode(node_id);
+
+            // The callback runs synchronously inside WalReplicaState.persist().
+            // Advance only the peers while that exact durability completion is
+            // blocked, matching a slow fsync without pausing unrelated work.
+            var round: usize = 0;
+            while (round < self.peer_rounds) : (round += 1) {
+                try cluster.stepAllExcept(self.node_index);
+            }
+        }
+    };
+
     const ReadBarrierRecorder = struct {
         const expected_context = "issue-398-linearizable-read";
 
@@ -11017,7 +11068,16 @@ test "metadata http cluster simulation recovers from a ready persistence stall w
         makeHostSimConfig(2, 4972, root_b, cat_b),
         makeHostSimConfig(3, 4972, root_c, cat_c),
     };
-    for (&configs) |*config| config.host.http.host.replica_state_backend = .wal;
+    var persistence_stalls = [_]PersistenceStall{
+        .{ .node_index = 0 },
+        .{ .node_index = 1 },
+        .{ .node_index = 2 },
+    };
+    for (&configs, 0..) |*config, index| {
+        config.host.http.host.replica_state_backend = .wal;
+        config.host.wal_replica_state.wal.artificial_sync_delay_ns = 1;
+        config.host.wal_replica_state.wal.commit_scheduler = persistence_stalls[index].scheduler();
+    }
 
     var read_barriers = [_]ReadBarrierRecorder{ .{}, .{}, .{} };
     var deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
@@ -11029,16 +11089,23 @@ test "metadata http cluster simulation recovers from a ready persistence stall w
 
     var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4972, configs[0..], deps[0..]);
     defer cluster.deinit();
+    for (&persistence_stalls) |*stall| stall.cluster = &cluster;
     try cluster.startAll();
     defer cluster.stopAll();
     try cluster.bootstrapMetadataReplicas();
     const stalled_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
 
-    // A synchronous Ready stall blocks every other task on that node's Raft
-    // lane. Keep peers and the real 100 ms reconcile-lease cadence running for
-    // longer than the 5-9 tick randomized election window.
+    persistence_stalls[stalled_leader].armed = true;
+    try cluster.node(stalled_leader).upsertStore(.{
+        .store_id = 398,
+        .node_id = cluster.cluster.configs[stalled_leader].host.http.host.local_node_id,
+        .role = "persistence-stall-probe",
+        .live = true,
+    });
+
     var rounds: usize = 0;
-    while (rounds < 12) : (rounds += 1) try cluster.stepAllExcept(stalled_leader);
+    while (rounds < 12 and !persistence_stalls[stalled_leader].fired) : (rounds += 1) try cluster.stepAll();
+    try std.testing.expect(persistence_stalls[stalled_leader].fired);
 
     const recovered_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
     try std.testing.expect(recovered_leader != stalled_leader);
@@ -11066,9 +11133,181 @@ test "metadata http cluster simulation recovers from a ready persistence stall w
 
     rounds = 0;
     while (rounds < 20) : (rounds += 1) try cluster.stepAll();
-    const quiet_status = cluster.cluster.node(recovered_leader).raftStatus(4972) orelse return error.MissingRaftStatus;
-    try std.testing.expect(quiet_status.soft.role == .leader);
-    try std.testing.expectEqual(stable_term, quiet_status.hard.current_term);
+    for (0..3) |index| {
+        const quiet_status = cluster.cluster.node(index).raftStatus(4972) orelse return error.MissingRaftStatus;
+        try std.testing.expectEqual(stable_term, quiet_status.hard.current_term);
+        try std.testing.expectEqual(index == recovered_leader, quiet_status.soft.role == .leader);
+    }
+}
+
+test "metadata http cluster simulation load balanced backup retries a real election" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_c.deinit();
+
+    var factory_a = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-a", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_a);
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-b", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_b);
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-c", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_c);
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-a.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-b.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-c.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_c);
+
+    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        makeHostSimConfig(1, 4973, root_a, cat_a),
+        makeHostSimConfig(2, 4973, root_b, cat_b),
+        makeHostSimConfig(3, 4973, root_c, cat_c),
+    };
+    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        makeHostSimDeps(&factory_a),
+        makeHostSimDeps(&factory_b),
+        makeHostSimDeps(&factory_c),
+    };
+
+    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4973, configs[0..], deps[0..]);
+    defer cluster.deinit();
+    try cluster.startAll();
+    defer cluster.stopAll();
+    try cluster.bootstrapMetadataReplicas();
+    const initial_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
+    try cluster.publishClusterNodes(initial_leader);
+    try cluster.publishClusterStores(initial_leader);
+
+    try cluster.node(initial_leader).upsertTable(.{
+        .table_id = 398,
+        .name = "docs",
+        .description = "backup election integration",
+        .indexes_json = api_tables.default_indexes_json,
+        .placement_role = "data",
+    });
+    try cluster.node(initial_leader).upsertRange(.{
+        .group_id = 4974,
+        .table_id = 398,
+        .start_key = "",
+        .end_key = null,
+    });
+    var rounds: usize = 0;
+    while (rounds < 8) : (rounds += 1) try cluster.stepAll();
+
+    var node_config = try common_config.Config.parseFromSlice(std.testing.allocator,
+        \\{
+        \\  "connections": {
+        \\    "test-backups": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["backup.write", "restore.read"],
+        \\      "external_io": { "protocol": "filesystem", "root": "/" }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer node_config.deinit();
+
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-db", .{tmp.sub_path});
+    defer std.testing.allocator.free(db_path);
+    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 1,
+    });
+    var writes = api_table_writes.BoundTableWriteSource.init("docs", &db);
+
+    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
+    defer http_io.deinit();
+    var status_sources: [3]PublicApiStatusSource = undefined;
+    var servers: [3]api_http_server.ApiHttpServer = undefined;
+    var listeners: [3]std_http_listener.StdHttpListener = undefined;
+    var started: usize = 0;
+    defer {
+        for (listeners[0..started]) |*listener| listener.deinit();
+        for (servers[0..started]) |*server| server.deinit();
+    }
+    for (0..3) |index| {
+        status_sources[index] = .{ .node = cluster.node(index) };
+        servers[index] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
+            std.testing.allocator,
+            leanSimHttpAllocator(),
+            .{ .node_config = &node_config },
+            status_sources[index].iface(),
+            null,
+            writes.source(),
+        );
+        listeners[index] = std_http_listener.StdHttpListener.initShared(
+            leanSimHttpAllocator(),
+            lean_sim_http_listener_cfg,
+            servers[index].executor(),
+            &http_io,
+        );
+        try listeners[index].start();
+        started += 1;
+    }
+    var api_base_uris: [3][]u8 = undefined;
+    var uri_count: usize = 0;
+    defer for (api_base_uris[0..uri_count]) |uri| std.testing.allocator.free(uri);
+    for (0..3) |index| {
+        api_base_uris[index] = try listeners[index].baseUri(std.testing.allocator);
+        uri_count += 1;
+    }
+    var client_executor: std_http_executor.StdHttpExecutor = undefined;
+    client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
+    defer client_executor.deinit();
+    var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+
+    const initial_leader_node_id = cluster.cluster.configs[initial_leader].host.http.host.local_node_id;
+    try cluster.virtual_network.partitionNode(initial_leader_node_id);
+    defer cluster.virtual_network.healNode(initial_leader_node_id);
+    rounds = 0;
+    while (rounds < 12) : (rounds += 1) try cluster.stepAllExcept(initial_leader);
+    const elected_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(elected_leader != initial_leader);
+
+    var ordered_endpoints: [3][]const u8 = undefined;
+    ordered_endpoints[0] = api_base_uris[initial_leader];
+    var next_endpoint: usize = 1;
+    for (0..3) |index| {
+        if (index == initial_leader) continue;
+        ordered_endpoints[next_endpoint] = api_base_uris[index];
+        next_endpoint += 1;
+    }
+
+    const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-output", .{tmp.sub_path});
+    defer std.testing.allocator.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, backup_root });
+    defer std.testing.allocator.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
+    defer std.testing.allocator.free(location_uri);
+    const backup_body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"backup_id\":\"election-snap\",\"location\":\"{s}\",\"connection\":\"test-backups\",\"table_names\":[\"docs\"]}}",
+        .{location_uri},
+    );
+    defer std.testing.allocator.free(backup_body);
+
+    var backup_response = try client.fetchClusterBackupFromEndpoints(&ordered_endpoints, backup_body);
+    defer backup_response.deinit(std.heap.page_allocator);
+    try std.testing.expect(backup_response.attempts > 1);
+
+    var manifest = try backups_api.readClusterManifest(std.testing.allocator, backup_root_abs, "election-snap");
+    defer manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), manifest.tables.len);
+    try std.testing.expectEqualStrings("docs", manifest.tables[0].name);
 }
 
 test "metadata http cluster simulation skips reconcile work without lease ownership" {
