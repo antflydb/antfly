@@ -1,6 +1,6 @@
 ---
 title: Supported models
-description: Which model architectures Antfly inference can run for text generation
+description: Which model architectures Antfly inference can run, and how far each has been verified
 prerequisites:
   - Antfly installed and running
 difficulty: beginner
@@ -12,95 +12,114 @@ tags: [inference, models, generation, gguf]
 - Which models can Antfly generate text with?
 - Why does my model fail to load?
 - What does "model architecture is not supported for generation" mean?
+- What does the `support` field in /ai/v1/models mean?
 </Questions>
 
-Antfly inference runs local text generation from GGUF models. Antfly is a database first
-and an inference engine second, so the set of architectures it can run is deliberately
-narrower than a dedicated engine like llama.cpp. This page states exactly what that set
-is, so you can tell "this model is out of scope" apart from "something is broken."
+Antfly is a database first and an inference engine second, so the set of model
+architectures it runs is deliberately narrower than a dedicated engine like llama.cpp.
+This page states exactly how far each architecture has been taken, so you can tell "this
+is out of scope" apart from "this is broken."
 
-Embedding, reranking, chunking, and recognition models are covered separately in
-[Antfly inference](/docs/guides/inference); this page is only about generation.
+Every generator reports its tier in `/ai/v1/models` as a `support` field, and the tiers
+below come from the same source as that field and as the error messages — they cannot
+drift apart.
 
-## Supported for generation
+## The three tiers
 
-These architectures have a GGUF tensor mapping and have been run end to end:
-
-| Family | Verified with | Notes |
+| Tier | Meaning | Behaviour |
 |---|---|---|
-| Gemma 3 | `unsloth/gemma-3-4b-it-GGUF` | Text only. Vision `mmproj` sidecars are ignored. |
-| Gemma 4 | `ggml-org/gemma-4-E4B-it-GGUF` | Includes E-series models with per-layer embeddings. |
-| Llama 3.x | `unsloth/Llama-3.2-1B-Instruct-GGUF` | Generation is correct; see the chat template caveat below. |
-| Qwen3 (dense) | `unsloth/Qwen3-1.7B-GGUF` | Not the MoE or linear-attention variants. |
-| Qwen2 | — | Shares the Qwen tensor mapping; not separately verified this release. |
+| **Supported** | Verified end to end against a real model. | Runs. |
+| **Experimental** | Has a weight mapping and a runtime, but is either unverified or known to misbehave. | Loads, logs a warning. |
+| **Unsupported** | No weight mapping, or no runtime. | Rejected with HTTP 400 before any load. |
 
-Multimodal projector sidecars (`mmproj-*.gguf`) are not used by the generation path. A
-bundle that contains one will still run as a text model.
+## Supported
 
-## Best effort, not verified
-
-Antfly's loader has tensor mappings for these families, so they may work, but we have not
-validated them for this release. Treat failures as expected rather than as regressions:
-
-- Mistral and Mixtral
-- Phi / Phi-3
-- BitNet
-- DeepSeek V4
-
-## Not supported
-
-These are recognised and rejected with a clear error rather than failing partway through
-a load:
-
-| Architecture | Example |
+| Family | Verified with |
 |---|---|
-| `qwen35` (Qwen3.5) | `unsloth/Qwen3.5-4B-GGUF` |
-| `qwen3next` (Qwen3-Next) | `unsloth/Qwen3-Coder-Next-GGUF` |
-| `qwen35moe` (Qwen3.5 MoE) | `unsloth/Qwen3.6-35B-A3B-GGUF` |
+| Gemma 3 | `unsloth/gemma-3-4b-it-GGUF` |
+| Gemma 4 | `ggml-org/gemma-4-E4B-it-GGUF` |
+| Llama 3.x | `unsloth/Llama-3.2-1B-Instruct-GGUF` |
+| Qwen3 (dense) | `unsloth/Qwen3-1.7B-GGUF` |
 
-Qwen3.5 and Qwen3-Next use hybrid linear attention, whose state-space tensors Antfly does
-not yet map from GGUF. Any architecture not listed on this page falls into this category.
+Text only. Multimodal projector sidecars (`mmproj-*.gguf`) are not used by the generation
+path; a bundle containing one still runs as a text model.
 
-Requesting generation from an unsupported model returns HTTP 400:
+## Experimental
+
+These load, but we do not stand behind their output for 0.2.0.
+
+| Family | Status |
+|---|---|
+| Qwen2 | **Do not use for generation.** Loads with a correct chat template and correct special-token ids, but output is wrong. `Qwen2.5-0.5B-Instruct` at `temperature: 0` answers "What is the capital of France?" with "The capital of the People's Republic of China is Beijing" via the CLI, and emits outright token soup over `/ai/v1/chat/completions`. Qwen3 on the same engine answers "Paris". The family stays loadable rather than blocked because `colqwen2` shares its tensor mapping as a multimodal embedding backbone. |
+| BitNet | `bitnet-b1.58-2B-4T` loads and generates, but degenerates into repetition. |
+| Phi | The tensor mapping works for the separate-projection layout, but **Phi-3 GGUFs cannot load** — they pack attention into a fused `attn_qkv.weight` and the FFN into a fused `ffn_up.weight`, which reports 257 missing tensors. |
+| Mistral / Mixtral | Full tensor mapping, no verified artifact. |
+| DeepSeek V4 | A substantial implementation (MoE routing, compressed/sparse attention) whose only exercise is synthetic unit tests. No artifact small enough to verify. |
+
+## Unsupported
+
+Rejected with a clear error rather than failing partway through a load.
+
+| Architecture | Reason |
+|---|---|
+| `qwen35`, `qwen3next`, `qwen35moe` | Hybrid linear attention; the GGUF `ssm_*` tensors have no mapping to the runtime. |
+| `falcon`, `opt`, `bloom` | Recognised by name only — no tensor mapping and no runtime. |
+| `gpt2`, `gpt_neo`, `gpt_neox`, `gptj` | No verified path for generation. |
+| `t5`, `mt5`, `longt5` | T5 has an encoder-decoder implementation but no generation path; `antfly inference generate` returns `InvalidModelForGeneration`. |
+| anything else | Any architecture not named on this page. |
+
+Requesting generation from an unsupported model returns HTTP 400 **before** the model is
+loaded:
 
 ```json
 {
   "error": "UNSUPPORTED_ARCHITECTURE",
-  "message": "model architecture \"qwen35moe\" is not supported for generation; supported architectures: llama, mistral, mixtral, qwen2, qwen3, gemma, gemma2, gemma3, gemma4, phi, phi3, bitnet, deepseek-v4"
+  "message": "model architecture \"qwen3_next\" is not supported for generation; supported: llama, qwen3, gemma, gemma2, gemma3, gemma4; experimental: mistral, mixtral, qwen2, phi, phi3, bitnet, deepseek-v4"
 }
 ```
 
+## Non-generation tasks
+
+| Task | Status |
+|---|---|
+| Embedding (`/embed`) | Supported — BERT, and CLIP/CLAP for multimodal. |
+| Reranking (`/rerank`) | Supported — verified with `mixedbread-ai/mxbai-rerank-base-v1`. |
+| Transcription (`/transcribe`) | Supported — verified with `openai/whisper-tiny`. |
+| Reading (`/read`) | Supported — Florence-2 and TrOCR-style encoder-decoders. |
+| Recognition / extraction | Supported — GLiNER2. |
+| Chunking (`/chunk`) | Falls back to the built-in `fixed_bert` / `fixed_bpe` chunkers. No ONNX chunker model is currently verified. |
+| Rewriting (`/rewrite`) | Declared but unverified; no rewriter model is currently exercised. |
+
 ## Known caveats
 
-**Llama 3.x chat templates.** Llama 3.x ships a Jinja chat template that Antfly's template
-engine cannot yet parse. The model loads and generates correctly, but chat requests fall
-back to raw prompting, which produces continuation-style output instead of a reply. Models
-in this state report `"chat_template": false` in `/ai/v1/models` once loaded. Applying the
-chat format on the client side is a workaround until this is fixed.
+**Llama 3.x chat templates.** Llama 3.x ships a Jinja chat template Antfly's template engine
+cannot yet parse. The model loads and generates correctly, but chat requests fall back to
+raw prompting, which produces continuation-style output instead of a reply. Affected models
+report `"chat_template": false` in `/ai/v1/models` once loaded. Applying the chat format
+client-side is a workaround.
 
-**Quantization variants.** A model directory containing several `.gguf` files (for example
+**Small Gemma 3 models over the chat endpoint.** `gemma-3-1b` answers correctly and stops
+cleanly through `antfly inference generate`, but can fail to stop when called through
+`/ai/v1/chat/completions`. Prefer `gemma-3-4b` or larger for chat.
+
+**Gemma 4 on Metal.** Some Gemma 4 bundles crash the Metal paged-KV kernel. Passing
+`--backend native` avoids it at a cost in speed.
+
+**Models without `tokenizer.json`.** Older HuggingFace repos that ship only the legacy
+`vocab.json` + `merges.txt` pair are detected as having a tokenizer but fail to load with
+`NoTokenizerFound`. `microsoft/layoutlmv3-base` is one such repo.
+
+**Quantization variants.** A directory containing several `.gguf` files (for example
 `Q4_1`, `Q4_K_M`, and `UD-Q4_K_XL`) resolves to one of them without reporting which. Keep
 one quantization per directory if the choice matters to you.
 
-**Small Gemma 3 models over the chat endpoint.** `gemma-3-1b` answers correctly and stops
-cleanly through `antfly inference generate`, but can fail to stop after its answer when
-called through `/ai/v1/chat/completions`. Larger Gemma 3 models are unaffected. Prefer
-`gemma-3-4b` or larger for chat.
-
-**Gemma 4 on Metal.** Some Gemma 4 bundles currently crash the Metal paged-KV kernel.
-Passing `--backend native` avoids it at a cost in speed.
-
 ## Checking a model before running it
 
-`smoke --inspect-only` reports what Antfly makes of a bundle without loading weights or
-generating:
+`smoke --inspect-only` reports what Antfly makes of a bundle without loading weights:
 
 ```bash
 antfly inference smoke ~/.antfly/inference/models/unsloth/Qwen3-1.7B-GGUF "hi" --inspect-only
 ```
-
-The output names the detected architecture, the parsed config, any unsupported tensor
-types, and any required tensors that could not be resolved:
 
 ```
 gguf path=.../Qwen3-1.7B-UD-Q4_K_XL.gguf architecture=qwen3 tensors=310 metadata=32
@@ -110,4 +129,4 @@ gguf path=.../Qwen3-1.7B-UD-Q4_K_XL.gguf architecture=qwen3 tensors=310 metadata
 ```
 
 `missing_required_tensors` with a non-zero count means the architecture was recognised but
-its tensor names could not be mapped — that is the signature of an unsupported family.
+its tensor names could not be mapped — the signature of an unsupported or fused layout.

@@ -1516,16 +1516,27 @@ pub fn supportLevel(family: ModelFamily) SupportLevel {
         // Verified against real GGUF artifacts.
         .llama, .qwen3, .gemma => .supported,
 
-        // Mapped and plumbed, but never run against a real model. deepseek_v4 in
-        // particular has a substantial architecture implementation whose only exercise
-        // is synthetic unit tests.
-        .mistral, .qwen2, .phi, .bitnet, .deepseek_v4 => .experimental,
+        // Loads and generates, but output is not trustworthy.
+        //
+        // qwen2 renders a correct ChatML prompt with correct special-token ids and
+        // terminates cleanly, yet answers a different question than the one asked
+        // (Qwen2.5-0.5B-Instruct, greedy: "capital of France" -> "the capital of the
+        // People's Republic of China is Beijing", where Qwen3 on the same engine answers
+        // "Paris"). bitnet degenerates into repetition. deepseek_v4 has a substantial
+        // implementation whose only exercise is synthetic unit tests, and no artifact
+        // small enough to verify here.
+        //
+        // phi has a working mapping for the separate-projection layout, but Phi-3 GGUFs
+        // pack attention into a fused attn_qkv.weight and the FFN into a fused
+        // ffn_up.weight, so a real Phi-3 reports 257 missing tensors. Splitting fused
+        // tensors is a larger change than a name mapping.
+        .qwen2, .bitnet, .mistral, .deepseek_v4, .phi => .experimental,
 
-        // Recognized, but with nothing behind them. qwen3_5 has a linear-attention
-        // runtime whose GGUF ssm_*/attn_qkv/attn_gate tensors have no mapping; gpt2 and
-        // friends have mappings but no verified path; falcon/opt/bloom exist only as
-        // enum entries with family defaults and no weight mapping, required-weight list,
-        // or runtime.
+        // Recognized, but nothing behind them.
+        //
+        // qwen3_5 has a linear-attention runtime whose GGUF ssm_*/attn_qkv/attn_gate
+        // tensors have no mapping. falcon/opt/bloom exist only as enum entries with
+        // family defaults -- no weight mapping, no required-weight list, no runtime.
         .qwen3_5, .gpt2, .gpt_neo, .gpt_neox, .gptj, .falcon, .opt, .bloom, .other => .unsupported,
     };
 }
