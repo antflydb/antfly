@@ -119,12 +119,40 @@ type EnrichmentScanOptions struct {
 	ProcessBatch BatchProcessor
 }
 
+func decodeEnrichmentHashID(enrichmentSuffix, value []byte) uint64 {
+	switch {
+	case bytes.HasSuffix(enrichmentSuffix, EmbeddingSuffix):
+		// Embeddings contain a hash ID (8 bytes), a dimension (uint32), and
+		// vector data (4 bytes per dimension).
+		if len(value) < 12 {
+			return 0
+		}
+	case bytes.HasSuffix(enrichmentSuffix, SummarySuffix):
+		// Summaries contain a hash ID (8 bytes) followed by text.
+		if len(value) < 8 {
+			return 0
+		}
+	default:
+		return 0
+	}
+
+	_, hashID, err := encoding.DecodeUint64Ascending(value)
+	if err != nil {
+		return 0
+	}
+	return hashID
+}
+
 // ScanForEnrichment scans for items (documents or summaries) that need enrichment,
 // processing them in batches. This is more efficient than collecting all results and
 // then processing, as it can stream through large datasets.
 //
 // Use PrimarySuffix to specify what to scan (DBRangeStart for documents, SummarySuffix for summaries).
 // Use EnrichmentSuffix to specify what enrichment to check for (e.g., EmbeddingSuffix, SummarySuffix).
+//
+// Each batch is processed with the scan iterator closed and the next window
+// opened fresh, so the traversal is not a point-in-time snapshot: an item
+// enriched while a batch is processing is skipped, not re-emitted.
 func ScanForEnrichment(ctx context.Context, db *pebble.DB, opts EnrichmentScanOptions) error {
 	var err error
 	defer func() {
@@ -148,6 +176,12 @@ func ScanForEnrichment(ctx context.Context, db *pebble.DB, opts EnrichmentScanOp
 
 	// When scanning summaries, we don't need JSON deserialization
 	scanningDocuments := bytes.Equal(primarySuffix, DBRangeStart)
+
+	// BatchSize < 1 would cut the window at the first primary key of every
+	// pass without advancing the lower bound - an unlogged infinite loop.
+	if opts.BatchSize < 1 {
+		opts.BatchSize = 1
+	}
 
 	batch := make([]DocumentScanState, 0, opts.BatchSize)
 	var currentDoc *DocumentScanState
@@ -187,137 +221,188 @@ func ScanForEnrichment(ctx context.Context, db *pebble.DB, opts EnrichmentScanOp
 			!bytes.HasSuffix(userKey, opts.EnrichmentSuffix)
 	}
 
-	err = Scan(ctx, db, ScanOptions{
-		LowerBound: opts.ByteRange[0],
-		UpperBound: opts.ByteRange[1],
-		SkipPoint:  skipPoint,
-	}, func(key []byte, value []byte) (bool, error) {
-		if bytes.HasSuffix(key, primarySuffix) {
-			// This is a primary key (document or summary)
-			if currentDoc != nil {
-				// Check if the previous item needs enrichment
-				if !hasEnrichment {
-					batch = append(batch, *currentDoc)
-					if len(batch) >= opts.BatchSize {
-						if err := flushBatch(); err != nil {
-							return false, err
-						}
-					}
-				}
-			}
+	refreshBoundaryEnrichment := func(itemKey []byte) error {
+		itemKeyStr := string(itemKey)
+		delete(seenEnrichments, itemKeyStr)
+		delete(seenEnrichmentHashIDs, itemKeyStr)
 
-			itemKey := key[:len(key)-len(primarySuffix)]
+		enrichmentKey := append(bytes.Clone(itemKey), opts.EnrichmentSuffix...)
+		value, closer, getErr := db.Get(enrichmentKey)
+		if errors.Is(getErr, pebble.ErrNotFound) {
+			return nil
+		}
+		if getErr != nil {
+			return fmt.Errorf("getting boundary enrichment for %s: %w", itemKey, getErr)
+		}
 
-			if scanningDocuments {
-				// Decompress the document value
-				if err := reader.Reset(bytes.NewReader(value)); err != nil {
-					return false, fmt.Errorf("resetting zstd reader for %s: %w", itemKey, err)
-				}
-				decompressed := &bytes.Buffer{}
-				if _, err := io.Copy(decompressed, reader); err != nil {
-					return false, fmt.Errorf("decompressing value for %s: %w", itemKey, err)
-				}
-
-				// Deserialize JSON document
-				var doc map[string]any
-				if err := json.NewDecoder(decompressed).Decode(&doc); err != nil {
-					return false, fmt.Errorf("decoding JSON document for %s: %w", itemKey, err)
-				}
-
-				// Start tracking a new document
-				currentDoc = &DocumentScanState{
-					CurrentDocKey: append([]byte(nil), itemKey...),
-					Document:      doc,
-				}
-			} else {
-				// Scanning summaries - extract summary content
-				if len(value) < 8 {
-					return true, nil // Skip malformed value
-				}
-
-				summary := string(value[8:])
-
-				// Start tracking a new summary (use Enrichment field)
-				currentDoc = &DocumentScanState{
-					CurrentDocKey: append([]byte(nil), itemKey...),
-					Enrichment:    summary,
-				}
-			}
-
-			// Check if we saw an enrichment for this key earlier
-			itemKeyStr := string(itemKey)
-			hasEnrichment = seenEnrichments[itemKeyStr]
-			if hasEnrichment {
-				delete(seenEnrichments, itemKeyStr) // Clean up
-				if hashID, ok := seenEnrichmentHashIDs[itemKeyStr]; ok {
-					currentDoc.EnrichmentHashID = hashID
-					delete(seenEnrichmentHashIDs, itemKeyStr) // Clean up
-				}
-			}
-		} else if bytes.HasSuffix(key, opts.EnrichmentSuffix) {
-			// This is an enrichment key
-			// Extract the base key (without the enrichment suffix)
-			baseKey := key[:len(key)-len(opts.EnrichmentSuffix)]
-
-			// If the base key is a chunk key (e.g., docKey:i:indexName:0:c),
-			// resolve it to the parent document key so that chunk-level
-			// embeddings are correctly attributed to their document.
-			// This is the common case in ephemeral chunking mode where
-			// chunks are not persisted but their embeddings are.
-			matchKey := baseKey
-			if docKey, ok := ExtractDocKeyFromChunk(baseKey); ok {
-				matchKey = docKey
-			}
-
-			// Extract hash ID from the value
-			var hashID uint64
-			if bytes.HasSuffix(opts.EnrichmentSuffix, EmbeddingSuffix) {
-				// For embeddings: hashID (8 bytes) + dimension (uint32) + vector data (4*dimension bytes)
-				if len(value) >= 12 { // At least hashID + dimension encoding
-					// Decode hashID first
-					_, hashID, err = encoding.DecodeUint64Ascending(value)
-					if err != nil {
-						hashID = 0 // Reset on error
-					}
-				}
-			} else if bytes.HasSuffix(opts.EnrichmentSuffix, SummarySuffix) {
-				// For summaries: hashID (8 bytes) followed by text
-				if len(value) >= 8 {
-					_, hashID, _ = encoding.DecodeUint64Ascending(value)
-				}
-			}
-
-			if IsDudEnrichment(value) {
-				// Dud enrichment: the item was previously unenrichable.
-				// Don't mark as enriched so it gets re-evaluated by
-				// generatePrompts, which will skip it again cheaply if
-				// the source content hasn't changed.
-			} else if currentDoc != nil && bytes.Equal(matchKey, currentDoc.CurrentDocKey) {
-				// This enrichment belongs to the current primary key
-				hasEnrichment = true
-				currentDoc.EnrichmentHashID = hashID
-			} else {
-				// This enrichment comes before its primary key, remember it
-				matchKeyStr := string(matchKey)
-				seenEnrichments[matchKeyStr] = true
-				if hashID != 0 {
-					seenEnrichmentHashIDs[matchKeyStr] = hashID
-				}
+		if !IsDudEnrichment(value) {
+			seenEnrichments[itemKeyStr] = true
+			if hashID := decodeEnrichmentHashID(opts.EnrichmentSuffix, value); hashID != 0 {
+				seenEnrichmentHashIDs[itemKeyStr] = hashID
 			}
 		}
-		return true, nil
-	})
-	if err != nil {
-		return err
+		if closeErr := closer.Close(); closeErr != nil {
+			return fmt.Errorf("closing boundary enrichment for %s: %w", itemKey, closeErr)
+		}
+		return nil
 	}
 
-	// Don't forget the last item
-	if currentDoc != nil && !hasEnrichment {
-		batch = append(batch, *currentDoc)
-	}
+	// ProcessBatch (network I/O in the enricher backfills) must never run
+	// under a live iterator: an open pebble iterator pins the version it was
+	// created against, so sstables obsoleted by concurrent flushes and
+	// compactions cannot be deleted until it closes. A backfill that calls a
+	// remote embedder per batch holds one scan open for hours and disk grows
+	// at write-rate x duration, unbounded, until the process restarts (pebble
+	// removes the orphaned files on Open). Scan in windows instead: collect
+	// one batch, stop at an item group boundary, close the iterator, process
+	// the batch, then resume from the boundary key.
+	lower := opts.ByteRange[0]
+	for {
+		var resumeKey []byte
+		var refreshBoundaryKey []byte
+		err = Scan(ctx, db, ScanOptions{
+			LowerBound: lower,
+			UpperBound: opts.ByteRange[1],
+			SkipPoint:  skipPoint,
+		}, func(key []byte, value []byte) (bool, error) {
+			if bytes.HasSuffix(key, primarySuffix) {
+				// This is a primary key (document or summary).
+				// Finalize the previous item before starting a new group.
+				if currentDoc != nil {
+					if !hasEnrichment {
+						batch = append(batch, *currentDoc)
+					}
+					currentDoc = nil
+				}
 
-	// Flush any remaining items
-	return flushBatch()
+				itemKey := key[:len(key)-len(primarySuffix)]
+
+				// Batch full: cut the window at this exact primary key. Some
+				// pipelines scan summaries (:s) whose embeddings (:e) sort before
+				// the primary. Revalidate that exact enrichment after ProcessBatch
+				// instead of rewinding the scan across potentially interleaved
+				// primary keys.
+				if len(batch) >= opts.BatchSize {
+					resumeKey = append([]byte(nil), key...)
+					enrichmentKey := append(bytes.Clone(itemKey), opts.EnrichmentSuffix...)
+					if bytes.Compare(enrichmentKey, resumeKey) < 0 {
+						refreshBoundaryKey = bytes.Clone(itemKey)
+					}
+					return false, nil
+				}
+
+				if scanningDocuments {
+					// Decompress the document value
+					if err := reader.Reset(bytes.NewReader(value)); err != nil {
+						return false, fmt.Errorf("resetting zstd reader for %s: %w", itemKey, err)
+					}
+					decompressed := &bytes.Buffer{}
+					if _, err := io.Copy(decompressed, reader); err != nil {
+						return false, fmt.Errorf("decompressing value for %s: %w", itemKey, err)
+					}
+
+					// Deserialize JSON document
+					var doc map[string]any
+					if err := json.NewDecoder(decompressed).Decode(&doc); err != nil {
+						return false, fmt.Errorf("decoding JSON document for %s: %w", itemKey, err)
+					}
+
+					// Start tracking a new document
+					currentDoc = &DocumentScanState{
+						CurrentDocKey: append([]byte(nil), itemKey...),
+						Document:      doc,
+					}
+				} else {
+					// Scanning summaries - extract summary content
+					if len(value) < 8 {
+						return true, nil // Skip malformed value
+					}
+
+					summary := string(value[8:])
+
+					// Start tracking a new summary (use Enrichment field)
+					currentDoc = &DocumentScanState{
+						CurrentDocKey: append([]byte(nil), itemKey...),
+						Enrichment:    summary,
+					}
+				}
+
+				// Check if we saw an enrichment for this key earlier
+				itemKeyStr := string(itemKey)
+				hasEnrichment = seenEnrichments[itemKeyStr]
+				if hasEnrichment {
+					delete(seenEnrichments, itemKeyStr) // Clean up
+					if hashID, ok := seenEnrichmentHashIDs[itemKeyStr]; ok {
+						currentDoc.EnrichmentHashID = hashID
+						delete(seenEnrichmentHashIDs, itemKeyStr) // Clean up
+					}
+				}
+			} else if bytes.HasSuffix(key, opts.EnrichmentSuffix) {
+				// This is an enrichment key
+				// Extract the base key (without the enrichment suffix)
+				baseKey := key[:len(key)-len(opts.EnrichmentSuffix)]
+
+				// If the base key is a chunk key (e.g., docKey:i:indexName:0:c),
+				// resolve it to the parent document key so that chunk-level
+				// embeddings are correctly attributed to their document.
+				// This is the common case in ephemeral chunking mode where
+				// chunks are not persisted but their embeddings are.
+				matchKey := baseKey
+				if docKey, ok := ExtractDocKeyFromChunk(baseKey); ok {
+					matchKey = docKey
+				}
+
+				hashID := decodeEnrichmentHashID(opts.EnrichmentSuffix, value)
+
+				if IsDudEnrichment(value) {
+					// Dud enrichment: the item was previously unenrichable.
+					// Don't mark as enriched so it gets re-evaluated by
+					// generatePrompts, which will skip it again cheaply if
+					// the source content hasn't changed.
+				} else if currentDoc != nil && bytes.Equal(matchKey, currentDoc.CurrentDocKey) {
+					// This enrichment belongs to the current primary key
+					hasEnrichment = true
+					currentDoc.EnrichmentHashID = hashID
+				} else {
+					// This enrichment comes before its primary key, remember it
+					matchKeyStr := string(matchKey)
+					seenEnrichments[matchKeyStr] = true
+					if hashID != 0 {
+						seenEnrichmentHashIDs[matchKeyStr] = hashID
+					}
+				}
+			}
+			return true, nil
+		})
+		if err != nil {
+			return err
+		}
+
+		if resumeKey == nil {
+			// Scan exhausted - don't forget the last item.
+			if currentDoc != nil && !hasEnrichment {
+				batch = append(batch, *currentDoc)
+			}
+		}
+
+		// The iterator is closed here; the batch is safe to process.
+		if err := flushBatch(); err != nil {
+			return err
+		}
+		if resumeKey == nil {
+			return nil
+		}
+		if refreshBoundaryKey != nil {
+			if err := refreshBoundaryEnrichment(refreshBoundaryKey); err != nil {
+				return err
+			}
+		}
+		lower = resumeKey
+		// currentDoc was finalized at the cut; seenEnrichments carries
+		// forward so enrichments seen ahead of their primary still match.
+		currentDoc = nil
+		hasEnrichment = false
+	}
 }
 
 // DocumentScanState tracks document scanning for backfill operations
@@ -353,6 +438,9 @@ type BackfillScanOptions struct {
 
 // ScanForBackfill scans documents and their associated summaries for backfilling indexes.
 // This is used by BleveIndexV2 during rebuild to efficiently collect documents with their summaries.
+//
+// Each batch is processed with the scan iterator closed and the next window
+// opened fresh, so the traversal is not a point-in-time snapshot.
 func ScanForBackfill(ctx context.Context, db *pebble.DB, opts BackfillScanOptions) error {
 	var err error
 	defer func() {
@@ -367,6 +455,12 @@ func ScanForBackfill(ctx context.Context, db *pebble.DB, opts BackfillScanOption
 			panic(r)
 		}
 	}()
+
+	// BatchSize < 1 would cut the window at the first document key of every
+	// pass without advancing the lower bound - an unlogged infinite loop.
+	if opts.BatchSize < 1 {
+		opts.BatchSize = 1
+	}
 
 	batch := make([]DocumentScanState, 0, opts.BatchSize)
 	var currentDoc *DocumentScanState
@@ -406,152 +500,166 @@ func ScanForBackfill(ctx context.Context, db *pebble.DB, opts BackfillScanOption
 		return !bytes.HasSuffix(userKey, DBRangeStart)
 	}
 
-	err = Scan(ctx, db, ScanOptions{
-		LowerBound: opts.ByteRange[0],
-		UpperBound: opts.ByteRange[1],
-		SkipPoint:  skipPoint,
-	}, func(key []byte, value []byte) (bool, error) {
-		if bytes.HasSuffix(key, SummarySuffix) {
-			// This is a summary key
-			if currentDoc == nil {
-				return true, nil // Skip if we haven't seen a document yet
-			}
-
-			docKey, indexName, ok := ParseSummaryKey(key)
-			if !ok {
-				return true, nil // Skip malformed key
-			}
-
-			// Check if this summary belongs to a different document
-			if !bytes.Equal(docKey, currentDoc.CurrentDocKey) {
-				// This is a summary for a different document, save current and start new
-				if currentDoc != nil {
-					batch = append(batch, *currentDoc)
-					if len(batch) >= opts.BatchSize {
-						if err := flushBatch(); err != nil {
-							return false, err
-						}
-					}
+	// Same windowed pattern as ScanForEnrichment: never run ProcessBatch
+	// under a live iterator (it pins obsoleted sstables for the scan's
+	// lifetime). Collect one batch, cut at a document boundary, close the
+	// iterator, process, resume.
+	lower := opts.ByteRange[0]
+	for {
+		var resumeKey []byte
+		err = Scan(ctx, db, ScanOptions{
+			LowerBound: lower,
+			UpperBound: opts.ByteRange[1],
+			SkipPoint:  skipPoint,
+		}, func(key []byte, value []byte) (bool, error) {
+			if bytes.HasSuffix(key, SummarySuffix) {
+				// This is a summary key
+				if currentDoc == nil {
+					return true, nil // Skip if we haven't seen a document yet
 				}
-				currentDoc = nil
-				return true, nil
-			}
 
-			// Extract summary value (skip first 8 bytes which are hashID)
-			if len(value) < 8 {
-				return true, nil
-			}
-			summary := string(value[8:])
-			if currentDoc.Summaries == nil {
-				currentDoc.Summaries = make(map[string]string)
-			}
-			currentDoc.Summaries[indexName] = summary
-
-		} else if bytes.Contains(key, ChunkingFullTextSuffix) {
-			// This is a chunk key: docKey:i:indexName:chunkID:cft
-			if currentDoc == nil {
-				return true, nil // Skip if we haven't seen a document yet
-			}
-
-			// Find :cft marker to split the key
-			before, _, ok := bytes.Cut(key, ChunkingFullTextSuffix)
-			if !ok {
-				return true, nil // Skip malformed key
-			}
-
-			// Extract base key (everything before :cft)
-			keyBeforeCft := before
-
-			docKey, indexName, ok := ParseChunkKey(append(bytes.Clone(keyBeforeCft), ChunkingFullTextSuffix...))
-			if !ok {
-				return true, nil // Skip malformed key
-			}
-
-			// Check if this chunk belongs to a different document
-			if !bytes.Equal(docKey, currentDoc.CurrentDocKey) {
-				// This is a chunk for a different document, save current and start new
-				if currentDoc != nil {
-					batch = append(batch, *currentDoc)
-					if len(batch) >= opts.BatchSize {
-						if err := flushBatch(); err != nil {
-							return false, err
-						}
-					}
+				docKey, indexName, ok := ParseSummaryKey(key)
+				if !ok {
+					return true, nil // Skip malformed key
 				}
-				currentDoc = nil
-				return true, nil
-			}
 
-			// Extract chunk JSON (skip first 8 bytes which are hashID)
-			if len(value) < 8 {
-				return true, nil
-			}
-			var chunk chunking.Chunk
-			if err := json.NewDecoder(bytes.NewReader(value[8:])).Decode(&chunk); err != nil {
-				// Skip malformed chunk
-				return true, nil
-			}
+				// Check if this summary belongs to a different document
+				if !bytes.Equal(docKey, currentDoc.CurrentDocKey) {
+					// This is a summary for a different document, save current and start new
+					if currentDoc != nil {
+						batch = append(batch, *currentDoc)
+					}
+					currentDoc = nil
+					return true, nil
+				}
 
-			// Initialize Chunks map if needed
-			if currentDoc.Chunks == nil {
-				currentDoc.Chunks = make(map[string][]chunking.Chunk)
-			}
+				// Extract summary value (skip first 8 bytes which are hashID)
+				if len(value) < 8 {
+					return true, nil
+				}
+				summary := string(value[8:])
+				if currentDoc.Summaries == nil {
+					currentDoc.Summaries = make(map[string]string)
+				}
+				currentDoc.Summaries[indexName] = summary
 
-			// Append chunk to the index's chunk list
-			currentDoc.Chunks[indexName] = append(currentDoc.Chunks[indexName], chunk)
+			} else if bytes.Contains(key, ChunkingFullTextSuffix) {
+				// This is a chunk key: docKey:i:indexName:chunkID:cft
+				if currentDoc == nil {
+					return true, nil // Skip if we haven't seen a document yet
+				}
 
-		} else if bytes.HasSuffix(key, DBRangeStart) {
-			// This is a main document key
-			if currentDoc != nil {
-				// Save the previous document
-				batch = append(batch, *currentDoc)
+				// Find :cft marker to split the key
+				before, _, ok := bytes.Cut(key, ChunkingFullTextSuffix)
+				if !ok {
+					return true, nil // Skip malformed key
+				}
+
+				// Extract base key (everything before :cft)
+				keyBeforeCft := before
+
+				docKey, indexName, ok := ParseChunkKey(append(bytes.Clone(keyBeforeCft), ChunkingFullTextSuffix...))
+				if !ok {
+					return true, nil // Skip malformed key
+				}
+
+				// Check if this chunk belongs to a different document
+				if !bytes.Equal(docKey, currentDoc.CurrentDocKey) {
+					// This is a chunk for a different document, save current and start new
+					if currentDoc != nil {
+						batch = append(batch, *currentDoc)
+					}
+					currentDoc = nil
+					return true, nil
+				}
+
+				// Extract chunk JSON (skip first 8 bytes which are hashID)
+				if len(value) < 8 {
+					return true, nil
+				}
+				var chunk chunking.Chunk
+				if err := json.NewDecoder(bytes.NewReader(value[8:])).Decode(&chunk); err != nil {
+					// Skip malformed chunk
+					return true, nil
+				}
+
+				// Initialize Chunks map if needed
+				if currentDoc.Chunks == nil {
+					currentDoc.Chunks = make(map[string][]chunking.Chunk)
+				}
+
+				// Append chunk to the index's chunk list
+				currentDoc.Chunks[indexName] = append(currentDoc.Chunks[indexName], chunk)
+
+			} else if bytes.HasSuffix(key, DBRangeStart) {
+				// This is a main document key
+				if currentDoc != nil {
+					// Save the previous document
+					batch = append(batch, *currentDoc)
+					currentDoc = nil
+				}
+
+				// Batch full: cut the window exactly at this primary key.
+				// Everything strictly before it was consumed, and a
+				// document's summary/chunk keys always sort after its own
+				// primary, so resuming here (inclusive) loses nothing and
+				// re-emits nothing. (How prefix-interleaved doc keys group
+				// is a separate, pre-existing concern the cut leaves as-is.)
 				if len(batch) >= opts.BatchSize {
-					if err := flushBatch(); err != nil {
-						return false, err
-					}
+					resumeKey = append([]byte(nil), key...)
+					return false, nil
+				}
+
+				// Decompress the document value
+				docKey := key[:len(key)-len(DBRangeStart)]
+				if err := reader.Reset(bytes.NewReader(value)); err != nil {
+					return false, fmt.Errorf("resetting zstd reader for %s: %w", docKey, err)
+				}
+				decompressed := &bytes.Buffer{}
+				if _, err := io.Copy(decompressed, reader); err != nil {
+					return false, fmt.Errorf("decompressing value for %s: %w", docKey, err)
+				}
+
+				// Deserialize JSON document
+				var doc map[string]any
+				if err := json.NewDecoder(decompressed).Decode(&doc); err != nil {
+					return false, fmt.Errorf("decoding JSON document for %s: %w", docKey, err)
+				}
+
+				// Start a new document
+				currentDoc = &DocumentScanState{
+					CurrentDocKey: append([]byte(nil), docKey...),
+					Document:      doc,
+				}
+				if opts.IncludeSummaries {
+					currentDoc.Summaries = make(map[string]string)
+				}
+				if opts.IncludeChunks {
+					currentDoc.Chunks = make(map[string][]chunking.Chunk)
 				}
 			}
 
-			// Decompress the document value
-			docKey := key[:len(key)-len(DBRangeStart)]
-			if err := reader.Reset(bytes.NewReader(value)); err != nil {
-				return false, fmt.Errorf("resetting zstd reader for %s: %w", docKey, err)
-			}
-			decompressed := &bytes.Buffer{}
-			if _, err := io.Copy(decompressed, reader); err != nil {
-				return false, fmt.Errorf("decompressing value for %s: %w", docKey, err)
-			}
+			return true, nil
+		})
+		if err != nil {
+			return err
+		}
 
-			// Deserialize JSON document
-			var doc map[string]any
-			if err := json.NewDecoder(decompressed).Decode(&doc); err != nil {
-				return false, fmt.Errorf("decoding JSON document for %s: %w", docKey, err)
-			}
-
-			// Start a new document
-			currentDoc = &DocumentScanState{
-				CurrentDocKey: append([]byte(nil), docKey...),
-				Document:      doc,
-			}
-			if opts.IncludeSummaries {
-				currentDoc.Summaries = make(map[string]string)
-			}
-			if opts.IncludeChunks {
-				currentDoc.Chunks = make(map[string][]chunking.Chunk)
+		if resumeKey == nil {
+			// Scan exhausted - don't forget the last document.
+			if currentDoc != nil {
+				batch = append(batch, *currentDoc)
 			}
 		}
 
-		return true, nil
-	})
-	if err != nil {
-		return err
+		// The iterator is closed here; the batch is safe to process.
+		if err := flushBatch(); err != nil {
+			return err
+		}
+		if resumeKey == nil {
+			return nil
+		}
+		lower = resumeKey
+		currentDoc = nil
 	}
-
-	// Don't forget the last document
-	if currentDoc != nil {
-		batch = append(batch, *currentDoc)
-	}
-
-	// Flush any remaining documents
-	return flushBatch()
 }

@@ -81,10 +81,10 @@ github.com/antchfx/xmlquery v1.5.0/go.mod h1:lJfWRXzYMK1ss32zm1GQV3gMIW/HFey3xDZ
 github.com/antchfx/xpath v1.3.5/go.mod h1:i54GszH55fYfBmoZXapTHN8T8tkcHfRgLyVwwqzXNcs=
 github.com/antchfx/xpath v1.3.6 h1:s0y+ElRRtTQdfHP609qFu0+c6bglDv20pqOViQjjdPI=
 github.com/antchfx/xpath v1.3.6/go.mod h1:i54GszH55fYfBmoZXapTHN8T8tkcHfRgLyVwwqzXNcs=
-github.com/antflydb/bleve/v2 v2.5.8-antfly002 h1:Qxw/E9+RJoQR4I30szCinKPLQMQMSII6PCs4xGR/RbI=
-github.com/antflydb/bleve/v2 v2.5.8-antfly002/go.mod h1:nnAd/6gGfLQXE5MBwd6sbX+HwI4xVRFQsWiskvnnbBU=
-github.com/antflydb/zapx/v17 v17.0.2-antfly005 h1:PFa1h2AyPstwrUGDWlZWx2FXnm53JIMHLdrRow9U8dA=
-github.com/antflydb/zapx/v17 v17.0.2-antfly005/go.mod h1:BIWKP0dHMgBVdFUSOsMCGrf+amY4L+ihYDEhNbLsVaQ=
+github.com/antflydb/bleve/v2 v2.5.8-antfly004 h1:0p4e8BFdg/NkIZTEzP+friH0eEQW2pTQ+VaPUEFQXM0=
+github.com/antflydb/bleve/v2 v2.5.8-antfly004/go.mod h1:nnAd/6gGfLQXE5MBwd6sbX+HwI4xVRFQsWiskvnnbBU=
+github.com/antflydb/zapx/v17 v17.0.2-antfly006 h1:tE40FCdCJzPP6i6aOc4A45mU4zQ+s+YPKRPAOLb/h/w=
+github.com/antflydb/zapx/v17 v17.0.2-antfly006/go.mod h1:BIWKP0dHMgBVdFUSOsMCGrf+amY4L+ihYDEhNbLsVaQ=
 github.com/apapsch/go-jsonmerge/v2 v2.0.0 h1:axGnT1gRIfimI7gJifB699GoE/oq+F2MU7Dml6nw9rQ=
 github.com/apapsch/go-jsonmerge/v2 v2.0.0/go.mod h1:lvDnEdqiQrp0O42VQGgmlKpxL1AP2+08jFMw88y4klk=
 github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de h1:FxWPpzIjnTlhPwqqXc4/vE0f7GvRjuAsbW+HOIe8KnA=

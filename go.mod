@@ -16,8 +16,8 @@ replace (
 replace github.com/danaugrs/go-tsne => github.com/danaugrs/go-tsne/tsne v0.0.0-20220306155740-2250969e057f
 
 replace (
-	github.com/blevesearch/bleve/v2 => github.com/antflydb/bleve/v2 v2.5.8-antfly002
-	github.com/blevesearch/zapx/v17 => github.com/antflydb/zapx/v17 v17.0.2-antfly005
+	github.com/blevesearch/bleve/v2 => github.com/antflydb/bleve/v2 v2.5.8-antfly004
+	github.com/blevesearch/zapx/v17 => github.com/antflydb/zapx/v17 v17.0.2-antfly006
 )
 
 replace github.com/tidwall/wal => github.com/ajroetker/wal v0.0.0-antfly000
