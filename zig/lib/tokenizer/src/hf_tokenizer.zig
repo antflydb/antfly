@@ -799,7 +799,12 @@ pub const HfTokenizer = struct {
     /// Parse vocab from a dict format: {"token": id, ...} (WordPiece and BPE)
     fn parseVocabDict(self: *HfTokenizer, obj: std.json.ObjectMap) !void {
         var allocated_direct_ids = false;
-        if (self.pre_tokenizer_type == .byte_level and self.byte_level_direct_ids == null) {
+        // Word-final suffixes change even one-byte lookup keys. Do not pay for
+        // a direct table that cannot be used safely by those tokenizers.
+        if (self.pre_tokenizer_type == .byte_level and
+            self.end_of_word_suffix.len == 0 and
+            self.byte_level_direct_ids == null)
+        {
             const direct_ids = try self.allocator.create(ByteLevelDirectIds);
             direct_ids.* = .{};
             self.byte_level_direct_ids = direct_ids;
@@ -2841,6 +2846,12 @@ pub const HfTokenizer = struct {
         var raw = std.ArrayListUnmanaged(i32).empty;
         defer raw.deinit(allocator);
         if (add_bos_token and self.pre_tokenizer_type == .metaspace) {
+            // This override intentionally bypasses encodeInto so it can
+            // suppress Metaspace's implicit prefix when BOS is explicit.
+            // Establish the same read epoch here before touching the shared
+            // lock-free BPE cache.
+            const cache_reader = self.enterBpeCacheRead();
+            defer if (cache_reader) |cache| self.leaveBpeCacheRead(cache);
             try self.encodeWithAddedTokensMetaspaceOverride(allocator, text, .never, &raw);
         } else {
             try self.encodeInto(allocator, text, &raw);
@@ -4490,6 +4501,30 @@ test "byte-level BPE direct-addresses exact two-byte vocabulary tokens" {
     try std.testing.expectEqualSlices(i32, &.{12}, ids);
 }
 
+test "byte-level BPE direct IDs preserve end-of-word suffix semantics" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 1, "a</w>": 2},
+        \\    "merges": [],
+        \\    "end_of_word_suffix": "</w>"
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+
+    try std.testing.expect(tok.byte_level_direct_ids == null);
+
+    const ids = try tok.encode(allocator, "a");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{2}, ids);
+}
+
 test "BPE cache obeys local and external byte budgets" {
     const allocator = std.testing.allocator;
     const json_str =
@@ -4566,6 +4601,85 @@ test "BPE cache obeys local and external byte budgets" {
 
     tok.deinitSelf();
     try std.testing.expectEqual(@as(usize, 0), budget.used_bytes.load(.acquire));
+}
+
+test "metaspace generation participates in BPE cache reclamation epochs" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {
+        \\      "a": 1, "b": 2, "c": 3,
+        \\      "abc": 4, "cab": 5
+        \\    },
+        \\    "merges": []
+        \\  },
+        \\  "pre_tokenizer": {
+        \\    "type": "Metaspace",
+        \\    "prepend_scheme": "always",
+        \\    "split": true
+        \\  }
+        \\}
+    ;
+
+    const entry_bytes =
+        @sizeOf(HfTokenizer.BpeCacheEntry) + "abc".len + @sizeOf(i32);
+    const hard_limit = @sizeOf(HfTokenizer.BpeCache) + entry_bytes;
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+    try tok.configureBpeCache(.{ .max_bytes = hard_limit });
+
+    const tokenizer = tok.tokenizer();
+    var first = try tokenizer.encodeForGenerationConfigured(
+        allocator,
+        "abc",
+        8,
+        true,
+    );
+    first.deinit();
+    var second = try tokenizer.encodeForGenerationConfigured(
+        allocator,
+        "abc",
+        8,
+        true,
+    );
+    second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), tok.bpeCacheStats().entries);
+
+    var first_replacement = try tokenizer.encodeForGenerationConfigured(
+        allocator,
+        "cab",
+        8,
+        true,
+    );
+    first_replacement.deinit();
+    var second_replacement = try tokenizer.encodeForGenerationConfigured(
+        allocator,
+        "cab",
+        8,
+        true,
+    );
+    second_replacement.deinit();
+
+    const cache = tok.bpe_cache orelse return error.TestExpectedBpeCache;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        cache.retired_bytes.load(.acquire),
+    );
+    try std.testing.expectEqual(
+        @sizeOf(HfTokenizer.BpeCache),
+        tok.bpeCacheStats().used_bytes,
+    );
+
+    var admitted_replacement = try tokenizer.encodeForGenerationConfigured(
+        allocator,
+        "cab",
+        8,
+        true,
+    );
+    admitted_replacement.deinit();
+    try std.testing.expectEqual(@as(usize, 1), tok.bpeCacheStats().entries);
 }
 
 test "BPE cache admits repeated keys and replaces cold entries" {

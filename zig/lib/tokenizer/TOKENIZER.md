@@ -133,6 +133,13 @@ filter, live entries, and not-yet-reclaimed entries share a 64 MiB
 per-tokenizer hard byte limit, so variable-length keys and results cannot
 exceed the memory envelope before the slot-count bound is reached.
 
+Every BPE entry point participates in the read epoch, including generation
+encoding's BOS-aware Metaspace override. That override cannot route through the
+normal `encodeInto` wrapper because it must suppress Metaspace's implicit
+prefix, so it establishes the same epoch explicitly. A focused pressure test
+forces replacement through this path and verifies that retired entries are
+reclaimed before the call returns.
+
 `BpeCacheConfig.resource_budget` optionally supplies cold-path `try_reserve`
 and `release` callbacks. Antfly standalone connects these callbacks to the
 node `ResourceManager`'s `inference.tokenizer_cache` slice, which enforces a
@@ -335,6 +342,12 @@ raw keys while loading the tokenizer. The tables cost about 257 KiB and are
 allocated only for ByteLevel tokenizers. They bypass hashing, probing, and
 pointer chasing for these exact tokens.
 
+The direct lookup is used only when the model has no end-of-word suffix.
+Suffix-aware BPE must construct the word-final lookup key even for a one-byte
+pretoken; bypassing that step would select the raw token instead of its
+word-final vocabulary entry. Regression coverage keeps both the suffix-free
+fast path and suffix-aware result exact.
+
 The remaining cache hit path directly appends its ID when the cached result has
 one token instead of entering the slice-copy path. Profiling the GPT-2 fixture
 after the direct maps showed 1,404,645 measured cache hits over ten iterations,
@@ -480,7 +493,7 @@ zig build test-tokenizer-batch
 ```
 
 `test-tokenizer` runs both implementations: the Hugging Face suite currently
-passes 33 tests with one optional external-model test skipped, and the
+passes 35 tests with one optional external-model test skipped, and the
 SentencePiece suite passes all 18 tests. The tokenizer-batch target also passes.
 `zig build inference-test` passes 2,024 tests with 11 skips, and
 `zig build root-test` passes all 222 root compile/unit tests. The focused
