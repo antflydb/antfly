@@ -79,7 +79,7 @@ pub fn syncDirPortable(io: anytype, path: []const u8) !void {
     while (true) switch (std.posix.errno(std.posix.system.fsync(dir.handle))) {
         .SUCCESS => return,
         .INTR => continue,
-        .INVAL => return,
+        .INVAL => return error.DurableDirectorySyncUnsupported,
         .BADF => return error.InvalidFileDescriptor,
         .IO => return error.InputOutput,
         .NOSPC => return error.NoSpaceLeft,

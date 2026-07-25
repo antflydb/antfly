@@ -417,6 +417,7 @@ pub const Storage = struct {
         const existing = self.readFileAlloc(allocator, path, std.math.maxInt(usize)) catch |err| switch (err) {
             error.FileNotFound => {
                 try self.writeFileAbsolute(path, contents);
+                if (sync) try self.syncFileAbsolute(path);
                 return;
             },
             else => return err,
@@ -428,6 +429,7 @@ pub const Storage = struct {
         @memcpy(joined[0..existing.len], existing);
         @memcpy(joined[existing.len..], contents);
         try self.writeFileAbsolute(path, joined);
+        if (sync) try self.syncFileAbsolute(path);
     }
 
     pub fn beginAtomicWrite(self: Storage, allocator: Allocator, path: []const u8) !AtomicWriteSink {
@@ -2463,6 +2465,7 @@ test "host storage delegates through callbacks" {
     const HostContext = struct {
         backing: *MemoryStorage,
         trailer_reads: usize = 0,
+        syncs: usize = 0,
 
         fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -2493,6 +2496,12 @@ test "host storage delegates through callbacks" {
         fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().writeFileAbsolute(path, contents);
+        }
+
+        fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.syncs += 1;
+            return self.backing.storage().syncFileAbsolute(path);
         }
 
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
@@ -2573,6 +2582,16 @@ test "host storage delegates through callbacks" {
         error.DurableDirectorySyncUnsupported,
         host.syncParentAbsolute("/host/not-durable"),
     );
+
+    var durable_host_vtable = host_vtable;
+    durable_host_vtable.sync_file_absolute = HostContext.syncFileAbsolute;
+    const durable_host = HostStorage.init(&host_ctx, &durable_host_vtable).storage();
+    try durable_host.appendFileAbsolute(std.testing.allocator, "/host/durable.log", "a", true);
+    try durable_host.appendFileAbsolute(std.testing.allocator, "/host/durable.log", "b", true);
+    try std.testing.expectEqual(@as(usize, 2), host_ctx.syncs);
+    const durable_contents = try durable_host.readFileAlloc(std.testing.allocator, "/host/durable.log", 32);
+    defer std.testing.allocator.free(durable_contents);
+    try std.testing.expectEqualStrings("ab", durable_contents);
 }
 
 test "storage range read future fallback waits and cancels" {

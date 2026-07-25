@@ -5303,15 +5303,24 @@ pub fn build(b: *std.Build) void {
     const ha_test_step = b.step("ha-test", "Run hot-standby HA storage tests");
     ha_test_step.dependOn(&run_ha_tests.step);
 
+    const lsm_backend_runtime_filters = selectTestFilters(b, &.{"storage.lsm_backend."});
     const lsm_backend_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"storage.lsm_backend."},
+        .filters = compileFiltersWithAnchors(
+            b,
+            &.{"storage.lsm_backend.mod.test_0"},
+            lsm_backend_runtime_filters,
+        ),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lsm_backend_tests = addFilteredTestRunArtifact(b, lsm_backend_tests);
+    const run_lsm_backend_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lsm_backend_tests,
+        lsm_backend_runtime_filters,
+    );
     const lsm_backend_test_step = b.step("lsm-backend-test", "Run LSM backend unit tests only");
     lsm_backend_test_step.dependOn(&run_lsm_backend_tests.step);
 

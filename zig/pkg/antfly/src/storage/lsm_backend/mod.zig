@@ -45,6 +45,7 @@ pub const mutableSnapshotReasonName = impl.mutableSnapshotReasonName;
 test {
     _ = impl;
     _ = cache;
+    _ = storage_io;
     _ = wal;
     _ = background;
     _ = compaction_scheduler;
