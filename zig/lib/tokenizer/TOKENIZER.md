@@ -77,12 +77,14 @@ validation, and output hashing all remain outside the reported interval.
 
 `--internal-threads N` permits up to N active queue consumers for one
 sufficiently large ByteLevel document. The encoder creates 4–8 chunks per
-consumer, capped at 128, so runtime tasks can pull another chunk when work is
-uneven without exceeding the requested concurrency. `--repeat N` repeats the
+consumer for ordinary inputs and 16 for inputs of at least 1 GiB, capped at
+256, so runtime tasks can pull another chunk when work is uneven without
+exceeding the requested concurrency. `--repeat N` repeats the
 corpus in memory before timing, which is useful for measuring internal
 parallelism without changing the fixture. `--cache-max-mb`,
-`--chunks-per-task`, and `--max-chunks` make cache-capacity and scheduling
-sweeps reproducible without changing production defaults. `--diagnostics`
+`--chunks-per-task`, `--max-chunks`, `--worker-cache-count`, and
+`--worker-cache-slots` make cache-capacity and scheduling sweeps reproducible
+without changing production defaults. `--diagnostics`
 reports scanner-only, serial cache-disabled, and serial warm throughput.
 `--profile-bpe` enables atomic cache-hit counters after warmup and reports
 direct hits, cache hits/misses, probe distribution, key lengths, and result
@@ -364,7 +366,7 @@ Each tokenizer retains a free list of parallel workspaces. A workspace contains
 the fixed chunk records and their reusable token-ID and BPE-merge buffers, so
 repeated `encodeIntoParallel` calls do not allocate and destroy chunk state.
 Chunk boundaries use a fixed stack array because internal chunking is capped at
-128. Workspaces are acquired per concurrent call and returned after the
+256. Workspaces are acquired per concurrent call and returned after the
 `std.Io.Group` is joined; concurrent requests therefore do not share mutable
 output state. The free list retains at most four workspaces, and only
 workspaces whose complete retained capacity is at most 64 MiB. Larger
@@ -388,11 +390,14 @@ the representative cold 738 KiB internal result is now about 497 MB/s.
 
 ### Bounded pull scheduling
 
-Large documents are divided into 4 chunks per requested consumer below 4 MiB
-and 8 above it, capped at 128 chunks. At most `max_tasks` `std.Io` consumers
-pull indices from one atomic queue. This keeps the public concurrency limit
-meaningful while allowing a fast consumer to take more work instead of waiting
-for the slowest fixed partition.
+Large documents are divided into 4 chunks per requested consumer below 4 MiB,
+8 above it, and 16 at or above 1 GiB, capped at 256 chunks. At most
+`max_tasks` `std.Io` consumers pull indices from one atomic queue. This keeps
+the public concurrency limit meaningful while allowing a fast consumer to take
+more work instead of waiting for the slowest fixed partition. The 16-chunk
+large-corpus tier was added after the complete private-cache run exposed a
+full-materialization occupancy cliff that the smaller scheduler sweep could
+not reveal.
 
 Combined with the reusable workspace, this moves steady internal throughput to
 about 2.72 GB/s for 738 KiB and 3.16 GB/s for 11.8 MB. An
@@ -402,8 +407,9 @@ pulling.
 
 A controlled 118 MB sweep with sixteen consumers measured median throughput of
 2.823 GB/s at the previous 64-chunk cap and 2.884 GB/s at 128 chunks, a 2.2
-percent improvement with identical token count and BLAKE3. The production
-default therefore uses the 128-chunk cap. One, two, four, and eight chunks per
+percent improvement with identical token count and BLAKE3. That result selected
+the former 128-chunk cap; the large-corpus tier now permits 256. One, two, four,
+and eight chunks per
 consumer measured 2.245, 2.658, 2.768, and 2.801 GB/s respectively in the
 initial sweep; task counts from one through sixteen scaled from 305 MB/s to
 2.92 GB/s.
@@ -571,30 +577,151 @@ workload is dominated by short strings, but Wyhash remains a better hash for
 this table and target CPU. Direct-addressing the shortest exact keys provided
 the useful version of this optimization.
 
-## Remaining work
+## Gigatoken parity plan
 
-The Gigatoken-derived checklist now has these outcomes:
+The earlier experiments tested individual Gigatoken ideas against Antfly's
+shared pointer cache. That is not the architecture behind Gigatoken's published
+8.79 GB/s result. At upstream commit
+`0d9765fa7312af7534535e6315a5c49d74807b2a`, its complete fast path combines:
 
-- Implemented: persistent `std.Io` scheduling, reusable chunk outputs, reusable
-  BPE merge scratch, over-decomposed pull scheduling, overlapped ordered gather,
-  Linux output huge-page advice, SIMD boundary masks, compact Unicode classes,
-  direct short-key IDs, packed merge-pair lookup, bounded boundary planning,
-  repeated-hit admission, CLOCK replacement, epoch-safe cache reclamation,
-  boundary-safe parallel added tokens, a 128-chunk scheduler cap, complete
-  memory-bounded validation, and the shared front-plus-bulk cache.
-- Measured and rejected on the current workload: inline shared entries,
-  worker-local caches, short-key hash replacement, two-phase prefetching,
-  multi-cursor streaming, and descending LPT chunk sizes.
-- Completed: the exact 11,920,511,059-byte OpenWebText benchmark and a scalable
-  second tier that retains long-tail pretokens without enlarging the hot front
-  table.
-- Still open: a compact inline representation specifically for the bulk tier
-  and bulk-only prefetching, plus hardware-counter attribution of the bulk-hit
-  path and output gather. These are justified only if they improve the full
-  corpus inside the 64 MiB production soft limit without regressing the small
-  guardrail. The 512 MiB control improved the complete corpus by only 18
-  percent, so further capacity growth is not an acceptable Antfly default or a
-  promising standalone optimization.
+- one persistent worker pool with about sixteen continuously useful consumers;
+- one private, pre-sized short-pretoken table per consumer (normally 64 MiB),
+  so hits perform no atomic operations, pointer chasing, allocation, or shared
+  cache-line writes;
+- a 32-byte inline entry containing a 128-bit length-tagged key and up to four
+  token IDs, with paired linear probes at 75 percent maximum load;
+- batches of 256 pretokens, with L2 prefetch during key preparation, L1
+  prefetch sixteen probes ahead, and four speculative output stores;
+- a two-phase 64-byte SIMD GPT-2 scanner whose uncommon Unicode and ambiguous
+  boundaries use a separate cold path;
+- at least 1 MiB chunks, about sixteen chunks per consumer, dynamic in-order
+  pull, bounded prefix commits, and deferred release of large chunk buffers.
+
+Its campaign report attributes roughly 1.5 CPU ns/input-byte to the final
+encoder. The qualified Zig run currently needs approximately 8 CPU
+ns/input-byte and keeps only 4.8--5.5 cores useful. Reaching parity therefore
+requires both a 5--6x per-core hot-path reduction and roughly 3x higher useful
+occupancy. Enlarging the existing shared cache cannot close either gap: the
+512 MiB control improved the complete corpus by only 18 percent.
+
+### Production implementation
+
+The parity path is deliberately opt-in because sixteen 64 MiB private tables
+consume about 1 GiB. `ParallelBpeConfig` controls the number and size of
+persistent worker-local tables. Tables are acquired by a `std.Io` consumer for
+the duration of its pull loop, survive across encode calls, and are independent
+of OS-thread identity. Lazy table creation happens in parallel and every byte
+is reserved through the tokenizer's `BpeCacheResourceBudget`; denial or
+allocation failure falls back to the bounded shared cache without affecting
+correctness.
+
+Short keys of 3--15 bytes use the private inline table. One- and two-byte
+vocabulary hits retain the direct-address tables, while longer keys and outputs
+larger than four IDs use the existing exact slow path. A 256-entry preparation
+batch separates scanning/key construction from probes, issues staged
+prefetches, and writes cached IDs directly to reserved output storage. Misses
+run BPE once and populate the local table. This is materially different from
+the rejected 512-entry local pointer cache: it replaces the shared pointer
+representation and its second dependent load instead of adding another lookup
+in front of it.
+
+The scheduler limits each opportunistic prefix commit to eight chunks. This
+prevents a finishing encoder from becoming a long serial gather worker while
+other consumers go idle. Chunk output and BPE scratch remain reusable through
+the existing workspace pool. After encode workers join, residual gathers of at
+least 64 MiB use the same bounded `std.Io` runtime to copy disjoint output
+ranges in parallel; smaller results avoid the task-launch overhead. Workspace
+retention and local-cache retention share the same process resource budget.
+
+The current 64-byte boundary-mask scanner remains the exact scanner used by
+both serial and local-cache paths. The next scanner milestone is not another
+multi-cursor loop: it is a generated two-phase ASCII/Unicode mask kernel with
+explicit usable and bad zones, plus architecture-specific NEON and AVX
+implementations. It must first exceed 2.4 GB/s on the scanner-only full-corpus
+stage and reproduce every existing boundary test. Until that gate passes, the
+portable mask implementation remains production code.
+
+### Qualification gates
+
+Performance changes are accepted only when all of the following hold:
+
+1. The 11,920,511,059-byte OpenWebText result contains exactly 2,704,046,552
+   tokens and has BLAKE3
+   `66cc8eb56e955f8669417b549d831a55418664ec337e16d5f9cb0b6ae5617a5a`.
+2. A fresh tokenizer with caching disabled independently produces the reference
+   sequence; concurrent timed output is checked exactly or with complete
+   BLAKE3 validation.
+3. The Pride-and-Prejudice small-corpus guardrail does not regress by more than
+   3 percent from the shared-cache path.
+4. No-cache, denied-budget, allocation-failure, added-token boundary, and
+   concurrent shared-tokenizer tests pass without leaks.
+5. Full-corpus reporting includes wall throughput, CPU ns/input-byte, average
+   useful cores, peak RSS, table bytes, cache occupancy, and scanner-only
+   throughput. A speedup obtained solely from unreported memory growth is not a
+   parity result.
+
+The benchmark exposes `--worker-cache-count` and `--worker-cache-slots`.
+`--worker-cache-count 16 --worker-cache-slots 2097152` reproduces Gigatoken's
+approximately 1 GiB private-cache geometry. Production defaults keep this
+disabled; a backend can enable it only when its resource manager admits the
+retained allocation. The published shared-cache configuration remains the
+memory-bounded baseline, not a claimed Gigatoken-equivalent configuration.
+
+### Inline-cache results
+
+The implemented path uses one padded 128-bit key load, ARM CRC32C when
+available (with a portable multiply-fold fallback), one prepared hash reused by
+both prefetch stages and the final paired probe, and four unconditional output
+stores. Large tables are seeded from exact vocabulary entries before their
+first use. A small table skips seeding when the vocabulary would consume more
+than half its capacity, preserving space for observed pretokens.
+
+On the M4 qualification host, ReleaseFast results were:
+
+| Corpus/configuration | Throughput | CPU ns/byte | Useful cores | Private table bytes |
+| --- | ---: | ---: | ---: | ---: |
+| 11.8 MB guardrail, shared cache | 2.575 GB/s | 4.23 | 10.88 | 0 |
+| 11.8 MB guardrail, 14 x 32K private entries | 2.507 GB/s | 4.30 | 10.77 | 14 MiB |
+| 1 GB OpenWebText prefix, default shared cache | 0.339 GB/s | 34.69 | 11.75 | 0 |
+| 1 GB OpenWebText prefix, 14 x 2M private entries | 1.694 GB/s | 6.14 | 10.40 | 896 MiB |
+| Complete OpenWebText, former shared baseline | 0.585 GB/s | 7.90 | 4.84 | 0 |
+| Complete OpenWebText, 14 x 2M private entries | 0.899 GB/s | 5.93 | 5.34 | 896 MiB |
+
+The complete result is 54 percent faster than the former qualified baseline
+and reproduces 2,704,046,552 tokens with BLAKE3
+`66cc8eb56e955f8669417b549d831a55418664ec337e16d5f9cb0b6ae5617a5a`.
+It used 256 chunks, peaked at 23.7 GB RSS, and filled 22,020,096 of
+29,360,128 private slots. The small guardrail is 1.0 percent slower, inside the
+3 percent acceptance bound in the initial paired run and 2.65 percent slower
+in the final paired run shown above. The large-corpus result is therefore a real
+improvement, but it is not yet Gigatoken parity.
+
+The data isolates the remaining work:
+
+- Reduce the complete hit path from 5.93 toward 1.5 CPU ns/input-byte. Hardware
+  counters must separate scanner/key preparation, paired random probes,
+  prepared-span traffic, output stores, and BPE misses before another hot-path
+  rewrite is accepted.
+- Replace the portable mixed-block scanner with the gated NEON/AVX two-phase
+  usable/bad-zone kernel. The current scanner retains safe ASCII prefixes
+  around Unicode but measures only about 0.66 GB/s, versus Gigatoken's
+  2.46--2.60 GB/s scanner.
+- Remove the full-materialization occupancy cliff. Sixteen chunks per consumer
+  and the 256-chunk cap raised complete useful occupancy from 4.83 to 5.34, but
+  the 1 GB prefix sustains more than twelve. Page faults, memory pressure,
+  ordered gather copies, allocator release, and `std.Io` task residency need
+  separate timing/counters on a host with enough RAM to avoid compression.
+- Add a high-memory output mode that reserves the one-token-per-input-byte
+  upper bound, permits unconditional writes without batch capacity checks, and
+  performs the suffix gather in parallel. It must remain resource-budgeted and
+  opt-in because the complete fixture alone would reserve roughly 48 GB for
+  final IDs.
+
+The target is first less than 3 CPU ns/input-byte with at least twelve useful
+cores on the complete corpus, then the approximately 1.5 CPU ns/input-byte /
+8.79 GB/s upstream envelope on comparable M4 Max hardware. The often-quoted
+28 GB/s figure is a pretoken-counting or synthetic substage, not Gigatoken's
+materialized complete-BPE OpenWebText result.
 
 The 4.4 GB compressed OpenWebText fixture is intentionally not a normal unit or
 CI dependency. Its decompressed input is 11,920,511,059 bytes and the reference

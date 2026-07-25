@@ -35,7 +35,9 @@ const Config = struct {
     cache_max_bytes: ?usize = null,
     cache_bulk_slots_per_shard: usize = 0,
     chunks_per_task: usize = 0,
-    max_chunks: usize = 128,
+    max_chunks: usize = 256,
+    worker_cache_count: usize = 0,
+    worker_cache_slots: usize = 0,
     validation_mode: ValidationMode = .exact,
     mmap_corpus: bool = false,
     prefault_corpus: bool = false,
@@ -54,7 +56,9 @@ fn usage(writer: *std.Io.Writer) !void {
         \\  --cache-max-mb N          cache hard limit; zero disables it
         \\  --cache-bulk-slots N      second-tier slots per shard; zero disables it
         \\  --chunks-per-task N       zero keeps the adaptive scheduler default
-        \\  --max-chunks N            cap chunks per encode at 1..128
+        \\  --max-chunks N            cap chunks per encode at 1..256
+        \\  --worker-cache-count N    persistent private cache tables (0..64)
+        \\  --worker-cache-slots N    power-of-two 32-byte entries per table
         \\  --profile-bpe             collect detailed BPE/cache counters
         \\  --diagnostics             measure scanner-only, serial no-cache, and serial warm stages
         \\  --diagnostic-iterations N stage repetitions (default: 1)
@@ -163,6 +167,18 @@ fn parseArgs(io: std.Io, args_in: std.process.Args) !Config {
                 args.next() orelse return error.MissingArgument,
                 10,
             );
+        } else if (std.mem.eql(u8, arg, "--worker-cache-count")) {
+            cfg.worker_cache_count = try std.fmt.parseInt(
+                usize,
+                args.next() orelse return error.MissingArgument,
+                10,
+            );
+        } else if (std.mem.eql(u8, arg, "--worker-cache-slots")) {
+            cfg.worker_cache_slots = try std.fmt.parseInt(
+                usize,
+                args.next() orelse return error.MissingArgument,
+                10,
+            );
         } else if (std.mem.eql(u8, arg, "--validation")) {
             const mode = args.next() orelse return error.MissingArgument;
             if (std.mem.eql(u8, mode, "exact")) {
@@ -188,11 +204,11 @@ fn parseArgs(io: std.Io, args_in: std.process.Args) !Config {
         cfg.repeat == 0 or
         cfg.repeat > 4096 or
         cfg.diagnostic_iterations == 0 or
-        cfg.chunks_per_task > 128 or
+        cfg.chunks_per_task > 256 or
         cfg.cache_bulk_slots_per_shard > 131072 or
         (cfg.prefault_corpus and !cfg.mmap_corpus) or
         cfg.max_chunks == 0 or
-        cfg.max_chunks > 128)
+        cfg.max_chunks > 256)
     {
         return error.InvalidConfiguration;
     }
@@ -568,6 +584,8 @@ pub fn main(init: std.process.Init) !void {
     try hf.configureParallelBpe(.{
         .chunks_per_task = cfg.chunks_per_task,
         .max_chunks = cfg.max_chunks,
+        .worker_cache_count = cfg.worker_cache_count,
+        .worker_cache_slots = cfg.worker_cache_slots,
     });
     const tokenizer = hf.tokenizer();
     const rss_after_load = processPeakRssBytes();
@@ -779,7 +797,8 @@ pub fn main(init: std.process.Init) !void {
         "runtime=std_io corpus_storage={s} tokenizer_bytes={d} corpus_bytes={d} repeat={d} warmup_iterations={d} iterations={d} threads={d} internal_threads={d} " ++
             "validation={s} tokens_per_iteration={d} token_hash={x} token_blake3={s} elapsed_seconds={d:.6} " ++
             "cpu_seconds={d:.6} average_cores={d:.3} cpu_ns_per_byte={d:.3} mb_per_second={d:.3} " ++
-            "mtokens_per_second={d:.3} chunks_per_task={d} max_chunks={d} ",
+            "mtokens_per_second={d:.3} chunks_per_task={d} max_chunks={d} " ++
+            "worker_cache_count={d} worker_cache_slots_per_table={d} ",
         .{
             if (cfg.mmap_corpus) "mmap" else "allocated",
             tokenizer_json.len,
@@ -801,12 +820,16 @@ pub fn main(init: std.process.Init) !void {
             mtok_per_second,
             cfg.chunks_per_task,
             cfg.max_chunks,
+            cfg.worker_cache_count,
+            cfg.worker_cache_slots,
         },
     );
     try stdout.interface.print(
         "cache_entries={d} cache_front_entries={d} cache_bulk_entries={d} cache_bulk_slots={d} " ++
             "cache_bytes={d} cache_limit_bytes={d} cache_rejected_reservations={d} " ++
-            "cache_rejected_admissions={d} cache_evictions={d} rss_after_load_bytes={d} " ++
+            "cache_rejected_admissions={d} cache_evictions={d} " ++
+            "worker_cache_tables={d} worker_cache_entries={d} worker_cache_slots={d} " ++
+            "worker_cache_bytes={d} rss_after_load_bytes={d} " ++
             "rss_after_warmup_bytes={d} rss_after_timed_bytes={d} rss_after_validation_bytes={d}\n",
         .{
             cache_stats.entries,
@@ -818,6 +841,10 @@ pub fn main(init: std.process.Init) !void {
             cache_stats.rejected_reservations,
             cache_stats.rejected_admissions,
             cache_stats.evictions,
+            cache_stats.worker_tables,
+            cache_stats.worker_entries,
+            cache_stats.worker_slots,
+            cache_stats.worker_bytes,
             rss_after_load,
             rss_after_warmup,
             rss_after_timed,
