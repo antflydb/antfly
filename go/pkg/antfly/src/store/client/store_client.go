@@ -23,7 +23,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -170,6 +169,19 @@ func (sc *StoreClient) ApplyMergeChunk(
 
 func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, backupReq common.BackupConfig) error {
 	backupReq.Format = common.NormalizeBackupFormat(backupReq.Format)
+	fileLocation := ""
+	if strings.HasPrefix(backupReq.Location, "file://") {
+		fileLocation = backupReq.ResolvedLocation
+		if fileLocation == "" {
+			if backupReq.Connection != "" {
+				return errors.New("filesystem backup requires a coordinator-resolved location")
+			}
+			fileLocation = backupReq.Location
+		}
+		if !strings.HasPrefix(fileLocation, "file://") {
+			return errors.New("resolved filesystem backup location must use file://")
+		}
+	}
 	// Create the request
 	url := sc.url + "/shard/backup"
 	body, err := json.Marshal(backupReq)
@@ -193,39 +205,64 @@ func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, backupReq c
 
 	if resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusConflict {
+			return fmt.Errorf("%w: %s", common.ErrBackupAlreadyExists, strings.TrimSpace(string(bodyBytes)))
+		}
 		return &ResponseError{StatusCode: resp.StatusCode, Body: string(bodyBytes)}
 	}
-	if after, ok := strings.CutPrefix(backupReq.Location, "file://"); ok {
+	if after, ok := strings.CutPrefix(fileLocation, "file://"); ok {
 		loc := after
-		if err := os.MkdirAll(loc, os.ModePerm); err != nil && !os.IsExist(err) { //nolint:gosec // G301: standard permissions for data directory
+		if err := os.MkdirAll(loc, 0o750); err != nil && !os.IsExist(err) {
 			return fmt.Errorf("creating backup directory: %w", err)
 		}
-		// Create a file to save the streamed data
 		backupFileName := common.ShardBackupFileName(backupReq.BackupID, shardID)
 		if backupReq.Format == common.BackupFormatPortable {
 			backupFileName = common.ShardPortableBackupFileName(backupReq.BackupID, shardID)
 		}
-		filePath := path.Join(loc, backupFileName)
-		file, err := os.Create(filepath.Clean(filePath))
+		filePath := filepath.Join(loc, backupFileName)
+		file, err := os.CreateTemp(loc, "."+backupFileName+".tmp-*")
 		if err != nil {
-			return fmt.Errorf("creating file: %w", err)
+			return fmt.Errorf("creating temporary backup file: %w", err)
 		}
-		defer func() { _ = file.Close() }()
-
-		// Copy the response body to the file in chunks
-		buffer := make([]byte, 4096)
-		for {
-			n, err := resp.Body.Read(buffer)
-			if err != nil && err != io.EOF {
-				return fmt.Errorf("reading response body: %w", err)
+		tempPath := file.Name()
+		defer func() {
+			_ = file.Close()
+			_ = os.Remove(tempPath)
+		}()
+		if err := file.Chmod(0o600); err != nil {
+			return fmt.Errorf("setting backup file permissions: %w", err)
+		}
+		if _, err := io.Copy(file, resp.Body); err != nil {
+			return fmt.Errorf("streaming backup response: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("syncing backup file: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			return fmt.Errorf("closing backup file: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := os.Link(tempPath, filepath.Clean(filePath)); err != nil {
+			if os.IsExist(err) {
+				return fmt.Errorf("%w: shard file %s", common.ErrBackupAlreadyExists, backupFileName)
 			}
-			if n == 0 {
-				break // End of stream
-			}
-			_, err = file.Write(buffer[:n])
-			if err != nil {
-				return fmt.Errorf("writing to file: %w", err)
-			}
+			return fmt.Errorf("publishing backup file: %w", err)
+		}
+		dir, err := os.Open(loc) //nolint:gosec // authorized coordinator-resolved directory
+		if err != nil {
+			return fmt.Errorf("opening backup directory for sync: %w", err)
+		}
+		if err := dir.Sync(); err != nil {
+			_ = dir.Close()
+			return fmt.Errorf("syncing backup directory: %w", err)
+		}
+		if err := dir.Close(); err != nil {
+			return fmt.Errorf("closing backup directory: %w", err)
 		}
 	}
 
@@ -737,6 +774,14 @@ func (sc *StoreClient) StartShard(
 	if restoreConfig := shardStartReq.RestoreConfig; restoreConfig != nil {
 		location := restoreConfig.Location
 		if strings.HasPrefix(location, "file://") {
+			if restoreConfig.ResolvedLocation != "" {
+				location = restoreConfig.ResolvedLocation
+			} else if restoreConfig.Connection != "" {
+				return errors.New("filesystem restore requires a coordinator-resolved location")
+			}
+			if !strings.HasPrefix(location, "file://") {
+				return errors.New("resolved filesystem restore location must use file://")
+			}
 			backupID := restoreConfig.BackupID
 			// Local file: stream as multipart
 			localDir := strings.TrimPrefix(location, "file://")
@@ -801,8 +846,7 @@ func (sc *StoreClient) StartShard(
 				}
 				defer func() { _ = backupFile.Close() }()
 
-				buf := make([]byte, 64*1024*1024) // 64MB buffer
-				if _, err := io.CopyBuffer(filePart, backupFile, buf); err != nil {
+				if _, err := io.Copy(filePart, backupFile); err != nil {
 					// ln.logger.Error("Failed to copy backup file to multipart writer", zap.String("path", fullBackupFilePath), zap.Error(err))
 					pipeW.CloseWithError(
 						fmt.Errorf(

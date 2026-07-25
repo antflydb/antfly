@@ -407,7 +407,7 @@ func TestHandleBackup_FileLocation_Success(t *testing.T) {
 	// fullBackupFilePath := filepath.Join(tempDir, expectedBackupFileName)
 
 	// Simulate the backup file being created by the Shard.Backup method
-	mockShard.On("Backup", mock.Anything, backupLocation, fmt.Sprintf("%s-%s", backupID, shardID)).
+	mockShard.On("Backup", mock.Anything, "", fmt.Sprintf("%s-%s", backupID, shardID)).
 		Return(nil).
 		Run(func(args mock.Arguments) {
 			snapDir := common.SnapDir(baseDir, shardID, mockStore.ID())
@@ -502,10 +502,15 @@ func TestHandleBackup_DefaultsToPortable(t *testing.T) {
 	assert.Equal(t, "attachment; filename="+common.ShardPortableBackupFileName(backupID, shardID), rr.Header().Get("Content-Disposition"))
 	assert.Equal(t, "portable backup data", rr.Body.String())
 
-	expectedPath := filepath.Join(tempDir, common.ShardPortableBackupFileName(backupID, shardID))
+	expectedPath := filepath.Join(
+		common.SnapDir(baseDir, shardID, mockStore.ID()),
+		common.ShardPortableBackupFileName(backupID, shardID),
+	)
 	content, err := os.ReadFile(expectedPath)
 	require.NoError(t, err)
 	assert.Equal(t, "portable backup data", string(content))
+	_, err = os.Stat(filepath.Join(tempDir, common.ShardPortableBackupFileName(backupID, shardID)))
+	require.ErrorIs(t, err, os.ErrNotExist)
 
 	mockShard.AssertExpectations(t)
 	mockStore.AssertExpectations(t)
@@ -603,7 +608,7 @@ func TestHandleBackup_ShardBackupFails(t *testing.T) {
 	backupLocation := "file://" + tempDir
 
 	mockStore.On("Shard", shardID).Return(mockShard, true)
-	mockShard.On("Backup", mock.Anything, backupLocation, fmt.Sprintf("%s-%s", backupID, shardID)).
+	mockShard.On("Backup", mock.Anything, "", fmt.Sprintf("%s-%s", backupID, shardID)).
 		Return(errors.New("shard backup failed"))
 
 	backupReq := common.BackupConfig{
@@ -646,7 +651,7 @@ func TestHandleBackup_FileLocation_BackupFileNotCreated(t *testing.T) {
 	backupLocation := "file://" + tempDir
 
 	// Simulate Shard.Backup succeeding but somehow not creating the file (or it gets deleted)
-	mockShard.On("Backup", mock.Anything, backupLocation, fmt.Sprintf("%s-%s", backupID, shardID)).
+	mockShard.On("Backup", mock.Anything, "", fmt.Sprintf("%s-%s", backupID, shardID)).
 		Return(nil)
 	mockStore.On("Shard", shardID).Return(mockShard, true)
 
@@ -1498,7 +1503,9 @@ func TestHandleBackup_AllowsConfiguredLocalBackupDir(t *testing.T) {
 	mockStore.On("Shard", shardID).Return(mockShard, true)
 	mockShard.On("Backup", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		backupName := args.String(2) + ".tar.zst"
-		require.NoError(t, os.WriteFile(filepath.Join(allowedDir, backupName), []byte("backup"), 0o600))
+		snapDir := common.SnapDir(baseDir, shardID, mockStore.ID())
+		require.NoError(t, os.MkdirAll(snapDir, 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(snapDir, backupName), []byte("backup"), 0o600))
 	}).Return(nil)
 
 	body, err := json.Marshal(common.BackupConfig{BackupID: "safe-id", Location: "file://" + allowedDir, Format: common.BackupFormatNative})

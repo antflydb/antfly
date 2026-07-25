@@ -16,6 +16,7 @@ package common
 
 import (
 	"encoding/json"
+	"errors"
 	"maps"
 	"slices"
 
@@ -35,6 +36,8 @@ const (
 	BackupFormatPortable BackupFormat = "portable"
 )
 
+var ErrBackupAlreadyExists = errors.New("backup already exists")
+
 func NormalizeBackupFormat(format BackupFormat) BackupFormat {
 	if format == "" {
 		return DefaultBackupFormat
@@ -43,10 +46,11 @@ func NormalizeBackupFormat(format BackupFormat) BackupFormat {
 }
 
 type BackupConfig struct {
-	BackupID   string       `json:"backup_id"`
-	Connection string       `json:"connection,omitempty"`
-	Location   string       `json:"location"`
-	Format     BackupFormat `json:"format,omitempty"`
+	BackupID         string       `json:"backup_id"`
+	Connection       string       `json:"connection,omitempty"`
+	Location         string       `json:"location"`
+	Format           BackupFormat `json:"format,omitempty"`
+	ResolvedLocation string       `json:"-"`
 }
 
 func (rc *BackupConfig) Equal(other *BackupConfig) bool {

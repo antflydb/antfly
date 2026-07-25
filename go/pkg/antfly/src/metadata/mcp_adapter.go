@@ -441,6 +441,10 @@ func (a *mcpAdapter) Backup(
 	if err != nil {
 		return err
 	}
+	if err := metadataStore.ReserveBackupID(ctx, backupID); err != nil {
+		return err
+	}
+	backup.ResolvedLocation = metadataStore.ResolvedLocation()
 	eg, egCtx := errgroup.WithContext(ctx)
 	for shardID := range table.Shards {
 		eg.Go(func() error {
@@ -452,6 +456,9 @@ func (a *mcpAdapter) Backup(
 	}
 	if err := eg.Wait(); err != nil {
 		return fmt.Errorf("backup failed: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Write backup metadata
@@ -490,10 +497,11 @@ func (a *mcpAdapter) Restore(
 	}
 
 	if err := a.t.tm.RestoreTable(tableMetadata, &common.BackupConfig{
-		Location:   location,
-		Connection: connection,
-		BackupID:   backupID,
-		Format:     format,
+		Location:         location,
+		ResolvedLocation: metadataStore.ResolvedLocation(),
+		Connection:       connection,
+		BackupID:         backupID,
+		Format:           format,
 	}); err != nil {
 		return fmt.Errorf("restoring table: %w", err)
 	}

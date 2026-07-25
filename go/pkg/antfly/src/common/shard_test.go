@@ -16,11 +16,30 @@ package common
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/goccy/go-json"
 )
+
+func TestBackupConfigDoesNotSerializeResolvedLocation(t *testing.T) {
+	config := BackupConfig{
+		BackupID:         "backup-1",
+		Connection:       "filesystem",
+		Location:         "file:///logical",
+		ResolvedLocation: "file:///private/authorized/logical",
+		Format:           BackupFormatPortable,
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal backup config: %v", err)
+	}
+	if strings.Contains(string(data), "private/authorized") ||
+		strings.Contains(string(data), "resolved") {
+		t.Fatalf("resolved location leaked into serialized backup config: %s", data)
+	}
+}
 
 func TestPeerSet_JSONRoundtrip(t *testing.T) {
 	original := NewPeerSet()

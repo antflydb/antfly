@@ -15,8 +15,11 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
@@ -41,6 +44,128 @@ func TestFileBackupStorePersistsFormatInVersionedEnvelope(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, common.BackupFormatNative, format)
 	assert.Equal(t, table.Name, restored.Name)
+}
+
+func TestFileBackupStorePublishesMetadataCreateOnly(t *testing.T) {
+	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
+	first := &store.Table{Name: "first"}
+	second := &store.Table{Name: "second"}
+
+	require.NoError(t, backupStore.WriteMetadata(
+		context.Background(),
+		"backup-1",
+		first,
+		common.BackupFormatPortable,
+	))
+	err := backupStore.WriteMetadata(
+		context.Background(),
+		"backup-1",
+		second,
+		common.BackupFormatPortable,
+	)
+	require.ErrorIs(t, err, ErrBackupAlreadyExists)
+
+	restored, _, err := backupStore.ReadMetadata(context.Background(), "backup-1")
+	require.NoError(t, err)
+	assert.Equal(t, first.Name, restored.Name)
+}
+
+func TestFileBackupStoreReservationPermanentlyConsumesID(t *testing.T) {
+	backupStore := &fileBackupStore{location: filepath.Join(t.TempDir(), "new", "backup")}
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+	require.ErrorIs(
+		t,
+		backupStore.ReserveBackupID(context.Background(), "backup-1"),
+		ErrBackupAlreadyExists,
+	)
+}
+
+func TestFileBackupStoreDoesNotPublishAfterCancellation(t *testing.T) {
+	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.ErrorIs(t, backupStore.ReserveBackupID(ctx, "reserved"), context.Canceled)
+	require.ErrorIs(
+		t,
+		backupStore.WriteMetadata(
+			ctx,
+			"metadata",
+			&store.Table{Name: "documents"},
+			common.BackupFormatPortable,
+		),
+		context.Canceled,
+	)
+	entries, err := os.ReadDir(root)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestFileBackupStoreConcurrentPublicationHasSingleWinner(t *testing.T) {
+	backupStore := &fileBackupStore{location: t.TempDir()}
+	var successes atomic.Int32
+	unexpected := make(chan error, 16)
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := backupStore.WriteMetadata(
+				context.Background(),
+				"backup-1",
+				&store.Table{Name: "documents"},
+				common.BackupFormatPortable,
+			)
+			switch {
+			case err == nil:
+				successes.Add(1)
+			case errors.Is(err, ErrBackupAlreadyExists):
+			default:
+				unexpected <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(unexpected)
+
+	assert.Equal(t, int32(1), successes.Load())
+	for err := range unexpected {
+		require.NoError(t, err)
+	}
+}
+
+func TestFileBackupStoreRejectsOversizedMetadata(t *testing.T) {
+	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "backup-1-metadata.json"),
+		make([]byte, maxBackupMetadataBytes+1),
+		0o600,
+	))
+
+	_, _, err := backupStore.ReadMetadata(context.Background(), "backup-1")
+	require.ErrorIs(t, err, ErrBackupMetadataTooLarge)
+}
+
+func TestTableBackupMetadataIDIsStableAndPathSafe(t *testing.T) {
+	first := tableBackupMetadataID("tenant/table with spaces", "backup-1")
+	assert.Equal(t, first, tableBackupMetadataID("tenant/table with spaces", "backup-1"))
+	assert.NotEqual(t, first, tableBackupMetadataID("tenant/table with spaces", "backup-2"))
+	assert.NotEqual(t, first, tableBackupMetadataID("tenant/table", "with spaces\x00backup-1"))
+	require.NoError(t, common.ValidateBackupID(first))
+	assert.Len(t, first, len("table-")+64)
+}
+
+func TestValidateBackupTableNamesRejectsAmbiguousSelections(t *testing.T) {
+	require.NoError(t, validateBackupTableNames([]string{"documents", "events"}))
+	require.ErrorContains(
+		t,
+		validateBackupTableNames([]string{"documents", "documents"}),
+		"selected more than once",
+	)
+	require.ErrorContains(t, validateBackupTableNames([]string{"documents", " "}), "cannot be empty")
 }
 
 func TestFileBackupStoreRejectsUnversionedMetadata(t *testing.T) {

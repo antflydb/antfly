@@ -15,6 +15,8 @@
 package common
 
 import (
+	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/url"
@@ -24,8 +26,8 @@ import (
 	"sync"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
-	"github.com/antflydb/antfly/go/pkg/libaf/s3"
 	"github.com/minio/minio-go/v7"
+	miniocredentials "github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 // Extension fields and methods for MetadataInfo
@@ -36,23 +38,73 @@ type (
 		parsed   map[types.ID]string
 	}
 
+	configRuntimeExtension struct {
+		mu            sync.Mutex
+		s3Connections map[string]*s3ConnectionRuntime
+	}
+
+	s3ConnectionRuntime struct {
+		mu          sync.Mutex
+		fingerprint [sha256.Size]byte
+		initialized bool
+		client      *minio.Client
+		buckets     sync.Map
+	}
+
+	s3BucketAdmission struct {
+		mu    sync.Mutex
+		ready bool
+	}
+
 	// S3Info is the runtime projection of a capability-scoped S3 connection.
 	// It is intentionally not part of the public configuration schema.
 	S3Info struct {
-		Endpoint         string
-		Bucket           string
-		Prefix           string
-		UseSsl           bool
-		CredentialSource AwsCredentialConfigSource
-		AccessKeyId      string
-		SecretAccessKey  string
-		SessionToken     string
-		Profile          string
+		Endpoint              string
+		Bucket                string
+		Prefix                string
+		Region                string
+		UseSsl                bool
+		AddressingStyle       S3ExternalIoConfigAddressingStyle
+		BucketProvisioning    S3ExternalIoConfigBucketProvisioning
+		CredentialSource      AwsCredentialConfigSource
+		AccessKeyId           string
+		SecretAccessKey       string
+		SessionToken          string
+		Profile               string
+		SharedCredentialsFile string
+		RoleArn               string
+		TokenFile             string
+		SessionName           string
+		StsEndpoint           string
+		runtime               *s3ConnectionRuntime
 	}
 )
 
 var metadataCache = make(map[*MetadataInfo]*metadataInfoExtension)
 var metadataCacheMu sync.Mutex
+var configRuntimeCache = make(map[*Config]*configRuntimeExtension)
+var configRuntimeCacheMu sync.Mutex
+
+func (c *Config) s3Runtime(connectionID string) *s3ConnectionRuntime {
+	configRuntimeCacheMu.Lock()
+	ext, ok := configRuntimeCache[c]
+	if !ok {
+		ext = &configRuntimeExtension{
+			s3Connections: make(map[string]*s3ConnectionRuntime),
+		}
+		configRuntimeCache[c] = ext
+	}
+	configRuntimeCacheMu.Unlock()
+
+	ext.mu.Lock()
+	defer ext.mu.Unlock()
+	runtime, ok := ext.s3Connections[connectionID]
+	if !ok {
+		runtime = &s3ConnectionRuntime{}
+		ext.s3Connections[connectionID] = runtime
+	}
+	return runtime
+}
 
 // GetOrchestrationURLs returns parsed orchestration URLs with caching
 func (m *MetadataInfo) GetOrchestrationURLs() (map[types.ID]string, error) {
@@ -483,14 +535,15 @@ func validateAWSCredentialConfig(config AwsCredentialConfig) error {
 	case AwsCredentialConfigSourceDefault:
 		if config.AccessKeyId != "" || config.SecretAccessKey != "" || config.SessionToken != "" ||
 			config.Profile != "" || config.SharedCredentialsFile != "" || config.RoleArn != "" ||
-			config.TokenFile != "" || config.StsEndpoint != "" {
+			config.TokenFile != "" || config.SessionName != "" || config.StsEndpoint != "" {
 			return errors.New("default AWS credential source cannot include static, profile, or web-identity fields")
 		}
 	case AwsCredentialConfigSourceStatic:
 		if strings.TrimSpace(config.AccessKeyId) == "" || strings.TrimSpace(config.SecretAccessKey) == "" {
 			return errors.New("static AWS credential source requires access_key_id and secret_access_key")
 		}
-		if config.Profile != "" || config.SharedCredentialsFile != "" || config.RoleArn != "" || config.TokenFile != "" {
+		if config.Profile != "" || config.SharedCredentialsFile != "" || config.RoleArn != "" ||
+			config.TokenFile != "" || config.SessionName != "" || config.StsEndpoint != "" {
 			return errors.New("static AWS credential source cannot include profile or web-identity fields")
 		}
 	case AwsCredentialConfigSourceProfile:
@@ -498,7 +551,8 @@ func validateAWSCredentialConfig(config AwsCredentialConfig) error {
 			return errors.New("profile AWS credential source requires profile")
 		}
 		if config.AccessKeyId != "" || config.SecretAccessKey != "" || config.SessionToken != "" ||
-			config.RoleArn != "" || config.TokenFile != "" || config.StsEndpoint != "" {
+			config.RoleArn != "" || config.TokenFile != "" || config.SessionName != "" ||
+			config.StsEndpoint != "" {
 			return errors.New("profile AWS credential source cannot include static or web-identity fields")
 		}
 	case AwsCredentialConfigSourceWebIdentity:
@@ -569,16 +623,53 @@ func (c *Config) resolveS3Info(
 		endpoint = "s3.amazonaws.com"
 		useSSL = true
 	}
+	addressingStyle := config.AddressingStyle
+	if addressingStyle == "" {
+		addressingStyle = S3ExternalIoConfigAddressingStyleVirtualHosted
+	}
+	switch addressingStyle {
+	case S3ExternalIoConfigAddressingStylePath,
+		S3ExternalIoConfigAddressingStyleVirtualHosted:
+	default:
+		return S3Info{}, fmt.Errorf(
+			"connection %q has unsupported S3 addressing_style %q",
+			connectionID,
+			addressingStyle,
+		)
+	}
+	bucketProvisioning := config.BucketProvisioning
+	if bucketProvisioning == "" {
+		bucketProvisioning = S3ExternalIoConfigBucketProvisioningRequireExisting
+	}
+	switch bucketProvisioning {
+	case S3ExternalIoConfigBucketProvisioningCreateIfMissing,
+		S3ExternalIoConfigBucketProvisioningRequireExisting:
+	default:
+		return S3Info{}, fmt.Errorf(
+			"connection %q has unsupported S3 bucket_provisioning %q",
+			connectionID,
+			bucketProvisioning,
+		)
+	}
 	return S3Info{
-		Endpoint:         endpoint,
-		Bucket:           bucket,
-		Prefix:           strings.Trim(strings.TrimSpace(prefix), "/"),
-		UseSsl:           useSSL,
-		CredentialSource: credentials.Source,
-		AccessKeyId:      credentials.AccessKeyId,
-		SecretAccessKey:  credentials.SecretAccessKey,
-		SessionToken:     credentials.SessionToken,
-		Profile:          credentials.Profile,
+		Endpoint:              endpoint,
+		Bucket:                bucket,
+		Prefix:                strings.Trim(strings.TrimSpace(prefix), "/"),
+		Region:                strings.TrimSpace(config.Region),
+		UseSsl:                useSSL,
+		AddressingStyle:       addressingStyle,
+		BucketProvisioning:    bucketProvisioning,
+		CredentialSource:      credentials.Source,
+		AccessKeyId:           credentials.AccessKeyId,
+		SecretAccessKey:       credentials.SecretAccessKey,
+		SessionToken:          credentials.SessionToken,
+		Profile:               credentials.Profile,
+		SharedCredentialsFile: credentials.SharedCredentialsFile,
+		RoleArn:               credentials.RoleArn,
+		TokenFile:             credentials.TokenFile,
+		SessionName:           credentials.SessionName,
+		StsEndpoint:           credentials.StsEndpoint,
+		runtime:               c.s3Runtime(connectionID),
 	}, nil
 }
 
@@ -589,6 +680,56 @@ func (c *Config) ResolveS3Info(connectionID, requiredCapability, location string
 		return S3Info{}, err
 	}
 	return c.resolveS3Info(connectionID, requiredCapability, bucket, prefix)
+}
+
+func pathWithinFilesystemRoot(root, candidate string) bool {
+	relative, err := filepath.Rel(root, candidate)
+	return err == nil &&
+		relative != ".." &&
+		!strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func resolvePathWithoutSymlinks(root, logical string) (string, error) {
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return "", fmt.Errorf("opening filesystem connection root: %w", err)
+	}
+	if !rootInfo.IsDir() {
+		return "", errors.New("filesystem connection root must be a directory")
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolving filesystem connection root: %w", err)
+	}
+
+	candidate := canonicalRoot
+	parts := strings.Split(filepath.Clean(logical), string(filepath.Separator))
+	for i, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		next := filepath.Join(candidate, part)
+		info, err := os.Lstat(next)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return "", fmt.Errorf("inspecting filesystem path component %q: %w", part, err)
+			}
+			candidate = filepath.Join(candidate, filepath.Join(parts[i:]...))
+			break
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("filesystem location cannot traverse symlink %q", next)
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return "", fmt.Errorf("filesystem path component %q is not a directory", next)
+		}
+		candidate = next
+	}
+	candidate = filepath.Clean(candidate)
+	if !pathWithinFilesystemRoot(canonicalRoot, candidate) {
+		return "", errors.New("filesystem location escapes connection root")
+	}
+	return candidate, nil
 }
 
 // ResolveFilesystemPath authorizes a logical file URI against a named
@@ -616,13 +757,10 @@ func (c *Config) ResolveFilesystemPath(
 		return "", fmt.Errorf("decoding filesystem connection %q: %w", connectionID, err)
 	}
 	rootConfig := strings.TrimSpace(config.Root)
-	root, err := filepath.Abs(rootConfig)
-	if err != nil {
-		return "", fmt.Errorf("resolving filesystem connection %q root: %w", connectionID, err)
-	}
 	if !filepath.IsAbs(rootConfig) {
 		return "", fmt.Errorf("filesystem connection %q root must be absolute", connectionID)
 	}
+	root := filepath.Clean(rootConfig)
 	uri, err := url.Parse(location)
 	if err != nil {
 		return "", fmt.Errorf("parsing filesystem location: %w", err)
@@ -638,18 +776,18 @@ func (c *Config) ResolveFilesystemPath(
 	}
 	logical := filepath.FromSlash(strings.TrimPrefix(uri.Path, "/"))
 	if logical == "" || logical == "." {
-		return root, nil
+		return resolvePathWithoutSymlinks(root, ".")
 	}
 	if filepath.IsAbs(logical) {
 		return "", errors.New("filesystem location must be relative to the connection root")
 	}
-	resolved := filepath.Join(root, filepath.Clean(logical))
-	relative, err := filepath.Rel(root, resolved)
-	if err != nil {
-		return "", fmt.Errorf("checking filesystem location scope: %w", err)
-	}
-	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+	cleanLogical := filepath.Clean(logical)
+	if cleanLogical == ".." || strings.HasPrefix(cleanLogical, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("filesystem location %q escapes connection %q root", location, connectionID)
+	}
+	resolved, err := resolvePathWithoutSymlinks(root, cleanLogical)
+	if err != nil {
+		return "", fmt.Errorf("resolving filesystem location for connection %q: %w", connectionID, err)
 	}
 	return resolved, nil
 }
@@ -691,65 +829,207 @@ func (c *Config) ResolveObjectStorageS3(lane string) (S3Info, error) {
 	return c.resolveS3Info(connection, "storage.primary", bucket, prefix)
 }
 
-// GetS3Credentials projects supported credential sources into the legacy
-// MinIO client. Profile and web-identity sources fail closed because this
-// client cannot refresh either source safely.
-func (s *S3Info) GetS3Credentials() (*s3.Credentials, error) {
-	accessKeyID := s.AccessKeyId
-	secretAccessKey := s.SecretAccessKey
-	sessionToken := s.SessionToken
+// GetS3Credentials constructs a refreshable provider for the configured
+// credential identity. The provider is retained by the per-connection client.
+func (s *S3Info) GetS3Credentials() (*miniocredentials.Credentials, error) {
 	switch s.CredentialSource {
 	case AwsCredentialConfigSourceDefault:
-		if accessKeyID == "" {
-			accessKeyID = os.Getenv("AWS_ACCESS_KEY_ID")
-		}
-		if secretAccessKey == "" {
-			secretAccessKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
-		}
-		if sessionToken == "" {
-			sessionToken = os.Getenv("AWS_SESSION_TOKEN")
-		}
+		return miniocredentials.NewChainCredentials([]miniocredentials.Provider{
+			&miniocredentials.EnvAWS{},
+			&miniocredentials.FileAWSCredentials{},
+			&miniocredentials.IAM{Region: s.Region},
+		}), nil
 	case AwsCredentialConfigSourceStatic:
-		if accessKeyID == "" || secretAccessKey == "" {
+		if s.AccessKeyId == "" || s.SecretAccessKey == "" {
 			return nil, errors.New("static S3 credentials require access_key_id and secret_access_key")
 		}
+		return miniocredentials.NewStaticV4(
+			s.AccessKeyId,
+			s.SecretAccessKey,
+			s.SessionToken,
+		), nil
 	case AwsCredentialConfigSourceProfile:
-		return nil, fmt.Errorf("S3 profile credential source %q is unsupported by the Go storage client", s.Profile)
+		if strings.TrimSpace(s.Profile) == "" {
+			return nil, errors.New("profile S3 credentials require profile")
+		}
+		return miniocredentials.NewFileAWSCredentials(
+			s.SharedCredentialsFile,
+			s.Profile,
+		), nil
 	case AwsCredentialConfigSourceWebIdentity:
-		return nil, errors.New("S3 web_identity credential source is unsupported by the Go storage client")
+		if strings.TrimSpace(s.RoleArn) == "" || strings.TrimSpace(s.TokenFile) == "" {
+			return nil, errors.New("web_identity S3 credentials require role_arn and token_file")
+		}
+		sessionName := strings.TrimSpace(s.SessionName)
+		if sessionName == "" {
+			sessionName = "antfly"
+		}
+		provider := &miniocredentials.IAM{
+			Endpoint: strings.TrimSpace(s.StsEndpoint),
+			Region:   strings.TrimSpace(s.Region),
+		}
+		provider.EKSIdentity.TokenFile = s.TokenFile
+		provider.EKSIdentity.RoleARN = s.RoleArn
+		provider.EKSIdentity.RoleSessionName = sessionName
+		return miniocredentials.New(provider), nil
 	default:
 		return nil, fmt.Errorf("unsupported S3 credential source %q", s.CredentialSource)
 	}
-
-	endpoint := s.Endpoint
-	if endpoint == "" {
-		endpoint = os.Getenv("AWS_ENDPOINT_URL")
-	}
-	if endpoint == "" {
-		endpoint = "s3.amazonaws.com"
-	}
-	if accessKeyID == "" || secretAccessKey == "" {
-		return nil, errors.New("S3 credentials are unavailable for the configured credential source")
-	}
-
-	return &s3.Credentials{
-		Endpoint:        endpoint,
-		UseSsl:          s.UseSsl,
-		AccessKeyId:     accessKeyID,
-		SecretAccessKey: secretAccessKey,
-		SessionToken:    sessionToken,
-	}, nil
 }
 
-// NewMinioClient creates a Minio client using this S3Info configuration.
-// Credentials are read from config fields (which may have been resolved via ${secret:...} syntax)
-// with fallback to environment variables.
-func (s *S3Info) NewMinioClient() (*minio.Client, error) {
-	credentials, err := s.GetS3Credentials()
+func normalizeMinioEndpoint(endpoint string, secure bool) (string, bool, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "", false, errors.New("S3 endpoint is required")
+	}
+	if !strings.Contains(endpoint, "://") {
+		if strings.ContainsAny(endpoint, "/?#") {
+			return "", false, errors.New("S3 endpoint must not include a path, query, or fragment")
+		}
+		return endpoint, secure, nil
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return "", false, fmt.Errorf("parsing S3 endpoint: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", false, fmt.Errorf("unsupported S3 endpoint scheme %q", parsed.Scheme)
+	}
+	if parsed.User != nil || parsed.Host == "" ||
+		(parsed.Path != "" && parsed.Path != "/") ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false, errors.New("S3 endpoint must contain only a scheme and host")
+	}
+	return parsed.Host, parsed.Scheme == "https", nil
+}
+
+func (s *S3Info) clientFingerprint() [sha256.Size]byte {
+	values := []string{
+		s.Endpoint,
+		s.Region,
+		fmt.Sprintf("%t", s.UseSsl),
+		string(s.AddressingStyle),
+		string(s.CredentialSource),
+		s.AccessKeyId,
+		s.SecretAccessKey,
+		s.SessionToken,
+		s.Profile,
+		s.SharedCredentialsFile,
+		s.RoleArn,
+		s.TokenFile,
+		s.SessionName,
+		s.StsEndpoint,
+	}
+	return sha256.Sum256([]byte(strings.Join(values, "\x00")))
+}
+
+func (s *S3Info) newMinioClient() (*minio.Client, error) {
+	credentialProvider, err := s.GetS3Credentials()
 	if err != nil {
 		return nil, err
 	}
-	return credentials.NewMinioClient()
+	endpoint, secure, err := normalizeMinioEndpoint(s.Endpoint, s.UseSsl)
+	if err != nil {
+		return nil, err
+	}
+	bucketLookup := minio.BucketLookupDNS
+	if s.AddressingStyle == S3ExternalIoConfigAddressingStylePath {
+		bucketLookup = minio.BucketLookupPath
+	}
+	return minio.New(endpoint, &minio.Options{
+		Creds:        credentialProvider,
+		Secure:       secure,
+		Region:       s.Region,
+		BucketLookup: bucketLookup,
+	})
+}
+
+// NewMinioClient returns the connection-owned client. Reusing the client keeps
+// credential refresh, endpoint discovery, and HTTP transport state bounded to
+// one runtime per named connection.
+func (s *S3Info) NewMinioClient() (*minio.Client, error) {
+	if s == nil {
+		return nil, errors.New("S3 configuration is required")
+	}
+	if s.runtime == nil {
+		return s.newMinioClient()
+	}
+	fingerprint := s.clientFingerprint()
+	s.runtime.mu.Lock()
+	defer s.runtime.mu.Unlock()
+	if s.runtime.initialized && s.runtime.fingerprint == fingerprint {
+		return s.runtime.client, nil
+	}
+	client, err := s.newMinioClient()
+	if err != nil {
+		return nil, err
+	}
+	s.runtime.client = client
+	s.runtime.fingerprint = fingerprint
+	s.runtime.initialized = true
+	return client, nil
+}
+
+func (s *S3Info) bucketAdmission() *s3BucketAdmission {
+	if s.runtime == nil {
+		return &s3BucketAdmission{}
+	}
+	key := fmt.Sprintf("%x\x00%s", s.clientFingerprint(), s.Bucket)
+	admission, _ := s.runtime.buckets.LoadOrStore(key, &s3BucketAdmission{})
+	return admission.(*s3BucketAdmission)
+}
+
+// EnsureBucket verifies write admission and applies the configured provisioning
+// policy once per connection/bucket runtime. Concurrent creators are serialized
+// and resolved by a final existence check.
+func (s *S3Info) EnsureBucket(ctx context.Context) (*minio.Client, error) {
+	client, err := s.NewMinioClient()
+	if err != nil {
+		return nil, err
+	}
+	admission := s.bucketAdmission()
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	if admission.ready {
+		return client, nil
+	}
+	exists, err := client.BucketExists(ctx, s.Bucket)
+	if err != nil {
+		return nil, fmt.Errorf("checking if bucket %s exists: %w", s.Bucket, err)
+	}
+	if exists {
+		admission.ready = true
+		return client, nil
+	}
+	if s.BucketProvisioning != S3ExternalIoConfigBucketProvisioningCreateIfMissing {
+		return nil, fmt.Errorf("bucket %s does not exist", s.Bucket)
+	}
+	if err := client.MakeBucket(ctx, s.Bucket, minio.MakeBucketOptions{Region: s.Region}); err != nil {
+		exists, existsErr := client.BucketExists(ctx, s.Bucket)
+		if existsErr != nil {
+			return nil, fmt.Errorf(
+				"creating bucket %s: %w (rechecking existence: %v)",
+				s.Bucket,
+				err,
+				existsErr,
+			)
+		}
+		if !exists {
+			return nil, fmt.Errorf("creating bucket %s: %w", s.Bucket, err)
+		}
+	}
+	admission.ready = true
+	return client, nil
+}
+
+// IsS3CreateConflict reports the two conditional-create conflict shapes used
+// by AWS S3 and compatible implementations.
+func IsS3CreateConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	code := minio.ToErrorResponse(err).Code
+	return code == minio.PreconditionFailed || code == "ConditionalRequestConflict"
 }
 
 // validateURL validates that a URL string is well-formed and uses supported schemes

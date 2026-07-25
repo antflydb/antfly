@@ -16,13 +16,19 @@ package sdk
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/storeutils"
+	json "github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -32,6 +38,54 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func TestStoreClientBackupUsesResolvedLocationWithoutSerializingIt(t *testing.T) {
+	root := t.TempDir()
+	var received common.BackupConfig
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&received))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("portable backup")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+	client := NewStoreClient(httpClient, types.ID(1), "http://store.test")
+	config := common.BackupConfig{
+		BackupID:         "backup-1",
+		Connection:       "filesystem",
+		Location:         "file:///logical",
+		ResolvedLocation: "file://" + root,
+		Format:           common.BackupFormatPortable,
+	}
+
+	require.NoError(t, client.Backup(context.Background(), types.ID(42), config))
+	assert.Equal(t, config.Location, received.Location)
+	assert.Empty(t, received.ResolvedLocation)
+	content, err := os.ReadFile(filepath.Join(
+		root,
+		common.ShardPortableBackupFileName(config.BackupID, types.ID(42)),
+	))
+	require.NoError(t, err)
+	assert.Equal(t, "portable backup", string(content))
+
+	err = client.Backup(context.Background(), types.ID(42), config)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, common.ErrBackupAlreadyExists))
+}
+
+func TestStoreClientBackupRejectsUnresolvedManagedFilesystemLocation(t *testing.T) {
+	client := NewStoreClient(http.DefaultClient, types.ID(1), "http://store.test")
+	err := client.Backup(context.Background(), types.ID(42), common.BackupConfig{
+		BackupID:   "backup-1",
+		Connection: "filesystem",
+		Location:   "file:///logical",
+		Format:     common.BackupFormatPortable,
+	})
+	require.ErrorContains(t, err, "coordinator-resolved")
 }
 
 func TestStoreClientBatch_PropagatesTimestamp(t *testing.T) {

@@ -18,11 +18,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/libaf/logging"
 	mapstructure "github.com/go-viper/mapstructure/v2"
+	"github.com/minio/minio-go/v7"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -760,6 +762,17 @@ func TestValidateStorage(t *testing.T) {
 		)
 		require.ErrorContains(t, err, "lacks required capability")
 
+		outside := t.TempDir()
+		if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
+			t.Skipf("symlinks are unavailable: %v", err)
+		}
+		_, err = config.ResolveFilesystemPath(
+			"filesystem",
+			"backup.write",
+			"file:///escape/backup-1",
+		)
+		require.ErrorContains(t, err, "cannot traverse symlink")
+
 		s3Info, err := config.ResolveS3Info(
 			"s3",
 			"backup.write",
@@ -776,6 +789,105 @@ func TestValidateStorage(t *testing.T) {
 		)
 		require.ErrorContains(t, err, "outside connection")
 	})
+}
+
+func TestValidateAWSCredentialConfigRejectsCrossVariantFields(t *testing.T) {
+	tests := []AwsCredentialConfig{
+		{Source: AwsCredentialConfigSourceDefault, SessionName: "unexpected"},
+		{
+			Source:          AwsCredentialConfigSourceStatic,
+			AccessKeyId:     "key",
+			SecretAccessKey: "secret",
+			StsEndpoint:     "https://sts.example.test",
+		},
+		{
+			Source:      AwsCredentialConfigSourceProfile,
+			Profile:     "production",
+			SessionName: "unexpected",
+		},
+	}
+	for _, config := range tests {
+		require.Error(t, validateAWSCredentialConfig(config))
+	}
+}
+
+func TestS3ProfileCredentialsAndConnectionClientReuse(t *testing.T) {
+	credentialsPath := filepath.Join(t.TempDir(), "credentials")
+	require.NoError(t, os.WriteFile(
+		credentialsPath,
+		[]byte("[production]\naws_access_key_id=profile-key\naws_secret_access_key=profile-secret\naws_session_token=profile-token\n"),
+		0o600,
+	))
+	profileInfo := S3Info{
+		CredentialSource:      AwsCredentialConfigSourceProfile,
+		Profile:               "production",
+		SharedCredentialsFile: credentialsPath,
+	}
+	provider, err := profileInfo.GetS3Credentials()
+	require.NoError(t, err)
+	value, err := provider.Get()
+	require.NoError(t, err)
+	assert.Equal(t, "profile-key", value.AccessKeyID)
+	assert.Equal(t, "profile-secret", value.SecretAccessKey)
+	assert.Equal(t, "profile-token", value.SessionToken)
+
+	connection := mustConnectionConfig(t, `{
+		"kind":"external_io",
+		"capabilities":["backup.write"],
+		"external_io":{
+			"protocol":"s3",
+			"endpoint":"http://localhost:9000",
+			"addressing_style":"path",
+			"buckets":["backup-bucket"],
+			"credentials":{"source":"static","access_key_id":"key","secret_access_key":"secret"}
+		}
+	}`)
+	config := &Config{Connections: map[string]ConnectionConfig{"backup": connection}}
+	firstInfo, err := config.ResolveS3Info(
+		"backup",
+		"backup.write",
+		"s3://backup-bucket/first",
+	)
+	require.NoError(t, err)
+	secondInfo, err := config.ResolveS3Info(
+		"backup",
+		"backup.write",
+		"s3://backup-bucket/second",
+	)
+	require.NoError(t, err)
+	firstClient, err := firstInfo.NewMinioClient()
+	require.NoError(t, err)
+	secondClient, err := secondInfo.NewMinioClient()
+	require.NoError(t, err)
+	assert.Same(t, firstClient, secondClient)
+
+	type clientResult struct {
+		client *minio.Client
+		err    error
+	}
+	results := make(chan clientResult, 32)
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client, err := secondInfo.NewMinioClient()
+			results <- clientResult{client: client, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	for result := range results {
+		require.NoError(t, result.err)
+		assert.Same(t, firstClient, result.client)
+	}
+}
+
+func TestIsS3CreateConflictNormalizesProviderResponses(t *testing.T) {
+	assert.True(t, IsS3CreateConflict(minio.ErrorResponse{Code: minio.PreconditionFailed}))
+	assert.True(t, IsS3CreateConflict(minio.ErrorResponse{Code: "ConditionalRequestConflict"}))
+	assert.False(t, IsS3CreateConflict(minio.ErrorResponse{Code: minio.AccessDenied}))
+	assert.False(t, IsS3CreateConflict(nil))
 }
 
 // TestValidateMaxShardSizeBytes tests the max shard size validation

@@ -309,7 +309,7 @@ type DB interface {
 	SearchTyped(ctx context.Context, req *indexes.RemoteIndexSearchRequest) (*indexes.RemoteIndexSearchResult, error)
 	Split(currRange types.Range, splitKey []byte, destDir1, destDir2 string, prepareOnly bool) error
 	FinalizeSplit(newRange types.Range) error
-	Snapshot(id string) (int64, error)
+	Snapshot(ctx context.Context, id string) (int64, error)
 	// diskSize is used for the split computation and empty for merge
 	Stats() (diskSize uint64, empty bool, indexStats map[string]indexes.IndexStats, err error)
 
@@ -1723,9 +1723,9 @@ func (db *DBImpl) configureS3Storage(pebbleOpts *pebble.Options) error {
 	)
 
 	// Create Minio client for S3 operations
-	minioClient, err := s3Info.NewMinioClient()
+	minioClient, err := s3Info.EnsureBucket(context.Background())
 	if err != nil {
-		return fmt.Errorf("creating S3 client: %w", err)
+		return fmt.Errorf("preparing S3 bucket: %w", err)
 	}
 
 	// Create base S3 storage
@@ -3606,7 +3606,10 @@ func (db *DBImpl) mergeVectorResults(primary, shadow *vectorindex.SearchResult) 
 	return merged
 }
 
-func (s *DBImpl) Snapshot(id string) (int64, error) {
+func (s *DBImpl) Snapshot(ctx context.Context, id string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	// Create a temporary staging directory for the snapshot (Archive Format v2)
 	stagingDir := filepath.Join(os.TempDir(), fmt.Sprintf("antfly-snap-%s-%s", id, uuid.NewString()))
 	defer func() {
@@ -3622,9 +3625,12 @@ func (s *DBImpl) Snapshot(id string) (int64, error) {
 	// Pause IndexManager (and all indexes) before checkpoint
 	indexesPaused := false
 	if im := s.getIndexManager(); im != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		pauseCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		if err := im.Pause(ctx); err != nil {
+		if err := im.Pause(pauseCtx); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return 0, ctxErr
+			}
 			s.logger.Warn("Failed to pause IndexManager, snapshot without indexes", zap.Error(err))
 		} else {
 			indexesPaused = true
@@ -3647,6 +3653,9 @@ func (s *DBImpl) Snapshot(id string) (int64, error) {
 	)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create checkpoint: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 
 	// Copy indexes directory (only if paused successfully)
@@ -3679,7 +3688,7 @@ func (s *DBImpl) Snapshot(id string) (int64, error) {
 	}
 
 	// Use SnapStore to create and store the archive with metadata
-	size, err := s.snapStore.CreateSnapshot(context.Background(), id, stagingDir, snapOpts)
+	size, err := s.snapStore.CreateSnapshot(ctx, id, stagingDir, snapOpts)
 	if err != nil {
 		return 0, fmt.Errorf("creating snapshot archive: %w", err)
 	}

@@ -15,7 +15,9 @@
 package common
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"encoding/base64"
 	"maps"
 	"os"
@@ -471,8 +473,13 @@ func TestArchiveWithSymlinks(t *testing.T) {
 		t.Skip("symlinks not supported on this platform")
 	}
 
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	relativeSource, err := filepath.Rel(cwd, srcDir)
+	require.NoError(t, err)
+
 	// Create archive
-	_, err = CreateArchive(srcDir, archiveFile, ArchiveGzip)
+	_, err = CreateArchive(relativeSource, archiveFile, ArchiveGzip)
 	require.NoError(t, err)
 
 	// Extract archive
@@ -489,6 +496,37 @@ func TestArchiveWithSymlinks(t *testing.T) {
 	target, err := os.Readlink(extractedLink)
 	require.NoError(t, err)
 	require.Equal(t, "target.txt", target)
+}
+
+func TestArchiveRejectsEscapingSymlink(t *testing.T) {
+	srcDir := t.TempDir()
+	archiveFile := filepath.Join(t.TempDir(), "archive.tar.gz")
+	if err := os.Symlink("../../outside", filepath.Join(srcDir, "escape")); err != nil {
+		t.Skipf("symlinks not supported on this platform: %v", err)
+	}
+	_, err := CreateArchive(srcDir, archiveFile, ArchiveGzip)
+	require.ErrorContains(t, err, "symlink target escapes source root")
+
+	file, err := os.Create(archiveFile)
+	require.NoError(t, err)
+	compressor := gzip.NewWriter(file)
+	archive := tar.NewWriter(compressor)
+	require.NoError(t, archive.WriteHeader(&tar.Header{
+		Name:     "escape",
+		Linkname: "../../outside",
+		Typeflag: tar.TypeSymlink,
+		Mode:     0o777,
+	}))
+	require.NoError(t, archive.Close())
+	require.NoError(t, compressor.Close())
+	require.NoError(t, file.Close())
+	err = ExtractArchive(
+		archiveFile,
+		filepath.Join(t.TempDir(), "extract"),
+		ArchiveGzip,
+		false,
+	)
+	require.ErrorContains(t, err, "symlink target escapes extraction root")
 }
 
 func TestArchiveErrCases(t *testing.T) {

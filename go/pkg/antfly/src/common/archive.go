@@ -18,6 +18,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -28,6 +29,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/pebbleutils"
@@ -56,6 +58,34 @@ const (
 	// MetadataFileName is the name of the metadata file embedded in archives.
 	MetadataFileName = "__antfly_metadata__.json"
 )
+
+const archiveCopyBufferSize = 1024 * 1024
+const maxArchiveEntryBytes = int64(1_000_000_000_000)
+const maxArchiveSymlinks = 100_000
+
+var archiveCopyBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, archiveCopyBufferSize)
+		return &buffer
+	},
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+type pendingArchiveSymlink struct {
+	path   string
+	target string
+}
+
+func (r contextReader) Read(data []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(data)
+}
 
 // Magic bytes for compression format detection
 var (
@@ -518,6 +548,25 @@ func CreateArchiveWithOptions(
 	destFile string,
 	opts CreateArchiveOptions,
 ) (os.FileInfo, error) {
+	return CreateArchiveWithOptionsContext(
+		context.Background(),
+		sourceDir,
+		destFile,
+		opts,
+	)
+}
+
+// CreateArchiveWithOptionsContext is CreateArchiveWithOptions with bounded
+// cancellation checks while walking and copying source files.
+func CreateArchiveWithOptionsContext(
+	ctx context.Context,
+	sourceDir string,
+	destFile string,
+	opts CreateArchiveOptions,
+) (os.FileInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Create the target file
 	file, err := os.Create(filepath.Clean(destFile))
 	if err != nil {
@@ -559,17 +608,36 @@ func CreateArchiveWithOptions(
 
 	// Create a new tar writer
 	tw := tar.NewWriter(compression)
+	tarClosed := false
+	compressionClosed := false
+	defer func() {
+		if !tarClosed {
+			_ = tw.Close()
+		}
+		if !compressionClosed {
+			_ = compression.Close()
+		}
+	}()
 
 	// Write metadata as the first entry
 	if err := writeMetadataEntry(tw, opts); err != nil {
 		return nil, fmt.Errorf("writing metadata: %w", err)
 	}
 
-	// Create a buffer to improve file copy performance.
-	buf := make([]byte, 64*1024*1024) // 64MB buffer
+	// A bounded shared pool avoids multiplying large transient allocations by
+	// the number of shards being backed up concurrently.
+	buffer := archiveCopyBufferPool.Get().(*[]byte)
+	defer archiveCopyBufferPool.Put(buffer)
+	sourceRoot, err := filepath.Abs(sourceDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolving archive source directory: %w", err)
+	}
 
 	// Walk through the source directory
 	err = filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			return err
 		}
@@ -589,6 +657,24 @@ func CreateArchiveWithOptions(
 		if info.Mode()&os.ModeSymlink == os.ModeSymlink {
 			if link, err = os.Readlink(path); err != nil {
 				return fmt.Errorf("failed to read symlink %s: %w", path, err)
+			}
+			if filepath.IsAbs(filepath.FromSlash(link)) {
+				return fmt.Errorf("archive symlink target must be relative: %s -> %s", path, link)
+			}
+			absolutePath, err := filepath.Abs(path)
+			if err != nil {
+				return fmt.Errorf("resolving archive symlink path %s: %w", path, err)
+			}
+			resolvedTarget := filepath.Clean(filepath.Join(
+				filepath.Dir(absolutePath),
+				filepath.FromSlash(link),
+			))
+			relativeTarget, err := filepath.Rel(sourceRoot, resolvedTarget)
+			if err != nil ||
+				relativeTarget == ".." ||
+				strings.HasPrefix(relativeTarget, ".."+string(filepath.Separator)) ||
+				filepath.IsAbs(relativeTarget) {
+				return fmt.Errorf("archive symlink target escapes source root: %s -> %s", path, link)
 			}
 		}
 
@@ -622,7 +708,7 @@ func CreateArchiveWithOptions(
 			_ = srcFile.Close()
 		}()
 
-		_, err = io.CopyBuffer(tw, srcFile, buf)
+		_, err = io.CopyBuffer(tw, contextReader{ctx: ctx, reader: srcFile}, *buffer)
 		if err != nil {
 			return fmt.Errorf("failed to copy file content %s: %w", path, err)
 		}
@@ -636,19 +722,28 @@ func CreateArchiveWithOptions(
 	if err := tw.Close(); err != nil {
 		return nil, fmt.Errorf("closing tar writer: %w", err)
 	}
+	tarClosed = true
 
 	// Close the compression writer to flush compressed data
 	if err := compression.Close(); err != nil {
 		return nil, fmt.Errorf("closing compression writer: %w", err)
 	}
+	compressionClosed = true
 
 	// Sync the file to ensure all data is written to disk
 	if err := file.Sync(); err != nil {
 		return nil, fmt.Errorf("syncing file: %w", err)
 	}
 
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("reading archive file metadata: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return nil, fmt.Errorf("closing archive file: %w", err)
+	}
 	removeFile = false
-	return file.Stat()
+	return info, nil
 }
 
 // ExtractArchive extracts a compressed tar archive to a destination directory.
@@ -671,6 +766,25 @@ func ExtractArchiveWithResult(
 	destDir string,
 	overwrite bool,
 ) (*ExtractArchiveResult, error) {
+	return ExtractArchiveWithResultContext(
+		context.Background(),
+		archiveFile,
+		destDir,
+		overwrite,
+	)
+}
+
+// ExtractArchiveWithResultContext is ExtractArchiveWithResult with bounded
+// cancellation checks during decompression and filesystem publication.
+func ExtractArchiveWithResultContext(
+	ctx context.Context,
+	archiveFile string,
+	destDir string,
+	overwrite bool,
+) (*ExtractArchiveResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Check if destination already exists
 	if _, err := os.Stat(destDir); err == nil {
 		// Directory exists
@@ -682,6 +796,9 @@ func ExtractArchiveWithResult(
 		}
 
 		// If overwrite is enabled, remove the existing directory
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if err := os.RemoveAll(destDir); err != nil {
 			return nil, fmt.Errorf("failed to remove existing directory: %w", err)
 		}
@@ -691,6 +808,9 @@ func ExtractArchiveWithResult(
 	}
 
 	// Detect compression type
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	archiveType, err := DetectArchiveType(archiveFile)
 	if err != nil {
 		return nil, fmt.Errorf("detecting archive type: %w", err)
@@ -735,20 +855,25 @@ func ExtractArchiveWithResult(
 	}
 
 	// Create a new tar reader
-	tr := tar.NewReader(decompression)
+	tr := tar.NewReader(contextReader{ctx: ctx, reader: decompression})
 
 	// Ensure the destination directory exists
 	if err := os.MkdirAll(destDir, os.ModePerm); err != nil { //nolint:gosec // G301: standard permissions for data directory
 		return nil, fmt.Errorf("failed to create destination directory: %w", err)
 	}
 
-	// Create a buffer to improve file copy performance.
-	buf := make([]byte, 64*1024*1024) // 64MB buffer
+	buffer := archiveCopyBufferPool.Get().(*[]byte)
+	defer archiveCopyBufferPool.Put(buffer)
 
 	result := &ExtractArchiveResult{}
+	cleanDestDir := filepath.Clean(destDir)
+	pendingSymlinks := make([]pendingArchiveSymlink, 0)
 
 	// Process each file in the tarball
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		header, err := tr.Next()
 		if err == io.EOF {
 			break // End of archive
@@ -767,12 +892,12 @@ func ExtractArchiveWithResult(
 			continue // Don't extract the metadata file to disk
 		}
 
-		// Check for ZipSlip vulnerability
-		if strings.Contains(destDir, "..") {
-			return nil, fmt.Errorf("illegal file path: %s", destDir)
-		}
-		target := filepath.Join(filepath.Clean(destDir), filepath.Clean(header.Name))
-		if !strings.HasPrefix(target, filepath.Clean(destDir)+string(os.PathSeparator)) {
+		target := filepath.Join(cleanDestDir, filepath.Clean(header.Name))
+		relative, err := filepath.Rel(cleanDestDir, target)
+		if err != nil ||
+			relative == ".." ||
+			strings.HasPrefix(relative, ".."+string(filepath.Separator)) ||
+			filepath.IsAbs(relative) {
 			return nil, fmt.Errorf("illegal file path: %s", target)
 		}
 
@@ -783,7 +908,15 @@ func ExtractArchiveWithResult(
 			if err := os.MkdirAll(target, os.ModePerm); err != nil { //nolint:gosec // G703: internal path with traversal protection; G301: standard permissions for data directory
 				return nil, fmt.Errorf("failed to create directory: %w", err)
 			}
-		case tar.TypeReg:
+		case tar.TypeReg, tar.TypeRegA:
+			if header.Size < 0 || header.Size > maxArchiveEntryBytes {
+				return nil, fmt.Errorf(
+					"file %s has invalid size %d; maximum allowed size is %d",
+					target,
+					header.Size,
+					maxArchiveEntryBytes,
+				)
+			}
 			// Create file
 			fileDir := filepath.Dir(target)
 			if err := os.MkdirAll(fileDir, os.ModePerm); err != nil { //nolint:gosec // G703: internal path with traversal protection; G301: standard permissions for data directory
@@ -794,30 +927,26 @@ func ExtractArchiveWithResult(
 			if err != nil {
 				return nil, fmt.Errorf("failed to create file: %w", err)
 			}
-			defer func() { _ = outFile.Close() }()
-
-			// To prevent decompression bombs, we'll read up to a certain limit.
-			limit := int64(1_000_000_000_000) // 1TB limit
-			limitedReader := io.LimitReader(tr, limit)
-
-			// Copy with a buffer for performance.
-			written, err := io.CopyBuffer(outFile, limitedReader, buf)
-			if err != nil {
+			written, copyErr := io.CopyBuffer(outFile, tr, *buffer)
+			closeErr := outFile.Close()
+			if copyErr != nil {
 				return nil, fmt.Errorf(
 					"failed to write file contents: %w, expected bytes: %d got bytes: %d ",
-					err,
+					copyErr,
 					header.Size,
 					written,
 				)
 			}
-
-			// If we wrote up to the limit, we need to check if the file was truncated.
-			if written == limit {
-				// Try to read one more byte; if successful, the file is too large.
-				n, _ := tr.Read(make([]byte, 1))
-				if n > 0 {
-					return nil, fmt.Errorf("file %s exceeds maximum allowed size of 1TB", target)
-				}
+			if closeErr != nil {
+				return nil, fmt.Errorf("closing extracted file: %w", closeErr)
+			}
+			if written != header.Size {
+				return nil, fmt.Errorf(
+					"file %s size mismatch: expected %d bytes, wrote %d",
+					target,
+					header.Size,
+					written,
+				)
 			}
 
 			mode := header.Mode
@@ -828,22 +957,51 @@ func ExtractArchiveWithResult(
 				return nil, fmt.Errorf("header has too large size %d", header.Mode)
 			}
 			// Set file permissions
-			if err := os.Chmod(target, os.FileMode(mode)); err != nil { //nolint:gosec // G703: internal path with traversal protection
+			if err := os.Chmod(target, os.FileMode(mode).Perm()); err != nil { //nolint:gosec // G703: internal path with traversal protection
 				return nil, fmt.Errorf("failed to set file permissions: %w", err)
 			}
 		case tar.TypeSymlink:
-			// Create parent directory if needed
-			parentDir := filepath.Dir(target)
-			if err := os.MkdirAll(parentDir, os.ModePerm); err != nil { //nolint:gosec // G703: internal path with traversal protection; G301: standard permissions for data directory
-				return nil, fmt.Errorf("failed to create parent directory for symlink: %w", err)
+			if len(pendingSymlinks) >= maxArchiveSymlinks {
+				return nil, fmt.Errorf("archive contains more than %d symlinks", maxArchiveSymlinks)
 			}
-
-			// Create the symlink
-			if err := os.Symlink(header.Linkname, target); err != nil {
-				return nil, fmt.Errorf("failed to create symlink: %w", err)
+			if filepath.IsAbs(filepath.FromSlash(header.Linkname)) {
+				return nil, fmt.Errorf("archive symlink target must be relative: %s", header.Linkname)
 			}
+			resolvedLinkTarget := filepath.Clean(filepath.Join(
+				filepath.Dir(target),
+				filepath.FromSlash(header.Linkname),
+			))
+			linkRelative, err := filepath.Rel(cleanDestDir, resolvedLinkTarget)
+			if err != nil ||
+				linkRelative == ".." ||
+				strings.HasPrefix(linkRelative, ".."+string(filepath.Separator)) ||
+				filepath.IsAbs(linkRelative) {
+				return nil, fmt.Errorf(
+					"archive symlink target escapes extraction root: %s -> %s",
+					header.Name,
+					header.Linkname,
+				)
+			}
+			pendingSymlinks = append(pendingSymlinks, pendingArchiveSymlink{
+				path:   target,
+				target: header.Linkname,
+			})
 		default:
 			return nil, fmt.Errorf("unsupported file type: %d for %s", header.Typeflag, target)
+		}
+	}
+
+	// Links are materialized only after every regular entry. This prevents a
+	// link from redirecting a later archive write outside the staging tree.
+	for _, link := range pendingSymlinks {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(filepath.Dir(link.path), 0o750); err != nil {
+			return nil, fmt.Errorf("creating archive symlink parent: %w", err)
+		}
+		if err := os.Symlink(link.target, link.path); err != nil {
+			return nil, fmt.Errorf("creating archive symlink: %w", err)
 		}
 	}
 

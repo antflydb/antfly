@@ -392,6 +392,19 @@ func TestDBWrapperSnapshot(t *testing.T) {
 	assert.EqualValues(t, 1, v["other"])
 }
 
+func TestPublishLocalBackupDoesNotCommitAfterCancellation(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.tar.zst")
+	target := filepath.Join(root, "published", "backup.tar.zst")
+	require.NoError(t, os.WriteFile(source, []byte("snapshot"), 0o600))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.ErrorIs(t, publishLocalBackup(ctx, source, target), context.Canceled)
+	_, err := os.Stat(target)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
 func TestStoreDBCloseDB_WaitsForBackgroundGoroutines(t *testing.T) {
 	dir := t.TempDir()
 

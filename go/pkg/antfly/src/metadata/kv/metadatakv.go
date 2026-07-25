@@ -310,9 +310,9 @@ func (s *metadataKV) configureS3Storage(pebbleOpts *pebble.Options) error {
 		zap.Bool("useSSL", s3Info.UseSsl),
 	)
 
-	minioClient, err := s3Info.NewMinioClient()
+	minioClient, err := s3Info.EnsureBucket(context.Background())
 	if err != nil {
-		return fmt.Errorf("creating S3 client: %w", err)
+		return fmt.Errorf("preparing S3 bucket: %w", err)
 	}
 
 	baseS3Storage, err := s3storage.NewS3Storage(

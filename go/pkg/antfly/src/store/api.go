@@ -379,9 +379,7 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 						if err != nil {
 							return fmt.Errorf("creating destination file %s: %w", destPath, err)
 						}
-						// Use a 64MB buffer for copying
-						buf := make([]byte, 64*1024*1024)
-						if _, err := io.CopyBuffer(outFile, filePart, buf); err != nil {
+						if _, err := io.Copy(outFile, filePart); err != nil {
 							_ = outFile.Close()
 							return fmt.Errorf("saving uploaded file to %s: %w", destPath, err)
 						}
@@ -535,8 +533,7 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 						return fmt.Errorf("creating destination backup file %s: %w", destPath, err)
 					}
 					defer func() { _ = output.Close() }()
-					buf := make([]byte, 64*1024*1024) // 64MB buffer
-					if _, err := io.CopyBuffer(output, input, buf); err != nil {
+					if _, err := io.Copy(output, input); err != nil {
 						return fmt.Errorf("copying local backup file from %s to %s: %w", srcPath, destPath, err)
 					}
 					h.logger.Info("Successfully copied local backup",
@@ -1031,11 +1028,9 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 	// Native backup: create tar.zst of Pebble checkpoint
 	// FIXME (ajr) Backups should include the byte range of the shard maybe?
 	fileName := common.ShardBackupFileName(req.BackupID, shardID)
-	var localDir string
 	isFileBackup := strings.HasPrefix(req.Location, "file://")
 	if isFileBackup {
-		var err error
-		localDir, err = h.authorizedLocalBackupDir(
+		_, err := h.authorizedLocalBackupDir(
 			req.Connection,
 			"backup.write",
 			req.Location,
@@ -1044,22 +1039,26 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
 			return
 		}
-		req.Location = "file://" + localDir
 	}
 	shardBackup := req
 	shardBackup.BackupID = strings.TrimSuffix(fileName, ".tar.zst")
+	if isFileBackup {
+		// The store owns only the staged shard snapshot. The metadata
+		// coordinator publishes the streamed response into the authorized
+		// external filesystem location.
+		shardBackup.Connection = ""
+		shardBackup.Location = ""
+	}
 	if err := shard.Backup(r.Context(), shardBackup); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to backup: %v", err), http.StatusInternalServerError)
+		status := http.StatusInternalServerError
+		if errors.Is(err, common.ErrBackupAlreadyExists) {
+			status = http.StatusConflict
+		}
+		http.Error(w, fmt.Sprintf("Failed to backup: %v", err), status)
 		return
 	}
 
 	if isFileBackup {
-		// Try user-provided location first (single-node), then fall back to snapDir (distributed)
-		userPath, err := safeJoinUnder(localDir, fileName)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Invalid backup path: %v", err), http.StatusBadRequest)
-			return
-		}
 		dataDir := h.antflyConfig.GetBaseDir()
 		snapDir := common.SnapDir(dataDir, shardID, h.store.ID())
 		snapPath, err := safeJoinUnder(snapDir, fileName)
@@ -1068,11 +1067,7 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		filePath := userPath
-		if _, err := os.Stat(userPath); os.IsNotExist(err) { //nolint:gosec // G703: internal path with traversal protection
-			filePath = snapPath
-		}
-		file, err := os.Open(filepath.Clean(filePath)) //nolint:gosec // G703: internal path with traversal protection
+		file, err := os.Open(filepath.Clean(snapPath)) //nolint:gosec // G703: internal path with traversal protection
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to open backup file: %v", err), http.StatusNotFound)
 			return
@@ -1093,9 +1088,8 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.FormatInt(fileInfo.Size(), 10))
 
-		// Stream the file content to the response body
-		buf := make([]byte, 64*1024*1024) // 64MB buffer
-		if _, err := io.CopyBuffer(w, file, buf); err != nil {
+		// Stream the file content to the response body.
+		if _, err := io.Copy(w, file); err != nil {
 			http.Error(w, "Error streaming file", http.StatusInternalServerError)
 			return
 		}
@@ -1108,16 +1102,14 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	destDir := common.SnapDir(h.antflyConfig.GetBaseDir(), shardID, h.store.ID())
 	streamResponse := false
 	if strings.HasPrefix(req.Location, "file://") {
-		localDir, err := h.authorizedLocalBackupDir(
+		if _, err := h.authorizedLocalBackupDir(
 			req.Connection,
 			"backup.write",
 			req.Location,
-		)
-		if err != nil {
+		); err != nil {
 			http.Error(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
 			return
 		}
-		destDir = localDir
 		streamResponse = true
 	} else if req.Location == "" {
 		streamResponse = true
@@ -1133,19 +1125,58 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	file, err := os.Create(filepath.Clean(destPath)) //nolint:gosec // internal path
+	file, err := os.CreateTemp(destDir, "."+fileName+".tmp-*") //nolint:gosec // internal path
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create backup file: %v", err), http.StatusInternalServerError)
 		return
 	}
+	tempPath := file.Name()
+	defer func() { _ = os.Remove(tempPath) }()
 
 	if err := shard.ExportPortable(r.Context(), file); err != nil {
 		_ = file.Close()
-		_ = os.Remove(destPath)
 		http.Error(w, fmt.Sprintf("Failed to export portable backup: %v", err), http.StatusInternalServerError)
 		return
 	}
-	_ = file.Close()
+	if err := r.Context().Err(); err != nil {
+		_ = file.Close()
+		http.Error(w, fmt.Sprintf("Portable backup was interrupted: %v", err), http.StatusRequestTimeout)
+		return
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		http.Error(w, fmt.Sprintf("Failed to sync portable backup: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if err := file.Close(); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to close portable backup: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if err := r.Context().Err(); err != nil {
+		http.Error(w, fmt.Sprintf("Portable backup was interrupted: %v", err), http.StatusRequestTimeout)
+		return
+	}
+	if err := os.Link(tempPath, filepath.Clean(destPath)); err != nil {
+		if !os.IsExist(err) {
+			http.Error(w, fmt.Sprintf("Failed to publish portable backup: %v", err), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		dir, err := os.Open(destDir) //nolint:gosec // internal snapshot directory
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to open portable backup directory for sync: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if err := dir.Sync(); err != nil {
+			_ = dir.Close()
+			http.Error(w, fmt.Sprintf("Failed to sync portable backup directory: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if err := dir.Close(); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to close portable backup directory: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
 
 	if strings.HasPrefix(req.Location, "s3://") {
 		s3Info, err := h.antflyConfig.ResolveS3Info(
@@ -1154,13 +1185,15 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 			req.Location,
 		)
 		if err != nil {
-			_ = os.Remove(destPath)
 			http.Error(w, fmt.Sprintf("Invalid S3 backup location: %v", err), http.StatusBadRequest)
 			return
 		}
-		if err := db.WriteBackupToBlobStore(context.Background(), destPath, &s3Info); err != nil {
-			_ = os.Remove(destPath)
-			http.Error(w, fmt.Sprintf("Failed to upload portable backup: %v", err), http.StatusInternalServerError)
+		if err := db.WriteBackupToBlobStore(r.Context(), destPath, &s3Info); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, common.ErrBackupAlreadyExists) {
+				status = http.StatusConflict
+			}
+			http.Error(w, fmt.Sprintf("Failed to upload portable backup: %v", err), status)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -1189,8 +1222,7 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(fileInfo.Size(), 10))
 
-	buf := make([]byte, 64*1024*1024) // 64MB buffer
-	if _, err := io.CopyBuffer(w, file, buf); err != nil {
+	if _, err := io.Copy(w, file); err != nil {
 		http.Error(w, "Error streaming file", http.StatusInternalServerError)
 		return
 	}
