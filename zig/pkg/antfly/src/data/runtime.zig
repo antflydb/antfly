@@ -1804,6 +1804,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.lite_native_link_cache,
         resource_manager_mod.Slice.lite_docstore_snapshot_cache,
         resource_manager_mod.Slice.inference_prompt_cache,
+        resource_manager_mod.Slice.inference_tokenizer_cache,
         resource_manager_mod.Slice.dense_repair_working_set,
         resource_manager_mod.Slice.shard_transition_working_set,
     }) |slice| {
@@ -3321,6 +3322,7 @@ pub const DataServer = struct {
     provisioned_startup_catch_up_mutex: std.atomic.Mutex = .unlocked,
     provisioned_startup_catch_up_thread: ?std.Thread = null,
     provisioned_startup_catch_up_active: std.atomic.Value(bool) = .init(false),
+    background_work_quiesced: bool = false,
     provisioned_startup_catch_up_target_mutex: std.atomic.Mutex = .unlocked,
     provisioned_startup_catch_up_target_group_id: u64 = 0,
     provisioned_startup_catch_up_target_table_name: ?[]u8 = null,
@@ -4535,8 +4537,16 @@ pub const DataServer = struct {
         }
     }
 
-    pub fn deinit(self: *DataServer) void {
+    /// Stop every DataServer activity that can retain or invoke an externally
+    /// supplied provider. This is intentionally separate from deinit so owners
+    /// can drain provider users, destroy the provider while shared accounting
+    /// state is still alive, and only then release the remaining DataServer
+    /// resources. Repeated calls are harmless.
+    pub fn quiesceBackgroundWork(self: *DataServer) void {
+        if (self.background_work_quiesced) return;
+        self.background_work_quiesced = true;
         self.unregisterMetadataLocalProviders();
+        if (self.data_raft) |raft| raft.stop();
         self.stopLsmMaintenanceBackground();
         self.joinProvisionedRootRefreshThread();
         self.joinLocalGroupStatusRefreshThread();
@@ -4548,7 +4558,19 @@ pub const DataServer = struct {
         self.stopReplicatedTransitionActions();
         self.clearProvisionedStartupCatchUpTarget();
         if (self.listener) |*listener| listener.deinit();
+        self.listener = null;
         if (self.http_server) |*http_server| http_server.deinit();
+        self.http_server = null;
+        _ = self.read_source.withAntflyProvider(null);
+        _ = self.write_source.withAntflyProvider(null);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withAntflyProvider(null);
+            apply_sm.write_cache.antfly_provider = null;
+        }
+    }
+
+    pub fn deinit(self: *DataServer) void {
+        self.quiesceBackgroundWork();
         if (self.ha_admin_server) |*server| server.deinit();
         if (self.ha_promoted_primary) |*primary| primary.close();
         if (self.ha_standby_replication_http_executor) |*executor| executor.deinit();
@@ -4557,7 +4579,6 @@ pub const DataServer = struct {
         // possible writer has reached this quiescent boundary.
         self.write_source.quiesce();
         if (self.data_raft) |raft| {
-            raft.stop();
             raft.deinit();
             self.alloc.destroy(raft);
         }
@@ -4595,8 +4616,6 @@ pub const DataServer = struct {
         }
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.query_io_impl) |*io_impl| io_impl.deinit();
-        self.listener = null;
-        self.http_server = null;
         self.ha_admin_server = null;
         self.ha_standby_replication_http_executor = null;
         self.ha_promoted_primary = null;

@@ -1340,8 +1340,11 @@ pub fn runFromIterator(
         if (cfg.inference.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
-    defer antfly_node.deinit();
-    try antfly_node.warmConfiguredModels(alloc);
+    // Until DataServer exists, error cleanup is owned here. Once its
+    // ResourceManager is attached below, the regular defer is registered
+    // after DataServer's so tokenizer budget callbacks are torn down first.
+    var antfly_node_needs_errdeinit = true;
+    errdefer if (antfly_node_needs_errdeinit) antfly_node.deinit();
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -1516,8 +1519,24 @@ pub fn runFromIterator(
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
     defer data_server.deinit();
+    antfly_node_needs_errdeinit = false;
+    defer {
+        // DataServer sources, recovery workers, and durable API jobs retain the
+        // embedded provider. Drain them while the node is valid, then release
+        // tokenizer reservations while DataServer's ResourceManager is valid.
+        // The earlier data_server.deinit defer performs final storage teardown.
+        data_server.quiesceBackgroundWork();
+        antfly_node.deinit();
+    }
 
     antfly_node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(&data_server.provisioned_storage.resource_manager);
+    try antfly_node.configureTokenizerCaches(.{
+        .resource_budget = tokenizerCacheResourceBudget(
+            &data_server.provisioned_storage.resource_manager,
+        ),
+    });
+    if (node_backend_runtime.ptr().io()) |io| antfly_node.attachIo(io);
+    try antfly_node.warmConfiguredModels(alloc);
     data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.
@@ -1732,6 +1751,41 @@ fn promptCacheResourceUsageObserver(manager: *antfly.resource_manager.ResourceMa
 fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) void {
     const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
     manager.observeUsage(.inference_prompt_cache, current, next);
+}
+
+fn tokenizerCacheResourceBudget(
+    manager: *antfly.resource_manager.ResourceManager,
+) inference.hf_tokenizer.HfTokenizer.BpeCacheResourceBudget {
+    return .{
+        .context = manager,
+        .try_reserve = reserveTokenizerCacheBytes,
+        .release = releaseTokenizerCacheBytes,
+    };
+}
+
+fn reserveTokenizerCacheBytes(context: *anyopaque, bytes: usize) bool {
+    const manager: *antfly.resource_manager.ResourceManager =
+        @ptrCast(@alignCast(context));
+    // Cache growth is optional: honor the slice's shrink policy at the soft
+    // boundary by declining new entries/workspace retention. reserve() below
+    // remains the atomic hard guard if another producer wins the race.
+    if (manager.admissionDecision(
+        .inference_tokenizer_cache,
+        @intCast(bytes),
+    ).action == .shrink_cache) return false;
+    var reservation = manager.reserve(
+        .inference_tokenizer_cache,
+        @intCast(bytes),
+    ) catch return false;
+    // The tokenizer owns the reservation until its entry/cache is released.
+    reservation.released = true;
+    return true;
+}
+
+fn releaseTokenizerCacheBytes(context: *anyopaque, bytes: usize) void {
+    const manager: *antfly.resource_manager.ResourceManager =
+        @ptrCast(@alignCast(context));
+    manager.releaseBytes(.inference_tokenizer_cache, @intCast(bytes));
 }
 
 fn localAntflyListModelsJson(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
