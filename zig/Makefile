@@ -57,7 +57,7 @@ inference-e2e-models: ## Prefetch the curated inference E2E model set with `antf
 # TLA+ Verification Commands
 # ====================================================================================
 
-.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-trace tla-clean
+.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-trace tla-clean tla-viz tla-viz-check tla-viz-trace
 
 generate: openapi-generate snowball-generate cabi-header-generate ## Regenerate checked-in generated sources.
 
@@ -122,3 +122,18 @@ tla-clean: ## Remove TLA+ model checker runtime artifacts.
 	rm -rf specs/tla/states specs/tla/.generated states
 	find specs/tla \( -name '*_TTrace_*.tla' -o -name '*_TTrace_*.bin' \) -delete
 	find specs/tla -type d -name states -prune -exec rm -rf {} +
+
+# ---- TLA+ visualizations -------------------------------------------------------
+# Pedagogical views of the specs; see specs/tla/README.md (Visualizations).
+
+tla-viz: ## Regenerate structural Mermaid diagrams (specs/tla/diagrams/).
+	$(SCRIPTS_PY) ../scripts/tla-viz/gen_structural.py --specs-dir specs/tla --out-dir specs/tla/diagrams
+
+tla-viz-check: ## Check the committed structural diagrams are up to date.
+	$(SCRIPTS_PY) ../scripts/tla-viz/gen_structural.py --check --specs-dir specs/tla --out-dir specs/tla/diagrams
+
+tla-viz-trace: ## Render one NDJSON trace to a self-contained HTML timeline: JSON=<file> [OUT=<file.html>]
+ifndef JSON
+	$(error JSON is required, e.g. make tla-viz-trace JSON=specs/tla/traces/ha_rejoin.ndjson)
+endif
+	$(SCRIPTS_PY) ../scripts/tla-viz/render_trace.py $(JSON) $(if $(OUT),-o $(OUT),)

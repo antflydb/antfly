@@ -1,0 +1,5 @@
+# TLC model checker runtime artifacts
+states/
+.generated/
+# tla-viz-trace default output (rendered trace timelines)
+*.html

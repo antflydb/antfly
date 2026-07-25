@@ -6,4 +6,6 @@ requires-python = ">=3.11"
 dependencies = [
     "openapi-spec-validator>=0.7.2",
     "PyYAML>=6.0",
+    "tree-sitter>=0.23",
+    "tree-sitter-tlaplus>=1.5.0",
 ]

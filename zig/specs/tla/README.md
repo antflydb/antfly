@@ -329,7 +329,8 @@ Validates checked-in split bridge fixtures against `AntflySplitRefinementBridge.
 
 ## Makefile Targets
 
-Four make targets; everything else is a subcommand of scripts/tla-check.sh.
+Four verification targets (everything else is a subcommand of
+scripts/tla-check.sh), plus three visualization targets (see Visualizations).
 
 ```bash
 make tla-check                  # full gate: audit + parse + core + fast + all mutants
@@ -338,12 +339,81 @@ make tla-check CHECK=<id>       # one check, e.g. CHECK=AntflyIndexLifecycleBadS
 make tla-trace TRACE=<family> TRACE_FILES=...   # NDJSON trace validation
 make tla-clean                  # remove TLC runtime artifacts
 
+make tla-viz                    # regenerate structural diagrams (specs/tla/diagrams/)
+make tla-viz-check              # fail if committed diagrams are stale
+make tla-viz-trace JSON=<file>  # render one NDJSON trace to an HTML timeline
+
 # Direct runner subcommands (from zig/):
 bash ../scripts/tla-check.sh list       # every check with its tier
 bash ../scripts/tla-check.sh audit      # static hygiene audit
 bash ../scripts/tla-check.sh smoke      # SANY-parse only
 bash ../scripts/tla-check.sh negative   # all expected-failure checks
 ```
+
+## Visualizations
+
+Pedagogical views of the models — for reading the architecture, not for
+verification. Three layers:
+
+### Structural diagrams (auto-generated)
+
+[`diagrams/`](diagrams/README.md) mirrors the spec layout with one generated
+markdown file per model: phase state machines (extracted from action guards
+and primed updates), an action/state table (reads resolved through helper
+operators), and an action→variable write graph, all GitHub-rendered Mermaid.
+Expected-failure mutant actions (named `Buggy*` or enabled by a bare `Buggy*`
+conjunct) are omitted and counted in each file's header. Regenerate with
+`make tla-viz` after editing a spec; `make tla-viz-check` is the staleness
+gate. Generator: `../../scripts/tla-viz/gen_structural.py`
+(tree-sitter-tlaplus based; extraction is heuristic and favors the suite's
+disciplined conjunct-list action style).
+
+### Interactive exploration with Spectacle
+
+[Spectacle](https://github.com/will62794/spectacle) interprets these specs in
+the browser: step actions forward/backward, inspect state, share exact traces
+as URLs. Models with an adjacent `<Model>_anim.tla` module get a live SVG
+view (an `AnimView` definition) that updates per state:
+
+- `storage/lsm/AntflyLsmLifecycle_anim.tla` — ownership cards for cache
+  entries, the mutable read snapshot, and removeSegments temporaries
+- `metadata/AntflyShardSplit_anim.tla` — parent/child shard cards with
+  phase, owned range, delta replay progress, and per-key data placement
+
+The `_anim.tla` modules are Spectacle-only (never loaded by TLC) but are kept
+SANY-parseable against their base specs. Suggested constants live in each
+module's header comment — including the base spec's `Buggy*` flags, which you
+can flip to TRUE to *watch* an expected-failure mutant unfold interactively.
+
+```bash
+git clone https://github.com/will62794/spectacle && cd spectacle
+python3 serve.py --local_dir /path/to/antfly/zig/specs/tla
+# open http://localhost:8000/#!/home?specpath=local_dir/metadata/AntflyShardSplit.tla \
+#   &constants[Keys]={"k1","k2","k3"}&constants[ParentKeys]={"k1"} \
+#   &constants[ChildKeys]={"k2","k3"}&constants[BuggyChildDefaultOnReplayCaughtUp]=FALSE
+```
+
+The hosted build (https://will62794.github.io/spectacle/) can load specs
+straight from `raw.githubusercontent.com` URLs via `?specpath=` once the
+branch is on GitHub — traces then become shareable links in PRs/Zulip.
+
+### Trace timelines
+
+`make tla-viz-trace JSON=<trace.ndjson> [OUT=<out.html>]` renders any of the
+suite's NDJSON trace families (`trace`, `antfly-trace`, `ha-trace`,
+`txn-session-trace`, `doc-identity-range-repair-trace`, ...) as one
+self-contained HTML swimlane timeline: a lane per node/shard where the events
+carry one, role tenure as lane tint and matched send→receive arrows for raft
+traces, event-category filters, hover detail, and a table view. No external
+assets — attachable to a PR or Zulip thread. Try the fixtures:
+
+```bash
+make tla-viz-trace JSON=specs/tla/example.ndjson OUT=/tmp/raft.html
+make tla-viz-trace JSON=specs/tla/traces/ha_rejoin.ndjson OUT=/tmp/ha.html
+```
+
+Multi-run raft traces are split into segments with the same boundary rules as
+`../../scripts/tla-segment-raft-trace.py`.
 
 ## Document Identity Range Repair Trace Fixture Validation
 
