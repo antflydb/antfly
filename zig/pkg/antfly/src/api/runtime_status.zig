@@ -156,6 +156,7 @@ pub const TableRuntimeSummary = struct {
     indexes_with_replay_debt: usize = 0,
     outstanding_replay_sequences: u64 = 0,
     max_index_replay_backlog: u64 = 0,
+    text_merge: db_mod.types.TextMergeStats = .{},
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
 };
 
@@ -626,6 +627,7 @@ pub const TableRuntimeSnapshotCache = struct {
             var group_it = entry.groups.valueIterator();
             while (group_it.next()) |status| {
                 result.group_count += 1;
+                db_mod.types.accumulateTextMergeStats(&result.text_merge, status.stats.text_merge);
                 db_mod.types.accumulateAsyncIndexingStats(&result.async_indexing, status.stats.async_indexing);
                 var group_has_replay_debt = false;
                 result.index_count += status.stats.indexes.len;

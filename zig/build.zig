@@ -4776,6 +4776,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source consistent visibility refreshes stale dense status",
             "provisioned table write source visibility hook defers status sampling to runtime owner",
             "provisioned table write source status visibility does not invalidate read cache",
+            "provisioned table write source metrics serve cached snapshot while write cache lock is busy",
             "provisioned table restore lifecycle reserves forwarded owner and caller sources",
             "provisioned startup catch-up enters through forwarded write owner",
             "provisioned runtime status inspection remains available during structural transition",
