@@ -6295,7 +6295,9 @@ test "support level separates verified, experimental, and unsupported families" 
 
     // Mapped and plumbed, but never run against a real model.
     try std.testing.expectEqual(gpt_mod.SupportLevel.experimental, gpt_mod.supportLevel(.mistral));
-    try std.testing.expectEqual(gpt_mod.SupportLevel.experimental, gpt_mod.supportLevel(.deepseek_v4));
+    // Loads and resolves every tensor, but execution panics in the grouped output
+    // projection, so it must not be reachable from a server.
+    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.deepseek_v4));
 
     // falcon/opt/bloom are enum entries with no weight mapping or runtime at all, so
     // they must not present as generators that merely happen to be missing tensors.
@@ -6329,7 +6331,7 @@ test "architecture strings named in errors resolve to their advertised level" {
             gpt_mod.supportLevel(gpt_mod.detectFamily(arch)),
         );
     }
-    for ([_][]const u8{ "mistral", "mixtral", "qwen2", "phi", "phi3", "bitnet", "deepseek_v4" }) |arch| {
+    for ([_][]const u8{ "mistral", "mixtral", "qwen2", "phi", "phi3", "bitnet" }) |arch| {
         try std.testing.expectEqual(
             gpt_mod.SupportLevel.experimental,
             gpt_mod.supportLevel(gpt_mod.detectFamily(arch)),
@@ -6348,4 +6350,19 @@ test "i32 index tables pass gguf tensor type inspection" {
     // DeepSeek V4 stores hash-MoE routing tables as I32. They are indices, not weights,
     // and quant_codec materializes them; inspection must not reject the file.
     try std.testing.expect(tensorTypeSupported(.{ .known = .I32 }));
+}
+
+
+test "unsupported families keep their gguf weight mapping" {
+    // The mapping predicate is independent of the support tier. deepseek_v4 is blocked
+    // for generation but its tensor names must still resolve, both because its mapping
+    // tests depend on them and because blocking a family should not silently change what
+    // the loader can parse.
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.deepseek_v4));
+    try std.testing.expect(gpt_mod.ggufWeightMappingSupported(.deepseek_v4));
+    try std.testing.expectEqualStrings(
+        "model.layers.0.self_attn.q_a_proj.weight",
+        normalizeGgufGptWeightKey(.{ .family = .deepseek_v4 }, "blk.0.attn_q_a.weight", &buf).?,
+    );
 }

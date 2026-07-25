@@ -54,7 +54,6 @@ These load, but we do not stand behind their output for 0.2.0.
 | BitNet | `bitnet-b1.58-2B-4T` loads and generates, but degenerates into repetition. |
 | Phi | The tensor mapping works for the separate-projection layout, but **Phi-3 GGUFs cannot load** — they pack attention into a fused `attn_qkv.weight` and the FFN into a fused `ffn_up.weight`, which reports 257 missing tensors. |
 | Mistral / Mixtral | Weights load cleanly (no missing tensors), but generation emits only `<unk>`. The cause is the tokenizer, not the weights — see the embedded-SentencePiece caveat below. |
-| DeepSeek V4 | Loads from a real GGUF and resolves all tensors, but execution still fails on a shape mismatch in the grouped output projection. Verified against a 99GB DeepSeek-V4-Flash Q2_K. |
 
 ## Unsupported
 
@@ -62,6 +61,7 @@ Rejected with a clear error rather than failing partway through a load.
 
 | Architecture | Reason |
 |---|---|
+| `deepseek4` (DeepSeek V4) | Loads from a real GGUF and resolves all 1328 tensors, but execution panics on a shape mismatch in the grouped output projection. It panics rather than erroring, so it would take a server process down. llama.cpp runs the same file at ~0.5 tok/s, so this is ours to fix. |
 | `qwen35`, `qwen3next`, `qwen35moe` | Hybrid linear attention; the GGUF `ssm_*` tensors have no mapping to the runtime. |
 | `falcon`, `opt`, `bloom` | Recognised by name only — no tensor mapping and no runtime. |
 | `gpt2`, `gpt_neo`, `gpt_neox`, `gptj` | No verified path for generation. |
@@ -74,7 +74,7 @@ loaded:
 ```json
 {
   "error": "UNSUPPORTED_ARCHITECTURE",
-  "message": "model architecture \"qwen3_next\" is not supported for generation; supported: llama, qwen3, gemma, gemma2, gemma3, gemma4; experimental: mistral, mixtral, qwen2, phi, phi3, bitnet, deepseek-v4"
+  "message": "model architecture \"qwen3_next\" is not supported for generation; supported: llama, qwen3, gemma, gemma2, gemma3, gemma4; experimental: mistral, mixtral, qwen2, phi, phi3, bitnet"
 }
 ```
 
