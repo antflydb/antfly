@@ -953,6 +953,33 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
         }
 
     tables: dict[str, str] = {}
+
+    def expected_status(policy: str) -> dict | None:
+        current = stateful_api.get_index(tables[policy], "document_vectors")
+        status = current.get("status", {})
+        coverage = status.get("coverage", {})
+        expected_covered = {"strict": 1, "partial": 2, "best_effort": 3}[policy]
+        expected_complete = policy == "best_effort"
+        if not (
+            coverage.get("source_total") == 3
+            and coverage.get("produced") == 1
+            and coverage.get("skipped") == 1
+            and coverage.get("terminal_failed") == 1
+            and coverage.get("covered") == expected_covered
+            and coverage.get("pending") == 3 - expected_covered
+            and coverage.get("observation_complete") is True
+            and coverage.get("complete") is expected_complete
+            and coverage.get("healthy") is False
+            and status.get("backfill_active") is False
+        ):
+            return None
+        if expected_complete:
+            if coverage.get("degraded") is not True:
+                return None
+        elif status.get("backfill_state") != "failed":
+            return None
+        return current
+
     bad_pdf = "data:application/pdf;base64," + base64.b64encode(
         b"%PDF-1.7\nnot a complete pdf"
     ).decode("ascii")
@@ -997,33 +1024,6 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
         )
         assert cleanup["upserted"] == 0
 
-    def expected_status(policy: str) -> dict | None:
-        current = stateful_api.get_index(tables[policy], "document_vectors")
-        status = current.get("status", {})
-        coverage = status.get("coverage", {})
-        expected_covered = {"strict": 1, "partial": 2, "best_effort": 3}[policy]
-        expected_complete = policy == "best_effort"
-        if not (
-            coverage.get("source_total") == 3
-            and coverage.get("produced") == 1
-            and coverage.get("skipped") == 1
-            and coverage.get("terminal_failed") == 1
-            and coverage.get("covered") == expected_covered
-            and coverage.get("pending") == 3 - expected_covered
-            and coverage.get("observation_complete") is True
-            and coverage.get("complete") is expected_complete
-            and coverage.get("healthy") is False
-            and status.get("backfill_active") is False
-        ):
-            return None
-        if expected_complete:
-            if coverage.get("degraded") is not True:
-                return None
-        elif status.get("backfill_state") != "failed":
-            return None
-        return current
-
-    for policy in tables:
         settled = wait_until(
             lambda policy=policy: expected_status(policy),
             timeout_s=90.0,
