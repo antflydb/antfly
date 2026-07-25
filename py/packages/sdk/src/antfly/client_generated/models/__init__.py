@@ -427,6 +427,9 @@ from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
 from .installed_extension import InstalledExtension
 from .installed_extension_status import InstalledExtensionStatus
+from .invoke_inference_connection_body import InvokeInferenceConnectionBody
+from .invoke_inference_connection_operation import InvokeInferenceConnectionOperation
+from .invoke_inference_connection_response_200 import InvokeInferenceConnectionResponse200
 from .ip_range_query import IPRangeQuery
 from .join_condition import JoinCondition
 from .join_operator import JoinOperator
@@ -557,6 +560,7 @@ from .role_assignment import RoleAssignment
 from .route_type import RouteType
 from .row_filter_entry import RowFilterEntry
 from .row_filter_entry_filter import RowFilterEntryFilter
+from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
 from .secret_entry import SecretEntry
@@ -1097,6 +1101,9 @@ __all__ = (
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
     "InstallManifest",
+    "InvokeInferenceConnectionBody",
+    "InvokeInferenceConnectionOperation",
+    "InvokeInferenceConnectionResponse200",
     "IPRangeQuery",
     "JoinCondition",
     "JoinOperator",
@@ -1227,6 +1234,7 @@ __all__ = (
     "RouteType",
     "RowFilterEntry",
     "RowFilterEntryFilter",
+    "RuntimeConfigStatus",
     "RuntimeDecl",
     "RuntimeDeclMode",
     "SecretEntry",
