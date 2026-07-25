@@ -1789,6 +1789,39 @@ fn parseInternalTableRestoreRequest(alloc: std.mem.Allocator, body: []const u8) 
     return parsed;
 }
 
+fn testInternalTableRestoreRequestBodyAlloc(
+    alloc: std.mem.Allocator,
+    backup_id: []const u8,
+    table_name: []const u8,
+    location: []const u8,
+    connection: []const u8,
+) ![]u8 {
+    const manifest = backups_api.TableBackupManifest{
+        .format = .native,
+        .backup_id = backup_id,
+        .table_name = table_name,
+        .description = "test restore manifest",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .shards = &.{.{
+            .group_id = 7001,
+            .start_key = "",
+            .end_key = null,
+            .snapshot_path = "artifacts/groups/7001",
+            .artifact_size_bytes = 0,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        }},
+    };
+    return try std.json.Stringify.valueAlloc(alloc, InternalTableRestoreRequest{
+        .backup_id = backup_id,
+        .location = location,
+        .connection = connection,
+        .manifest = manifest,
+    }, .{});
+}
+
 fn buildNodeShutdownStatus(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
@@ -4200,11 +4233,20 @@ test "metadata http server accepts internal reallocate and split merge routes" {
             self.store_status_count += 1;
         }
 
-        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8, _: *const backups_api.TableBackupManifest) !void {
+        fn restoreTable(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            location_uri: []const u8,
+            connection: []const u8,
+            manifest: *const backups_api.TableBackupManifest,
+        ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("file:///tmp/out", location_uri);
-            try std.testing.expectEqualStrings("snap1", backup_id);
+            try std.testing.expectEqualStrings("test-backups", connection);
+            try std.testing.expectEqualStrings("snap1", manifest.backup_id);
+            try std.testing.expectEqualStrings("docs", manifest.table_name);
             self.restore_count += 1;
         }
 
@@ -4294,10 +4336,18 @@ test "metadata http server accepts internal reallocate and split merge routes" {
     defer store_status.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), store_status.status);
 
+    const restore_body = try testInternalTableRestoreRequestBodyAlloc(
+        std.testing.allocator,
+        "snap1",
+        "docs",
+        "file:///tmp/out",
+        "test-backups",
+    );
+    defer std.testing.allocator.free(restore_body);
     var restore = try server.handle(.{
         .method = .POST,
         .uri = "/internal/v1/tables/docs/restore",
-        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/out\"}",
+        .body = restore_body,
         .content_type = "application/json",
     });
     defer restore.deinit(std.testing.allocator);
@@ -4763,10 +4813,18 @@ test "metadata http server returns 400 for invalid internal restore backup locat
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
 
+    const restore_body = try testInternalTableRestoreRequestBodyAlloc(
+        std.testing.allocator,
+        "snap1",
+        "docs",
+        "s3://bucket/out",
+        "test-backups",
+    );
+    defer std.testing.allocator.free(restore_body);
     var restore = try server.handle(.{
         .method = .POST,
         .uri = "/internal/v1/tables/docs/restore",
-        .body = "{\"backup_id\":\"snap1\",\"location\":\"s3://bucket/out\"}",
+        .body = restore_body,
         .content_type = "application/json",
     });
     defer restore.deinit(std.testing.allocator);

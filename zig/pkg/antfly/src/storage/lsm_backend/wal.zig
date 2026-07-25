@@ -59,6 +59,13 @@ pub const AppendResult = struct {
     bytes: usize = 0,
     segment: u64 = 0,
     segment_became_nonempty: bool = false,
+    segment_syncs: u64 = 0,
+    index_syncs: u64 = 0,
+};
+
+pub const SyncResult = struct {
+    segment_syncs: u64 = 0,
+    index_syncs: u64 = 0,
 };
 
 pub const ReplayStats = struct {
@@ -214,12 +221,15 @@ pub fn appendStateWithOptionsResult(
     const current = try readCurrentSegment(storage, allocator, root_dir);
     var segment = current.segment;
     var current_size = current.size;
+    var index_syncs: u64 = 0;
     if (!current.index_exists) {
         try writeCurrentSegment(storage, allocator, root_dir, segment, current_size);
+        index_syncs += 1;
         try writeCheckpointIndex(storage, allocator, root_dir, .{
             .oldest_retained_segment = 1,
             .covered_through_segment = 0,
         });
+        index_syncs += 1;
     }
     var segment_path = try segmentPathAlloc(allocator, root_dir, segment);
     var segment_path_owned = true;
@@ -230,6 +240,7 @@ pub fn appendStateWithOptionsResult(
         segment += 1;
         current_size = 0;
         try writeCurrentSegment(storage, allocator, root_dir, segment, current_size);
+        index_syncs += 1;
         segment_path = try segmentPathAlloc(allocator, root_dir, segment);
         segment_path_owned = true;
     }
@@ -244,6 +255,7 @@ pub fn appendStateWithOptionsResult(
     current_size += record.len;
     if (!current.index_exists or current.segment != segment or current.size != current_size) {
         try writeCurrentSegment(storage, allocator, root_dir, segment, current_size);
+        index_syncs += 1;
     }
     allocator.free(segment_path);
     segment_path_owned = false;
@@ -251,6 +263,8 @@ pub fn appendStateWithOptionsResult(
         .bytes = record.len,
         .segment = segment,
         .segment_became_nonempty = segment_became_nonempty,
+        .segment_syncs = @intFromBool(sync),
+        .index_syncs = index_syncs,
     };
 }
 
@@ -262,9 +276,9 @@ pub fn currentSegment(storage: storage_io.Storage, allocator: Allocator, root_di
     return (try readCurrentSegment(storage, allocator, root_dir)).segment;
 }
 
-pub fn syncCurrentState(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !void {
+pub fn syncCurrentState(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !SyncResult {
     const current = readCurrentSegmentIfPresent(storage, allocator, root_dir) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => return .{},
         else => return err,
     };
     const temp_allocator = allocator;
@@ -275,6 +289,7 @@ pub fn syncCurrentState(storage: storage_io.Storage, allocator: Allocator, root_
     const index_path = try indexPathAlloc(temp_allocator, root_dir);
     defer temp_allocator.free(index_path);
     try storage.appendFileAbsolute(allocator, index_path, "", true);
+    return .{ .segment_syncs = 1, .index_syncs = 1 };
 }
 
 pub fn replayIntoMutable(

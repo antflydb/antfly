@@ -116,7 +116,7 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
     );
     const persist = ready.persist_ready_detail;
     std.log.warn(
-        "metadata raft ready persist detail group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+        "metadata raft ready persist detail group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} wal_inner_segment_syncs={d} wal_inner_index_syncs={d} wal_post_commit_segment_syncs={d} wal_post_commit_index_syncs={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
         .{
             ready.group_id,
             persist.skipped_no_durable_state,
@@ -131,6 +131,10 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
             @divTrunc(persist.wal_put_elapsed_ns, std.time.ns_per_ms),
             @divTrunc(persist.wal_commit_elapsed_ns, std.time.ns_per_ms),
             persist.wal_physical_commits,
+            persist.wal_inner_segment_syncs,
+            persist.wal_inner_index_syncs,
+            persist.wal_post_commit_segment_syncs,
+            persist.wal_post_commit_index_syncs,
             persist.encoded_bytes,
             persist.delta_records_since_checkpoint,
             persist.delta_bytes_since_checkpoint,
@@ -3778,7 +3782,7 @@ pub const MetadataHttpService = struct {
         );
         const persist = ready.persist_ready_detail;
         std.log.warn(
-            "metadata linearizable read timeout persist detail request_id={d} group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+            "metadata linearizable read timeout persist detail request_id={d} group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} wal_inner_segment_syncs={d} wal_inner_index_syncs={d} wal_post_commit_segment_syncs={d} wal_post_commit_index_syncs={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
             .{
                 request_id,
                 ready.group_id,
@@ -3794,6 +3798,10 @@ pub const MetadataHttpService = struct {
                 @divTrunc(persist.wal_put_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(persist.wal_commit_elapsed_ns, std.time.ns_per_ms),
                 persist.wal_physical_commits,
+                persist.wal_inner_segment_syncs,
+                persist.wal_inner_index_syncs,
+                persist.wal_post_commit_segment_syncs,
+                persist.wal_post_commit_index_syncs,
                 persist.encoded_bytes,
                 persist.delta_records_since_checkpoint,
                 persist.delta_bytes_since_checkpoint,

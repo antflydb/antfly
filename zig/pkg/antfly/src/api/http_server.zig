@@ -10324,6 +10324,46 @@ fn testBackupNodeConfig(alloc: std.mem.Allocator) !common_config.Config {
     );
 }
 
+fn borrowedTestRestoreManifest(backup_id: []const u8, table_name: []const u8) backups_api.TableBackupManifest {
+    return .{
+        .format = .native,
+        .backup_id = backup_id,
+        .table_name = table_name,
+        .description = "test restore manifest",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = tables_api.default_indexes_json,
+        .replication_sources_json = "[]",
+        .shards = &.{.{
+            .group_id = 7001,
+            .start_key = "",
+            .end_key = null,
+            .snapshot_path = "artifacts/groups/7001",
+            .artifact_size_bytes = 0,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        }},
+    };
+}
+
+fn writeTestRestoreManifestLocationAlloc(
+    alloc: std.mem.Allocator,
+    tmp_sub_path: []const u8,
+    directory_name: []const u8,
+    backup_id: []const u8,
+    table_name: []const u8,
+) ![]u8 {
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/{s}", .{ tmp_sub_path, directory_name });
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+
+    const manifest = borrowedTestRestoreManifest(backup_id, table_name);
+    try backups_api.writeManifest(alloc, backup_root_abs, &manifest);
+    return try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+}
+
 fn attachTestRestoreJobStore(alloc: std.mem.Allocator, server: *ApiHttpServer, tmp_sub_path: []const u8, name: []const u8) !void {
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/{s}", .{ tmp_sub_path, name });
     defer alloc.free(path);
@@ -13670,7 +13710,7 @@ pub fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResp
 
 fn isRetryableMetadataLeadershipError(err: anyerror) bool {
     return switch (err) {
-        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => true,
+        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => true,
         else => false,
     };
 }
@@ -13694,10 +13734,8 @@ fn restoreIdempotencyNamespaceAlloc(
 }
 
 fn metadataAccessFailure(err: anyerror) error{ NotLeader, InternalFailure } {
-    return switch (err) {
-        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => error.NotLeader,
-        else => error.InternalFailure,
-    };
+    if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+    return error.InternalFailure;
 }
 
 pub fn buildLocalSchemaUpdateStatus(alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !struct {
@@ -26373,7 +26411,7 @@ test "api http server returns retryable not leader through public table adapter 
     try std.testing.expectEqual(@as(usize, 1), source.create_index_calls);
 }
 
-test "api http server returns retryable not leader through public cluster adapter mutation" {
+test "api http server returns retryable not leader when cluster backup read barrier times out" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
         linearizable_read_calls: usize = 0,
@@ -26395,7 +26433,7 @@ test "api http server returns retryable not leader through public cluster adapte
         fn ensureLinearizableRead(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.linearizable_read_calls += 1;
-            return error.ProposalDropped;
+            return error.MetadataLinearizableReadTimeout;
         }
     };
 
@@ -26414,6 +26452,121 @@ test "api http server returns retryable not leader through public cluster adapte
 
     try expectPublicMetadataNotLeaderResponse(resp);
     try std.testing.expectEqual(@as(usize, 1), source.linearizable_read_calls);
+}
+
+test "api http server cluster backup succeeds after load balanced metadata timeout retry" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-backup-retry-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-backup-retry-out", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location_uri);
+
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 1,
+    });
+    var writes = table_writes.BoundTableWriteSource.init("docs", &db);
+
+    const FakeSource = struct {
+        read_timeout: bool,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .ensure_linearizable_read = ensureLinearizableRead,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn ensureLinearizableRead(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.read_timeout) return error.MetadataLinearizableReadTimeout;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .description = "docs table",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 1,
+                    .table_id = 1,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var timed_out_source = FakeSource{ .read_timeout = true };
+    var recovered_source = FakeSource{ .read_timeout = false };
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var timed_out_server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, timed_out_source.iface(), null, writes.source());
+    defer timed_out_server.deinit();
+    var recovered_server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, recovered_source.iface(), null, writes.source());
+    defer recovered_server.deinit();
+
+    const backup_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"backup_id\":\"scheduled-snap\",\"location\":\"{s}\",\"connection\":\"test-backups\",\"table_names\":[\"docs\"]}}",
+        .{location_uri},
+    );
+    defer alloc.free(backup_body);
+
+    var retry_response = try timed_out_server.handle(.{
+        .method = .POST,
+        .uri = "/backup",
+        .content_type = "application/json",
+        .body = backup_body,
+    });
+    defer retry_response.deinit(alloc);
+    try expectPublicMetadataNotLeaderResponse(retry_response);
+
+    var success_response = try recovered_server.handle(.{
+        .method = .POST,
+        .uri = "/backup",
+        .content_type = "application/json",
+        .body = backup_body,
+    });
+    defer success_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), success_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, success_response.body, "\"completed\"") != null);
+
+    var manifest = try backups_api.readClusterManifest(alloc, backup_root_abs, "scheduled-snap");
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), manifest.tables.len);
+    try std.testing.expectEqualStrings("docs", manifest.tables[0].name);
 }
 
 test "api http server rejects restore before persistence without an asynchronous worker" {
@@ -27533,6 +27686,8 @@ test "api http server cluster restore rehydrates extension metadata" {
         .table_backup_id = try alloc.dupe(u8, "docs-snap-cluster"),
     };
     defer cluster_entry.deinit(alloc);
+    const table_manifest = borrowedTestRestoreManifest("docs-snap-cluster", "docs");
+    try backups_api.writeManifest(alloc, backup_root_abs, &table_manifest);
     const installed = [_]extension_domain.InstalledExtension{.{
         .name = "memoryaf",
         .package_name = "memoryaf",
@@ -27569,6 +27724,18 @@ test "api http server cluster restore rehydrates extension metadata" {
         installed_count: usize = 0,
         member_count: usize = 0,
         dependency_count: usize = 0,
+        tables: [1]metadata_table_manager.TableRecord = .{.{
+            .table_id = 1,
+            .name = "docs",
+        }},
+        ranges: [1]metadata_table_manager.RangeRecord = .{.{
+            .group_id = 7001,
+            .range_id = 7001,
+            .table_id = 1,
+            .start_key = "",
+            .end_key = null,
+        }},
+        restore_progresses: [1]metadata_table_manager.RestoreProgressRecord,
     };
 
     const FakeSource = struct {
@@ -27591,13 +27758,24 @@ test "api http server cluster restore rehydrates extension metadata" {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .tables = if (self.state.table_restored)
+                    self.state.tables[0..]
+                else
+                    @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = if (self.state.table_restored)
+                    self.state.ranges[0..]
+                else
+                    @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .restore_progresses = if (self.state.table_restored)
+                    self.state.restore_progresses[0..]
+                else
+                    @constCast((&[_]metadata_table_manager.RestoreProgressRecord{})[0..]),
                 .extension_packages = @constCast((&[_]extension_domain.PackageManifest{.{
                     .name = "memoryaf",
                     .version = "1.0.0",
@@ -27611,11 +27789,20 @@ test "api http server cluster restore rehydrates extension metadata" {
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, location_uri_arg: []const u8, backup_id: []const u8) !void {
+        fn restoreTable(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            location_uri_arg: []const u8,
+            connection: []const u8,
+            manifest: *const backups_api.TableBackupManifest,
+        ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expect(location_uri_arg.len > 0);
-            try std.testing.expectEqualStrings("docs-snap-cluster", backup_id);
+            try std.testing.expectEqualStrings("test-backups", connection);
+            try std.testing.expectEqualStrings("docs-snap-cluster", manifest.backup_id);
+            try std.testing.expectEqualStrings("docs", manifest.table_name);
             self.state.table_restored = true;
         }
 
@@ -27633,7 +27820,20 @@ test "api http server cluster restore rehydrates extension metadata" {
         }
     };
 
-    var state = State{};
+    var state = State{
+        .restore_progresses = .{.{
+            .table_id = 1,
+            .node_id = 1,
+            .group_id = 7001,
+            .backup_id = "docs-snap-cluster",
+            .location = location_uri,
+            .snapshot_path = "artifacts/groups/7001",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            .primary_restored = true,
+            .runtime_repair_complete = true,
+            .phase = "complete",
+        }},
+    };
     var source = FakeSource{ .state = &state };
     var node_config = try testBackupNodeConfig(alloc);
     defer node_config.deinit();
@@ -27670,9 +27870,12 @@ test "api http server prefers metadata-owned restore over inline write-source re
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const location_uri = try writeTestRestoreManifestLocationAlloc(alloc, &tmp.sub_path, "metadata-restore-backup", "snap1", "docs");
+    defer alloc.free(location_uri);
 
     const RestoreSource = struct {
         restored: bool = false,
+        expected_location: []const u8,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -27688,11 +27891,20 @@ test "api http server prefers metadata-owned restore over inline write-source re
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+        fn restoreTable(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            location_uri_arg: []const u8,
+            connection: []const u8,
+            manifest: *const backups_api.TableBackupManifest,
+        ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqualStrings("snap1", backup_id);
-            try std.testing.expectEqualStrings("file:///tmp/out", location_uri);
+            try std.testing.expectEqualStrings(self.expected_location, location_uri_arg);
+            try std.testing.expectEqualStrings("test-backups", connection);
+            try std.testing.expectEqualStrings("snap1", manifest.backup_id);
+            try std.testing.expectEqualStrings("docs", manifest.table_name);
             self.restored = true;
         }
     };
@@ -27761,7 +27973,7 @@ test "api http server prefers metadata-owned restore over inline write-source re
         }
     };
 
-    var restore_source = RestoreSource{};
+    var restore_source = RestoreSource{ .expected_location = location_uri };
     var node_config = try testBackupNodeConfig(alloc);
     defer node_config.deinit();
     var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{});
@@ -27769,11 +27981,17 @@ test "api http server prefers metadata-owned restore over inline write-source re
     var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, restore_source.iface(), null, FailingWrites.source());
     defer server.deinit();
     try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-jobs");
+    const restore_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"backup_id\":\"snap1\",\"location\":\"{s}\",\"connection\":\"test-backups\"}}",
+        .{location_uri},
+    );
+    defer alloc.free(restore_body);
     var restore_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/docs/restore",
         .content_type = "application/json",
-        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
+        .body = restore_body,
     });
     defer restore_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
@@ -27787,10 +28005,13 @@ test "api http server retries stale metadata table-exists restore race" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const location_uri = try writeTestRestoreManifestLocationAlloc(alloc, &tmp.sub_path, "metadata-restore-race-backup", "snap1", "docs");
+    defer alloc.free(location_uri);
 
     const RestoreSource = struct {
         attempts: usize = 0,
         restored: bool = false,
+        expected_location: []const u8,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -27806,18 +28027,27 @@ test "api http server retries stale metadata table-exists restore race" {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+        fn restoreTable(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            location_uri_arg: []const u8,
+            connection: []const u8,
+            manifest: *const backups_api.TableBackupManifest,
+        ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqualStrings("snap1", backup_id);
-            try std.testing.expectEqualStrings("file:///tmp/out", location_uri);
+            try std.testing.expectEqualStrings(self.expected_location, location_uri_arg);
+            try std.testing.expectEqualStrings("test-backups", connection);
+            try std.testing.expectEqualStrings("snap1", manifest.backup_id);
+            try std.testing.expectEqualStrings("docs", manifest.table_name);
             self.attempts += 1;
             if (self.attempts == 1) return error.TableAlreadyExists;
             self.restored = true;
         }
     };
 
-    var restore_source = RestoreSource{};
+    var restore_source = RestoreSource{ .expected_location = location_uri };
     var node_config = try testBackupNodeConfig(alloc);
     defer node_config.deinit();
     var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{});
@@ -27825,11 +28055,17 @@ test "api http server retries stale metadata table-exists restore race" {
     var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config, .backend_runtime = &backend_runtime }, restore_source.iface(), null, null);
     defer server.deinit();
     try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-jobs");
+    const restore_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"backup_id\":\"snap1\",\"location\":\"{s}\",\"connection\":\"test-backups\"}}",
+        .{location_uri},
+    );
+    defer alloc.free(restore_body);
     var restore_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/docs/restore",
         .content_type = "application/json",
-        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
+        .body = restore_body,
     });
     defer restore_resp.deinit(alloc);
 
@@ -27858,8 +28094,19 @@ test "api http server retries interrupted metadata restore publication" {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !void {
+        fn restoreTable(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            location_uri: []const u8,
+            connection: []const u8,
+            manifest: *const backups_api.TableBackupManifest,
+        ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("file:///backup", location_uri);
+            try std.testing.expectEqualStrings("test-backups", connection);
+            try std.testing.expectEqualStrings("daily", manifest.backup_id);
             self.attempts += 1;
             if (self.attempts == 1) return error.TestPublicationInterrupted;
         }
@@ -27869,7 +28116,14 @@ test "api http server retries interrupted metadata restore publication" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
     defer server.deinit();
 
-    try std.testing.expect(try server.restoreMetadataTableWithRetry(std.testing.allocator, "docs", "file:///backup", "daily"));
+    const manifest = borrowedTestRestoreManifest("daily", "docs");
+    try std.testing.expect(try server.restoreMetadataTableWithRetry(
+        std.testing.allocator,
+        "docs",
+        "file:///backup",
+        "test-backups",
+        &manifest,
+    ));
     try std.testing.expectEqual(@as(usize, 2), source.attempts);
 }
 

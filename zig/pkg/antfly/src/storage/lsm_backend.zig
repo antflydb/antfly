@@ -649,6 +649,8 @@ pub const Backend = struct {
         wal_append_ns: u64 = 0,
         wal_sync_records: u64 = 0,
         wal_sync_ns: u64 = 0,
+        wal_segment_syncs: u64 = 0,
+        wal_index_syncs: u64 = 0,
         wal_replay_records: u64 = 0,
         wal_replay_entries: u64 = 0,
         wal_replay_bytes: u64 = 0,
@@ -1623,22 +1625,33 @@ pub const Backend = struct {
         if (force and !self.options.backend.read_only and self.options.wal_enabled) {
             var wal_lock = try self.acquireWalOperationLock(.exclusive);
             defer wal_lock.release();
-            try wal_mod.syncCurrentState(self.storage.?, self.allocator, self.root_dir.?);
+            _ = try wal_mod.syncCurrentState(self.storage.?, self.allocator, self.root_dir.?);
         }
         try self.finalizeDeferredStorageWorkLocked();
     }
 
     pub fn syncReplayState(self: *Backend) !void {
-        if (self.root_dir == null) return;
+        _ = try self.syncReplayStateWithStats();
+    }
+
+    pub fn syncReplayStateWithStats(self: *Backend) !wal_mod.SyncResult {
+        if (self.root_dir == null) return .{};
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
         if (!self.options.backend.read_only and self.options.wal_enabled) {
             var wal_lock = try self.acquireWalOperationLock(.exclusive);
             defer wal_lock.release();
-            try wal_mod.syncCurrentState(self.storage.?, self.allocator, self.root_dir.?);
-            return;
+            return try wal_mod.syncCurrentState(self.storage.?, self.allocator, self.root_dir.?);
         }
         try self.finalizeDeferredStorageWorkLocked();
+        return .{};
+    }
+
+    pub fn commitProvidesDurability(self: *const Backend) bool {
+        return self.root_dir != null and
+            !self.options.backend.read_only and
+            self.options.wal_enabled and
+            self.options.wal_sync_on_commit;
     }
 
     pub fn snapshotReadStats(self: *const Backend) ReadStats {
@@ -3529,6 +3542,8 @@ pub const Backend = struct {
         self.write_stats.wal_append_records += 1;
         self.write_stats.wal_append_entries += @intCast(state.entries.items.len);
         self.write_stats.wal_append_bytes += append_result.bytes;
+        self.write_stats.wal_segment_syncs += append_result.segment_syncs;
+        self.write_stats.wal_index_syncs += append_result.index_syncs;
         const append_ns = self.writeStatsElapsedNs(start_ns);
         self.write_stats.wal_append_ns += append_ns;
         if (self.options.wal_sync_on_commit) {

@@ -3235,6 +3235,27 @@ pub const MetadataHttpClusterSimulation = struct {
         }
     }
 
+    pub fn stepAllExcept(self: *MetadataHttpClusterSimulation, stalled_index: usize) anyerror!void {
+        std.debug.assert(stalled_index < self.cluster.nodes.len);
+        self.manual_clock.advanceMs(100);
+        _ = try self.virtual_network.drainDue(null);
+        for (0..self.cluster.nodes.len) |i| {
+            if (i == stalled_index) continue;
+            try self.refreshOwnedMetadataRuntimes(i);
+        }
+        for (0..self.cluster.nodes.len) |i| {
+            if (i == stalled_index) continue;
+            _ = try self.cluster.node(i).stepOnce();
+            _ = try self.virtual_network.drainDue(null);
+            try self.refreshOwnedMetadataRuntimes(i);
+        }
+        _ = try self.virtual_network.advanceTicks(1);
+        for (0..self.cluster.nodes.len) |i| {
+            if (i == stalled_index) continue;
+            try self.refreshOwnedMetadataRuntimes(i);
+        }
+    }
+
     pub fn runUntil(
         self: *MetadataHttpClusterSimulation,
         max_rounds: usize,
@@ -10940,6 +10961,114 @@ test "metadata http cluster simulation transfers reconcile lease on leader resta
     const restarted_status = try cluster.node(leader_index).metadataStatus();
     try std.testing.expect(!restarted_status.reconcile_lease_held_by_local);
     try std.testing.expectEqual(new_leader_status.reconcile_lease_owner_node_id, restarted_status.reconcile_lease_owner_node_id);
+}
+
+test "metadata http cluster simulation recovers from a ready persistence stall without term churn" {
+    const ReadBarrierRecorder = struct {
+        const expected_context = "issue-398-linearizable-read";
+
+        completed: bool = false,
+
+        fn observer(self: *@This()) raft_state_machine.ReadStateObserver {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .on_read_states = onReadStates },
+            };
+        }
+
+        fn onReadStates(ptr: *anyopaque, group_id: u64, read_states: []const raft_engine.core.ReadState) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (group_id != 4972) return;
+            for (read_states) |read_state| {
+                if (std.mem.eql(u8, read_state.request_ctx, expected_context)) self.completed = true;
+            }
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_c.deinit();
+
+    var factory_a = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-a", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_a);
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-b", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_b);
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-c", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_c);
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-a.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-b.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-c.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_c);
+
+    var configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        makeHostSimConfig(1, 4972, root_a, cat_a),
+        makeHostSimConfig(2, 4972, root_b, cat_b),
+        makeHostSimConfig(3, 4972, root_c, cat_c),
+    };
+    for (&configs) |*config| config.host.http.host.replica_state_backend = .wal;
+
+    var read_barriers = [_]ReadBarrierRecorder{ .{}, .{}, .{} };
+    var deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        makeHostSimDeps(&factory_a),
+        makeHostSimDeps(&factory_b),
+        makeHostSimDeps(&factory_c),
+    };
+    for (&deps, 0..) |*dep, index| dep.host.read_state_observer = read_barriers[index].observer();
+
+    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4972, configs[0..], deps[0..]);
+    defer cluster.deinit();
+    try cluster.startAll();
+    defer cluster.stopAll();
+    try cluster.bootstrapMetadataReplicas();
+    const stalled_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
+
+    // A synchronous Ready stall blocks every other task on that node's Raft
+    // lane. Keep peers and the real 100 ms reconcile-lease cadence running for
+    // longer than the 5-9 tick randomized election window.
+    var rounds: usize = 0;
+    while (rounds < 12) : (rounds += 1) try cluster.stepAllExcept(stalled_leader);
+
+    const recovered_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(recovered_leader != stalled_leader);
+
+    rounds = 0;
+    while (rounds < 24) : (rounds += 1) try cluster.stepAll();
+    const stable_status = cluster.cluster.node(recovered_leader).raftStatus(4972) orelse return error.MissingRaftStatus;
+    try std.testing.expect(stable_status.soft.role == .leader);
+    const stable_term = stable_status.hard.current_term;
+
+    const lease_status = try cluster.node(recovered_leader).metadataStatus();
+    try std.testing.expect(lease_status.reconcile_lease_held_by_local);
+    try std.testing.expectEqual(
+        cluster.cluster.configs[recovered_leader].host.http.host.local_node_id,
+        lease_status.reconcile_lease_owner_node_id,
+    );
+
+    try cluster.cluster.node(recovered_leader).runtime.svc.requestReadableLease(
+        4972,
+        ReadBarrierRecorder.expected_context,
+    );
+    rounds = 0;
+    while (rounds < 24 and !read_barriers[recovered_leader].completed) : (rounds += 1) try cluster.stepAll();
+    try std.testing.expect(read_barriers[recovered_leader].completed);
+
+    rounds = 0;
+    while (rounds < 20) : (rounds += 1) try cluster.stepAll();
+    const quiet_status = cluster.cluster.node(recovered_leader).raftStatus(4972) orelse return error.MissingRaftStatus;
+    try std.testing.expect(quiet_status.soft.role == .leader);
+    try std.testing.expectEqual(stable_term, quiet_status.hard.current_term);
 }
 
 test "metadata http cluster simulation skips reconcile work without lease ownership" {

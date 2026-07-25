@@ -713,8 +713,11 @@ fn metadataRaftStatusIsVoter(status: raft_engine.core.Status, local_node_id: u64
 fn metadataRaftStatusShouldBootstrapCampaign(status: ?raft_engine.core.Status, local_node_id: u64) bool {
     const raft_status = status orelse return false;
     if (raft_status.soft.leader_id != null) return false;
+    // campaign() restarts pre-vote and clears collected votes. Let an
+    // in-flight election consume its randomized timeout before retrying.
     switch (raft_status.soft.role) {
-        .follower, .pre_candidate, .candidate => {},
+        .follower => {},
+        .pre_candidate, .candidate => if (raft_status.election_elapsed < raft_status.randomized_election_timeout) return false,
         .leader => return false,
     }
     return metadataRaftStatusIsVoter(raft_status, local_node_id);
@@ -1662,9 +1665,17 @@ test "metadata runtime retries bootstrap campaign only for leaderless voters" {
     try std.testing.expect(metadataRaftStatusShouldBootstrapCampaign(status, 1));
 
     status.soft.role = .pre_candidate;
+    status.election_elapsed = 4;
+    status.randomized_election_timeout = 5;
+    try std.testing.expect(!metadataRaftStatusShouldBootstrapCampaign(status, 1));
+    status.election_elapsed = 5;
     try std.testing.expect(metadataRaftStatusShouldBootstrapCampaign(status, 1));
 
     status.soft.role = .candidate;
+    status.election_elapsed = 4;
+    status.randomized_election_timeout = 5;
+    try std.testing.expect(!metadataRaftStatusShouldBootstrapCampaign(status, 1));
+    status.election_elapsed = 5;
     try std.testing.expect(metadataRaftStatusShouldBootstrapCampaign(status, 1));
 
     status.soft.role = .leader;

@@ -926,6 +926,10 @@ pub const WalReplicaState = struct {
         diagnostics.wal_put_elapsed_ns += counterDelta(before.total_put_ns, after.total_put_ns);
         diagnostics.wal_commit_elapsed_ns += counterDelta(before.total_commit_ns, after.total_commit_ns);
         diagnostics.wal_physical_commits += counterDelta(before.physical_commits, after.physical_commits);
+        diagnostics.wal_inner_segment_syncs += counterDelta(before.inner_segment_syncs, after.inner_segment_syncs);
+        diagnostics.wal_inner_index_syncs += counterDelta(before.inner_index_syncs, after.inner_index_syncs);
+        diagnostics.wal_post_commit_segment_syncs += counterDelta(before.post_commit_segment_syncs, after.post_commit_segment_syncs);
+        diagnostics.wal_post_commit_index_syncs += counterDelta(before.post_commit_index_syncs, after.post_commit_index_syncs);
     }
 
     fn counterDelta(before: u64, after: u64) u64 {
