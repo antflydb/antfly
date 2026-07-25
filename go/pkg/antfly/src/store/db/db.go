@@ -1711,7 +1711,10 @@ func (db *DBImpl) getPebbleOpts() (*pebble.Options, error) {
 // This sets up the LeaderAwareS3Storage wrapper which only allows the Raft leader to write to S3.
 // Note: This method should only be called when S3 storage is enabled.
 func (db *DBImpl) configureS3Storage(pebbleOpts *pebble.Options) error {
-	s3Info := db.antflyConfig.Storage.Local.S3
+	s3Info, err := db.antflyConfig.ResolveObjectStorageS3("artifacts")
+	if err != nil {
+		return fmt.Errorf("resolving object storage artifacts lane: %w", err)
+	}
 	db.logger.Info("Configuring S3 storage for Pebble",
 		zap.String("endpoint", s3Info.Endpoint),
 		zap.String("bucket", s3Info.Bucket),

@@ -4650,13 +4650,15 @@ fn chooseStatefulJoinStrategyWithStats(
 ) StatefulJoinStrategyDecision {
     const left_size_bytes = left_stats.estimatedSizeBytes();
     const right_size_bytes = right_stats.estimatedSizeBytes();
+    const left_size_known = left_stats.hasAny();
+    const right_size_known = right_stats.hasAny();
     if (right_stats.row_count_known and right_stats.row_count == 0) {
         return .{ .strategy = .broadcast };
     } else if (left_stats.row_count_known and left_stats.row_count == 0) {
         return .{ .strategy = .broadcast };
-    } else if (join_model.joinSideBelowBroadcastThreshold(right_size_bytes)) {
+    } else if (right_size_known and join_model.joinSideBelowBroadcastThreshold(right_size_bytes)) {
         return .{ .strategy = .broadcast };
-    } else if (join_model.joinSideBelowBroadcastThreshold(left_size_bytes)) {
+    } else if (left_size_known and join_model.joinSideBelowBroadcastThreshold(left_size_bytes)) {
         return .{ .strategy = .broadcast };
     } else if (supported_index_lookup and right_stats.row_count_known and right_stats.row_count > 0) {
         const simple_strategy = join_model.chooseBroadcastOrIndexLookupWithStats(
@@ -4671,6 +4673,10 @@ fn chooseStatefulJoinStrategyWithStats(
         } else {
             return chooseStatefulShuffleCandidateOrBroadcast(join, left_rows, left_size_bytes, right_size_bytes);
         }
+    } else if (supported_index_lookup and !right_stats.row_count_known) {
+        return .{ .strategy = .index_lookup };
+    } else if (!left_size_known or !right_size_known) {
+        return .{ .strategy = .broadcast };
     } else {
         return chooseStatefulShuffleCandidateOrBroadcast(join, left_rows, left_size_bytes, right_size_bytes);
     }
@@ -7095,6 +7101,64 @@ test "distributed join uses row estimates when byte statistics are unavailable" 
         .row_count_known = true,
     };
     try std.testing.expectEqual(std.math.maxInt(u64), overflowing.estimatedSizeBytes());
+}
+
+test "distributed join preserves no-stat strategy when one side is unknown" {
+    const join = SupportedJoinRequest{
+        .right_table = @constCast("right"),
+        .join_type = .inner,
+        .left_field = @constCast("left_id"),
+        .right_field = @constCast("_id"),
+    };
+    const large = JoinTableStats{
+        .row_count = 100_000,
+        .size_bytes = join_model.join_broadcast_threshold_bytes * 2,
+        .row_count_known = true,
+        .size_bytes_known = true,
+    };
+
+    const unknown_left = chooseStatefulJoinStrategyWithStats(
+        join,
+        true,
+        50_000,
+        100,
+        .{},
+        large,
+    );
+    try std.testing.expectEqual(RightJoinQueryResult.StrategyUsed.index_lookup, unknown_left.strategy);
+
+    const unknown_right = chooseStatefulJoinStrategyWithStats(
+        join,
+        true,
+        50_000,
+        100,
+        large,
+        .{},
+    );
+    try std.testing.expectEqual(RightJoinQueryResult.StrategyUsed.index_lookup, unknown_right.strategy);
+
+    const size_only_right = chooseStatefulJoinStrategyWithStats(
+        join,
+        true,
+        50_000,
+        100,
+        large,
+        .{
+            .size_bytes = join_model.join_broadcast_threshold_bytes * 2,
+            .size_bytes_known = true,
+        },
+    );
+    try std.testing.expectEqual(RightJoinQueryResult.StrategyUsed.index_lookup, size_only_right.strategy);
+
+    const unsupported_lookup = chooseStatefulJoinStrategyWithStats(
+        join,
+        false,
+        50_000,
+        100,
+        large,
+        .{},
+    );
+    try std.testing.expectEqual(RightJoinQueryResult.StrategyUsed.broadcast, unsupported_lookup.strategy);
 }
 
 test "distributed join stable job id is deterministic and changes with inputs" {

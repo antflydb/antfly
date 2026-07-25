@@ -978,6 +978,7 @@ pub const ApiHttpServer = struct {
         fn init(
             alloc: std.mem.Allocator,
             snapshot: *const metadata_api.AdminSnapshot,
+            prefix: ?[]const u8,
         ) !RuntimeStatusSnapshotIndex {
             var index = RuntimeStatusSnapshotIndex{
                 .alloc = alloc,
@@ -985,33 +986,49 @@ pub const ApiHttpServer = struct {
             };
             errdefer index.deinit();
 
-            try index.table_by_group.ensureTotalCapacity(
+            var table_names = std.AutoHashMapUnmanaged(u64, []const u8).empty;
+            defer table_names.deinit(alloc);
+            const selected_table_count = if (prefix) |value| count: {
+                var count: usize = 0;
+                for (snapshot.tables) |table| {
+                    if (std.mem.startsWith(u8, table.name, value)) count += 1;
+                }
+                break :count count;
+            } else snapshot.tables.len;
+            try table_names.ensureTotalCapacity(
                 alloc,
-                std.math.cast(u32, snapshot.ranges.len) orelse return error.TooManyRuntimeStatuses,
+                std.math.cast(u32, selected_table_count) orelse return error.TooManyRuntimeStatuses,
             );
+            try index.table_id_by_name.ensureTotalCapacity(
+                alloc,
+                std.math.cast(u32, selected_table_count) orelse return error.TooManyRuntimeStatuses,
+            );
+            for (snapshot.tables) |table| {
+                if (prefix) |value| {
+                    if (!std.mem.startsWith(u8, table.name, value)) continue;
+                }
+                table_names.putAssumeCapacity(table.table_id, table.name);
+                index.table_id_by_name.putAssumeCapacity(table.name, table.table_id);
+            }
+
+            const selected_range_count = if (prefix != null) count: {
+                var count: usize = 0;
+                for (snapshot.ranges) |range| {
+                    if (table_names.contains(range.table_id)) count += 1;
+                }
+                break :count count;
+            } else snapshot.ranges.len;
+            try index.table_by_group.ensureTotalCapacity(alloc, std.math.cast(u32, selected_range_count) orelse return error.TooManyRuntimeStatuses);
             for (snapshot.ranges) |range| {
+                if (!table_names.contains(range.table_id)) continue;
                 index.table_by_group.putAssumeCapacity(range.group_id, range.table_id);
                 const entry = try index.groups_by_table.getOrPut(alloc, range.table_id);
                 if (!entry.found_existing) entry.value_ptr.* = .empty;
                 try entry.value_ptr.append(alloc, range.group_id);
             }
 
-            var table_names = std.AutoHashMapUnmanaged(u64, []const u8).empty;
-            defer table_names.deinit(alloc);
-            try table_names.ensureTotalCapacity(
-                alloc,
-                std.math.cast(u32, snapshot.tables.len) orelse return error.TooManyRuntimeStatuses,
-            );
-            try index.table_id_by_name.ensureTotalCapacity(
-                alloc,
-                std.math.cast(u32, snapshot.tables.len) orelse return error.TooManyRuntimeStatuses,
-            );
-            for (snapshot.tables) |table| {
-                table_names.putAssumeCapacity(table.table_id, table.name);
-                index.table_id_by_name.putAssumeCapacity(table.name, table.table_id);
-            }
-
             for (snapshot.placement_intents) |intent| {
+                if (!index.table_by_group.contains(intent.record.group_id)) continue;
                 try index.groups_with_placements.put(alloc, intent.record.group_id, {});
                 if (intent.store_id != 0) {
                     try index.store_owners.put(alloc, .{
@@ -5660,7 +5677,7 @@ pub const ApiHttpServer = struct {
     ) !?[]tables_api.TableStorageStatus {
         var items = std.ArrayListUnmanaged(tables_api.TableStorageStatus).empty;
         defer items.deinit(alloc);
-        var runtime_index = try RuntimeStatusSnapshotIndex.init(alloc, snapshot);
+        var runtime_index = try RuntimeStatusSnapshotIndex.init(alloc, snapshot, prefix);
         defer runtime_index.deinit();
 
         for (snapshot.tables) |*table| {
@@ -25168,7 +25185,7 @@ test "table storage status indexes one distributed snapshot by table and owner" 
         .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
     };
 
-    var index = try ApiHttpServer.RuntimeStatusSnapshotIndex.init(alloc, &snapshot);
+    var index = try ApiHttpServer.RuntimeStatusSnapshotIndex.init(alloc, &snapshot, null);
     defer index.deinit();
     try std.testing.expectEqual(@as(?u64, 1), index.tableId("docs"));
     try std.testing.expectEqualSlices(u64, &.{10}, index.groupIdsForTable(1));
@@ -25176,6 +25193,15 @@ test "table storage status indexes one distributed snapshot by table and owner" 
     try std.testing.expectEqual(@as(usize, 1), index.reportsForTable(1).len);
     try std.testing.expectEqual(@as(u64, 20), index.reportsForTable(1)[0].store_id);
     try std.testing.expectEqual(@as(usize, 1), index.reportsForTable(2).len);
+
+    var docs_only = try ApiHttpServer.RuntimeStatusSnapshotIndex.init(alloc, &snapshot, "doc");
+    defer docs_only.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), docs_only.tableId("docs"));
+    try std.testing.expectEqual(@as(?u64, null), docs_only.tableId("customers"));
+    try std.testing.expectEqualSlices(u64, &.{10}, docs_only.groupIdsForTable(1));
+    try std.testing.expectEqual(@as(usize, 0), docs_only.groupIdsForTable(2).len);
+    try std.testing.expectEqual(@as(usize, 1), docs_only.reportsForTable(1).len);
+    try std.testing.expectEqual(@as(usize, 0), docs_only.reportsForTable(2).len);
 }
 
 test "api index status ignores propagated runtime status from removed owner" {

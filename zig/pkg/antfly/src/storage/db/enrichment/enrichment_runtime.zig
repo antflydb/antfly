@@ -365,6 +365,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
             runtime.last_embed_batch_items = @intCast(items);
             runtime.last_embed_batch_bytes = @intCast(bytes);
             runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
+            runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
             runtime.last_embed_batch_ns = elapsed_ns;
             runtime.total_embed_ns += elapsed_ns;
         }
@@ -385,6 +386,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
             runtime.last_embed_batch_items = @intCast(items);
             runtime.last_embed_batch_bytes = @intCast(bytes);
             runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
+            runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
             runtime.last_embed_batch_ns = elapsed_ns;
             runtime.total_embed_ns += elapsed_ns;
         }
@@ -399,6 +401,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
             runtime.last_embed_batch_items = @intCast(items);
             runtime.last_embed_batch_bytes = @intCast(bytes);
             runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
+            runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
             runtime.last_embed_batch_ns = elapsed_ns;
             runtime.total_embed_ns += elapsed_ns;
         }
@@ -1090,6 +1093,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     last_embed_batch_items: u64 = 0,
     last_embed_batch_bytes: u64 = 0,
     last_embed_batch_max_bytes: u64 = 0,
+    last_embed_batch_completed_ms: u64 = 0,
     last_embed_batch_ns: u64 = 0,
     total_embed_ns: u64 = 0,
     dense_artifact_bytes_written: u64 = 0,
@@ -1289,6 +1293,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .last_embed_batch_items = self.last_embed_batch_items,
             .last_embed_batch_bytes = self.last_embed_batch_bytes,
             .last_embed_batch_max_bytes = self.last_embed_batch_max_bytes,
+            .last_embed_batch_completed_ms = self.last_embed_batch_completed_ms,
             .last_embed_batch_ns = self.last_embed_batch_ns,
             .total_embed_ns = self.total_embed_ns,
             .dense_artifact_bytes_written = self.dense_artifact_bytes_written,
@@ -1341,6 +1346,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     last_embed_batch_items: u64 = 0,
     last_embed_batch_bytes: u64 = 0,
     last_embed_batch_max_bytes: u64 = 0,
+    last_embed_batch_completed_ms: u64 = 0,
     last_embed_batch_ns: u64 = 0,
     total_embed_ns: u64 = 0,
     dense_artifact_bytes_written: u64 = 0,
@@ -1623,6 +1629,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .last_embed_batch_items = self.last_embed_batch_items,
             .last_embed_batch_bytes = self.last_embed_batch_bytes,
             .last_embed_batch_max_bytes = self.last_embed_batch_max_bytes,
+            .last_embed_batch_completed_ms = self.last_embed_batch_completed_ms,
             .last_embed_batch_ns = self.last_embed_batch_ns,
             .total_embed_ns = self.total_embed_ns,
             .dense_artifact_bytes_written = self.dense_artifact_bytes_written,

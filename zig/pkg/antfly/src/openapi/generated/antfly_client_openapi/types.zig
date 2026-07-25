@@ -2748,6 +2748,9 @@ pub const EnrichmentRuntimeStatus = struct {
     last_embed_batch_items: i64,
     last_embed_batch_bytes: i64,
     last_embed_batch_max_bytes: i64,
+    /// Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch.
+    last_embed_batch_completed_ms: i64,
+    /// Elapsed duration in nanoseconds for the most recently completed embedding batch.
     last_embed_batch_ns: i64,
     total_embed_ns: i64,
 };

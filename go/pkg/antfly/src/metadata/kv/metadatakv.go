@@ -299,7 +299,10 @@ func (s *metadataKV) getPebbleOpts() (*pebble.Options, error) {
 
 // configureS3Storage configures Pebble to use S3 for remote sstable storage.
 func (s *metadataKV) configureS3Storage(pebbleOpts *pebble.Options) error {
-	s3Info := s.antflyConfig.Storage.Local.S3
+	s3Info, err := s.antflyConfig.ResolveObjectStorageS3("catalog")
+	if err != nil {
+		return fmt.Errorf("resolving object storage catalog lane: %w", err)
+	}
 	s.logger.Info("Configuring S3 storage for metadata Pebble",
 		zap.String("endpoint", s3Info.Endpoint),
 		zap.String("bucket", s3Info.Bucket),

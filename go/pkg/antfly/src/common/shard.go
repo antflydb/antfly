@@ -43,14 +43,18 @@ func NormalizeBackupFormat(format BackupFormat) BackupFormat {
 }
 
 type BackupConfig struct {
-	BackupID string       `json:"backup_id"`
-	Location string       `json:"location"`
-	Format   BackupFormat `json:"format,omitempty"`
+	BackupID   string       `json:"backup_id"`
+	Connection string       `json:"connection,omitempty"`
+	Location   string       `json:"location"`
+	Format     BackupFormat `json:"format,omitempty"`
 }
 
 func (rc *BackupConfig) Equal(other *BackupConfig) bool {
 	return rc == nil && other == nil || rc != nil && other != nil &&
-		rc.BackupID == other.BackupID && rc.Location == other.Location
+		rc.BackupID == other.BackupID &&
+		rc.Connection == other.Connection &&
+		rc.Location == other.Location &&
+		NormalizeBackupFormat(rc.Format) == NormalizeBackupFormat(other.Format)
 }
 
 type PeerSet map[types.ID]struct{}

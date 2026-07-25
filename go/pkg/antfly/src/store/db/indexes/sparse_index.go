@@ -789,7 +789,7 @@ func (si *SparseIndex) Stats() IndexStats {
 		pendingSequenceCount += uint64(si.walBuf.Len()) //nolint:gosec // G115: Len() is non-negative
 	}
 	if pendingSequenceCount > 0 {
-		is.EnrichmentRuntime.PendingSequenceCount = &pendingSequenceCount
+		is.EnrichmentRuntime.PendingSequenceCount = pendingSequenceCount
 	}
 
 	return is.AsIndexStats()

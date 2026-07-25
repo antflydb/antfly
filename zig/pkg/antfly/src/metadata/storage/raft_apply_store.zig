@@ -2938,7 +2938,7 @@ pub const RaftApplyStore = struct {
 };
 
 const transition_magic = "afmd1";
-const runtime_status_record_version: u16 = 9;
+const runtime_status_record_version: u16 = 10;
 const group_status_record_version: u16 = 3;
 
 const TransitionTag = enum(u8) {
@@ -3803,6 +3803,7 @@ fn appendRuntimeEnrichmentStatusRecord(
     try appendInt(alloc, out, u64, record.last_embed_batch_items);
     try appendInt(alloc, out, u64, record.last_embed_batch_bytes);
     try appendInt(alloc, out, u64, record.last_embed_batch_max_bytes);
+    try appendInt(alloc, out, u64, record.last_embed_batch_completed_ms);
     try appendInt(alloc, out, u64, record.last_embed_batch_ns);
     try appendInt(alloc, out, u64, record.total_embed_ns);
     try appendInt(alloc, out, u64, record.dense_artifact_bytes_written);
@@ -3815,6 +3816,7 @@ fn readRuntimeEnrichmentStatusRecord(
     alloc: std.mem.Allocator,
     encoded: []const u8,
     pos: *usize,
+    version: u16,
 ) !metadata.RuntimeEnrichmentStatusReport {
     if (pos.* + 3 > encoded.len) return error.InvalidMetadataTransitionEncoding;
     const enabled = encoded[pos.*] != 0;
@@ -3885,6 +3887,7 @@ fn readRuntimeEnrichmentStatusRecord(
         .last_embed_batch_items = try readInt(encoded, pos, u64),
         .last_embed_batch_bytes = try readInt(encoded, pos, u64),
         .last_embed_batch_max_bytes = try readInt(encoded, pos, u64),
+        .last_embed_batch_completed_ms = if (version >= 10) try readInt(encoded, pos, u64) else 0,
         .last_embed_batch_ns = try readInt(encoded, pos, u64),
         .total_embed_ns = try readInt(encoded, pos, u64),
         .dense_artifact_bytes_written = try readInt(encoded, pos, u64),
@@ -3926,7 +3929,7 @@ fn readRuntimeGroupStatusRecord(
     const created_at_millis = if (version >= 2) try readInt(encoded, pos, u64) else 0;
     const index_count = try readInt(encoded, pos, u32);
     const enrichment = if (version >= 9)
-        try readRuntimeEnrichmentStatusRecord(alloc, encoded, pos)
+        try readRuntimeEnrichmentStatusRecord(alloc, encoded, pos, version)
     else blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const enabled = encoded[pos.*] != 0;
@@ -7523,6 +7526,7 @@ test "metadata raft apply store runtime status codec preserves document identity
             .projection_checkpoint_config_hash = std.math.maxInt(u64) - 7,
             .processed_requests = 17,
             .embed_batches_completed = 3,
+            .last_embed_batch_completed_ms = 1_753_392_345_678,
             .worker_started = true,
             .stalled = true,
         },
@@ -7584,6 +7588,7 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expect(status.enrichment.stalled);
     try std.testing.expectEqual(@as(u64, 17), status.enrichment.processed_requests);
     try std.testing.expectEqual(@as(u64, 3), status.enrichment.embed_batches_completed);
+    try std.testing.expectEqual(@as(u64, 1_753_392_345_678), status.enrichment.last_embed_batch_completed_ms);
     try std.testing.expectEqual(std.math.maxInt(u64) - 7, status.enrichment.projection_checkpoint_config_hash);
     try std.testing.expectEqualStrings("rebuilding", status.enrichment.projection_checkpoint_status);
     try std.testing.expectEqual(@as(u64, 1), status.doc_identity.namespace_table_id);

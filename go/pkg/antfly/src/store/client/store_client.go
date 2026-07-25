@@ -168,13 +168,8 @@ func (sc *StoreClient) ApplyMergeChunk(
 	return nil
 }
 
-func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string, format common.BackupFormat) error {
-	format = common.NormalizeBackupFormat(format)
-	backupReq := common.BackupConfig{
-		BackupID: id,
-		Location: loc,
-		Format:   format,
-	}
+func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, backupReq common.BackupConfig) error {
+	backupReq.Format = common.NormalizeBackupFormat(backupReq.Format)
 	// Create the request
 	url := sc.url + "/shard/backup"
 	body, err := json.Marshal(backupReq)
@@ -207,7 +202,7 @@ func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, loc, id str
 		}
 		// Create a file to save the streamed data
 		backupFileName := common.ShardBackupFileName(backupReq.BackupID, shardID)
-		if format == common.BackupFormatPortable {
+		if backupReq.Format == common.BackupFormatPortable {
 			backupFileName = common.ShardPortableBackupFileName(backupReq.BackupID, shardID)
 		}
 		filePath := path.Join(loc, backupFileName)

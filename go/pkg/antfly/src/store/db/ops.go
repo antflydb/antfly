@@ -205,13 +205,10 @@ func DecodeProto(data []byte, kvStoreOp *Op) error {
 	return nil
 }
 
-// WriteBackupToBlobStore writes a backup file to an S3-compatible blob store.
-func WriteBackupToBlobStore(ctx context.Context, bucketURL, filePath string, s3Info *common.S3Info) error {
-	// e.g. "s3://my-bucket-name/optional/prefix"
-	bucket, prefix, err := common.ParseS3URL(bucketURL)
-	if err != nil {
-		return fmt.Errorf("parsing bucket URL: %w", err)
-	}
+// WriteBackupToBlobStore writes a backup file to an authorized S3 location.
+func WriteBackupToBlobStore(ctx context.Context, filePath string, s3Info *common.S3Info) error {
+	bucket := s3Info.Bucket
+	prefix := s3Info.Prefix
 	minioClient, err := s3Info.NewMinioClient()
 	if err != nil {
 		return fmt.Errorf("creating S3 client: %w", err)

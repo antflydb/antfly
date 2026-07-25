@@ -9254,7 +9254,15 @@ export interface components {
             last_embed_batch_bytes: number;
             /** Format: uint64 */
             last_embed_batch_max_bytes: number;
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch.
+             */
+            last_embed_batch_completed_ms: number;
+            /**
+             * Format: uint64
+             * @description Elapsed duration in nanoseconds for the most recently completed embedding batch.
+             */
             last_embed_batch_ns: number;
             /** Format: uint64 */
             total_embed_ns: number;

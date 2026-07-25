@@ -4921,6 +4921,7 @@ pub fn build(b: *std.Build) void {
             "enrichment aggregation preserves telemetry and fences mixed checkpoint identity",
             "table storage status indexes one distributed snapshot by table and owner",
             "distributed join uses row estimates when byte statistics are unavailable",
+            "distributed join preserves no-stat strategy when one side is unknown",
             "api http server join planner uses complete fresh local stats before metadata publication",
             "external embeddings index readiness does not require table doc coverage",
             "api http server preserves public query availability errors",

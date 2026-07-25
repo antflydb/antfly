@@ -723,6 +723,7 @@ const ProjectedCoreSnapshot = struct {
                 @sizeOf(metadata_table_manager.RuntimeGroupStatusReport) * record.runtime_statuses.len;
             for (record.runtime_statuses) |status| {
                 out.estimated_bytes += status.table_name.len + status.source.len + status.freshness.len +
+                    status.enrichment.projection_checkpoint_status.len +
                     @sizeOf(metadata_table_manager.RuntimeIndexStatusReport) * status.indexes.len;
                 for (status.indexes) |index| out.estimated_bytes += index.name.len + index.kind.len;
             }

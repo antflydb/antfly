@@ -22,7 +22,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -423,19 +422,19 @@ func (s *StoreDB) preEnrichBatch(
 	}.Build(), nil
 }
 
-const backupValidationRegex = `^[a-zA-Z0-9_-]+$`
-
-var backupRegex = regexp.MustCompile(backupValidationRegex)
-
-func (s *StoreDB) Backup(ctx context.Context, loc, id string) error {
-	if !backupRegex.MatchString(id) {
-		return fmt.Errorf("invalid backup ID: %s, must match regex %s", id, backupValidationRegex)
+func (s *StoreDB) Backup(ctx context.Context, backup common.BackupConfig) error {
+	if err := common.ValidateBackupID(backup.BackupID); err != nil {
+		return fmt.Errorf("invalid backup ID: %w", err)
 	}
-	loc = strings.TrimPrefix(loc, "file://") // Remove "file://" prefix if present
+	location := backup.Location
+	if strings.HasPrefix(location, "file://") {
+		location = strings.TrimPrefix(location, "file://")
+	}
 
 	backupOp := BackupOp_builder{
-		BackupId: id,
-		Location: loc,
+		BackupId:   backup.BackupID,
+		Connection: backup.Connection,
+		Location:   location,
 	}.Build()
 	return s.applyOpBackup(ctx, backupOp)
 
@@ -1119,15 +1118,21 @@ func (s *StoreDB) applyOpBackup(_ context.Context, backup *BackupOp) error {
 		return errors.New("backup operation data is nil")
 	}
 	backupID := backup.GetBackupId()
+	connection := backup.GetConnection()
 	location := backup.GetLocation()
 	archiveFile, err := s.snapStore.Path(backupID)
 	if err != nil {
 		return fmt.Errorf("getting archive file path: %w", err)
 	}
 	backupToBlobStore := false
+	var s3Info common.S3Info
 	if location != "" {
 		if strings.HasPrefix(location, "s3://") {
 			backupToBlobStore = true
+			s3Info, err = s.antflyConfig.ResolveS3Info(connection, "backup.write", location)
+			if err != nil {
+				return fmt.Errorf("authorizing S3 backup: %w", err)
+			}
 		} else {
 			archiveFile = filepath.Join(location, fmt.Sprintf("%v.tar.zst", backupID))
 		}
@@ -1150,7 +1155,7 @@ func (s *StoreDB) applyOpBackup(_ context.Context, backup *BackupOp) error {
 			)
 			blobTime := time.Now()
 			// Don't timeout the blob store write if the client times out, it might take a while
-			err := WriteBackupToBlobStore(context.Background(), location, archiveFile, &s.antflyConfig.Storage.Local.S3)
+			err := WriteBackupToBlobStore(context.Background(), archiveFile, &s3Info)
 			s.logger.Info("Blob store write completed",
 				zap.String("backupID", backupID),
 				zap.Duration("blobWriteDuration", time.Since(blobTime)),
@@ -1196,7 +1201,7 @@ func (s *StoreDB) applyOpBackup(_ context.Context, backup *BackupOp) error {
 			zap.String("location", location),
 		)
 		// Don't timeout the blob store write if the client times out, it might take a while
-		err := WriteBackupToBlobStore(context.Background(), location, archiveFile, &s.antflyConfig.Storage.Local.S3)
+		err := WriteBackupToBlobStore(context.Background(), archiveFile, &s3Info)
 		blobDuration := time.Since(blobTime)
 		s.logger.Info("Backup operation completed",
 			zap.String("backupID", backupID),

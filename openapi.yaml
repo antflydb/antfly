@@ -17373,6 +17373,7 @@ components:
         - last_embed_batch_items
         - last_embed_batch_bytes
         - last_embed_batch_max_bytes
+        - last_embed_batch_completed_ms
         - last_embed_batch_ns
         - total_embed_ns
       properties:
@@ -17470,9 +17471,15 @@ components:
         last_embed_batch_max_bytes:
           type: integer
           format: uint64
+        last_embed_batch_completed_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock completion time in Unix milliseconds for the most recently completed
+            embedding batch.
         last_embed_batch_ns:
           type: integer
           format: uint64
+          description: Elapsed duration in nanoseconds for the most recently completed embedding batch.
         total_embed_ns:
           type: integer
           format: uint64

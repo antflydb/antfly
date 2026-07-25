@@ -1647,15 +1647,18 @@ fn aggregateEnrichmentStats(
     {
         dst.active_embed_batch_started_ms = src.active_embed_batch_started_ms;
     }
-    if (src.last_embed_batch_ns > dst.last_embed_batch_ns or
-        (src.last_embed_batch_ns == dst.last_embed_batch_ns and
-            (src.last_embed_batch_bytes > dst.last_embed_batch_bytes or
-                (src.last_embed_batch_bytes == dst.last_embed_batch_bytes and
-                    src.last_embed_batch_items > dst.last_embed_batch_items))))
+    if (src.last_embed_batch_completed_ms > dst.last_embed_batch_completed_ms or
+        (src.last_embed_batch_completed_ms == dst.last_embed_batch_completed_ms and
+            (src.last_embed_batch_ns > dst.last_embed_batch_ns or
+                (src.last_embed_batch_ns == dst.last_embed_batch_ns and
+                    (src.last_embed_batch_bytes > dst.last_embed_batch_bytes or
+                        (src.last_embed_batch_bytes == dst.last_embed_batch_bytes and
+                            src.last_embed_batch_items > dst.last_embed_batch_items))))))
     {
         dst.last_embed_batch_items = src.last_embed_batch_items;
         dst.last_embed_batch_bytes = src.last_embed_batch_bytes;
         dst.last_embed_batch_max_bytes = src.last_embed_batch_max_bytes;
+        dst.last_embed_batch_completed_ms = src.last_embed_batch_completed_ms;
         dst.last_embed_batch_ns = src.last_embed_batch_ns;
     }
     dst.total_embed_ns +|= src.total_embed_ns;
@@ -2433,6 +2436,8 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try appendIntValue(alloc, out, stats.last_embed_batch_bytes);
     try out.appendSlice(alloc, ",\"last_embed_batch_max_bytes\":");
     try appendIntValue(alloc, out, stats.last_embed_batch_max_bytes);
+    try out.appendSlice(alloc, ",\"last_embed_batch_completed_ms\":");
+    try appendIntValue(alloc, out, stats.last_embed_batch_completed_ms);
     try out.appendSlice(alloc, ",\"last_embed_batch_ns\":");
     try appendIntValue(alloc, out, stats.last_embed_batch_ns);
     try out.appendSlice(alloc, ",\"total_embed_ns\":");
@@ -2475,6 +2480,7 @@ test "enrichment aggregation preserves telemetry and fences mixed checkpoint ide
         .active_embed_batch_started_ms = 200,
         .last_embed_batch_items = 4,
         .last_embed_batch_bytes = 100,
+        .last_embed_batch_completed_ms = 2000,
         .last_embed_batch_ns = 900,
     }, true);
     aggregateEnrichmentStats(&aggregate, .{
@@ -2490,7 +2496,8 @@ test "enrichment aggregation preserves telemetry and fences mixed checkpoint ide
         .active_embed_batch_started_ms = 100,
         .last_embed_batch_items = 8,
         .last_embed_batch_bytes = 200,
-        .last_embed_batch_ns = 901,
+        .last_embed_batch_completed_ms = 1000,
+        .last_embed_batch_ns = 9010,
     }, false);
 
     try std.testing.expectEqual(std.math.maxInt(u64), aggregate.processed_requests);
@@ -2503,8 +2510,9 @@ test "enrichment aggregation preserves telemetry and fences mixed checkpoint ide
     try std.testing.expectEqual(@as(u64, 0), aggregate.projection_checkpoint_config_hash);
     try std.testing.expectEqual(@as(u64, 8), aggregate.active_embed_batch_items);
     try std.testing.expectEqual(@as(u64, 100), aggregate.active_embed_batch_started_ms);
-    try std.testing.expectEqual(@as(u64, 8), aggregate.last_embed_batch_items);
-    try std.testing.expectEqual(@as(u64, 901), aggregate.last_embed_batch_ns);
+    try std.testing.expectEqual(@as(u64, 4), aggregate.last_embed_batch_items);
+    try std.testing.expectEqual(@as(u64, 2000), aggregate.last_embed_batch_completed_ms);
+    try std.testing.expectEqual(@as(u64, 900), aggregate.last_embed_batch_ns);
 
     var encoded = std.ArrayListUnmanaged(u8).empty;
     defer encoded.deinit(std.testing.allocator);

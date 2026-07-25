@@ -15,6 +15,7 @@
 package common
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,6 +35,13 @@ func JSONStructTag() viper.DecoderConfigOption {
 	}
 }
 
+func mustConnectionConfig(t *testing.T, encoded string) ConnectionConfig {
+	t.Helper()
+	var connection ConnectionConfig
+	require.NoError(t, connection.UnmarshalJSON([]byte(encoded)))
+	return connection
+}
+
 // TestConfigUnmarshalFromYAML tests that Viper can unmarshal YAML into Config struct
 func TestConfigUnmarshalFromYAML(t *testing.T) {
 	tests := []struct {
@@ -51,8 +59,6 @@ storage:
   engine: "local"
   local:
     base_dir: "antflydb"
-    data: "local"
-    metadata: "local"
 metadata:
   orchestration_urls:
     "1": "http://localhost:5001"
@@ -65,8 +71,6 @@ default_shards_per_table: 4
 				assert.Equal(t, "0.0.1", cfg.Version)
 				assert.Equal(t, 4200, cfg.HealthPort)
 				assert.Equal(t, "antflydb", cfg.Storage.Local.BaseDir)
-				assert.Equal(t, StorageBackendLocal, cfg.Storage.Local.Data)
-				assert.Equal(t, StorageBackendLocal, cfg.Storage.Local.Metadata)
 				assert.Len(t, cfg.Metadata.OrchestrationUrls, 1)
 				assert.Equal(t, uint64(1), cfg.ReplicationFactor)
 				assert.Equal(t, uint64(1073741824), cfg.MaxShardSizeBytes)
@@ -100,21 +104,27 @@ default_shards_per_table: 4
 			},
 		},
 		{
-			name: "config with S3 storage",
+			name: "config with object storage",
 			yaml: `
 version: "0.0.1"
 health_port: 4200
+deployment_mode: "serverless"
+connections:
+  primary:
+    kind: "external_io"
+    capabilities: ["storage.primary"]
+    external_io:
+      protocol: "s3"
+      buckets: ["my-antfly-bucket"]
+      prefix: "production"
+      credentials:
+        source: "default"
 storage:
-  engine: "local"
-  local:
-    base_dir: "antflydb"
-    data: "s3"
-    metadata: "local"
-    s3:
-      endpoint: "s3.amazonaws.com"
-      bucket: "my-antfly-bucket"
-      prefix: "production/"
-      use_ssl: true
+  engine: "object"
+  object:
+    connection: "primary"
+    bucket: "my-antfly-bucket"
+    prefix: "production/cluster"
 metadata:
   orchestration_urls:
     "1": "http://localhost:5001"
@@ -124,12 +134,10 @@ max_shards_per_table: 100
 default_shards_per_table: 8
 `,
 			validate: func(t *testing.T, cfg *Config) {
-				assert.Equal(t, StorageBackendS3, cfg.Storage.Local.Data)
-				assert.Equal(t, StorageBackendLocal, cfg.Storage.Local.Metadata)
-				assert.Equal(t, "s3.amazonaws.com", cfg.Storage.Local.S3.Endpoint)
-				assert.Equal(t, "my-antfly-bucket", cfg.Storage.Local.S3.Bucket)
-				assert.Equal(t, "production/", cfg.Storage.Local.S3.Prefix)
-				assert.True(t, cfg.Storage.Local.S3.UseSsl)
+				assert.Equal(t, StorageEngineObject, cfg.Storage.Engine)
+				assert.Equal(t, "primary", cfg.Storage.Object.Connection)
+				assert.Equal(t, "my-antfly-bucket", cfg.Storage.Object.Bucket)
+				assert.Equal(t, "production/cluster", cfg.Storage.Object.Prefix)
 			},
 		},
 		{
@@ -551,32 +559,16 @@ func TestValidateTLS(t *testing.T) {
 
 // TestValidateStorage tests the storage validation logic
 func TestValidateStorage(t *testing.T) {
-	// Set up environment variables for S3 tests
-	originalAccessKey := os.Getenv("AWS_ACCESS_KEY_ID")
-	originalSecretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
-	defer func() {
-		os.Setenv("AWS_ACCESS_KEY_ID", originalAccessKey)
-		os.Setenv("AWS_SECRET_ACCESS_KEY", originalSecretKey)
-	}()
-
 	tests := []struct {
-		name       string
-		config     *Config
-		setupEnv   func()
-		cleanupEnv func()
-		wantErr    bool
-		errMsg     string
+		name    string
+		config  *Config
+		wantErr bool
+		errMsg  string
 	}{
 		{
 			name: "valid local storage",
 			config: &Config{
-				Storage: StorageConfig{
-					Local: LocalStorageConfig{
-						BaseDir:  "antflydb",
-						Data:     StorageBackendLocal,
-						Metadata: StorageBackendLocal,
-					},
-				},
+				Storage: StorageConfig{Engine: StorageEngineLocal, Local: LocalStorageConfig{BaseDir: "antflydb"}},
 			},
 			wantErr: false,
 		},
@@ -629,197 +621,54 @@ func TestValidateStorage(t *testing.T) {
 			name: "empty base directory",
 			config: &Config{
 				Storage: StorageConfig{
-					Local: LocalStorageConfig{
-						BaseDir:  "",
-						Data:     StorageBackendLocal,
-						Metadata: StorageBackendLocal,
-					},
+					Engine: StorageEngineLocal,
+					Local:  LocalStorageConfig{BaseDir: ""},
 				},
 			},
 			wantErr: true,
 			errMsg:  "storage.local.base_dir is required",
 		},
 		{
-			name: "invalid keyvalue backend",
+			name: "object storage requires serverless",
 			config: &Config{
+				DeploymentMode: ConfigDeploymentModeDistributed,
 				Storage: StorageConfig{
-					Local: LocalStorageConfig{
-						BaseDir:  "antflydb",
-						Data:     "invalid",
-						Metadata: StorageBackendLocal,
-					},
+					Engine: StorageEngineObject,
+					Object: ObjectStorageConfig{Connection: "primary", Bucket: "bucket"},
 				},
 			},
 			wantErr: true,
-			errMsg:  "storage.local.data must be 'local' or 's3'",
+			errMsg:  "requires deployment_mode serverless",
 		},
 		{
-			name: "invalid metadatakv backend",
+			name: "object storage requires named connection",
 			config: &Config{
+				DeploymentMode: ConfigDeploymentModeServerless,
 				Storage: StorageConfig{
-					Local: LocalStorageConfig{
-						BaseDir:  "antflydb",
-						Data:     StorageBackendLocal,
-						Metadata: "invalid",
-					},
+					Engine: StorageEngineObject,
+					Object: ObjectStorageConfig{Connection: "missing", Bucket: "bucket"},
 				},
 			},
 			wantErr: true,
-			errMsg:  "storage.local.metadata must be 'local' or 's3'",
+			errMsg:  `connection "missing" was not found`,
 		},
 		{
-			name: "S3 keyvalue without S3 config",
+			name: "object storage rejects mixed local member",
 			config: &Config{
+				DeploymentMode: ConfigDeploymentModeServerless,
 				Storage: StorageConfig{
-					Local: LocalStorageConfig{
-						BaseDir:  "antflydb",
-						Data:     StorageBackendS3,
-						Metadata: StorageBackendLocal,
-						S3:       S3Info{},
-					},
+					Engine: StorageEngineObject,
+					Local:  LocalStorageConfig{BaseDir: "antflydb"},
+					Object: ObjectStorageConfig{Connection: "primary", Bucket: "bucket"},
 				},
 			},
 			wantErr: true,
-			errMsg:  "storage.local.s3.endpoint is required when using S3 storage",
-		},
-		{
-			name: "S3 with valid config and credentials",
-			config: &Config{
-				Storage: StorageConfig{
-					Local: LocalStorageConfig{
-						BaseDir:  "antflydb",
-						Data:     StorageBackendS3,
-						Metadata: StorageBackendLocal,
-						S3: S3Info{
-							Endpoint: "s3.amazonaws.com",
-							Bucket:   "my-bucket",
-							UseSsl:   true,
-						},
-					},
-				},
-			},
-			setupEnv: func() {
-				os.Setenv("AWS_ACCESS_KEY_ID", "test-key")
-				os.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
-			},
-			cleanupEnv: func() {
-				os.Unsetenv("AWS_ACCESS_KEY_ID")
-				os.Unsetenv("AWS_SECRET_ACCESS_KEY")
-			},
-			wantErr: false,
-		},
-		{
-			name: "S3 without credentials",
-			config: &Config{
-				Storage: StorageConfig{
-					Local: LocalStorageConfig{
-						BaseDir:  "antflydb",
-						Data:     StorageBackendS3,
-						Metadata: StorageBackendLocal,
-						S3: S3Info{
-							Endpoint: "s3.amazonaws.com",
-							Bucket:   "my-bucket",
-							UseSsl:   true,
-						},
-					},
-				},
-			},
-			setupEnv: func() {
-				os.Unsetenv("AWS_ACCESS_KEY_ID")
-				os.Unsetenv("AWS_SECRET_ACCESS_KEY")
-			},
-			wantErr: true,
-			errMsg:  "S3 credentials required",
-		},
-		{
-			name: "S3 with empty endpoint",
-			config: &Config{
-				Storage: StorageConfig{
-					Local: LocalStorageConfig{
-						BaseDir:  "antflydb",
-						Data:     StorageBackendS3,
-						Metadata: StorageBackendLocal,
-						S3: S3Info{
-							Endpoint: "",
-							Bucket:   "my-bucket",
-						},
-					},
-				},
-			},
-			setupEnv: func() {
-				os.Setenv("AWS_ACCESS_KEY_ID", "test-key")
-				os.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
-			},
-			cleanupEnv: func() {
-				os.Unsetenv("AWS_ACCESS_KEY_ID")
-				os.Unsetenv("AWS_SECRET_ACCESS_KEY")
-			},
-			wantErr: true,
-			errMsg:  "storage.local.s3.endpoint is required when using S3 storage",
-		},
-		{
-			name: "S3 with empty bucket",
-			config: &Config{
-				Storage: StorageConfig{
-					Local: LocalStorageConfig{
-						BaseDir:  "antflydb",
-						Data:     StorageBackendS3,
-						Metadata: StorageBackendLocal,
-						S3: S3Info{
-							Endpoint: "s3.amazonaws.com",
-							Bucket:   "",
-						},
-					},
-				},
-			},
-			setupEnv: func() {
-				os.Setenv("AWS_ACCESS_KEY_ID", "test-key")
-				os.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
-			},
-			cleanupEnv: func() {
-				os.Unsetenv("AWS_ACCESS_KEY_ID")
-				os.Unsetenv("AWS_SECRET_ACCESS_KEY")
-			},
-			wantErr: true,
-			errMsg:  "storage.local.s3.bucket is required when using S3 storage",
-		},
-		{
-			name: "S3 with bucket name too short",
-			config: &Config{
-				Storage: StorageConfig{
-					Local: LocalStorageConfig{
-						BaseDir:  "antflydb",
-						Data:     StorageBackendS3,
-						Metadata: StorageBackendLocal,
-						S3: S3Info{
-							Endpoint: "s3.amazonaws.com",
-							Bucket:   "ab",
-						},
-					},
-				},
-			},
-			setupEnv: func() {
-				os.Setenv("AWS_ACCESS_KEY_ID", "test-key")
-				os.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
-			},
-			cleanupEnv: func() {
-				os.Unsetenv("AWS_ACCESS_KEY_ID")
-				os.Unsetenv("AWS_SECRET_ACCESS_KEY")
-			},
-			wantErr: true,
-			errMsg:  "S3 bucket name must be between 3 and 63 characters",
+			errMsg:  "must be the only storage member",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.setupEnv != nil {
-				tt.setupEnv()
-			}
-			if tt.cleanupEnv != nil {
-				defer tt.cleanupEnv()
-			}
-
 			err := tt.config.validateStorage()
 
 			if tt.wantErr {
@@ -832,6 +681,101 @@ func TestValidateStorage(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("object storage validates connection capability and scope", func(t *testing.T) {
+		connection := mustConnectionConfig(t, `{
+			"kind":"external_io",
+			"capabilities":["storage.primary"],
+			"external_io":{
+				"protocol":"s3",
+				"buckets":["data-bucket","wal-bucket"],
+				"prefix":"tenant-a",
+				"credentials":{"source":"static","access_key_id":"key","secret_access_key":"secret"}
+			}
+		}`)
+		config := &Config{
+			DeploymentMode: ConfigDeploymentModeServerless,
+			Connections:    map[string]ConnectionConfig{"primary": connection},
+			Storage: StorageConfig{
+				Engine: StorageEngineObject,
+				Object: ObjectStorageConfig{
+					Connection: "primary",
+					Bucket:     "data-bucket",
+					Prefix:     "tenant-a/cluster",
+					Lanes: ObjectStorageLanes{
+						Wal: ObjectStorageLocation{Bucket: "wal-bucket", Prefix: "tenant-a/cluster/wal"},
+					},
+				},
+			},
+		}
+		require.NoError(t, config.validateStorage())
+
+		config.Storage.Object.Prefix = "tenant-b/cluster"
+		err := config.validateStorage()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "outside connection")
+	})
+
+	t.Run("external IO resolvers enforce capability and scope", func(t *testing.T) {
+		root := t.TempDir()
+		filesystem := mustConnectionConfig(t, fmt.Sprintf(`{
+			"kind":"external_io",
+			"capabilities":["backup.write","restore.read"],
+			"external_io":{"protocol":"filesystem","root":%q}
+		}`, root))
+		s3Connection := mustConnectionConfig(t, `{
+			"kind":"external_io",
+			"capabilities":["backup.write"],
+			"external_io":{
+				"protocol":"s3",
+				"buckets":["backup-bucket"],
+				"prefix":"tenant-a",
+				"credentials":{"source":"static","access_key_id":"key","secret_access_key":"secret"}
+			}
+		}`)
+		config := &Config{Connections: map[string]ConnectionConfig{
+			"filesystem": filesystem,
+			"s3":         s3Connection,
+		}}
+
+		resolved, err := config.ResolveFilesystemPath(
+			"filesystem",
+			"backup.write",
+			"file:///daily/backup-1",
+		)
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(root, "daily", "backup-1"), resolved)
+
+		_, err = config.ResolveFilesystemPath(
+			"filesystem",
+			"backup.write",
+			"file:///../outside",
+		)
+		require.ErrorContains(t, err, "escapes")
+
+		_, err = config.ResolveFilesystemPath(
+			"filesystem",
+			"storage.primary",
+			"file:///daily",
+		)
+		require.ErrorContains(t, err, "lacks required capability")
+
+		s3Info, err := config.ResolveS3Info(
+			"s3",
+			"backup.write",
+			"s3://backup-bucket/tenant-a/daily",
+		)
+		require.NoError(t, err)
+		assert.Equal(t, "backup-bucket", s3Info.Bucket)
+		assert.Equal(t, "tenant-a/daily", s3Info.Prefix)
+
+		_, err = config.ResolveS3Info(
+			"s3",
+			"backup.write",
+			"s3://backup-bucket/tenant-b/daily",
+		)
+		require.ErrorContains(t, err, "outside connection")
+	})
 }
 
 // TestValidateMaxShardSizeBytes tests the max shard size validation
@@ -973,11 +917,8 @@ func TestConfigValidate(t *testing.T) {
 					},
 				},
 				Storage: StorageConfig{
-					Local: LocalStorageConfig{
-						BaseDir:  "antflydb",
-						Data:     StorageBackendLocal,
-						Metadata: StorageBackendLocal,
-					},
+					Engine: StorageEngineLocal,
+					Local:  LocalStorageConfig{BaseDir: "antflydb"},
 				},
 				ReplicationFactor:     3,
 				MaxShardSizeBytes:     1073741824,
@@ -1116,20 +1057,16 @@ func TestHelperMethods(t *testing.T) {
 				expected: "local",
 			},
 			{
-				name: "empty data returns local",
+				name: "local engine returns local",
 				config: &Config{
-					Storage: StorageConfig{
-						Local: LocalStorageConfig{Data: ""},
-					},
+					Storage: StorageConfig{Engine: StorageEngineLocal},
 				},
 				expected: "local",
 			},
 			{
-				name: "s3 data",
+				name: "object engine returns s3",
 				config: &Config{
-					Storage: StorageConfig{
-						Local: LocalStorageConfig{Data: StorageBackendS3},
-					},
+					Storage: StorageConfig{Engine: StorageEngineObject},
 				},
 				expected: "s3",
 			},
@@ -1155,20 +1092,16 @@ func TestHelperMethods(t *testing.T) {
 				expected: "local",
 			},
 			{
-				name: "empty metadata returns local",
+				name: "local engine returns local",
 				config: &Config{
-					Storage: StorageConfig{
-						Local: LocalStorageConfig{Metadata: ""},
-					},
+					Storage: StorageConfig{Engine: StorageEngineLocal},
 				},
 				expected: "local",
 			},
 			{
-				name: "s3 metadata",
+				name: "object engine returns s3",
 				config: &Config{
-					Storage: StorageConfig{
-						Local: LocalStorageConfig{Metadata: StorageBackendS3},
-					},
+					Storage: StorageConfig{Engine: StorageEngineObject},
 				},
 				expected: "s3",
 			},
@@ -1313,6 +1246,24 @@ func TestParseS3URL(t *testing.T) {
 			url:         "my-bucket/prefix",
 			shouldError: true,
 			errContains: "expected s3:// scheme",
+		},
+		{
+			name:        "invalid - traversal segment",
+			url:         "s3://my-bucket/tenant-a/../tenant-b",
+			shouldError: true,
+			errContains: "dot path segments",
+		},
+		{
+			name:        "invalid - encoded traversal segment",
+			url:         "s3://my-bucket/tenant-a/%2e%2e/tenant-b",
+			shouldError: true,
+			errContains: "dot path segments",
+		},
+		{
+			name:        "invalid - query",
+			url:         "s3://my-bucket/prefix?version=1",
+			shouldError: true,
+			errContains: "query or fragment",
 		},
 	}
 

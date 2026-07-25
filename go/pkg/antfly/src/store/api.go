@@ -158,6 +158,15 @@ func (h *StoreAPI) localBackupDir(location string) (string, error) {
 	return "", fmt.Errorf("file backup location %s must be under antfly base directory or a directory listed in %s", dir, allowedFileBackupDirsEnv)
 }
 
+func (h *StoreAPI) authorizedLocalBackupDir(
+	connection, capability, location string,
+) (string, error) {
+	if strings.TrimSpace(connection) != "" {
+		return h.antflyConfig.ResolveFilesystemPath(connection, capability, location)
+	}
+	return h.localBackupDir(location)
+}
+
 func validateBackupIDForHTTP(w http.ResponseWriter, backupID string) bool {
 	if err := common.ValidateBackupID(backupID); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid backup ID: %v", err), http.StatusBadRequest)
@@ -169,41 +178,20 @@ func validateBackupIDForHTTP(w http.ResponseWriter, backupID string) bool {
 func downloadFromS3(
 	ctx context.Context,
 	logger *zap.Logger,
-	bucketURL, objectNameKey, destPath string,
+	objectNameKey, destPath string,
 	s3Info *common.S3Info,
 ) error {
-	bucketName, prefix, err := common.ParseS3URL(bucketURL)
-	if err != nil {
-		return fmt.Errorf("parsing bucket URL %s: %w", bucketURL, err)
-	}
-
 	// Construct full object key with optional prefix, matching the write path
 	// in WriteBackupToBlobStore.
 	fullObjectKey := objectNameKey
-	if prefix != "" {
-		fullObjectKey = path.Join(prefix, objectNameKey)
+	if s3Info.Prefix != "" {
+		fullObjectKey = path.Join(s3Info.Prefix, objectNameKey)
 	}
 
 	logger.Info("Downloading from S3",
-		zap.String("bucket", bucketName),
+		zap.String("bucket", s3Info.Bucket),
 		zap.String("object", fullObjectKey),
 		zap.String("destination", destPath))
-
-	// TODO: Enable multipart download with progress tracking using the SDK's DownloadObject
-	// method (../../../libaf/s3) when ready:
-	//
-	// opts := &s3.DownloadObjectOptions{
-	// 	ProgressFn: func(partNumber, partSize, totalParts int) {
-	// 		logger.Info("Downloading backup part",
-	// 			zap.Int("partNumber", partNumber),
-	// 			zap.Int("size", partSize),
-	// 			zap.Int("total", totalParts),
-	// 		)
-	// 	},
-	// }
-	// if err := s3Info.GetS3Credentials().DownloadObject(ctx, bucketName, fullObjectKey, destPath, opts); err != nil {
-	// 	return err
-	// }
 
 	// Simple download without progress tracking
 	minioClient, err := s3Info.NewMinioClient()
@@ -213,12 +201,12 @@ func downloadFromS3(
 	if err := os.MkdirAll(filepath.Dir(destPath), os.ModePerm); err != nil { //nolint:gosec // G301: standard permissions for data directory
 		return fmt.Errorf("creating directory %s: %w", filepath.Dir(destPath), err)
 	}
-	if err := minioClient.FGetObject(ctx, bucketName, fullObjectKey, destPath, minio.GetObjectOptions{}); err != nil {
-		return fmt.Errorf("downloading object %s from bucket %s: %w", fullObjectKey, bucketName, err)
+	if err := minioClient.FGetObject(ctx, s3Info.Bucket, fullObjectKey, destPath, minio.GetObjectOptions{}); err != nil {
+		return fmt.Errorf("downloading object %s from bucket %s: %w", fullObjectKey, s3Info.Bucket, err)
 	}
 
 	logger.Info("Successfully downloaded from S3",
-		zap.String("bucket", bucketName),
+		zap.String("bucket", s3Info.Bucket),
 		zap.String("object", fullObjectKey),
 		zap.String("destination", destPath))
 	return nil
@@ -455,13 +443,21 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 			) // Directory creation handled by downloadFromS3 or local copy
 
 			if strings.HasPrefix(restoreConf.Location, "s3://") {
+				s3Info, err := h.antflyConfig.ResolveS3Info(
+					restoreConf.Connection,
+					"restore.read",
+					restoreConf.Location,
+				)
+				if err != nil {
+					return fmt.Errorf("%w: authorizing S3 restore: %v", ErrBadRequest, err)
+				}
 				destPath, err := safeJoinUnder(snapDir, backupFileName)
 				if err != nil {
 					return fmt.Errorf("%w: invalid destination backup path: %v", ErrBadRequest, err)
 				}
 				// Don't cancel the download if the request context is canceled,
 				// it could take a while.
-				if err := downloadFromS3(context.Background(), h.logger, restoreConf.Location, backupFileName, destPath, &h.antflyConfig.Storage.Local.S3); err != nil {
+				if err := downloadFromS3(context.Background(), h.logger, backupFileName, destPath, &s3Info); err != nil {
 					alternateName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
 					if format == common.BackupFormatNative {
 						alternateName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
@@ -470,7 +466,7 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 					if alternatePathErr != nil {
 						alternateDestPath = destPath
 					}
-					alternateErr := downloadFromS3(context.Background(), h.logger, restoreConf.Location, alternateName, alternateDestPath, &h.antflyConfig.Storage.Local.S3)
+					alternateErr := downloadFromS3(context.Background(), h.logger, alternateName, alternateDestPath, &s3Info)
 					if alternateErr != nil {
 						h.logger.Error(
 							"Failed to download backup from S3 for shard",
@@ -494,7 +490,11 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 				// This case might occur if the leader specifies a local file path accessible to this node,
 				// though typically for file transfers it would use multipart. Restrict local filesystem
 				// restore sources to the configured Antfly base directory.
-				localBasePath, err := h.localBackupDir(restoreConf.Location)
+				localBasePath, err := h.authorizedLocalBackupDir(
+					restoreConf.Connection,
+					"restore.read",
+					restoreConf.Location,
+				)
 				if err != nil {
 					return fmt.Errorf("%w: invalid restore location: %v", ErrBadRequest, err)
 				}
@@ -1032,20 +1032,28 @@ func (h *StoreAPI) handleBackup(w http.ResponseWriter, r *http.Request) {
 	// FIXME (ajr) Backups should include the byte range of the shard maybe?
 	fileName := common.ShardBackupFileName(req.BackupID, shardID)
 	var localDir string
-	if strings.HasPrefix(req.Location, "file://") {
+	isFileBackup := strings.HasPrefix(req.Location, "file://")
+	if isFileBackup {
 		var err error
-		localDir, err = h.localBackupDir(req.Location)
+		localDir, err = h.authorizedLocalBackupDir(
+			req.Connection,
+			"backup.write",
+			req.Location,
+		)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
 			return
 		}
+		req.Location = "file://" + localDir
 	}
-	if err := shard.Backup(r.Context(), req.Location, strings.TrimSuffix(fileName, ".tar.zst")); err != nil {
+	shardBackup := req
+	shardBackup.BackupID = strings.TrimSuffix(fileName, ".tar.zst")
+	if err := shard.Backup(r.Context(), shardBackup); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to backup: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	if strings.HasPrefix(req.Location, "file://") {
+	if isFileBackup {
 		// Try user-provided location first (single-node), then fall back to snapDir (distributed)
 		userPath, err := safeJoinUnder(localDir, fileName)
 		if err != nil {
@@ -1100,7 +1108,11 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	destDir := common.SnapDir(h.antflyConfig.GetBaseDir(), shardID, h.store.ID())
 	streamResponse := false
 	if strings.HasPrefix(req.Location, "file://") {
-		localDir, err := h.localBackupDir(req.Location)
+		localDir, err := h.authorizedLocalBackupDir(
+			req.Connection,
+			"backup.write",
+			req.Location,
+		)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
 			return
@@ -1136,7 +1148,17 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	_ = file.Close()
 
 	if strings.HasPrefix(req.Location, "s3://") {
-		if err := db.WriteBackupToBlobStore(context.Background(), req.Location, destPath, &h.antflyConfig.Storage.Local.S3); err != nil {
+		s3Info, err := h.antflyConfig.ResolveS3Info(
+			req.Connection,
+			"backup.write",
+			req.Location,
+		)
+		if err != nil {
+			_ = os.Remove(destPath)
+			http.Error(w, fmt.Sprintf("Invalid S3 backup location: %v", err), http.StatusBadRequest)
+			return
+		}
+		if err := db.WriteBackupToBlobStore(context.Background(), destPath, &s3Info); err != nil {
 			_ = os.Remove(destPath)
 			http.Error(w, fmt.Sprintf("Failed to upload portable backup: %v", err), http.StatusInternalServerError)
 			return

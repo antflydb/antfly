@@ -316,6 +316,7 @@ pub const RuntimeEnrichmentStatusReport = struct {
     last_embed_batch_items: u64 = 0,
     last_embed_batch_bytes: u64 = 0,
     last_embed_batch_max_bytes: u64 = 0,
+    last_embed_batch_completed_ms: u64 = 0,
     last_embed_batch_ns: u64 = 0,
     total_embed_ns: u64 = 0,
     dense_artifact_bytes_written: u64 = 0,

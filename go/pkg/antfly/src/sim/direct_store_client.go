@@ -94,23 +94,31 @@ func (c *directStoreClient) ApplyMergeChunk(
 	}.Build())
 }
 
-func (c *directStoreClient) Backup(ctx context.Context, shardID types.ID, loc, id string, format common.BackupFormat) error {
+func (c *directStoreClient) Backup(ctx context.Context, shardID types.ID, backup common.BackupConfig) error {
 	shard, err := c.shard(shardID)
 	if err != nil {
 		return err
 	}
-	if err := shard.Backup(ctx, loc, id); err != nil {
+	shardBackup := backup
+	shardBackup.BackupID = strings.TrimSuffix(
+		common.ShardBackupFileName(backup.BackupID, shardID),
+		".tar.zst",
+	)
+	if err := shard.Backup(ctx, shardBackup); err != nil {
 		return err
 	}
-	backupDir, ok := strings.CutPrefix(loc, "file://")
+	backupDir, ok := strings.CutPrefix(backup.Location, "file://")
 	if !ok {
 		return nil
 	}
 	if err := os.MkdirAll(backupDir, os.ModePerm); err != nil && !os.IsExist(err) { //nolint:gosec // G301: test/sim data dir
 		return fmt.Errorf("creating backup directory: %w", err)
 	}
-	srcPath := filepath.Join(common.SnapDir(c.h.config.GetBaseDir(), shardID, c.nodeID), id+".tar.zst")
-	dstPath := filepath.Join(backupDir, common.ShardBackupFileName(id, shardID))
+	srcPath := filepath.Join(
+		common.SnapDir(c.h.config.GetBaseDir(), shardID, c.nodeID),
+		shardBackup.BackupID+".tar.zst",
+	)
+	dstPath := filepath.Join(backupDir, common.ShardBackupFileName(backup.BackupID, shardID))
 	src, err := os.Open(filepath.Clean(srcPath))
 	if err != nil {
 		return fmt.Errorf("opening backup archive %s: %w", srcPath, err)

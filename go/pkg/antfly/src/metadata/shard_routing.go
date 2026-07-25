@@ -821,14 +821,13 @@ func (ms *MetadataStore) forwardBatchToShard(
 func (ms *MetadataStore) forwardBackupToShard(
 	ctx context.Context,
 	shardID types.ID,
-	loc, id string,
-	format common.BackupFormat,
+	backup common.BackupConfig,
 ) error {
 	targetURL, err := ms.leaderClientForShard(ctx, shardID)
 	if err != nil {
 		return fmt.Errorf("failed to find leader for shard %s: %w", shardID, err)
 	}
-	return targetURL.Backup(ctx, shardID, loc, id, format)
+	return targetURL.Backup(ctx, shardID, backup)
 }
 
 // forwardLookupToShard sends a batch lookup request to the leader node of a specific shard.

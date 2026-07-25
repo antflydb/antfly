@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -33,6 +34,20 @@ type (
 	metadataInfoExtension struct {
 		parsedMu sync.Mutex
 		parsed   map[types.ID]string
+	}
+
+	// S3Info is the runtime projection of a capability-scoped S3 connection.
+	// It is intentionally not part of the public configuration schema.
+	S3Info struct {
+		Endpoint         string
+		Bucket           string
+		Prefix           string
+		UseSsl           bool
+		CredentialSource AwsCredentialConfigSource
+		AccessKeyId      string
+		SecretAccessKey  string
+		SessionToken     string
+		Profile          string
 	}
 )
 
@@ -233,7 +248,9 @@ func (c *Config) validateStorage() error {
 	}
 	hasLite := strings.TrimSpace(c.Storage.Lite.Path) != ""
 	hasLocal := strings.TrimSpace(c.Storage.Local.BaseDir) != ""
-	hasObject := strings.TrimSpace(string(c.Storage.Object.Provider)) != "" || strings.TrimSpace(c.Storage.Object.Bucket) != ""
+	hasObject := strings.TrimSpace(c.Storage.Object.Connection) != "" ||
+		strings.TrimSpace(c.Storage.Object.Bucket) != "" ||
+		strings.TrimSpace(c.Storage.Object.Prefix) != ""
 
 	switch engine {
 	case StorageEngineLite:
@@ -246,7 +263,7 @@ func (c *Config) validateStorage() error {
 		if !strings.HasSuffix(c.Storage.Lite.Path, ".aflite") {
 			return errors.New("storage.lite.path must end in .aflite")
 		}
-		if hasLocal || hasObject || c.Storage.Local.S3.Bucket != "" || c.Storage.Local.Data != "" || c.Storage.Local.Metadata != "" {
+		if hasLocal || hasObject {
 			return errors.New("storage.lite, storage.local, and storage.object are mutually exclusive")
 		}
 		if c.ReplicationFactor > 1 || c.DefaultShardsPerTable > 1 {
@@ -260,14 +277,20 @@ func (c *Config) validateStorage() error {
 		if c.EffectiveDeploymentMode() != ConfigDeploymentModeServerless {
 			return errors.New("storage.engine=object requires deployment_mode serverless")
 		}
-		if hasLite || hasLocal || !hasObject || c.Storage.Local.S3.Bucket != "" || c.Storage.Local.Data != "" || c.Storage.Local.Metadata != "" {
+		if hasLite || hasLocal || !hasObject {
 			return errors.New("storage.object is required and must be the only storage member when storage.engine=object")
-		}
-		if c.Storage.Object.Provider != ObjectStorageConfigProviderS3 {
-			return fmt.Errorf("unsupported object storage provider %q", c.Storage.Object.Provider)
 		}
 		if bucketLen := len(strings.TrimSpace(c.Storage.Object.Bucket)); bucketLen < 3 || bucketLen > 63 {
 			return fmt.Errorf("object storage bucket name must be between 3 and 63 characters, got %d", bucketLen)
+		}
+		for _, lane := range []string{"", "artifacts", "manifests", "wal", "progress", "catalog"} {
+			if _, err := c.ResolveObjectStorageS3(lane); err != nil {
+				label := lane
+				if label == "" {
+					label = "root"
+				}
+				return fmt.Errorf("storage.object %s validation failed: %w", label, err)
+			}
 		}
 		return nil
 	case StorageEngineLocal:
@@ -281,46 +304,6 @@ func (c *Config) validateStorage() error {
 	// Validate local storage base directory
 	if strings.TrimSpace(c.Storage.Local.BaseDir) == "" {
 		return errors.New("storage.local.base_dir is required")
-	}
-
-	// Validate data backend selection
-	if c.Storage.Local.Data != "" && c.Storage.Local.Data != StorageBackendLocal && c.Storage.Local.Data != StorageBackendS3 {
-		return fmt.Errorf("storage.local.data must be 'local' or 's3', got '%s'", c.Storage.Local.Data)
-	}
-
-	// Validate metadata backend selection
-	if c.Storage.Local.Metadata != "" && c.Storage.Local.Metadata != StorageBackendLocal && c.Storage.Local.Metadata != StorageBackendS3 {
-		return fmt.Errorf("storage.local.metadata must be 'local' or 's3', got '%s'", c.Storage.Local.Metadata)
-	}
-
-	// If either data or metadata uses S3, validate S3 configuration
-	if c.Storage.Local.Data == StorageBackendS3 || c.Storage.Local.Metadata == StorageBackendS3 {
-		// Validate S3 endpoint
-		if strings.TrimSpace(c.Storage.Local.S3.Endpoint) == "" {
-			return errors.New("storage.local.s3.endpoint is required when using S3 storage")
-		}
-
-		// Validate S3 bucket
-		if strings.TrimSpace(c.Storage.Local.S3.Bucket) == "" {
-			return errors.New("storage.local.s3.bucket is required when using S3 storage")
-		}
-
-		// Validate bucket name format (basic validation)
-		bucket := strings.TrimSpace(c.Storage.Local.S3.Bucket)
-		if len(bucket) < 3 || len(bucket) > 63 {
-			return fmt.Errorf("S3 bucket name must be between 3 and 63 characters, got %d", len(bucket))
-		}
-
-		// Check for credentials from config (resolved via secrets resolver) or environment variables
-		creds := c.Storage.Local.S3.GetS3Credentials()
-		if creds.AccessKeyId == "" || creds.SecretAccessKey == "" {
-			return errors.New(
-				"S3 credentials required: set access_key_id and secret_access_key in config " +
-					"(supports ${secret:aws.access_key_id} syntax for keystore lookup), " +
-					"or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables, " +
-					"or configure IAM roles when running on AWS",
-			)
-		}
 	}
 
 	return nil
@@ -411,51 +394,342 @@ func (c *Config) GetBaseDir() string {
 
 // GetKeyValueStorageType returns the storage type for key-value data ("local" or "s3")
 func (c *Config) GetKeyValueStorageType() string {
-	if c == nil {
+	if c == nil || c.Storage.Engine != StorageEngineObject {
 		return "local"
 	}
-	if c.Storage.Local.Data == "" {
-		return "local"
-	}
-	return string(c.Storage.Local.Data)
+	return "s3"
 }
 
 // GetMetadataStorageType returns the storage type for metadata ("local" or "s3")
 func (c *Config) GetMetadataStorageType() string {
-	if c == nil {
+	if c == nil || c.Storage.Engine != StorageEngineObject {
 		return "local"
 	}
-	if c.Storage.Local.Metadata == "" {
-		return "local"
-	}
-	return string(c.Storage.Local.Metadata)
+	return "s3"
 }
 
-// GetS3Credentials returns S3 credentials from config with fallback to environment variables.
-// Config values take precedence; if not set, falls back to environment variables:
-// - AWS_ACCESS_KEY_ID for access key
-// - AWS_SECRET_ACCESS_KEY for secret key
-// - AWS_SESSION_TOKEN for session token
-// - AWS_ENDPOINT_URL for endpoint (useful for S3-compatible storage like GCS, MinIO)
-func (s *S3Info) GetS3Credentials() *s3.Credentials {
+func hasCapability(capabilities []string, required string) bool {
+	for _, capability := range capabilities {
+		if capability == required {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Config) resolveExternalIOConnection(
+	connectionID, requiredCapability string,
+) (ExternalIoConnectionVariant, error) {
+	if c == nil {
+		return ExternalIoConnectionVariant{}, errors.New("config is required")
+	}
+	connectionID = strings.TrimSpace(connectionID)
+	if connectionID == "" {
+		return ExternalIoConnectionVariant{}, errors.New("connection is required")
+	}
+	connection, ok := c.Connections[connectionID]
+	if !ok {
+		return ExternalIoConnectionVariant{}, fmt.Errorf("connection %q was not found", connectionID)
+	}
+	kind, err := connection.Discriminator()
+	if err != nil {
+		return ExternalIoConnectionVariant{}, fmt.Errorf("reading connection %q kind: %w", connectionID, err)
+	}
+	if kind != "external_io" {
+		return ExternalIoConnectionVariant{}, fmt.Errorf(
+			"connection %q has kind %q, want external_io",
+			connectionID,
+			kind,
+		)
+	}
+	external, err := connection.AsExternalIoConnectionVariant()
+	if err != nil {
+		return ExternalIoConnectionVariant{}, fmt.Errorf(
+			"decoding external_io connection %q: %w",
+			connectionID,
+			err,
+		)
+	}
+	if !hasCapability(external.Capabilities, requiredCapability) {
+		return ExternalIoConnectionVariant{}, fmt.Errorf(
+			"connection %q lacks required capability %q",
+			connectionID,
+			requiredCapability,
+		)
+	}
+	return external, nil
+}
+
+func objectPrefixWithinScope(prefix, allowed string) bool {
+	prefix = strings.Trim(strings.TrimSpace(prefix), "/")
+	allowed = strings.Trim(strings.TrimSpace(allowed), "/")
+	return allowed == "" || prefix == allowed || strings.HasPrefix(prefix, allowed+"/")
+}
+
+func validateObjectPrefix(prefix string) error {
+	if strings.ContainsAny(prefix, "\\\x00") {
+		return errors.New("object prefix cannot include backslashes or NUL bytes")
+	}
+	for _, segment := range strings.Split(prefix, "/") {
+		if segment == "." || segment == ".." {
+			return errors.New("object prefix cannot include dot path segments")
+		}
+	}
+	return nil
+}
+
+func validateAWSCredentialConfig(config AwsCredentialConfig) error {
+	switch config.Source {
+	case AwsCredentialConfigSourceDefault:
+		if config.AccessKeyId != "" || config.SecretAccessKey != "" || config.SessionToken != "" ||
+			config.Profile != "" || config.SharedCredentialsFile != "" || config.RoleArn != "" ||
+			config.TokenFile != "" || config.StsEndpoint != "" {
+			return errors.New("default AWS credential source cannot include static, profile, or web-identity fields")
+		}
+	case AwsCredentialConfigSourceStatic:
+		if strings.TrimSpace(config.AccessKeyId) == "" || strings.TrimSpace(config.SecretAccessKey) == "" {
+			return errors.New("static AWS credential source requires access_key_id and secret_access_key")
+		}
+		if config.Profile != "" || config.SharedCredentialsFile != "" || config.RoleArn != "" || config.TokenFile != "" {
+			return errors.New("static AWS credential source cannot include profile or web-identity fields")
+		}
+	case AwsCredentialConfigSourceProfile:
+		if strings.TrimSpace(config.Profile) == "" {
+			return errors.New("profile AWS credential source requires profile")
+		}
+		if config.AccessKeyId != "" || config.SecretAccessKey != "" || config.SessionToken != "" ||
+			config.RoleArn != "" || config.TokenFile != "" || config.StsEndpoint != "" {
+			return errors.New("profile AWS credential source cannot include static or web-identity fields")
+		}
+	case AwsCredentialConfigSourceWebIdentity:
+		if strings.TrimSpace(config.RoleArn) == "" || strings.TrimSpace(config.TokenFile) == "" {
+			return errors.New("web_identity AWS credential source requires role_arn and token_file")
+		}
+		if config.AccessKeyId != "" || config.SecretAccessKey != "" || config.SessionToken != "" ||
+			config.Profile != "" || config.SharedCredentialsFile != "" {
+			return errors.New("web_identity AWS credential source cannot include static or profile fields")
+		}
+	default:
+		return fmt.Errorf("unsupported AWS credential source %q", config.Source)
+	}
+	return nil
+}
+
+func (c *Config) resolveS3Info(
+	connectionID, requiredCapability, bucket, prefix string,
+) (S3Info, error) {
+	external, err := c.resolveExternalIOConnection(connectionID, requiredCapability)
+	if err != nil {
+		return S3Info{}, err
+	}
+	protocol, err := external.ExternalIo.Discriminator()
+	if err != nil {
+		return S3Info{}, fmt.Errorf("reading connection %q protocol: %w", connectionID, err)
+	}
+	if protocol != "s3" {
+		return S3Info{}, fmt.Errorf("connection %q uses protocol %q, want s3", connectionID, protocol)
+	}
+	config, err := external.ExternalIo.AsS3ExternalIoConfig()
+	if err != nil {
+		return S3Info{}, fmt.Errorf("decoding S3 connection %q: %w", connectionID, err)
+	}
+	if err := validateObjectPrefix(config.Prefix); err != nil {
+		return S3Info{}, fmt.Errorf("connection %q prefix: %w", connectionID, err)
+	}
+	if err := validateObjectPrefix(prefix); err != nil {
+		return S3Info{}, fmt.Errorf("requested S3 prefix: %w", err)
+	}
+	bucket = strings.TrimSpace(bucket)
+	if bucket == "" {
+		return S3Info{}, errors.New("S3 bucket is required")
+	}
+	bucketAllowed := false
+	for _, allowed := range config.Buckets {
+		if bucket == allowed {
+			bucketAllowed = true
+			break
+		}
+	}
+	if !bucketAllowed {
+		return S3Info{}, fmt.Errorf("connection %q does not allow bucket %q", connectionID, bucket)
+	}
+	if !objectPrefixWithinScope(prefix, config.Prefix) {
+		return S3Info{}, fmt.Errorf("prefix %q is outside connection %q scope %q", prefix, connectionID, config.Prefix)
+	}
+	credentials := config.Credentials
+	if credentials.Source == "" {
+		credentials.Source = AwsCredentialConfigSourceDefault
+	}
+	if err := validateAWSCredentialConfig(credentials); err != nil {
+		return S3Info{}, fmt.Errorf("connection %q credentials: %w", connectionID, err)
+	}
+	endpoint := strings.TrimSpace(config.Endpoint)
+	useSSL := config.UseSsl
+	if endpoint == "" {
+		endpoint = "s3.amazonaws.com"
+		useSSL = true
+	}
+	return S3Info{
+		Endpoint:         endpoint,
+		Bucket:           bucket,
+		Prefix:           strings.Trim(strings.TrimSpace(prefix), "/"),
+		UseSsl:           useSSL,
+		CredentialSource: credentials.Source,
+		AccessKeyId:      credentials.AccessKeyId,
+		SecretAccessKey:  credentials.SecretAccessKey,
+		SessionToken:     credentials.SessionToken,
+		Profile:          credentials.Profile,
+	}, nil
+}
+
+// ResolveS3Info authorizes one S3 location against a named connection.
+func (c *Config) ResolveS3Info(connectionID, requiredCapability, location string) (S3Info, error) {
+	bucket, prefix, err := ParseS3URL(location)
+	if err != nil {
+		return S3Info{}, err
+	}
+	return c.resolveS3Info(connectionID, requiredCapability, bucket, prefix)
+}
+
+// ResolveFilesystemPath authorizes a logical file URI against a named
+// filesystem connection and resolves it beneath the administrator-owned root.
+func (c *Config) ResolveFilesystemPath(
+	connectionID, requiredCapability, location string,
+) (string, error) {
+	external, err := c.resolveExternalIOConnection(connectionID, requiredCapability)
+	if err != nil {
+		return "", err
+	}
+	protocol, err := external.ExternalIo.Discriminator()
+	if err != nil {
+		return "", fmt.Errorf("reading connection %q protocol: %w", connectionID, err)
+	}
+	if protocol != "filesystem" {
+		return "", fmt.Errorf(
+			"connection %q uses protocol %q, want filesystem",
+			connectionID,
+			protocol,
+		)
+	}
+	config, err := external.ExternalIo.AsFilesystemExternalIoConfig()
+	if err != nil {
+		return "", fmt.Errorf("decoding filesystem connection %q: %w", connectionID, err)
+	}
+	rootConfig := strings.TrimSpace(config.Root)
+	root, err := filepath.Abs(rootConfig)
+	if err != nil {
+		return "", fmt.Errorf("resolving filesystem connection %q root: %w", connectionID, err)
+	}
+	if !filepath.IsAbs(rootConfig) {
+		return "", fmt.Errorf("filesystem connection %q root must be absolute", connectionID)
+	}
+	uri, err := url.Parse(location)
+	if err != nil {
+		return "", fmt.Errorf("parsing filesystem location: %w", err)
+	}
+	if uri.Scheme != "file" {
+		return "", fmt.Errorf("expected file:// scheme, got %q", uri.Scheme)
+	}
+	if uri.Host != "" && uri.Host != "localhost" {
+		return "", fmt.Errorf("filesystem location host %q is not local", uri.Host)
+	}
+	if uri.RawQuery != "" || uri.Fragment != "" {
+		return "", errors.New("filesystem location cannot include a query or fragment")
+	}
+	logical := filepath.FromSlash(strings.TrimPrefix(uri.Path, "/"))
+	if logical == "" || logical == "." {
+		return root, nil
+	}
+	if filepath.IsAbs(logical) {
+		return "", errors.New("filesystem location must be relative to the connection root")
+	}
+	resolved := filepath.Join(root, filepath.Clean(logical))
+	relative, err := filepath.Rel(root, resolved)
+	if err != nil {
+		return "", fmt.Errorf("checking filesystem location scope: %w", err)
+	}
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("filesystem location %q escapes connection %q root", location, connectionID)
+	}
+	return resolved, nil
+}
+
+// ResolveObjectStorageS3 resolves one object-engine durability lane. An empty
+// lane resolves the root location.
+func (c *Config) ResolveObjectStorageS3(lane string) (S3Info, error) {
+	if c == nil {
+		return S3Info{}, errors.New("config is required")
+	}
+	location := ObjectStorageLocation{}
+	switch lane {
+	case "":
+	case "artifacts":
+		location = c.Storage.Object.Lanes.Artifacts
+	case "manifests":
+		location = c.Storage.Object.Lanes.Manifests
+	case "wal":
+		location = c.Storage.Object.Lanes.Wal
+	case "progress":
+		location = c.Storage.Object.Lanes.Progress
+	case "catalog":
+		location = c.Storage.Object.Lanes.Catalog
+	default:
+		return S3Info{}, fmt.Errorf("unsupported object storage lane %q", lane)
+	}
+	connection := c.Storage.Object.Connection
+	bucket := c.Storage.Object.Bucket
+	prefix := c.Storage.Object.Prefix
+	if location.Connection != "" {
+		connection = location.Connection
+	}
+	if location.Bucket != "" {
+		bucket = location.Bucket
+	}
+	if location.Prefix != "" {
+		prefix = location.Prefix
+	}
+	return c.resolveS3Info(connection, "storage.primary", bucket, prefix)
+}
+
+// GetS3Credentials projects supported credential sources into the legacy
+// MinIO client. Profile and web-identity sources fail closed because this
+// client cannot refresh either source safely.
+func (s *S3Info) GetS3Credentials() (*s3.Credentials, error) {
 	accessKeyID := s.AccessKeyId
-	if accessKeyID == "" {
-		accessKeyID = os.Getenv("AWS_ACCESS_KEY_ID")
-	}
-
 	secretAccessKey := s.SecretAccessKey
-	if secretAccessKey == "" {
-		secretAccessKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
-	}
-
 	sessionToken := s.SessionToken
-	if sessionToken == "" {
-		sessionToken = os.Getenv("AWS_SESSION_TOKEN")
+	switch s.CredentialSource {
+	case AwsCredentialConfigSourceDefault:
+		if accessKeyID == "" {
+			accessKeyID = os.Getenv("AWS_ACCESS_KEY_ID")
+		}
+		if secretAccessKey == "" {
+			secretAccessKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+		}
+		if sessionToken == "" {
+			sessionToken = os.Getenv("AWS_SESSION_TOKEN")
+		}
+	case AwsCredentialConfigSourceStatic:
+		if accessKeyID == "" || secretAccessKey == "" {
+			return nil, errors.New("static S3 credentials require access_key_id and secret_access_key")
+		}
+	case AwsCredentialConfigSourceProfile:
+		return nil, fmt.Errorf("S3 profile credential source %q is unsupported by the Go storage client", s.Profile)
+	case AwsCredentialConfigSourceWebIdentity:
+		return nil, errors.New("S3 web_identity credential source is unsupported by the Go storage client")
+	default:
+		return nil, fmt.Errorf("unsupported S3 credential source %q", s.CredentialSource)
 	}
 
 	endpoint := s.Endpoint
 	if endpoint == "" {
 		endpoint = os.Getenv("AWS_ENDPOINT_URL")
+	}
+	if endpoint == "" {
+		endpoint = "s3.amazonaws.com"
+	}
+	if accessKeyID == "" || secretAccessKey == "" {
+		return nil, errors.New("S3 credentials are unavailable for the configured credential source")
 	}
 
 	return &s3.Credentials{
@@ -464,14 +738,18 @@ func (s *S3Info) GetS3Credentials() *s3.Credentials {
 		AccessKeyId:     accessKeyID,
 		SecretAccessKey: secretAccessKey,
 		SessionToken:    sessionToken,
-	}
+	}, nil
 }
 
 // NewMinioClient creates a Minio client using this S3Info configuration.
 // Credentials are read from config fields (which may have been resolved via ${secret:...} syntax)
 // with fallback to environment variables.
 func (s *S3Info) NewMinioClient() (*minio.Client, error) {
-	return s.GetS3Credentials().NewMinioClient()
+	credentials, err := s.GetS3Credentials()
+	if err != nil {
+		return nil, err
+	}
+	return credentials.NewMinioClient()
 }
 
 // validateURL validates that a URL string is well-formed and uses supported schemes
@@ -551,6 +829,12 @@ func ParseS3URL(location string) (bucket string, prefix string, err error) {
 	if u.Scheme != "s3" {
 		return "", "", fmt.Errorf("expected s3:// scheme, got %s://", u.Scheme)
 	}
+	if u.User != nil || u.Port() != "" {
+		return "", "", errors.New("S3 URL cannot include user information or a port")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", "", errors.New("S3 URL cannot include a query or fragment")
+	}
 
 	bucket = u.Host
 	if bucket == "" {
@@ -559,6 +843,9 @@ func ParseS3URL(location string) (bucket string, prefix string, err error) {
 
 	// Path starts with /, so trim the leading slash
 	prefix = strings.TrimPrefix(u.Path, "/")
+	if err := validateObjectPrefix(prefix); err != nil {
+		return "", "", fmt.Errorf("invalid S3 prefix: %w", err)
+	}
 
 	return bucket, prefix, nil
 }

@@ -414,16 +414,37 @@ func (a *mcpAdapter) Batch(ctx context.Context, tableName string, inserts map[st
 }
 
 // Backup implements antflymcp.AntflyHandler.
-func (a *mcpAdapter) Backup(ctx context.Context, tableName, backupID, location string) error {
+func (a *mcpAdapter) Backup(
+	ctx context.Context,
+	tableName, backupID, connection, location string,
+) error {
+	if err := common.ValidateBackupID(backupID); err != nil {
+		return err
+	}
 	table, err := a.t.tm.GetTable(tableName)
 	if err != nil {
 		return fmt.Errorf("getting table %s: %w", tableName, err)
 	}
 
+	backup := common.BackupConfig{
+		BackupID:   backupID,
+		Connection: connection,
+		Location:   location,
+		Format:     common.DefaultBackupFormat,
+	}
+	metadataStore, err := newBackupStore(
+		a.t.ln.config,
+		connection,
+		"backup.write",
+		location,
+	)
+	if err != nil {
+		return err
+	}
 	eg, egCtx := errgroup.WithContext(ctx)
 	for shardID := range table.Shards {
 		eg.Go(func() error {
-			if err := a.t.ln.forwardBackupToShard(egCtx, shardID, location, backupID, common.DefaultBackupFormat); err != nil {
+			if err := a.t.ln.forwardBackupToShard(egCtx, shardID, backup); err != nil {
 				return fmt.Errorf("backing up shard %s: %w", shardID, err)
 			}
 			return nil
@@ -434,7 +455,7 @@ func (a *mcpAdapter) Backup(ctx context.Context, tableName, backupID, location s
 	}
 
 	// Write backup metadata
-	if err := newBackupStore(location, &a.t.ln.config.Storage.Local.S3).WriteMetadata(ctx, backupID, table); err != nil {
+	if err := metadataStore.WriteMetadata(ctx, backupID, table, backup.Format); err != nil {
 		return fmt.Errorf("writing backup metadata: %w", err)
 	}
 
@@ -442,8 +463,23 @@ func (a *mcpAdapter) Backup(ctx context.Context, tableName, backupID, location s
 }
 
 // Restore implements antflymcp.AntflyHandler.
-func (a *mcpAdapter) Restore(ctx context.Context, tableName, backupID, location string) error {
-	tableMetadata, err := newBackupStore(location, &a.t.ln.config.Storage.Local.S3).ReadMetadata(ctx, backupID)
+func (a *mcpAdapter) Restore(
+	ctx context.Context,
+	tableName, backupID, connection, location string,
+) error {
+	if err := common.ValidateBackupID(backupID); err != nil {
+		return err
+	}
+	metadataStore, err := newBackupStore(
+		a.t.ln.config,
+		connection,
+		"restore.read",
+		location,
+	)
+	if err != nil {
+		return err
+	}
+	tableMetadata, format, err := metadataStore.ReadMetadata(ctx, backupID)
 	if err != nil {
 		return fmt.Errorf("reading backup metadata: %w", err)
 	}
@@ -454,9 +490,10 @@ func (a *mcpAdapter) Restore(ctx context.Context, tableName, backupID, location 
 	}
 
 	if err := a.t.tm.RestoreTable(tableMetadata, &common.BackupConfig{
-		Location: location,
-		BackupID: backupID,
-		Format:   common.DefaultBackupFormat,
+		Location:   location,
+		Connection: connection,
+		BackupID:   backupID,
+		Format:     format,
 	}); err != nil {
 		return fmt.Errorf("restoring table: %w", err)
 	}

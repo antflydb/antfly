@@ -47,7 +47,9 @@ class EnrichmentRuntimeStatus:
         last_embed_batch_items (int):
         last_embed_batch_bytes (int):
         last_embed_batch_max_bytes (int):
-        last_embed_batch_ns (int):
+        last_embed_batch_completed_ms (int): Wall-clock completion time in Unix milliseconds for the most recently
+            completed embedding batch.
+        last_embed_batch_ns (int): Elapsed duration in nanoseconds for the most recently completed embedding batch.
         total_embed_ns (int):
     """
 
@@ -83,6 +85,7 @@ class EnrichmentRuntimeStatus:
     last_embed_batch_items: int
     last_embed_batch_bytes: int
     last_embed_batch_max_bytes: int
+    last_embed_batch_completed_ms: int
     last_embed_batch_ns: int
     total_embed_ns: int
 
@@ -151,6 +154,8 @@ class EnrichmentRuntimeStatus:
 
         last_embed_batch_max_bytes = self.last_embed_batch_max_bytes
 
+        last_embed_batch_completed_ms = self.last_embed_batch_completed_ms
+
         last_embed_batch_ns = self.last_embed_batch_ns
 
         total_embed_ns = self.total_embed_ns
@@ -191,6 +196,7 @@ class EnrichmentRuntimeStatus:
                 "last_embed_batch_items": last_embed_batch_items,
                 "last_embed_batch_bytes": last_embed_batch_bytes,
                 "last_embed_batch_max_bytes": last_embed_batch_max_bytes,
+                "last_embed_batch_completed_ms": last_embed_batch_completed_ms,
                 "last_embed_batch_ns": last_embed_batch_ns,
                 "total_embed_ns": total_embed_ns,
             }
@@ -265,6 +271,8 @@ class EnrichmentRuntimeStatus:
 
         last_embed_batch_max_bytes = d.pop("last_embed_batch_max_bytes")
 
+        last_embed_batch_completed_ms = d.pop("last_embed_batch_completed_ms")
+
         last_embed_batch_ns = d.pop("last_embed_batch_ns")
 
         total_embed_ns = d.pop("total_embed_ns")
@@ -302,6 +310,7 @@ class EnrichmentRuntimeStatus:
             last_embed_batch_items=last_embed_batch_items,
             last_embed_batch_bytes=last_embed_batch_bytes,
             last_embed_batch_max_bytes=last_embed_batch_max_bytes,
+            last_embed_batch_completed_ms=last_embed_batch_completed_ms,
             last_embed_batch_ns=last_embed_batch_ns,
             total_embed_ns=total_embed_ns,
         )

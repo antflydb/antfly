@@ -283,8 +283,12 @@ func (m *Store) ID() types.ID {
 	return m.config.ID
 }
 
-func (m *Store) S3Info() *common.S3Info {
-	return &m.antflyConfig.Storage.Local.S3
+func (m *Store) ResolveS3Info(connectionID, capability, location string) (common.S3Info, error) {
+	return m.antflyConfig.ResolveS3Info(connectionID, capability, location)
+}
+
+func (m *Store) ResolveFilesystemPath(connectionID, capability, location string) (string, error) {
+	return m.antflyConfig.ResolveFilesystemPath(connectionID, capability, location)
 }
 
 // ErrorcC dynamically receives new error channels from shards and fans them in

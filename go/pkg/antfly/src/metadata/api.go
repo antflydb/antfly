@@ -282,6 +282,38 @@ func (ca *ClusterApi) ListConnections(w http.ResponseWriter, r *http.Request, pa
 	}
 }
 
+func (ca *ClusterApi) InvokeInferenceConnection(
+	w http.ResponseWriter,
+	_ *http.Request,
+	_ string,
+	_ InvokeInferenceConnectionParamsOperation,
+) {
+	http.Error(
+		w,
+		"inference connection invocation is not supported by the Go metadata server",
+		http.StatusNotImplemented,
+	)
+}
+
+// Restore job orchestration is implemented by the Zig metadata service. The Go
+// server rejects these endpoints explicitly instead of reporting fabricated
+// progress for work it cannot schedule or observe.
+func (t *TableApi) ListRestoreJobs(
+	w http.ResponseWriter,
+	_ *http.Request,
+	_ ListRestoreJobsParams,
+) {
+	http.Error(w, "restore jobs are not supported by the Go metadata server", http.StatusNotImplemented)
+}
+
+func (t *TableApi) CancelRestoreJob(w http.ResponseWriter, _ *http.Request, _ string) {
+	http.Error(w, "restore jobs are not supported by the Go metadata server", http.StatusNotImplemented)
+}
+
+func (t *TableApi) GetRestoreJob(w http.ResponseWriter, _ *http.Request, _ string) {
+	http.Error(w, "restore jobs are not supported by the Go metadata server", http.StatusNotImplemented)
+}
+
 type wrapper struct {
 	*TableApi
 	*ClusterApi

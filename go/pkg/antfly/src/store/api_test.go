@@ -64,8 +64,8 @@ type MockShard struct {
 	raftNode *MockRaftNode // Add this if Shard methods interact with raftNode directly
 }
 
-func (m *MockShard) Backup(ctx context.Context, location, backupID string) error {
-	args := m.Called(ctx, location, backupID)
+func (m *MockShard) Backup(ctx context.Context, backup common.BackupConfig) error {
+	args := m.Called(ctx, backup.Location, backup.BackupID)
 	return args.Error(0)
 }
 
@@ -1031,11 +1031,10 @@ func TestHandleStartShard_Success_Multipart_WithFile(t *testing.T) {
 	mockStore.AssertExpectations(t)
 }
 
-func TestHandleStartShard_Failure_RestoreConfig_S3_CannotCreateClientOrDownloadFails(t *testing.T) {
+func TestHandleStartShard_RejectsS3RestoreWithoutAuthorizedConnection(t *testing.T) {
 	api, mockStore, _ := setupStoreAPI(t, types.ID(1))
 	newShardID := types.ID(103)
 	backupID := "s3backup"
-	// Using a clearly invalid hostname to ensure NewMinioClient or FGetObject fails.
 	s3BucketURL := "s3://invalid-s3-endpoint-for-test.localdomain"
 	restoreLocation := s3BucketURL + "/backups"
 
@@ -1063,11 +1062,12 @@ func TestHandleStartShard_Failure_RestoreConfig_S3_CannotCreateClientOrDownloadF
 
 	assert.Equal(
 		t,
-		http.StatusInternalServerError,
+		http.StatusBadRequest,
 		rr.Code,
-		"Expected server error due to S3 download failure",
+		"Expected an unauthorized S3 location to fail before network access",
 	)
-	assert.Contains(t, rr.Body.String(), "downloading s3 backup")
+	assert.Contains(t, rr.Body.String(), "authorizing S3 restore")
+	assert.Contains(t, rr.Body.String(), "connection is required")
 	mockStore.AssertNotCalled(
 		t,
 		"StartRaftGroup",

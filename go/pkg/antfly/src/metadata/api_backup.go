@@ -49,6 +49,10 @@ func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName
 		errorResponse(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := common.ValidateBackupID(br.BackupId); err != nil {
+		errorResponse(w, fmt.Sprintf("Invalid backup ID: %v", err), http.StatusBadRequest)
+		return
+	}
 	table, err := t.tm.GetTable(tableName)
 	if err != nil {
 		err := fmt.Errorf("getting table %s: %w", tableName, err)
@@ -57,11 +61,27 @@ func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	backupConfig := common.BackupConfig{
+		BackupID:   br.BackupId,
+		Connection: br.Connection,
+		Location:   br.Location,
+		Format:     backupFormatFromRequest(br.Format),
+	}
+	metadataStore, err := newBackupStore(
+		t.ln.config,
+		br.Connection,
+		"backup.write",
+		br.Location,
+	)
+	if err != nil {
+		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
+		return
+	}
 	g, _ := workerpool.NewGroup(ctx, t.pool)
 	for shardID := range table.Shards {
 		g.Go(func(ctx context.Context) error {
 			// Forward the insert to the appropriate shard
-			if err := t.ln.forwardBackupToShard(ctx, shardID, br.Location, br.BackupId, backupFormatFromRequest(br.Format)); err != nil {
+			if err := t.ln.forwardBackupToShard(ctx, shardID, backupConfig); err != nil {
 				if !errors.Is(err, context.Canceled) {
 					t.logger.Error("Error forwarding backup", zap.Error(err))
 				}
@@ -79,7 +99,7 @@ func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName
 		}
 	}
 
-	if err := newBackupStore(br.Location, &t.ln.config.Storage.Local.S3).WriteMetadata(ctx, br.BackupId, table); err != nil {
+	if err := metadataStore.WriteMetadata(ctx, br.BackupId, table, backupConfig.Format); err != nil {
 		errorResponse(w, fmt.Sprintf("Failed to write backup metadata: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -93,7 +113,12 @@ func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName
 	}
 }
 
-func (t *TableApi) RestoreTable(w http.ResponseWriter, r *http.Request, tableName string) {
+func (t *TableApi) RestoreTable(
+	w http.ResponseWriter,
+	r *http.Request,
+	tableName string,
+	_ RestoreTableParams,
+) {
 	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
 		return
 	}
@@ -107,11 +132,25 @@ func (t *TableApi) RestoreTable(w http.ResponseWriter, r *http.Request, tableNam
 		)
 		return
 	}
+	if err := common.ValidateBackupID(rr.BackupId); err != nil {
+		errorResponse(w, fmt.Sprintf("Invalid backup ID: %v", err), http.StatusBadRequest)
+		return
+	}
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	tableMetadata, err := newBackupStore(rr.Location, &t.ln.config.Storage.Local.S3).ReadMetadata(ctx, rr.BackupId)
+	metadataStore, err := newBackupStore(
+		t.ln.config,
+		rr.Connection,
+		"restore.read",
+		rr.Location,
+	)
+	if err != nil {
+		errorResponse(w, fmt.Sprintf("Invalid restore location: %v", err), http.StatusBadRequest)
+		return
+	}
+	tableMetadata, backupFormat, err := metadataStore.ReadMetadata(ctx, rr.BackupId)
 	if err != nil {
 		errorResponse(w, fmt.Sprintf("Failed to read backup metadata: %v", err), http.StatusInternalServerError)
 		return
@@ -137,8 +176,10 @@ func (t *TableApi) RestoreTable(w http.ResponseWriter, r *http.Request, tableNam
 	// autoscaling on this tables shards.
 	// MVP (ajr) Contains side-effects for raft log
 	if err := t.tm.RestoreTable(tableMetadata, &common.BackupConfig{
-		Location: rr.Location, BackupID: rr.BackupId,
-		Format: backupFormatFromRequest(rr.Format),
+		Location:   rr.Location,
+		Connection: rr.Connection,
+		BackupID:   rr.BackupId,
+		Format:     backupFormat,
 	}); err != nil {
 		errorResponse(
 			w,
@@ -173,20 +214,20 @@ func clusterBackupFormatFromRequest(format ClusterBackupRequestFormat) common.Ba
 }
 
 func backupInfoFormatFromMetadata(format common.BackupFormat) BackupInfoFormat {
-	if format == "" {
-		return BackupInfoFormatNative
-	}
 	return BackupInfoFormat(format)
 }
 
 // ClusterBackupMetadata represents the metadata for a cluster-level backup
 type ClusterBackupMetadata struct {
+	Version       uint32                   `json:"version"`
 	BackupID      string                   `json:"backup_id"`
 	Timestamp     time.Time                `json:"timestamp"`
 	AntflyVersion string                   `json:"antfly_version"`
 	Format        common.BackupFormat      `json:"format,omitempty"`
 	Tables        []ClusterBackupTableInfo `json:"tables"`
 }
+
+const clusterBackupMetadataVersion = 1
 
 // ClusterBackupTableInfo tracks backup status for a single table in a cluster backup
 type ClusterBackupTableInfo struct {
@@ -197,28 +238,51 @@ type ClusterBackupTableInfo struct {
 	Error          string `json:"error,omitempty"`
 }
 
+func validateClusterBackupMetadata(id string, meta *ClusterBackupMetadata) error {
+	if meta == nil {
+		return fmt.Errorf("cluster backup metadata is required")
+	}
+	if meta.Version != clusterBackupMetadataVersion {
+		return fmt.Errorf("unsupported cluster backup metadata version %d", meta.Version)
+	}
+	if meta.BackupID != id {
+		return fmt.Errorf(
+			"cluster backup metadata ID mismatch: requested %q, found %q",
+			id,
+			meta.BackupID,
+		)
+	}
+	switch meta.Format {
+	case common.BackupFormatNative, common.BackupFormatPortable:
+		return nil
+	default:
+		return fmt.Errorf("unsupported cluster backup format %q", meta.Format)
+	}
+}
+
 func writeClusterMetadataToFile(_ context.Context, location, id string, meta *ClusterBackupMetadata) error {
+	if err := common.ValidateBackupID(id); err != nil {
+		return err
+	}
+	if err := validateClusterBackupMetadata(id, meta); err != nil {
+		return err
+	}
 	filePath := path.Join(
 		strings.TrimPrefix(location, "file://"),
 		id+"-cluster-metadata.json",
 	)
-	file, err := os.Create(filepath.Clean(filePath))
-	if err != nil {
-		return fmt.Errorf("creating cluster metadata file: %w", err)
-	}
-	defer func() { _ = file.Close() }()
-	if err := json.NewEncoder(file).Encode(meta); err != nil {
-		return fmt.Errorf("encoding cluster metadata to JSON: %w", err)
-	}
-	return nil
+	return writeJSONFileAtomically(filepath.Clean(filePath), meta)
 }
 
-func writeClusterMetadataToBlobStore(ctx context.Context, bucketURL, id string, meta *ClusterBackupMetadata, s3Info *common.S3Info) error {
-	// e.g. "s3://my-bucket-name/optional/prefix"
-	bucket, prefix, err := common.ParseS3URL(bucketURL)
-	if err != nil {
-		return fmt.Errorf("parsing bucket URL: %w", err)
+func writeClusterMetadataToBlobStore(ctx context.Context, id string, meta *ClusterBackupMetadata, s3Info *common.S3Info) error {
+	if err := common.ValidateBackupID(id); err != nil {
+		return err
 	}
+	if err := validateClusterBackupMetadata(id, meta); err != nil {
+		return err
+	}
+	bucket := s3Info.Bucket
+	prefix := s3Info.Prefix
 	minioClient, err := s3Info.NewMinioClient()
 	if err != nil {
 		return fmt.Errorf("creating S3 client: %w", err)
@@ -245,6 +309,9 @@ func writeClusterMetadataToBlobStore(ctx context.Context, bucketURL, id string, 
 }
 
 func readClusterMetadataFromFile(_ context.Context, location, id string) (*ClusterBackupMetadata, error) {
+	if err := common.ValidateBackupID(id); err != nil {
+		return nil, err
+	}
 	filePath := path.Join(
 		strings.TrimPrefix(location, "file://"),
 		id+"-cluster-metadata.json",
@@ -257,15 +324,18 @@ func readClusterMetadataFromFile(_ context.Context, location, id string) (*Clust
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, fmt.Errorf("unmarshalling cluster metadata: %w", err)
 	}
+	if err := validateClusterBackupMetadata(id, &meta); err != nil {
+		return nil, err
+	}
 	return &meta, nil
 }
 
-func readClusterMetadataFromBlobStore(ctx context.Context, bucketURL, id string, s3Info *common.S3Info) (*ClusterBackupMetadata, error) {
-	// e.g. "s3://my-bucket-name/optional/prefix"
-	bucket, prefix, err := common.ParseS3URL(bucketURL)
-	if err != nil {
-		return nil, fmt.Errorf("parsing bucket URL: %w", err)
+func readClusterMetadataFromBlobStore(ctx context.Context, id string, s3Info *common.S3Info) (*ClusterBackupMetadata, error) {
+	if err := common.ValidateBackupID(id); err != nil {
+		return nil, err
 	}
+	bucket := s3Info.Bucket
+	prefix := s3Info.Prefix
 	minioClient, err := s3Info.NewMinioClient()
 	if err != nil {
 		return nil, fmt.Errorf("creating S3 client: %w", err)
@@ -291,6 +361,9 @@ func readClusterMetadataFromBlobStore(ctx context.Context, bucketURL, id string,
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, fmt.Errorf("unmarshalling cluster metadata: %w", err)
 	}
+	if err := validateClusterBackupMetadata(id, &meta); err != nil {
+		return nil, err
+	}
 	return &meta, nil
 }
 
@@ -306,9 +379,39 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, fmt.Sprintf("Failed to parse request: %v", err), http.StatusBadRequest)
 		return
 	}
+	if err := common.ValidateBackupID(req.BackupId); err != nil {
+		errorResponse(w, fmt.Sprintf("Invalid backup ID: %v", err), http.StatusBadRequest)
+		return
+	}
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	resolvedLocation, s3Info, err := resolveBackupLocation(
+		t.ln.config,
+		req.Connection,
+		"backup.write",
+		req.Location,
+	)
+	if err != nil {
+		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
+		return
+	}
+	metadataStore, err := newBackupStore(
+		t.ln.config,
+		req.Connection,
+		"backup.write",
+		req.Location,
+	)
+	if err != nil {
+		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
+		return
+	}
+	backupConfig := common.BackupConfig{
+		BackupID:   req.BackupId,
+		Connection: req.Connection,
+		Location:   req.Location,
+		Format:     clusterBackupFormatFromRequest(req.Format),
+	}
 
 	// Get list of tables to backup
 	var tableNames []string
@@ -332,8 +435,9 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create cluster metadata
-	backupFormat := clusterBackupFormatFromRequest(req.Format)
+	backupFormat := backupConfig.Format
 	clusterMeta := &ClusterBackupMetadata{
+		Version:       clusterBackupMetadataVersion,
 		BackupID:      req.BackupId,
 		Timestamp:     time.Now(),
 		AntflyVersion: multirafthttp.Version,
@@ -374,7 +478,7 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 			shardEg.SetLimit(innerFanOutLimit)
 			for shardID := range table.Shards {
 				shardEg.Go(func() error {
-					if err := t.ln.forwardBackupToShard(shardCtx, shardID, req.Location, req.BackupId, backupFormat); err != nil {
+					if err := t.ln.forwardBackupToShard(shardCtx, shardID, backupConfig); err != nil {
 						if !errors.Is(err, context.Canceled) {
 							t.logger.Error("Error forwarding backup", zap.String("table", tableName), zap.Error(err))
 						}
@@ -403,7 +507,7 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 
 			// Write table metadata with table-specific backup ID
 			tableBackupID := tableName + "-" + req.BackupId
-			if err := newBackupStore(req.Location, &t.ln.config.Storage.Local.S3).WriteMetadata(ctx, tableBackupID, table); err != nil {
+			if err := metadataStore.WriteMetadata(ctx, tableBackupID, table, backupFormat); err != nil {
 				mu.Lock()
 				results[i] = TableBackupStatus{
 					Name:   tableName,
@@ -440,12 +544,12 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 
 	// Write cluster-level metadata
 	if strings.HasPrefix(req.Location, "s3://") {
-		if err := writeClusterMetadataToBlobStore(ctx, req.Location, req.BackupId, clusterMeta, &t.ln.config.Storage.Local.S3); err != nil {
+		if err := writeClusterMetadataToBlobStore(ctx, req.BackupId, clusterMeta, s3Info); err != nil {
 			errorResponse(w, fmt.Sprintf("Failed to write cluster metadata: %v", err), http.StatusInternalServerError)
 			return
 		}
 	} else {
-		if err := writeClusterMetadataToFile(ctx, req.Location, req.BackupId, clusterMeta); err != nil {
+		if err := writeClusterMetadataToFile(ctx, resolvedLocation, req.BackupId, clusterMeta); err != nil {
 			errorResponse(w, fmt.Sprintf("Failed to write cluster metadata: %v", err), http.StatusInternalServerError)
 			return
 		}
@@ -477,7 +581,7 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 }
 
 // Restore restores multiple tables from a cluster backup
-func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request) {
+func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request, _ RestoreParams) {
 	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, "*", usermgr.PermissionTypeAdmin) {
 		return
 	}
@@ -486,6 +590,10 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request) {
 	var req ClusterRestoreRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		errorResponse(w, fmt.Sprintf("Failed to parse request: %v", err), http.StatusBadRequest)
+		return
+	}
+	if err := common.ValidateBackupID(req.BackupId); err != nil {
+		errorResponse(w, fmt.Sprintf("Invalid backup ID: %v", err), http.StatusBadRequest)
 		return
 	}
 
@@ -497,22 +605,48 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	resolvedLocation, s3Info, err := resolveBackupLocation(
+		t.ln.config,
+		req.Connection,
+		"restore.read",
+		req.Location,
+	)
+	if err != nil {
+		errorResponse(w, fmt.Sprintf("Invalid restore location: %v", err), http.StatusBadRequest)
+		return
+	}
+	metadataStore, err := newBackupStore(
+		t.ln.config,
+		req.Connection,
+		"restore.read",
+		req.Location,
+	)
+	if err != nil {
+		errorResponse(w, fmt.Sprintf("Invalid restore location: %v", err), http.StatusBadRequest)
+		return
+	}
 
 	// Read cluster backup metadata
 	var clusterMeta *ClusterBackupMetadata
-	var err error
 	if strings.HasPrefix(req.Location, "s3://") {
-		clusterMeta, err = readClusterMetadataFromBlobStore(ctx, req.Location, req.BackupId, &t.ln.config.Storage.Local.S3)
+		clusterMeta, err = readClusterMetadataFromBlobStore(ctx, req.BackupId, s3Info)
 	} else {
-		clusterMeta, err = readClusterMetadataFromFile(ctx, req.Location, req.BackupId)
+		clusterMeta, err = readClusterMetadataFromFile(ctx, resolvedLocation, req.BackupId)
 	}
 	if err != nil {
 		errorResponse(w, fmt.Sprintf("Failed to read cluster backup metadata: %v", err), http.StatusInternalServerError)
 		return
 	}
 	restoreFormat := clusterMeta.Format
-	if restoreFormat == "" {
-		restoreFormat = common.BackupFormatNative
+	switch restoreFormat {
+	case common.BackupFormatNative, common.BackupFormatPortable:
+	default:
+		errorResponse(
+			w,
+			fmt.Sprintf("Invalid backup format in cluster metadata: %q", restoreFormat),
+			http.StatusInternalServerError,
+		)
+		return
 	}
 
 	// Determine which tables to restore
@@ -595,13 +729,27 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request) {
 
 			// Read table metadata from backup using table-specific backup ID
 			tableBackupID := tableName + "-" + req.BackupId
-			tableMetadata, err := newBackupStore(req.Location, &t.ln.config.Storage.Local.S3).ReadMetadata(ctx, tableBackupID)
+			tableMetadata, tableFormat, err := metadataStore.ReadMetadata(ctx, tableBackupID)
 			if err != nil {
 				mu.Lock()
 				results[i] = TableRestoreStatus{
 					Name:   tableName,
 					Status: TableRestoreStatusStatusFailed,
 					Error:  fmt.Sprintf("failed to read backup metadata: %v", err),
+				}
+				mu.Unlock()
+				return nil
+			}
+			if tableFormat != restoreFormat {
+				mu.Lock()
+				results[i] = TableRestoreStatus{
+					Name:   tableName,
+					Status: TableRestoreStatusStatusFailed,
+					Error: fmt.Sprintf(
+						"backup format mismatch: cluster metadata has %q, table metadata has %q",
+						restoreFormat,
+						tableFormat,
+					),
 				}
 				mu.Unlock()
 				return nil
@@ -621,9 +769,10 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request) {
 
 			// Restore the table using the base backup ID (shard files use the base backup ID)
 			if err := t.tm.RestoreTable(tableMetadata, &common.BackupConfig{
-				Location: req.Location,
-				BackupID: req.BackupId,
-				Format:   restoreFormat,
+				Location:   req.Location,
+				Connection: req.Connection,
+				BackupID:   req.BackupId,
+				Format:     restoreFormat,
 			}); err != nil {
 				mu.Lock()
 				results[i] = TableRestoreStatus{
@@ -688,6 +837,16 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 
 	ctx := r.Context()
 	location := params.Location
+	resolvedLocation, s3Info, err := resolveBackupLocation(
+		t.ln.config,
+		params.Connection,
+		"restore.read",
+		location,
+	)
+	if err != nil {
+		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
+		return
+	}
 
 	var backups []BackupInfo
 
@@ -698,7 +857,7 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 			errorResponse(w, fmt.Sprintf("Invalid location URL: %v", err), http.StatusBadRequest)
 			return
 		}
-		minioClient, err := t.ln.config.Storage.Local.S3.NewMinioClient()
+		minioClient, err := s3Info.NewMinioClient()
 		if err != nil {
 			errorResponse(w, fmt.Sprintf("Failed to create S3 client: %v", err), http.StatusInternalServerError)
 			return
@@ -723,7 +882,7 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 				}
 
 				// Read the metadata
-				meta, err := readClusterMetadataFromBlobStore(ctx, location, backupID, &t.ln.config.Storage.Local.S3)
+				meta, err := readClusterMetadataFromBlobStore(ctx, backupID, s3Info)
 				if err != nil {
 					t.logger.Warn("Error reading cluster metadata", zap.String("backup_id", backupID), zap.Error(err))
 					continue
@@ -748,7 +907,7 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 		}
 	} else {
 		// File-based listing
-		dirPath := strings.TrimPrefix(location, "file://")
+		dirPath := strings.TrimPrefix(resolvedLocation, "file://")
 		entries, err := os.ReadDir(dirPath)
 		if err != nil {
 			errorResponse(w, fmt.Sprintf("Failed to read directory: %v", err), http.StatusInternalServerError)
