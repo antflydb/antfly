@@ -47,18 +47,27 @@ zig build bench-tokenizer -- /path/to/tokenizer.json /path/to/corpus.txt \
 
 Use `--warmup 0 --iterations 1` for a cold first pass. `--threads N` runs
 concurrent `std.Io` tasks against the same tokenizer and cache. The benchmark
-reports the token count and sequence hash so invalid performance results are
-visible. `--internal-threads N` permits up to N active queue consumers for one
+reports the token count and sequence hash. After the timed interval, it builds
+an independent serial reference with a fresh, cache-disabled tokenizer and
+compares the final complete sequence retained by every timed worker
+byte-for-byte. It then releases those buffers, repeats the requested external
+and internal concurrency against the measured tokenizer, and compares every
+replay sequence byte-for-byte. This validation is outside the measured
+interval, so concurrency correctness cannot be hidden by a same-length
+corruption and does not reduce the reported throughput.
+`--internal-threads N` permits up to N active queue consumers for one
 sufficiently large ByteLevel document. The encoder creates 4–8 chunks per
 consumer, capped at 64, so runtime tasks can pull another chunk when work is
 uneven without exceeding the requested concurrency. `--repeat N` repeats the
 corpus in memory before timing, which is useful for measuring internal
 parallelism without changing the fixture. `--profile-bpe` enables atomic
 cache-hit counters after warmup and reports key-length and result-size
-histograms. Profiling is for attribution rather than throughput measurement
-because the counters intentionally add work to the hot path. No benchmark or
-tokenizer path creates an OS thread directly. Every run also reports live cache
-entries, accounted bytes, the local byte limit, and rejected reservations.
+histograms. Profiling and cache statistics are snapshotted before the untimed
+validation pass. Profiling is for attribution rather than throughput
+measurement because the counters intentionally add work to the hot path. No
+benchmark or tokenizer path creates an OS thread directly. Every run also
+reports live cache entries, accounted bytes, the local byte limit, and rejected
+reservations.
 
 ## Baseline and current results
 
