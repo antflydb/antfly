@@ -606,7 +606,10 @@ pub fn applyBroadcastJoinPlanCost(
     right_size_bytes: u64,
 ) void {
     estimated_cost.* = @as(f64, @floatFromInt(right_rows)) + @as(f64, @floatFromInt(left_rows)) * 0.001;
-    estimated_memory_bytes.* = if (right_size_bytes > 0) right_size_bytes else right_rows * join_estimated_row_bytes;
+    estimated_memory_bytes.* = if (right_size_bytes > 0)
+        right_size_bytes
+    else
+        std.math.mul(u64, right_rows, join_estimated_row_bytes) catch std.math.maxInt(u64);
 }
 
 pub fn applyIndexLookupJoinPlanCostSimple(
@@ -617,7 +620,7 @@ pub fn applyIndexLookupJoinPlanCostSimple(
 ) void {
     const lookup_count = if (distinct_left_keys == 0) left_rows else distinct_left_keys;
     estimated_cost.* = @as(f64, @floatFromInt(lookup_count)) * 0.25;
-    estimated_memory_bytes.* = @max(@as(u64, 1), lookup_count) * 128;
+    estimated_memory_bytes.* = std.math.mul(u64, @max(@as(u64, 1), lookup_count), 128) catch std.math.maxInt(u64);
 }
 
 pub fn applyIndexLookupJoinPlanCostBatched(
@@ -625,7 +628,7 @@ pub fn applyIndexLookupJoinPlanCostBatched(
     estimated_memory_bytes: *u64,
     left_rows: u64,
 ) void {
-    const batches = if (left_rows == 0) 0 else (left_rows + join_lookup_batch_size - 1) / join_lookup_batch_size;
+    const batches = if (left_rows == 0) 0 else 1 + (left_rows - 1) / join_lookup_batch_size;
     estimated_cost.* = @as(f64, @floatFromInt(batches)) * 10 + @as(f64, @floatFromInt(left_rows)) * 0.01;
     estimated_memory_bytes.* = join_lookup_batch_size * join_estimated_row_bytes;
 }

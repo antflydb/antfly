@@ -67,6 +67,7 @@ pub const MergedGroupStatus = struct {
     group_id: u64,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
+    disk_bytes_known: bool = false,
     empty: bool = true,
     created_at_millis: u64 = 0,
     updated_at_millis: u64 = 0,
@@ -1923,10 +1924,13 @@ fn mergeRuntimeGroupFacts(
             if (status.group_id != group_id) continue;
             store_reports_runtime_facts = store_reports_runtime_facts or
                 status.doc_count > 0 or
-                status.disk_bytes > 0 or
+                status.disk_bytes_known or
                 runtimeDocIdentityHasFacts(status.doc_identity);
             if (status.doc_count > merged.doc_count) merged.doc_count = status.doc_count;
-            if (status.disk_bytes > merged.disk_bytes) merged.disk_bytes = status.disk_bytes;
+            if (status.disk_bytes_known and (!merged.disk_bytes_known or status.disk_bytes > merged.disk_bytes)) {
+                merged.disk_bytes = status.disk_bytes;
+                merged.disk_bytes_known = true;
+            }
             if (status.doc_count > 0) merged.empty = false;
             const updated_at_millis = @divTrunc(status.updated_at_ns, std.time.ns_per_ms);
             if (updated_at_millis > merged.updated_at_millis) merged.updated_at_millis = updated_at_millis;
@@ -2282,6 +2286,7 @@ fn mergeHealthyGroupStatusFallback(stores: []const table_manager.StoreRecord, gr
         .group_id = base.group_id,
         .doc_count = base.doc_count,
         .disk_bytes = base.disk_bytes,
+        .disk_bytes_known = base.disk_bytes_known,
         .empty = base.empty,
         .created_at_millis = base.created_at_millis,
         .updated_at_millis = base.updated_at_millis,

@@ -314,10 +314,10 @@ components:
           type: integer
           format: uint64
           description: "Projection generation associated with the durable checkpoint."
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: "^[0-9a-f]{16}$"
           description: "Projection configuration identity associated with the durable checkpoint."
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -588,7 +588,8 @@ components:
         - projection_checkpoint_status
         - projection_checkpoint_applied_sequence
         - projection_checkpoint_generation
-        - projection_checkpoint_config_hash
+        - projection_checkpoint_config_fingerprint
+        - projection_checkpoint_identity_consistent
         - checkpoint_replay_tail_sequence_count
         - processed_requests
         - error_count
@@ -634,9 +635,12 @@ components:
         projection_checkpoint_generation:
           type: integer
           format: uint64
-        projection_checkpoint_config_hash:
-          type: integer
-          format: uint64
+        projection_checkpoint_config_fingerprint:
+          type: string
+          pattern: "^[0-9a-f]{16}$"
+        projection_checkpoint_identity_consistent:
+          type: boolean
+          description: "Whether every shard contributing to this status reports the same checkpoint generation and configuration identity."
         checkpoint_replay_tail_sequence_count:
           type: integer
           format: uint64
@@ -881,10 +885,10 @@ components:
           type: integer
           format: uint64
           description: "Projection generation associated with the durable checkpoint."
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: "^[0-9a-f]{16}$"
           description: "Projection configuration identity associated with the durable checkpoint."
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -1171,10 +1175,10 @@ components:
           type: integer
           format: uint64
           description: "Projection generation associated with the durable checkpoint."
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: "^[0-9a-f]{16}$"
           description: "Projection configuration identity associated with the durable checkpoint."
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -1571,10 +1575,10 @@ components:
           type: integer
           format: uint64
           description: "Projection generation associated with the durable checkpoint."
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: "^[0-9a-f]{16}$"
           description: "Projection configuration identity associated with the durable checkpoint."
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true

@@ -20,7 +20,9 @@ class EnrichmentRuntimeStatus:
         projection_checkpoint_status (str):
         projection_checkpoint_applied_sequence (int):
         projection_checkpoint_generation (int):
-        projection_checkpoint_config_hash (int):
+        projection_checkpoint_config_fingerprint (str):
+        projection_checkpoint_identity_consistent (bool): Whether every shard contributing to this status reports the
+            same checkpoint generation and configuration identity.
         checkpoint_replay_tail_sequence_count (int):
         processed_requests (int):
         error_count (int):
@@ -56,7 +58,8 @@ class EnrichmentRuntimeStatus:
     projection_checkpoint_status: str
     projection_checkpoint_applied_sequence: int
     projection_checkpoint_generation: int
-    projection_checkpoint_config_hash: int
+    projection_checkpoint_config_fingerprint: str
+    projection_checkpoint_identity_consistent: bool
     checkpoint_replay_tail_sequence_count: int
     processed_requests: int
     error_count: int
@@ -98,7 +101,9 @@ class EnrichmentRuntimeStatus:
 
         projection_checkpoint_generation = self.projection_checkpoint_generation
 
-        projection_checkpoint_config_hash = self.projection_checkpoint_config_hash
+        projection_checkpoint_config_fingerprint = self.projection_checkpoint_config_fingerprint
+
+        projection_checkpoint_identity_consistent = self.projection_checkpoint_identity_consistent
 
         checkpoint_replay_tail_sequence_count = self.checkpoint_replay_tail_sequence_count
 
@@ -161,7 +166,8 @@ class EnrichmentRuntimeStatus:
                 "projection_checkpoint_status": projection_checkpoint_status,
                 "projection_checkpoint_applied_sequence": projection_checkpoint_applied_sequence,
                 "projection_checkpoint_generation": projection_checkpoint_generation,
-                "projection_checkpoint_config_hash": projection_checkpoint_config_hash,
+                "projection_checkpoint_config_fingerprint": projection_checkpoint_config_fingerprint,
+                "projection_checkpoint_identity_consistent": projection_checkpoint_identity_consistent,
                 "checkpoint_replay_tail_sequence_count": checkpoint_replay_tail_sequence_count,
                 "processed_requests": processed_requests,
                 "error_count": error_count,
@@ -209,7 +215,9 @@ class EnrichmentRuntimeStatus:
 
         projection_checkpoint_generation = d.pop("projection_checkpoint_generation")
 
-        projection_checkpoint_config_hash = d.pop("projection_checkpoint_config_hash")
+        projection_checkpoint_config_fingerprint = d.pop("projection_checkpoint_config_fingerprint")
+
+        projection_checkpoint_identity_consistent = d.pop("projection_checkpoint_identity_consistent")
 
         checkpoint_replay_tail_sequence_count = d.pop("checkpoint_replay_tail_sequence_count")
 
@@ -269,7 +277,8 @@ class EnrichmentRuntimeStatus:
             projection_checkpoint_status=projection_checkpoint_status,
             projection_checkpoint_applied_sequence=projection_checkpoint_applied_sequence,
             projection_checkpoint_generation=projection_checkpoint_generation,
-            projection_checkpoint_config_hash=projection_checkpoint_config_hash,
+            projection_checkpoint_config_fingerprint=projection_checkpoint_config_fingerprint,
+            projection_checkpoint_identity_consistent=projection_checkpoint_identity_consistent,
             checkpoint_replay_tail_sequence_count=checkpoint_replay_tail_sequence_count,
             processed_requests=processed_requests,
             error_count=error_count,

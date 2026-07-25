@@ -1335,9 +1335,9 @@ test "membership repair detects under and over replication" {
         .{ .record = .{ .group_id = 15501, .replica_id = 2, .local_node_id = 102 } },
     };
     const candidates = [_]CandidateDomain{
-        .{ .node_id = 101, .role = "data" },
-        .{ .node_id = 102, .role = "data" },
-        .{ .node_id = 103, .role = "data" },
+        .{ .node_id = 101, .role = "data", .failure_domain = "zone-a" },
+        .{ .node_id = 102, .role = "data", .failure_domain = "zone-b" },
+        .{ .node_id = 103, .role = "data", .failure_domain = "zone-c" },
     };
 
     try std.testing.expect(!groupNeedsMembershipRepair(&current, 15501, 2, &.{ 101, 102, 103 }, &candidates, "data"));

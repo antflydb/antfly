@@ -2938,8 +2938,8 @@ pub const RaftApplyStore = struct {
 };
 
 const transition_magic = "afmd1";
-const runtime_status_record_version: u16 = 8;
-const group_status_record_version: u16 = 2;
+const runtime_status_record_version: u16 = 9;
+const group_status_record_version: u16 = 3;
 
 const TransitionTag = enum(u8) {
     initialize_metadata_incarnation = 45,
@@ -3751,13 +3751,7 @@ fn appendRuntimeGroupStatusRecord(
     try out.append(alloc, if (record.disk_bytes_known) 1 else 0);
     try appendInt(alloc, out, u64, record.created_at_millis);
     try appendInt(alloc, out, u32, record.index_count);
-    try out.append(alloc, if (record.enrichment_enabled) 1 else 0);
-    try appendInt(alloc, out, u64, record.enrichment_target_sequence);
-    try appendInt(alloc, out, u64, record.enrichment_applied_sequence);
-    try out.append(alloc, if (record.enrichment_retrying) 1 else 0);
-    try out.append(alloc, if (record.enrichment_worker_failed) 1 else 0);
-    try out.append(alloc, if (record.enrichment_worker_started) 1 else 0);
-    try out.append(alloc, if (record.enrichment_stalled) 1 else 0);
+    try appendRuntimeEnrichmentStatusRecord(alloc, out, record.enrichment);
     try out.append(alloc, if (record.async_indexing_active) 1 else 0);
     try out.append(alloc, if (record.async_startup_active) 1 else 0);
     try out.append(alloc, if (record.async_dense_catch_up_active) 1 else 0);
@@ -3766,6 +3760,138 @@ fn appendRuntimeGroupStatusRecord(
     try appendRuntimeDocSetPlanningStatusRecord(alloc, out, record.doc_set_planning);
     try appendInt(alloc, out, u32, @intCast(record.indexes.len));
     for (record.indexes) |index| try appendRuntimeIndexStatusRecord(alloc, out, index);
+}
+
+fn appendRuntimeEnrichmentStatusRecord(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: metadata.RuntimeEnrichmentStatusReport,
+) !void {
+    try out.append(alloc, if (record.enabled) 1 else 0);
+    try out.append(alloc, if (record.lease_owned) 1 else 0);
+    try out.append(alloc, if (record.has_lease) 1 else 0);
+    try appendInt(alloc, out, u64, record.acquisition_count);
+    try appendInt(alloc, out, u64, record.lease_acquire_failures);
+    try appendInt(alloc, out, u64, record.lost_leases);
+    try appendInt(alloc, out, u64, record.last_acquired_ms);
+    try appendInt(alloc, out, u64, record.target_sequence);
+    try appendInt(alloc, out, u64, record.applied_sequence);
+    try appendRequiredString(alloc, out, record.projection_checkpoint_status);
+    try appendInt(alloc, out, u64, record.projection_checkpoint_applied_sequence);
+    try appendInt(alloc, out, u64, record.projection_checkpoint_generation);
+    try appendInt(alloc, out, u64, record.projection_checkpoint_config_hash);
+    try appendInt(alloc, out, u64, record.checkpoint_replay_tail_sequence_count);
+    try appendInt(alloc, out, u64, record.processed_requests);
+    try appendInt(alloc, out, u64, record.error_count);
+    try appendInt(alloc, out, u64, record.retryable_error_count);
+    try appendInt(alloc, out, u64, record.fatal_error_count);
+    try out.append(alloc, if (record.retrying) 1 else 0);
+    try out.append(alloc, if (record.worker_failed) 1 else 0);
+    try out.append(alloc, if (record.worker_started) 1 else 0);
+    try out.append(alloc, if (record.stalled) 1 else 0);
+    try appendInt(alloc, out, u64, record.skip_by_hash_count);
+    try appendInt(alloc, out, u64, record.skipped_source_count);
+    try appendInt(alloc, out, u64, record.codec_decode_failures);
+    try appendInt(alloc, out, u64, record.embed_batches_started);
+    try appendInt(alloc, out, u64, record.embed_batches_completed);
+    try appendInt(alloc, out, u64, record.embed_items_started);
+    try appendInt(alloc, out, u64, record.embed_items_completed);
+    try appendInt(alloc, out, u64, record.active_embed_batch_items);
+    try appendInt(alloc, out, u64, record.active_embed_batch_bytes);
+    try appendInt(alloc, out, u64, record.active_embed_batch_max_bytes);
+    try appendInt(alloc, out, u64, record.active_embed_batch_started_ms);
+    try appendInt(alloc, out, u64, record.last_embed_batch_items);
+    try appendInt(alloc, out, u64, record.last_embed_batch_bytes);
+    try appendInt(alloc, out, u64, record.last_embed_batch_max_bytes);
+    try appendInt(alloc, out, u64, record.last_embed_batch_ns);
+    try appendInt(alloc, out, u64, record.total_embed_ns);
+    try appendInt(alloc, out, u64, record.dense_artifact_bytes_written);
+    try appendInt(alloc, out, u64, record.sparse_artifact_bytes_written);
+    try appendInt(alloc, out, u64, record.chunk_artifact_bytes_written);
+    try appendInt(alloc, out, u64, record.artifact_bytes_written);
+}
+
+fn readRuntimeEnrichmentStatusRecord(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata.RuntimeEnrichmentStatusReport {
+    if (pos.* + 3 > encoded.len) return error.InvalidMetadataTransitionEncoding;
+    const enabled = encoded[pos.*] != 0;
+    pos.* += 1;
+    const lease_owned = encoded[pos.*] != 0;
+    pos.* += 1;
+    const has_lease = encoded[pos.*] != 0;
+    pos.* += 1;
+    const acquisition_count = try readInt(encoded, pos, u64);
+    const lease_acquire_failures = try readInt(encoded, pos, u64);
+    const lost_leases = try readInt(encoded, pos, u64);
+    const last_acquired_ms = try readInt(encoded, pos, u64);
+    const target_sequence = try readInt(encoded, pos, u64);
+    const applied_sequence = try readInt(encoded, pos, u64);
+    const projection_checkpoint_status = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(projection_checkpoint_status);
+    const projection_checkpoint_applied_sequence = try readInt(encoded, pos, u64);
+    const projection_checkpoint_generation = try readInt(encoded, pos, u64);
+    const projection_checkpoint_config_hash = try readInt(encoded, pos, u64);
+    const checkpoint_replay_tail_sequence_count = try readInt(encoded, pos, u64);
+    const processed_requests = try readInt(encoded, pos, u64);
+    const error_count = try readInt(encoded, pos, u64);
+    const retryable_error_count = try readInt(encoded, pos, u64);
+    const fatal_error_count = try readInt(encoded, pos, u64);
+    if (pos.* + 4 > encoded.len) return error.InvalidMetadataTransitionEncoding;
+    const retrying = encoded[pos.*] != 0;
+    pos.* += 1;
+    const worker_failed = encoded[pos.*] != 0;
+    pos.* += 1;
+    const worker_started = encoded[pos.*] != 0;
+    pos.* += 1;
+    const stalled = encoded[pos.*] != 0;
+    pos.* += 1;
+    return .{
+        .enabled = enabled,
+        .lease_owned = lease_owned,
+        .has_lease = has_lease,
+        .acquisition_count = acquisition_count,
+        .lease_acquire_failures = lease_acquire_failures,
+        .lost_leases = lost_leases,
+        .last_acquired_ms = last_acquired_ms,
+        .target_sequence = target_sequence,
+        .applied_sequence = applied_sequence,
+        .projection_checkpoint_status = projection_checkpoint_status,
+        .projection_checkpoint_applied_sequence = projection_checkpoint_applied_sequence,
+        .projection_checkpoint_generation = projection_checkpoint_generation,
+        .projection_checkpoint_config_hash = projection_checkpoint_config_hash,
+        .checkpoint_replay_tail_sequence_count = checkpoint_replay_tail_sequence_count,
+        .processed_requests = processed_requests,
+        .error_count = error_count,
+        .retryable_error_count = retryable_error_count,
+        .fatal_error_count = fatal_error_count,
+        .retrying = retrying,
+        .worker_failed = worker_failed,
+        .worker_started = worker_started,
+        .stalled = stalled,
+        .skip_by_hash_count = try readInt(encoded, pos, u64),
+        .skipped_source_count = try readInt(encoded, pos, u64),
+        .codec_decode_failures = try readInt(encoded, pos, u64),
+        .embed_batches_started = try readInt(encoded, pos, u64),
+        .embed_batches_completed = try readInt(encoded, pos, u64),
+        .embed_items_started = try readInt(encoded, pos, u64),
+        .embed_items_completed = try readInt(encoded, pos, u64),
+        .active_embed_batch_items = try readInt(encoded, pos, u64),
+        .active_embed_batch_bytes = try readInt(encoded, pos, u64),
+        .active_embed_batch_max_bytes = try readInt(encoded, pos, u64),
+        .active_embed_batch_started_ms = try readInt(encoded, pos, u64),
+        .last_embed_batch_items = try readInt(encoded, pos, u64),
+        .last_embed_batch_bytes = try readInt(encoded, pos, u64),
+        .last_embed_batch_max_bytes = try readInt(encoded, pos, u64),
+        .last_embed_batch_ns = try readInt(encoded, pos, u64),
+        .total_embed_ns = try readInt(encoded, pos, u64),
+        .dense_artifact_bytes_written = try readInt(encoded, pos, u64),
+        .sparse_artifact_bytes_written = try readInt(encoded, pos, u64),
+        .chunk_artifact_bytes_written = try readInt(encoded, pos, u64),
+        .artifact_bytes_written = try readInt(encoded, pos, u64),
+    };
 }
 
 fn readRuntimeGroupStatusRecord(
@@ -3799,30 +3925,45 @@ fn readRuntimeGroupStatusRecord(
     } else false;
     const created_at_millis = if (version >= 2) try readInt(encoded, pos, u64) else 0;
     const index_count = try readInt(encoded, pos, u32);
-    if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
-    const enrichment_enabled = encoded[pos.*] != 0;
-    pos.* += 1;
-    const enrichment_target_sequence = try readInt(encoded, pos, u64);
-    const enrichment_applied_sequence = try readInt(encoded, pos, u64);
-    const enrichment_lifecycle_field_count: usize = if (version >= 8) 5 else 3;
-    if (pos.* + enrichment_lifecycle_field_count > encoded.len) return error.InvalidMetadataTransitionEncoding;
-    const enrichment_retrying = encoded[pos.*] != 0;
-    pos.* += 1;
-    const enrichment_worker_failed = encoded[pos.*] != 0;
-    pos.* += 1;
-    const enrichment_worker_started = if (version >= 8) blk: {
-        const value = encoded[pos.*] != 0;
+    const enrichment = if (version >= 9)
+        try readRuntimeEnrichmentStatusRecord(alloc, encoded, pos)
+    else blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const enabled = encoded[pos.*] != 0;
         pos.* += 1;
-        break :blk value;
-    } else false;
-    const enrichment_stalled = if (version >= 8) blk: {
-        const value = encoded[pos.*] != 0;
+        const target_sequence = try readInt(encoded, pos, u64);
+        const applied_sequence = try readInt(encoded, pos, u64);
+        const lifecycle_field_count: usize = if (version >= 8) 4 else 2;
+        if (pos.* + lifecycle_field_count > encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const retrying = encoded[pos.*] != 0;
         pos.* += 1;
-        break :blk value;
-    } else false;
+        const worker_failed = encoded[pos.*] != 0;
+        pos.* += 1;
+        const worker_started = if (version >= 8) started: {
+            const value = encoded[pos.*] != 0;
+            pos.* += 1;
+            break :started value;
+        } else false;
+        const stalled = if (version >= 8) stalled_value: {
+            const value = encoded[pos.*] != 0;
+            pos.* += 1;
+            break :stalled_value value;
+        } else false;
+        break :blk metadata.RuntimeEnrichmentStatusReport{
+            .enabled = enabled,
+            .target_sequence = target_sequence,
+            .applied_sequence = applied_sequence,
+            .projection_checkpoint_status = try alloc.dupe(u8, if (enabled) "rebuilding" else "clean"),
+            .retrying = retrying,
+            .worker_failed = worker_failed,
+            .worker_started = worker_started,
+            .stalled = stalled,
+        };
+    };
+    errdefer alloc.free(enrichment.projection_checkpoint_status);
+    if (pos.* + 4 > encoded.len) return error.InvalidMetadataTransitionEncoding;
     const async_indexing_active = encoded[pos.*] != 0;
     pos.* += 1;
-    if (pos.* + 3 > encoded.len) return error.InvalidMetadataTransitionEncoding;
     const async_startup_active = encoded[pos.*] != 0;
     pos.* += 1;
     const async_dense_catch_up_active = encoded[pos.*] != 0;
@@ -3858,13 +3999,7 @@ fn readRuntimeGroupStatusRecord(
         .disk_bytes_known = disk_bytes_known,
         .created_at_millis = created_at_millis,
         .index_count = index_count,
-        .enrichment_enabled = enrichment_enabled,
-        .enrichment_target_sequence = enrichment_target_sequence,
-        .enrichment_applied_sequence = enrichment_applied_sequence,
-        .enrichment_retrying = enrichment_retrying,
-        .enrichment_worker_failed = enrichment_worker_failed,
-        .enrichment_worker_started = enrichment_worker_started,
-        .enrichment_stalled = enrichment_stalled,
+        .enrichment = enrichment,
         .async_indexing_active = async_indexing_active,
         .async_startup_active = async_startup_active,
         .async_dense_catch_up_active = async_dense_catch_up_active,
@@ -4098,6 +4233,7 @@ fn appendGroupStatusRecord(
     try appendInt(alloc, out, u64, record.raft_applied_index);
     try appendInt(alloc, out, u64, record.doc_count);
     try appendInt(alloc, out, u64, record.disk_bytes);
+    try out.append(alloc, if (record.disk_bytes_known) 1 else 0);
     try out.append(alloc, if (record.empty) 1 else 0);
     try appendInt(alloc, out, u32, 0);
     try appendInt(alloc, out, u64, record.updated_at_millis);
@@ -4122,12 +4258,18 @@ fn readGroupStatusRecord(
 ) !metadata.GroupStatusReport {
     _ = alloc;
     const version = try readInt(encoded, pos, u16);
-    if (version != 1 and version != group_status_record_version) return error.InvalidMetadataTransitionEncoding;
+    if (version == 0 or version > group_status_record_version) return error.InvalidMetadataTransitionEncoding;
     const group_id = try readInt(encoded, pos, u64);
     const relocation_generation = if (version >= 2) try readInt(encoded, pos, u64) else 0;
     const raft_applied_index = if (version >= 2) try readInt(encoded, pos, u64) else 0;
     const doc_count = try readInt(encoded, pos, u64);
     const disk_bytes = try readInt(encoded, pos, u64);
+    const disk_bytes_known = if (version >= 3) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const value = encoded[pos.*] != 0;
+        pos.* += 1;
+        break :blk value;
+    } else false;
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
     const empty = encoded[pos.*] != 0;
     pos.* += 1;
@@ -4195,6 +4337,7 @@ fn readGroupStatusRecord(
         .raft_applied_index = raft_applied_index,
         .doc_count = doc_count,
         .disk_bytes = disk_bytes,
+        .disk_bytes_known = disk_bytes_known,
         .empty = empty,
         .created_at_millis = created_at_millis,
         .updated_at_millis = updated_at_millis,
@@ -7156,6 +7299,8 @@ test "metadata raft apply store transition codec preserves exact raft voter iden
     const fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 101, 102, 104 }, null);
     var group_statuses = [_]metadata.GroupStatusReport{.{
         .group_id = 5101,
+        .disk_bytes = 4096,
+        .disk_bytes_known = true,
         .local_leader = true,
         .local_voter = true,
         .voter_count = 3,
@@ -7179,6 +7324,8 @@ test "metadata raft apply store transition codec preserves exact raft voter iden
     const statuses = decoded.upsert_store.group_statuses;
     try std.testing.expectEqual(@as(usize, 1), statuses.len);
     try std.testing.expect(statuses[0].voter_set_known);
+    try std.testing.expect(statuses[0].disk_bytes_known);
+    try std.testing.expectEqual(@as(u64, 4096), statuses[0].disk_bytes);
     try std.testing.expectEqual(@as(u16, 3), statuses[0].voter_count);
     try std.testing.expectEqualSlices(u8, &fingerprint, &statuses[0].voter_set_fingerprint);
 }
@@ -7371,8 +7518,14 @@ test "metadata raft apply store runtime status codec preserves document identity
         .freshness = "fresh",
         .disk_bytes = 4096,
         .disk_bytes_known = true,
-        .enrichment_worker_started = true,
-        .enrichment_stalled = true,
+        .enrichment = .{
+            .projection_checkpoint_status = "rebuilding",
+            .projection_checkpoint_config_hash = std.math.maxInt(u64) - 7,
+            .processed_requests = 17,
+            .embed_batches_completed = 3,
+            .worker_started = true,
+            .stalled = true,
+        },
         .doc_identity = .{
             .namespace_table_id = 1,
             .namespace_shard_id = 10,
@@ -7427,8 +7580,12 @@ test "metadata raft apply store runtime status codec preserves document identity
     const status = decoded.runtime_statuses[0];
     try std.testing.expectEqual(@as(u64, 4096), status.disk_bytes);
     try std.testing.expect(status.disk_bytes_known);
-    try std.testing.expect(status.enrichment_worker_started);
-    try std.testing.expect(status.enrichment_stalled);
+    try std.testing.expect(status.enrichment.worker_started);
+    try std.testing.expect(status.enrichment.stalled);
+    try std.testing.expectEqual(@as(u64, 17), status.enrichment.processed_requests);
+    try std.testing.expectEqual(@as(u64, 3), status.enrichment.embed_batches_completed);
+    try std.testing.expectEqual(std.math.maxInt(u64) - 7, status.enrichment.projection_checkpoint_config_hash);
+    try std.testing.expectEqualStrings("rebuilding", status.enrichment.projection_checkpoint_status);
     try std.testing.expectEqual(@as(u64, 1), status.doc_identity.namespace_table_id);
     try std.testing.expectEqual(@as(u64, 10), status.doc_identity.namespace_shard_id);
     try std.testing.expectEqual(@as(u64, 1001), status.doc_identity.namespace_range_id);

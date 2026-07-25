@@ -187,6 +187,7 @@ pub const GroupStatusReport = struct {
     raft_applied_index: u64 = 0,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
+    disk_bytes_known: bool = false,
     empty: bool = true,
     created_at_millis: u64 = 0,
     updated_at_millis: u64 = 0,
@@ -278,6 +279,51 @@ pub const StoreStatusReport = struct {
     runtime_statuses: []RuntimeGroupStatusReport = &.{},
 };
 
+pub const RuntimeEnrichmentStatusReport = struct {
+    enabled: bool = false,
+    lease_owned: bool = true,
+    has_lease: bool = false,
+    acquisition_count: u64 = 0,
+    lease_acquire_failures: u64 = 0,
+    lost_leases: u64 = 0,
+    last_acquired_ms: u64 = 0,
+    target_sequence: u64 = 0,
+    applied_sequence: u64 = 0,
+    projection_checkpoint_status: []const u8 = "clean",
+    projection_checkpoint_applied_sequence: u64 = 0,
+    projection_checkpoint_generation: u64 = 0,
+    projection_checkpoint_config_hash: u64 = 0,
+    checkpoint_replay_tail_sequence_count: u64 = 0,
+    processed_requests: u64 = 0,
+    error_count: u64 = 0,
+    retryable_error_count: u64 = 0,
+    fatal_error_count: u64 = 0,
+    retrying: bool = false,
+    worker_failed: bool = false,
+    worker_started: bool = false,
+    stalled: bool = false,
+    skip_by_hash_count: u64 = 0,
+    skipped_source_count: u64 = 0,
+    codec_decode_failures: u64 = 0,
+    embed_batches_started: u64 = 0,
+    embed_batches_completed: u64 = 0,
+    embed_items_started: u64 = 0,
+    embed_items_completed: u64 = 0,
+    active_embed_batch_items: u64 = 0,
+    active_embed_batch_bytes: u64 = 0,
+    active_embed_batch_max_bytes: u64 = 0,
+    active_embed_batch_started_ms: u64 = 0,
+    last_embed_batch_items: u64 = 0,
+    last_embed_batch_bytes: u64 = 0,
+    last_embed_batch_max_bytes: u64 = 0,
+    last_embed_batch_ns: u64 = 0,
+    total_embed_ns: u64 = 0,
+    dense_artifact_bytes_written: u64 = 0,
+    sparse_artifact_bytes_written: u64 = 0,
+    chunk_artifact_bytes_written: u64 = 0,
+    artifact_bytes_written: u64 = 0,
+};
+
 pub const RuntimeGroupStatusReport = struct {
     table_id: u64 = 0,
     table_name: []const u8 = "",
@@ -295,13 +341,7 @@ pub const RuntimeGroupStatusReport = struct {
     disk_bytes_known: bool = false,
     created_at_millis: u64 = 0,
     index_count: u32 = 0,
-    enrichment_enabled: bool = false,
-    enrichment_target_sequence: u64 = 0,
-    enrichment_applied_sequence: u64 = 0,
-    enrichment_retrying: bool = false,
-    enrichment_worker_failed: bool = false,
-    enrichment_worker_started: bool = false,
-    enrichment_stalled: bool = false,
+    enrichment: RuntimeEnrichmentStatusReport = .{},
     async_indexing_active: bool = false,
     async_startup_active: bool = false,
     async_dense_catch_up_active: bool = false,
@@ -1251,6 +1291,7 @@ pub fn cloneGroupStatus(alloc: std.mem.Allocator, record: GroupStatusReport) !Gr
         .raft_applied_index = record.raft_applied_index,
         .doc_count = record.doc_count,
         .disk_bytes = record.disk_bytes,
+        .disk_bytes_known = record.disk_bytes_known,
         .empty = record.empty,
         .created_at_millis = record.created_at_millis,
         .updated_at_millis = record.updated_at_millis,
@@ -1312,9 +1353,11 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
     errdefer alloc.free(source);
     const freshness = try alloc.dupe(u8, record.freshness);
     errdefer alloc.free(freshness);
+    const projection_checkpoint_status = try alloc.dupe(u8, record.enrichment.projection_checkpoint_status);
+    errdefer alloc.free(projection_checkpoint_status);
     const indexes = try cloneRuntimeIndexStatusReports(alloc, record.indexes);
     errdefer freeRuntimeIndexStatusReports(alloc, indexes);
-    return .{
+    var result: RuntimeGroupStatusReport = .{
         .table_id = record.table_id,
         .table_name = table_name,
         .group_id = record.group_id,
@@ -1331,13 +1374,7 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .disk_bytes_known = record.disk_bytes_known,
         .created_at_millis = record.created_at_millis,
         .index_count = record.index_count,
-        .enrichment_enabled = record.enrichment_enabled,
-        .enrichment_target_sequence = record.enrichment_target_sequence,
-        .enrichment_applied_sequence = record.enrichment_applied_sequence,
-        .enrichment_retrying = record.enrichment_retrying,
-        .enrichment_worker_failed = record.enrichment_worker_failed,
-        .enrichment_worker_started = record.enrichment_worker_started,
-        .enrichment_stalled = record.enrichment_stalled,
+        .enrichment = record.enrichment,
         .async_indexing_active = record.async_indexing_active,
         .async_startup_active = record.async_startup_active,
         .async_dense_catch_up_active = record.async_dense_catch_up_active,
@@ -1346,12 +1383,15 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .doc_set_planning = record.doc_set_planning,
         .indexes = indexes,
     };
+    result.enrichment.projection_checkpoint_status = projection_checkpoint_status;
+    return result;
 }
 
 pub fn freeRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGroupStatusReport) void {
     alloc.free(record.table_name);
     alloc.free(record.source);
     alloc.free(record.freshness);
+    alloc.free(record.enrichment.projection_checkpoint_status);
     freeRuntimeIndexStatusReports(alloc, record.indexes);
 }
 

@@ -958,6 +958,161 @@ pub const ApiHttpServer = struct {
     const JoinShuffleJobState = distributed_join.JoinShuffleJobState;
     const extractJsonPathValue = distributed_join.extractJsonPathValue;
     const parseSupportedJoinRequest = distributed_join.parseSupportedJoinRequest;
+
+    const RuntimeStatusOwnerKey = struct {
+        group_id: u64,
+        owner_id: u64,
+    };
+
+    const RuntimeStatusSnapshotIndex = struct {
+        alloc: std.mem.Allocator,
+        store_count: usize = 0,
+        table_by_group: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+        table_id_by_name: std.StringHashMapUnmanaged(u64) = .empty,
+        groups_by_table: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(u64)) = .empty,
+        groups_with_placements: std.AutoHashMapUnmanaged(u64, void) = .empty,
+        store_owners: std.AutoHashMapUnmanaged(RuntimeStatusOwnerKey, void) = .empty,
+        node_owners: std.AutoHashMapUnmanaged(RuntimeStatusOwnerKey, void) = .empty,
+        reports_by_table: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(*const metadata_table_manager.RuntimeGroupStatusReport)) = .empty,
+
+        fn init(
+            alloc: std.mem.Allocator,
+            snapshot: *const metadata_api.AdminSnapshot,
+        ) !RuntimeStatusSnapshotIndex {
+            var index = RuntimeStatusSnapshotIndex{
+                .alloc = alloc,
+                .store_count = snapshot.stores.len,
+            };
+            errdefer index.deinit();
+
+            try index.table_by_group.ensureTotalCapacity(
+                alloc,
+                std.math.cast(u32, snapshot.ranges.len) orelse return error.TooManyRuntimeStatuses,
+            );
+            for (snapshot.ranges) |range| {
+                index.table_by_group.putAssumeCapacity(range.group_id, range.table_id);
+                const entry = try index.groups_by_table.getOrPut(alloc, range.table_id);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(alloc, range.group_id);
+            }
+
+            var table_names = std.AutoHashMapUnmanaged(u64, []const u8).empty;
+            defer table_names.deinit(alloc);
+            try table_names.ensureTotalCapacity(
+                alloc,
+                std.math.cast(u32, snapshot.tables.len) orelse return error.TooManyRuntimeStatuses,
+            );
+            try index.table_id_by_name.ensureTotalCapacity(
+                alloc,
+                std.math.cast(u32, snapshot.tables.len) orelse return error.TooManyRuntimeStatuses,
+            );
+            for (snapshot.tables) |table| {
+                table_names.putAssumeCapacity(table.table_id, table.name);
+                index.table_id_by_name.putAssumeCapacity(table.name, table.table_id);
+            }
+
+            for (snapshot.placement_intents) |intent| {
+                try index.groups_with_placements.put(alloc, intent.record.group_id, {});
+                if (intent.store_id != 0) {
+                    try index.store_owners.put(alloc, .{
+                        .group_id = intent.record.group_id,
+                        .owner_id = intent.store_id,
+                    }, {});
+                }
+                if (intent.record.local_node_id != 0) {
+                    try index.node_owners.put(alloc, .{
+                        .group_id = intent.record.group_id,
+                        .owner_id = intent.record.local_node_id,
+                    }, {});
+                }
+                for (intent.peer_node_ids) |peer_node_id| {
+                    try index.node_owners.put(alloc, .{
+                        .group_id = intent.record.group_id,
+                        .owner_id = peer_node_id,
+                    }, {});
+                }
+            }
+
+            for (snapshot.stores) |*store| {
+                for (store.runtime_statuses) |*report| {
+                    const table_id = index.table_by_group.get(report.group_id) orelse continue;
+                    if (report.table_id != 0 and report.table_id != table_id) continue;
+                    if (report.table_name.len != 0) {
+                        const table_name = table_names.get(table_id) orelse continue;
+                        if (!std.mem.eql(u8, report.table_name, table_name)) continue;
+                    }
+                    if (index.groups_with_placements.contains(report.group_id) and
+                        !index.store_owners.contains(.{ .group_id = report.group_id, .owner_id = store.store_id }) and
+                        !index.node_owners.contains(.{ .group_id = report.group_id, .owner_id = store.node_id }))
+                    {
+                        continue;
+                    }
+                    const entry = try index.reports_by_table.getOrPut(alloc, table_id);
+                    if (!entry.found_existing) entry.value_ptr.* = .empty;
+                    try entry.value_ptr.append(alloc, report);
+                }
+            }
+            return index;
+        }
+
+        fn deinit(self: *RuntimeStatusSnapshotIndex) void {
+            var groups_iterator = self.groups_by_table.valueIterator();
+            while (groups_iterator.next()) |groups| groups.deinit(self.alloc);
+            self.groups_by_table.deinit(self.alloc);
+            var iterator = self.reports_by_table.valueIterator();
+            while (iterator.next()) |reports| reports.deinit(self.alloc);
+            self.reports_by_table.deinit(self.alloc);
+            self.table_by_group.deinit(self.alloc);
+            self.table_id_by_name.deinit(self.alloc);
+            self.groups_with_placements.deinit(self.alloc);
+            self.store_owners.deinit(self.alloc);
+            self.node_owners.deinit(self.alloc);
+            self.* = undefined;
+        }
+
+        fn reportsForTable(
+            self: *const RuntimeStatusSnapshotIndex,
+            table_id: u64,
+        ) []const *const metadata_table_manager.RuntimeGroupStatusReport {
+            const reports = self.reports_by_table.get(table_id) orelse return &.{};
+            return reports.items;
+        }
+
+        fn groupIdsForTable(self: *const RuntimeStatusSnapshotIndex, table_id: u64) []const u64 {
+            const groups = self.groups_by_table.get(table_id) orelse return &.{};
+            return groups.items;
+        }
+
+        fn tableId(self: *const RuntimeStatusSnapshotIndex, table_name: []const u8) ?u64 {
+            return self.table_id_by_name.get(table_name);
+        }
+
+        fn statusAllowed(
+            self: *const RuntimeStatusSnapshotIndex,
+            table_name: []const u8,
+            status: runtime_status.LocalTableRuntimeStatus,
+            fallback_node_id: u64,
+        ) bool {
+            const table_id = self.table_id_by_name.get(table_name) orelse return true;
+            if (self.table_by_group.get(status.group_id)) |owner_table_id| {
+                if (owner_table_id != table_id) return false;
+            } else if (self.groups_by_table.contains(table_id)) {
+                return false;
+            }
+            if (!self.groups_with_placements.contains(status.group_id)) return true;
+            if (status.metadata.store_id != 0 and self.store_owners.contains(.{
+                .group_id = status.group_id,
+                .owner_id = status.metadata.store_id,
+            })) return true;
+            const node_id = if (status.metadata.node_id != 0) status.metadata.node_id else fallback_node_id;
+            if (node_id != 0 and self.node_owners.contains(.{
+                .group_id = status.group_id,
+                .owner_id = node_id,
+            })) return true;
+            return status.metadata.store_id == 0 and node_id == 0 and self.store_count <= 1;
+        }
+    };
+
     fn encodeJoinPartitionRequest(
         _: *const ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -1637,16 +1792,22 @@ pub const ApiHttpServer = struct {
         }
 
         var stats: distributed_join.JoinTableStats = .{};
+        var all_sizes_known = true;
         for (snapshot.ranges) |range| {
             if (range.table_id != table.table_id) continue;
             const status = status_by_group.get(range.group_id) orelse return null;
-            if (!runtime_status.statusRuntimeFresh(status.*) or !status.disk_bytes_known) return null;
+            if (!runtime_status.statusRuntimeFresh(status.*)) return null;
             stats.row_count +|= @max(status.stats.source_doc_count, status.stats.doc_count);
-            stats.size_bytes +|= status.disk_bytes;
+            if (status.disk_bytes_known) {
+                stats.size_bytes +|= status.disk_bytes;
+            } else {
+                all_sizes_known = false;
+            }
             stats.shard_count += 1;
         }
         if (stats.shard_count == 0) return null;
-        stats.has_stats = true;
+        stats.row_count_known = true;
+        stats.size_bytes_known = all_sizes_known;
         return stats;
     }
 
@@ -1795,6 +1956,15 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         snapshot: ?*const metadata_api.AdminSnapshot,
     ) !?runtime_status.LocalTableRuntimeStatuses {
+        return try self.localTableRuntimeStatusesWithSnapshotIndex(table_name, snapshot, null);
+    }
+
+    fn localTableRuntimeStatusesWithSnapshotIndex(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+        snapshot_index: ?*const RuntimeStatusSnapshotIndex,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
         var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
         var item_indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
         defer item_indexes.deinit(self.alloc);
@@ -1814,12 +1984,16 @@ pub const ApiHttpServer = struct {
                     read_statuses_present = true;
                     errdefer owned.deinit(self.alloc);
                     read_needs_refresh = runtimeStatusesNeedWriterRefresh(owned.items);
-                    try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &item_indexes, &owned);
+                    try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, &items, &item_indexes, &owned);
                 }
             }
         }
         if (snapshot) |admin_snapshot| {
-            try self.appendRemoteRuntimeStatusesFromSnapshot(&items, &item_indexes, table_name, admin_snapshot);
+            if (snapshot_index) |index| {
+                try self.appendRemoteRuntimeStatusesFromIndex(&items, &item_indexes, table_name, index);
+            } else {
+                try self.appendRemoteRuntimeStatusesFromSnapshot(&items, &item_indexes, table_name, admin_snapshot);
+            }
         }
         const should_query_writes = if (snapshot == null)
             self.table_reads == null or !read_statuses_present or read_needs_refresh
@@ -1835,7 +2009,7 @@ pub const ApiHttpServer = struct {
             if (write_statuses) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
-                try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &item_indexes, &owned);
+                try self.appendLocalRuntimeStatuses(table_name, snapshot, snapshot_index, &items, &item_indexes, &owned);
             }
         }
         if (items.items.len == 0) {
@@ -1880,6 +2054,7 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         table_name: []const u8,
         snapshot: ?*const metadata_api.AdminSnapshot,
+        snapshot_index: ?*const RuntimeStatusSnapshotIndex,
         items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
         item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
         owned: *runtime_status.LocalTableRuntimeStatuses,
@@ -1888,7 +2063,15 @@ pub const ApiHttpServer = struct {
         const additional_indexes = std.math.cast(u32, owned.items.len) orelse return error.TooManyRuntimeStatuses;
         try item_indexes.ensureUnusedCapacity(self.alloc, additional_indexes);
         for (owned.items) |item| {
-            if (!self.localRuntimeStatusAllowedBySnapshot(table_name, snapshot, item)) {
+            const allowed = if (snapshot_index) |index|
+                index.statusAllowed(
+                    table_name,
+                    item,
+                    if (self.cfg.session_router) |router| router.localNodeId() else 0,
+                )
+            else
+                self.localRuntimeStatusAllowedBySnapshot(table_name, snapshot, item);
+            if (!allowed) {
                 var discard = item;
                 discard.deinit(self.alloc);
                 continue;
@@ -1925,6 +2108,23 @@ pub const ApiHttpServer = struct {
                 try upsertRuntimeStatus(self.alloc, items, item_indexes, &status);
                 consumed = true;
             }
+        }
+    }
+
+    fn appendRemoteRuntimeStatusesFromIndex(
+        self: *ApiHttpServer,
+        items: *std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus),
+        item_indexes: *std.AutoHashMapUnmanaged(u64, usize),
+        table_name: []const u8,
+        snapshot_index: *const RuntimeStatusSnapshotIndex,
+    ) !void {
+        const table_id = snapshot_index.tableId(table_name) orelse return;
+        for (snapshot_index.reportsForTable(table_id)) |report| {
+            var status = try localRuntimeStatusFromRemoteReport(self.alloc, report.*);
+            var consumed = false;
+            errdefer if (!consumed) status.deinit(self.alloc);
+            try upsertRuntimeStatus(self.alloc, items, item_indexes, &status);
+            consumed = true;
         }
     }
 
@@ -2094,15 +2294,7 @@ pub const ApiHttpServer = struct {
                 .doc_count = report.doc_count,
                 .index_count = report.index_count,
                 .indexes = indexes,
-                .enrichment = .{
-                    .enabled = report.enrichment_enabled,
-                    .target_sequence = report.enrichment_target_sequence,
-                    .applied_sequence = report.enrichment_applied_sequence,
-                    .retrying = report.enrichment_retrying,
-                    .worker_failed = report.enrichment_worker_failed,
-                    .worker_started = report.enrichment_worker_started,
-                    .stalled = report.enrichment_stalled,
-                },
+                .enrichment = enrichmentStatsFromRemoteReport(report.enrichment),
                 .async_indexing = .{
                     .startup = .{ .active = report.async_startup_active },
                     .dense_catch_up = .{ .active = report.async_dense_catch_up_active },
@@ -2112,6 +2304,16 @@ pub const ApiHttpServer = struct {
                 .doc_set_planning = docSetPlanningStatsFromRemoteReport(report.doc_set_planning),
             },
         };
+    }
+
+    fn enrichmentStatsFromRemoteReport(
+        report: metadata_table_manager.RuntimeEnrichmentStatusReport,
+    ) db_mod.types.EnrichmentStats {
+        var stats: db_mod.types.EnrichmentStats = .{};
+        inline for (std.meta.fields(metadata_table_manager.RuntimeEnrichmentStatusReport)) |field| {
+            @field(stats, field.name) = @field(report, field.name);
+        }
+        return stats;
     }
 
     fn docIdentityStatsFromRemoteReport(
@@ -2220,19 +2422,39 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         snapshot: ?*const metadata_api.AdminSnapshot,
     ) !?tables_api.TableStorageStatus {
-        const table = if (snapshot) |value|
-            tables_api.findTableByName(value, table_name) orelse return null
+        return try self.bestEffortSingleTableStorageStatusWithSnapshotIndex(table_name, snapshot, null);
+    }
+
+    fn bestEffortSingleTableStorageStatusWithSnapshotIndex(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+        snapshot_index: ?*const RuntimeStatusSnapshotIndex,
+    ) !?tables_api.TableStorageStatus {
+        const table_id = if (snapshot) |value|
+            if (snapshot_index) |index|
+                index.tableId(table_name) orelse return null
+            else
+                (tables_api.findTableByName(value, table_name) orelse return null).table_id
         else
             null;
         var expected_group_count: usize = 0;
         if (snapshot) |value| {
-            for (value.ranges) |range| {
-                if (range.table_id == table.?.table_id) expected_group_count += 1;
+            if (snapshot_index) |index| {
+                expected_group_count = index.groupIdsForTable(table_id.?).len;
+            } else {
+                for (value.ranges) |range| {
+                    if (range.table_id == table_id.?) expected_group_count += 1;
+                }
             }
             if (expected_group_count == 0) return null;
         }
 
-        var local_statuses = (try self.localTableRuntimeStatusesWithSnapshot(table_name, snapshot)) orelse return null;
+        var local_statuses = (try self.localTableRuntimeStatusesWithSnapshotIndex(
+            table_name,
+            snapshot,
+            snapshot_index,
+        )) orelse return null;
         defer local_statuses.deinit(self.alloc);
 
         var doc_count: u64 = 0;
@@ -2253,26 +2475,46 @@ pub const ApiHttpServer = struct {
             }
         }
         if (snapshot) |value| {
-            for (value.ranges) |range| {
-                if (range.table_id != table.?.table_id) continue;
-                const item = status_by_group.get(range.group_id) orelse {
-                    disk_usage_complete = false;
-                    continue;
-                };
-                // Derived visibility may trail a weak-sync primary write. The
-                // identity-backed source count is the O(1) authority; retain
-                // the derived count as a compatibility floor.
-                doc_count +|= @max(item.stats.source_doc_count, item.stats.doc_count);
-                if (!runtime_status.statusRuntimeFresh(item.*)) {
-                    disk_usage_complete = false;
-                    continue;
+            if (snapshot_index) |index| {
+                for (index.groupIdsForTable(table_id.?)) |group_id| {
+                    const item = status_by_group.get(group_id) orelse {
+                        disk_usage_complete = false;
+                        continue;
+                    };
+                    doc_count +|= @max(item.stats.source_doc_count, item.stats.doc_count);
+                    if (!runtime_status.statusRuntimeFresh(item.*)) {
+                        disk_usage_complete = false;
+                        continue;
+                    }
+                    fresh_group_count += 1;
+                    if (!item.disk_bytes_known) {
+                        disk_usage_complete = false;
+                        continue;
+                    }
+                    disk_usage +|= item.disk_bytes;
                 }
-                fresh_group_count += 1;
-                if (!item.disk_bytes_known) {
-                    disk_usage_complete = false;
-                    continue;
+            } else {
+                for (value.ranges) |range| {
+                    if (range.table_id != table_id.?) continue;
+                    const item = status_by_group.get(range.group_id) orelse {
+                        disk_usage_complete = false;
+                        continue;
+                    };
+                    // Derived visibility may trail a weak-sync primary write. The
+                    // identity-backed source count is the O(1) authority; retain
+                    // the derived count as a compatibility floor.
+                    doc_count +|= @max(item.stats.source_doc_count, item.stats.doc_count);
+                    if (!runtime_status.statusRuntimeFresh(item.*)) {
+                        disk_usage_complete = false;
+                        continue;
+                    }
+                    fresh_group_count += 1;
+                    if (!item.disk_bytes_known) {
+                        disk_usage_complete = false;
+                        continue;
+                    }
+                    disk_usage +|= item.disk_bytes;
                 }
-                disk_usage +|= item.disk_bytes;
             }
         } else {
             for (local_statuses.items) |item| {
@@ -5418,12 +5660,18 @@ pub const ApiHttpServer = struct {
     ) !?[]tables_api.TableStorageStatus {
         var items = std.ArrayListUnmanaged(tables_api.TableStorageStatus).empty;
         defer items.deinit(alloc);
+        var runtime_index = try RuntimeStatusSnapshotIndex.init(alloc, snapshot);
+        defer runtime_index.deinit();
 
         for (snapshot.tables) |*table| {
             if (prefix) |pfx| {
                 if (!std.mem.startsWith(u8, table.name, pfx)) continue;
             }
-            const status = (try self.bestEffortSingleTableStorageStatusWithSnapshot(table.name, snapshot)) orelse continue;
+            const status = (try self.bestEffortSingleTableStorageStatusWithSnapshotIndex(
+                table.name,
+                snapshot,
+                &runtime_index,
+            )) orelse continue;
             try items.append(alloc, status);
         }
 
@@ -24715,8 +24963,12 @@ test "remote runtime status reports replay debt separately from active catch-up"
         .freshness = "fresh",
         .doc_count = 56_250,
         .index_count = 1,
-        .enrichment_worker_started = true,
-        .enrichment_stalled = true,
+        .enrichment = .{
+            .projection_checkpoint_status = "rebuilding",
+            .processed_requests = 17,
+            .worker_started = true,
+            .stalled = true,
+        },
         .async_dense_catch_up_active = false,
         .doc_identity = .{
             .namespace_table_id = 1,
@@ -24776,6 +25028,8 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(@as(u64, 2), status.stats.doc_set_planning.stale_identity_generation_rejection_count);
     try std.testing.expect(status.stats.enrichment.worker_started);
     try std.testing.expect(status.stats.enrichment.stalled);
+    try std.testing.expectEqual(@as(u64, 17), status.stats.enrichment.processed_requests);
+    try std.testing.expectEqualStrings("rebuilding", status.stats.enrichment.projection_checkpoint_status);
 }
 
 test "table storage status sums complete fresh shard disk usage" {
@@ -24847,7 +25101,8 @@ test "table storage status sums complete fresh shard disk usage" {
     try std.testing.expectEqual(@as(?u64, 12_288), complete.disk_usage);
 
     const join_stats = (try server.joinContext().localTableStats("docs", &snapshot)).?;
-    try std.testing.expect(join_stats.has_stats);
+    try std.testing.expect(join_stats.row_count_known);
+    try std.testing.expect(join_stats.size_bytes_known);
     try std.testing.expectEqual(@as(u64, 12), join_stats.row_count);
     try std.testing.expectEqual(@as(u64, 12_288), join_stats.size_bytes);
     try std.testing.expectEqual(@as(usize, 2), join_stats.shard_count);
@@ -24855,9 +25110,72 @@ test "table storage status sums complete fresh shard disk usage" {
     group_11[0].disk_bytes_known = false;
     const incomplete = (try server.bestEffortSingleTableStorageStatusWithSnapshot("docs", &snapshot)).?;
     try std.testing.expectEqual(@as(?u64, null), incomplete.disk_usage);
+    const row_only_join_stats = (try server.joinContext().localTableStats("docs", &snapshot)).?;
+    try std.testing.expect(row_only_join_stats.row_count_known);
+    try std.testing.expect(!row_only_join_stats.size_bytes_known);
+    try std.testing.expectEqual(@as(u64, 12), row_only_join_stats.row_count);
 
     snapshot.ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]);
     try std.testing.expect((try server.bestEffortSingleTableStorageStatusWithSnapshot("docs", &snapshot)) == null);
+}
+
+test "table storage status indexes one distributed snapshot by table and owner" {
+    const alloc = std.testing.allocator;
+    var docs_reports = [_]metadata_table_manager.RuntimeGroupStatusReport{
+        .{
+            .table_id = 1,
+            .table_name = "docs",
+            .group_id = 10,
+            .store_id = 20,
+            .node_id = 30,
+        },
+        .{
+            .table_id = 1,
+            .table_name = "docs",
+            .group_id = 10,
+            .store_id = 99,
+            .node_id = 99,
+        },
+    };
+    var customer_reports = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .table_id = 2,
+        .table_name = "customers",
+        .group_id = 11,
+        .store_id = 21,
+        .node_id = 31,
+    }};
+    var stores = [_]metadata_table_manager.StoreRecord{
+        .{ .store_id = 20, .node_id = 30, .runtime_statuses = docs_reports[0..1] },
+        .{ .store_id = 99, .node_id = 99, .runtime_statuses = docs_reports[1..2] },
+        .{ .store_id = 21, .node_id = 31, .runtime_statuses = customer_reports[0..] },
+    };
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+            .{ .table_id = 1, .name = "docs", .placement_role = "data" },
+            .{ .table_id = 2, .name = "customers", .placement_role = "data" },
+        })[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = null },
+            .{ .group_id = 11, .table_id = 2, .start_key = "", .end_key = null },
+        })[0..]),
+        .stores = stores[0..],
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{
+            .{ .record = .{ .group_id = 10, .replica_id = 1, .local_node_id = 30 }, .store_id = 20 },
+            .{ .record = .{ .group_id = 11, .replica_id = 1, .local_node_id = 31 }, .store_id = 21 },
+        })[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    var index = try ApiHttpServer.RuntimeStatusSnapshotIndex.init(alloc, &snapshot);
+    defer index.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), index.tableId("docs"));
+    try std.testing.expectEqualSlices(u64, &.{10}, index.groupIdsForTable(1));
+    try std.testing.expectEqualSlices(u64, &.{11}, index.groupIdsForTable(2));
+    try std.testing.expectEqual(@as(usize, 1), index.reportsForTable(1).len);
+    try std.testing.expectEqual(@as(u64, 20), index.reportsForTable(1)[0].store_id);
+    try std.testing.expectEqual(@as(usize, 1), index.reportsForTable(2).len);
 }
 
 test "api index status ignores propagated runtime status from removed owner" {
@@ -27517,8 +27835,8 @@ test "api http server join planner uses snapshot stats for low-selectivity looku
         .{ .group_id = 201, .table_id = 2, .start_key = "", .end_key = null },
     };
     var merged = [_]metadata_reconciler.MergedGroupStatus{
-        .{ .group_id = 101, .doc_count = 100_000, .disk_bytes = 64 * 1024 * 1024, .empty = false },
-        .{ .group_id = 201, .doc_count = 100_000, .disk_bytes = 64 * 1024 * 1024, .empty = false },
+        .{ .group_id = 101, .doc_count = 100_000, .disk_bytes = 64 * 1024 * 1024, .disk_bytes_known = true, .empty = false },
+        .{ .group_id = 201, .doc_count = 100_000, .disk_bytes = 64 * 1024 * 1024, .disk_bytes_known = true, .empty = false },
     };
     var fake = FakeSource{
         .snapshot = .{
@@ -27623,6 +27941,7 @@ test "api http server join planner uses complete fresh local stats before metada
                 .group_id = group_id,
                 .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
                 .disk_bytes = 1024,
+                .disk_bytes_known = true,
                 .stats = .{ .doc_count = doc_count },
             };
             return .{ .items = items };
@@ -27788,8 +28107,8 @@ test "api http server join planner selects shuffle for large inner joins" {
         .{ .group_id = 201, .table_id = 2, .start_key = "", .end_key = null },
     };
     var merged = [_]metadata_reconciler.MergedGroupStatus{
-        .{ .group_id = 101, .doc_count = 200_000, .disk_bytes = 128 * 1024 * 1024, .empty = false },
-        .{ .group_id = 201, .doc_count = 100, .disk_bytes = 128 * 1024 * 1024, .empty = false },
+        .{ .group_id = 101, .doc_count = 200_000, .disk_bytes = 128 * 1024 * 1024, .disk_bytes_known = true, .empty = false },
+        .{ .group_id = 201, .doc_count = 100, .disk_bytes = 128 * 1024 * 1024, .disk_bytes_known = true, .empty = false },
     };
     var fake = FakeSource{
         .snapshot = .{
@@ -27872,8 +28191,8 @@ test "api http server join planner falls back from shuffle to broadcast for righ
         .{ .group_id = 201, .table_id = 2, .start_key = "", .end_key = null },
     };
     var merged = [_]metadata_reconciler.MergedGroupStatus{
-        .{ .group_id = 101, .doc_count = 200_000, .disk_bytes = 128 * 1024 * 1024, .empty = false },
-        .{ .group_id = 201, .doc_count = 100_000, .disk_bytes = 128 * 1024 * 1024, .empty = false },
+        .{ .group_id = 101, .doc_count = 200_000, .disk_bytes = 128 * 1024 * 1024, .disk_bytes_known = true, .empty = false },
+        .{ .group_id = 201, .doc_count = 100_000, .disk_bytes = 128 * 1024 * 1024, .disk_bytes_known = true, .empty = false },
     };
     var fake = FakeSource{
         .snapshot = .{

@@ -69,6 +69,7 @@ pub const StoreRecord = table_manager.StoreRecord;
 pub const GroupStatusReport = table_manager.GroupStatusReport;
 pub const StoreStatusReport = table_manager.StoreStatusReport;
 pub const RuntimeGroupStatusReport = table_manager.RuntimeGroupStatusReport;
+pub const RuntimeEnrichmentStatusReport = table_manager.RuntimeEnrichmentStatusReport;
 pub const RuntimeDocIdentityStatusReport = table_manager.RuntimeDocIdentityStatusReport;
 pub const RuntimeDocSetPlanningStatusReport = table_manager.RuntimeDocSetPlanningStatusReport;
 pub const RuntimeIndexStatusReport = table_manager.RuntimeIndexStatusReport;

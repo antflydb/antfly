@@ -9092,11 +9092,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -9210,8 +9207,9 @@ export interface components {
             projection_checkpoint_applied_sequence: number;
             /** Format: uint64 */
             projection_checkpoint_generation: number;
-            /** Format: uint64 */
-            projection_checkpoint_config_hash: number;
+            projection_checkpoint_config_fingerprint: string;
+            /** @description Whether every shard contributing to this status reports the same checkpoint generation and configuration identity. */
+            projection_checkpoint_identity_consistent: boolean;
             /** Format: uint64 */
             checkpoint_replay_tail_sequence_count: number;
             /** Format: uint64 */
@@ -9375,11 +9373,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -9510,11 +9505,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -9688,11 +9680,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.

@@ -1999,6 +1999,7 @@ const ParsedGroupStatus = struct {
     raft_applied_index: ?u64 = null,
     doc_count: ?u64 = null,
     disk_bytes: ?u64 = null,
+    disk_bytes_known: ?bool = null,
     empty: ?bool = null,
     created_at_millis: ?u64 = null,
     updated_at_millis: ?u64 = null,
@@ -2054,13 +2055,7 @@ const ParsedRuntimeGroupStatus = struct {
     disk_bytes_known: ?bool = null,
     created_at_millis: ?u64 = null,
     index_count: ?u32 = null,
-    enrichment_enabled: ?bool = null,
-    enrichment_target_sequence: ?u64 = null,
-    enrichment_applied_sequence: ?u64 = null,
-    enrichment_retrying: ?bool = null,
-    enrichment_worker_failed: ?bool = null,
-    enrichment_worker_started: ?bool = null,
-    enrichment_stalled: ?bool = null,
+    enrichment: ?metadata_table_manager.RuntimeEnrichmentStatusReport = null,
     async_indexing_active: ?bool = null,
     async_startup_active: ?bool = null,
     async_dense_catch_up_active: ?bool = null,
@@ -2245,6 +2240,7 @@ fn cloneParsedGroupStatuses(
             .raft_applied_index = parsed.raft_applied_index orelse 0,
             .doc_count = parsed.doc_count orelse 0,
             .disk_bytes = parsed.disk_bytes orelse 0,
+            .disk_bytes_known = parsed.disk_bytes_known orelse false,
             .empty = parsed.empty orelse true,
             .created_at_millis = parsed.created_at_millis orelse 0,
             .updated_at_millis = parsed.updated_at_millis orelse 0,
@@ -2294,6 +2290,9 @@ fn cloneParsedRuntimeGroupStatus(
     errdefer alloc.free(source);
     const freshness = try alloc.dupe(u8, parsed.freshness orelse "unknown");
     errdefer alloc.free(freshness);
+    var enrichment = parsed.enrichment orelse metadata_table_manager.RuntimeEnrichmentStatusReport{};
+    enrichment.projection_checkpoint_status = try alloc.dupe(u8, enrichment.projection_checkpoint_status);
+    errdefer alloc.free(enrichment.projection_checkpoint_status);
     return .{
         .table_id = parsed.table_id orelse 0,
         .table_name = table_name,
@@ -2311,13 +2310,7 @@ fn cloneParsedRuntimeGroupStatus(
         .disk_bytes_known = parsed.disk_bytes_known orelse false,
         .created_at_millis = parsed.created_at_millis orelse 0,
         .index_count = parsed.index_count orelse @intCast(indexes.len),
-        .enrichment_enabled = parsed.enrichment_enabled orelse false,
-        .enrichment_target_sequence = parsed.enrichment_target_sequence orelse 0,
-        .enrichment_applied_sequence = parsed.enrichment_applied_sequence orelse 0,
-        .enrichment_retrying = parsed.enrichment_retrying orelse false,
-        .enrichment_worker_failed = parsed.enrichment_worker_failed orelse false,
-        .enrichment_worker_started = parsed.enrichment_worker_started orelse false,
-        .enrichment_stalled = parsed.enrichment_stalled orelse false,
+        .enrichment = enrichment,
         .async_indexing_active = parsed.async_indexing_active orelse false,
         .async_startup_active = parsed.async_startup_active orelse (parsed.async_indexing_active orelse false),
         .async_dense_catch_up_active = parsed.async_dense_catch_up_active orelse (parsed.async_indexing_active orelse false),

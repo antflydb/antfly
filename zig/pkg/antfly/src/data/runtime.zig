@@ -12003,6 +12003,7 @@ fn hashGroupStatus(hasher: *std.hash.Wyhash, status: antfly.metadata.table_manag
     hasher.update(std.mem.asBytes(&status.raft_applied_index));
     hasher.update(std.mem.asBytes(&status.doc_count));
     hasher.update(std.mem.asBytes(&status.disk_bytes));
+    hasher.update(std.mem.asBytes(&status.disk_bytes_known));
     hasher.update(std.mem.asBytes(&status.empty));
     hasher.update(std.mem.asBytes(&status.local_leader));
     hasher.update(std.mem.asBytes(&status.local_voter));
@@ -12040,6 +12041,8 @@ fn runtimeStatusReportFromLocalStatus(
     errdefer alloc.free(source);
     const freshness = try alloc.dupe(u8, @tagName(status.metadata.freshness));
     errdefer alloc.free(freshness);
+    const enrichment = try runtimeEnrichmentStatusReportFromStats(alloc, status.stats.enrichment);
+    errdefer alloc.free(enrichment.projection_checkpoint_status);
     return .{
         .table_id = table.table_id,
         .table_name = table_name,
@@ -12057,13 +12060,7 @@ fn runtimeStatusReportFromLocalStatus(
         .disk_bytes_known = status.disk_bytes_known,
         .created_at_millis = status.created_at_millis,
         .index_count = status.stats.index_count,
-        .enrichment_enabled = status.stats.enrichment.enabled,
-        .enrichment_target_sequence = status.stats.enrichment.target_sequence,
-        .enrichment_applied_sequence = status.stats.enrichment.applied_sequence,
-        .enrichment_retrying = status.stats.enrichment.retrying,
-        .enrichment_worker_failed = status.stats.enrichment.worker_failed,
-        .enrichment_worker_started = status.stats.enrichment.worker_started,
-        .enrichment_stalled = status.stats.enrichment.stalled,
+        .enrichment = enrichment,
         .async_indexing_active = status.stats.async_indexing.startup.active or
             status.stats.async_indexing.dense_catch_up.active or
             status.stats.async_indexing.bulk_coalescing.active_session,
@@ -12074,6 +12071,21 @@ fn runtimeStatusReportFromLocalStatus(
         .doc_set_planning = runtimeDocSetPlanningStatusReportFromStats(status.stats.doc_set_planning),
         .indexes = indexes,
     };
+}
+
+fn runtimeEnrichmentStatusReportFromStats(
+    alloc: std.mem.Allocator,
+    stats: antfly.db.types.EnrichmentStats,
+) !antfly.metadata.table_manager.RuntimeEnrichmentStatusReport {
+    var report: antfly.metadata.table_manager.RuntimeEnrichmentStatusReport = .{};
+    inline for (std.meta.fields(antfly.metadata.table_manager.RuntimeEnrichmentStatusReport)) |field| {
+        if (comptime std.mem.eql(u8, field.name, "projection_checkpoint_status")) {
+            @field(report, field.name) = try alloc.dupe(u8, @field(stats, field.name));
+        } else {
+            @field(report, field.name) = @field(stats, field.name);
+        }
+    }
+    return report;
 }
 
 fn runtimeDocIdentityStatusReportFromStats(
@@ -12534,6 +12546,7 @@ fn collectLocalGroupStatusFromDb(
         .group_id = group_id,
         .doc_count = source_doc_count,
         .disk_bytes = try directoryUsageBytes(alloc, db_path),
+        .disk_bytes_known = true,
         .empty = source_doc_count == 0,
         .created_at_millis = created_at_millis,
         .updated_at_millis = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)),
@@ -12692,7 +12705,8 @@ fn collectLocalGroupStatusFromRuntimeStatus(
     return .{
         .group_id = group_id,
         .doc_count = source_doc_count,
-        .disk_bytes = if (status.disk_bytes != 0) status.disk_bytes else fallback.disk_bytes,
+        .disk_bytes = if (status.disk_bytes_known) status.disk_bytes else fallback.disk_bytes,
+        .disk_bytes_known = status.disk_bytes_known or fallback.disk_bytes_known,
         .empty = source_doc_count == 0,
         .created_at_millis = if (status.created_at_millis != 0)
             status.created_at_millis

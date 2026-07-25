@@ -677,7 +677,7 @@ pub fn mergeHealthyGroupStatuses(
                 .group_id = runtime_status.group_id,
                 .node_id = store.node_id,
             })) continue;
-            if (runtime_status.doc_count == 0 and runtime_status.disk_bytes == 0 and !runtimeDocIdentityHasFacts(runtime_status.doc_identity)) continue;
+            if (runtime_status.doc_count == 0 and !runtime_status.disk_bytes_known and !runtimeDocIdentityHasFacts(runtime_status.doc_identity)) continue;
             const entry = try indexes.getOrPut(alloc, runtime_status.group_id);
             if (!entry.found_existing) {
                 entry.value_ptr.* = states.items.len;
@@ -691,6 +691,7 @@ pub fn mergeHealthyGroupStatuses(
                     .group_id = runtime_status.group_id,
                     .doc_count = runtime_status.doc_count,
                     .disk_bytes = runtime_status.disk_bytes,
+                    .disk_bytes_known = runtime_status.disk_bytes_known,
                     .empty = runtime_status.doc_count == 0 and runtime_status.disk_bytes == 0,
                     .created_at_millis = runtime_status.created_at_millis,
                     .updated_at_millis = updated_at_millis,
@@ -726,6 +727,7 @@ pub fn mergeHealthyGroupStatuses(
             .group_id = base.group_id,
             .doc_count = base.doc_count,
             .disk_bytes = base.disk_bytes,
+            .disk_bytes_known = base.disk_bytes_known,
             .empty = base.empty,
             .created_at_millis = base.created_at_millis,
             .updated_at_millis = base.updated_at_millis,
@@ -869,6 +871,7 @@ fn refreshDocIdentityLifecycles(merged: []metadata_reconciler.MergedGroupStatus)
 
 fn moreCompleteGroupStatus(candidate: metadata_table_manager.GroupStatusReport, current: metadata_table_manager.GroupStatusReport) bool {
     if (candidate.doc_count != current.doc_count) return candidate.doc_count > current.doc_count;
+    if (candidate.disk_bytes_known != current.disk_bytes_known) return candidate.disk_bytes_known;
     if (candidate.disk_bytes != current.disk_bytes) return candidate.disk_bytes > current.disk_bytes;
     return candidate.updated_at_millis >= current.updated_at_millis;
 }

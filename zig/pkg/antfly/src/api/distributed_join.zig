@@ -332,7 +332,18 @@ pub const JoinTableStats = struct {
     row_count: u64 = 0,
     size_bytes: u64 = 0,
     shard_count: usize = 0,
-    has_stats: bool = false,
+    row_count_known: bool = false,
+    size_bytes_known: bool = false,
+
+    pub fn hasAny(self: JoinTableStats) bool {
+        return self.row_count_known or self.size_bytes_known;
+    }
+
+    pub fn estimatedSizeBytes(self: JoinTableStats) u64 {
+        if (self.size_bytes_known and (self.size_bytes != 0 or !self.row_count_known or self.row_count == 0)) return self.size_bytes;
+        if (!self.row_count_known) return 0;
+        return std.math.mul(u64, self.row_count, join_model.join_estimated_row_bytes) catch std.math.maxInt(u64);
+    }
 };
 
 pub const PlannedJoinExecution = struct {
@@ -3376,53 +3387,53 @@ pub fn planSupportedJoinExecution(
 
     var snapshot = (try ctx.adminSnapshot()) orelse {
         const right_stats = foreign_right_stats orelse JoinTableStats{};
-        plan.used_stats = right_stats.has_stats;
+        plan.used_stats = right_stats.hasAny();
         if (plan.used_stats) {
             chooseJoinExecutionStrategyWithStats(&plan, join, supported_index_lookup, left_rows, distinct_left_keys, .{}, right_stats);
         } else {
             plan.strategy = join_model.chooseJoinExecutionStrategyWithoutStats(RightJoinQueryResult.StrategyUsed, join, supported_index_lookup);
         }
-        estimateJoinPlanCosts(&plan, plan.strategy, left_rows, right_stats.row_count, right_stats.size_bytes);
+        estimateJoinPlanCosts(&plan, plan.strategy, left_rows, right_stats.row_count, right_stats.estimatedSizeBytes());
         return plan;
     };
     defer ctx.freeAdminSnapshot(&snapshot);
 
     var left_stats = estimateJoinTableStatsFromSnapshot(&snapshot, left_table_name);
-    if (!left_stats.has_stats) {
+    if (!left_stats.hasAny()) {
         if (ctx.localTableStats(left_table_name, &snapshot) catch null) |local_stats| {
             left_stats = local_stats;
         }
     }
     var right_stats = foreign_right_stats orelse estimateJoinTableStatsFromSnapshot(&snapshot, join.right_table);
-    if (foreign_right_stats == null and !right_stats.has_stats) {
+    if (foreign_right_stats == null and !right_stats.hasAny()) {
         if (ctx.localTableStats(join.right_table, &snapshot) catch null) |local_stats| {
             right_stats = local_stats;
         }
     }
-    plan.used_stats = left_stats.has_stats or right_stats.has_stats;
+    plan.used_stats = left_stats.hasAny() or right_stats.hasAny();
 
     if (join_model.resolveJoinStrategyHint(RightJoinQueryResult.StrategyUsed, join, supported_index_lookup)) |hint| {
         if (hint.shuffle_requested) {
-            chooseStatefulShuffleStrategyOrForcedBroadcast(join, left_rows, right_stats.size_bytes).apply(&plan);
+            chooseStatefulShuffleStrategyOrForcedBroadcast(join, left_rows, right_stats.estimatedSizeBytes()).apply(&plan);
         } else {
             (StatefulJoinStrategyDecision{
                 .strategy = hint.strategy,
                 .forced_broadcast_fallback = hint.forced_broadcast_fallback,
             }).apply(&plan);
         }
-        estimateJoinPlanCosts(&plan, plan.strategy, left_rows, right_stats.row_count, right_stats.size_bytes);
+        estimateJoinPlanCosts(&plan, plan.strategy, left_rows, right_stats.row_count, right_stats.estimatedSizeBytes());
         return plan;
     }
 
     if (!plan.used_stats) {
         plan.strategy = join_model.chooseJoinExecutionStrategyWithoutStats(RightJoinQueryResult.StrategyUsed, join, supported_index_lookup);
-        estimateJoinPlanCosts(&plan, plan.strategy, left_rows, right_stats.row_count, right_stats.size_bytes);
+        estimateJoinPlanCosts(&plan, plan.strategy, left_rows, right_stats.row_count, right_stats.estimatedSizeBytes());
         return plan;
     }
 
     chooseJoinExecutionStrategyWithStats(&plan, join, supported_index_lookup, left_rows, distinct_left_keys, left_stats, right_stats);
 
-    estimateJoinPlanCosts(&plan, plan.strategy, left_rows, right_stats.row_count, right_stats.size_bytes);
+    estimateJoinPlanCosts(&plan, plan.strategy, left_rows, right_stats.row_count, right_stats.estimatedSizeBytes());
     return plan;
 }
 
@@ -3855,7 +3866,8 @@ fn estimateForeignJoinTableStats(
     return .{
         .row_count = @intCast(@max(stats.row_count, 0)),
         .size_bytes = @intCast(@max(stats.size_bytes, 0)),
-        .has_stats = true,
+        .row_count_known = true,
+        .size_bytes_known = true,
     };
 }
 
@@ -4636,25 +4648,31 @@ fn chooseStatefulJoinStrategyWithStats(
     left_stats: JoinTableStats,
     right_stats: JoinTableStats,
 ) StatefulJoinStrategyDecision {
-    if (join_model.joinSideBelowBroadcastThreshold(right_stats.size_bytes)) {
+    const left_size_bytes = left_stats.estimatedSizeBytes();
+    const right_size_bytes = right_stats.estimatedSizeBytes();
+    if (right_stats.row_count_known and right_stats.row_count == 0) {
         return .{ .strategy = .broadcast };
-    } else if (join_model.joinSideBelowBroadcastThreshold(left_stats.size_bytes)) {
+    } else if (left_stats.row_count_known and left_stats.row_count == 0) {
         return .{ .strategy = .broadcast };
-    } else if (supported_index_lookup and right_stats.row_count > 0) {
+    } else if (join_model.joinSideBelowBroadcastThreshold(right_size_bytes)) {
+        return .{ .strategy = .broadcast };
+    } else if (join_model.joinSideBelowBroadcastThreshold(left_size_bytes)) {
+        return .{ .strategy = .broadcast };
+    } else if (supported_index_lookup and right_stats.row_count_known and right_stats.row_count > 0) {
         const simple_strategy = join_model.chooseBroadcastOrIndexLookupWithStats(
             RightJoinQueryResult.StrategyUsed,
             supported_index_lookup,
             distinct_left_keys,
             right_stats.row_count,
-            right_stats.size_bytes,
+            right_size_bytes,
         );
         if (simple_strategy == .index_lookup) {
             return .{ .strategy = .index_lookup };
         } else {
-            return chooseStatefulShuffleCandidateOrBroadcast(join, left_rows, left_stats.size_bytes, right_stats.size_bytes);
+            return chooseStatefulShuffleCandidateOrBroadcast(join, left_rows, left_size_bytes, right_size_bytes);
         }
     } else {
-        return chooseStatefulShuffleCandidateOrBroadcast(join, left_rows, left_stats.size_bytes, right_stats.size_bytes);
+        return chooseStatefulShuffleCandidateOrBroadcast(join, left_rows, left_size_bytes, right_size_bytes);
     }
 }
 
@@ -4696,17 +4714,25 @@ fn estimateJoinTableStatsFromSnapshot(
 ) JoinTableStats {
     const table = tables_api.findTableByName(snapshot, table_name) orelse return .{};
     var stats: JoinTableStats = .{};
+    var reported_shards: usize = 0;
+    var all_sizes_known = true;
     for (snapshot.ranges) |range| {
         if (range.table_id != table.table_id) continue;
         stats.shard_count += 1;
         for (snapshot.merged_group_statuses) |status| {
             if (status.group_id != range.group_id) continue;
-            stats.row_count += status.doc_count;
-            stats.size_bytes += status.disk_bytes;
-            stats.has_stats = true;
+            stats.row_count +|= status.doc_count;
+            reported_shards += 1;
+            if (status.disk_bytes_known) {
+                stats.size_bytes +|= status.disk_bytes;
+            } else {
+                all_sizes_known = false;
+            }
             break;
         }
     }
+    stats.row_count_known = stats.shard_count > 0 and reported_shards == stats.shard_count;
+    stats.size_bytes_known = stats.row_count_known and all_sizes_known;
     return stats;
 }
 
@@ -4736,20 +4762,22 @@ fn estimateJoinPlanCosts(
             );
         },
         .shuffle => {
-            plan.estimated_cost = @as(f64, @floatFromInt(left_rows + right_rows)) * 2;
+            const total_rows = left_rows +| right_rows;
+            const estimated_total_bytes = std.math.mul(u64, total_rows, join_model.join_estimated_row_bytes) catch std.math.maxInt(u64);
+            plan.estimated_cost = @as(f64, @floatFromInt(total_rows)) * 2;
             plan.estimated_memory_bytes = if (plan.shuffle_partitions > 0)
-                ((left_rows + right_rows) * join_model.join_estimated_row_bytes) / @as(u64, @intCast(plan.shuffle_partitions))
+                estimated_total_bytes / @as(u64, @intCast(plan.shuffle_partitions))
             else
-                (left_rows + right_rows) * join_model.join_estimated_row_bytes;
+                estimated_total_bytes;
         },
     }
 }
 
 fn calculateShufflePartitions(left_rows: u64, right_size_bytes: u64) usize {
     const target_partition_bytes: u64 = 10 * 1024 * 1024;
-    const estimated_left_bytes = left_rows * 200;
-    const total_bytes = estimated_left_bytes + right_size_bytes;
-    const raw = if (total_bytes == 0) 1 else (total_bytes + target_partition_bytes - 1) / target_partition_bytes;
+    const estimated_left_bytes = std.math.mul(u64, left_rows, join_model.join_estimated_row_bytes) catch std.math.maxInt(u64);
+    const total_bytes = estimated_left_bytes +| right_size_bytes;
+    const raw = if (total_bytes == 0) 1 else 1 + (total_bytes - 1) / target_partition_bytes;
     const bounded = @max(@as(u64, 1), @min(@as(u64, 128), raw));
     return @intCast(bounded);
 }
@@ -7006,8 +7034,8 @@ test "distributed join chooses stateful shuffle or forced broadcast from stats" 
         false,
         50_000,
         50_000,
-        .{ .row_count = 50_000, .size_bytes = join_model.join_broadcast_threshold_bytes * 2, .has_stats = true },
-        .{ .row_count = 50_000, .size_bytes = join_model.join_broadcast_threshold_bytes * 2, .has_stats = true },
+        .{ .row_count = 50_000, .size_bytes = join_model.join_broadcast_threshold_bytes * 2, .row_count_known = true, .size_bytes_known = true },
+        .{ .row_count = 50_000, .size_bytes = join_model.join_broadcast_threshold_bytes * 2, .row_count_known = true, .size_bytes_known = true },
     );
     try std.testing.expectEqual(RightJoinQueryResult.StrategyUsed.shuffle, left_decision.strategy);
     try std.testing.expect(left_decision.shuffle_candidate);
@@ -7019,8 +7047,8 @@ test "distributed join chooses stateful shuffle or forced broadcast from stats" 
         false,
         50_000,
         50_000,
-        .{ .row_count = 50_000, .size_bytes = join_model.join_broadcast_threshold_bytes * 2, .has_stats = true },
-        .{ .row_count = 50_000, .size_bytes = join_model.join_broadcast_threshold_bytes * 2, .has_stats = true },
+        .{ .row_count = 50_000, .size_bytes = join_model.join_broadcast_threshold_bytes * 2, .row_count_known = true, .size_bytes_known = true },
+        .{ .row_count = 50_000, .size_bytes = join_model.join_broadcast_threshold_bytes * 2, .row_count_known = true, .size_bytes_known = true },
     );
     try std.testing.expectEqual(RightJoinQueryResult.StrategyUsed.broadcast, right_decision.strategy);
     try std.testing.expect(right_decision.shuffle_candidate);
@@ -7032,12 +7060,41 @@ test "distributed join chooses stateful shuffle or forced broadcast from stats" 
         true,
         50_000,
         100,
-        .{ .row_count = 50_000, .size_bytes = join_model.join_broadcast_threshold_bytes * 2, .has_stats = true },
-        .{ .row_count = 100_000, .size_bytes = join_model.join_broadcast_threshold_bytes * 2, .has_stats = true },
+        .{ .row_count = 50_000, .size_bytes = join_model.join_broadcast_threshold_bytes * 2, .row_count_known = true, .size_bytes_known = true },
+        .{ .row_count = 100_000, .size_bytes = join_model.join_broadcast_threshold_bytes * 2, .row_count_known = true, .size_bytes_known = true },
     );
     try std.testing.expectEqual(RightJoinQueryResult.StrategyUsed.index_lookup, lookup_decision.strategy);
     try std.testing.expect(!lookup_decision.shuffle_candidate);
     try std.testing.expect(!lookup_decision.forced_broadcast_fallback);
+}
+
+test "distributed join uses row estimates when byte statistics are unavailable" {
+    const join = SupportedJoinRequest{
+        .right_table = @constCast("right"),
+        .join_type = .inner,
+        .left_field = @constCast("left_id"),
+        .right_field = @constCast("_id"),
+    };
+    const row_only = JoinTableStats{
+        .row_count = 3,
+        .row_count_known = true,
+    };
+    try std.testing.expectEqual(@as(u64, 3 * join_model.join_estimated_row_bytes), row_only.estimatedSizeBytes());
+    const decision = chooseStatefulJoinStrategyWithStats(
+        join,
+        true,
+        2,
+        2,
+        .{},
+        row_only,
+    );
+    try std.testing.expectEqual(RightJoinQueryResult.StrategyUsed.broadcast, decision.strategy);
+
+    const overflowing = JoinTableStats{
+        .row_count = std.math.maxInt(u64),
+        .row_count_known = true,
+    };
+    try std.testing.expectEqual(std.math.maxInt(u64), overflowing.estimatedSizeBytes());
 }
 
 test "distributed join stable job id is deterministic and changes with inputs" {
