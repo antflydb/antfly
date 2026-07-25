@@ -62,6 +62,7 @@ const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const tabular_mod = @import("../tabular/root.zig");
 const c_file = @import("../util/c_file.zig");
+const gguf_format = @import("../gguf/format.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
@@ -562,6 +563,41 @@ fn estimateParsedDenseEmbedPromptTokens(inputs: *const ParsedDenseEmbedInputs) u
 fn isOpenAiListTask(task: []const u8) bool {
     return std.mem.eql(u8, task, "generators") or std.mem.eql(u8, task, "embedders");
 }
+
+/// Best-effort architecture name for a model, for error messages.
+///
+/// `config_model_arch` comes from config.json, which GGUF-only bundles do not have. In
+/// that case fall back to reading `general.architecture` out of the GGUF, which is cheap
+/// because `readArchitecture` skips the rest of the metadata table.
+///
+/// The returned slice borrows from `man` or from `scratch`; it is valid until either is
+/// released.
+fn modelArchitectureName(
+    man: *const manifest_mod.ModelManifest,
+    scratch: *?c_file.MmapRegion,
+) []const u8 {
+    if (man.config_model_arch.len > 0) return man.config_model_arch;
+
+    const gguf_path = man.gguf_path orelse return "unknown";
+    var region = c_file.MmapRegion.init(man.allocator, gguf_path) catch return "unknown";
+    const arch = gguf_format.readArchitecture(region.data) catch null;
+    if (arch) |value| {
+        scratch.* = region;
+        return value;
+    }
+    region.deinit();
+    return "unknown";
+}
+
+/// A discovered model resolved once, so the ten task passes in `listModelsJsonAlloc` can
+/// filter and render without touching the filesystem again.
+const DiscoveredModelListing = struct {
+    entry: registry_mod.ModelEntry,
+    manifest: manifest_mod.ModelManifest,
+    /// `@tagName(manifest.model_type)`, not the path-derived `entry.kind`.
+    kind: []const u8,
+    readers_supported: bool,
+};
 
 fn appendOpenAiModelEntry(
     buf: *std.ArrayListUnmanaged(u8),
@@ -2699,11 +2735,23 @@ pub const Node = struct {
             config.prefill_chunk_size = native_generate_lease.?.prefill_chunk_size;
         }
 
-        const gpt_config = session_factory.getGptConfig(model.session) orelse
+        const gpt_config = session_factory.getGptConfig(model.session) orelse {
+            // The session is not a decoder at all, which in practice means the
+            // architecture was never recognized and the model fell through to the
+            // default encoder path. Name it, so the caller can tell "unsupported model"
+            // apart from "Antfly is broken".
+            var arch_region: ?c_file.MmapRegion = null;
+            defer if (arch_region) |*region| region.deinit();
+            const arch = modelArchitectureName(&model.manifest, &arch_region);
             return ctx.status(400).json(.{
-                .@"error" = "INVALID_MODEL",
-                .message = "model does not support generation (not a GPT-family model)",
+                .@"error" = "UNSUPPORTED_ARCHITECTURE",
+                .message = try std.fmt.allocPrint(
+                    ctx.allocator,
+                    "model architecture \"{s}\" is not supported for generation; supported architectures: {s}",
+                    .{ arch, gpt_model_mod.gguf_supported_architectures },
+                ),
             });
+        };
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
             .native => .native,
             .metal => .metal,
@@ -5553,6 +5601,35 @@ pub const Node = struct {
             "extractors",
         };
 
+        // Resolve each discovered model once, up front. The task loop below runs ten
+        // times, so anything done inside it is paid ten times over; previously that meant
+        // two full `manifest.loadFromDir` calls per model per task, and a full load parses
+        // tokenizer JSON and GGUF tokenizer metadata. `loadListingFromDir` skips both and
+        // is the purpose-built entry point for exactly this.
+        var listings = std.ArrayListUnmanaged(DiscoveredModelListing).empty;
+        defer {
+            for (listings.items) |*listing| listing.manifest.deinit();
+            listings.deinit(a);
+        }
+        try listings.ensureTotalCapacity(a, discovered.len);
+        for (discovered) |entry| {
+            var man = manifest_mod.loadListingFromDir(a, entry.path) catch continue;
+            if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(man)) {
+                man.deinit();
+                continue;
+            }
+            listings.appendAssumeCapacity(.{
+                .entry = entry,
+                .manifest = man,
+                // The manifest knows what the model actually is; `entry.kind` is only
+                // inferred from the directory path by `discoverShallow`, so a model
+                // outside a legacy `generators/` directory defaults to embedder even
+                // when its own model_manifest.json says otherwise.
+                .kind = @tagName(man.model_type),
+                .readers_supported = readers_mod.isSupportedManifest(a, entry.path, man),
+            });
+        }
+
         for (task_names, 0..) |task, task_idx| {
             if (task_idx > 0) try body.append(a, ',');
             try body.append(a, '"');
@@ -5568,28 +5645,27 @@ pub const Node = struct {
             }
 
             // Add discovered models matching this task
-            for (discovered) |entry| {
-                if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(a, entry.path)) continue;
-                if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(a, entry.path)) continue;
+            for (listings.items) |*listing| {
+                if (std.mem.eql(u8, task, "readers") and !listing.readers_supported) continue;
 
-                var maybe_manifest: ?manifest_mod.ModelManifest = manifest_mod.loadFromDir(a, entry.path) catch null;
-                defer if (maybe_manifest) |*man| man.deinit();
-
-                const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
-                const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
-                const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
-                const inputs = if (maybe_manifest) |*man| man.inputs else &.{};
-                const has_visual = if (maybe_manifest) |*man| man.visual_model_path != null or man.visual_projection_path != null else false;
-                const has_audio = if (maybe_manifest) |*man| man.audio_model_path != null or man.audio_projection_path != null else false;
-                if (!taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) continue;
+                const man = &listing.manifest;
+                const has_visual = man.visual_model_path != null or man.visual_projection_path != null;
+                const has_audio = man.audio_model_path != null or man.audio_projection_path != null;
+                if (!taskMatchesModelListing(task, listing.kind, man.gliner_model_type, man.tasks, man.capabilities)) continue;
 
                 if (model_count > 0) try body.append(a, ',');
-                try jsonEncodeString(&body, a, entry.name);
+                try jsonEncodeString(&body, a, listing.entry.name);
                 try body.append(a, ':');
-                try appendModelInfo(&body, a, @tagName(entry.kind), gliner_model_type, capabilities, inputs, has_visual, has_audio);
+                // Discovery does not parse chat templates (that is what made this handler
+                // slow), so only models already loaded can report a template failure.
+                const chat_template_failed = if (self.model_manager.loaded.get(listing.entry.path)) |loaded|
+                    loaded.chat_template_failed
+                else
+                    false;
+                try appendModelInfo(&body, a, listing.kind, man.gliner_model_type, man.capabilities, man.inputs, has_visual, has_audio, chat_template_failed);
                 if (isOpenAiListTask(task)) {
                     if (openai_data_count > 0) try openai_data.append(a, ',');
-                    try appendOpenAiModelEntry(&openai_data, a, entry.name, list_created);
+                    try appendOpenAiModelEntry(&openai_data, a, listing.entry.name, list_created);
                     openai_data_count += 1;
                 }
                 model_count += 1;
@@ -5623,6 +5699,7 @@ pub const Node = struct {
                         model.manifest.inputs,
                         model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
                         model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+                        model.chat_template_failed,
                     );
                     if (isOpenAiListTask(task)) {
                         if (openai_data_count > 0) try openai_data.append(a, ',');
@@ -6630,6 +6707,9 @@ fn appendModelInfo(
     inputs: []const []const u8,
     has_visual: bool,
     has_audio: bool,
+    /// Set when the model shipped a chat template we could not parse. Without this the
+    /// degradation to raw prompting is invisible to API clients.
+    chat_template_failed: bool,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
     const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
@@ -6639,7 +6719,7 @@ fn appendModelInfo(
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
 
     if (capabilities.len == 0 and !inferred_classification and !inferred_relations and !inferred_extraction and !has_known_inputs) {
-        try buf.appendSlice(allocator, "{}");
+        try buf.appendSlice(allocator, if (chat_template_failed) "{\"chat_template\":false}" else "{}");
         return;
     }
 
@@ -6673,7 +6753,9 @@ fn appendModelInfo(
         try jsonEncodeString(buf, allocator, input);
         input_index += 1;
     }
-    try buf.appendSlice(allocator, "]}");
+    try buf.append(allocator, ']');
+    if (chat_template_failed) try buf.appendSlice(allocator, ",\"chat_template\":false");
+    try buf.append(allocator, '}');
 }
 
 /// Wrapper that prepends a path prefix to route registrations.

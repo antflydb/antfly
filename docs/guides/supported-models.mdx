@@ -1,0 +1,113 @@
+---
+title: Supported models
+description: Which model architectures Antfly inference can run for text generation
+prerequisites:
+  - Antfly installed and running
+difficulty: beginner
+estimatedTime: "5 min"
+tags: [inference, models, generation, gguf]
+---
+
+<Questions>
+- Which models can Antfly generate text with?
+- Why does my model fail to load?
+- What does "model architecture is not supported for generation" mean?
+</Questions>
+
+Antfly inference runs local text generation from GGUF models. Antfly is a database first
+and an inference engine second, so the set of architectures it can run is deliberately
+narrower than a dedicated engine like llama.cpp. This page states exactly what that set
+is, so you can tell "this model is out of scope" apart from "something is broken."
+
+Embedding, reranking, chunking, and recognition models are covered separately in
+[Antfly inference](/docs/guides/inference); this page is only about generation.
+
+## Supported for generation
+
+These architectures have a GGUF tensor mapping and have been run end to end:
+
+| Family | Verified with | Notes |
+|---|---|---|
+| Gemma 3 | `unsloth/gemma-3-4b-it-GGUF` | Text only. Vision `mmproj` sidecars are ignored. |
+| Gemma 4 | `ggml-org/gemma-4-E4B-it-GGUF` | Includes E-series models with per-layer embeddings. |
+| Llama 3.x | `unsloth/Llama-3.2-1B-Instruct-GGUF` | Generation is correct; see the chat template caveat below. |
+| Qwen3 (dense) | `unsloth/Qwen3-1.7B-GGUF` | Not the MoE or linear-attention variants. |
+| Qwen2 | — | Shares the Qwen tensor mapping; not separately verified this release. |
+
+Multimodal projector sidecars (`mmproj-*.gguf`) are not used by the generation path. A
+bundle that contains one will still run as a text model.
+
+## Best effort, not verified
+
+Antfly's loader has tensor mappings for these families, so they may work, but we have not
+validated them for this release. Treat failures as expected rather than as regressions:
+
+- Mistral and Mixtral
+- Phi / Phi-3
+- BitNet
+- DeepSeek V4
+
+## Not supported
+
+These are recognised and rejected with a clear error rather than failing partway through
+a load:
+
+| Architecture | Example |
+|---|---|
+| `qwen35` (Qwen3.5) | `unsloth/Qwen3.5-4B-GGUF` |
+| `qwen3next` (Qwen3-Next) | `unsloth/Qwen3-Coder-Next-GGUF` |
+| `qwen35moe` (Qwen3.5 MoE) | `unsloth/Qwen3.6-35B-A3B-GGUF` |
+
+Qwen3.5 and Qwen3-Next use hybrid linear attention, whose state-space tensors Antfly does
+not yet map from GGUF. Any architecture not listed on this page falls into this category.
+
+Requesting generation from an unsupported model returns HTTP 400:
+
+```json
+{
+  "error": "UNSUPPORTED_ARCHITECTURE",
+  "message": "model architecture \"qwen35moe\" is not supported for generation; supported architectures: llama, mistral, mixtral, qwen2, qwen3, gemma, gemma2, gemma3, gemma4, phi, phi3, bitnet, deepseek-v4"
+}
+```
+
+## Known caveats
+
+**Llama 3.x chat templates.** Llama 3.x ships a Jinja chat template that Antfly's template
+engine cannot yet parse. The model loads and generates correctly, but chat requests fall
+back to raw prompting, which produces continuation-style output instead of a reply. Models
+in this state report `"chat_template": false` in `/ai/v1/models` once loaded. Applying the
+chat format on the client side is a workaround until this is fixed.
+
+**Quantization variants.** A model directory containing several `.gguf` files (for example
+`Q4_1`, `Q4_K_M`, and `UD-Q4_K_XL`) resolves to one of them without reporting which. Keep
+one quantization per directory if the choice matters to you.
+
+**Small Gemma 3 models over the chat endpoint.** `gemma-3-1b` answers correctly and stops
+cleanly through `antfly inference generate`, but can fail to stop after its answer when
+called through `/ai/v1/chat/completions`. Larger Gemma 3 models are unaffected. Prefer
+`gemma-3-4b` or larger for chat.
+
+**Gemma 4 on Metal.** Some Gemma 4 bundles currently crash the Metal paged-KV kernel.
+Passing `--backend native` avoids it at a cost in speed.
+
+## Checking a model before running it
+
+`smoke --inspect-only` reports what Antfly makes of a bundle without loading weights or
+generating:
+
+```bash
+antfly inference smoke ~/.antfly/inference/models/unsloth/Qwen3-1.7B-GGUF "hi" --inspect-only
+```
+
+The output names the detected architecture, the parsed config, any unsupported tensor
+types, and any required tensors that could not be resolved:
+
+```
+gguf path=.../Qwen3-1.7B-UD-Q4_K_XL.gguf architecture=qwen3 tensors=310 metadata=32
+  gpt family=qwen3 layers=28 heads=16 kv_heads=8 hidden=2048 head_dim=128 ...
+  unsupported_tensor_types=none
+  missing_required_tensors=none
+```
+
+`missing_required_tensors` with a non-zero count means the architecture was recognised but
+its tensor names could not be mapped — that is the signature of an unsupported family.

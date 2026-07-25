@@ -1557,6 +1557,22 @@ fn overlayGptStructuralConfig(target: *gpt_mod.Config, source: gpt_mod.Config) v
     if (source.ple_hidden_size > 0) target.ple_hidden_size = source.ple_hidden_size;
     // RoPE dim override from rope_freqs.weight tensor.
     if (source.rope_dim_override > 0) target.rope_dim_override = source.rope_dim_override;
+
+    // Fields below describe the GGUF artifact itself rather than a preference, so the
+    // GGUF-derived value wins over config.json. `source` is always a fully GGUF-derived
+    // config here; the alternative is silently running weights under a description that
+    // does not match them.
+    //
+    // weight_tying is set by observing whether the file carries a separate output.weight.
+    // Gemma 3 GGUFs have no output.weight, and their config.json omits tie_word_embeddings,
+    // so without this the runtime looks for a lm_head.weight that does not exist.
+    target.weight_tying = source.weight_tying;
+    // rope_partial_factor is derived from rope.dimension_count against the head dim, which
+    // is how llama.cpp reads the same file. unsloth's Gemma 4 config.json claims 0.25 while
+    // its GGUF declares full-width rotation, and honoring config.json produced empty output.
+    target.rope_partial_factor = source.rope_partial_factor;
+    // Softcapping is often absent from GGUF metadata, so only a positive value is authoritative.
+    if (source.final_logit_softcapping != 0.0) target.final_logit_softcapping = source.final_logit_softcapping;
 }
 
 pub fn refineGptConfigFromGgufTensorInfo(config: *gpt_mod.Config, file: *const gguf_mod.format.File) void {
@@ -2270,10 +2286,7 @@ fn leadingTensorDim(
 }
 
 fn normalizeGgufGptWeightKey(config: gpt_mod.Config, key: []const u8, buf: *[256]u8) ?[]const u8 {
-    switch (config.family) {
-        .llama, .mistral, .qwen2, .gemma, .bitnet, .phi, .deepseek_v4 => {},
-        else => return null,
-    }
+    if (!gpt_mod.ggufWeightMappingSupported(config.family)) return null;
 
     if (std.mem.eql(u8, key, "token_embd.weight")) return "model.embed_tokens.weight";
     if (std.mem.eql(u8, key, "output_norm.weight")) return "model.norm.weight";
@@ -5645,6 +5658,80 @@ test "overlay gpt structural config keeps gguf gemma norm offset" {
     };
     overlayGptStructuralConfig(&target, source);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), target.norm_weight_offset, 1e-6);
+}
+
+test "overlay gpt structural config takes weight tying from gguf" {
+    // Gemma 3 config.json omits tie_word_embeddings, so the HF-derived config says false
+    // while the GGUF (which has no output.weight tensor) says true. Honoring config.json
+    // sent the runtime looking for a lm_head.weight that is not in the file.
+    var target: gpt_mod.Config = .{ .family = .gemma, .weight_tying = false };
+    const source: gpt_mod.Config = .{ .family = .gemma, .weight_tying = true };
+
+    overlayGptStructuralConfig(&target, source);
+
+    try std.testing.expect(target.weight_tying);
+}
+
+test "overlay gpt structural config takes rope partial factor from gguf" {
+    // unsloth's Gemma 4 config.json claims partial_rotary_factor 0.25 while its GGUF
+    // declares rope.dimension_count equal to the head dim (full rotation). Following
+    // config.json produced empty completions from an otherwise-identical artifact.
+    var target: gpt_mod.Config = .{ .family = .gemma, .rope_partial_factor = 0.25 };
+    const source: gpt_mod.Config = .{ .family = .gemma, .rope_partial_factor = 1.0 };
+
+    overlayGptStructuralConfig(&target, source);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), target.rope_partial_factor, 1e-6);
+}
+
+test "overlay gpt structural config keeps config softcapping when gguf omits it" {
+    var target: gpt_mod.Config = .{ .family = .gemma, .final_logit_softcapping = 30.0 };
+    const source: gpt_mod.Config = .{ .family = .gemma, .final_logit_softcapping = 0.0 };
+
+    overlayGptStructuralConfig(&target, source);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 30.0), target.final_logit_softcapping, 1e-6);
+}
+
+test "qwen3 gguf weights normalize onto hf names" {
+    var buf: [256]u8 = undefined;
+    const config = gpt_mod.Config{ .family = .qwen3 };
+
+    try std.testing.expectEqualStrings(
+        "model.layers.7.self_attn.q_norm.weight",
+        normalizeGgufGptWeightKey(config, "blk.7.attn_q_norm.weight", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "model.layers.7.self_attn.k_norm.weight",
+        normalizeGgufGptWeightKey(config, "blk.7.attn_k_norm.weight", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "model.layers.0.self_attn.q_proj.weight",
+        normalizeGgufGptWeightKey(config, "blk.0.attn_q.weight", &buf).?,
+    );
+    // Qwen3 has no qkv bias, so ffn_norm must land on post_attention_layernorm rather
+    // than the Gemma-style pre_feedforward_layernorm.
+    try std.testing.expectEqualStrings(
+        "model.layers.0.post_attention_layernorm.weight",
+        normalizeGgufGptWeightKey(config, "blk.0.ffn_norm.weight", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "model.embed_tokens.weight",
+        normalizeGgufGptWeightKey(config, "token_embd.weight", &buf).?,
+    );
+}
+
+test "qwen3_5 gguf weights are not claimed as mappable" {
+    // qwen3_5 carries ssm_*/attn_qkv/attn_gate tensors with no mapping to the
+    // linear-attention runtime. Claiming support would fail late with a wall of
+    // missing tensors instead of a clear unsupported-architecture error.
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(!gpt_mod.ggufWeightMappingSupported(.qwen3_5));
+    try std.testing.expect(normalizeGgufGptWeightKey(
+        .{ .family = .qwen3_5 },
+        "blk.0.attn_q.weight",
+        &buf,
+    ) == null);
 }
 
 test "mistral gguf ffn norm maps to post-attention layernorm" {

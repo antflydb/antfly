@@ -3224,8 +3224,16 @@ pub const HfTokenizer = struct {
                         }
                     },
                     .bpe => {
-                        // BPE: tokens may use byte-level encoding or have ▁ for spaces
-                        if (self.pre_tokenizer_type == .byte_level) {
+                        // BPE: tokens may use byte-level encoding or have ▁ for spaces.
+                        //
+                        // byte_level_split must decode the same way as byte_level. Llama 3
+                        // and Qwen3 both declare pre_tokenizer Sequence[Split, ByteLevel]
+                        // with decoder ByteLevel, so skipping the decode here left raw
+                        // marker characters ('Ġ' for space, 'Ċ' for newline) in generated
+                        // text.
+                        if (self.pre_tokenizer_type == .byte_level or
+                            self.pre_tokenizer_type == .byte_level_split)
+                        {
                             try appendByteDecoded(&result, allocator, token);
                         } else {
                             try result.appendSlice(allocator, token);
@@ -5209,4 +5217,39 @@ test "metaspace pre-tokenizer split false with first prepend" {
 
     try std.testing.expectEqual(@as(usize, 1), words.len);
     try std.testing.expectEqualStrings("\xe2\x96\x81What\xe2\x96\x81is\xe2\x96\x812+2?", words[0]);
+}
+
+test "byte-level decode applies to Sequence[Split, ByteLevel] pre-tokenizers" {
+    const allocator = std.testing.allocator;
+
+    // The pre_tokenizer shape used by Llama 3 and Qwen3. It parses to
+    // .byte_level_split, which decode once treated as "not byte level", leaving the
+    // raw space marker 'Ġ' (U+0120) and newline marker 'Ċ' (U+010A) in output text.
+    const json_str =
+        \\{
+        \\  "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+        \\    {"type": "Split", "pattern": {"Regex": "\\s+"}, "behavior": "Isolated", "invert": false},
+        \\    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false}
+        \\  ]},
+        \\  "decoder": {"type": "ByteLevel"},
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "continuing_subword_prefix": null,
+        \\    "end_of_word_suffix": null,
+        \\    "byte_fallback": false,
+        \\    "vocab": {"Okay": 10, "Ġlet": 11, "Ġsee": 12, "Ċ": 13},
+        \\    "merges": []
+        \\  }
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+
+    try std.testing.expectEqual(PreTokenizerType.byte_level_split, tok.pre_tokenizer_type);
+
+    const text = try tok.decode(allocator, &.{ 10, 11, 12, 13 });
+    defer allocator.free(text);
+
+    try std.testing.expectEqualStrings("Okay let see\n", text);
 }

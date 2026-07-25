@@ -722,6 +722,9 @@ pub const LoadedModel = struct {
     model_dir: []const u8,
     allocator: std.mem.Allocator,
     chat_tmpl: ?*ChatTemplate = null,
+    /// The model shipped a chat template that we could not parse, so chat requests fall
+    /// back to raw prompting. Distinct from `chat_tmpl == null` with no template at all.
+    chat_template_failed: bool = false,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
     shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = null,
     prompt_prefix_cache: runtime.kv.prompt_cache.PromptPrefixCache,
@@ -1174,8 +1177,12 @@ pub const ModelManager = struct {
         const session = try loadSessionForPreferredBackends(self.allocator, sm.preferred_backends, model_dir, man, sm);
 
         // Load chat template if available (for generator models)
+        var chat_template_failed = false;
         const chat_tmpl: ?*ChatTemplate = if (man.chat_template) |ct_source| blk2: {
-            const ct = self.allocator.create(ChatTemplate) catch break :blk2 null;
+            const ct = self.allocator.create(ChatTemplate) catch {
+                chat_template_failed = true;
+                break :blk2 null;
+            };
             ct.* = ChatTemplate.init(
                 self.allocator,
                 ct_source,
@@ -1184,8 +1191,11 @@ pub const ModelManager = struct {
                 man.unk_token,
                 man.pad_token,
             ) catch |err| {
-                std.log.warn("chat template init failed for {s}: {s}", .{ model_dir, @errorName(err) });
+                // Chat requests will silently degrade to raw prompting from here on, which
+                // looks like a model quality problem rather than a template problem.
+                std.log.err("chat template init failed for {s}: {s}; chat requests will use raw prompts", .{ model_dir, @errorName(err) });
                 self.allocator.destroy(ct);
+                chat_template_failed = true;
                 break :blk2 null;
             };
             break :blk2 ct;
@@ -1232,6 +1242,7 @@ pub const ModelManager = struct {
             .model_dir = try self.allocator.dupe(u8, model_dir),
             .allocator = self.allocator,
             .chat_tmpl = chat_tmpl,
+            .chat_template_failed = chat_template_failed,
             .shared_moe_cache = shared_moe_cache,
             .shared_prefetch = shared_prefetch,
             .prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(self.allocator),
@@ -1333,6 +1344,10 @@ fn loadSessionForPreferredBackends(
 ) !backends.Session {
     var effective_scratch: [7]backends.BackendType = undefined;
     const effective_backends = effectiveLoadBackends(&effective_scratch, preferred_backends, man);
+    // Keep the first real failure. Reporting a blanket NoModelFileFound hides the
+    // actionable cause: a GGUF whose tensors could not be resolved fails with
+    // MissingRequiredWeights, and callers were being told the file did not exist.
+    var first_err: ?anyerror = null;
     for (effective_backends) |backend| {
         if (!backend.supportsDirectSessionLoad()) continue;
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
@@ -1340,7 +1355,10 @@ fn loadSessionForPreferredBackends(
         var backend_session_manager = sessionManagerForPreferredBackends(allocator, single_backend[0..], source_session_manager);
         if (backend_session_manager.loadModel(candidate_path)) |session| {
             return session;
-        } else |_| {}
+        } else |err| {
+            std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });
+            if (first_err == null) first_err = err;
+        }
     }
 
     std.log.err("loadModel({s}) failed: no backend accepted model", .{model_dir});
@@ -1352,7 +1370,8 @@ fn loadSessionForPreferredBackends(
         man.visual_projection_path,
         man.audio_projection_path,
     });
-    return error.NoModelFileFound;
+    // NoModelFileFound only when nothing was even attempted.
+    return first_err orelse error.NoModelFileFound;
 }
 
 test "shouldPreferNativeSession prefers native GLiNER weights" {

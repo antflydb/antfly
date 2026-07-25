@@ -122,6 +122,12 @@ pub const SessionManager = struct {
         var effective_buf: [backend_order_capacity]BackendType = undefined;
         const effective_backends = effectiveBackendOrder(self.allocator, &effective_buf, self.preferred_backends, if (manifest) |m| m else null);
 
+        // Every backend below logs its failure and moves on, so without this the caller
+        // only ever sees a blanket NoBackendAvailable. The actionable cause -- a GGUF
+        // whose tensors could not be resolved fails with MissingRequiredWeights -- was
+        // reaching the log but never the API response.
+        var first_err: ?anyerror = null;
+
         for (effective_backends) |backend| {
             if (!backend.available()) continue;
             if (!backend.supportsDirectSessionLoad()) {
@@ -142,17 +148,20 @@ pub const SessionManager = struct {
                     if (!isOnnxFilePath(effective_model_path)) continue;
                     break :blk onnx.createSession(self.allocator, effective_model_path) catch |err| {
                         std.log.err("onnx runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     };
                 } else continue,
                 .metal => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx metal session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     }
                 else if (build_options.enable_metal)
                     session_factory.createMetalSession(self.allocator, model_path) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     }
                 else
@@ -160,11 +169,13 @@ pub const SessionManager = struct {
                 .cuda => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .cuda, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx CUDA session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     }
                 else if (build_options.enable_cuda)
                     session_factory.createCudaSession(self.allocator, model_path) catch |err| {
                         std.log.err("CUDA session create failed for {s}: {s}", .{ model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     }
                 else
@@ -172,16 +183,19 @@ pub const SessionManager = struct {
                 .native => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx native session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     }
                 else
                     session_factory.createNativeSession(self.allocator, model_path) catch |err| {
                         std.log.err("native session create failed for {s}: {s}", .{ model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     },
                 .wasm => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .wasm, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx wasm session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     }
                 else
@@ -204,7 +218,8 @@ pub const SessionManager = struct {
             std.log.info("selected backend {s} for {s}", .{ @tagName(backend), model_path });
             return session;
         }
-        return error.NoBackendAvailable;
+        // NoBackendAvailable only when no backend produced a real error.
+        return first_err orelse error.NoBackendAvailable;
     }
 
     fn createImportedOnnxSession(
