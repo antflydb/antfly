@@ -163,12 +163,52 @@ TRANSCRIBER_MODELS = [
     ),
 ]
 
+# Generator models used to keep the decoder support tiers honest.
+#
+# Each family in models/gpt.zig has a SupportLevel; these are the artifacts those levels
+# were measured against. Without them the tiers are assertions rather than results.
+GENERATOR_MODELS = [
+    ModelSpec(
+        name="gemma-4-e2b-it-gguf",
+        repo="ggml-org/gemma-4-e2b-it-gguf",
+        task="generators",
+        large=True,
+    ),
+    ModelSpec(
+        name="Qwen3-1.7B-GGUF",
+        repo="unsloth/Qwen3-1.7B-GGUF",
+        task="generators",
+        large=True,
+    ),
+    ModelSpec(
+        name="Llama-3.2-1B-Instruct-GGUF",
+        repo="unsloth/Llama-3.2-1B-Instruct-GGUF",
+        task="generators",
+        large=True,
+    ),
+    # Experimental tier. Pulled so the tier stays evidence-based: qwen2 answers
+    # unreliably and bitnet degenerates, and a regression either way should be visible.
+    ModelSpec(
+        name="Qwen2.5-0.5B-Instruct-GGUF",
+        repo="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        task="generators",
+    ),
+    ModelSpec(
+        name="bitnet-b1.58-2B-4T-gguf",
+        repo="microsoft/bitnet-b1.58-2B-4T-gguf",
+        task="generators",
+        large=True,
+    ),
+]
+
+
 DEFAULT_GENERATOR_MODEL = "openai-community/gpt2"
 DEFAULT_TOOL_GENERATOR_MODEL = "ggml-org/gemma-4-e2b-it-gguf"
 DEFAULT_MULTIMODAL_GENERATOR_MODEL = "ggml-org/gemma-4-e2b-it-gguf"
 
 CURATED_MODELS = [
     *EMBEDDER_MODELS,
+    *GENERATOR_MODELS,
     *RERANKER_MODELS,
     *CLASSIFIER_MODELS,
     *RECOGNIZER_MODELS,
