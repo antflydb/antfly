@@ -1491,6 +1491,28 @@ pub fn isGenerativeModel(model_type: []const u8) bool {
     return detectFamily(model_type) != .other;
 }
 
+/// Families whose GGUF tensor names can be mapped onto the HF-style names the runtime
+/// expects. Recognizing an architecture is not enough to run it from a GGUF: without a
+/// name mapping every layer tensor stays unresolved and the load fails with
+/// MissingRequiredWeights.
+///
+/// This is the single source of truth. `normalizeGgufGptWeightKey` gates on it, the
+/// generation error path reports it, and the supported-model docs are written from it.
+pub fn ggufWeightMappingSupported(family: ModelFamily) bool {
+    return switch (family) {
+        .llama, .mistral, .qwen2, .qwen3, .gemma, .bitnet, .phi, .deepseek_v4 => true,
+        // qwen3_5 is recognized and has a linear-attention runtime, but its GGUF carries
+        // ssm_*/attn_qkv/attn_gate tensors with no mapping to that runtime yet.
+        .qwen3_5 => false,
+        .gpt2, .gpt_neo, .gpt_neox, .gptj, .falcon, .opt, .bloom, .other => false,
+    };
+}
+
+/// Human-readable list of the architectures we can generate from, for error messages
+/// and docs. Kept adjacent to `ggufWeightMappingSupported` so the two cannot drift.
+pub const gguf_supported_architectures =
+    "llama, mistral, mixtral, qwen2, qwen3, gemma, gemma2, gemma3, gemma4, phi, phi3, bitnet, deepseek-v4";
+
 fn parseDeepseekV4ScoringFunc(value: []const u8) DeepseekV4ScoringFunc {
     if (std.mem.eql(u8, value, "sqrtsoftplus")) return .sqrtsoftplus;
     if (std.mem.eql(u8, value, "softmax")) return .softmax;

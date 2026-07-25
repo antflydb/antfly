@@ -62,6 +62,7 @@ const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const tabular_mod = @import("../tabular/root.zig");
 const c_file = @import("../util/c_file.zig");
+const gguf_format = @import("../gguf/format.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
@@ -562,6 +563,31 @@ fn estimateParsedDenseEmbedPromptTokens(inputs: *const ParsedDenseEmbedInputs) u
 
 fn isOpenAiListTask(task: []const u8) bool {
     return std.mem.eql(u8, task, "generators") or std.mem.eql(u8, task, "embedders");
+}
+
+/// Best-effort architecture name for a model, for error messages.
+///
+/// `config_model_arch` comes from config.json, which GGUF-only bundles do not have. In
+/// that case fall back to reading `general.architecture` out of the GGUF, which is cheap
+/// because `readArchitecture` skips the rest of the metadata table.
+///
+/// The returned slice borrows from `man` or from `scratch`; it is valid until either is
+/// released.
+fn modelArchitectureName(
+    man: *const manifest_mod.ModelManifest,
+    scratch: *?c_file.MmapRegion,
+) []const u8 {
+    if (man.config_model_arch.len > 0) return man.config_model_arch;
+
+    const gguf_path = man.gguf_path orelse return "unknown";
+    var region = c_file.MmapRegion.init(man.allocator, gguf_path) catch return "unknown";
+    const arch = gguf_format.readArchitecture(region.data) catch null;
+    if (arch) |value| {
+        scratch.* = region;
+        return value;
+    }
+    region.deinit();
+    return "unknown";
 }
 
 fn appendOpenAiModelEntry(
@@ -2739,11 +2765,23 @@ pub const Node = struct {
             config.prefill_chunk_size = native_generate_lease.?.prefill_chunk_size;
         }
 
-        const gpt_config = session_factory.getGptConfig(model.session) orelse
+        const gpt_config = session_factory.getGptConfig(model.session) orelse {
+            // The session is not a decoder at all, which in practice means the
+            // architecture was never recognized and the model fell through to the
+            // default encoder path. Name it, so the caller can tell "unsupported model"
+            // apart from "Antfly is broken".
+            var arch_region: ?c_file.MmapRegion = null;
+            defer if (arch_region) |*region| region.deinit();
+            const arch = modelArchitectureName(&model.manifest, &arch_region);
             return ctx.status(400).json(.{
-                .@"error" = "INVALID_MODEL",
-                .message = "model does not support generation (not a GPT-family model)",
+                .@"error" = "UNSUPPORTED_ARCHITECTURE",
+                .message = try std.fmt.allocPrint(
+                    ctx.allocator,
+                    "model architecture \"{s}\" is not supported for generation; supported architectures: {s}",
+                    .{ arch, gpt_model_mod.gguf_supported_architectures },
+                ),
             });
+        };
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
             .native => .native,
             .metal => .metal,
@@ -5651,7 +5689,23 @@ pub const Node = struct {
                 if (model_count > 0) try body.append(a, ',');
                 try jsonEncodeString(&body, a, entry.name);
                 try body.append(a, ':');
-                try appendModelInfo(&body, a, @tagName(entry.kind), gliner_model_type, capabilities, inputs, has_visual, has_audio);
+                // Discovery does not parse chat templates (that is what made this handler
+                // slow), so only models already loaded can report a template failure.
+                const chat_template_failed = if (self.model_manager.loaded.get(entry.path)) |loaded|
+                    loaded.chat_template_failed
+                else
+                    false;
+                try appendModelInfo(
+                    &body,
+                    a,
+                    @tagName(entry.kind),
+                    gliner_model_type,
+                    capabilities,
+                    inputs,
+                    has_visual,
+                    has_audio,
+                    chat_template_failed,
+                );
                 if (isOpenAiListTask(task)) {
                     try appendUniqueOpenAiModelEntry(
                         &openai_data,
@@ -5693,6 +5747,7 @@ pub const Node = struct {
                         model.manifest.inputs,
                         model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
                         model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+                        model.chat_template_failed,
                     );
                     if (isOpenAiListTask(task)) {
                         try appendUniqueOpenAiModelEntry(
@@ -6736,6 +6791,9 @@ fn appendModelInfo(
     inputs: []const []const u8,
     has_visual: bool,
     has_audio: bool,
+    /// Set when the model shipped a chat template we could not parse. Without this the
+    /// degradation to raw prompting is invisible to API clients.
+    chat_template_failed: bool,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
     const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
@@ -6745,7 +6803,7 @@ fn appendModelInfo(
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
 
     if (capabilities.len == 0 and !inferred_classification and !inferred_relations and !inferred_extraction and !has_known_inputs) {
-        try buf.appendSlice(allocator, "{}");
+        try buf.appendSlice(allocator, if (chat_template_failed) "{\"chat_template\":false}" else "{}");
         return;
     }
 
@@ -6779,7 +6837,9 @@ fn appendModelInfo(
         try jsonEncodeString(buf, allocator, input);
         input_index += 1;
     }
-    try buf.appendSlice(allocator, "]}");
+    try buf.append(allocator, ']');
+    if (chat_template_failed) try buf.appendSlice(allocator, ",\"chat_template\":false");
+    try buf.append(allocator, '}');
 }
 
 /// Wrapper that prepends a path prefix to route registrations.

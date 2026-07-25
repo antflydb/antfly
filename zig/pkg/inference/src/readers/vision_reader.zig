@@ -215,6 +215,16 @@ pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8)
     var man = manifest_mod.loadFromDir(allocator, model_path) catch return false;
     defer man.deinit();
 
+    return isSupportedManifest(man);
+}
+
+/// Same check against a manifest the caller already has.
+///
+/// Only `native_arch_hint` and the artifact paths matter here, all of which
+/// `loadListingFromDir` populates. Callers in listing paths should prefer this: a full
+/// `loadFromDir` parses GGUF tokenizer metadata, which for a large vocab costs over a
+/// second per model.
+pub fn isSupportedManifest(man: manifest_mod.ModelManifest) bool {
     return man.native_arch_hint == .florence and
         (man.gguf_path != null or man.safetensors_path != null or man.safetensors_index_path != null);
 }

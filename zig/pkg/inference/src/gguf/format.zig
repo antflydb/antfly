@@ -156,6 +156,32 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !File {
     };
 }
 
+/// Read only `general.architecture` from a GGUF file, skipping every other metadata value
+/// without allocating it.
+///
+/// `parse` materializes the whole KV table, which for a modern tokenizer means allocating
+/// hundreds of thousands of token strings. Model listing only needs the architecture, and
+/// doing a full parse per listed model is what made `/ai/v1/models` take seconds per call.
+///
+/// Returns a slice borrowed from `bytes`, or null if the key is absent.
+pub fn readArchitecture(bytes: []const u8) !?[]const u8 {
+    var cursor = Cursor{ .bytes = bytes };
+    const header = try parseHeader(&cursor);
+
+    for (0..@as(usize, @intCast(header.metadata_count))) |_| {
+        const key = try cursor.readBorrowedString();
+        const raw_type = try cursor.readInt(u32);
+        const value_type = metadataValueTypeFromRaw(raw_type) orelse return error.UnsupportedMetadataType;
+
+        if (value_type == .string and std.mem.eql(u8, key, "general.architecture")) {
+            return try cursor.readBorrowedString();
+        }
+        try cursor.skipMetadataValue(value_type);
+    }
+
+    return null;
+}
+
 fn parseHeader(cursor: *Cursor) !Header {
     const got_magic = try cursor.readBytes(magic.len);
     if (!std.mem.eql(u8, got_magic, magic)) return error.InvalidGgufMagic;
@@ -305,7 +331,109 @@ const Cursor = struct {
         const bytes = try self.readBytes(@intCast(len));
         return allocator.dupe(u8, bytes);
     }
+
+    fn readBorrowedString(self: *Cursor) ![]const u8 {
+        const len = try self.readInt(u64);
+        return self.readBytes(@intCast(len));
+    }
+
+    fn skipBytes(self: *Cursor, count: u64) !void {
+        const end = self.pos + count;
+        if (end > self.bytes.len) return error.UnexpectedEndOfFile;
+        self.pos = end;
+    }
+
+    /// Advance past one metadata value without allocating it.
+    fn skipMetadataValue(self: *Cursor, value_type: MetadataValueType) !void {
+        switch (value_type) {
+            .u8, .i8, .bool_ => try self.skipBytes(1),
+            .u16, .i16 => try self.skipBytes(2),
+            .u32, .i32, .f32 => try self.skipBytes(4),
+            .u64, .i64, .f64 => try self.skipBytes(8),
+            .string => {
+                const len = try self.readInt(u64);
+                try self.skipBytes(len);
+            },
+            .array => {
+                const raw_elem_type = try self.readInt(u32);
+                const elem_type = metadataValueTypeFromRaw(raw_elem_type) orelse return error.UnsupportedMetadataType;
+                if (elem_type == .array) return error.UnsupportedNestedMetadataArray;
+                const count = try self.readInt(u64);
+                switch (elem_type) {
+                    // Fixed-width elements can be skipped in one jump.
+                    .u8, .i8, .bool_ => try self.skipBytes(count),
+                    .u16, .i16 => try self.skipBytes(count * 2),
+                    .u32, .i32, .f32 => try self.skipBytes(count * 4),
+                    .u64, .i64, .f64 => try self.skipBytes(count * 8),
+                    // Strings are length-prefixed, so they must be walked individually.
+                    .string => for (0..@intCast(count)) |_| {
+                        const len = try self.readInt(u64);
+                        try self.skipBytes(len);
+                    },
+                    .array => unreachable,
+                }
+            },
+        }
+    }
 };
+
+test "readArchitecture skips past preceding metadata including token arrays" {
+    const allocator = std.testing.allocator;
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, magic);
+    try appendLe(u32, allocator, &data, 3);
+    try appendLe(u64, allocator, &data, 0);
+    try appendLe(u64, allocator, &data, 4);
+
+    // A string array, like tokenizer.ggml.tokens: the entry that makes a full parse
+    // expensive, and the one readArchitecture must walk without allocating.
+    try appendString(allocator, &data, "tokenizer.ggml.tokens");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.array));
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendLe(u64, allocator, &data, 3);
+    try appendString(allocator, &data, "<bos>");
+    try appendString(allocator, &data, "hello");
+    try appendString(allocator, &data, "world");
+
+    // A fixed-width array, skipped in one jump.
+    try appendString(allocator, &data, "tokenizer.ggml.token_type");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.array));
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.i32));
+    try appendLe(u64, allocator, &data, 3);
+    try appendLe(i32, allocator, &data, 1);
+    try appendLe(i32, allocator, &data, 1);
+    try appendLe(i32, allocator, &data, 1);
+
+    try appendString(allocator, &data, "gemma4.block_count");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, 42);
+
+    try appendString(allocator, &data, "general.architecture");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendString(allocator, &data, "gemma4");
+
+    const arch = try readArchitecture(data.items);
+    try std.testing.expectEqualStrings("gemma4", arch.?);
+}
+
+test "readArchitecture returns null when the key is absent" {
+    const allocator = std.testing.allocator;
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, magic);
+    try appendLe(u32, allocator, &data, 3);
+    try appendLe(u64, allocator, &data, 0);
+    try appendLe(u64, allocator, &data, 1);
+
+    try appendString(allocator, &data, "general.alignment");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, 32);
+
+    try std.testing.expect(try readArchitecture(data.items) == null);
+}
 
 test "parse minimal gguf file" {
     const allocator = std.testing.allocator;
