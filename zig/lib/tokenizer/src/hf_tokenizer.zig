@@ -130,6 +130,8 @@ pub const HfTokenizer = struct {
         hash: u64,
         key: []const u8,
         token_ids: []const i32,
+        referenced: std.atomic.Value(bool) = .init(true),
+        next_retired: ?*BpeCacheEntry = null,
     };
 
     const BpeCacheShard = struct {
@@ -137,6 +139,23 @@ pub const HfTokenizer = struct {
         slots: [bpe_cache_slots_per_shard]std.atomic.Value(usize) =
             @splat(.{ .raw = 0 }),
         count: std.atomic.Value(usize) = .init(0),
+        tombstones: usize = 0,
+        clock_hand: usize = 0,
+    };
+
+    const bpe_cache_tombstone: usize = 1;
+    const bpe_doorkeeper_words = 4096;
+    const bpe_doorkeeper_rotate_after = 32 * 1024;
+
+    const BpeDoorkeeper = struct {
+        // Two independent bits materially reduce false second-hit admission.
+        // Two rotating generations keep a one-shot scan from saturating the
+        // filter forever.
+        generations: [2][bpe_doorkeeper_words]std.atomic.Value(u64) =
+            @splat(@splat(.{ .raw = 0 })),
+        active_generation: std.atomic.Value(u8) = .init(0),
+        observations: std.atomic.Value(usize) = .init(0),
+        rotating: std.atomic.Value(bool) = .init(false),
     };
 
     const BpeCache = struct {
@@ -146,6 +165,13 @@ pub const HfTokenizer = struct {
         used_bytes: std.atomic.Value(usize) = .init(0),
         rejected_reservations: std.atomic.Value(u64) = .init(0),
         resource_budget: ?BpeCacheResourceBudget = null,
+        doorkeeper: BpeDoorkeeper = .{},
+        reader_gate: std.atomic.Value(bool) = .init(false),
+        active_readers: std.atomic.Value(usize) = .init(0),
+        reclaiming: std.atomic.Value(bool) = .init(false),
+        retired_mutex: std.atomic.Mutex = .unlocked,
+        retired_head: ?*BpeCacheEntry = null,
+        retired_bytes: std.atomic.Value(usize) = .init(0),
     };
 
     pub const BpeCacheResourceBudget = struct {
@@ -994,6 +1020,9 @@ pub const HfTokenizer = struct {
     // =====================================================================
 
     fn encode(self: *HfTokenizer, allocator: std.mem.Allocator, text: []const u8) ![]i32 {
+        const cache_reader = self.enterBpeCacheRead();
+        defer if (cache_reader) |cache| self.leaveBpeCacheRead(cache);
+
         // Skip the buffer-reuse layer in the dedicated single-shot path:
         // we avoid a redundant ensureUnusedCapacity wraparound and the
         // toOwnedSlice resize that would chase it. Body mirrors `encodeInto`.
@@ -1024,6 +1053,9 @@ pub const HfTokenizer = struct {
         text: []const u8,
         ids: *std.ArrayListUnmanaged(i32),
     ) !void {
+        const cache_reader = self.enterBpeCacheRead();
+        defer if (cache_reader) |cache| self.leaveBpeCacheRead(cache);
+
         if (!self.do_lowercase and self.replace_space_with == null) {
             return self.encodeWithAddedTokens(allocator, text, ids);
         }
@@ -1239,6 +1271,11 @@ pub const HfTokenizer = struct {
         return byte == ' ' or (byte >= 9 and byte <= 13);
     }
 
+    fn parallelBpeTarget(text_len: usize, chunk_count: usize, idx: usize) usize {
+        return (text_len / chunk_count) * idx +
+            ((text_len % chunk_count) * idx) / chunk_count;
+    }
+
     fn parallelBpeBoundary(text: []const u8, target: usize) usize {
         var pos = target;
         while (pos < text.len) : (pos += 1) {
@@ -1249,6 +1286,37 @@ pub const HfTokenizer = struct {
             }
         }
         return text.len;
+    }
+
+    /// Resolve monotonically increasing targets without rescanning a suffix
+    /// whose answer is already known. Prose retains the old few-byte probes,
+    /// while whitespace-free/minified inputs scan to EOF only once.
+    fn collectParallelBpeBoundaries(
+        text: []const u8,
+        chunk_count: usize,
+        boundaries: *[65]usize,
+    ) usize {
+        var boundary_count: usize = 1;
+        boundaries[0] = 0;
+        var target_idx: usize = 1;
+        while (target_idx < chunk_count) {
+            const target = parallelBpeTarget(text.len, chunk_count, target_idx);
+            const boundary = parallelBpeBoundary(text, target);
+            if (boundary == text.len) break;
+            if (boundary > boundaries[boundary_count - 1]) {
+                boundaries[boundary_count] = boundary;
+                boundary_count += 1;
+            }
+            target_idx += 1;
+            while (target_idx < chunk_count and
+                parallelBpeTarget(text.len, chunk_count, target_idx) <= boundary)
+            {
+                target_idx += 1;
+            }
+        }
+
+        boundaries[boundary_count] = text.len;
+        return boundary_count + 1;
     }
 
     /// Parallelize one large GPT-2 ByteLevel document at pretoken-safe
@@ -1291,24 +1359,18 @@ pub const HfTokenizer = struct {
             4;
         const chunk_count = @min(runner_count * chunks_per_runner, 64);
         var boundaries: [65]usize = undefined;
-        var boundary_count: usize = 1;
-        boundaries[0] = 0;
-        for (1..chunk_count) |idx| {
-            const target =
-                (text.len / chunk_count) * idx +
-                ((text.len % chunk_count) * idx) / chunk_count;
-            const boundary = parallelBpeBoundary(text, target);
-            if (boundary > boundaries[boundary_count - 1] and
-                boundary < text.len)
-            {
-                boundaries[boundary_count] = boundary;
-                boundary_count += 1;
-            }
-        }
-        boundaries[boundary_count] = text.len;
-        boundary_count += 1;
+        const boundary_count = collectParallelBpeBoundaries(
+            text,
+            chunk_count,
+            &boundaries,
+        );
         const worker_count = boundary_count - 1;
         if (worker_count <= 1) return self.encodeInto(allocator, text, ids);
+
+        // One read-side critical section protects every worker's lock-free
+        // cache lookup. Serial fallbacks establish their own section.
+        const cache_reader = self.enterBpeCacheRead();
+        defer if (cache_reader) |cache| self.leaveBpeCacheRead(cache);
 
         const workspace = try self.acquireParallelBpeWorkspace();
         defer self.releaseParallelBpeWorkspace(workspace);
@@ -2008,6 +2070,190 @@ pub const HfTokenizer = struct {
         return std.hash.Wyhash.hash(0, word);
     }
 
+    fn bpeCacheEntryBytes(entry: *const BpeCacheEntry) usize {
+        return @sizeOf(BpeCacheEntry) +
+            entry.key.len +
+            entry.token_ids.len * @sizeOf(i32);
+    }
+
+    fn enterBpeCacheRead(self: *HfTokenizer) ?*BpeCache {
+        const cache = self.bpe_cache orelse return null;
+        while (true) {
+            while (cache.reader_gate.load(.acquire)) std.atomic.spinLoopHint();
+            _ = cache.active_readers.fetchAdd(1, .acq_rel);
+            if (!cache.reader_gate.load(.acquire)) return cache;
+            const previous = cache.active_readers.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+        }
+    }
+
+    fn leaveBpeCacheRead(self: *HfTokenizer, cache: *BpeCache) void {
+        const previous = cache.active_readers.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1 and cache.retired_bytes.load(.acquire) != 0) {
+            self.reclaimRetiredBpeCacheEntries(cache);
+        }
+    }
+
+    fn observeBpeCacheCandidate(cache: *BpeCache, hash: u64) bool {
+        const mixed = hash ^ (hash >> 29) ^ (hash *% 0x9e3779b97f4a7c15);
+        const word_index: usize = @intCast(hash & (bpe_doorkeeper_words - 1));
+        const first_bit: u6 = @intCast((hash >> 12) & 63);
+        var second_bit: u6 = @intCast(mixed & 63);
+        if (second_bit == first_bit) second_bit +%= 1;
+        const mask = (@as(u64, 1) << first_bit) | (@as(u64, 1) << second_bit);
+        const active: usize = cache.doorkeeper.active_generation.load(.acquire) & 1;
+        const previous = active ^ 1;
+        const old_bits = cache.doorkeeper.generations[active][word_index].fetchOr(mask, .monotonic);
+        const seen_active = old_bits & mask == mask;
+        const seen_previous =
+            cache.doorkeeper.generations[previous][word_index].load(.monotonic) & mask == mask;
+
+        const observations = cache.doorkeeper.observations.fetchAdd(1, .monotonic) + 1;
+        if (observations >= bpe_doorkeeper_rotate_after and
+            cache.doorkeeper.rotating.cmpxchgStrong(false, true, .acq_rel, .acquire) == null)
+        {
+            const old_active: usize = cache.doorkeeper.active_generation.load(.acquire) & 1;
+            const next = old_active ^ 1;
+            for (&cache.doorkeeper.generations[next]) |*word| word.store(0, .monotonic);
+            cache.doorkeeper.observations.store(0, .monotonic);
+            cache.doorkeeper.active_generation.store(@intCast(next), .release);
+            cache.doorkeeper.rotating.store(false, .release);
+        }
+        return seen_active or seen_previous;
+    }
+
+    fn retireBpeCacheEntry(cache: *BpeCache, entry: *BpeCacheEntry) void {
+        lockBpeCacheMutex(&cache.retired_mutex);
+        entry.next_retired = cache.retired_head;
+        cache.retired_head = entry;
+        cache.retired_mutex.unlock();
+        _ = cache.retired_bytes.fetchAdd(bpeCacheEntryBytes(entry), .release);
+    }
+
+    fn bpeCacheShardContainsLocked(
+        shard: *BpeCacheShard,
+        hash: u64,
+        word: []const u8,
+    ) bool {
+        var slot_idx = bpeCacheSlot(hash);
+        for (0..bpe_cache_slots_per_shard) |_| {
+            const raw = shard.slots[slot_idx].load(.acquire);
+            if (raw == 0) return false;
+            if (raw > bpe_cache_tombstone) {
+                const entry: *const BpeCacheEntry = @ptrFromInt(raw);
+                if (entry.hash == hash and std.mem.eql(u8, entry.key, word)) return true;
+            }
+            slot_idx = (slot_idx + 1) & (bpe_cache_slots_per_shard - 1);
+        }
+        return false;
+    }
+
+    fn evictBpeCacheEntry(cache: *BpeCache, shard: *BpeCacheShard) bool {
+        for (0..bpe_cache_slots_per_shard * 2) |_| {
+            const slot_idx = shard.clock_hand;
+            shard.clock_hand = (slot_idx + 1) & (bpe_cache_slots_per_shard - 1);
+            const raw = shard.slots[slot_idx].load(.acquire);
+            if (raw <= bpe_cache_tombstone) continue;
+            const entry: *BpeCacheEntry = @ptrFromInt(raw);
+            if (entry.referenced.swap(false, .acq_rel)) continue;
+
+            shard.slots[slot_idx].store(bpe_cache_tombstone, .release);
+            const previous = shard.count.fetchSub(1, .release);
+            std.debug.assert(previous > 0);
+            shard.tombstones += 1;
+            retireBpeCacheEntry(cache, entry);
+            return true;
+        }
+        return false;
+    }
+
+    fn evictBpeCacheEntryForPressure(
+        cache: *BpeCache,
+        candidate_hash: u64,
+        candidate_word: []const u8,
+    ) void {
+        // One pending retirement is sufficient to make the next encode retry
+        // admission with released capacity. Avoid draining the cache when a
+        // long request encounters many misses before its read epoch can end.
+        if (cache.retired_bytes.load(.acquire) != 0) return;
+        const candidate_shard_idx = bpeCacheShard(candidate_hash);
+        for (0..bpe_cache_shard_count) |offset| {
+            const shard_idx =
+                (candidate_shard_idx + offset) & (bpe_cache_shard_count - 1);
+            const shard = &cache.shards[shard_idx];
+            lockBpeCacheMutex(&shard.mutex);
+            if (shard_idx == candidate_shard_idx and
+                bpeCacheShardContainsLocked(shard, candidate_hash, candidate_word))
+            {
+                shard.mutex.unlock();
+                return;
+            }
+            const evicted = evictBpeCacheEntry(cache, shard);
+            shard.mutex.unlock();
+            if (evicted) return;
+        }
+    }
+
+    fn rebuildBpeCacheShard(shard: *BpeCacheShard) void {
+        if (shard.tombstones < bpe_cache_slots_per_shard / 4) return;
+        var entries: [bpe_cache_slots_per_shard]*BpeCacheEntry = undefined;
+        var entry_count: usize = 0;
+        for (&shard.slots) |*slot| {
+            const raw = slot.load(.monotonic);
+            if (raw > bpe_cache_tombstone) {
+                entries[entry_count] = @ptrFromInt(raw);
+                entry_count += 1;
+            }
+            slot.store(0, .monotonic);
+        }
+        shard.tombstones = 0;
+        shard.clock_hand = 0;
+        for (entries[0..entry_count]) |entry| {
+            var slot_idx = bpeCacheSlot(entry.hash);
+            while (shard.slots[slot_idx].load(.monotonic) != 0) {
+                slot_idx = (slot_idx + 1) & (bpe_cache_slots_per_shard - 1);
+            }
+            shard.slots[slot_idx].store(@intFromPtr(entry), .monotonic);
+        }
+        std.debug.assert(entry_count == shard.count.load(.monotonic));
+    }
+
+    fn reclaimRetiredBpeCacheEntries(self: *HfTokenizer, cache: *BpeCache) void {
+        if (cache.reclaiming.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+
+        cache.reader_gate.store(true, .release);
+        while (cache.active_readers.load(.acquire) != 0) std.atomic.spinLoopHint();
+
+        lockBpeCacheMutex(&cache.retired_mutex);
+        var retired = cache.retired_head;
+        cache.retired_head = null;
+        const retired_bytes = cache.retired_bytes.swap(0, .acq_rel);
+        cache.retired_mutex.unlock();
+
+        for (&cache.shards) |*shard| {
+            lockBpeCacheMutex(&shard.mutex);
+            rebuildBpeCacheShard(shard);
+            shard.mutex.unlock();
+        }
+
+        var released_bytes: usize = 0;
+        while (retired) |entry| {
+            const next = entry.next_retired;
+            released_bytes += bpeCacheEntryBytes(entry);
+            self.allocator.free(entry.key);
+            self.allocator.free(entry.token_ids);
+            self.allocator.destroy(entry);
+            retired = next;
+        }
+        std.debug.assert(released_bytes == retired_bytes);
+        releaseBpeCacheBytes(cache, released_bytes);
+        // Publish reclamation completion before admitting another reader, so
+        // an immediately retiring newcomer cannot lose the only reclaim wakeup.
+        cache.reclaiming.store(false, .release);
+        cache.reader_gate.store(false, .release);
+    }
+
     fn appendCachedBpe(
         self: *HfTokenizer,
         allocator: std.mem.Allocator,
@@ -2027,8 +2273,18 @@ pub const HfTokenizer = struct {
                 self.recordBpeCacheMiss(probes);
                 return false;
             }
+            if (raw == bpe_cache_tombstone) {
+                slot_idx = (slot_idx + 1) & (bpe_cache_slots_per_shard - 1);
+                continue;
+            }
             const entry: *const BpeCacheEntry = @ptrFromInt(raw);
             if (entry.hash == hash and std.mem.eql(u8, entry.key, word)) {
+                // Keep steady-state hits read-only. A write is needed only
+                // after the CLOCK scanner has cleared this entry, avoiding
+                // cache-line ownership traffic between parallel readers.
+                if (!entry.referenced.load(.monotonic)) {
+                    @constCast(entry).referenced.store(true, .monotonic);
+                }
                 if (entry.token_ids.len == 1) {
                     try ids.append(allocator, entry.token_ids[0]);
                 } else {
@@ -2107,6 +2363,7 @@ pub const HfTokenizer = struct {
 
         const hash = bpeCacheHash(word);
         const cache = self.bpe_cache orelse return;
+        if (!observeBpeCacheCandidate(cache, hash)) return;
         const ids_bytes = std.math.mul(
             usize,
             token_ids.len,
@@ -2117,7 +2374,14 @@ pub const HfTokenizer = struct {
             @sizeOf(BpeCacheEntry) + word.len,
             ids_bytes,
         ) catch return;
-        if (!tryReserveBpeCacheBytes(cache, entry_bytes)) return;
+        if (!tryReserveBpeCacheBytes(cache, entry_bytes)) {
+            // If the candidate can ever fit, make room for its next admitted
+            // occurrence. The current read epoch safely delays reclamation.
+            if (entry_bytes <= cache.max_bytes -| @sizeOf(BpeCache)) {
+                evictBpeCacheEntryForPressure(cache, hash, word);
+            }
+            return;
+        }
         var own_reservation = true;
         defer if (own_reservation) releaseBpeCacheBytes(cache, entry_bytes);
 
@@ -2139,24 +2403,50 @@ pub const HfTokenizer = struct {
         const shard = &cache.shards[bpeCacheShard(hash)];
         lockBpeCacheMutex(&shard.mutex);
         defer shard.mutex.unlock();
-        if (shard.count.load(.monotonic) >= bpe_cache_max_entries_per_shard) return;
 
         var slot_idx = bpeCacheSlot(hash);
         for (0..bpe_cache_slots_per_shard) |_| {
             const raw = shard.slots[slot_idx].load(.acquire);
             if (raw == 0) {
-                shard.slots[slot_idx].store(@intFromPtr(new_entry), .release);
-                _ = shard.count.fetchAdd(1, .release);
-                own_key = false;
-                own_ids = false;
-                own_entry = false;
-                own_reservation = false;
-                return;
+                break;
+            }
+            if (raw == bpe_cache_tombstone) {
+                slot_idx = (slot_idx + 1) & (bpe_cache_slots_per_shard - 1);
+                continue;
             }
             const entry: *const BpeCacheEntry = @ptrFromInt(raw);
             if (entry.hash == hash and std.mem.eql(u8, entry.key, word)) return;
             slot_idx = (slot_idx + 1) & (bpe_cache_slots_per_shard - 1);
         }
+
+        if (shard.count.load(.monotonic) >= bpe_cache_max_entries_per_shard and
+            !evictBpeCacheEntry(cache, shard))
+        {
+            return;
+        }
+
+        var first_tombstone: ?usize = null;
+        slot_idx = bpeCacheSlot(hash);
+        for (0..bpe_cache_slots_per_shard) |_| {
+            const raw = shard.slots[slot_idx].load(.acquire);
+            if (raw == bpe_cache_tombstone and first_tombstone == null) {
+                first_tombstone = slot_idx;
+            } else if (raw == 0) {
+                break;
+            }
+            slot_idx = (slot_idx + 1) & (bpe_cache_slots_per_shard - 1);
+        }
+        const insert_idx = first_tombstone orelse slot_idx;
+        if (shard.slots[insert_idx].load(.monotonic) == bpe_cache_tombstone) {
+            std.debug.assert(shard.tombstones > 0);
+            shard.tombstones -= 1;
+        }
+        shard.slots[insert_idx].store(@intFromPtr(new_entry), .release);
+        _ = shard.count.fetchAdd(1, .release);
+        own_key = false;
+        own_ids = false;
+        own_entry = false;
+        own_reservation = false;
     }
 
     fn bpeEncodeWord(
@@ -2976,13 +3266,21 @@ pub const HfTokenizer = struct {
             for (&cache.shards) |*shard| {
                 for (&shard.slots) |*slot| {
                     const raw = slot.load(.monotonic);
-                    if (raw != 0) {
+                    if (raw > bpe_cache_tombstone) {
                         const entry: *BpeCacheEntry = @ptrFromInt(raw);
                         allocator.free(entry.key);
                         allocator.free(entry.token_ids);
                         allocator.destroy(entry);
                     }
                 }
+            }
+            var retired = cache.retired_head;
+            while (retired) |entry| {
+                const next = entry.next_retired;
+                allocator.free(entry.key);
+                allocator.free(entry.token_ids);
+                allocator.destroy(entry);
+                retired = next;
             }
             if (cache.resource_budget) |budget| {
                 budget.release(budget.context, accounted_bytes);
@@ -3942,6 +4240,60 @@ test "gpt2 ASCII vector scanner matches scalar boundaries" {
     try std.testing.expectEqualSlices(usize, scalar.items, vectorized.items);
 }
 
+test "parallel BPE boundary collection matches independent target scans" {
+    const Reference = struct {
+        fn boundary(text: []const u8, target: usize) usize {
+            var pos = target;
+            while (pos < text.len) : (pos += 1) {
+                if (HfTokenizer.isAsciiWhitespaceByte(text[pos]) and
+                    (pos == 0 or !HfTokenizer.isAsciiWhitespaceByte(text[pos - 1])))
+                {
+                    return pos;
+                }
+            }
+            return text.len;
+        }
+    };
+    const cases = [_][]const u8{
+        "",
+        "no-whitespace-at-all",
+        " leading and  repeated\twhitespace\nruns ",
+        "a\nb\r\nc\x0bd\x0ce",
+        "one trailing run       ",
+    };
+    const chunk_counts = [_]usize{ 1, 2, 3, 8, 64 };
+
+    for (cases) |text| {
+        for (chunk_counts) |chunk_count| {
+            var expected: [65]usize = undefined;
+            var expected_count: usize = 1;
+            expected[0] = 0;
+            for (1..chunk_count) |idx| {
+                const target = HfTokenizer.parallelBpeTarget(text.len, chunk_count, idx);
+                const boundary = Reference.boundary(text, target);
+                if (boundary > expected[expected_count - 1] and boundary < text.len) {
+                    expected[expected_count] = boundary;
+                    expected_count += 1;
+                }
+            }
+            expected[expected_count] = text.len;
+            expected_count += 1;
+
+            var actual: [65]usize = undefined;
+            const actual_count = HfTokenizer.collectParallelBpeBoundaries(
+                text,
+                chunk_count,
+                &actual,
+            );
+            try std.testing.expectEqualSlices(
+                usize,
+                expected[0..expected_count],
+                actual[0..actual_count],
+            );
+        }
+    }
+}
+
 test "real tokenizer.json golden values" {
     const allocator = std.testing.allocator;
 
@@ -4180,6 +4532,7 @@ test "BPE cache obeys local and external byte budgets" {
     const hard_limit = @sizeOf(HfTokenizer.BpeCache) + entry_bytes;
     var budget = Budget{ .max_bytes = hard_limit };
     var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    errdefer tok.deinitSelf();
     try tok.configureBpeCache(.{
         .max_bytes = hard_limit,
         .resource_budget = .{
@@ -4193,9 +4546,17 @@ test "BPE cache obeys local and external byte budgets" {
     allocator.free(first);
     const second = try tok.encode(allocator, "abc");
     allocator.free(second);
-    const uncached_under_pressure = try tok.encode(allocator, "cab");
-    defer allocator.free(uncached_under_pressure);
-    try std.testing.expectEqualSlices(i32, &.{6}, uncached_under_pressure);
+    const first_cab = try tok.encode(allocator, "cab");
+    allocator.free(first_cab);
+    const second_cab = try tok.encode(allocator, "cab");
+    allocator.free(second_cab);
+    const pressure_stats = tok.bpeCacheStats();
+    try std.testing.expectEqual(@as(usize, 0), pressure_stats.entries);
+    try std.testing.expectEqual(@sizeOf(HfTokenizer.BpeCache), pressure_stats.used_bytes);
+
+    const third_cab = try tok.encode(allocator, "cab");
+    defer allocator.free(third_cab);
+    try std.testing.expectEqualSlices(i32, &.{6}, third_cab);
 
     const stats = tok.bpeCacheStats();
     try std.testing.expectEqual(@as(usize, 1), stats.entries);
@@ -4205,6 +4566,73 @@ test "BPE cache obeys local and external byte budgets" {
 
     tok.deinitSelf();
     try std.testing.expectEqual(@as(usize, 0), budget.used_bytes.load(.acquire));
+}
+
+test "BPE cache admits repeated keys and replaces cold entries" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 1},
+        \\    "merges": []
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+
+    var tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+
+    const first = try tok.encode(allocator, "unseen");
+    allocator.free(first);
+    try std.testing.expectEqual(@as(usize, 0), tok.bpeCacheStats().entries);
+    const second = try tok.encode(allocator, "unseen");
+    allocator.free(second);
+    try std.testing.expectEqual(@as(usize, 1), tok.bpeCacheStats().entries);
+
+    const cache = tok.bpe_cache orelse return error.TestExpectedBpeCache;
+    const reader = tok.enterBpeCacheRead() orelse return error.TestExpectedBpeCache;
+    var reader_active = true;
+    defer if (reader_active) tok.leaveBpeCacheRead(reader);
+    var newest: [32]u8 = undefined;
+    var newest_len: usize = 0;
+    var candidate: usize = 0;
+    var inserted: usize = 0;
+    while (inserted <= HfTokenizer.bpe_cache_max_entries_per_shard) : (candidate += 1) {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "collision-{d}", .{candidate});
+        if (HfTokenizer.bpeCacheShard(HfTokenizer.bpeCacheHash(key)) != 0) continue;
+        tok.cacheBpe(key, &.{42});
+        tok.cacheBpe(key, &.{42});
+        @memcpy(newest[0..key.len], key);
+        newest_len = key.len;
+        inserted += 1;
+    }
+    tok.leaveBpeCacheRead(reader);
+    reader_active = false;
+
+    const stats = tok.bpeCacheStats();
+    // The unrelated "unseen" key may share this shard, but the shard itself
+    // remains strictly capped and the newest admitted key survives.
+    try std.testing.expect(stats.entries <=
+        HfTokenizer.bpe_cache_max_entries_per_shard *
+            HfTokenizer.bpe_cache_shard_count);
+    try std.testing.expectEqual(
+        HfTokenizer.bpe_cache_max_entries_per_shard,
+        cache.shards[0].count.load(.acquire),
+    );
+    const verify_reader = tok.enterBpeCacheRead() orelse return error.TestExpectedBpeCache;
+    defer tok.leaveBpeCacheRead(verify_reader);
+    var ids = std.ArrayListUnmanaged(i32).empty;
+    defer ids.deinit(allocator);
+    try std.testing.expect(try tok.appendCachedBpe(
+        allocator,
+        newest[0..newest_len],
+        &ids,
+    ));
+    try std.testing.expectEqualSlices(i32, &.{42}, ids.items);
+    try std.testing.expectEqual(@as(usize, 0), cache.retired_bytes.load(.acquire));
 }
 
 test "parallel workspaces remain resource-accounted without a BPE cache table" {

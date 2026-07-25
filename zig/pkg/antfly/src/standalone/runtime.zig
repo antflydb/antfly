@@ -1495,7 +1495,14 @@ pub fn runFromIterator(
     }, local_metadata.catalogSource(), local_metadata.statusSource());
     defer data_server.deinit();
     antfly_node_needs_errdeinit = false;
-    defer antfly_node.deinit();
+    defer {
+        // DataServer sources, recovery workers, and durable API jobs retain the
+        // embedded provider. Drain them while the node is valid, then release
+        // tokenizer reservations while DataServer's ResourceManager is valid.
+        // The earlier data_server.deinit defer performs final storage teardown.
+        data_server.quiesceBackgroundWork();
+        antfly_node.deinit();
+    }
 
     antfly_node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(&data_server.provisioned_storage.resource_manager);
     try antfly_node.configureTokenizerCaches(.{

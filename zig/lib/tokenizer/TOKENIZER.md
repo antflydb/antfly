@@ -75,9 +75,9 @@ Measured on an Apple M4 Max. Throughput is decimal MB/s.
 | Current | steady, 1 task | 291–295 MB/s |
 | Current | steady, 14 concurrent `std.Io` tasks | 2.86–3.09 GB/s |
 | Current, 738 KiB corpus | cold, 14 internal tasks | 497.04 MB/s |
-| Current, 738 KiB corpus | steady, 16 internal tasks | 2.72 GB/s |
-| Current, 11.8 MB repeated corpus | cold, 14 internal tasks | 1.642 GB/s |
-| Current, 11.8 MB repeated corpus | steady, 16 internal tasks | 3.16 GB/s |
+| Current, 738 KiB corpus | steady, 16 internal tasks | 2.57 GB/s |
+| Current, 11.8 MB repeated corpus | cold, 16 internal tasks | 1.69 GB/s |
+| Current, 11.8 MB repeated corpus | steady, 16 internal tasks | 3.01 GB/s |
 
 The current implementation is approximately 16.4–16.6 times faster than the
 original single-thread steady-state implementation while also correcting the
@@ -90,7 +90,7 @@ differs. Moving dispatch to the application's persistent `std.Io` runtime
 removes per-call OS thread creation. Reusing the tokenizer's task workspaces
 removes repeated chunk-output allocation. Pull scheduling and an ordered
 overlapped gather further reduce runtime imbalance and the serial copy tail.
-The 8.79 GB/s result is still about 2.8 times the 11.8 MB internally
+The 8.79 GB/s result is still about 2.9 times the 11.8 MB internally
 parallel result here, but Gigatoken measures an 11.9 GB OpenWebText
 input—roughly one thousand times larger—using a cache designed for about
 1.3 million unique pretokens per worker. The remaining gap is principally in
@@ -115,13 +115,23 @@ alphabet once while loading `tokenizer.json`. The hot encoder therefore uses
 raw input bytes directly, while `id_to_token` retains the original display
 strings for decoding.
 
-The pretoken cache has 64 shards and 2,048 slots per shard. Reads are lock-free;
-only insertion takes a shard lock. Each shard stops inserting at 75 percent load
-to preserve bounded probe lengths, for a maximum of 98,304 cached pretokens.
-The fixed table and immutable entries also share a 64 MiB per-tokenizer hard
-byte limit, so variable-length keys and results cannot exceed the intended
-memory envelope before the slot-count bound is reached. Entries are freed when
-the tokenizer is deinitialized.
+The pretoken cache has 64 shards and 2,048 slots per shard. Reads remain
+lock-free; admission, replacement, and table maintenance take only the affected
+shard lock. Each shard stays at or below 75 percent load to preserve bounded
+probe lengths, for a maximum of 98,304 cached pretokens. A rotating two-hash
+doorkeeper requires a repeated observation before allocation, which prevents a
+one-pass long-tail corpus from displacing the reusable working set. Saturated
+shards use second-chance CLOCK replacement instead of becoming permanently
+frozen. Hits normally only read the CLOCK bit; they write it only after an
+eviction scan has cleared it.
+
+Removed entries are reclaimed after all active encode calls leave a lightweight
+read epoch. This keeps lookup pointer loads lock-free without leaking evicted
+keys or risking use-after-free. Tombstones preserve probe chains and are
+periodically rebuilt while readers are gated. The fixed table, admission
+filter, live entries, and not-yet-reclaimed entries share a 64 MiB
+per-tokenizer hard byte limit, so variable-length keys and results cannot
+exceed the memory envelope before the slot-count bound is reached.
 
 `BpeCacheConfig.resource_budget` optionally supplies cold-path `try_reserve`
 and `release` callbacks. Antfly standalone connects these callbacks to the
@@ -136,10 +146,12 @@ resource pressure never makes model loading or tokenization fail. Parallel
 workspace retention uses the same budget even when the optional fixed cache
 table could not be allocated.
 
-Standalone installs the budget before warming configured models and destroys
-the inference node before the `DataServer` that owns the manager. This ordering
-is part of the callback lifetime contract: every tokenizer reservation is
-released while its manager context is still alive.
+Standalone installs the budget before warming configured models. Shutdown is
+explicitly staged: `DataServer.quiesceBackgroundWork()` closes request
+admission and joins durable/background users of the local inference provider;
+the inference node is then destroyed and releases every tokenizer reservation
+while the manager context is alive; final `DataServer.deinit()` storage and
+resource-manager teardown happens last.
 
 ## Accepted optimizations
 
@@ -279,6 +291,17 @@ experimental descending-size LPT layout was slower than uniform chunks on the
 M4 Max, so the accepted scheduler uses uniform byte targets and dynamic
 pulling.
 
+### Bounded parallel-boundary planning
+
+Chunk planning probes forward from monotonically increasing byte targets for
+the next safe whitespace-run boundary. Once a boundary is found, every target
+that resolves to it is skipped. The first EOF result terminates planning.
+Normal prose therefore keeps the cheap few-byte targeted probes, while a
+whitespace-free or minified document scans its remaining suffix once instead
+of up to 63 times before taking the required serial fallback. A focused test
+compares the optimized collector against independent scans across empty,
+whitespace-free, repeated-whitespace, and mixed ASCII-whitespace inputs.
+
 ### Overlapped ordered gather
 
 The caller reserves a one-token-per-three-input-bytes density estimate before
@@ -298,10 +321,12 @@ large contiguous output where it is safe and useful; the current sharded cache
 contains allocator-owned objects and is not falsely treated as one huge-page
 allocation.
 
-Post-hardening validation retained the complete hashes and measured 2.72 GB/s
-for ten iterations of the 738 KiB internal-task workload and 3.16 GB/s for five
-iterations of the 11.8 MB workload. Both reported 9,571 live entries, 1,576,232
-accounted cache bytes, and zero rejected reservations.
+Post-hardening validation retained the complete hashes and measured 2.57 GB/s
+for 100 iterations of the 738 KiB internal-task workload and 3.01 GB/s for ten
+iterations of the 11.8 MB workload. Both reported 9,571 live entries, 1,795,976
+accounted cache bytes, and zero rejected reservations. Four concurrent
+requests, each using up to four consumers, measured 3.21 GB/s on the 738 KiB
+fixture.
 
 ### ByteLevel direct-address IDs and single-result appends
 
@@ -330,6 +355,23 @@ CPU sampling before the direct maps attributed about 21 percent of observed
 stacks to Wyhash. After one- and two-byte keys bypassed the cache, that fell to
 about 13 percent. The result supports targeting key representation and
 avoidable lookups rather than replacing the proven hash with an ad hoc one.
+
+### Pollution-resistant bounded cache
+
+Cold misses first pass through a 64 KiB, two-generation doorkeeper. Two
+independent bits share one atomic word, so observation needs one read-modify-
+write instead of contending on two cache lines. A key must be observed twice
+within the rolling window before the cache allocates its immutable key and
+token-ID result. Rotation clears an inactive generation before publishing it,
+so an unbounded stream of unique pretokens cannot saturate admission forever.
+
+At the 75-percent shard limit, insertion gives entries a second chance with a
+CLOCK bit and replaces a cold victim. A read-side epoch permits the hit path to
+load immutable entry pointers without locks; retired entries are freed and
+their local and `ResourceManager` bytes released only after prior readers
+drain. If a byte reservation is denied, an eligible victim can be retired so a
+later repeated candidate can use the released capacity. Duplicate checks under
+the shard lock prevent a racing insertion from causing needless eviction.
 
 ## Rejected or inconclusive experiments
 
@@ -405,7 +447,8 @@ The Gigatoken-derived checklist now has these outcomes:
 - Implemented: persistent `std.Io` scheduling, reusable chunk outputs, reusable
   BPE merge scratch, over-decomposed pull scheduling, overlapped ordered gather,
   Linux output huge-page advice, SIMD boundary masks, compact Unicode classes,
-  direct short-key IDs, and packed merge-pair lookup.
+  direct short-key IDs, packed merge-pair lookup, bounded boundary planning,
+  repeated-hit admission, CLOCK replacement, and epoch-safe cache reclamation.
 - Measured and rejected on the current workload: inline shared entries,
   worker-local caches, short-key hash replacement, two-phase prefetching,
   multi-cursor streaming, and descending LPT chunk sizes.
@@ -437,7 +480,7 @@ zig build test-tokenizer-batch
 ```
 
 `test-tokenizer` runs both implementations: the Hugging Face suite currently
-passes 31 tests with one optional external-model test skipped, and the
+passes 33 tests with one optional external-model test skipped, and the
 SentencePiece suite passes all 18 tests. The tokenizer-batch target also passes.
 `zig build inference-test` passes 2,024 tests with 11 skips, and
 `zig build root-test` passes all 222 root compile/unit tests. The focused
