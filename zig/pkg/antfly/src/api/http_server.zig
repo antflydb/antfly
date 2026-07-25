@@ -5102,7 +5102,6 @@ pub const ApiHttpServer = struct {
                         error.TableAlreadyExists => return try textResponse(self.alloc, 409, "table already exists"),
                         error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid table configuration"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return err,
                         error.UnexpectedHttpStatus => {
                             if (platform_time.monotonicNs() -| metadata_create_start_ns >= metadata_create_timeout_ns) {
                                 std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
@@ -5112,6 +5111,7 @@ pub const ApiHttpServer = struct {
                             continue;
                         },
                         else => {
+                            if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
                             std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
                             return err;
                         },
@@ -6654,65 +6654,6 @@ pub const ApiHttpServer = struct {
             return .committed_durable;
         }
         unreachable;
-    }
-
-    fn restoreLocalTableDataFromManifest(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, backup_id: []const u8) !void {
-        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch |err| switch (err) {
-            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
-            else => return error.InvalidBackupRequest,
-        };
-        defer manifest.deinit(self.alloc);
-        if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
-        try backups_api.validateRestorableManifestLayout(&manifest);
-
-        const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
-        const local_backup_root = switch (backup_location.*) {
-            .file => |value| value,
-            .remote => try self.createBackupStagingRoot(backup_id),
-        };
-        defer switch (backup_location.*) {
-            .file => {},
-            .remote => self.destroyBackupStagingRoot(local_backup_root),
-        };
-        if (switch (backup_location.*) {
-            .remote => true,
-            .file => false,
-        }) {
-            for (manifest.shards) |shard| {
-                const dest_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
-                defer self.alloc.free(dest_root);
-                switch (manifest.format) {
-                    .portable => try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root),
-                    .native => try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root),
-                }
-            }
-        }
-
-        self.waitForMetadataProjection(table_name, manifest.schema_json, manifest.indexes_json) catch |err| switch (err) {
-            error.TableVisibilityTimeout => return error.TableVisibilityTimeout,
-            else => return err,
-        };
-
-        const timeout_ns = 30 * std.time.ns_per_s;
-        const poll_interval_ns = 50 * std.time.ns_per_ms;
-        const start_ns = platform_time.monotonicNs();
-        while (true) {
-            if ((table_writes_source.restoreTable(self.alloc, table_name, .{
-                .backup_root = local_backup_root,
-                .manifest = &manifest,
-                .io = self.sharedApiIo(),
-            }) catch |err| switch (err) {
-                error.UnsupportedOperation => return error.UnsupportedOperation,
-                error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
-                else => {
-                    std.log.err("restoreLocalTableDataFromManifest restoreTable failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
-                    return err;
-                },
-            }) != null) return;
-
-            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
-            sleepNs(poll_interval_ns);
-        }
     }
 
     fn restoreMetadataTableWithRetry(
@@ -13710,7 +13651,12 @@ pub fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResp
 
 fn isRetryableMetadataLeadershipError(err: anyerror) bool {
     return switch (err) {
-        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => true,
+        error.NotLeader,
+        error.ProposalDropped,
+        error.LeaderTransferInProgress,
+        error.MetadataLinearizableReadTimeout,
+        error.ReconcileLeaseNotHeld,
+        => true,
         else => false,
     };
 }
@@ -26251,7 +26197,7 @@ fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
     try std.testing.expect(metadata_not_leader);
 }
 
-test "api http server returns retryable not leader for local public metadata mutation" {
+test "api http server returns retryable not leader when local reconcile lease is lost" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
         create_calls: usize = 0,
@@ -26274,7 +26220,7 @@ test "api http server returns retryable not leader for local public metadata mut
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             self.create_calls += 1;
-            return error.NotLeader;
+            return error.ReconcileLeaseNotHeld;
         }
     };
 
@@ -27161,7 +27107,7 @@ test "api http server durability-pending restore preserves committed metadata" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("snap1", plan.manifest.backup_id);
-            try std.testing.expectEqualStrings(self.expected_location, plan.source_location orelse return error.TestUnexpectedResult);
+            try std.testing.expectEqualStrings(self.expected_location, plan.source_location);
             self.restore_calls += 1;
             self.state.restored.store(true, .release);
             if (plan.reconcile_only) return;

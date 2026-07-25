@@ -4370,7 +4370,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "api http server requires auth on public routes when enabled",
-            "api http server returns retryable not leader for local public metadata mutation",
+            "api http server returns retryable not leader when local reconcile lease is lost",
             "api http server returns retryable not leader when metadata proposal is dropped",
             "api http server returns retryable not leader through public table adapter mutation",
             "api http server returns retryable not leader when cluster backup read barrier times out",
@@ -5004,6 +5004,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "table write source restore acquires lifecycle unless caller reserves it",
             "provisioned native backup restore repeats through shared read and write owners",
+            "provisioned create reuses a generation opened by startup reconciliation",
             "hosted backup forwarding preserves external io authority",
             "provisioned table restore preparation blocks writes and competing structural mutation",
             "provisioned table restore preparation blocks writes while allowing reads",
@@ -5256,6 +5257,7 @@ pub fn build(b: *std.Build) void {
             "metadata http server serves status and filtered admin routes",
             "metadata http server accepts internal reallocate and split merge routes",
             "metadata http server returns 400 for invalid internal restore backup locations",
+            "metadata http server returns retryable authority response when reconcile lease is not held",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

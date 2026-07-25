@@ -1187,9 +1187,11 @@ pub const MetadataHttpServer = struct {
                     }) catch return try textResponse(alloc, 400, "invalid catalog publication contract");
                     defer parsed.deinit();
                     const valid = self.source.validatePublication(parsed.value) catch |err| switch (err) {
-                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => return try notLeaderResponse(alloc),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
+                        else => if (isRetryableMetadataAuthorityError(err))
+                            return try notLeaderResponse(alloc)
+                        else
+                            return err,
                     };
                     return try textResponse(alloc, if (valid) 204 else 409, "");
                 }
@@ -1200,9 +1202,11 @@ pub const MetadataHttpServer = struct {
                     }) catch return try textResponse(alloc, 400, "invalid catalog table publication contract");
                     defer parsed.deinit();
                     const valid = self.source.validateTablePublication(parsed.value) catch |err| switch (err) {
-                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => return try notLeaderResponse(alloc),
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => return err,
+                        else => if (isRetryableMetadataAuthorityError(err))
+                            return try notLeaderResponse(alloc)
+                        else
+                            return err,
                     };
                     return try textResponse(alloc, if (valid) 204 else 409, "");
                 }
@@ -1748,9 +1752,9 @@ pub const MetadataHttpServer = struct {
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
-        return self.handleWithAllocator(alloc, req) catch |err| switch (err) {
-            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => try notLeaderResponse(alloc),
-            else => return err,
+        return self.handleWithAllocator(alloc, req) catch |err| {
+            if (isRetryableMetadataAuthorityError(err)) return try notLeaderResponse(alloc);
+            return err;
         };
     }
 };
@@ -3025,6 +3029,18 @@ fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
         .content_type = content_type,
         .headers = headers,
         .body = body,
+    };
+}
+
+fn isRetryableMetadataAuthorityError(err: anyerror) bool {
+    return switch (err) {
+        error.NotLeader,
+        error.ProposalDropped,
+        error.LeaderTransferInProgress,
+        error.MetadataLinearizableReadTimeout,
+        error.ReconcileLeaseNotHeld,
+        => true,
+        else => false,
     };
 }
 
@@ -4901,4 +4917,64 @@ test "metadata http server accepts reseed exact cutover route" {
     try std.testing.expectEqual(@as(u32, 1), source.reseed_source_ordinal.?);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"slot_name\":\"fresh_slot\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"publication_name\":\"fresh_pub\"") != null);
+}
+
+test "metadata http server returns retryable authority response when reconcile lease is not held" {
+    const FakeSource = struct {
+        create_calls: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .create_table = createTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.UnexpectedStatusCall;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshotCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn createTable(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            _: tables_api.CreateTableRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.create_calls += 1;
+            return error.ReconcileLeaseNotHeld;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var resp = try server.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = "/internal/v1/tables/docs",
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqual(@as(usize, 1), source.create_calls);
+    var authority_header_found = false;
+    for (resp.headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header)) continue;
+        try std.testing.expectEqualStrings(http_common.metadata_not_leader_value, header.value);
+        authority_header_found = true;
+    }
+    try std.testing.expect(authority_header_found);
 }

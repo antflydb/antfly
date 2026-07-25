@@ -10930,13 +10930,54 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
 
-        self.beginLocalStructuralMutation(table_name);
-        errdefer self.abortLocalStructuralMutation(table_name);
-
         const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
         const schema_json = tables_api.effectiveSchemaJson(req.schema_json);
         const indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, raw_indexes_json, schema_json);
         defer alloc.free(indexes_json);
+
+        if (self.write_cache) |cache| {
+            // Catalog admission and local owner reconciliation are concurrent.
+            // Treat create as an idempotent ensure operation so a startup or
+            // reconcile owner that already opened the generation is reused
+            // through the shared writer cache instead of deleted underneath.
+            self.beginLocalStructuralCachedDbMutation(table_name);
+            errdefer self.abortLocalStructuralCachedDbMutation(table_name);
+
+            for (group_ids) |group_id| {
+                std.log.info("provisioned create table local group begin table={s} group_id={d}", .{ table_name, group_id });
+                const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+                defer alloc.free(path);
+
+                var cached = try self.getOrOpenCachedDbForLocalMutation(
+                    alloc,
+                    cache,
+                    path,
+                    group_id,
+                    self.visibleRootGeneration(group_id),
+                    table_name,
+                    false,
+                );
+                defer cached.deinit(alloc);
+                try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
+                try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+                _ = try metadata_table_provisioner.reconcileDbIndexes(alloc, cached.db, indexes_json);
+                _ = try metadata_table_provisioner.ensureResolversWithOptions(alloc, cached.db, indexes_json, .{
+                    .drain_backfill = false,
+                });
+                try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db);
+                std.log.info("provisioned create table local group ready table={s} group_id={d}", .{ table_name, group_id });
+            }
+
+            self.finishLocalStructuralCachedDbMutation(table_name);
+            std.log.info("provisioned create table local notify table={s}", .{table_name});
+            self.notifyLocalChange(table_name, .structural);
+            std.log.info("provisioned create table local done table={s}", .{table_name});
+            return {};
+        }
+
+        self.beginLocalStructuralMutation(table_name);
+        errdefer self.abortLocalStructuralMutation(table_name);
+
         for (group_ids) |group_id| {
             std.log.info("provisioned create table local group begin table={s} group_id={d}", .{ table_name, group_id });
             try deleteGroupPathIfPresent(alloc, self.replica_root_dir, group_id);
@@ -20547,6 +20588,7 @@ test "bound table write source backs up and restores a local table" {
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .source_location = "file://bound-native-test",
     });
 
     db.close();
@@ -20619,6 +20661,7 @@ test "bound table write source backs up and restores a portable local table" {
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .source_location = "file://bound-portable-test",
     });
 
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
@@ -20771,6 +20814,7 @@ test "provisioned table restore rejects multi-range manifests before opening sto
     try std.testing.expectError(error.UnsupportedMultiRangeTable, source.source().restoreTable(std.testing.allocator, "docs", .{
         .backup_root = "/tmp/unused-antfly-multi-range-backup",
         .manifest = &manifest,
+        .source_location = "file:///tmp/unused-antfly-multi-range-backup",
     }));
 }
 
@@ -20870,15 +20914,16 @@ test "provisioned table restore retry skips exact incomplete restore state with 
     defer manifest.deinit(alloc);
     try backups_api.writeManifest(alloc, backup_root, &manifest);
 
+    const location = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root});
+    defer alloc.free(location);
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .source_location = location,
     });
     source.restore_repair_work_group.await(source.table_activity_threaded.io()) catch {};
     source.drainRestoreRepairCompletionsScheduled();
 
-    const location = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root});
-    defer alloc.free(location);
     try db_mod.DB.markRestorePrimaryRestoredForPathWithArtifact(
         alloc,
         db_path,
@@ -20899,6 +20944,7 @@ test "provisioned table restore retry skips exact incomplete restore state with 
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .source_location = location,
     });
 }
 
@@ -21198,6 +21244,7 @@ test "provisioned table restore rejects mismatched doc identity namespace" {
     try std.testing.expectError(error.IdentityNamespaceMismatch, source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .source_location = "file://provisioned-identity-mismatch-test",
     }));
 }
 
@@ -21300,6 +21347,7 @@ test "provisioned table write source backs up and restores full_text writes from
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
+        .source_location = "file://provisioned-write-cache-test",
     });
     try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
@@ -21574,6 +21622,7 @@ test "provisioned native backup restore repeats through shared read and write ow
         _ = try source.source().restoreTable(alloc, "docs", .{
             .backup_root = backup_root,
             .manifest = &manifest,
+            .source_location = "file://provisioned-native-restore-repeat",
         });
         try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
@@ -27403,6 +27452,7 @@ test "table write source restore acquires lifecycle unless caller reserves it" {
     const plan = backups_api.TableRestorePlan{
         .backup_root = "/tmp/unused-antfly-automatic-restore-lifecycle",
         .manifest = &manifest,
+        .source_location = "file:///tmp/unused-antfly-automatic-restore-lifecycle",
     };
 
     var context = Context{};
@@ -34394,6 +34444,98 @@ test "provisioned table write source create table provisions local indexes and s
     try std.testing.expectEqualStrings("title", enrichment.field);
 }
 
+test "provisioned create reuses a generation opened by startup reconciliation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/create-startup-owner-race", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .range_id = 7101,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var startup_write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.bindWriteCaches(&write_cache, &startup_write_cache);
+
+    {
+        var startup_owner = try startup_write_cache.getOrOpenLockedMode(
+            path,
+            Catalog.iface(),
+            7001,
+            source.visibleRootGeneration(7001),
+            "docs",
+            .startup_catch_up,
+        );
+        defer startup_owner.deinit(alloc);
+        try startup_owner.db.batch(.{
+            .writes = &.{.{ .key = "doc:admitted", .value = "{\"title\":\"already provisioned\"}" }},
+            .timestamp_ns = 1,
+        });
+    }
+
+    _ = try source.source().createTable(alloc, "docs", .{});
+
+    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    var serving_owner = try write_cache.getOrOpenLocked(
+        path,
+        Catalog.iface(),
+        7001,
+        source.visibleRootGeneration(7001),
+        "docs",
+    );
+    defer serving_owner.deinit(alloc);
+    var admitted = (try serving_owner.db.lookup(alloc, "doc:admitted", .{})) orelse return error.TestUnexpectedResult;
+    defer admitted.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, admitted.json, "already provisioned") != null);
+}
+
 test "provisioned table write source restore table does not hold local db mutex during restore work" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-table-restore-mutex";
@@ -34473,6 +34615,7 @@ test "provisioned table write source restore table does not hold local db mutex 
             _ = self.source.source().restoreTable(std.heap.page_allocator, "docs", .{
                 .backup_root = backup_root,
                 .manifest = self.manifest,
+                .source_location = "file://provisioned-restore-preparation-test",
             }) catch |err| {
                 self.err = err;
             };

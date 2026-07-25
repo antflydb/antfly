@@ -150,7 +150,10 @@ pub const TableBackupPlan = struct {
 pub const TableRestorePlan = struct {
     backup_root: []const u8,
     manifest: *const TableBackupManifest,
-    source_location: ?[]const u8 = null,
+    /// Stable identity of the admitted backup source. This remains the
+    /// restore idempotency key after a remote artifact is copied into a
+    /// private local staging root.
+    source_location: []const u8,
     reconcile_only: bool = false,
     replace_existing: bool = false,
     publication_hook: ?RestorePublicationHook = null,
