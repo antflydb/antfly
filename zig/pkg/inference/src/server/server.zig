@@ -560,6 +560,25 @@ fn estimateParsedDenseEmbedPromptTokens(inputs: *const ParsedDenseEmbedInputs) u
     return total;
 }
 
+/// Message for an architecture we cannot generate with.
+///
+/// The experimental list is empty whenever no family qualifies as working-but-early, so
+/// it is only mentioned when it has something in it.
+fn unsupportedArchitectureMessage(allocator: std.mem.Allocator, arch: []const u8) ![]u8 {
+    if (gpt_model_mod.gguf_experimental_architectures.len == 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            "model architecture \"{s}\" is not supported for generation; supported: {s}",
+            .{ arch, gpt_model_mod.gguf_supported_architectures },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "model architecture \"{s}\" is not supported for generation; supported: {s}; experimental: {s}",
+        .{ arch, gpt_model_mod.gguf_supported_architectures, gpt_model_mod.gguf_experimental_architectures },
+    );
+}
+
 fn isOpenAiListTask(task: []const u8) bool {
     return std.mem.eql(u8, task, "generators") or std.mem.eql(u8, task, "embedders");
 }
@@ -622,14 +641,39 @@ fn modelSupportLevel(
 /// Uses the manifest already in hand: `config_model_arch` when config.json supplied one,
 /// otherwise a cheap `general.architecture` read that skips the rest of the GGUF metadata.
 fn listingSupportLevel(allocator: std.mem.Allocator, man: manifest_mod.ModelManifest) []const u8 {
-    if (man.model_type != .generator) return "";
+    _ = allocator;
+    if (man.model_type != .generator) return @tagName(model_caps.modelClassSupportLevel(&man));
 
     var region: ?c_file.MmapRegion = null;
     defer if (region) |*value| value.deinit();
     const arch = modelArchitectureName(&man, &region);
     if (std.mem.eql(u8, arch, "unknown")) return "";
-    _ = allocator;
     return @tagName(gpt_model_mod.supportLevel(gpt_model_mod.detectFamily(arch)));
+}
+
+/// Reject a model class we cannot serve, before anything is loaded.
+///
+/// Unlike the generation gate this is not about honesty alone: the blocked classes crash
+/// the process (unbounded allocation in the ONNX vision path, a rank assertion while
+/// importing an ONNX seq2seq graph), so reaching them turns one bad request into a dead
+/// server for every other caller.
+fn rejectUnsupportedModelClass(
+    ctx: *httpx.Context,
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+) !?httpx.Response {
+    var man = manifest_mod.loadListingFromDir(allocator, model_path) catch return null;
+    defer man.deinit();
+    if (model_caps.modelClassSupportLevel(&man) != .unsupported) return null;
+
+    return try ctx.status(400).json(.{
+        .@"error" = "UNSUPPORTED_MODEL",
+        .message = try std.fmt.allocPrint(
+            allocator,
+            "model is not supported for {s}; see https://antfly.io/docs/guides/supported-models",
+            .{@tagName(man.model_type)},
+        ),
+    });
 }
 
 /// A discovered model resolved once, so the ten task passes in `listModelsJsonAlloc` can
@@ -1878,6 +1922,8 @@ pub const Node = struct {
                 .message = "model not found; specify 'model' as a path or owner/name",
             });
 
+        if (try rejectUnsupportedModelClass(ctx, ctx.allocator, model_path)) |response| return response;
+
         const model = self.model_manager.loadFromDir(model_path) catch |err|
             return ctx.status(500).json(.{
                 .@"error" = "MODEL_LOAD_FAILED",
@@ -2288,15 +2334,7 @@ pub const Node = struct {
             switch (modelSupportLevel(ctx.allocator, model_path, &gate_arch, &gate_region)) {
                 .unsupported => return ctx.status(400).json(.{
                     .@"error" = "UNSUPPORTED_ARCHITECTURE",
-                    .message = try std.fmt.allocPrint(
-                        ctx.allocator,
-                        "model architecture \"{s}\" is not supported for generation; supported: {s}; experimental: {s}",
-                        .{
-                            gate_arch orelse "unknown",
-                            gpt_model_mod.gguf_supported_architectures,
-                            gpt_model_mod.gguf_experimental_architectures,
-                        },
-                    ),
+                    .message = try unsupportedArchitectureMessage(ctx.allocator, gate_arch orelse "unknown"),
                 }),
                 .experimental => std.log.warn(
                     "model architecture \"{s}\" is experimental and unverified; generation may fail or produce poor output",
@@ -2818,15 +2856,7 @@ pub const Node = struct {
             const arch = modelArchitectureName(&model.manifest, &arch_region);
             return ctx.status(400).json(.{
                 .@"error" = "UNSUPPORTED_ARCHITECTURE",
-                .message = try std.fmt.allocPrint(
-                    ctx.allocator,
-                    "model architecture \"{s}\" is not supported for generation; supported: {s}; experimental: {s}",
-                    .{
-                        arch,
-                        gpt_model_mod.gguf_supported_architectures,
-                        gpt_model_mod.gguf_experimental_architectures,
-                    },
-                ),
+                .message = try unsupportedArchitectureMessage(ctx.allocator, arch),
             });
         };
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
@@ -5057,6 +5087,8 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, model_name, "rewriters") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
+        if (try rejectUnsupportedModelClass(ctx, ctx.allocator, model_path)) |response| return response;
+
         // Check if this is an encoder-decoder model and find ONNX file paths
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const paths = enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path) catch
@@ -5185,6 +5217,8 @@ pub const Node = struct {
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         const model_path = self.resolveModelPath(ctx.io, model_name, "readers") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
+
+        if (try rejectUnsupportedModelClass(ctx, ctx.allocator, model_path)) |response| return response;
 
         var reader = readers_mod.LoadedReader.loadFromDir(
             ctx.allocator,

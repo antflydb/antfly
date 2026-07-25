@@ -6287,14 +6287,20 @@ test "Gemma resident embeddings retain CUDA-supported quantized formats" {
     try std.testing.expect(!shouldKeepResidentGptEmbeddingQuantizedOnly(llama_cfg, .{ .known = .Q6_K }));
 }
 
-test "support level separates verified, experimental, and unsupported families" {
+test "support level separates verified and unsupported families" {
     // Verified against real GGUF artifacts.
     try std.testing.expectEqual(gpt_mod.SupportLevel.supported, gpt_mod.supportLevel(.llama));
     try std.testing.expectEqual(gpt_mod.SupportLevel.supported, gpt_mod.supportLevel(.qwen3));
     try std.testing.expectEqual(gpt_mod.SupportLevel.supported, gpt_mod.supportLevel(.gemma));
 
-    // Mapped and plumbed, but never run against a real model.
-    try std.testing.expectEqual(gpt_mod.SupportLevel.experimental, gpt_mod.supportLevel(.mistral));
+    // Measured against real artifacts and unusable: qwen2 answers the wrong question,
+    // bitnet degenerates, mistral emits only <unk>, Phi-3 cannot load. None of these are
+    // "early", so none belong in experimental.
+    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.qwen2));
+    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.bitnet));
+    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.mistral));
+    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.phi));
+
     // Loads and resolves every tensor, but execution panics in the grouped output
     // projection, so it must not be reachable from a server.
     try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.deepseek_v4));
@@ -6331,9 +6337,12 @@ test "architecture strings named in errors resolve to their advertised level" {
             gpt_mod.supportLevel(gpt_mod.detectFamily(arch)),
         );
     }
+    // Nothing is experimental for 0.2.0: every family that fell short of supported did
+    // so by producing unusable output, and that belongs in unsupported.
+    try std.testing.expectEqual(@as(usize, 0), gpt_mod.gguf_experimental_architectures.len);
     for ([_][]const u8{ "mistral", "mixtral", "qwen2", "phi", "phi3", "bitnet" }) |arch| {
         try std.testing.expectEqual(
-            gpt_mod.SupportLevel.experimental,
+            gpt_mod.SupportLevel.unsupported,
             gpt_mod.supportLevel(gpt_mod.detectFamily(arch)),
         );
     }
