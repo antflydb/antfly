@@ -11358,6 +11358,25 @@ pub fn runFromIterator(
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
 
+    var remote_content_runtime: antfly.common.remote_content_runtime.Runtime = undefined;
+    var remote_content_runtime_initialized = false;
+    defer if (remote_content_runtime_initialized) remote_content_runtime.deinit();
+    var remote_content_facade = antfly.common.config.Config.RemoteContentConfig{};
+    const remote_content = if (cli.config_path) |config_path| blk: {
+        remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.init(
+            alloc,
+            config_path,
+            if (secret_store_initialized) &secret_store else null,
+            null,
+        );
+        remote_content_runtime_initialized = true;
+        remote_content_runtime.attach(&remote_content_facade);
+        break :blk &remote_content_facade;
+    } else if (loaded_config) |*cfg|
+        if (cfg.remote_content) |*configured| configured else null
+    else
+        null;
+
     const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer alloc.free(data_dir);
     try antfly.common.data_format.ensureCompatible(alloc, data_dir);
@@ -11446,7 +11465,7 @@ pub fn runFromIterator(
             .ard_public_catalog_enabled = cli.ard_public_catalog_enabled,
             .user_manager = if (user_manager) |*manager| manager else null,
             .secret_store = if (secret_store_initialized) &secret_store else null,
-            .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
+            .remote_content = remote_content,
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,

@@ -2210,6 +2210,61 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/connections/{connection_id}/inference/{operation}:
+    post:
+      summary: Invoke an Antfly-compatible inference connection
+      tags:
+        - cluster_management
+      operationId: invokeInferenceConnection
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: operation
+          in: path
+          required: true
+          description: Requires the connection capability `models.<operation>`.
+          schema:
+            type: string
+            enum:
+              - embed
+              - generate
+              - rerank
+              - chunk
+              - recognize
+              - extract
+              - rewrite
+              - read
+              - transcribe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Inference provider response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          description: Invalid connection or operation
+        '401':
+          description: Unauthorized - authentication required
+        '403':
+          description: The connection does not declare the capability required by this operation
+        '502':
+          description: Inference provider request failed
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/secrets:
     get:
       summary: List secrets status
@@ -7341,6 +7396,8 @@ components:
           description: Runtime deployment topology
         secret_store:
           $ref: '#/components/schemas/SecretStoreStatus'
+        runtime_config:
+          $ref: '#/components/schemas/RuntimeConfigStatus'
         storage:
           $ref: '#/components/schemas/StorageRuntimeStatus'
     ClusterTopology:
@@ -7369,6 +7426,8 @@ components:
           description: Runtime deployment topology
         secret_store:
           $ref: '#/components/schemas/SecretStoreStatus'
+        runtime_config:
+          $ref: '#/components/schemas/RuntimeConfigStatus'
         storage:
           $ref: '#/components/schemas/StorageRuntimeStatus'
         data:
@@ -8858,10 +8917,64 @@ components:
       type: object
       description: Non-secret status for the local secrets file store, when one is available.
       properties:
+        generation:
+          type: integer
+          format: uint64
+          description: Generation of the currently published secret-store snapshot.
+        supports_source_generation:
+          type: boolean
+          description: Whether this store can expose one exact opaque source-generation acknowledgement.
+            This remains true when a single loaded file predates the generation field, and is false for
+            layered stores whose served snapshot has multiple publication sources.
+          x-omitzero: false
+        source_generation:
+          type: string
+          nullable: true
+          description: Opaque, non-secret generation embedded by the control plane in the currently applied
+            secrets file. It is null for files without an acknowledgement generation and never derives
+            from secret values.
+        last_reload_failed:
+          type: boolean
+          description: Whether the latest observed replacement failed to load.
+          x-omitzero: false
         stale:
           type: boolean
           description: Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
           x-omitzero: false
+        reload_successes:
+          type: integer
+          format: uint64
+        reload_failures:
+          type: integer
+          format: uint64
+    RuntimeConfigStatus:
+      type: object
+      description: Non-secret status for the applied config.json snapshot. Hot publication accepts validated
+        remote_content-only changes; startup-only changes remain stale until restart.
+      properties:
+        generation:
+          type: integer
+          format: uint64
+          description: Generation of the fully validated and atomically published configuration.
+        hash:
+          type: string
+          description: Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters
+            match the operator config-hash annotation.
+        last_reload_failed:
+          type: boolean
+          description: Whether the latest observed replacement failed loading, semantic validation, or
+            requires restart because startup-only fields changed.
+          x-omitzero: false
+        stale:
+          type: boolean
+          description: Whether requests are using the last-known-good snapshot after a failed reload.
+          x-omitzero: false
+        reload_successes:
+          type: integer
+          format: uint64
+        reload_failures:
+          type: integer
+          format: uint64
     SecretStatus:
       type: string
       enum:
@@ -12306,7 +12419,7 @@ components:
             UTF-8 template input is limited to 64 KiB.
 
 
-            Use this when you want to embed multimodal content (images, PDFs, etc.) instead of
+            Use this when you want to embed template-time multimodal content instead of
 
             just text. The template is rendered using dotprompt with access to remote content helpers.
 
@@ -12315,14 +12428,20 @@ components:
 
             - `remoteMedia url=<url>` - Fetches and embeds remote images/media
 
-            - `remotePDF url=<url>` - Fetches and extracts content from PDFs
+            - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs
 
             - `remoteText url=<url>` - Fetches and includes remote text content
 
 
+            Use a `document_extraction` asset producer when PDF pages and chunks must be persisted
+
+            and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference
+            input.
+
+
             **Examples**:
 
-            - PDF search: `{{remotePDF url=this}}`
+            - Legacy PDF search: `{{remotePDF url=this}}`
 
             - Image search: `{{remoteMedia url=this}}`
 
@@ -12330,7 +12449,7 @@ components:
 
 
             When not specified, the semantic_search string is embedded as plain text.
-          example: '{{remotePDF url=this}}'
+          example: '{{remoteMedia url=this}}'
         indexes:
           type: array
           items:

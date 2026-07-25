@@ -366,7 +366,10 @@ pub const AntflyApiHandler = struct {
             _ = secret_store.refreshIfChanged() catch |err| {
                 std.log.warn("secret store status refresh skipped err={}", .{err});
             };
-            cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+            try cluster.applySecretStoreHealth(alloc, &public_status, secret_store.healthSnapshot());
+        }
+        if (self.api_server.cfg.remote_content) |remote_content| {
+            if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(alloc, &public_status, health);
         }
         return ctx.json(public_status);
     }
@@ -386,7 +389,10 @@ pub const AntflyApiHandler = struct {
             _ = secret_store.refreshIfChanged() catch |err| {
                 std.log.warn("secret store status refresh skipped err={}", .{err});
             };
-            cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+            try cluster.applySecretStoreHealth(alloc, &public_status, secret_store.healthSnapshot());
+        }
+        if (self.api_server.cfg.remote_content) |remote_content| {
+            if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(alloc, &public_status, health);
         }
         var snapshot_opt = try self.api_server.source.cachedAdminSnapshot();
         if (snapshot_opt == null) {
@@ -412,6 +418,19 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("content-type", "application/json");
         _ = ctx.response.body(body);
         return ctx.response.build();
+    }
+
+    pub fn invokeInferenceConnection(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id: []const u8, operation: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "request body required");
+        const result = self.api_server.invokeInferenceConnection(ctx.allocator, connection_id, operation, body) catch |err| switch (err) {
+            error.ConnectionCapabilityMissing => return textResponse(ctx, 403, @errorName(err)),
+            error.ConnectionNotFound, error.ConnectionNotInference, error.InvalidConfig, error.ConnectionURLMissing, error.InvalidConnectionURL, error.ProviderNotAntflyCompatible, error.UnsupportedInferenceOperation => return textResponse(ctx, 400, @errorName(err)),
+            else => return textResponse(ctx, 502, @errorName(err)),
+        };
+        return jsonResponse(ctx, result.status, result.body);
     }
 
     pub fn listSecrets(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

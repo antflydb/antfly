@@ -453,6 +453,9 @@ pub const DenseSearchProfile = struct {
     hbc_quantized_cache_lookup_ns: u64 = 0,
     resolved_search_width: u32 = 0,
     resolved_epsilon: f32 = 0,
+    native_filter_candidate_count: u64 = 0,
+    search_route: []const u8 = "",
+    route_reason: []const u8 = "",
     hbc_nodes_visited: u64 = 0,
     hbc_leaves_explored: u64 = 0,
     hbc_approx_vectors_scored: u64 = 0,
@@ -8780,10 +8783,28 @@ fn searchQueryCanUseMappedDocValues(
     expected_type: runtime_schema_mod.AntflyType,
 ) !bool {
     const schema = runtime_schema orelse return false;
-    const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse return false;
+    const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse blk: {
+        if (!schemaInfersDynamicFieldType(schema, field)) return false;
+        if (expected_type != .numeric and expected_type != .boolean) return false;
+        break :blk runtime_schema_mod.FieldMapping{
+            .field_type = expected_type,
+            .doc_values = true,
+        };
+    };
     if (mapping.field_type != expected_type) return false;
     if (!runtime_schema_mod.mappingHasNativeDocValues(mapping)) return false;
     return try snapshotTypedDocValuesCoverageForMapping(snapshot, field, mapping) == .covered;
+}
+
+fn schemaInfersDynamicFieldType(schema: runtime_schema_mod.TableSchema, field: []const u8) bool {
+    for (schema.full_text_documents) |document| {
+        for (document.infer_type_dynamic_paths) |path| {
+            if (path.len == 0) return true;
+            if (!std.mem.startsWith(u8, field, path)) continue;
+            if (field.len == path.len or (field.len > path.len and field[path.len] == '.')) return true;
+        }
+    }
+    return false;
 }
 
 fn searchQueryCanUseMappedGeoDocValues(
@@ -12194,6 +12215,8 @@ fn searchDenseInternal(
     const collect_hbc_profile = include_hbc_profile or bench_query_profile;
 
     if (native_constraints.positive_filter and native_constraints.filter_ids.len == 0) {
+        profile.search_route = "empty_result";
+        profile.route_reason = "empty_native_filter";
         profile.returned_hit_count = 0;
         profile.total_ns = platform_time.monotonicNs() - total_start;
         return .{
@@ -12206,6 +12229,7 @@ fn searchDenseInternal(
     }
 
     const effective_filter_ids = if (native_constraints.positive_filter) native_constraints.filter_ids else req.filter_ids;
+    profile.native_filter_candidate_count = @intCast(effective_filter_ids.len);
     const effective_exclude_ids = if (native_constraints.exclude_ids.len > 0) native_constraints.exclude_ids else req.exclude_ids;
     var bounded_full_candidate_count: u32 = if (native_constraints.positive_filter)
         @intCast(@min(native_constraints.filter_ids.len, std.math.maxInt(u32)))
@@ -12260,8 +12284,12 @@ fn searchDenseInternal(
         };
 
         const hbc_search_start = platform_time.monotonicNs();
-        const use_exact_native_filter = shouldExactScoreNativeDenseFilter(native_constraints, paging);
-        var results = if (use_exact_native_filter) blk: {
+        const route = denseSearchRoute(native_constraints, paging, executor.exact_dense_search != null);
+        profile.search_route = route.name;
+        profile.route_reason = route.reason;
+        var results = if (route.exact_native_filter) blk: {
+            // The callback is an optional executor override, not an exact-route
+            // capability gate. Preserve the built-in exact scorer fallback.
             const exact = if (executor.exact_dense_search) |exact_search|
                 try exact_search(executor.ctx, entry, hbc_req)
             else
@@ -12468,15 +12496,77 @@ fn shouldLogBenchQueryProfile() bool {
     return current % every == 0;
 }
 
-fn shouldExactScoreNativeDenseFilter(
+const DenseSearchRoute = struct {
+    exact_native_filter: bool,
+    name: []const u8,
+    reason: []const u8,
+};
+
+fn denseSearchRoute(
     native_constraints: NativeDenseConstraints,
     paging: ComponentPaging,
-) bool {
-    if (!native_constraints.positive_filter) return false;
-    if (native_constraints.filter_ids.len == 0) return false;
+    exact_executor_available: bool,
+) DenseSearchRoute {
+    if (!native_constraints.positive_filter) return .{
+        .exact_native_filter = false,
+        .name = "hbc",
+        .reason = "no_native_filter",
+    };
+    if (native_constraints.filter_ids.len == 0) return .{
+        .exact_native_filter = false,
+        .name = "hbc",
+        .reason = "empty_native_filter",
+    };
     const paging_budget = pagingCandidateWindow(paging) *| 32;
     const budget = @max(paging_budget, default_exact_native_filter_candidate_budget);
-    return native_constraints.filter_ids.len <= budget;
+    if (native_constraints.filter_ids.len <= budget) return .{
+        .exact_native_filter = true,
+        .name = "exact_native_filter",
+        .reason = if (exact_executor_available)
+            "candidate_count_within_budget"
+        else
+            "candidate_count_within_budget_builtin",
+    };
+    return .{
+        .exact_native_filter = false,
+        .name = "hbc",
+        .reason = "native_filter_candidate_budget_exceeded",
+    };
+}
+
+test "dense search route reports exact native filter budget decisions" {
+    const paging = ComponentPaging{ .offset = 0, .limit = 100 };
+
+    const no_filter = denseSearchRoute(.{}, paging, false);
+    try std.testing.expect(!no_filter.exact_native_filter);
+    try std.testing.expectEqualStrings("hbc", no_filter.name);
+    try std.testing.expectEqualStrings("no_native_filter", no_filter.reason);
+
+    var within_budget_ids: [500]u64 = undefined;
+    const within_budget = denseSearchRoute(.{
+        .positive_filter = true,
+        .filter_ids = &within_budget_ids,
+    }, paging, true);
+    try std.testing.expect(within_budget.exact_native_filter);
+    try std.testing.expectEqualStrings("exact_native_filter", within_budget.name);
+    try std.testing.expectEqualStrings("candidate_count_within_budget", within_budget.reason);
+
+    const builtin_fallback = denseSearchRoute(.{
+        .positive_filter = true,
+        .filter_ids = &within_budget_ids,
+    }, paging, false);
+    try std.testing.expect(builtin_fallback.exact_native_filter);
+    try std.testing.expectEqualStrings("exact_native_filter", builtin_fallback.name);
+    try std.testing.expectEqualStrings("candidate_count_within_budget_builtin", builtin_fallback.reason);
+
+    var over_budget_ids: [3201]u64 = undefined;
+    const over_budget = denseSearchRoute(.{
+        .positive_filter = true,
+        .filter_ids = &over_budget_ids,
+    }, paging, false);
+    try std.testing.expect(!over_budget.exact_native_filter);
+    try std.testing.expectEqualStrings("hbc", over_budget.name);
+    try std.testing.expectEqualStrings("native_filter_candidate_budget_exceeded", over_budget.reason);
 }
 
 fn pagingCandidateWindow(paging: ComponentPaging) u32 {
@@ -12745,7 +12835,7 @@ fn logBenchDenseQueryProfile(
 ) void {
     const estimated_leaves = estimateLeafCount(index_stats);
     std.log.info(
-        "antfly_bench_dense_query index={s} primary_text={s} has_filter={} has_exclusion={} k={d} limit={d} offset={d} effort={d:.3} nodes={d} active={d} estimated_leaves={d} leaf_size={d} branching={d} search_width={d} epsilon={d:.3} total_us={d} index_lookup_us={d} constraint_us={d} hbc_us={d} doc_key_us={d} doc_ordinal_us={d} load_projected_us={d} postprocess_us={d} raw_hits={d} returned_hits={d}",
+        "antfly_bench_dense_query index={s} primary_text={s} has_filter={} has_exclusion={} k={d} limit={d} offset={d} effort={d:.3} nodes={d} active={d} estimated_leaves={d} leaf_size={d} branching={d} search_width={d} epsilon={d:.3} native_filter_candidates={d} route={s} route_reason={s} total_us={d} index_lookup_us={d} constraint_us={d} hbc_us={d} doc_key_us={d} doc_ordinal_us={d} load_projected_us={d} postprocess_us={d} raw_hits={d} returned_hits={d}",
         .{
             req.index_name orelse "",
             req.primary_text_index_name orelse "",
@@ -12762,6 +12852,9 @@ fn logBenchDenseQueryProfile(
             index_stats.branching_factor,
             profile.resolved_search_width,
             profile.resolved_epsilon,
+            profile.native_filter_candidate_count,
+            profile.search_route,
+            profile.route_reason,
             nsToUs(profile.total_ns),
             nsToUs(profile.index_lookup_ns),
             nsToUs(profile.constraint_ns),

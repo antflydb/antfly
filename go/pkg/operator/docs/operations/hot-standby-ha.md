@@ -5,6 +5,11 @@ clusters running in Standalone mode. It is separate from the Raft metadata HA pa
 hot standby is a single-primary data-plane strategy with one or more standby
 processes receiving and applying HA WAL records.
 
+> [!IMPORTANT]
+> Hot-standby HA is release-gated off by default. The operator must be started
+> with `--enable-hot-standby-ha=true` before it will admit or reconcile an
+> `AntflyCluster` with `spec.highAvailability.mode: HotStandby`.
+
 ## Control Surfaces
 
 Use the typed admin API for normal automation:

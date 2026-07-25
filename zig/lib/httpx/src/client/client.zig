@@ -2834,6 +2834,39 @@ const python_tls_fixed_keepalive_server_script =
     "            continue\n" ++
     "listener.close()\n";
 
+const python_tls_head_keepalive_server_script =
+    "import socket\n" ++
+    "import ssl\n" ++
+    "import sys\n" ++
+    "import time\n" ++
+    "\n" ++
+    "port = int(sys.argv[1])\n" ++
+    "cert = sys.argv[2]\n" ++
+    "key = sys.argv[3]\n" ++
+    "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
+    "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
+    "listener.bind(('127.0.0.1', port))\n" ++
+    "listener.listen(1)\n" ++
+    "ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\n" ++
+    "ctx.load_cert_chain(certfile=cert, keyfile=key)\n" ++
+    "conn, _ = listener.accept()\n" ++
+    "with conn:\n" ++
+    "    with ctx.wrap_socket(conn, server_side=True) as tls_conn:\n" ++
+    "        data = b''\n" ++
+    "        while b'\\r\\n\\r\\n' not in data:\n" ++
+    "            chunk = tls_conn.recv(4096)\n" ++
+    "            if not chunk:\n" ++
+    "                break\n" ++
+    "            data += chunk\n" ++
+    "        tls_conn.sendall(\n" ++
+    "            b'HTTP/1.1 403 Forbidden\\r\\n'\n" ++
+    "            b'Content-Length: 243\\r\\n'\n" ++
+    "            b'Content-Type: application/xml\\r\\n'\n" ++
+    "            b'Connection: keep-alive\\r\\n\\r\\n'\n" ++
+    "        )\n" ++
+    "        time.sleep(2.0)\n" ++
+    "listener.close()\n";
+
 const python_slow_drip_server_script =
     "import socket\n" ++
     "import sys\n" ++
@@ -3233,6 +3266,59 @@ test "HTTPS client streams fixed content-length body with keep-alive to writer" 
     try std.testing.expectEqual(@as(u16, 200), resp.status.code);
     try std.testing.expectEqual(@as(usize, 16 * 16384), out.items.len);
     try std.testing.expect(resp.body == null);
+}
+
+test "HTTPS HEAD returns after headers on a keep-alive connection" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const port = try reserveEphemeralPort(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_head_keepalive_server_script });
+
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+
+    var child = std.process.spawn(io, .{
+        .argv = &.{
+            "python3",
+            "server.py",
+            port_arg,
+            "cert.pem",
+            "key.pem",
+        },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+
+    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+
+    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/object", .{port});
+    defer allocator.free(url);
+
+    var client = Client.initWithConfig(allocator, io, .{
+        .verify_ssl = false,
+        .retry_policy = .{ .max_retries = 0 },
+        .timeouts = .{ .request_ms = 500, .read_ms = 500, .write_ms = 500 },
+    });
+    defer client.deinit();
+
+    var resp = try client.head(url, .{});
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, 403), resp.status.code);
+    try std.testing.expect(resp.body == null);
+    try std.testing.expectEqualStrings("243", resp.headers.get(HeaderName.CONTENT_LENGTH).?);
 }
 
 // Tests for decompressBody and responseFromParser were removed — these methods

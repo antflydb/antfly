@@ -90,7 +90,8 @@ components:
     RemoteContentConfig:
       type: object
       description: |
-        Configuration for remote content fetching (remotePDF, remoteMedia, remoteText templates).
+        Configuration for remote content fetching (`remoteMedia`, `remoteText`, and the deprecated
+        `remotePDF` compatibility helper). Durable PDF ingestion uses a `document_extraction` asset producer.
         Consolidates S3 credentials and security settings separate from backup storage.
 
         **Credential Resolution Order:**

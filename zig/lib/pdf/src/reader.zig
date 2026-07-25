@@ -4371,7 +4371,6 @@ fn parseXrefTableGuarded(
     if (trailer_out.* == null) {
         trailer_out.* = try trailer.clone(alloc);
     }
-
     if (trailer.get("Prev")) |prev_value| {
         if (prev_value.asInteger()) |prev| {
             if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited);
@@ -9184,6 +9183,25 @@ test "reader init rejects missing startxref" {
     try std.testing.expectError(error.MissingStartXref, Reader.init(std.testing.allocator, sample));
 }
 
+test "xref parser rejects a cyclic Prev chain" {
+    const alloc = std.testing.allocator;
+    const bytes =
+        "xref\n" ++
+        "0 0\n" ++
+        "trailer\n" ++
+        "<< /Size 1 /Prev 0 >>\n";
+
+    var entries = std.ArrayList(XrefEntry).empty;
+    defer entries.deinit(alloc);
+    var trailer: ?syntax.Object = null;
+    defer if (trailer) |*value| value.deinit(alloc);
+
+    try std.testing.expectError(
+        error.CyclicXref,
+        parseXrefTable(alloc, bytes, 0, &entries, &trailer),
+    );
+}
+
 test "reader can load indirect object from xref table" {
     const alloc = std.testing.allocator;
     const prefix =
@@ -9937,25 +9955,6 @@ test "xref trailer is deinitialized once when recursive Prev parsing fails" {
     try std.testing.expectError(
         error.ExpectedTrailerDict,
         parseXrefTable(alloc, bytes, invalid_previous.len, &entries, &trailer),
-    );
-}
-
-test "xref parser rejects a cyclic Prev chain" {
-    const alloc = std.testing.allocator;
-    const bytes =
-        "xref\n" ++
-        "0 0\n" ++
-        "trailer\n" ++
-        "<< /Size 1 /Prev 0 >>\n";
-
-    var entries = std.ArrayList(XrefEntry).empty;
-    defer entries.deinit(alloc);
-    var trailer: ?syntax.Object = null;
-    defer if (trailer) |*value| value.deinit(alloc);
-
-    try std.testing.expectError(
-        error.CyclicXref,
-        parseXrefTable(alloc, bytes, 0, &entries, &trailer),
     );
 }
 

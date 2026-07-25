@@ -782,6 +782,8 @@ test "native backend renders simple pdf first page png" {
     defer alloc.free(ocr_page.rgba);
     try std.testing.expect(ocr_page.width > native_page.width);
     try std.testing.expect(ocr_page.height > native_page.height);
+    try std.testing.expectError(error.RenderedPageTooLarge, renderPagePngAlloc(alloc, out.items, 1, 150, 10));
+    try std.testing.expectError(error.InvalidPageNumber, renderPagePngAlloc(alloc, out.items, 2, 150, 40_000_000));
 }
 
 test "native backend renders embedded fixture pdf first page png" {

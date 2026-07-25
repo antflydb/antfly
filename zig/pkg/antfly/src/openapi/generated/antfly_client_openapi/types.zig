@@ -1475,6 +1475,7 @@ pub const ClusterStatus = struct {
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
     secret_store: ?SecretStoreStatus = null,
+    runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
 };
 
@@ -1487,6 +1488,7 @@ pub const ClusterTopology = struct {
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
     secret_store: ?SecretStoreStatus = null,
+    runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
     data: ClusterDataStatus,
 };
@@ -6595,7 +6597,7 @@ pub const QueryRequest = struct {
     full_text_search: ?std.json.Value = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
     /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
     indexes: ?[]const []const u8 = null,
@@ -7133,7 +7135,7 @@ pub const RetrievalQueryRequest = struct {
     full_text_search: ?std.json.Value = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
     /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
     indexes: ?[]const []const u8 = null,
@@ -7285,6 +7287,20 @@ pub const RowFilterEntry = struct {
     table: []const u8,
     /// Antfly query JSON that documents must match to be visible.
     filter: std.json.ArrayHashMap(std.json.Value),
+};
+
+/// Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only changes; startup-only changes remain stale until restart.
+pub const RuntimeConfigStatus = struct {
+    /// Generation of the fully validated and atomically published configuration.
+    generation: ?i64 = null,
+    /// Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters match the operator config-hash annotation.
+    hash: ?[]const u8 = null,
+    /// Whether the latest observed replacement failed loading, semantic validation, or requires restart because startup-only fields changed.
+    last_reload_failed: ?bool = null,
+    /// Whether requests are using the last-known-good snapshot after a failed reload.
+    stale: ?bool = null,
+    reload_successes: ?i64 = null,
+    reload_failures: ?i64 = null,
 };
 
 pub const RuntimeDecl = struct {
@@ -7446,8 +7462,18 @@ pub const SecretStatus = enum {
 
 /// Non-secret status for the local secrets file store, when one is available.
 pub const SecretStoreStatus = struct {
+    /// Generation of the currently published secret-store snapshot.
+    generation: ?i64 = null,
+    /// Whether this store can expose one exact opaque source-generation acknowledgement. This remains true when a single loaded file predates the generation field, and is false for layered stores whose served snapshot has multiple publication sources.
+    supports_source_generation: ?bool = null,
+    /// Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values.
+    source_generation: ?[]const u8 = null,
+    /// Whether the latest observed replacement failed to load.
+    last_reload_failed: ?bool = null,
     /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
     stale: ?bool = null,
+    reload_successes: ?i64 = null,
+    reload_failures: ?i64 = null,
 };
 
 pub const SecretWriteRequest = struct {

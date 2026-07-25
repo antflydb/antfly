@@ -120,7 +120,9 @@ const Allocator = std.mem.Allocator;
 pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) u64 {
     if (comptime builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
         if (remote_content) |remote| {
-            if (remote.security) |security| {
+            var snapshot = remote.acquire();
+            defer snapshot.deinit();
+            if (snapshot.config.security) |security| {
                 if (security.max_download_size_bytes) |value| return value;
             }
         }
@@ -136,6 +138,20 @@ pub fn inlineDataUriSourceTooLarge(remote_content: ?*const scraping.RemoteConten
 
 pub fn validateInlineSourceSize(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !void {
     if (try inlineDataUriSourceTooLarge(remote_content, source_text)) return error.StreamTooLong;
+}
+
+pub const default_ocr_model = "antflydb/Florence-2-base";
+pub const default_ocr_config_json =
+    \\{"provider":"antfly","model":"antflydb/Florence-2-base"}
+;
+
+pub fn effectiveOcrConfigJson(config: Config) []const u8 {
+    return if (config.ocr_config_json.len > 0) config.ocr_config_json else default_ocr_config_json;
+}
+
+pub fn ocrEnabledForRoute(config: Config, route_type: []const u8) bool {
+    return config.ocr_enabled or
+        (config.ocr_pdf_fallback_enabled and std.mem.eql(u8, route_type, "pdf"));
 }
 
 pub fn renderPdfPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
@@ -305,6 +321,7 @@ pub const Config = struct {
     last_modified_field: []const u8 = "",
     html_strip_tags: bool = true,
     ocr_enabled: bool = false,
+    ocr_pdf_fallback_enabled: bool = false,
     ocr_mode: OcrMode = .auto,
     ocr_config_json: []const u8 = "",
     ocr_render_dpi: u16 = 150,
@@ -353,7 +370,9 @@ pub const florence_ocr_canonical_prompt = "What is the text in the image?";
 
 pub fn effectiveOcrPrompt(config: Config) []const u8 {
     if (config.ocr_prompt.len > 0) return config.ocr_prompt;
-    if (isFlorenceModel(config.ocr_model)) return florence_ocr_prompt;
+    if (isFlorenceModel(config.ocr_model) or
+        (config.ocr_pdf_fallback_enabled and config.ocr_config_json.len == 0))
+        return florence_ocr_prompt;
     return default_ocr_prompt;
 }
 
@@ -664,7 +683,7 @@ const Route = struct {
 };
 
 pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
-    if (raw.len == 0) return .{};
+    if (raw.len == 0) return .{ .ocr_pdf_fallback_enabled = true };
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidDocumentExtractionConfig;
@@ -686,13 +705,25 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     config.version_field = try dupeSourceStringField(alloc, object, "version_field");
     config.last_modified_field = try dupeSourceStringField(alloc, object, "last_modified_field");
     config.html_strip_tags = (try boolField(object, "html_strip_tags")) orelse true;
-    config.ocr_enabled = (try boolField(object, "ocr_fallback")) orelse false;
+    const configured_ocr_fallback = try boolField(object, "ocr_fallback");
+    const has_explicit_ocr_config = object.get("ocr") != null;
+    config.ocr_enabled = configured_ocr_fallback orelse false;
+    config.ocr_pdf_fallback_enabled = configured_ocr_fallback orelse true;
     config.ocr_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "ocr", &config.ocr_enabled);
+    if (has_explicit_ocr_config) config.ocr_pdf_fallback_enabled = config.ocr_enabled;
     try parseOcrOptions(alloc, object, &config);
     config.transcription_enabled = (try boolField(object, "transcribe_audio")) orelse false;
     config.transcription_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "transcription", &config.transcription_enabled);
     config.route_preset = try parseRoutePreset(object);
     config.routes = try parseRoutesAlloc(alloc, object);
+    if (configured_ocr_fallback == null and !has_explicit_ocr_config) {
+        for (config.routes) |route| {
+            if (route.extractor_type == .ocr) {
+                config.ocr_enabled = true;
+                break;
+            }
+        }
+    }
     return config;
 }
 
@@ -3241,6 +3272,51 @@ test "document extraction parses generated OCR and transcription config" {
     try std.testing.expect(config.transcription_enabled);
     try std.testing.expect(std.mem.indexOf(u8, config.ocr_config_json, "mock-reader") != null);
     try std.testing.expect(std.mem.indexOf(u8, config.transcription_config_json, "mock-transcriber") != null);
+}
+
+test "document extraction defaults OCR to PDF routes and accepts explicit image OCR" {
+    const alloc = std.testing.allocator;
+    var defaults = try parseConfig(alloc, "{}");
+    defer defaults.deinit(alloc);
+    try std.testing.expect(!defaults.ocr_enabled);
+    try std.testing.expect(defaults.ocr_pdf_fallback_enabled);
+    try std.testing.expect(ocrEnabledForRoute(defaults, "pdf"));
+    try std.testing.expect(!ocrEnabledForRoute(defaults, "image"));
+    try std.testing.expectEqualStrings(default_ocr_config_json, effectiveOcrConfigJson(defaults));
+
+    var image_enabled = try parseConfig(alloc, "{\"ocr\":{\"config\":{\"provider\":\"mock-reader\"}}}");
+    defer image_enabled.deinit(alloc);
+    try std.testing.expect(ocrEnabledForRoute(image_enabled, "image"));
+
+    var routed_image = try parseConfig(alloc, "{\"routes\":[{\"extractor\":{\"type\":\"ocr\"}}]}");
+    defer routed_image.deinit(alloc);
+    try std.testing.expect(ocrEnabledForRoute(routed_image, "image"));
+
+    var fallback_disabled = try parseConfig(alloc, "{\"ocr_fallback\":false}");
+    defer fallback_disabled.deinit(alloc);
+    try std.testing.expect(!fallback_disabled.ocr_enabled);
+    try std.testing.expect(!ocrEnabledForRoute(fallback_disabled, "pdf"));
+
+    var nested_disabled = try parseConfig(alloc, "{\"ocr\":{\"enabled\":false}}");
+    defer nested_disabled.deinit(alloc);
+    try std.testing.expect(!nested_disabled.ocr_enabled);
+    try std.testing.expect(!ocrEnabledForRoute(nested_disabled, "pdf"));
+}
+
+test "document extraction OCR parts carry PNG media and Florence prompt" {
+    const alloc = std.testing.allocator;
+    const png = &.{ 0x89, 'P', 'N', 'G' };
+    const parts = try ocrPagePartsJsonAlloc(alloc, .{ .ocr_model = default_ocr_model }, "pdf", "application/pdf", .{
+        .unit_id = @constCast("page:000001"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(""),
+        .method = @constCast("ocr_pending"),
+        .page_number = 1,
+    }, png);
+    defer alloc.free(parts);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "<OCR>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "image/png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "iVBORw==") != null);
 }
 
 test "document extraction applies source metadata fields from row json" {

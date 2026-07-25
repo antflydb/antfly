@@ -139,7 +139,7 @@ pub fn create(config: Config) Graph {
         mod.addImport("antfly-json", json_mod);
         break :blk mod;
     };
-    const platform_mod = shared.platform orelse createSharedModule(config, "lib/platform/src/root.zig");
+    const platform_mod = shared.platform orelse @panic("inference runtime requires a configured antfly_platform module");
     const vellum_mod = shared.vellum orelse createSharedModule(config, "lib/vellum/src/mod.zig");
     const google_mod = shared.google orelse blk: {
         const mod = createSharedModule(config, "lib/google/src/root.zig");

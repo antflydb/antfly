@@ -23,11 +23,11 @@ import {
   Skeleton,
   Textarea,
 } from "@antfly/design-system";
-import { type ChunkResponse, InferenceClient } from "@antfly/sdk";
+import type { ChunkResponse } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { Clock, Database, Hash, RotateCcw, Scissors, Zap } from "lucide-react";
 import type React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
@@ -35,6 +35,7 @@ import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
 
 // Configuration state (extends SDK config with UI-specific fields)
 interface ChunkConfig {
@@ -124,7 +125,7 @@ The era of modern computing began with a flurry of development before and during
 };
 
 const ChunkingPlaygroundPage: React.FC = () => {
-  const { inferenceApiUrl } = useApiConfig();
+  const { inferenceUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -153,39 +154,18 @@ const ChunkingPlaygroundPage: React.FC = () => {
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
-
-  const inferenceClient = useMemo(
-    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
-    [inferenceApiUrl]
-  );
+  const { models: connectionModels, loading: modelsLoading } =
+    useSelectedInferenceModelNames("chunker");
 
   // Persist state to localStorage
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ inputText, config }));
   }, [inputText, config]);
 
-  // Fetch available chunker models
   useEffect(() => {
-    const controller = new AbortController();
-    (async () => {
-      try {
-        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
-          signal: controller.signal,
-        });
-        if (response.ok) {
-          const data = await response.json();
-          setAvailableModels(Object.keys(data.chunkers || {}));
-        }
-      } catch {
-        // Ignore fetch errors
-      } finally {
-        if (!controller.signal.aborted) {
-          setModelsLoaded(true);
-        }
-      }
-    })();
-    return () => controller.abort();
-  }, [inferenceApiUrl]);
+    setAvailableModels(connectionModels);
+    setModelsLoaded(!modelsLoading);
+  }, [connectionModels, modelsLoading]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
@@ -222,20 +202,26 @@ const ChunkingPlaygroundPage: React.FC = () => {
     try {
       const actualSeparator = config.separator.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
 
-      const data = await inferenceClient.chunk(
-        inputText,
-        {
-          model: config.model,
-          text: {
-            target_tokens: config.target_tokens,
-            overlap_tokens: config.overlap_tokens,
-            separator: actualSeparator,
+      const response = await fetch(inferenceUrl("chunk"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: abortControllerRef.current.signal,
+        body: JSON.stringify({
+          input: inputText,
+          config: {
+            model: config.model,
+            text: {
+              target_tokens: config.target_tokens,
+              overlap_tokens: config.overlap_tokens,
+              separator: actualSeparator,
+            },
+            max_chunks: config.max_chunks,
+            threshold: config.threshold,
           },
-          max_chunks: config.max_chunks,
-          threshold: config.threshold,
-        },
-        { signal: abortControllerRef.current.signal }
-      );
+        }),
+      });
+      if (!response.ok) throw new Error(`Chunk failed: ${response.status}`);
+      const data: ChunkResponse = await response.json();
 
       setResult(data);
       setProcessingTime(performance.now() - startTime);
@@ -251,7 +237,7 @@ const ChunkingPlaygroundPage: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [inputText, config, inferenceClient]);
+  }, [inputText, config, inferenceUrl]);
 
   // Cmd+Enter shortcut
   useEffect(() => {

@@ -1561,6 +1561,27 @@ pub const ApiHttpServer = struct {
         return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(response, .{})});
     }
 
+    pub fn invokeInferenceConnection(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        connection_id: []const u8,
+        operation: []const u8,
+        body: []const u8,
+    ) !connections_api.InvokeResult {
+        const node_config = self.cfg.node_config orelse return error.ConnectionNotFound;
+        var client = httpx.Client.initWithConfig(alloc, self.inferenceIo(), .{ .keep_alive = false });
+        defer client.deinit();
+        return connections_api.invokeInferenceConnection(
+            alloc,
+            &client,
+            node_config,
+            self.cfg.secret_store,
+            connection_id,
+            operation,
+            body,
+        );
+    }
+
     /// Shared asynchronous I/O runtime for short-lived API helpers. Borrowers
     /// must not retain it beyond the server lifetime.
     pub fn sharedApiIo(self: *ApiHttpServer) ?std.Io {
@@ -2515,7 +2536,10 @@ pub const ApiHttpServer = struct {
                 _ = secret_store.refreshIfChanged() catch |err| {
                     std.log.warn("secret store status refresh skipped err={}", .{err});
                 };
-                cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+                try cluster.applySecretStoreHealth(self.alloc, &public_status, secret_store.healthSnapshot());
+            }
+            if (self.cfg.remote_content) |remote_content| {
+                if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(self.alloc, &public_status, health);
             }
             return try jsonResponse(self.alloc, public_status);
         }
@@ -2532,7 +2556,10 @@ pub const ApiHttpServer = struct {
                 _ = secret_store.refreshIfChanged() catch |err| {
                     std.log.warn("secret store status refresh skipped err={}", .{err});
                 };
-                cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
+                try cluster.applySecretStoreHealth(self.alloc, &public_status, secret_store.healthSnapshot());
+            }
+            if (self.cfg.remote_content) |remote_content| {
+                if (remote_content.runtimeHealth()) |health| try cluster.applyRuntimeConfigHealth(self.alloc, &public_status, health);
             }
             var snapshot_opt = try self.source.cachedAdminSnapshot();
             if (snapshot_opt == null) {

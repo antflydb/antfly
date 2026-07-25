@@ -19,6 +19,7 @@ const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
 const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
+const platform_build = @import("lib/platform/build_support.zig");
 
 const LmdbBackend = antfly_storage_build.LmdbBackend;
 const chainLabeledFilteredTests = antfly_tests_build.chainLabeledFilteredTests;
@@ -474,6 +475,9 @@ const AntflyRootImports = struct {
     prometheus: *std.Build.Module,
     structlog: *std.Build.Module,
     platform: *std.Build.Module,
+    platform_link_libc: bool,
+    platform_target: std.Build.ResolvedTarget,
+    filesystem_capacity_source_file: std.Build.LazyPath,
 
     const import_table = [_]struct { name: []const u8, field: []const u8 }{
         .{ .name = "lmdb_engine", .field = "lmdb_engine" },
@@ -539,13 +543,20 @@ const AntflyRootImports = struct {
         .{ .name = "inference_server", .field = "inference_server" },
         .{ .name = "prometheus", .field = "prometheus" },
         .{ .name = "structlog", .field = "structlog" },
-        .{ .name = "antfly_platform", .field = "platform" },
     };
 
     fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
         mod.addOptions("build_options", self.build_options);
         inline for (import_table) |entry| {
             mod.addImport(entry.name, @field(self, entry.field));
+        }
+        mod.addImport("antfly_platform", self.platform);
+        if (link_libc and !self.platform_link_libc) {
+            platform_build.addFilesystemCapacitySource(
+                mod,
+                self.filesystem_capacity_source_file,
+                self.platform_target,
+            );
         }
         mod.addIncludePath(b.path("lib/lmdb"));
         if (include_lmdb_c) {
@@ -1091,6 +1102,7 @@ pub fn build(b: *std.Build) void {
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
+    const include_ha_tests_in_aggregates = b.option(bool, "ha-tests", "Include hot-standby HA suites in aggregate test steps") orelse true;
     const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
@@ -1258,15 +1270,19 @@ pub fn build(b: *std.Build) void {
     // Protobuf wire format
     const protobuf_dep = b.dependency("protobuf", .{});
     const protobuf_mod = protobuf_dep.module("protobuf");
-    const platform_mod = b.createModule(.{
+    const platform_mod = platform_build.createModule(b, .{
         .root_source_file = b.path("lib/platform/src/root.zig"),
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .target = target,
         .optimize = optimize,
+        .link_libc = link_libc,
     });
-    const wasm_platform_mod = b.createModule(.{
+    const wasm_platform_mod = platform_build.createModule(b, .{
         .root_source_file = b.path("lib/platform/src/root.zig"),
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .target = wasm_target,
         .optimize = optimize,
+        .link_libc = false,
     });
     const objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),
@@ -1692,6 +1708,9 @@ pub fn build(b: *std.Build) void {
         .prometheus = prometheus_mod,
         .structlog = structlog_mod,
         .platform = platform_mod,
+        .platform_link_libc = link_libc,
+        .platform_target = target,
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
 
     // Library module
@@ -2655,6 +2674,18 @@ pub fn build(b: *std.Build) void {
     const bench_pdf_step = b.step("bench-pdf", "Run lib/pdf benchmarks");
     bench_pdf_step.dependOn(&run_lib_pdf_bench.step);
 
+    const lib_pdf_safety_tests = b.addTest(.{
+        .root_module = pdf_mod,
+        .filters = &.{
+            "native backend renders simple pdf first page png",
+            "stream decoders enforce the decoded byte budget before growth",
+            "xref parser rejects a cyclic Prev chain",
+        },
+    });
+    const run_lib_pdf_safety_tests = b.addRunArtifact(lib_pdf_safety_tests);
+    const lib_pdf_safety_test_step = b.step("lib-pdf-safety-test", "Run focused PDF OCR rendering and parser safety tests");
+    lib_pdf_safety_test_step.dependOn(&run_lib_pdf_safety_tests.step);
+
     const lib_image_conformance_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
         .target = target,
@@ -2879,14 +2910,14 @@ pub fn build(b: *std.Build) void {
 
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"file secret store"},
+        .filters = &.{ "file secret store", "remote content runtime", "cluster status carries non-secret" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
     const run_lib_common_secrets_tests = b.addRunArtifact(lib_common_secrets_tests);
-    const lib_common_secrets_test_step = b.step("lib-common-secrets-test", "Run common/secret store tests");
+    const lib_common_secrets_test_step = b.step("lib-common-secrets-test", "Run common secret and remote-content reload tests");
     lib_common_secrets_test_step.dependOn(&run_lib_common_secrets_tests.step);
 
     const lib_casbin_tests = b.addTest(.{
@@ -3597,6 +3628,7 @@ pub fn build(b: *std.Build) void {
         "storage.db.db.test.db sparse ",
         "storage.db.db.test.db graph ",
         "storage.db.db.test.db search ",
+        "storage.db.db.test.db schema-present infer_types opt-in recursively infers nested fields after reopen",
         "storage.db.db.test.db document _edges",
         "storage.db.db.test.db document _embeddings",
         "sort execution plan dimension names are stable for profiles",
@@ -3637,6 +3669,8 @@ pub fn build(b: *std.Build) void {
         "match_all id seek zero limit exposes internal sort profile when sampled",
         "match_all id seek zero limit respects cursor bounds exactly",
         "match_all native candidate sort applies cursor before admission",
+        "dense search route reports exact native filter budget decisions",
+        "document mapper emits default dynamic schema text fields",
         "document mapper emits schema keyword typed doc values",
         "document mapper omits multi-valued schema keyword typed doc values",
         "document mapper omits multi-valued schema numeric typed doc values",
@@ -4137,6 +4171,9 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "object probe cache identity covers every bucket and credential source",
             "connection cache remains valid across every allocation failure",
+            "build response exposes embedded inference as a local connection",
+            "inference connection operations are allowlisted",
+            "inference connection URLs require an HTTP origin",
             "build response reports mock connected and types filter",
             "build response reports configured external io connections",
             "build response reports configured web search connections",
@@ -5068,7 +5105,9 @@ pub fn build(b: *std.Build) void {
     var chaos_progress_tail: ?*std.Build.Step = null;
     chaos_progress_tail = chainLabeledRun(b, lib_metadata_vopr_chaos_tests, "lib-metadata-vopr-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);
-    chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
+    if (include_ha_tests_in_aggregates) {
+        chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
+    }
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
     const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad legacy metadata and raft chaos simulation soaks");
@@ -5320,7 +5359,9 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);
-    unit_test_step.dependOn(ha_test_step);
+    if (include_ha_tests_in_aggregates) {
+        unit_test_step.dependOn(ha_test_step);
+    }
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
 
@@ -6500,7 +6541,9 @@ pub fn build(b: *std.Build) void {
     run_compat.addArg("compat/cases");
     const compat_step = b.step("compat", "Run the shared compatibility corpus");
     compat_step.dependOn(&run_compat.step);
-    compat_step.dependOn(&run_lib_ha_compat_tests.step);
+    if (include_ha_tests_in_aggregates) {
+        compat_step.dependOn(&run_lib_ha_compat_tests.step);
+    }
 
     const search_benchmark_index_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_index.zig"),

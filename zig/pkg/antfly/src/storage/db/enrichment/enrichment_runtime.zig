@@ -2916,7 +2916,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     pdf_session_override: ?*document_extraction_mod.PdfRenderSession,
 ) !void {
     const enabled = switch (kind) {
-        .ocr => config.ocr_enabled,
+        .ocr => document_extraction_mod.ocrEnabledForRoute(config, route_type),
         .transcript => config.transcription_enabled,
     };
     if (!enabled) return;
@@ -2935,7 +2935,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         .transcript => .transcriber,
     };
     const config_json = switch (kind) {
-        .ocr => config.ocr_config_json,
+        .ocr => document_extraction_mod.effectiveOcrConfigJson(config),
         .transcript => config.transcription_config_json,
     };
     const method = switch (kind) {
@@ -3072,6 +3072,14 @@ fn flushRuntimeGeneratedTextBatch(
     const request_bytes = runtimeGeneratedTextBatchBytes(requests);
     var produced = producer.produceBatch(alloc, requests) catch |err| {
         logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", @errorName(err), started_ns);
+        if (isUnavailableOcrModelError(kind, err)) {
+            for (unit_indices) |unit_idx| {
+                try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
+                try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
+            }
+            clearRuntimeGeneratedTextBatchParts(alloc, parts_values);
+            return;
+        }
         if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
         for (unit_indices) |unit_idx| try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
         return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, @errorName(err));
@@ -3123,6 +3131,11 @@ fn flushRuntimeGeneratedTextBatchSequential(
         const started_ns = runtime.config.clock.nowRealtimeNs();
         const produced = producer.produce(alloc, request) catch |err| {
             logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", @errorName(err), started_ns);
+            if (isUnavailableOcrModelError(kind, err)) {
+                try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
+                try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
+                continue;
+            }
             if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
             try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, runtimeGeneratedTextFailureStage(err));
             try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
@@ -3258,6 +3271,17 @@ fn completeRuntimeDocumentExtractionGeneratedTextUnit(
 
 const RuntimeGeneratedUnitTextKind = enum { ocr, transcript };
 
+fn isUnavailableOcrModelError(kind: RuntimeGeneratedUnitTextKind, err: anyerror) bool {
+    if (kind != .ocr) return false;
+    return switch (err) {
+        error.ModelNotFound,
+        error.ModelNotSpecified,
+        error.UnsupportedReaderProvider,
+        => true,
+        else => false,
+    };
+}
+
 fn applyRuntimeGeneratedUnitText(
     alloc: Allocator,
     unit: *document_extraction_mod.Unit,
@@ -3270,7 +3294,7 @@ fn applyRuntimeGeneratedUnitText(
 ) !void {
     if (produced.len == 0 and kind != .ocr) {
         alloc.free(produced);
-        return;
+        return error.EmptyGeneratedText;
     }
     defer alloc.free(produced);
     var parsed = try parseRuntimeGeneratedUnitTextOutputAlloc(alloc, produced);
@@ -3733,13 +3757,13 @@ fn replaceDocumentExtractionUnitWithClone(alloc: Allocator, dst: *document_extra
     dst.* = cloned;
 }
 
-fn runtimeGeneratedTextNeeded(config: document_extraction_mod.Config, unit: document_extraction_mod.Unit) bool {
-    return runtimeGeneratedTextKind(config, unit) != null;
+fn runtimeGeneratedTextNeeded(config: document_extraction_mod.Config, route_type: []const u8, unit: document_extraction_mod.Unit) bool {
+    return runtimeGeneratedTextKind(config, route_type, unit) != null;
 }
 
-fn runtimeGeneratedTextKind(config: document_extraction_mod.Config, unit: document_extraction_mod.Unit) ?RuntimeGeneratedUnitTextKind {
+fn runtimeGeneratedTextKind(config: document_extraction_mod.Config, route_type: []const u8, unit: document_extraction_mod.Unit) ?RuntimeGeneratedUnitTextKind {
     const status = unit.extraction_status orelse return null;
-    if (config.ocr_enabled and std.mem.eql(u8, status, "pending_ocr")) return .ocr;
+    if (document_extraction_mod.ocrEnabledForRoute(config, route_type) and std.mem.eql(u8, status, "pending_ocr")) return .ocr;
     if (config.transcription_enabled and std.mem.eql(u8, status, "pending_transcription")) return .transcript;
     return null;
 }
@@ -3788,7 +3812,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
 
     fn onUnit(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (runtimeGeneratedTextKind(self.config, unit.*)) |kind| {
+        if (runtimeGeneratedTextKind(self.config, self.info.route_type, unit.*)) |kind| {
             if (self.pending_generated_kind != null and self.pending_generated_kind.? != kind) {
                 try self.flushPendingGeneratedText();
             }
@@ -4067,7 +4091,7 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
 
     fn onUnit(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (runtimeGeneratedTextNeeded(self.config, unit.*)) {
+        if (runtimeGeneratedTextNeeded(self.config, self.info.route_type, unit.*)) {
             const cached = self.generated_units.get(unit.unit_id) orelse return error.MissingGeneratedUnitCache;
             try replaceDocumentExtractionUnitWithClone(self.runtime.alloc, unit, cached.*);
         }
@@ -9568,6 +9592,69 @@ test "document extraction rejects and records Florence prompt echoes" {
     try std.testing.expectEqualStrings("", units[0].text);
     try std.testing.expect(!units[0].ocr_used);
     try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "OcrPromptEcho") != null);
+}
+
+test "document extraction missing OCR model is a terminal unit failure" {
+    const alloc = std.testing.allocator;
+
+    const MissingModelProducer = struct {
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = produce, .produce_batch = produceBatch } };
+        }
+
+        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.ModelNotFound;
+        }
+
+        fn produceBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
+            return error.ModelNotFound;
+        }
+    };
+
+    var fake = MissingModelProducer{};
+    const producer = fake.producer();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .asset_producer = producer },
+        .ownership = undefined,
+    };
+    var units = [_]document_extraction_mod.Unit{.{
+        .unit_id = try alloc.dupe(u8, "unit:1"),
+        .unit_type = try alloc.dupe(u8, "image"),
+        .text = try alloc.dupe(u8, ""),
+        .method = try alloc.dupe(u8, "ocr_pending"),
+        .extraction_status = try alloc.dupe(u8, "pending_ocr"),
+    }};
+    defer units[0].deinit(alloc);
+
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(
+        &runtime,
+        alloc,
+        producer,
+        .{ .ocr_enabled = true },
+        .{ .max_items = 8, .max_bytes = 1024 * 1024 },
+        "https://example.test/image.png",
+        "",
+        "image",
+        "image/png",
+        units[0..],
+        .ocr,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
+    try std.testing.expect(!units[0].ocr_used);
+    try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "ModelNotFound") != null);
 }
 
 test "generic generated asset batch fallback isolates malformed batch envelope" {

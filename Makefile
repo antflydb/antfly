@@ -132,7 +132,7 @@ zig-test:
 	$(ZIG_MAKE) test
 
 zig-unit-test:
-	$(ZIG_MAKE) unit-test
+	$(ZIG_MAKE) unit-test ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
 
 zig-generate:
 	$(ZIG_MAKE) generate

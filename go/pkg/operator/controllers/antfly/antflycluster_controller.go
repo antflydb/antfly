@@ -49,13 +49,16 @@ import (
 // AntflyClusterReconciler reconciles an AntflyCluster object
 type AntflyClusterReconciler struct {
 	client.Client
-	Scheme                *runtime.Scheme
-	AutoScaler            *AutoScaler
-	KubeClient            kubernetes.Interface
-	NodeStatsFetcher      func(context.Context, string) (*kubeletStatsSummary, error)
-	HTTPClient            *http.Client
-	Recorder              events.EventRecorder
-	ManageInferencePools  bool
+	Scheme               *runtime.Scheme
+	AutoScaler           *AutoScaler
+	KubeClient           kubernetes.Interface
+	NodeStatsFetcher     func(context.Context, string) (*kubeletStatsSummary, error)
+	HTTPClient           *http.Client
+	Recorder             events.EventRecorder
+	ManageInferencePools bool
+	// EnableHotStandbyHA is always set by the operator binary. A nil value keeps
+	// existing embedded controller and unit-test constructors backward compatible.
+	EnableHotStandbyHA    *bool
 	DefaultInferenceImage string
 
 	// validationAttempts tracks consecutive validation failure counts per cluster
@@ -1125,8 +1128,24 @@ func (r *AntflyClusterReconciler) applyDefaults(cluster *antflyv1.AntflyCluster)
 // validateClusterConfiguration validates the cluster configuration (T025)
 // This is a fallback validation for cases where webhook validation is disabled
 func (r *AntflyClusterReconciler) validateClusterConfiguration(cluster *antflyv1.AntflyCluster) error {
+	if !r.hotStandbyHAEnabled() && hotStandbyHARequested(cluster) {
+		return hotStandbyHAFeatureGateError()
+	}
 	// Call the webhook validation methods as fallback
 	return cluster.ValidateCreate()
+}
+
+func (r *AntflyClusterReconciler) hotStandbyHAEnabled() bool {
+	return r.EnableHotStandbyHA == nil || *r.EnableHotStandbyHA
+}
+
+func hotStandbyHARequested(cluster *antflyv1.AntflyCluster) bool {
+	return cluster != nil && cluster.Spec.HighAvailability != nil &&
+		cluster.Spec.HighAvailability.Mode == antflyv1.HAModeHotStandby
+}
+
+func hotStandbyHAFeatureGateError() error {
+	return fmt.Errorf("hot-standby HA is disabled by the operator feature gate; restart the operator with --enable-hot-standby-ha=true to reconcile spec.highAvailability.mode=HotStandby")
 }
 
 // calculateBackoff calculates exponential backoff duration for validation failures (T027)
@@ -1445,6 +1464,16 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 		}
 		return ctrl.Result{}, nil
+	}
+
+	if !r.hotStandbyHAEnabled() && hotStandbyHARequested(&antflyCluster) {
+		validationErr := hotStandbyHAFeatureGateError()
+		log.Error(validationErr, "Cluster configuration validation failed")
+		if statusErr := r.updateStatusWithValidationError(ctx, &antflyCluster, validationErr); statusErr != nil {
+			log.Error(statusErr, "Failed to update status with validation error")
+		}
+		attempt := r.incrementValidationAttempts(req.String())
+		return ctrl.Result{RequeueAfter: calculateBackoff(attempt - 1)}, nil
 	}
 
 	// Ensure finalizer is present when WhenDeleted=Delete.
@@ -2117,6 +2146,8 @@ func (r *AntflyClusterReconciler) reconcileConfigMap(ctx context.Context, cluste
 	if err != nil {
 		return fmt.Errorf("failed to generate complete config: %w", err)
 	}
+	configSum := sha256.Sum256([]byte(completeConfig))
+	configHash := fmt.Sprintf("%x", configSum)[:16]
 
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2136,11 +2167,22 @@ func (r *AntflyClusterReconciler) reconcileConfigMap(ctx context.Context, cluste
 		configMap.Data = map[string]string{
 			"config.json": completeConfig,
 		}
+		if configMap.Annotations == nil {
+			configMap.Annotations = make(map[string]string)
+		}
+		configMap.Annotations[generatedConfigHashAnnotation] = configHash
 
 		return nil
 	})
 
-	return err
+	if err != nil {
+		return err
+	}
+	cluster.Status.ConfigPublication = &antflyv1.ConfigPublicationStatus{
+		ObservedGeneration: cluster.Generation,
+		SHA256:             fmt.Sprintf("%x", configSum),
+	}
+	return nil
 }
 
 // generateCompleteConfig creates a complete Antfly configuration by merging user config with generated metadata network config
@@ -2777,15 +2819,35 @@ exec /antfly standalone --id %d --config /config/config.json \
 	return err
 }
 
+const generatedConfigHashAnnotation = "antfly.io/config-hash"
+const compatibilityRolloutGenerationAnnotation = "cloud.antfly.io/compatibility-rollout-generation"
+
 // buildPodAnnotations returns the complete annotations for pod templates including:
 // - Service mesh annotations
-// - EnvFrom hash annotation for secret rotation detection
+// - Generated non-secret Antfly config hash
+// - EnvFrom hash annotation (ConfigMap contents and Secret reference names only)
 func (r *AntflyClusterReconciler) buildPodAnnotations(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster, envFrom []corev1.EnvFromSource) map[string]string {
 	annotations := make(map[string]string)
 
 	// Add service mesh annotations
 	if cluster.Spec.ServiceMesh != nil && cluster.Spec.ServiceMesh.Enabled {
 		maps.Copy(annotations, cluster.Spec.ServiceMesh.Annotations)
+	}
+	// Colony uses this non-secret generation only when the running Antfly
+	// version does not expose live-reload acknowledgements. Copying it to the
+	// template provides a compatibility rollout without granting the operator
+	// permission to read Secret contents.
+	if generation := strings.TrimSpace(cluster.Annotations[compatibilityRolloutGenerationAnnotation]); generation != "" {
+		annotations[compatibilityRolloutGenerationAnnotation] = generation
+	}
+
+	// ConfigMap volumes are updated in place, but older Antfly versions only
+	// parse config.json during startup. Hash the generated non-secret config so
+	// those versions roll when routing or credential references change. Secret
+	// values are deliberately absent from this hash and remain live-reloadable.
+	if completeConfig, err := r.generateCompleteConfig(cluster); err == nil {
+		sum := sha256.Sum256([]byte(completeConfig))
+		annotations[generatedConfigHashAnnotation] = fmt.Sprintf("%x", sum)[:16]
 	}
 
 	// Add envFrom hash annotation if there are envFrom sources

@@ -181,6 +181,9 @@ func (p *pdfModeProcessor) Process(
 
 // RemotePDFFn is a Handlebars helper that downloads a PDF from a URL and extracts text.
 // Equivalent to {{remoteMedia url="..." mode="extract"}} but kept for backward compatibility.
+//
+// Deprecated: use document_extraction for durable PDF ingestion, or remoteMedia for
+// template-time multimodal inference input.
 // Usage: {{remotePDF url="https://example.com/doc.pdf"}}
 // Usage: {{remotePDF url="s3://bucket/doc.pdf" credentials="primary"}}
 // Returns: Extracted text content (plain string, not a dotprompt directive)
