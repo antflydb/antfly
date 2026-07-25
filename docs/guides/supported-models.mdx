@@ -1,38 +1,84 @@
 ---
 title: Supported models
-description: Which model architectures Antfly inference can run, and how far each has been verified
+description: Which models Antfly inference runs locally, and how far each has been verified
 prerequisites:
   - Antfly installed and running
 difficulty: beginner
 estimatedTime: "5 min"
-tags: [inference, models, generation, gguf]
+tags: [inference, models, embedding, reranking, generation, gguf]
 ---
 
 <Questions>
-- Which models can Antfly generate text with?
-- Why does my model fail to load?
-- What does "model architecture is not supported for generation" mean?
+- Which models does Antfly actually support?
+- Why was my model rejected?
 - What does the `support` field in /ai/v1/models mean?
+- Which models should I start with?
 </Questions>
 
-Antfly is a database first and an inference engine second, so the set of model
-architectures it runs is deliberately narrower than a dedicated engine like llama.cpp.
-This page states exactly how far each architecture has been taken, so you can tell "this
-is out of scope" apart from "this is broken."
+Antfly is a database first and an inference engine second. It certifies the models needed
+to turn unstructured data into searchable, ranked, structured knowledge, and interoperates
+with general-purpose generators rather than trying to run all of them.
 
-Every generator reports its tier in `/ai/v1/models` as a `support` field, and the tiers
-below come from the same source as that field and as the error messages — they cannot
-drift apart.
+Every model reports its tier in `/ai/v1/models` as a `support` field. The tables below and
+that field come from the same source in the code, so they cannot drift apart.
 
-## The three tiers
+## Tiers
 
 | Tier | Meaning | Behaviour |
 |---|---|---|
-| **Supported** | Verified end to end against a real model. | Runs. |
-| **Experimental** | Has a weight mapping and a runtime, but is either unverified or known to misbehave. | Loads, logs a warning. |
-| **Unsupported** | No weight mapping, or no runtime. | Rejected with HTTP 400 before any load. |
+| **Supported** | Verified end to end against a real model, with the result checked for correctness rather than just a 200. | Runs. |
+| **Experimental** | Works, but early: correct output, less proven. | Runs, with a warning. |
+| **Unsupported** | Cannot be relied on — no mapping, no runtime, or a runtime that does not produce usable output. | Rejected with HTTP 400 before any load. |
 
-## Supported
+**Nothing is `experimental` in 0.2.0.** Every model that fell short of supported did so by
+failing outright, and a model that loads and emits garbage is worse than one that refuses,
+because the failure is silent.
+
+## Start here
+
+| Role | Use this | Verified alternates |
+|---|---|---|
+| Fast text embedding | `BAAI/bge-small-en-v1.5` | `sentence-transformers/all-MiniLM-L6-v2` |
+| Higher-quality embedding | `BAAI/bge-large-en-v1.5` | `BAAI/bge-base-en-v1.5`, `mixedbread-ai/mxbai-embed-large-v1` |
+| Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | — |
+| Reranking | `mixedbread-ai/mxbai-rerank-base-v1` | `cross-encoder/ms-marco-MiniLM-L6-v2` |
+| Multimodal (text + image + audio) | `antflydb/clipclap` | — |
+| Chunking | `fixed_bert` (built in) | `mirth/chonky_mmbert_small_multilingual_1` |
+| Recognition & extraction | `antflydb/gliner2-base-v1` | — |
+| Document reading / OCR | `antflydb/Florence-2-base` | — |
+| Transcription | `openai/whisper-tiny` | — |
+| Local generation | `ggml-org/gemma-4-E4B-it-GGUF` | Gemma 3, Llama 3.x, Qwen3 dense GGUFs |
+
+Pull models by their full `owner/name` reference:
+
+```bash
+antfly inference pull hf:BAAI/bge-small-en-v1.5 --tasks embed
+antfly inference pull hf:antflydb/clipclap:gguf:Q4_K --tasks embed
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF --tasks generate
+```
+
+## Supported, with evidence
+
+Each was checked for a correct result, not merely a successful response.
+
+| Capability | Model | Verified by |
+|---|---|---|
+| Dense embedding | `BAAI/bge-small-en-v1.5` | dim 384, unit norm; query↔relevant 0.81 vs irrelevant 0.27 |
+| Dense embedding | `BAAI/bge-base-en-v1.5` | dim 768, unit norm |
+| Dense embedding | `BAAI/bge-large-en-v1.5` | dim 1024; relevant 0.86 vs irrelevant 0.35 |
+| Dense embedding | `mixedbread-ai/mxbai-embed-large-v1` | dim 1024; relevant 0.885 vs irrelevant 0.312 |
+| Dense embedding | `sentence-transformers/all-MiniLM-L6-v2` | dim 384; relevant 0.824 vs irrelevant −0.007 |
+| Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | 90 non-zero terms |
+| Reranking | `mixedbread-ai/mxbai-rerank-base-v1` | relevant 0.9997 vs irrelevant 0.0003 |
+| Reranking | `cross-encoder/ms-marco-MiniLM-L6-v2` | relevant 0.1610 vs irrelevant 0.0001 |
+| Multimodal | `antflydb/clipclap` | text, image and audio all embed; image↔"red" 0.277 vs image↔"blue" 0.189 |
+| Chunking | `fixed_bert`, `fixed_bpe`, `mirth/chonky_mmbert_small_multilingual_1` | all split a three-topic document at its topic boundaries |
+| Extraction | `antflydb/gliner2-base-v1` | "Marie Curie worked at the University of Paris in France" → correct name, organization and country |
+| Reading / OCR | `antflydb/Florence-2-base` | reads rendered text back exactly |
+| Transcription | `openai/whisper-tiny` | transcribes recorded speech |
+| Generation | Gemma 3, Gemma 4, Llama 3.x, Qwen3 dense GGUF | see below |
+
+### Generation
 
 | Family | Verified with |
 |---|---|
@@ -44,82 +90,71 @@ drift apart.
 Text only. Multimodal projector sidecars (`mmproj-*.gguf`) are not used by the generation
 path; a bundle containing one still runs as a text model.
 
-## Experimental
-
-These load, but we do not stand behind their output for 0.2.0.
-
-| Family | Status |
-|---|---|
-| Qwen2 | **Do not use for generation.** Loads with a correct chat template and correct special-token ids, but output is wrong. `Qwen2.5-0.5B-Instruct` at `temperature: 0` answers "What is the capital of France?" with "The capital of the People's Republic of China is Beijing" via the CLI, and emits outright token soup over `/ai/v1/chat/completions`. Qwen3 on the same engine answers "Paris". The family stays loadable rather than blocked because `colqwen2` shares its tensor mapping as a multimodal embedding backbone. |
-| BitNet | `bitnet-b1.58-2B-4T` loads and generates, but degenerates into repetition. |
-| Phi | The tensor mapping works for the separate-projection layout, but **Phi-3 GGUFs cannot load** — they pack attention into a fused `attn_qkv.weight` and the FFN into a fused `ffn_up.weight`, which reports 257 missing tensors. |
-| Mistral / Mixtral | Weights load cleanly (no missing tensors), but generation emits only `<unk>`. The cause is the tokenizer, not the weights — see the embedded-SentencePiece caveat below. |
-
 ## Unsupported
 
-Rejected with a clear error rather than failing partway through a load.
+Rejected with HTTP 400 before any load. Some of these do not merely fail — they would
+otherwise crash the server, so blocking them protects every other caller.
 
-| Architecture | Reason |
+| Model or family | Why |
 |---|---|
-| `deepseek4` (DeepSeek V4) | Loads from a real GGUF and resolves all 1328 tensors, but execution panics on a shape mismatch in the grouped output projection. It panics rather than erroring, so it would take a server process down. llama.cpp runs the same file at ~0.5 tok/s, so this is ours to fix. |
-| `qwen35`, `qwen3next`, `qwen35moe` | Hybrid linear attention; the GGUF `ssm_*` tensors have no mapping to the runtime. |
+| Standalone CLIP (`Xenova/clip-vit-base-patch32`) | Image embedding allocates without bound — about 800 MB/s to 31 GB for one 64×64 image — until the process is killed. Use `antflydb/clipclap`. |
+| Standalone CLAP (`Xenova/clap-htsat-unfused`) | `ShapeMismatch` converting the audio encoder. Use `antflydb/clipclap`. |
+| TrOCR-style readers (`Xenova/trocr-base-printed`) | ONNX encoder/decoder readers exhaust memory the same way as CLIP. Use `antflydb/Florence-2-base`. |
+| Seq2seq rewriters (`/rewrite`) | Importing an ONNX encoder/decoder graph panics on a rank assertion. No rewriter model currently works. |
+| `microsoft/layoutlmv3-base` | Ships the legacy `vocab.json` + `merges.txt` pair with no `tokenizer.json`; the manifest accepts it but the loader rejects it. |
+| `monkt/paddleocr-onnx` | No backend accepts the model. |
+| `nomic-ai/nomic-embed-text-v1.5-GGUF` | `NoTokenizerFound`. |
+| Qwen2 | Loads with a correct chat template and clean termination, then answers the wrong question and emits token soup over the chat endpoint. |
+| Mistral / Mixtral | Loads with zero missing tensors, then argmaxes to token 0 on every step on both backends. The prompt tokenizes correctly, so the fault is in the forward pass. |
+| Phi | The mapping works for the separate-projection layout, but Phi-3 GGUFs fuse `attn_qkv` and `ffn_up` and report 257 missing tensors. |
+| BitNet | Loads and generates, then degenerates into repetition. |
+| DeepSeek V4 (`deepseek4`) | Loads and resolves all 1328 tensors, then panics on a shape mismatch in the grouped output projection. llama.cpp runs the same file, so this is ours to fix. |
+| `qwen35`, `qwen3next`, `qwen35moe` | Hybrid linear attention; the GGUF `ssm_*` tensors have no mapping. |
 | `falcon`, `opt`, `bloom` | Recognised by name only — no tensor mapping and no runtime. |
-| `gpt2`, `gpt_neo`, `gpt_neox`, `gptj` | No verified path for generation. |
-| `t5`, `mt5`, `longt5` | T5 has an encoder-decoder implementation but no generation path; `antfly inference generate` returns `InvalidModelForGeneration`. |
-| anything else | Any architecture not named on this page. |
+| `gpt2`, `gpt_neo`, `gpt_neox`, `gptj`, `t5` | No verified generation path. T5 has an encoder-decoder implementation but no generation path. |
 
-Requesting generation from an unsupported model returns HTTP 400 **before** the model is
-loaded:
+A rejected generation request looks like:
 
 ```json
 {
   "error": "UNSUPPORTED_ARCHITECTURE",
-  "message": "model architecture \"qwen3_next\" is not supported for generation; supported: llama, qwen3, gemma, gemma2, gemma3, gemma4; experimental: mistral, mixtral, qwen2, phi, phi3, bitnet"
+  "message": "model architecture \"qwen3_next\" is not supported for generation; supported: llama, qwen3, gemma, gemma2, gemma3, gemma4"
 }
 ```
 
-## Non-generation tasks
+## Licensing
 
-| Task | Status |
-|---|---|
-| Embedding (`/embed`) | Supported — BERT, and CLIP/CLAP for multimodal. |
-| Reranking (`/rerank`) | Supported — verified with `mixedbread-ai/mxbai-rerank-base-v1`. |
-| Transcription (`/transcribe`) | Supported — verified with `openai/whisper-tiny`. |
-| Reading (`/read`) | Supported — Florence-2 and TrOCR-style encoder-decoders. |
-| Recognition / extraction | Supported — GLiNER2. |
-| Chunking (`/chunk`) | Falls back to the built-in `fixed_bert` / `fixed_bpe` chunkers. No ONNX chunker model is currently verified. |
-| Rewriting (`/rewrite`) | Declared but unverified; no rewriter model is currently exercised. |
+`Babelscape/rebel-large` is **CC-BY-NC-SA — non-commercial only**, and about 3 GB. It
+appears in our test suite for relation extraction, but it is not part of any default bundle
+and must not be deployed commercially. `antflydb/gliner2-base-v1` is the recommended
+extraction model.
 
 ## Known caveats
 
 **Llama 3.x chat templates.** Llama 3.x ships a Jinja chat template Antfly's template engine
 cannot yet parse. The model loads and generates correctly, but chat requests fall back to
 raw prompting, which produces continuation-style output instead of a reply. Affected models
-report `"chat_template": false` in `/ai/v1/models` once loaded. Applying the chat format
-client-side is a workaround.
+report `"chat_template": false` in `/ai/v1/models`.
 
 **Small Gemma 3 models over the chat endpoint.** `gemma-3-1b` answers correctly and stops
-cleanly through `antfly inference generate`, but can fail to stop when called through
+cleanly through `antfly inference generate`, but can fail to stop through
 `/ai/v1/chat/completions`. Prefer `gemma-3-4b` or larger for chat.
 
-**Gemma 4 on Metal.** Some Gemma 4 bundles crash the Metal paged-KV kernel. Passing
-`--backend native` avoids it at a cost in speed.
+**Gemma 4 on Metal.** Some Gemma 4 bundles crash the Metal paged-KV kernel. Pass
+`--backend native` to avoid it, at a cost in speed.
 
-**GGUF bundles with an embedded SentencePiece vocabulary.** A GGUF whose
-`tokenizer.ggml.model` is `llama`, with no `tokenizer.model` or `tokenizer.json` sidecar in
-the directory, is detected as a SentencePiece tokenizer but tokenizes everything to
-`<unk>`. This affects the common "pure GGUF" distribution of Llama-2 and Mistral-family
-models, including `TheBloke/Mistral-7B-Instruct-v0.2-GGUF`. Bundles whose GGUF carries a
-byte-level BPE vocabulary instead (Gemma 4, for example) use a different path and work.
-As a workaround, place the upstream `tokenizer.json` alongside the `.gguf`.
+**Mixed-variant model directories.** Pulling a second variant into a directory that already
+holds another leaves both in place, and different parts of a model can then resolve to
+different variants. ClipClap in particular fails this way. Keep one variant per directory;
+if in doubt, delete and re-pull.
 
-**Models without `tokenizer.json`.** Older HuggingFace repos that ship only the legacy
-`vocab.json` + `merges.txt` pair are detected as having a tokenizer but fail to load with
-`NoTokenizerFound`. `microsoft/layoutlmv3-base` is one such repo.
+**Chunk overlap.** `/chunk` returns `InvalidChunkOverlap` when `target_tokens` is smaller
+than `overlap_tokens`. Set both together when using small chunks.
 
-**Quantization variants.** A directory containing several `.gguf` files (for example
-`Q4_1`, `Q4_K_M`, and `UD-Q4_K_XL`) resolves to one of them without reporting which. Keep
-one quantization per directory if the choice matters to you.
+## Not covered here
+
+Hosted generation providers (OpenAI, Gemini/Vertex, Bedrock, Cohere, OpenRouter) and Ollama
+are configured separately and are not part of this local-model matrix.
 
 ## Checking a model before running it
 
