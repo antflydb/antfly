@@ -3,14 +3,16 @@
 ## Standards
 
 `INVENTORY.md` is the live inventory: every model's code anchors, checks,
-invariants, correspondence evidence, quality tier, and open backlog items.
+invariants, correspondence evidence shape, assumptions, and open backlog.
+The suite does not label models "mature." Exhausting a bounded abstraction is
+evidence about that abstraction, not a refinement proof for the database.
 
-A model is mature only when it has: (1) code/test anchors for every state
-variable and action, (2) at least one deliberately-broken check per semantic
-rule, verified to fail on exactly that rule, (3) bounded but
-implementation-shaped state, and (4) a note for every behavior deliberately
-left out. Do not call a model mature merely because TLC exhausts its bounded
-state space.
+For every model record: (1) code/test anchors for state and actions, (2) a
+deliberately broken check for each important semantic rule, (3) explicit
+bounds and fairness assumptions, (4) deliberately omitted behavior, and
+(5) whether named implementation tests were actually observed executing.
+The B1 and B5 July-25 smokeout findings are examples of why fairness and
+enabling assumptions are part of the result rather than harmless boilerplate.
 
 `bash ../scripts/tla-check.sh audit` is the static hygiene audit: leftover
 `_TTrace_` artifacts, `Buggy*` constants no check enables, sections no tier
@@ -191,11 +193,12 @@ These specs are bounded around cohesive protocols and lifecycles, not individual
 - `AntflyPlacementRepairBadReplicaRenumber` -- Expected-failure survivor-identity-renumbering mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyPlacementRepairBadRepairWithRebalance` -- Expected-failure mandatory-repair-plus-optional-rebalance mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyPlacementRepairBadDuplicateReplicaIds` -- Expected-failure duplicate-declared-replica-id mutant used by `bash ../scripts/tla-check.sh negative`.
+- `AntflyPlacementReadiness.tla` -- Store voter-report knowledge/estimate aggregation and exact stable-placement transition admission. Its B1 mutant reproduces an unknown follower count latching ambiguity against an exact leader count.
 - `AntflyRuntimeStatusReconciliation.tla` -- Runtime observation precedence and storage-root provenance composed with complete join statistics, schema-migration progress, old-read-schema retention, and standby availability.
 - `AntflyTableLifecycle.tla` -- Table create/drop lifecycle: in-memory desired vs raft-committed topology, per-command applies, crash rebuilding desired from committed, planner scope, and convergence liveness.
 - `AntflyHARetentionReseed.tla` -- WAL retention floor vs per-slot reseed marking vs truncation, plus backup slots as retention pins with fail-closed backup end; no-permanent-unmarked-lag liveness.
 - `AntflyPromotionOwnerHandoff.tla` -- Entity promotion single-owner handoff across split/merge: detach-before-transfer-before-attach, non-durable attachment with crash/reattach, isLocalOwner promotion gate, handoff-completes liveness. Sketch-tier authority guardrail; intentionally collapses raft leadership and runtime detail.
-- `AntflyIndexLifecycle.tla` -- Index lifecycle (stale->building->fresh) with non-atomic durable status snapshots, shadow-swap completeness, watermark-validating crash recovery, and build-converges liveness.
+- `AntflyIndexLifecycle.tla` -- Two-generation index lifecycle with non-atomic durable status, shadow-swap completeness, bounded competing work, durable scheduler wakeups/admission, and explicit convergence assumptions. The B5-shaped mutant loses the second generation's rebuild wakeup.
 - `AntflyQueryCompletenessBadRouteBeforeChildReady` -- Expected-failure route-before-child-ready mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyQueryCompletenessBadDoubleServe` -- Expected-failure parent/child double-serve mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyQueryCompletenessBadMissingDoc` -- Expected-failure child-serving-without-moved-doc mutant used by `bash ../scripts/tla-check.sh negative`.
@@ -219,10 +222,11 @@ These specs are bounded around cohesive protocols and lifecycles, not individual
 - `AntflyDbSplitVisibilityBadChildServe` -- Expected-failure premature child serving before replay/index catch-up mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyDbSplitVisibilityBadMergeDonor` -- Expected-failure merge donor post-handoff serving mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyDbSplitVisibilityBadEnrichmentOwner` -- Expected-failure stale/non-owning enrichment publication mutant used by `bash ../scripts/tla-check.sh negative`.
-- `AntflySplitRefinementBridge.tla` -- Boundary model linking shard split fence/cutover readiness to DB-local replay/index readiness and metadata child routing.
+- `AntflySplitRefinementBridge.tla` -- Boundary model linking stable-placement bootstrap admission, shard fence/cutover readiness, DB-local replay/index readiness, and metadata child routing.
 - `AntflySplitRefinementBridgeBadRouteBeforeDbServing` -- Expected-failure metadata route-before-DB-serving mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflySplitRefinementBridgeBadDbServeBeforeShardCutover` -- Expected-failure DB child-serving-before-shard-cutover mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflySplitRefinementBridgeBadStaleFenceCutover` -- Expected-failure stale-fence split cutover mutant used by `bash ../scripts/tla-check.sh negative`.
+- `AntflySplitRefinementBridgeBadBootstrapWithoutStablePlacement` -- Expected-failure leader-only destination bootstrap mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyDocumentIdentity.tla` -- Document identity namespace, stable ordinal ownership, generation visibility, resolved-doc-filter context, canonical namespace repair, and strict namespace-open behavior.
 - `AntflyDocumentIdentityBadReuseOrdinal` -- Expected-failure tombstoned ordinal reuse mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyDocumentIdentityBadStaleFilter` -- Expected-failure stale resolved-doc-filter generation mutant used by `bash ../scripts/tla-check.sh negative`.
@@ -321,7 +325,7 @@ Validates checked-in HA trace fixtures against the focused HA contracts for stan
 
 Validates checked-in split bridge fixtures against `AntflySplitRefinementBridge.tla`. These fixtures mirror representative shard fence/cutover, DB replay/index catch-up, metadata routing, and rollback orderings, but they are not currently emitted live by Zig tests.
 
-- `TraceAntflySplitRefinementBridge.tla` -- Trace fixture spec for `split-bridge-trace` NDJSON events (`BeginSplit`, `ParentRightWrite`, `ReplayDelta`, `BuildTextIndex`, `BuildSparseIndex`, `BuildGraphIndex`, `SetShardFence`, `CompleteShardCutover`, `PublishDbChildServing`, `RouteMetadataToChild`, `Rollback`)
+- `TraceAntflySplitRefinementBridge.tla` -- Trace fixture spec for `split-bridge-trace` NDJSON events (`BeginSplit`, `ObserveDestinationStablePlacement`, `BootstrapDestination`, `ParentRightWrite`, `ReplayDelta`, `BuildTextIndex`, `BuildSparseIndex`, `BuildGraphIndex`, `SetShardFence`, `CompleteShardCutover`, `PublishDbChildServing`, `RouteMetadataToChild`, `Rollback`)
 - `TraceAntflySplitRefinementBridge.cfgs` -- TLC configuration (checks `TraceMatched` and bridge safety invariants)
 - `traces/split_bridge_cutover.ndjson` -- Positive cutover fixture covering DB catch-up before serving and metadata routing
 - `traces/split_bridge_rollback.ndjson` -- Positive rollback fixture covering no child exposure after rollback

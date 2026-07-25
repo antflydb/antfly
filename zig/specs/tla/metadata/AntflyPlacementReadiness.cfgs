@@ -1,0 +1,53 @@
+\* All TLC check configs for AntflyPlacementReadiness.tla.
+
+==== positive tier=fast
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyUnknownReportLatchesAmbiguity = FALSE
+    BuggyLeaderAloneAdmitsTransition = FALSE
+
+INVARIANTS
+    TypeOK
+    UnknownReportsDoNotCreateAuthoritativeConflict
+    TransitionRequiresStablePlacement
+    KnownAndAmbiguousAreExclusive
+
+==== heavy-liveness tier=heavy
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyUnknownReportLatchesAmbiguity = FALSE
+    BuggyLeaderAloneAdmitsTransition = FALSE
+
+INVARIANTS
+    TypeOK
+    UnknownReportsDoNotCreateAuthoritativeConflict
+    TransitionRequiresStablePlacement
+    KnownAndAmbiguousAreExclusive
+
+PROPERTIES
+    EvidenceEventuallyRecoversReadiness
+    TransitionEventuallyStarts
+
+==== BadUnknownReportLatchesAmbiguity
+\* Expected-failure B1 mutant: a follower that disclaims voter-set knowledge
+\* reports a partial count and latches ambiguity against the exact leader count.
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyUnknownReportLatchesAmbiguity = TRUE
+    BuggyLeaderAloneAdmitsTransition = FALSE
+
+INVARIANT UnknownReportsDoNotCreateAuthoritativeConflict
+
+==== BadLeaderAloneAdmitsTransition
+\* Expected-failure mutant: a known leader bypasses the remaining stable
+\* placement conjuncts.
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyUnknownReportLatchesAmbiguity = FALSE
+    BuggyLeaderAloneAdmitsTransition = TRUE
+
+INVARIANT TransitionRequiresStablePlacement

@@ -95,6 +95,10 @@ BridgeActionFromTrace ==
        /\ BeginSplit
     \/ /\ LoglineIsEvent("ParentRightWrite")
        /\ ParentRightWriteDuringSplit
+    \/ /\ LoglineIsEvent("ObserveDestinationStablePlacement")
+       /\ ObserveDestinationStablePlacement
+    \/ /\ LoglineIsEvent("BootstrapDestination")
+       /\ BootstrapDestination
     \/ /\ LoglineIsEvent("ReplayDelta")
        /\ ReplayDelta
     \/ /\ LoglineIsEvent("BuildTextIndex")

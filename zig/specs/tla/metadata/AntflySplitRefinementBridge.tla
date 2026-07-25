@@ -21,6 +21,7 @@
   the facts that must agree across layers:
 
     - shard finalization/cutover readiness,
+    - destination stable-placement readiness and bootstrap admission,
     - DB split-delta replay and shadow-index readiness,
     - DB child serving state and parent write fencing,
     - metadata right-range routing.
@@ -36,6 +37,8 @@
     - No byte ranges or concrete keys; "right" is the split-off range.
     - No exact archive bytes or shadow-index payloads.
     - The model is about cross-layer gating, not complete split mechanics.
+    - AntflyPlacementReadiness owns the detailed voter-report aggregation;
+      this bridge consumes only its StablePlacementReady result.
 *)
 
 EXTENDS Naturals, TLC
@@ -43,7 +46,8 @@ EXTENDS Naturals, TLC
 CONSTANTS
     BuggyRouteBeforeDbServing,
     BuggyDbServeBeforeShardCutover,
-    BuggyCompleteWithStaleFence
+    BuggyCompleteWithStaleFence,
+    BuggyBootstrapWithoutStablePlacement
 
 MaxSeq == 2
 Phases == {"single", "splitting", "cutover", "children", "rolledBack"}
@@ -63,12 +67,20 @@ VARIABLES
     parentAcceptsRight,
     childAcceptsRight,
     routeRightOwner,
-    staleFenceCompletion
+    staleFenceCompletion,
+    placementBridge
 
 vars == <<phase, shardFenceSet, shardFenceSeq, shardCutoverReady,
           dbDeltaSeq, dbReplaySeq, dbTextIndexSeq, dbSparseIndexSeq,
           dbGraphIndexSeq, dbChildServing, parentAcceptsRight,
-          childAcceptsRight, routeRightOwner, staleFenceCompletion>>
+          childAcceptsRight, routeRightOwner, staleFenceCompletion,
+          placementBridge>>
+
+CoreVars ==
+    <<phase, shardFenceSet, shardFenceSeq, shardCutoverReady,
+      dbDeltaSeq, dbReplaySeq, dbTextIndexSeq, dbSparseIndexSeq,
+      dbGraphIndexSeq, dbChildServing, parentAcceptsRight,
+      childAcceptsRight, routeRightOwner, staleFenceCompletion>>
 
 DbReplayCaughtUp == dbReplaySeq = dbDeltaSeq
 
@@ -94,6 +106,26 @@ Init ==
     /\ childAcceptsRight = FALSE
     /\ routeRightOwner = "parent"
     /\ staleFenceCompletion = FALSE
+    /\ placementBridge =
+        [stable |-> FALSE, bootstrapped |-> FALSE, unsafe |-> FALSE]
+
+ObserveDestinationStablePlacement ==
+    /\ phase = "splitting"
+    /\ ~placementBridge.stable
+    /\ placementBridge' = [placementBridge EXCEPT !.stable = TRUE]
+    /\ UNCHANGED CoreVars
+
+BootstrapDestination ==
+    /\ phase = "splitting"
+    /\ ~placementBridge.bootstrapped
+    /\ IF BuggyBootstrapWithoutStablePlacement
+       THEN TRUE
+       ELSE placementBridge.stable
+    /\ placementBridge' =
+        [placementBridge EXCEPT
+            !.bootstrapped = TRUE,
+            !.unsafe = (@ \/ ~placementBridge.stable)]
+    /\ UNCHANGED CoreVars
 
 BeginSplit ==
     /\ phase = "single"
@@ -103,7 +135,7 @@ BeginSplit ==
     /\ routeRightOwner' = "parent"
     /\ UNCHANGED <<shardFenceSet, shardFenceSeq, shardCutoverReady,
                   dbDeltaSeq, dbReplaySeq, dbTextIndexSeq, dbSparseIndexSeq,
-                  dbGraphIndexSeq, dbChildServing, staleFenceCompletion>>
+                  dbGraphIndexSeq, dbChildServing, staleFenceCompletion, placementBridge>>
 
 ParentRightWriteDuringSplit ==
     /\ phase = "splitting"
@@ -114,7 +146,7 @@ ParentRightWriteDuringSplit ==
     /\ UNCHANGED <<phase, shardFenceSet, shardFenceSeq, dbReplaySeq,
                   dbTextIndexSeq, dbSparseIndexSeq, dbGraphIndexSeq,
                   dbChildServing, parentAcceptsRight, childAcceptsRight,
-                  routeRightOwner, staleFenceCompletion>>
+                  routeRightOwner, staleFenceCompletion, placementBridge>>
 
 ReplayDelta ==
     /\ phase = "splitting"
@@ -123,7 +155,7 @@ ReplayDelta ==
     /\ UNCHANGED <<phase, shardFenceSet, shardFenceSeq, shardCutoverReady,
                   dbDeltaSeq, dbTextIndexSeq, dbSparseIndexSeq,
                   dbGraphIndexSeq, dbChildServing, parentAcceptsRight,
-                  childAcceptsRight, routeRightOwner, staleFenceCompletion>>
+                  childAcceptsRight, routeRightOwner, staleFenceCompletion, placementBridge>>
 
 BuildTextIndex ==
     /\ phase = "splitting"
@@ -132,7 +164,7 @@ BuildTextIndex ==
     /\ UNCHANGED <<phase, shardFenceSet, shardFenceSeq, shardCutoverReady,
                   dbDeltaSeq, dbReplaySeq, dbSparseIndexSeq, dbGraphIndexSeq,
                   dbChildServing, parentAcceptsRight, childAcceptsRight,
-                  routeRightOwner, staleFenceCompletion>>
+                  routeRightOwner, staleFenceCompletion, placementBridge>>
 
 BuildSparseIndex ==
     /\ phase = "splitting"
@@ -141,7 +173,7 @@ BuildSparseIndex ==
     /\ UNCHANGED <<phase, shardFenceSet, shardFenceSeq, shardCutoverReady,
                   dbDeltaSeq, dbReplaySeq, dbTextIndexSeq, dbGraphIndexSeq,
                   dbChildServing, parentAcceptsRight, childAcceptsRight,
-                  routeRightOwner, staleFenceCompletion>>
+                  routeRightOwner, staleFenceCompletion, placementBridge>>
 
 BuildGraphIndex ==
     /\ phase = "splitting"
@@ -150,17 +182,18 @@ BuildGraphIndex ==
     /\ UNCHANGED <<phase, shardFenceSet, shardFenceSeq, shardCutoverReady,
                   dbDeltaSeq, dbReplaySeq, dbTextIndexSeq, dbSparseIndexSeq,
                   dbChildServing, parentAcceptsRight, childAcceptsRight,
-                  routeRightOwner, staleFenceCompletion>>
+                  routeRightOwner, staleFenceCompletion, placementBridge>>
 
 SetShardFence ==
     /\ phase = "splitting"
+    /\ placementBridge.bootstrapped
     /\ DbReplayCaughtUp
     /\ shardFenceSet' = TRUE
     /\ shardFenceSeq' = dbDeltaSeq
     /\ UNCHANGED <<phase, shardCutoverReady, dbDeltaSeq, dbReplaySeq,
                   dbTextIndexSeq, dbSparseIndexSeq, dbGraphIndexSeq,
                   dbChildServing, parentAcceptsRight, childAcceptsRight,
-                  routeRightOwner, staleFenceCompletion>>
+                  routeRightOwner, staleFenceCompletion, placementBridge>>
 
 CompleteShardCutover ==
     /\ phase = "splitting"
@@ -171,7 +204,7 @@ CompleteShardCutover ==
     /\ UNCHANGED <<shardFenceSet, shardFenceSeq, dbDeltaSeq, dbReplaySeq,
                   dbTextIndexSeq, dbSparseIndexSeq, dbGraphIndexSeq,
                   dbChildServing, parentAcceptsRight, childAcceptsRight,
-                  routeRightOwner, staleFenceCompletion>>
+                  routeRightOwner, staleFenceCompletion, placementBridge>>
 
 BuggyCompleteShardCutoverWithStaleFence ==
     /\ BuggyCompleteWithStaleFence
@@ -185,7 +218,7 @@ BuggyCompleteShardCutoverWithStaleFence ==
     /\ UNCHANGED <<shardFenceSet, shardFenceSeq, dbDeltaSeq, dbReplaySeq,
                   dbTextIndexSeq, dbSparseIndexSeq, dbGraphIndexSeq,
                   dbChildServing, parentAcceptsRight, childAcceptsRight,
-                  routeRightOwner>>
+                  routeRightOwner, placementBridge>>
 
 PublishDbChildServing ==
     /\ phase = "cutover"
@@ -197,7 +230,7 @@ PublishDbChildServing ==
     /\ childAcceptsRight' = TRUE
     /\ UNCHANGED <<shardFenceSet, shardFenceSeq, shardCutoverReady,
                   dbDeltaSeq, dbReplaySeq, dbTextIndexSeq, dbSparseIndexSeq,
-                  dbGraphIndexSeq, routeRightOwner, staleFenceCompletion>>
+                  dbGraphIndexSeq, routeRightOwner, staleFenceCompletion, placementBridge>>
 
 BuggyDbChildServingBeforeShardCutover ==
     /\ BuggyDbServeBeforeShardCutover
@@ -208,7 +241,7 @@ BuggyDbChildServingBeforeShardCutover ==
     /\ childAcceptsRight' = TRUE
     /\ UNCHANGED <<phase, shardFenceSet, shardFenceSeq, shardCutoverReady,
                   dbDeltaSeq, dbReplaySeq, dbTextIndexSeq, dbSparseIndexSeq,
-                  dbGraphIndexSeq, routeRightOwner, staleFenceCompletion>>
+                  dbGraphIndexSeq, routeRightOwner, staleFenceCompletion, placementBridge>>
 
 RouteMetadataToChild ==
     /\ phase = "children"
@@ -218,7 +251,7 @@ RouteMetadataToChild ==
     /\ UNCHANGED <<phase, shardFenceSet, shardFenceSeq, shardCutoverReady,
                   dbDeltaSeq, dbReplaySeq, dbTextIndexSeq, dbSparseIndexSeq,
                   dbGraphIndexSeq, dbChildServing, parentAcceptsRight,
-                  childAcceptsRight, staleFenceCompletion>>
+                  childAcceptsRight, staleFenceCompletion, placementBridge>>
 
 BuggyRouteMetadataToChildBeforeDbServing ==
     /\ BuggyRouteBeforeDbServing
@@ -227,7 +260,7 @@ BuggyRouteMetadataToChildBeforeDbServing ==
     /\ UNCHANGED <<phase, shardFenceSet, shardFenceSeq, shardCutoverReady,
                   dbDeltaSeq, dbReplaySeq, dbTextIndexSeq, dbSparseIndexSeq,
                   dbGraphIndexSeq, dbChildServing, parentAcceptsRight,
-                  childAcceptsRight, staleFenceCompletion>>
+                  childAcceptsRight, staleFenceCompletion, placementBridge>>
 
 Rollback ==
     /\ phase = "splitting"
@@ -240,10 +273,12 @@ Rollback ==
     /\ childAcceptsRight' = FALSE
     /\ routeRightOwner' = "parent"
     /\ UNCHANGED <<dbDeltaSeq, dbReplaySeq, dbTextIndexSeq, dbSparseIndexSeq,
-                  dbGraphIndexSeq, staleFenceCompletion>>
+                  dbGraphIndexSeq, staleFenceCompletion, placementBridge>>
 
 Next ==
     \/ BeginSplit
+    \/ ObserveDestinationStablePlacement
+    \/ BootstrapDestination
     \/ ParentRightWriteDuringSplit
     \/ ReplayDelta
     \/ BuildTextIndex
@@ -275,6 +310,8 @@ TypeOK ==
     /\ childAcceptsRight \in BOOLEAN
     /\ routeRightOwner \in Owners
     /\ staleFenceCompletion \in BOOLEAN
+    /\ placementBridge \in
+        [stable: BOOLEAN, bootstrapped: BOOLEAN, unsafe: BOOLEAN]
 
 ReplayNeverExceedsDelta ==
     /\ dbReplaySeq <= dbDeltaSeq
@@ -286,6 +323,10 @@ ShardCutoverRequiresCurrentReplay ==
     shardCutoverReady =>
         /\ DbReplayCaughtUp
         /\ ~staleFenceCompletion
+        /\ placementBridge.bootstrapped
+
+DestinationBootstrapRequiresStablePlacement ==
+    ~placementBridge.unsafe
 
 DbServingRequiresShardCutoverAndIndexes ==
     dbChildServing =>
@@ -315,6 +356,7 @@ Safety ==
     /\ TypeOK
     /\ ReplayNeverExceedsDelta
     /\ ShardCutoverRequiresCurrentReplay
+    /\ DestinationBootstrapRequiresStablePlacement
     /\ DbServingRequiresShardCutoverAndIndexes
     /\ MetadataChildRouteRequiresBothLayersReady
     /\ ParentAndChildDoNotBothAcceptRight

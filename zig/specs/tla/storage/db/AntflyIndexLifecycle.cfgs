@@ -10,15 +10,18 @@ SPECIFICATION FairSpec
 CONSTANTS
     BuggySwapIncompleteShadow = FALSE
     BuggyRecoverTrustsStaleStatus = FALSE
+    BuggyLoseSecondSchemaWakeup = FALSE
 
 INVARIANTS
     TypeOK
     FreshImpliesCaughtUp
     NoFreshServeBehind
+    EveryRequestedGenerationHasDurableWork
     Safety
 
 PROPERTIES
     BuildEventuallyConverges
+    SecondSchemaEventuallyConverges
 
 ==== BadRecoverTrustsStatus
 \* Expected-failure config: crash recovery trusts a stale durable "fresh"
@@ -31,6 +34,7 @@ SPECIFICATION Spec
 CONSTANTS
     BuggySwapIncompleteShadow = FALSE
     BuggyRecoverTrustsStaleStatus = TRUE
+    BuggyLoseSecondSchemaWakeup = FALSE
 
 INVARIANTS
     NoFreshServeBehind
@@ -45,6 +49,20 @@ SPECIFICATION Spec
 CONSTANTS
     BuggySwapIncompleteShadow = TRUE
     BuggyRecoverTrustsStaleStatus = FALSE
+    BuggyLoseSecondSchemaWakeup = FALSE
 
 INVARIANTS
     FreshImpliesCaughtUp
+
+==== BadLoseSecondSchemaWakeup
+\* Expected-failure B5-shaped mutant: the generation-one worker completes,
+\* generation two is requested, but no durable rebuild wakeup is published.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySwapIncompleteShadow = FALSE
+    BuggyRecoverTrustsStaleStatus = FALSE
+    BuggyLoseSecondSchemaWakeup = TRUE
+
+INVARIANT EveryRequestedGenerationHasDurableWork

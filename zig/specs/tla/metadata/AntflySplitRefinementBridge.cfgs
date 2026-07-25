@@ -11,11 +11,13 @@ CONSTANTS
     BuggyRouteBeforeDbServing = FALSE
     BuggyDbServeBeforeShardCutover = FALSE
     BuggyCompleteWithStaleFence = FALSE
+    BuggyBootstrapWithoutStablePlacement = FALSE
 
 INVARIANTS
     TypeOK
     ReplayNeverExceedsDelta
     ShardCutoverRequiresCurrentReplay
+    DestinationBootstrapRequiresStablePlacement
     DbServingRequiresShardCutoverAndIndexes
     MetadataChildRouteRequiresBothLayersReady
     ParentAndChildDoNotBothAcceptRight
@@ -31,6 +33,7 @@ CONSTANTS
     BuggyRouteBeforeDbServing = FALSE
     BuggyDbServeBeforeShardCutover = TRUE
     BuggyCompleteWithStaleFence = FALSE
+    BuggyBootstrapWithoutStablePlacement = FALSE
 
 INVARIANTS
     Safety
@@ -44,6 +47,7 @@ CONSTANTS
     BuggyRouteBeforeDbServing = TRUE
     BuggyDbServeBeforeShardCutover = FALSE
     BuggyCompleteWithStaleFence = FALSE
+    BuggyBootstrapWithoutStablePlacement = FALSE
 
 INVARIANTS
     Safety
@@ -57,6 +61,22 @@ CONSTANTS
     BuggyRouteBeforeDbServing = FALSE
     BuggyDbServeBeforeShardCutover = FALSE
     BuggyCompleteWithStaleFence = TRUE
+    BuggyBootstrapWithoutStablePlacement = FALSE
 
 INVARIANTS
     Safety
+
+==== BadBootstrapWithoutStablePlacement
+\* Expected-failure mutant: a known destination leader is treated as
+\* sufficient even though the placement-status protocol has not established
+\* a known exact voter set.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyRouteBeforeDbServing = FALSE
+    BuggyDbServeBeforeShardCutover = FALSE
+    BuggyCompleteWithStaleFence = FALSE
+    BuggyBootstrapWithoutStablePlacement = TRUE
+
+INVARIANT DestinationBootstrapRequiresStablePlacement

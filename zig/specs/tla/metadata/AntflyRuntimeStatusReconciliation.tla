@@ -16,7 +16,10 @@ What this proves:
     until that boundary.
 Deliberate omissions:
   - JSON encoding, byte counts beyond known/unknown, continuous timestamps,
-    schema payload semantics, index build internals, and network transport.
+    schema payload semantics, index build scheduling, and network transport.
+  - BuildTargetSchema represents accepted progress evidence. Its fairness is
+    not an implementation scheduler guarantee; AntflyIndexLifecycle owns the
+    bounded contention, wakeup, admission, and two-generation rebuild contract.
 State bounds:
   - Two nodes, two ranges, two topology/root generations, one migration, and
     bounded status publications.
