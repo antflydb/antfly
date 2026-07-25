@@ -45,7 +45,7 @@ pub const ClusterRestoreRequest = struct {
 };
 
 pub const format_version: u32 = 2;
-pub const cluster_format_version: u32 = 1;
+pub const cluster_format_version: u32 = 2;
 pub const table_backup_id = "table";
 pub const antfly_version = "zig-dev";
 pub const max_portable_backup_file_bytes: usize = 1024 * 1024 * 1024;
@@ -150,9 +150,9 @@ pub const TableBackupPlan = struct {
 pub const TableRestorePlan = struct {
     backup_root: []const u8,
     manifest: *const TableBackupManifest,
-    /// Stable identity of the admitted backup source. This remains the
-    /// restore idempotency key after a remote artifact is copied into a
-    /// private local staging root.
+    /// Stable location of the admitted backup source. The storage boundary
+    /// canonicalizes this into the durable restore idempotency identity after
+    /// a remote artifact is copied into a private local staging root.
     source_location: []const u8,
     reconcile_only: bool = false,
     replace_existing: bool = false,
@@ -161,6 +161,68 @@ pub const TableRestorePlan = struct {
     /// callers may omit this and use the bounded threaded fallback.
     io: ?std.Io = null,
 };
+
+pub const max_restore_source_identity_bytes: usize = 4096;
+
+/// Produces the bounded, canonical identity persisted with a restored
+/// generation. Canonicalization makes equivalent accepted spellings (such as
+/// gcs:// and gs://, redundant file path components, or trailing object-store
+/// separators) share one idempotency key.
+pub fn canonicalRestoreSourceIdentityAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    if (raw.len == 0 or raw.len > max_restore_source_identity_bytes)
+        return error.InvalidBackupRequest;
+    for (raw) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return error.InvalidBackupRequest;
+    }
+    if (std.mem.indexOfAny(u8, raw, "?#") != null) return error.InvalidBackupRequest;
+
+    const normalized = normalizeRemoteLocationAlloc(alloc, raw) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+    };
+    defer alloc.free(normalized);
+    _ = std.Uri.parse(normalized) catch return error.InvalidBackupRequest;
+
+    var parsed = remote_uri.parseAlloc(alloc, normalized) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidBackupRequest,
+    };
+    defer switch (parsed) {
+        .file => |path| alloc.free(path),
+        .gcs => |*value| value.deinit(alloc),
+        .s3 => |*value| value.deinit(alloc),
+    };
+    return switch (parsed) {
+        .file => |path| blk: {
+            if (!std.fs.path.isAbsolute(path)) return error.InvalidBackupRequest;
+            const canonical_path = std.fs.path.resolve(alloc, &.{path}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+            };
+            defer alloc.free(canonical_path);
+            break :blk std.fmt.allocPrint(alloc, "file://{s}", .{canonical_path});
+        },
+        .gcs => |value| canonicalObjectStoreLocationAlloc(alloc, "gs", value),
+        .s3 => |value| canonicalObjectStoreLocationAlloc(alloc, "s3", value),
+    };
+}
+
+fn canonicalObjectStoreLocationAlloc(
+    alloc: std.mem.Allocator,
+    scheme: []const u8,
+    location: remote_uri.BucketPath,
+) ![]u8 {
+    const prefix = trimRightSlash(location.prefix);
+    if (prefix.len == 0) return try std.fmt.allocPrint(alloc, "{s}://{s}", .{ scheme, location.bucket });
+    return try std.fmt.allocPrint(alloc, "{s}://{s}/{s}", .{ scheme, location.bucket, prefix });
+}
+
+pub fn validateCanonicalRestoreSourceIdentity(
+    alloc: std.mem.Allocator,
+    identity: []const u8,
+) !void {
+    const canonical = try canonicalRestoreSourceIdentityAlloc(alloc, identity);
+    defer alloc.free(canonical);
+    if (!std.mem.eql(u8, identity, canonical)) return error.InvalidBackupRequest;
+}
 
 pub const RestorePublicationHook = struct {
     ptr: *anyopaque,
@@ -873,10 +935,13 @@ pub const ClusterTableBackupEntry = struct {
 
 pub const ClusterBackupManifest = struct {
     format_version: u32 = cluster_format_version,
+    state: enum { complete } = .complete,
     backup_id: []const u8,
     timestamp: []const u8,
     location: []const u8,
     antfly_version: []const u8,
+    expected_table_count: usize = 0,
+    completed_table_count: usize = 0,
     tables: []const ClusterTableBackupEntry,
     installed_extensions: []extension_domain.InstalledExtension = &.{},
     extension_members: []extension_domain.ExtensionMember = &.{},
@@ -1464,6 +1529,8 @@ pub fn createClusterManifestWithExtensions(
         .timestamp = try currentTimestampRfc3339(alloc),
         .location = try alloc.dupe(u8, location),
         .antfly_version = try alloc.dupe(u8, antfly_version),
+        .expected_table_count = owned_entries.len,
+        .completed_table_count = owned_entries.len,
         .tables = owned_entries,
         .installed_extensions = owned_installed,
         .extension_members = owned_members,
@@ -1499,7 +1566,7 @@ pub fn readClusterManifest(
     var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     if (parsed.value.format_version != cluster_format_version) return error.UnsupportedBackupFormat;
-    try validateClusterManifest(&parsed.value, backup_id);
+    try validateClusterManifest(alloc, &parsed.value, backup_id);
     return try cloneClusterBackupManifest(alloc, parsed.value);
 }
 
@@ -1536,7 +1603,7 @@ pub fn readClusterManifestFromLocation(
             var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
             defer parsed.deinit();
             if (parsed.value.format_version != cluster_format_version) return error.UnsupportedBackupFormat;
-            try validateClusterManifest(&parsed.value, backup_id);
+            try validateClusterManifest(alloc, &parsed.value, backup_id);
             return try cloneClusterBackupManifest(alloc, parsed.value);
         },
     }
@@ -1553,9 +1620,34 @@ pub fn clusterManifestExistsAtLocation(alloc: std.mem.Allocator, location: *Back
     };
 }
 
-fn validateClusterManifest(manifest: *const ClusterBackupManifest, requested_backup_id: []const u8) !void {
+fn validateClusterManifest(
+    alloc: std.mem.Allocator,
+    manifest: *const ClusterBackupManifest,
+    requested_backup_id: []const u8,
+) !void {
     if (!std.mem.eql(u8, manifest.backup_id, requested_backup_id)) return error.InvalidBackupRequest;
-    for (manifest.tables) |table| try validateBackupId(table.table_backup_id);
+    if (manifest.state != .complete or
+        manifest.expected_table_count == 0 or
+        manifest.expected_table_count != manifest.tables.len or
+        manifest.completed_table_count != manifest.expected_table_count)
+    {
+        return error.IncompleteClusterBackup;
+    }
+    var table_names = std.StringHashMapUnmanaged(void).empty;
+    defer table_names.deinit(alloc);
+    var table_backup_ids = std.StringHashMapUnmanaged(void).empty;
+    defer table_backup_ids.deinit(alloc);
+    try table_names.ensureTotalCapacity(alloc, @intCast(manifest.tables.len));
+    try table_backup_ids.ensureTotalCapacity(alloc, @intCast(manifest.tables.len));
+
+    for (manifest.tables) |table| {
+        if (table.name.len == 0) return error.InvalidBackupRequest;
+        try validateBackupId(table.table_backup_id);
+        if (table_names.contains(table.name) or table_backup_ids.contains(table.table_backup_id))
+            return error.InvalidBackupRequest;
+        table_names.putAssumeCapacity(table.name, {});
+        table_backup_ids.putAssumeCapacity(table.table_backup_id, {});
+    }
 }
 
 pub fn encodeClusterBackupResponse(
@@ -2287,10 +2379,13 @@ fn cloneClusterBackupManifest(alloc: std.mem.Allocator, manifest: ClusterBackupM
 
     return .{
         .format_version = manifest.format_version,
+        .state = manifest.state,
         .backup_id = try alloc.dupe(u8, manifest.backup_id),
         .timestamp = try alloc.dupe(u8, manifest.timestamp),
         .location = try alloc.dupe(u8, manifest.location),
         .antfly_version = try alloc.dupe(u8, manifest.antfly_version),
+        .expected_table_count = manifest.expected_table_count,
+        .completed_table_count = manifest.completed_table_count,
         .tables = tables,
         .installed_extensions = installed_extensions,
         .extension_members = extension_members,
@@ -2928,6 +3023,9 @@ test "cluster backup manifest round trips extension metadata" {
 
     var loaded = try readClusterManifest(std.testing.allocator, root, "snap");
     defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(.complete, loaded.state);
+    try std.testing.expectEqual(@as(usize, 1), loaded.expected_table_count);
+    try std.testing.expectEqual(@as(usize, 1), loaded.completed_table_count);
     try std.testing.expectEqual(@as(usize, 1), loaded.installed_extensions.len);
     try std.testing.expectEqualStrings("memoryaf", loaded.installed_extensions[0].name);
     try std.testing.expectEqualStrings("sha256:abc", loaded.installed_extensions[0].package_digest);
@@ -2945,10 +3043,109 @@ test "cluster backup manifest round trips extension metadata" {
     try std.testing.expectEqualStrings("antfly_core", loaded.extension_dependencies[0].package_name);
 }
 
+test "cluster backup manifest rejects incomplete coverage" {
+    const tables = [_]ClusterTableBackupEntry{.{
+        .name = "docs",
+        .table_backup_id = "docs-snap",
+    }};
+    var manifest = try createClusterManifest(
+        std.testing.allocator,
+        "snap",
+        "file:///tmp/backups",
+        &tables,
+    );
+    defer manifest.deinit(std.testing.allocator);
+
+    try validateClusterManifest(std.testing.allocator, &manifest, "snap");
+
+    manifest.completed_table_count = 0;
+    try std.testing.expectError(
+        error.IncompleteClusterBackup,
+        validateClusterManifest(std.testing.allocator, &manifest, "snap"),
+    );
+    manifest.completed_table_count = 1;
+    manifest.expected_table_count = 2;
+    try std.testing.expectError(
+        error.IncompleteClusterBackup,
+        validateClusterManifest(std.testing.allocator, &manifest, "snap"),
+    );
+    manifest.expected_table_count = 1;
+
+    var empty = try createClusterManifest(
+        std.testing.allocator,
+        "empty",
+        "file:///tmp/backups",
+        &.{},
+    );
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.IncompleteClusterBackup,
+        validateClusterManifest(std.testing.allocator, &empty, "empty"),
+    );
+}
+
 test "backup location parsing requires absolute file uri" {
     try std.testing.expectEqualStrings("/tmp/antfly-backup", try parseFileLocation("file:///tmp/antfly-backup"));
     try std.testing.expectError(error.UnsupportedBackupLocation, parseFileLocation("s3://bucket/path"));
     try std.testing.expectError(error.InvalidBackupLocation, parseFileLocation("file://relative"));
+}
+
+test "restore source identities are bounded and canonical" {
+    const alloc = std.testing.allocator;
+
+    const canonical_file = try canonicalRestoreSourceIdentityAlloc(
+        alloc,
+        "file:///tmp/antfly/../backups",
+    );
+    defer alloc.free(canonical_file);
+    try std.testing.expectEqualStrings("file:///tmp/backups", canonical_file);
+
+    const canonical_gcs = try canonicalRestoreSourceIdentityAlloc(
+        alloc,
+        "gcs://archive/backups/daily/",
+    );
+    defer alloc.free(canonical_gcs);
+    try std.testing.expectEqualStrings("gs://archive/backups/daily", canonical_gcs);
+
+    try validateCanonicalRestoreSourceIdentity(alloc, "s3://archive/backups");
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        validateCanonicalRestoreSourceIdentity(alloc, "s3://archive/backups/"),
+    );
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        canonicalRestoreSourceIdentityAlloc(alloc, ""),
+    );
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        canonicalRestoreSourceIdentityAlloc(alloc, "file://relative"),
+    );
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        canonicalRestoreSourceIdentityAlloc(alloc, "s3://archive/bad\x00path"),
+    );
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        canonicalRestoreSourceIdentityAlloc(alloc, "s3://archive/backups?token=secret"),
+    );
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        canonicalRestoreSourceIdentityAlloc(alloc, "file:///tmp/backups#fragment"),
+    );
+
+    const oversized = try alloc.alloc(u8, max_restore_source_identity_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, 'a');
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        canonicalRestoreSourceIdentityAlloc(alloc, oversized),
+    );
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        canonicalRestoreSourceIdentityAlloc(failing.allocator(), "s3://archive/backups"),
+    );
 }
 
 test "backup manifest round trips through remote objectstore location" {

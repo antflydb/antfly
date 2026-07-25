@@ -195,9 +195,17 @@ func TestFileBackupStoreRejectsUnknownFormat(t *testing.T) {
 
 func TestClusterBackupMetadataRequiresVersionIDAndFormat(t *testing.T) {
 	valid := &ClusterBackupMetadata{
-		Version:  clusterBackupMetadataVersion,
-		BackupID: "backup-1",
-		Format:   common.BackupFormatPortable,
+		Version:             clusterBackupMetadataVersion,
+		State:               clusterBackupStateComplete,
+		BackupID:            "backup-1",
+		Format:              common.BackupFormatPortable,
+		ExpectedTableCount:  1,
+		CompletedTableCount: 1,
+		Tables: []ClusterBackupTableInfo{{
+			Name:           "documents",
+			BackupLocation: "file:///backups/documents-metadata.json",
+			Status:         "completed",
+		}},
 	}
 	require.NoError(t, validateClusterBackupMetadata("backup-1", valid))
 
@@ -223,5 +231,22 @@ func TestClusterBackupMetadataRequiresVersionIDAndFormat(t *testing.T) {
 		t,
 		validateClusterBackupMetadata("backup-1", &unknownFormat),
 		"unsupported cluster backup format",
+	)
+
+	incomplete := *valid
+	incomplete.CompletedTableCount = 0
+	require.ErrorContains(
+		t,
+		validateClusterBackupMetadata("backup-1", &incomplete),
+		"incomplete table coverage",
+	)
+
+	failedTable := *valid
+	failedTable.Tables = append([]ClusterBackupTableInfo(nil), valid.Tables...)
+	failedTable.Tables[0].Status = "failed"
+	require.ErrorContains(
+		t,
+		validateClusterBackupMetadata("backup-1", &failedTable),
+		"incomplete table entry",
 	)
 }

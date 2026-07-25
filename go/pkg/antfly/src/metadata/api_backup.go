@@ -273,15 +273,21 @@ func writeBackupError(w http.ResponseWriter, message string, err error) {
 
 // ClusterBackupMetadata represents the metadata for a cluster-level backup
 type ClusterBackupMetadata struct {
-	Version       uint32                   `json:"version"`
-	BackupID      string                   `json:"backup_id"`
-	Timestamp     time.Time                `json:"timestamp"`
-	AntflyVersion string                   `json:"antfly_version"`
-	Format        common.BackupFormat      `json:"format,omitempty"`
-	Tables        []ClusterBackupTableInfo `json:"tables"`
+	Version             uint32                   `json:"version"`
+	State               string                   `json:"state"`
+	BackupID            string                   `json:"backup_id"`
+	Timestamp           time.Time                `json:"timestamp"`
+	AntflyVersion       string                   `json:"antfly_version"`
+	Format              common.BackupFormat      `json:"format,omitempty"`
+	ExpectedTableCount  int                      `json:"expected_table_count"`
+	CompletedTableCount int                      `json:"completed_table_count"`
+	Tables              []ClusterBackupTableInfo `json:"tables"`
 }
 
-const clusterBackupMetadataVersion = 1
+const (
+	clusterBackupMetadataVersion = 2
+	clusterBackupStateComplete   = "complete"
+)
 
 // ClusterBackupTableInfo tracks backup status for a single table in a cluster backup
 type ClusterBackupTableInfo struct {
@@ -305,6 +311,38 @@ func validateClusterBackupMetadata(id string, meta *ClusterBackupMetadata) error
 			id,
 			meta.BackupID,
 		)
+	}
+	if meta.State != clusterBackupStateComplete {
+		return fmt.Errorf("cluster backup %q is not complete", id)
+	}
+	if meta.ExpectedTableCount == 0 ||
+		meta.ExpectedTableCount != len(meta.Tables) ||
+		meta.CompletedTableCount != meta.ExpectedTableCount {
+		return fmt.Errorf(
+			"cluster backup %q has incomplete table coverage: expected %d, completed %d, recorded %d",
+			id,
+			meta.ExpectedTableCount,
+			meta.CompletedTableCount,
+			len(meta.Tables),
+		)
+	}
+	tableNames := make(map[string]struct{}, len(meta.Tables))
+	backupLocations := make(map[string]struct{}, len(meta.Tables))
+	for _, table := range meta.Tables {
+		if strings.TrimSpace(table.Name) == "" ||
+			table.Status != "completed" ||
+			strings.TrimSpace(table.BackupLocation) == "" ||
+			table.Error != "" {
+			return fmt.Errorf("cluster backup %q contains an incomplete table entry", id)
+		}
+		if _, exists := tableNames[table.Name]; exists {
+			return fmt.Errorf("cluster backup %q contains duplicate table %q", id, table.Name)
+		}
+		if _, exists := backupLocations[table.BackupLocation]; exists {
+			return fmt.Errorf("cluster backup %q contains duplicate table backup location", id)
+		}
+		tableNames[table.Name] = struct{}{}
+		backupLocations[table.BackupLocation] = struct{}{}
 	}
 	switch meta.Format {
 	case common.BackupFormatNative, common.BackupFormatPortable:
@@ -550,12 +588,14 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 	// Create cluster metadata
 	backupFormat := backupConfig.Format
 	clusterMeta := &ClusterBackupMetadata{
-		Version:       clusterBackupMetadataVersion,
-		BackupID:      req.BackupId,
-		Timestamp:     time.Now(),
-		AntflyVersion: multirafthttp.Version,
-		Format:        backupFormat,
-		Tables:        make([]ClusterBackupTableInfo, len(tableNames)),
+		Version:            clusterBackupMetadataVersion,
+		State:              clusterBackupStateComplete,
+		BackupID:           req.BackupId,
+		Timestamp:          time.Now(),
+		AntflyVersion:      multirafthttp.Version,
+		Format:             backupFormat,
+		ExpectedTableCount: len(tableNames),
+		Tables:             make([]ClusterBackupTableInfo, len(tableNames)),
 	}
 
 	// Track results for response
@@ -685,19 +725,6 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write cluster-level metadata
-	if strings.HasPrefix(req.Location, "s3://") {
-		if err := writeClusterMetadataToBlobStore(ctx, req.BackupId, clusterMeta, s3Info); err != nil {
-			writeBackupError(w, "Failed to write cluster metadata", err)
-			return
-		}
-	} else {
-		if err := writeClusterMetadataToFile(ctx, resolvedLocation, req.BackupId, clusterMeta); err != nil {
-			writeBackupError(w, "Failed to write cluster metadata", err)
-			return
-		}
-	}
-
 	// Determine overall status
 	status := ClusterBackupResponseStatusCompleted
 	failedCount := 0
@@ -710,6 +737,23 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		status = ClusterBackupResponseStatusFailed
 	} else if failedCount > 0 {
 		status = ClusterBackupResponseStatusPartial
+	}
+
+	// The cluster manifest is the final commit point. Publish it only after
+	// every requested table artifact and table manifest is durable.
+	if failedCount == 0 {
+		clusterMeta.CompletedTableCount = len(results)
+		if strings.HasPrefix(req.Location, "s3://") {
+			if err := writeClusterMetadataToBlobStore(ctx, req.BackupId, clusterMeta, s3Info); err != nil {
+				writeBackupError(w, "Failed to write cluster metadata", err)
+				return
+			}
+		} else {
+			if err := writeClusterMetadataToFile(ctx, resolvedLocation, req.BackupId, clusterMeta); err != nil {
+				writeBackupError(w, "Failed to write cluster metadata", err)
+				return
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1058,7 +1102,8 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 				meta, err := readClusterMetadataFromBlobStore(ctx, backupID, s3Info)
 				if err != nil {
 					t.logger.Warn("Error reading cluster metadata", zap.String("backup_id", backupID), zap.Error(err))
-					continue
+					errorResponse(w, "Failed to validate cluster backup metadata", http.StatusInternalServerError)
+					return
 				}
 
 				tableNames := make([]string, 0, len(meta.Tables))
@@ -1099,7 +1144,8 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 				meta, err := readClusterMetadataFromFile(ctx, resolvedLocation, backupID)
 				if err != nil {
 					t.logger.Warn("Error reading cluster metadata", zap.String("backup_id", backupID), zap.Error(err))
-					continue
+					errorResponse(w, "Failed to validate cluster backup metadata", http.StatusInternalServerError)
+					return
 				}
 
 				tableNames := make([]string, 0, len(meta.Tables))

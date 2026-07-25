@@ -9021,6 +9021,16 @@ test "lsm backend persisted compaction streams run blocks without full run loads
             return self.backing.storage().appendFileAbsolute(self.backing.allocator, path, contents, sync);
         }
 
+        fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().renameAbsolute(old_path, new_path);
@@ -9050,6 +9060,8 @@ test "lsm backend persisted compaction streams run blocks without full run loads
         .read_file_trailer_alloc = CountingStorage.readFileTrailerAlloc,
         .write_file_absolute = CountingStorage.writeFileAbsolute,
         .append_file_absolute = CountingStorage.appendFileAbsolute,
+        .sync_file_absolute = CountingStorage.syncFileAbsolute,
+        .sync_parent_absolute = CountingStorage.syncParentAbsolute,
         .rename_absolute = CountingStorage.renameAbsolute,
         .delete_file_absolute = CountingStorage.deleteFileAbsolute,
         .delete_tree = CountingStorage.deleteTree,
@@ -10076,6 +10088,16 @@ test "lsm backend shared cache owns loaded table allocations" {
             return self.backing.storage().writeFileAbsolute(path, contents);
         }
 
+        fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().renameAbsolute(old_path, new_path);
@@ -10109,6 +10131,8 @@ test "lsm backend shared cache owns loaded table allocations" {
         .file_size = Context.fileSize,
         .read_file_trailer_alloc = Context.readFileTrailerAlloc,
         .write_file_absolute = Context.writeFileAbsolute,
+        .sync_file_absolute = Context.syncFileAbsolute,
+        .sync_parent_absolute = Context.syncParentAbsolute,
         .rename_absolute = Context.renameAbsolute,
         .delete_file_absolute = Context.deleteFileAbsolute,
         .delete_tree = Context.deleteTree,
@@ -10435,6 +10459,16 @@ test "lsm backend reuses cached raw table bytes to avoid fragmented index reads"
             return self.backing.storage().writeFileAbsolute(path, contents);
         }
 
+        fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().renameAbsolute(old_path, new_path);
@@ -10462,6 +10496,8 @@ test "lsm backend reuses cached raw table bytes to avoid fragmented index reads"
         .read_file_range_alloc = CountingHostContext.readFileRangeAlloc,
         .file_size = CountingHostContext.fileSize,
         .write_file_absolute = CountingHostContext.writeFileAbsolute,
+        .sync_file_absolute = CountingHostContext.syncFileAbsolute,
+        .sync_parent_absolute = CountingHostContext.syncParentAbsolute,
         .rename_absolute = CountingHostContext.renameAbsolute,
         .delete_file_absolute = CountingHostContext.deleteFileAbsolute,
         .delete_tree = CountingHostContext.deleteTree,
@@ -10568,6 +10604,16 @@ test "lsm backend avoids full run table load on bloom negative" {
             return self.backing.storage().writeFileAbsolute(path, contents);
         }
 
+        fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().renameAbsolute(old_path, new_path);
@@ -10597,6 +10643,8 @@ test "lsm backend avoids full run table load on bloom negative" {
         .file_size = Context.fileSize,
         .read_file_trailer_alloc = Context.readFileTrailerAlloc,
         .write_file_absolute = Context.writeFileAbsolute,
+        .sync_file_absolute = Context.syncFileAbsolute,
+        .sync_parent_absolute = Context.syncParentAbsolute,
         .rename_absolute = Context.renameAbsolute,
         .delete_file_absolute = Context.deleteFileAbsolute,
         .delete_tree = Context.deleteTree,
@@ -11099,6 +11147,16 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
             return self.backing.storage().writeFileAbsolute(path, contents);
         }
 
+        fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().renameAbsolute(old_path, new_path);
@@ -11128,6 +11186,8 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
         .file_size = Context.fileSize,
         .read_file_trailer_alloc = Context.readFileTrailerAlloc,
         .write_file_absolute = Context.writeFileAbsolute,
+        .sync_file_absolute = Context.syncFileAbsolute,
+        .sync_parent_absolute = Context.syncParentAbsolute,
         .rename_absolute = Context.renameAbsolute,
         .delete_file_absolute = Context.deleteFileAbsolute,
         .delete_tree = Context.deleteTree,
@@ -13859,6 +13919,16 @@ test "lsm backend reclaims obsolete run files after retention on a later writer 
             return self.backing.storage().writeFileAbsolute(path, contents);
         }
 
+        fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().renameAbsolute(old_path, new_path);
@@ -13890,6 +13960,8 @@ test "lsm backend reclaims obsolete run files after retention on a later writer 
         .read_file_range_alloc = Context.readFileRangeAlloc,
         .file_size = Context.fileSize,
         .write_file_absolute = Context.writeFileAbsolute,
+        .sync_file_absolute = Context.syncFileAbsolute,
+        .sync_parent_absolute = Context.syncParentAbsolute,
         .rename_absolute = Context.renameAbsolute,
         .delete_file_absolute = Context.deleteFileAbsolute,
         .delete_tree = Context.deleteTree,
@@ -15188,6 +15260,16 @@ test "lsm backend reloads persisted manifest and run files over host storage" {
             return self.backing.storage().writeFileAbsolute(path, contents);
         }
 
+        fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().renameAbsolute(old_path, new_path);
@@ -15215,6 +15297,8 @@ test "lsm backend reloads persisted manifest and run files over host storage" {
         .read_file_range_alloc = HostContext.readFileRangeAlloc,
         .file_size = HostContext.fileSize,
         .write_file_absolute = HostContext.writeFileAbsolute,
+        .sync_file_absolute = HostContext.syncFileAbsolute,
+        .sync_parent_absolute = HostContext.syncParentAbsolute,
         .rename_absolute = HostContext.renameAbsolute,
         .delete_file_absolute = HostContext.deleteFileAbsolute,
         .delete_tree = HostContext.deleteTree,

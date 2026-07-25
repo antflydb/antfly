@@ -7508,7 +7508,7 @@ test "public api e2e serves cluster backup list and restore routes" {
     try std.testing.expectEqualStrings("overwrite-log", parsed_logs_lookup_after_overwrite.value.title);
 }
 
-test "public api e2e reports partial cluster backup and restore statuses" {
+test "public api e2e does not publish or restore a partial cluster backup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
@@ -7628,53 +7628,11 @@ test "public api e2e reports partial cluster backup and restore statuses" {
     defer backups_resp.deinit(std.testing.allocator);
     var parsed_backups = try std.json.parseFromSlice(metadata_openapi.BackupListResponse, std.testing.allocator, backups_resp.body, .{});
     defer parsed_backups.deinit();
-    try std.testing.expectEqual(@as(usize, 1), parsed_backups.value.backups.len);
-    try std.testing.expectEqualStrings("cluster-partial", parsed_backups.value.backups[0].backup_id);
-    try std.testing.expectEqual(@as(usize, 1), parsed_backups.value.backups[0].tables.len);
-    try std.testing.expectEqualStrings("docs", parsed_backups.value.backups[0].tables[0]);
-
-    _ = try client.dropTable(base_uri, "docs");
-    rounds = 0;
-    while (rounds < 8) : (rounds += 1) try svc.runRound();
-    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchTable(base_uri, "docs"));
-
-    const partial_restore_body = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"backup_id\":\"cluster-partial\",\"location\":\"file://{s}\",\"table_names\":[\"docs\",\"missing\"]}}",
-        .{backup_root},
+    try std.testing.expectEqual(@as(usize, 0), parsed_backups.value.backups.len);
+    try std.testing.expectError(
+        error.FileNotFound,
+        backups_api.readClusterManifest(std.testing.allocator, backup_root, "cluster-partial"),
     );
-    defer std.testing.allocator.free(partial_restore_body);
-    var partial_restore_resp = try client.fetchClusterRestore(base_uri, partial_restore_body);
-    defer partial_restore_resp.deinit(std.testing.allocator);
-    var parsed_partial_restore = try std.json.parseFromSlice(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, partial_restore_resp.body, .{});
-    defer parsed_partial_restore.deinit();
-    try std.testing.expectEqualStrings("partial", parsed_partial_restore.value.status);
-    try std.testing.expectEqual(@as(usize, 2), parsed_partial_restore.value.tables.len);
-
-    var saw_docs_restore = false;
-    var saw_missing_restore = false;
-    for (parsed_partial_restore.value.tables) |table_status| {
-        if (std.mem.eql(u8, table_status.name, "docs")) {
-            saw_docs_restore = true;
-            try std.testing.expectEqualStrings("triggered", table_status.status);
-            try std.testing.expect(table_status.@"error" == null);
-        } else if (std.mem.eql(u8, table_status.name, "missing")) {
-            saw_missing_restore = true;
-            try std.testing.expectEqualStrings("failed", table_status.status);
-            try std.testing.expectEqualStrings("backup does not include table", table_status.@"error".?);
-        }
-    }
-    try std.testing.expect(saw_docs_restore);
-    try std.testing.expect(saw_missing_restore);
-
-    rounds = 0;
-    while (rounds < 8) : (rounds += 1) try svc.runRound();
-
-    var docs_lookup = try client.fetchLookup(base_uri, "docs", "doc:a", null);
-    defer docs_lookup.deinit(std.testing.allocator);
-    var parsed_docs_lookup = try parseJsonBody(LookupTitle, std.testing.allocator, docs_lookup.body);
-    defer parsed_docs_lookup.deinit();
-    try std.testing.expectEqualStrings("alpha", parsed_docs_lookup.value.title);
 }
 
 test "public api e2e reports unsupported multi-range tables in cluster backup" {
@@ -7875,53 +7833,11 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
     defer backups_resp.deinit(std.testing.allocator);
     var parsed_backups = try std.json.parseFromSlice(metadata_openapi.BackupListResponse, std.testing.allocator, backups_resp.body, .{});
     defer parsed_backups.deinit();
-    try std.testing.expectEqual(@as(usize, 1), parsed_backups.value.backups.len);
-    try std.testing.expectEqualStrings("cluster-multirange", parsed_backups.value.backups[0].backup_id);
-    try std.testing.expectEqual(@as(usize, 1), parsed_backups.value.backups[0].tables.len);
-    try std.testing.expectEqualStrings("logs", parsed_backups.value.backups[0].tables[0]);
-
-    _ = try client.dropTable(base_uri, "docs");
-    _ = try client.dropTable(base_uri, "logs");
-    rounds = 0;
-    while (rounds < 8) : (rounds += 1) try svc.runRound();
-
-    const partial_restore_body = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"backup_id\":\"cluster-multirange\",\"location\":\"file://{s}\",\"table_names\":[\"docs\",\"logs\"]}}",
-        .{backup_root},
+    try std.testing.expectEqual(@as(usize, 0), parsed_backups.value.backups.len);
+    try std.testing.expectError(
+        error.FileNotFound,
+        backups_api.readClusterManifest(std.testing.allocator, backup_root, "cluster-multirange"),
     );
-    defer std.testing.allocator.free(partial_restore_body);
-    var partial_restore_resp = try client.fetchClusterRestore(base_uri, partial_restore_body);
-    defer partial_restore_resp.deinit(std.testing.allocator);
-    var parsed_partial_restore = try std.json.parseFromSlice(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, partial_restore_resp.body, .{});
-    defer parsed_partial_restore.deinit();
-    try std.testing.expectEqualStrings("partial", parsed_partial_restore.value.status);
-    try std.testing.expectEqual(@as(usize, 2), parsed_partial_restore.value.tables.len);
-
-    var saw_docs_restore = false;
-    var saw_logs_restore = false;
-    for (parsed_partial_restore.value.tables) |table_status| {
-        if (std.mem.eql(u8, table_status.name, "docs")) {
-            saw_docs_restore = true;
-            try std.testing.expectEqualStrings("failed", table_status.status);
-            try std.testing.expectEqualStrings("backup does not include table", table_status.@"error".?);
-        } else if (std.mem.eql(u8, table_status.name, "logs")) {
-            saw_logs_restore = true;
-            try std.testing.expectEqualStrings("triggered", table_status.status);
-            try std.testing.expect(table_status.@"error" == null);
-        }
-    }
-    try std.testing.expect(saw_docs_restore);
-    try std.testing.expect(saw_logs_restore);
-
-    rounds = 0;
-    while (rounds < 8) : (rounds += 1) try svc.runRound();
-
-    var logs_lookup = try client.fetchLookup(base_uri, "logs", "log:a", null);
-    defer logs_lookup.deinit(std.testing.allocator);
-    var parsed_logs_lookup = try parseJsonBody(LookupTitle, std.testing.allocator, logs_lookup.body);
-    defer parsed_logs_lookup.deinit();
-    try std.testing.expectEqualStrings("entry", parsed_logs_lookup.value.title);
 }
 
 test "public api smoke e2e commits transaction across split ranges" {

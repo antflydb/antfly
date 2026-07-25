@@ -2853,9 +2853,17 @@ paths:
         - All shard data (compressed with zstd)
 
 
-        The backup creates a cluster-level manifest that tracks all included tables
+        A non-empty backup publishes a cluster-level manifest only after every
 
-        and their individual backup locations.
+        requested table backup is durable. The manifest is the final commit
+
+        point and records complete expected/completed table counts. A `partial`
+
+        or `failed` attempt returns per-table diagnostics but does not publish a
+
+        restorable aggregate manifest. A cluster with no selected tables returns
+
+        `400` without writing a backup artifact.
 
 
         Backup IDs are immutable. Reusing an ID that already has a published
@@ -2896,6 +2904,8 @@ paths:
             is fully successful, while `partial` or `failed` reports per-table
 
             failures even though the request itself was processed successfully.
+
+            Only `completed` publishes a restorable cluster manifest.
           content:
             application/json:
               schema:

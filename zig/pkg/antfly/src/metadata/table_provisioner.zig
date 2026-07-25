@@ -2075,6 +2075,64 @@ test "table provisioner registers a resolver declared in the table index config"
     try std.testing.expectEqual(@as(usize, 0), removed_resolvers.len);
 }
 
+test "table provisioner can admit resolver backfill without draining corpus work" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-async-resolver";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const graph_only =
+        \\{
+        \\  "relations_graph":{"type":"graph",
+        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}}
+        \\}
+    ;
+    _ = try reconcileDbIndexesWithOptions(alloc, &db, graph_only, .{});
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const with_resolver =
+        \\{
+        \\  "relations_graph":{"type":"graph",
+        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}},
+        \\  "resolvers":[
+        \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}
+        \\  ]
+        \\}
+    ;
+    const summary = try reconcileDbIndexesWithOptions(alloc, &db, with_resolver, .{
+        .drain_resolver_backfill = false,
+    });
+    try std.testing.expectEqual(@as(usize, 1), summary.resolvers_added);
+
+    const resolvers = try db.listResolvers(alloc);
+    defer {
+        for (resolvers) |*cfg| cfg.deinit(alloc);
+        alloc.free(resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+    try std.testing.expectEqualStrings("kg", resolvers[0].name);
+}
+
 test "table provisioner registers explicit document enrichments from index config" {
     const alloc = std.heap.c_allocator;
     const path = "/tmp/antfly-metadata-table-provisioner-enrichments";

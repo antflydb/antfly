@@ -15,6 +15,7 @@
 const std = @import("std");
 const group_ids = @import("../common/group_ids.zig");
 const metadata_api = @import("api.zig");
+const metadata_authority = @import("authority.zig");
 const metadata_admin = @import("admin.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_table_manager = @import("table_manager.zig");
@@ -1188,7 +1189,7 @@ pub const MetadataHttpServer = struct {
                     defer parsed.deinit();
                     const valid = self.source.validatePublication(parsed.value) catch |err| switch (err) {
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => if (isRetryableMetadataAuthorityError(err))
+                        else => if (metadata_authority.isRetryableError(err))
                             return try notLeaderResponse(alloc)
                         else
                             return err,
@@ -1203,7 +1204,7 @@ pub const MetadataHttpServer = struct {
                     defer parsed.deinit();
                     const valid = self.source.validateTablePublication(parsed.value) catch |err| switch (err) {
                         error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
-                        else => if (isRetryableMetadataAuthorityError(err))
+                        else => if (metadata_authority.isRetryableError(err))
                             return try notLeaderResponse(alloc)
                         else
                             return err,
@@ -1753,7 +1754,7 @@ pub const MetadataHttpServer = struct {
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.handleWithAllocator(alloc, req) catch |err| {
-            if (isRetryableMetadataAuthorityError(err)) return try notLeaderResponse(alloc);
+            if (metadata_authority.isRetryableError(err)) return try notLeaderResponse(alloc);
             return err;
         };
     }
@@ -3029,18 +3030,6 @@ fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
         .content_type = content_type,
         .headers = headers,
         .body = body,
-    };
-}
-
-fn isRetryableMetadataAuthorityError(err: anyerror) bool {
-    return switch (err) {
-        error.NotLeader,
-        error.ProposalDropped,
-        error.LeaderTransferInProgress,
-        error.MetadataLinearizableReadTimeout,
-        error.ReconcileLeaseNotHeld,
-        => true,
-        else => false,
     };
 }
 

@@ -32,6 +32,7 @@ const coverage_policy = @import("coverage_policy.zig");
 const table_contract = @import("table_contract.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
+const metadata_authority = @import("../metadata/authority.zig");
 const metadata_mod = @import("../metadata/mod.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
@@ -2941,29 +2942,30 @@ pub const ApiHttpServer = struct {
         if (try self.dispatchArdRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchExtensionAgentRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
-        const extension_resp = self.dispatchExtensionRoutes(req, uri_parts) catch |err| switch (err) {
-            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => {
+        const extension_resp = self.dispatchExtensionRoutes(req, uri_parts) catch |err| {
+            if (metadata_authority.isRetryableError(err)) {
                 if (publicExtensionRouteMutatesMetadata(req.method, uri_parts.path)) {
                     return try metadataNotLeaderResponse(self.alloc);
                 }
                 return err;
-            },
-            else => return err,
+            }
+            return err;
         };
         if (extension_resp) |resp| return resp;
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchSecretRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchTransactionRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try http_internal_routes.handle(self.internalRoutesContext(uri_parts), req)) |resp| return resp;
-        const public_table_resp = self.dispatchPublicTableRoutes(req, uri_parts, authenticated_identity) catch |err| switch (err) {
-            error.InvalidPathParameter => return try textResponse(self.alloc, 400, "invalid path parameter"),
-            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => {
+        const public_table_resp = self.dispatchPublicTableRoutes(req, uri_parts, authenticated_identity) catch |err| {
+            if (err == error.InvalidPathParameter)
+                return try textResponse(self.alloc, 400, "invalid path parameter");
+            if (metadata_authority.isRetryableError(err)) {
                 if (publicTableRouteMutatesMetadata(req.method, uri_parts.path)) {
                     return try metadataNotLeaderResponse(self.alloc);
                 }
                 return err;
-            },
-            else => return err,
+            }
+            return err;
         };
         if (public_table_resp) |resp| return resp;
         return try textResponse(self.alloc, 404, "not found");
@@ -5111,7 +5113,7 @@ pub const ApiHttpServer = struct {
                             continue;
                         },
                         else => {
-                            if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                            if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                             std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
                             return err;
                         },
@@ -6666,32 +6668,35 @@ pub const ApiHttpServer = struct {
     ) !bool {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
-            return self.source.restoreTable(alloc, table_name, location_uri, connection, manifest) catch |err| switch (err) {
-                error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return err,
-                error.InvalidBackupRequest,
-                error.BackupManifestTooLarge,
-                error.UnsupportedBackupMigrationState,
-                error.UnsupportedBackupFormat,
-                error.UnsupportedMultiRangeTable,
-                error.TableNotFound,
-                error.UnsupportedOperation,
-                error.OutOfMemory,
-                => return err,
-                else => {
-                    // A reconciliation plan publishes the table and ranges as
-                    // separate proposals. Any error after one proposal may be
-                    // an interrupted exact restore intent, not a clean abort.
-                    switch (self.distributedRestoreIntentState(table_name, location_uri, manifest.backup_id) catch |state_err| switch (state_err) {
-                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return state_err,
-                        else => .missing,
-                    }) {
-                        .pending, .completed => return true,
-                        .missing, .conflicting => {},
-                    }
-                    if (attempt + 1 >= 3) return err;
-                    sleepNs(100 * std.time.ns_per_ms);
-                    continue;
-                },
+            return self.source.restoreTable(alloc, table_name, location_uri, connection, manifest) catch |err| {
+                if (metadata_authority.isRetryableError(err)) return err;
+                return switch (err) {
+                    error.InvalidBackupRequest,
+                    error.BackupManifestTooLarge,
+                    error.UnsupportedBackupMigrationState,
+                    error.UnsupportedBackupFormat,
+                    error.UnsupportedMultiRangeTable,
+                    error.TableNotFound,
+                    error.UnsupportedOperation,
+                    error.OutOfMemory,
+                    => return err,
+                    else => {
+                        // A reconciliation plan publishes the table and ranges as
+                        // separate proposals. Any error after one proposal may be
+                        // an interrupted exact restore intent, not a clean abort.
+                        const intent_state = self.distributedRestoreIntentState(table_name, location_uri, manifest.backup_id) catch |state_err| blk: {
+                            if (metadata_authority.isRetryableError(state_err)) return state_err;
+                            break :blk .missing;
+                        };
+                        switch (intent_state) {
+                            .pending, .completed => return true,
+                            .missing, .conflicting => {},
+                        }
+                        if (attempt + 1 >= 3) return err;
+                        sleepNs(100 * std.time.ns_per_ms);
+                        continue;
+                    },
+                };
             };
         }
         return false;
@@ -7838,7 +7843,10 @@ pub const ApiHttpServer = struct {
                     if (self.tableExists(table_name) catch |table_exists_err| return metadataAccessFailure(table_exists_err)) return error.TableAlreadyExists;
                     return error.InvalidBackupRequest;
                 },
-                else => return mapExecuteRestoreError(err),
+                else => {
+                    if (metadata_authority.isRetryableError(err)) return error.NotLeader;
+                    return mapExecuteRestoreError(err);
+                },
             }) {
                 return;
             }
@@ -7851,15 +7859,18 @@ pub const ApiHttpServer = struct {
                 if (self.tableExists(table_name) catch |table_exists_err| return metadataAccessFailure(table_exists_err)) return error.TableAlreadyExists;
                 return error.InvalidBackupRequest;
             },
-            else => return mapExecuteRestoreError(err),
+            else => {
+                if (metadata_authority.isRetryableError(err)) return error.NotLeader;
+                return mapExecuteRestoreError(err);
+            },
         };
         if (outcome == .committed_durable) return error.RestoreDurabilityConfirmed;
     }
 
     fn mapExecuteRestoreError(err: anyerror) public_table_http.TableApi.ExecuteRestoreError {
         if (backups_api.isArtifactIntegrityError(err)) return error.BackupIntegrityFailure;
+        if (metadata_authority.isRetryableError(err)) return error.NotLeader;
         return switch (err) {
-            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => error.NotLeader,
             error.TableAlreadyExists => error.TableAlreadyExists,
             error.UnsupportedBackupMigrationState => error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => error.UnsupportedMultiRangeTable,
@@ -7998,12 +8009,13 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             else => {
+                if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 std.log.err("public create index metadata update failed table={s} index={s} err={}", .{ table_name, index_name, err });
                 return error.InternalFailure;
             },
         };
         self.waitForIndexMetadataProjection(table_name, index_name, stored_index_json) catch |err| {
-            if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+            if (metadata_authority.isRetryableError(err)) return error.NotLeader;
             std.log.err("public create index metadata projection wait failed table={s} index={s} err={}", .{ table_name, index_name, err });
             return error.InternalFailure;
         };
@@ -8043,6 +8055,7 @@ pub const ApiHttpServer = struct {
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             else => {
+                if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 std.log.err("public delete index metadata update failed table={s} index={s} err={}", .{ table_name, index_name, err });
                 return error.InternalFailure;
             },
@@ -8052,7 +8065,7 @@ pub const ApiHttpServer = struct {
         };
         defer alloc.free(expected_indexes_json);
         self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
-            if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+            if (metadata_authority.isRetryableError(err)) return error.NotLeader;
             std.log.err("public delete index metadata projection wait failed table={s} index={s} err={}", .{ table_name, index_name, err });
             return error.InternalFailure;
         };
@@ -8101,12 +8114,13 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
             else => {
+                if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 std.log.err("public artifact enrichment metadata update failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
                 return error.InternalFailure;
             },
         };
         self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
-            if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+            if (metadata_authority.isRetryableError(err)) return error.NotLeader;
             std.log.err("public artifact enrichment metadata projection wait failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
             return error.InternalFailure;
         };
@@ -8146,7 +8160,10 @@ pub const ApiHttpServer = struct {
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
-            else => return error.InternalFailure,
+            else => {
+                if (metadata_authority.isRetryableError(err)) return error.NotLeader;
+                return error.InternalFailure;
+            },
         };
         self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
             return metadataAccessFailure(err);
@@ -8272,7 +8289,7 @@ pub const ApiHttpServer = struct {
         const op_alloc = self.alloc;
 
         self.source.ensureLinearizableRead() catch |err| {
-            if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+            if (metadata_authority.isRetryableError(err)) return error.NotLeader;
             std.log.warn("cluster backup metadata read barrier failed err={s}", .{@errorName(err)});
             return error.InternalFailure;
         };
@@ -8290,6 +8307,10 @@ pub const ApiHttpServer = struct {
         };
         defer freeOwnedTableNames(op_alloc, table_names);
         if (table_names.len > restore_jobs.max_cluster_tables_per_job) return error.InvalidRequest;
+        // An aggregate manifest is a restorable commit record. An empty
+        // selection has no commit to publish and is rejected before creating
+        // any table artifact.
+        if (table_names.len == 0) return error.NoTables;
 
         const statuses = op_alloc.alloc(backups_api.ClusterTableBackupStatus, table_names.len) catch return error.InternalFailure;
         const status_names = op_alloc.alloc([]u8, table_names.len) catch {
@@ -8309,7 +8330,7 @@ pub const ApiHttpServer = struct {
         }
         var extension_snapshot_opt = self.source.adminSnapshot() catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
-            else => null,
+            else => if (metadata_authority.isRetryableError(err)) return error.NotLeader else null,
         };
         defer if (extension_snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
         const extension_snapshot: ?*const metadata_api.AdminSnapshot = if (extension_snapshot_opt) |*snapshot| snapshot else null;
@@ -8322,11 +8343,20 @@ pub const ApiHttpServer = struct {
 
             const table_backup_id = self.backupGenerationIdAlloc() catch return error.InternalFailure;
             self.backupOwnedTable(table_name, location, req.location, table_backup_id, req.format, connection) catch |err| {
-                if (isRetryableMetadataLeadershipError(err)) {
-                    op_alloc.free(table_backup_id);
-                    return error.NotLeader;
-                }
                 statuses[i].@"error" = switch (err) {
+                    // Once table execution begins, the request may already have
+                    // published artifacts for an earlier table. Never return
+                    // the retry-marked 503 from this phase: replaying the POST
+                    // would duplicate side effects. Return a sanitized
+                    // per-table outcome without publishing an incomplete
+                    // aggregate manifest; the caller can choose a new backup
+                    // id for a retry.
+                    error.NotLeader,
+                    error.ProposalDropped,
+                    error.LeaderTransferInProgress,
+                    error.MetadataLinearizableReadTimeout,
+                    error.ReconcileLeaseNotHeld,
+                    => "metadata leader unavailable",
                     error.TableNotFound => "not found",
                     error.UnsupportedOperation => "method not allowed",
                     error.UnsupportedMultiRangeTable => "backup does not support multi-range tables",
@@ -8353,16 +8383,21 @@ pub const ApiHttpServer = struct {
             table_backup_id_owned = null;
         }
 
-        const installed_extensions = if (extension_snapshot) |snapshot| snapshot.installed_extensions else &.{};
-        const extension_members = if (extension_snapshot) |snapshot| snapshot.extension_members else &.{};
-        const extension_dependencies = if (extension_snapshot) |snapshot| snapshot.extension_dependencies else &.{};
-        var manifest = backups_api.createClusterManifestWithExtensions(op_alloc, req.backup_id, req.location, cluster_tables.items, installed_extensions, extension_members, extension_dependencies) catch return error.InternalFailure;
-        defer manifest.deinit(op_alloc);
-        backups_api.writeClusterManifestToLocation(op_alloc, location, &manifest) catch |err| switch (err) {
-            error.BackupAlreadyExists => return error.BackupAlreadyExists,
-            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
-            else => return error.InternalFailure,
-        };
+        // Per-table manifests and payloads must be durable before this final
+        // publication. If any requested table failed, return its sanitized
+        // status without exposing a partial aggregate as a restore candidate.
+        if (cluster_tables.items.len == table_names.len) {
+            const installed_extensions = if (extension_snapshot) |snapshot| snapshot.installed_extensions else &.{};
+            const extension_members = if (extension_snapshot) |snapshot| snapshot.extension_members else &.{};
+            const extension_dependencies = if (extension_snapshot) |snapshot| snapshot.extension_dependencies else &.{};
+            var manifest = backups_api.createClusterManifestWithExtensions(op_alloc, req.backup_id, req.location, cluster_tables.items, installed_extensions, extension_members, extension_dependencies) catch return error.InternalFailure;
+            defer manifest.deinit(op_alloc);
+            backups_api.writeClusterManifestToLocation(op_alloc, location, &manifest) catch |err| switch (err) {
+                error.BackupAlreadyExists => return error.BackupAlreadyExists,
+                error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+                else => return error.InternalFailure,
+            };
+        }
 
         return backups_api.encodeClusterBackupResponse(alloc, req.backup_id, statuses) catch return error.InternalFailure;
     }
@@ -8411,7 +8446,10 @@ pub const ApiHttpServer = struct {
 
         preflightClusterRestoreExtensions(self, &manifest) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
-            else => return error.InvalidRequest,
+            else => {
+                if (metadata_authority.isRetryableError(err)) return error.NotLeader;
+                return error.InvalidRequest;
+            },
         };
 
         var owned_table_names: ?[][]u8 = null;
@@ -8489,7 +8527,7 @@ pub const ApiHttpServer = struct {
                     };
                 }
                 self.checkpointRestoreTableCompleted(cancellation, @intCast(i)) catch |err| {
-                    if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                    if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
                     return error.InternalFailure;
                 };
                 statuses[i].status = "committed";
@@ -8498,7 +8536,7 @@ pub const ApiHttpServer = struct {
 
             if (!restoreTableAttempted(active_table_index, durability_pending_table_ranges, published_table_ranges, @intCast(i))) {
                 self.checkpointRestoreTableStarted(cancellation, @intCast(i)) catch |err| {
-                    if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                    if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
                     return error.InternalFailure;
                 };
             }
@@ -8532,8 +8570,9 @@ pub const ApiHttpServer = struct {
                     error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                     error.UnsupportedOperation => false,
                     else => {
+                        if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                         self.checkpointRestoreTableAborted(cancellation, @intCast(i)) catch |checkpoint_err| {
-                            if (checkpoint_err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(checkpoint_err)) return error.NotLeader;
+                            if (checkpoint_err == error.RestoreJobFenced or metadata_authority.isRetryableError(checkpoint_err)) return error.NotLeader;
                             return error.InternalFailure;
                         };
                         std.log.err("cluster restore failed table={s} backup_id={s} err={}", .{
@@ -8559,7 +8598,7 @@ pub const ApiHttpServer = struct {
                 };
                 if (restored_via_metadata) {
                     self.checkpointRestoreTablePublished(cancellation, @intCast(i)) catch |err| {
-                        if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                        if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
                         return error.InternalFailure;
                     };
                     self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, cancellation) catch |err| switch (err) {
@@ -8571,7 +8610,7 @@ pub const ApiHttpServer = struct {
                         },
                     };
                     self.checkpointRestoreTableCompleted(cancellation, @intCast(i)) catch |err| {
-                        if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                        if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
                         return error.InternalFailure;
                     };
                     statuses[i].status = "committed";
@@ -8581,7 +8620,7 @@ pub const ApiHttpServer = struct {
 
             const replace_existing = is_overwrite and (self.tableExists(table_name) catch |err| return metadataAccessFailure(err));
             const outcome = self.restoreOwnedTableWithRetryAndLifecycle(table_name, location, req.location, table_backup_id, false, replace_existing) catch |err| {
-                if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 std.log.err("cluster restore failed table={s} backup_id={s} err={}", .{
                     table_name,
                     table_backup_id,
@@ -8604,13 +8643,13 @@ pub const ApiHttpServer = struct {
                 };
                 if (err == error.RestoreDurabilityPending or err == error.GenerationDurabilityUncertain) {
                     self.checkpointRestoreTableDurabilityPending(cancellation, @intCast(i)) catch |checkpoint_err| {
-                        if (checkpoint_err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(checkpoint_err)) return error.NotLeader;
+                        if (checkpoint_err == error.RestoreJobFenced or metadata_authority.isRetryableError(checkpoint_err)) return error.NotLeader;
                         return error.InternalFailure;
                     };
                     statuses[i].status = "durability_pending";
                 } else {
                     self.checkpointRestoreTableAborted(cancellation, @intCast(i)) catch |checkpoint_err| {
-                        if (checkpoint_err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(checkpoint_err)) return error.NotLeader;
+                        if (checkpoint_err == error.RestoreJobFenced or metadata_authority.isRetryableError(checkpoint_err)) return error.NotLeader;
                         return error.InternalFailure;
                     };
                 }
@@ -8620,11 +8659,11 @@ pub const ApiHttpServer = struct {
                 .committed_durable => "committed",
             };
             self.checkpointRestoreTablePublished(cancellation, @intCast(i)) catch |err| {
-                if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
                 return error.InternalFailure;
             };
             self.checkpointRestoreTableCompleted(cancellation, @intCast(i)) catch |err| {
-                if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+                if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
                 return error.InternalFailure;
             };
         }
@@ -8640,6 +8679,7 @@ pub const ApiHttpServer = struct {
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                 error.UnsupportedOperation => {},
                 else => {
+                    if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                     std.log.err("cluster restore extension metadata restore failed err={}", .{err});
                     return error.InternalFailure;
                 },
@@ -9917,7 +9957,7 @@ pub const ApiHttpServer = struct {
                 if (!restore_jobs.containsTableIndex(state.published_table_ranges orelse &.{}, 0)) {
                     if (!restore_jobs.tableAttempted(state, 0)) {
                         self.checkpointRestoreTableStarted(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
-                            if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.RestoreJobFenced;
+                            if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
                             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                             self.alloc.free(failed);
                             return;
@@ -9941,7 +9981,7 @@ pub const ApiHttpServer = struct {
                         error.RestoreDurabilityConfirmed => restored_via_metadata = false,
                         error.RestoreDurabilityPending => {
                             self.checkpointRestoreTableDurabilityPending(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |checkpoint_err| {
-                                if (checkpoint_err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(checkpoint_err)) return error.RestoreJobFenced;
+                                if (checkpoint_err == error.RestoreJobFenced or metadata_authority.isRetryableError(checkpoint_err)) return error.RestoreJobFenced;
                                 const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(checkpoint_err));
                                 self.alloc.free(failed);
                                 return;
@@ -9959,7 +9999,7 @@ pub const ApiHttpServer = struct {
                         },
                     };
                     self.checkpointRestoreTablePublished(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
-                        if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.RestoreJobFenced;
+                        if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
                         return;
@@ -9980,14 +10020,14 @@ pub const ApiHttpServer = struct {
                 }
                 if (restored_via_metadata and !self.cfg.deployment_mode.isStandalone()) {
                     self.waitForDistributedRestoreCompletion(table_name, state.location, state.backup_id, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }) catch |err| {
-                        if (isRetryableMetadataLeadershipError(err)) return error.RestoreJobFenced;
+                        if (metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
                         return;
                     };
                 }
                 self.checkpointRestoreTableCompleted(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
-                    if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return error.RestoreJobFenced;
+                    if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
                     const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                     self.alloc.free(failed);
                     return;
@@ -10209,7 +10249,7 @@ const RestoreJobWork = struct {
             // Leadership rebuilds recover running attempts into the durable
             // FIFO. The old owner must never turn a correctly fenced attempt
             // into a terminal failure while leadership is moving.
-            if (err == error.RestoreJobFenced or isRetryableMetadataLeadershipError(err)) return;
+            if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return;
             std.log.err("restore job execution failed job_id={d} err={s}", .{ self.job_id, @errorName(err) });
             self.server.restore_job_store.failRunningById(self.server.alloc, self.job_id, @errorName(err)) catch |persist_err| {
                 std.log.err("failed to persist restore job failure job_id={d} err={s}", .{ self.job_id, @errorName(persist_err) });
@@ -10233,7 +10273,7 @@ fn restoreJobIdFromPath(path: []const u8) ?u64 {
 }
 
 fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
-    if (isRetryableMetadataLeadershipError(err)) return try metadataNotLeaderResponse(alloc);
+    if (metadata_authority.isRetryableError(err)) return try metadataNotLeaderResponse(alloc);
     return switch (err) {
         error.InvalidIdempotencyKey => try jsonErrorResponse(alloc, 400, "invalid idempotency key"),
         error.IdempotencyConflict => try jsonErrorResponse(alloc, 409, "idempotency key reused for a different restore"),
@@ -13649,18 +13689,6 @@ pub fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResp
     };
 }
 
-fn isRetryableMetadataLeadershipError(err: anyerror) bool {
-    return switch (err) {
-        error.NotLeader,
-        error.ProposalDropped,
-        error.LeaderTransferInProgress,
-        error.MetadataLinearizableReadTimeout,
-        error.ReconcileLeaseNotHeld,
-        => true,
-        else => false,
-    };
-}
-
 fn restoreIdempotencyNamespaceAlloc(
     alloc: std.mem.Allocator,
     principal: ?[]const u8,
@@ -13680,7 +13708,7 @@ fn restoreIdempotencyNamespaceAlloc(
 }
 
 fn metadataAccessFailure(err: anyerror) error{ NotLeader, InternalFailure } {
-    if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
+    if (metadata_authority.isRetryableError(err)) return error.NotLeader;
     return error.InternalFailure;
 }
 
@@ -26400,6 +26428,65 @@ test "api http server returns retryable not leader when cluster backup read barr
     try std.testing.expectEqual(@as(usize, 1), source.linearizable_read_calls);
 }
 
+test "api http server rejects an empty cluster backup without publishing a manifest" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/empty-cluster-backup", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    var location: backups_api.BackupLocation = .{ .file = try alloc.dupe(u8, backup_root) };
+    defer location.deinit(alloc);
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    try std.testing.expectError(
+        error.NoTables,
+        ApiHttpServer.executePublicClusterBackup(
+            &server,
+            alloc,
+            .{
+                .backup_id = "empty",
+                .location = "file:///backups",
+                .connection = "backups",
+            },
+            &location,
+        ),
+    );
+    try std.testing.expect(!(try backups_api.clusterManifestExistsAtLocation(alloc, &location, "empty")));
+}
+
 test "api http server cluster backup succeeds after load balanced metadata timeout retry" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -26513,6 +26600,117 @@ test "api http server cluster backup succeeds after load balanced metadata timeo
     defer manifest.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), manifest.tables.len);
     try std.testing.expectEqualStrings("docs", manifest.tables[0].name);
+}
+
+test "api http server does not advertise a retry after cluster backup side effects begin" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-backup-partial-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-backup-partial-out", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location_uri);
+
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 1,
+    });
+    var writes = table_writes.BoundTableWriteSource.init("docs", &db);
+
+    const FakeSource = struct {
+        snapshot_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .ensure_linearizable_read = ensureLinearizableRead,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn ensureLinearizableRead(_: *anyopaque) !void {}
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.snapshot_calls += 1;
+            // extension snapshot, then the first table lookup, then leadership
+            // loss while resolving the second table.
+            if (self.snapshot_calls == 3) return error.NotLeader;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .description = "docs table",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 1,
+                    .table_id = 1,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{};
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .node_config = &node_config }, source.iface(), null, writes.source());
+    defer server.deinit();
+
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"backup_id\":\"partial-snap\",\"location\":\"{s}\",\"connection\":\"test-backups\",\"table_names\":[\"docs\",\"later\"]}}",
+        .{location_uri},
+    );
+    defer alloc.free(body);
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = "/backup",
+        .content_type = "application/json",
+        .body = body,
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "metadata leader unavailable") != null);
+    for (response.headers) |header| {
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header));
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, "Retry-After"));
+    }
+    var location: backups_api.BackupLocation = .{ .file = try alloc.dupe(u8, backup_root_abs) };
+    defer location.deinit(alloc);
+    try std.testing.expect(!(try backups_api.clusterManifestExistsAtLocation(
+        alloc,
+        &location,
+        "partial-snap",
+    )));
 }
 
 test "api http server rejects restore before persistence without an asynchronous worker" {

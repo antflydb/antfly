@@ -249,6 +249,7 @@ pub const ModeledDevice = struct {
     alloc: Allocator,
     mutex: SpinMutex = .{},
     files: std.StringHashMapUnmanaged(FileState) = .empty,
+    durable_files: std.StringHashMapUnmanaged([]u8) = .empty,
     tick: u64 = 1,
     fail_next_write: bool = false,
     fail_next_sync: bool = false,
@@ -271,6 +272,12 @@ pub const ModeledDevice = struct {
             entry.value_ptr.deinit(self.alloc);
         }
         self.files.deinit(self.alloc);
+        var durable_it = self.durable_files.iterator();
+        while (durable_it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.durable_files.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -368,6 +375,11 @@ pub const ModeledDevice = struct {
         const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
         self.mutex.lock();
         defer self.mutex.unlock();
+        try self.syncContentsLocked(path);
+        try self.syncDirectoryLocked(parentPath(path));
+    }
+
+    fn syncContentsLocked(self: *ModeledDevice, path: []const u8) !void {
         if (self.fail_next_sync or self.consumeFaultNeedle(&self.fail_next_sync_path_contains, path)) {
             self.fail_next_sync = false;
             return error.InjectedSyncFault;
@@ -380,6 +392,48 @@ pub const ModeledDevice = struct {
         const durable = try self.alloc.dupe(u8, file.volatile_bytes);
         if (file.durable_bytes.len > 0) self.alloc.free(file.durable_bytes);
         file.durable_bytes = durable;
+        if (self.durable_files.getPtr(path)) |durable_file| {
+            const persisted = try self.alloc.dupe(u8, file.volatile_bytes);
+            self.alloc.free(durable_file.*);
+            durable_file.* = persisted;
+        }
+    }
+
+    fn syncDirectoryLocked(self: *ModeledDevice, parent: []const u8) !void {
+        var obsolete = std.ArrayListUnmanaged([]const u8).empty;
+        defer obsolete.deinit(self.alloc);
+        var durable_it = self.durable_files.keyIterator();
+        while (durable_it.next()) |path| {
+            if (std.mem.eql(u8, parentPath(path.*), parent) and !self.files.contains(path.*)) {
+                try obsolete.append(self.alloc, path.*);
+            }
+        }
+        for (obsolete.items) |path| {
+            const removed = self.durable_files.fetchRemove(path) orelse continue;
+            self.alloc.free(removed.key);
+            self.alloc.free(removed.value);
+        }
+
+        var volatile_it = self.files.iterator();
+        while (volatile_it.next()) |entry| {
+            if (!std.mem.eql(u8, parentPath(entry.key_ptr.*), parent)) continue;
+            try self.publishDurableFileLocked(entry.key_ptr.*, entry.value_ptr.durable_bytes);
+        }
+    }
+
+    fn publishDurableFileLocked(self: *ModeledDevice, path: []const u8, bytes: []const u8) !void {
+        const durable_bytes = try self.alloc.dupe(u8, bytes);
+        errdefer self.alloc.free(durable_bytes);
+        const owned_path = try self.alloc.dupe(u8, path);
+        errdefer self.alloc.free(owned_path);
+        const gop = try self.durable_files.getOrPut(self.alloc, owned_path);
+        if (gop.found_existing) {
+            self.alloc.free(owned_path);
+            self.alloc.free(gop.value_ptr.*);
+        } else {
+            gop.key_ptr.* = owned_path;
+        }
+        gop.value_ptr.* = durable_bytes;
     }
 
     fn truncate(ptr: *anyopaque, path: []const u8, len: usize) !void {
@@ -439,12 +493,28 @@ pub const ModeledDevice = struct {
         const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
         self.mutex.lock();
         defer self.mutex.unlock();
-        var it = self.files.valueIterator();
-        while (it.next()) |file| {
-            const volatile_bytes = try self.alloc.dupe(u8, file.durable_bytes);
-            if (file.volatile_bytes.len > 0) self.alloc.free(file.volatile_bytes);
-            file.volatile_bytes = volatile_bytes;
+
+        var restored: std.StringHashMapUnmanaged(FileState) = .empty;
+        errdefer {
+            var restored_it = restored.iterator();
+            while (restored_it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(self.alloc);
+            }
+            restored.deinit(self.alloc);
         }
+        var durable_it = self.durable_files.iterator();
+        while (durable_it.next()) |entry| {
+            try cloneDurableFileInto(self.alloc, &restored, entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        var volatile_it = self.files.iterator();
+        while (volatile_it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.alloc);
+        }
+        self.files.deinit(self.alloc);
+        self.files = restored;
     }
 
     fn ensureFile(self: *ModeledDevice, path: []const u8) !*FileState {
@@ -481,7 +551,9 @@ const modeled_storage_vtable: lsm_storage.Storage.VTable = .{
     .file_size = modeledFileSize,
     .read_file_trailer_alloc = modeledReadFileTrailerAlloc,
     .write_file_absolute = modeledWriteFileAbsolute,
+    .append_file_absolute = modeledAppendFileAbsolute,
     .sync_file_absolute = modeledSyncFileAbsolute,
+    .sync_parent_absolute = modeledSyncParentAbsolute,
     .rename_absolute = modeledRenameAbsolute,
     .delete_file_absolute = modeledDeleteFileAbsolute,
     .delete_tree = modeledDeleteTree,
@@ -531,9 +603,35 @@ fn modeledWriteFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const
     try device.sync(path);
 }
 
+fn modeledAppendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, should_sync: bool) !void {
+    const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    if (self.fail_next_write or self.consumeFaultNeedle(&self.fail_next_write_path_contains, path)) {
+        self.fail_next_write = false;
+        return error.InjectedWriteFault;
+    }
+    const file = try self.ensureFile(path);
+    const old_len = file.volatile_bytes.len;
+    try resizeBuffer(self.alloc, &file.volatile_bytes, old_len + contents.len);
+    @memcpy(file.volatile_bytes[old_len..], contents);
+    if (should_sync) try self.syncContentsLocked(path);
+}
+
 fn modeledSyncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
     try self.device().sync(path);
+}
+
+fn modeledSyncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+    const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    if (self.fail_next_sync or self.consumeFaultNeedle(&self.fail_next_sync_path_contains, path)) {
+        self.fail_next_sync = false;
+        return error.InjectedSyncFault;
+    }
+    try self.syncDirectoryLocked(parentPath(path));
 }
 
 fn modeledRenameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
@@ -586,6 +684,28 @@ fn pathContains(prefix: []const u8, path: []const u8) bool {
     if (!std.mem.startsWith(u8, path, prefix)) return false;
     if (path.len == prefix.len) return true;
     return path[prefix.len] == '/';
+}
+
+fn parentPath(path: []const u8) []const u8 {
+    return std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
+}
+
+fn cloneDurableFileInto(
+    alloc: Allocator,
+    files: *std.StringHashMapUnmanaged(ModeledDevice.FileState),
+    path: []const u8,
+    bytes: []const u8,
+) !void {
+    const owned_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(owned_path);
+    const volatile_bytes = try alloc.dupe(u8, bytes);
+    errdefer alloc.free(volatile_bytes);
+    const durable_bytes = try alloc.dupe(u8, bytes);
+    errdefer alloc.free(durable_bytes);
+    try files.put(alloc, owned_path, .{
+        .volatile_bytes = volatile_bytes,
+        .durable_bytes = durable_bytes,
+    });
 }
 
 fn resizeBuffer(alloc: Allocator, buffer: *[]u8, new_len: usize) !void {
@@ -697,6 +817,56 @@ test "modeled device preserves only synced bytes across crash" {
     const bytes = try device.readAlloc(std.testing.allocator, "wal", 0, 16);
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("abc", bytes);
+}
+
+test "modeled storage requires a directory sync for a newly created file" {
+    var device_model = ModeledDevice.init(std.testing.allocator);
+    defer device_model.deinit();
+    const storage = device_model.storage();
+
+    try storage.appendFileAbsolute(std.testing.allocator, "/wal/1.log", "first", true);
+    try device_model.device().crash();
+    try std.testing.expectError(
+        error.FileNotFound,
+        storage.readFileAlloc(std.testing.allocator, "/wal/1.log", 16),
+    );
+
+    try storage.appendFileAbsolute(std.testing.allocator, "/wal/1.log", "first", true);
+    device_model.injectSyncFailure();
+    try std.testing.expectError(
+        error.InjectedSyncFault,
+        storage.syncParentAbsolute("/wal/1.log"),
+    );
+    try device_model.device().crash();
+    try std.testing.expectError(
+        error.FileNotFound,
+        storage.readFileAlloc(std.testing.allocator, "/wal/1.log", 16),
+    );
+
+    try storage.appendFileAbsolute(std.testing.allocator, "/wal/1.log", "first", true);
+    try storage.syncParentAbsolute("/wal/1.log");
+    try device_model.device().crash();
+    const bytes = try storage.readFileAlloc(std.testing.allocator, "/wal/1.log", 16);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("first", bytes);
+}
+
+test "modeled storage rolls back an unsynced rename namespace" {
+    var device_model = ModeledDevice.init(std.testing.allocator);
+    defer device_model.deinit();
+    const storage = device_model.storage();
+
+    try storage.writeFileAbsolute("/root/old", "stable");
+    try storage.renameAbsolute("/root/old", "/root/new");
+    try device_model.device().crash();
+
+    const old = try storage.readFileAlloc(std.testing.allocator, "/root/old", 16);
+    defer std.testing.allocator.free(old);
+    try std.testing.expectEqualStrings("stable", old);
+    try std.testing.expectError(
+        error.FileNotFound,
+        storage.readFileAlloc(std.testing.allocator, "/root/new", 16),
+    );
 }
 
 test "modeled device exposes lsm storage view" {

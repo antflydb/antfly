@@ -17,6 +17,7 @@ const std = @import("std");
 pub const storage = @import("storage/mod.zig");
 pub const runtime = @import("runtime.zig");
 pub const api = @import("api.zig");
+pub const authority = @import("authority.zig");
 pub const incarnation = @import("incarnation.zig");
 pub const admin = @import("admin.zig");
 pub const http_routes = @import("http_routes.zig");
@@ -132,6 +133,7 @@ test "metadata module compiles" {
     _ = storage;
     _ = runtime;
     _ = api;
+    std.testing.refAllDecls(authority);
     std.testing.refAllDecls(incarnation);
     _ = admin;
     _ = http_routes;

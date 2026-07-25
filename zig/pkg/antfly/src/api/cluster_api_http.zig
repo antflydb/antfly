@@ -31,6 +31,7 @@ pub const ClusterApi = struct {
     pub const ExecuteBackupError = error{
         NotLeader,
         InvalidRequest,
+        NoTables,
         BackupAlreadyExists,
         BackupManifestTooLarge,
         MethodNotAllowed,
@@ -182,6 +183,7 @@ pub fn handleClusterBackup(
     const response_body = api.executeClusterBackup(alloc, req, &location) catch |err| switch (err) {
         error.NotLeader => return err,
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") },
+        error.NoTables => return .{ .status = 400, .body = try alloc.dupe(u8, "no tables to backup") },
         error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, "backup id already exists") },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },

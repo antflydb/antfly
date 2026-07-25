@@ -67,7 +67,8 @@ pub fn createFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.Creat
 }
 
 pub fn syncDirPortable(io: anytype, path: []const u8) !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+        return error.DurableDirectorySyncUnsupported;
 
     var dir = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true })

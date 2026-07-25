@@ -1174,6 +1174,21 @@ pub const ProvisionedTableWriteCache = struct {
         }
     };
 
+    const PreparedStructuralPublication = struct {
+        table_metadata: ?TableMetadata,
+        entry_schema_json: []?[]u8,
+        managed_config_fingerprint: [32]u8,
+
+        fn deinit(self: *PreparedStructuralPublication, alloc: std.mem.Allocator) void {
+            if (self.table_metadata) |*metadata| metadata.deinit(alloc);
+            for (self.entry_schema_json) |value| {
+                if (value) |owned| alloc.free(owned);
+            }
+            alloc.free(self.entry_schema_json);
+            self.* = undefined;
+        }
+    };
+
     fn cloneTableMetadataAlloc(
         self: *ProvisionedTableWriteCache,
         table_name: []const u8,
@@ -1191,6 +1206,96 @@ pub const ProvisionedTableWriteCache = struct {
             .indexes_json = owned_indexes_json,
             .schema_json = owned_schema_json,
         };
+    }
+
+    fn prepareStructuralPublication(
+        self: *ProvisionedTableWriteCache,
+        table_name: []const u8,
+        indexes_json: []const u8,
+        schema_json: []const u8,
+        entry_count: usize,
+    ) !PreparedStructuralPublication {
+        var table_metadata = try self.cloneTableMetadataAlloc(table_name, indexes_json, schema_json);
+        errdefer table_metadata.deinit(self.alloc);
+
+        const entry_schema_json = try self.alloc.alloc(?[]u8, entry_count);
+        errdefer self.alloc.free(entry_schema_json);
+        @memset(entry_schema_json, null);
+        var initialized: usize = 0;
+        errdefer for (entry_schema_json[0..initialized]) |value| {
+            if (value) |owned| self.alloc.free(owned);
+        };
+        while (initialized < entry_schema_json.len) : (initialized += 1) {
+            entry_schema_json[initialized] = try self.alloc.dupe(u8, schema_json);
+        }
+
+        return .{
+            .table_metadata = table_metadata,
+            .entry_schema_json = entry_schema_json,
+            .managed_config_fingerprint = managedConfigFingerprint(indexes_json),
+        };
+    }
+
+    /// Publishes a completed table structural mutation as one cache-visible
+    /// state transition. All fallible allocation and validation precedes the
+    /// first swap, so readers cannot observe a new generation with stale schema
+    /// or managed-index identity.
+    fn publishStructuralMutationLocked(
+        self: *ProvisionedTableWriteCache,
+        cached_groups: []CachedDb,
+        target_generations: []const u64,
+        prepared: *PreparedStructuralPublication,
+    ) !void {
+        if (cached_groups.len != target_generations.len or
+            cached_groups.len != prepared.entry_schema_json.len)
+        {
+            return error.InvalidStructuralPublication;
+        }
+        const replacement_metadata = prepared.table_metadata orelse
+            return error.InvalidStructuralPublication;
+        const table_name = replacement_metadata.table_name;
+
+        for (cached_groups, target_generations) |cached, target_generation| {
+            if ((cached.cache orelse return error.StaleCachedDbLease) != self)
+                return error.StaleCachedDbLease;
+            const entry = cached.entry orelse return error.StaleCachedDbLease;
+            if (entry.retired or
+                entry.lsm_root_generation != target_generation or
+                !std.mem.eql(u8, entry.table_name, table_name))
+            {
+                return error.StaleCachedDbLease;
+            }
+        }
+
+        const replace_index = blk: {
+            for (self.table_metadata.items, 0..) |metadata, i| {
+                if (std.mem.eql(u8, metadata.table_name, table_name)) break :blk i;
+            }
+            break :blk null;
+        };
+        if (replace_index == null) try self.table_metadata.ensureUnusedCapacity(self.alloc, 1);
+
+        var retired_metadata: ?TableMetadata = null;
+        if (replace_index) |i| {
+            retired_metadata = self.table_metadata.items[i];
+            self.table_metadata.items[i] = replacement_metadata;
+        } else {
+            if (self.table_metadata.items.len >= max_cached_write_tables) self.evictOldestTable();
+            self.table_metadata.appendAssumeCapacity(replacement_metadata);
+        }
+        prepared.table_metadata = retired_metadata;
+
+        for (cached_groups, target_generations, prepared.entry_schema_json) |*cached, target_generation, *replacement_schema| {
+            const entry = cached.entry.?;
+            const retired_schema = entry.schema_json;
+            entry.schema_json = replacement_schema.*;
+            replacement_schema.* = retired_schema;
+            entry.managed_config_fingerprint = prepared.managed_config_fingerprint;
+            entry.lsm_root_generation = target_generation;
+            entry.allow_generation_adoption = false;
+            entry.allow_active_generation_adoption = false;
+            cached.schema_json = entry.schema_json;
+        }
     }
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedTableWriteCache {
@@ -10943,31 +11048,62 @@ pub const ProvisionedTableWriteSource = struct {
             self.beginLocalStructuralCachedDbMutation(table_name);
             errdefer self.abortLocalStructuralCachedDbMutation(table_name);
 
-            for (group_ids) |group_id| {
+            var cached_groups = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
+            defer {
+                for (cached_groups.items) |*cached| cached.deinit(alloc);
+                cached_groups.deinit(alloc);
+            }
+            try cached_groups.ensureTotalCapacity(alloc, group_ids.len);
+            const target_generations = try alloc.alloc(u64, group_ids.len);
+            defer alloc.free(target_generations);
+
+            for (group_ids, 0..) |group_id, group_index| {
                 std.log.info("provisioned create table local group begin table={s} group_id={d}", .{ table_name, group_id });
                 const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
                 defer alloc.free(path);
 
-                var cached = try self.getOrOpenCachedDbForLocalMutation(
-                    alloc,
-                    cache,
-                    path,
-                    group_id,
-                    self.visibleRootGeneration(group_id),
-                    table_name,
-                    false,
-                );
-                defer cached.deinit(alloc);
-                try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
-                try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
-                _ = try metadata_table_provisioner.reconcileDbIndexes(alloc, cached.db, indexes_json);
-                _ = try metadata_table_provisioner.ensureResolversWithOptions(alloc, cached.db, indexes_json, .{
-                    .drain_backfill = false,
-                });
-                try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db);
+                const visible_generation = self.visibleRootGeneration(group_id);
+                {
+                    var cached = try self.getOrOpenCachedDbForLocalMutation(
+                        alloc,
+                        cache,
+                        path,
+                        group_id,
+                        visible_generation,
+                        table_name,
+                        false,
+                    );
+                    errdefer cached.deinit(alloc);
+                    const entry = cached.entry orelse return error.StaleCachedDbLease;
+                    if (entry.retired) return error.StaleCachedDbLease;
+                    target_generations[group_index] = entry.lsm_root_generation;
+                    try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
+                    try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+                    _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
+                        .drain_resolver_backfill = false,
+                    });
+                    cached_groups.appendAssumeCapacity(cached);
+                }
                 std.log.info("provisioned create table local group ready table={s} group_id={d}", .{ table_name, group_id });
             }
 
+            var publication = try cache.prepareStructuralPublication(
+                table_name,
+                indexes_json,
+                schema_json,
+                cached_groups.items.len,
+            );
+            defer publication.deinit(cache.alloc);
+            lockAtomic(&self.local_db_mutex);
+            cache.publishStructuralMutationLocked(cached_groups.items, target_generations, &publication) catch |err| {
+                self.local_db_mutex.unlock();
+                return err;
+            };
+            self.local_db_mutex.unlock();
+
+            for (group_ids, cached_groups.items) |group_id, cached| {
+                try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db);
+            }
             self.finishLocalStructuralCachedDbMutation(table_name);
             std.log.info("provisioned create table local notify table={s}", .{table_name});
             self.notifyLocalChange(table_name, .structural);
@@ -11818,6 +11954,8 @@ pub const ProvisionedTableWriteSource = struct {
         try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
         if (plan.reconcile_only and plan.replace_existing) return error.InvalidBackupRequest;
         const restore_io = plan.io orelse self.table_activity_threaded.io();
+        const source_identity = try backups_api.canonicalRestoreSourceIdentityAlloc(alloc, plan.source_location);
+        defer alloc.free(source_identity);
 
         const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
         defer alloc.free(local_location);
@@ -11832,7 +11970,7 @@ pub const ProvisionedTableWriteSource = struct {
         const restore_source: backup_restore.RestoreSource = .{
             .backup_id = plan.manifest.backup_id,
             .location = local_location,
-            .identity_location = plan.source_location,
+            .identity_location = source_identity,
             .snapshot_path = source_shard.snapshot_path,
             .authority = .staged_local,
             .expected_artifact_size_bytes = source_shard.artifact_size_bytes,
@@ -20588,7 +20726,7 @@ test "bound table write source backs up and restores a local table" {
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
-        .source_location = "file://bound-native-test",
+        .source_location = "file:///bound-native-test",
     });
 
     db.close();
@@ -20661,7 +20799,7 @@ test "bound table write source backs up and restores a portable local table" {
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
-        .source_location = "file://bound-portable-test",
+        .source_location = "file:///bound-portable-test",
     });
 
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
@@ -21244,7 +21382,7 @@ test "provisioned table restore rejects mismatched doc identity namespace" {
     try std.testing.expectError(error.IdentityNamespaceMismatch, source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
-        .source_location = "file://provisioned-identity-mismatch-test",
+        .source_location = "file:///provisioned-identity-mismatch-test",
     }));
 }
 
@@ -21347,7 +21485,7 @@ test "provisioned table write source backs up and restores full_text writes from
     _ = try source.source().restoreTable(alloc, "docs", .{
         .backup_root = backup_root,
         .manifest = &manifest,
-        .source_location = "file://provisioned-write-cache-test",
+        .source_location = "file:///provisioned-write-cache-test",
     });
     try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
@@ -21622,7 +21760,7 @@ test "provisioned native backup restore repeats through shared read and write ow
         _ = try source.source().restoreTable(alloc, "docs", .{
             .backup_root = backup_root,
             .manifest = &manifest,
-            .source_location = "file://provisioned-native-restore-repeat",
+            .source_location = "file:///provisioned-native-restore-repeat",
         });
         try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
@@ -34472,7 +34610,7 @@ test "provisioned create reuses a generation opened by startup reconciliation" {
                     .table_id = 7,
                     .name = "docs",
                     .description = "docs table",
-                    .schema_json = "",
+                    .schema_json = tables_api.default_schema_json,
                     .read_schema_json = "",
                     .indexes_json = tables_api.default_indexes_json,
                     .replication_sources_json = "[]",
@@ -34523,6 +34661,21 @@ test "provisioned create reuses a generation opened by startup reconciliation" {
 
     try std.testing.expectEqual(@as(usize, 0), startup_write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+    {
+        lockAtomic(&source.local_db_mutex);
+        defer source.local_db_mutex.unlock();
+        const entry = write_cache.entries.items[0];
+        try std.testing.expectEqual(source.visibleRootGeneration(7001), entry.lsm_root_generation);
+        try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(
+            entry,
+            tables_api.default_indexes_json,
+        ));
+        try std.testing.expectEqualStrings(tables_api.default_schema_json, entry.schema_json.?);
+        const metadata = write_cache.tableMetadataLocked("docs") orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(tables_api.default_indexes_json, metadata.indexes_json.?);
+        try std.testing.expectEqualStrings(tables_api.default_schema_json, metadata.schema_json.?);
+    }
     var serving_owner = try write_cache.getOrOpenLocked(
         path,
         Catalog.iface(),
@@ -34615,7 +34768,7 @@ test "provisioned table write source restore table does not hold local db mutex 
             _ = self.source.source().restoreTable(std.heap.page_allocator, "docs", .{
                 .backup_root = backup_root,
                 .manifest = self.manifest,
-                .source_location = "file://provisioned-restore-preparation-test",
+                .source_location = "file:///provisioned-restore-preparation-test",
             }) catch |err| {
                 self.err = err;
             };
@@ -36384,11 +36537,53 @@ test "write cache local mutation preempts stale startup writer" {
     source.startup_write_cache = &startup_write_cache;
 
     var startup = try startup_write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 1, "docs");
-    startup.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), startup_write_cache.entries.items.len);
 
-    var foreground = try source.getOrOpenCachedDbForLocalMutation(alloc, &write_cache, path, 7001, 1, "docs", true);
-    defer foreground.deinit(alloc);
+    const Context = struct {
+        source: *ProvisionedTableWriteSource,
+        write_cache: *ProvisionedTableWriteCache,
+        path: []const u8,
+        started: std.atomic.Value(bool) = .init(false),
+        completed: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            var foreground = self.source.getOrOpenCachedDbForLocalMutation(
+                std.heap.page_allocator,
+                self.write_cache,
+                self.path,
+                7001,
+                1,
+                "docs",
+                true,
+            ) catch |err| {
+                self.err = err;
+                self.completed.store(true, .release);
+                return;
+            };
+            foreground.deinit(std.heap.page_allocator);
+            self.completed.store(true, .release);
+        }
+    };
+    var context = Context{
+        .source = &source,
+        .write_cache = &write_cache,
+        .path = path,
+    };
+    const thread = try std.Thread.spawn(.{}, Context.run, .{&context});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    while (!context.started.load(.acquire)) std.atomic.spinLoopHint();
+    sleepNs(10 * std.time.ns_per_ms);
+    try std.testing.expect(!context.completed.load(.acquire));
+
+    startup.deinit(alloc);
+    thread.join();
+    joined = true;
+    if (context.err) |err| return err;
+    try std.testing.expect(context.completed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), startup_write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), startup_write_cache.retired_entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), startup_write_cache.closing_entries.items.len);

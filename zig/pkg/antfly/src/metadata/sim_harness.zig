@@ -4434,6 +4434,51 @@ fn applyDropIndexMutation(
     try target.runRound();
 }
 
+const PublicApiLinearizableReadDriver = struct {
+    const request_context = "public-api-linearizable-read";
+
+    cluster: ?*MetadataHttpClusterSimulation = null,
+    node_index: usize,
+    completed: std.atomic.Value(bool) = .init(false),
+    max_rounds: usize = 48,
+
+    fn observer(self: *@This()) raft_state_machine.ReadStateObserver {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .on_read_states = onReadStates },
+        };
+    }
+
+    fn onReadStates(ptr: *anyopaque, _: u64, read_states: []const raft_engine.core.ReadState) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        for (read_states) |read_state| {
+            if (std.mem.eql(u8, read_state.request_ctx, request_context)) {
+                self.completed.store(true, .release);
+                return;
+            }
+        }
+    }
+
+    fn ensure(self: *@This()) !void {
+        const cluster = self.cluster orelse return error.MetadataLinearizableReadTimeout;
+        self.completed.store(false, .release);
+        cluster.cluster.node(self.node_index).runtime.svc.requestReadableLease(
+            cluster.metadata_group_id,
+            request_context,
+        ) catch |err| switch (err) {
+            error.NotLeader => return error.NotLeader,
+            else => return err,
+        };
+
+        var rounds: usize = 0;
+        while (rounds < self.max_rounds) : (rounds += 1) {
+            try cluster.stepAll();
+            if (self.completed.load(.acquire)) return;
+        }
+        return error.MetadataLinearizableReadTimeout;
+    }
+};
+
 const PublicApiStatusSource = struct {
     const MetadataSnapshotMode = enum {
         local,
@@ -4442,6 +4487,7 @@ const PublicApiStatusSource = struct {
 
     node: MetadataHttpNodeSimulation,
     metadata_snapshot_mode: MetadataSnapshotMode = .local,
+    linearizable_read_driver: ?*PublicApiLinearizableReadDriver = null,
 
     fn metadataNode(self: @This()) MetadataHttpNodeSimulation {
         return switch (self.metadata_snapshot_mode) {
@@ -4484,6 +4530,7 @@ const PublicApiStatusSource = struct {
 
     fn ensureLinearizableRead(ptr: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.linearizable_read_driver) |driver| return try driver.ensure();
         const target = self.metadataNode();
         const leader_index = self.node.cluster.currentMetadataLeaderIndex() orelse
             return error.MetadataLinearizableReadTimeout;
@@ -11173,14 +11220,21 @@ test "metadata http cluster simulation load balanced backup retries a real elect
         makeHostSimConfig(2, 4973, root_b, cat_b),
         makeHostSimConfig(3, 4973, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    var read_drivers = [_]PublicApiLinearizableReadDriver{
+        .{ .node_index = 0 },
+        .{ .node_index = 1 },
+        .{ .node_index = 2 },
+    };
+    var deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
     };
+    for (&deps, 0..) |*dep, index| dep.host.read_state_observer = read_drivers[index].observer();
 
     var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4973, configs[0..], deps[0..]);
     defer cluster.deinit();
+    for (&read_drivers) |*driver| driver.cluster = &cluster;
     try cluster.startAll();
     defer cluster.stopAll();
     try cluster.bootstrapMetadataReplicas();
@@ -11217,15 +11271,28 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     );
     defer node_config.deinit();
 
-    const db_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-db", .{tmp.sub_path});
-    defer std.testing.allocator.free(db_path);
-    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
-    defer db.close();
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
-        .timestamp_ns = 1,
-    });
-    var writes = api_table_writes.BoundTableWriteSource.init("docs", &db);
+    var db_paths: [3][]u8 = undefined;
+    var dbs: [3]db_mod.DB = undefined;
+    var db_count: usize = 0;
+    defer {
+        for (dbs[0..db_count]) |*db| db.close();
+        for (db_paths[0..db_count]) |path| std.testing.allocator.free(path);
+    }
+    var writes: [3]api_table_writes.BoundTableWriteSource = undefined;
+    for (0..3) |index| {
+        db_paths[index] = try std.fmt.allocPrint(
+            std.testing.allocator,
+            ".zig-cache/tmp/{s}/backup-election-db-{d}",
+            .{ tmp.sub_path, index },
+        );
+        dbs[index] = try db_mod.DB.open(std.testing.allocator, db_paths[index], .{});
+        db_count += 1;
+        try dbs[index].batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .timestamp_ns = 1,
+        });
+        writes[index] = api_table_writes.BoundTableWriteSource.init("docs", &dbs[index]);
+    }
 
     var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
@@ -11238,14 +11305,17 @@ test "metadata http cluster simulation load balanced backup retries a real elect
         for (servers[0..started]) |*server| server.deinit();
     }
     for (0..3) |index| {
-        status_sources[index] = .{ .node = cluster.node(index) };
+        status_sources[index] = .{
+            .node = cluster.node(index),
+            .linearizable_read_driver = &read_drivers[index],
+        };
         servers[index] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             std.testing.allocator,
             leanSimHttpAllocator(),
             .{ .node_config = &node_config },
             status_sources[index].iface(),
             null,
-            writes.source(),
+            writes[index].source(),
         );
         listeners[index] = std_http_listener.StdHttpListener.initShared(
             leanSimHttpAllocator(),
@@ -11271,10 +11341,6 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     const initial_leader_node_id = cluster.cluster.configs[initial_leader].host.http.host.local_node_id;
     try cluster.virtual_network.partitionNode(initial_leader_node_id);
     defer cluster.virtual_network.healNode(initial_leader_node_id);
-    rounds = 0;
-    while (rounds < 12) : (rounds += 1) try cluster.stepAllExcept(initial_leader);
-    const elected_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
-    try std.testing.expect(elected_leader != initial_leader);
 
     var ordered_endpoints: [3][]const u8 = undefined;
     ordered_endpoints[0] = api_base_uris[initial_leader];
@@ -11303,6 +11369,8 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     var backup_response = try client.fetchClusterBackupFromEndpoints(&ordered_endpoints, backup_body);
     defer backup_response.deinit(std.heap.page_allocator);
     try std.testing.expect(backup_response.attempts > 1);
+    const elected_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(elected_leader != initial_leader);
 
     var manifest = try backups_api.readClusterManifest(std.testing.allocator, backup_root_abs, "election-snap");
     defer manifest.deinit(std.testing.allocator);

@@ -15,6 +15,7 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const metadata_mod = @import("mod.zig");
+const metadata_authority = @import("authority.zig");
 const service = @import("service.zig");
 const transition_state = @import("transition_state.zig");
 const metadata_storage = @import("storage/mod.zig");
@@ -311,13 +312,14 @@ pub const MetadataServer = struct {
                     } else {
                         last_unexpected_error = null;
                     }
-                } else |err| switch (err) {
-                    error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => last_unexpected_error = null,
-                    else => {
+                } else |err| {
+                    if (metadata_authority.isRetryableError(err)) {
+                        last_unexpected_error = null;
+                    } else {
                         if (last_unexpected_error == null or last_unexpected_error.? != err)
                             std.log.err("metadata restore supervisor failed err={s}", .{@errorName(err)});
                         last_unexpected_error = err;
-                    },
+                    }
                 }
             }
             io.sleep(std.Io.Duration.fromMilliseconds(250), .awake) catch return;
@@ -442,11 +444,11 @@ const MetadataAdminMux = struct {
         const self: *MetadataAdminMux = @ptrCast(@alignCast(ptr));
         if (isPublicApiRequest(req.uri)) {
             if (isRestoreApiRequest(req.uri)) {
-                const local_leader = self.ensureRestoreLeadershipIfLocalLeader() catch |err| switch (err) {
-                    error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => {
+                const local_leader = self.ensureRestoreLeadershipIfLocalLeader() catch |err| {
+                    if (metadata_authority.isRetryableError(err)) {
                         return try public_api_http_server.metadataNotLeaderResponse(alloc);
-                    },
-                    else => return err,
+                    }
+                    return err;
                 };
                 // Mutations and collection reads stay leader-serialized. A
                 // follower can refresh one replicated job by key, but it has
@@ -454,9 +456,10 @@ const MetadataAdminMux = struct {
                 if (!local_leader and (req.method != .GET or isRestoreJobCollectionRequest(req.uri)))
                     return try public_api_http_server.metadataNotLeaderResponse(alloc);
             }
-            var response = self.public_api.handle(req) catch |err| switch (err) {
-                error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout => try public_api_http_server.metadataNotLeaderResponse(alloc),
-                else => return err,
+            var response = self.public_api.handle(req) catch |err| {
+                if (metadata_authority.isRetryableError(err))
+                    return try public_api_http_server.metadataNotLeaderResponse(alloc);
+                return err;
             };
             if (response.owner_allocator == null) response.owner_allocator = self.public_api.alloc;
             return response;

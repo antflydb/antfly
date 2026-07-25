@@ -88,6 +88,13 @@ fn openRestoreLocation(
             {
                 return error.InvalidStagedRestoreSource;
             }
+            backups_api.validateCanonicalRestoreSourceIdentity(
+                alloc,
+                restore.identity_location.?,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidStagedRestoreSource,
+            };
             break :blk null;
         },
     };

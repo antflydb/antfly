@@ -252,6 +252,10 @@ pub fn appendStateWithOptionsResult(
         },
         else => return err,
     };
+    // fsync(file) does not make a newly-created directory entry durable on
+    // POSIX filesystems. Pay the parent-directory boundary only for the first
+    // record in a segment; steady-state appends remain one file sync.
+    if (sync and segment_became_nonempty) try storage.syncParentAbsolute(segment_path);
     allocator.free(segment_path);
     segment_path_owned = false;
     return .{
@@ -1847,6 +1851,16 @@ test "lsm wal replay reads chunks into bounded pending buffer" {
             return self.backing.storage().appendFileAbsolute(std.testing.allocator, path, contents, sync);
         }
 
+        fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().renameAbsolute(old_path, new_path);
@@ -1877,6 +1891,8 @@ test "lsm wal replay reads chunks into bounded pending buffer" {
         .read_file_trailer_alloc = CountingStorage.readFileTrailerAlloc,
         .write_file_absolute = CountingStorage.writeFileAbsolute,
         .append_file_absolute = CountingStorage.appendFileAbsolute,
+        .sync_file_absolute = CountingStorage.syncFileAbsolute,
+        .sync_parent_absolute = CountingStorage.syncParentAbsolute,
         .rename_absolute = CountingStorage.renameAbsolute,
         .delete_file_absolute = CountingStorage.deleteFileAbsolute,
         .delete_tree = CountingStorage.deleteTree,
