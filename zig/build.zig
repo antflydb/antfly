@@ -1608,6 +1608,25 @@ pub fn build(b: *std.Build) void {
     const inference_chunker_mod = inference_graph.inference_chunker_mod;
     const inference_server_mod = inference_graph.inference_mod;
 
+    const hf_tokenizer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/tokenizer/src/hf_tokenizer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    hf_tokenizer_tests.root_module.addImport(
+        "sentencepiece_proto",
+        sentencepiece_proto_mod,
+    );
+    const run_hf_tokenizer_tests = b.addRunArtifact(hf_tokenizer_tests);
+    const hf_tokenizer_test_step = b.step(
+        "hf-tokenizer-test",
+        "Run Hugging Face tokenizer tests",
+    );
+    hf_tokenizer_test_step.dependOn(&run_hf_tokenizer_tests.step);
+
     const transcribing_mod = b.createModule(.{
         .root_source_file = b.path("lib/transcribing/src/mod.zig"),
         .target = target,
@@ -4926,6 +4945,7 @@ pub fn build(b: *std.Build) void {
     const resource_budget_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
+            "default tokenizer cache budget is aligned with its resource slice",
             "resource manager observes over-budget external usage",
             "resource manager evaluates projected admission with configured action",
             "resource manager bounds soft write throttling without waiting for compaction publication",
@@ -5322,6 +5342,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
+    unit_test_step.dependOn(&run_hf_tokenizer_tests.step);
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);
@@ -6439,6 +6460,24 @@ pub fn build(b: *std.Build) void {
     }
     const json_bench_step = b.step("json-bench", "Benchmark std.json vs antfly-json parsing");
     json_bench_step.dependOn(&run_json_bench.step);
+
+    const tokenizer_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/tokenizer_benchmark.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    tokenizer_bench_mod.addImport("inference_tokenizer", inference_graph.inference_tokenizer_mod);
+    const tokenizer_bench = b.addExecutable(.{
+        .name = "tokenizer_benchmark",
+        .root_module = tokenizer_bench_mod,
+    });
+    const run_tokenizer_bench = b.addRunArtifact(tokenizer_bench);
+    if (b.args) |args| {
+        run_tokenizer_bench.addArgs(args);
+    }
+    const tokenizer_bench_step = b.step("bench-tokenizer", "Benchmark the native Zig HuggingFace tokenizer");
+    tokenizer_bench_step.dependOn(&run_tokenizer_bench.step);
 
     // Benchmark executable
     const bench_mod = b.createModule(.{

@@ -63,6 +63,10 @@ pub const Tokenizer = struct {
         /// hot ingest paths reuse a single ArrayList across many encode
         /// calls instead of allocating and freeing per call.
         encodeInto: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) anyerror!void,
+        /// Optional internally parallel encoder for large documents. Backends
+        /// without a safe chunking strategy use the serial encodeInto path.
+        /// Work is scheduled through the caller's std.Io runtime.
+        encodeIntoParallel: ?*const fn (ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32), max_tasks: usize) anyerror!void = null,
         /// Encode text with model wrapping such as [CLS]/[SEP], optionally including offsets.
         encodeForModel: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!EncodeResult,
         /// Encode text for causal generation, optionally with BOS-aware start-of-sequence semantics.
@@ -86,6 +90,30 @@ pub const Tokenizer = struct {
     /// to encode a fresh sequence or skip clearing to concatenate sequences.
     pub fn encodeInto(self: Tokenizer, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) !void {
         return self.vtable.encodeInto(self.ptr, allocator, text, out);
+    }
+
+    /// Append token IDs using up to `max_tasks` concurrent consumers when
+    /// the backend can split the input without changing tokenizer semantics.
+    /// A backend may create more chunks than consumers for load balancing.
+    /// Parallel work composes with the caller's persistent std.Io runtime;
+    /// callers without an Io should use encodeInto's serial path. The
+    /// tokenizer's construction allocator must remain alive and be safe for
+    /// concurrent use until deinitTokenizer; `out` and its allocator remain
+    /// exclusively owned by the calling task for the duration of this call.
+    pub fn encodeIntoParallel(
+        self: Tokenizer,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        out: *std.ArrayListUnmanaged(i32),
+        max_tasks: usize,
+    ) !void {
+        if (max_tasks > 1) {
+            if (self.vtable.encodeIntoParallel) |parallel| {
+                return parallel(self.ptr, io, allocator, text, out, max_tasks);
+            }
+        }
+        return self.encodeInto(allocator, text, out);
     }
 
     pub fn decode(self: Tokenizer, allocator: std.mem.Allocator, ids: []const i32) ![]u8 {
