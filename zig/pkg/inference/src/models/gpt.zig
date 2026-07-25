@@ -1617,8 +1617,11 @@ pub fn supportLevel(family: ModelFamily) SupportLevel {
         //            token soup over /ai/v1/chat/completions. Qwen3 answers "Paris" on
         //            the same engine.
         //   bitnet   loads and generates, then degenerates into repetition.
-        //   mistral  loads with zero missing tensors and generates only <unk>; the fault
-        //            is the GGUF-embedded SentencePiece tokenizer path, not the weights.
+        //   mistral  loads with zero missing tensors and emits only <unk>. Not a
+        //            tokenizer fault: the prompt encodes correctly (Mistral chat template
+        //            -> 28792/16289/28793 for [INST]), and the model then argmaxes to
+        //            token id 0 on every step, on both the native and Metal backends.
+        //            The forward pass is degenerate, somewhere shared by both.
         //   phi      has a working mapping for the separate-projection layout, but Phi-3
         //            GGUFs fuse attn_qkv and ffn_up and report 257 missing tensors.
         //
