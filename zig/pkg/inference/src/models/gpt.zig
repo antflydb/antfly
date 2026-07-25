@@ -1612,22 +1612,34 @@ pub fn supportLevel(family: ModelFamily) SupportLevel {
         // pack attention into a fused attn_qkv.weight and the FFN into a fused
         // ffn_up.weight, so a real Phi-3 reports 257 missing tensors. Splitting fused
         // tensors is a larger change than a name mapping.
-        .qwen2, .bitnet, .mistral, .deepseek_v4, .phi => .experimental,
+        .qwen2, .bitnet, .mistral, .phi => .experimental,
 
         // Recognized, but nothing behind them.
+        //
+        // deepseek_v4 now loads a real GGUF and resolves all of its tensors, but
+        // execution dies on a shape mismatch in the grouped output projection --
+        // std.debug.assert, so it panics rather than returning an error, which would
+        // take the server process down with it. Blocked until that path works.
         //
         // qwen3_5 has a linear-attention runtime whose GGUF ssm_*/attn_qkv/attn_gate
         // tensors have no mapping. falcon/opt/bloom exist only as enum entries with
         // family defaults -- no weight mapping, no required-weight list, no runtime.
-        .qwen3_5, .gpt2, .gpt_neo, .gpt_neox, .gptj, .falcon, .opt, .bloom, .other => .unsupported,
+        .deepseek_v4, .qwen3_5, .gpt2, .gpt_neo, .gpt_neox, .gptj, .falcon, .opt, .bloom, .other => .unsupported,
     };
 }
 
 /// Whether GGUF tensor names can be mapped onto the HF-style names the runtime expects.
-/// Without a mapping every layer tensor stays unresolved and the load fails with
-/// MissingRequiredWeights.
+///
+/// This is a mechanical fact about the code, deliberately independent of `supportLevel`.
+/// A mapping can exist for a family we refuse to generate with, and it is still needed:
+/// colqwen2 rides the qwen2 mapping as a multimodal embedding backbone, and the deepseek
+/// and phi mappings are exercised by tests. Deriving this from the policy tier meant
+/// demoting a family silently disabled its tensor names too.
 pub fn ggufWeightMappingSupported(family: ModelFamily) bool {
-    return supportLevel(family) != .unsupported;
+    return switch (family) {
+        .llama, .mistral, .qwen2, .qwen3, .gemma, .bitnet, .phi, .deepseek_v4 => true,
+        .qwen3_5, .gpt2, .gpt_neo, .gpt_neox, .gptj, .falcon, .opt, .bloom, .other => false,
+    };
 }
 
 /// Architectures usable for generation, for error messages and docs.
@@ -1637,7 +1649,7 @@ pub const gguf_supported_architectures =
 /// Architectures that will load but are unverified. Named separately so an error can
 /// point at them without implying the same confidence as the list above.
 pub const gguf_experimental_architectures =
-    "mistral, mixtral, qwen2, phi, phi3, bitnet, deepseek-v4";
+    "mistral, mixtral, qwen2, phi, phi3, bitnet";
 
 fn parseDeepseekV4ScoringFunc(value: []const u8) DeepseekV4ScoringFunc {
     if (std.mem.eql(u8, value, "sqrtsoftplus")) return .sqrtsoftplus;
