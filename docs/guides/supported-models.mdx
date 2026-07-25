@@ -53,7 +53,7 @@ These load, but we do not stand behind their output for 0.2.0.
 | Qwen2 | **Do not use for generation.** Loads with a correct chat template and correct special-token ids, but output is wrong. `Qwen2.5-0.5B-Instruct` at `temperature: 0` answers "What is the capital of France?" with "The capital of the People's Republic of China is Beijing" via the CLI, and emits outright token soup over `/ai/v1/chat/completions`. Qwen3 on the same engine answers "Paris". The family stays loadable rather than blocked because `colqwen2` shares its tensor mapping as a multimodal embedding backbone. |
 | BitNet | `bitnet-b1.58-2B-4T` loads and generates, but degenerates into repetition. |
 | Phi | The tensor mapping works for the separate-projection layout, but **Phi-3 GGUFs cannot load** — they pack attention into a fused `attn_qkv.weight` and the FFN into a fused `ffn_up.weight`, which reports 257 missing tensors. |
-| Mistral / Mixtral | Full tensor mapping, no verified artifact. |
+| Mistral / Mixtral | Weights load cleanly (no missing tensors), but generation emits only `<unk>`. The cause is the tokenizer, not the weights — see the embedded-SentencePiece caveat below. |
 | DeepSeek V4 | A substantial implementation (MoE routing, compressed/sparse attention) whose only exercise is synthetic unit tests. No artifact small enough to verify. |
 
 ## Unsupported
@@ -104,6 +104,14 @@ cleanly through `antfly inference generate`, but can fail to stop when called th
 
 **Gemma 4 on Metal.** Some Gemma 4 bundles crash the Metal paged-KV kernel. Passing
 `--backend native` avoids it at a cost in speed.
+
+**GGUF bundles with an embedded SentencePiece vocabulary.** A GGUF whose
+`tokenizer.ggml.model` is `llama`, with no `tokenizer.model` or `tokenizer.json` sidecar in
+the directory, is detected as a SentencePiece tokenizer but tokenizes everything to
+`<unk>`. This affects the common "pure GGUF" distribution of Llama-2 and Mistral-family
+models, including `TheBloke/Mistral-7B-Instruct-v0.2-GGUF`. Bundles whose GGUF carries a
+byte-level BPE vocabulary instead (Gemma 4, for example) use a different path and work.
+As a workaround, place the upstream `tokenizer.json` alongside the `.gguf`.
 
 **Models without `tokenizer.json`.** Older HuggingFace repos that ship only the legacy
 `vocab.json` + `merges.txt` pair are detected as having a tokenizer but fail to load with

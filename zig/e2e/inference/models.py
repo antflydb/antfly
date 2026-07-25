@@ -199,6 +199,15 @@ GENERATOR_MODELS = [
         task="generators",
         large=True,
     ),
+    # Weights load with no missing tensors, but the GGUF-embedded SentencePiece
+    # tokenizer yields only <unk>, so generation is unusable. Kept so that path has
+    # an artifact behind it.
+    ModelSpec(
+        name="Mistral-7B-Instruct-v0.2-GGUF",
+        repo="TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+        task="generators",
+        large=True,
+    ),
 ]
 
 
