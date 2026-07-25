@@ -7733,12 +7733,13 @@ pub const ProvisionedTableWriteSource = struct {
         // An opening attempt does not own runtime truth until it has leased the
         // generation. Publishing before the open lets a normal WriterLocked
         // return overwrite a healthy writer observation indefinitely.
-        _ = db_mod.DB.recoverIncompleteRestoreImportIfNeeded(alloc, path, .{}) catch |err| {
+        const source_io = self.table_activity_threaded.io();
+        _ = db_mod.DB.recoverIncompleteRestoreImportIfNeededWithIo(alloc, source_io, path, .{}) catch |err| {
             if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
             std.log.warn("managed startup catch-up restore import recovery failed table={s} err={}", .{ table_name, err });
             return err;
         };
-        const restore_repair_needed = db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path) catch |err| {
+        const restore_repair_needed = db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, source_io, path) catch |err| {
             if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
             std.log.warn("managed startup catch-up restore repair probe failed table={s} err={}", .{ table_name, err });
             return err;
@@ -9572,7 +9573,7 @@ pub const ProvisionedTableWriteSource = struct {
         var open_attempts: usize = 0;
         var logged_open_wait = false;
         while (true) {
-            if (!try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path)) return;
+            if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, self.table_activity_threaded.io(), path)) return;
 
             const owned_indexes_json = if (indexes_json_override == null)
                 (try loadTableIndexesJson(alloc, self.catalog, table_name)) orelse return error.TableVisibilityTimeout
@@ -9688,7 +9689,11 @@ pub const ProvisionedTableWriteSource = struct {
             defer {
                 if (read_cache_exclusive) |*exclusive| exclusive.deinit();
             }
-            if (!try db_mod.DB.restoreRuntimeRepairNeededForPath(self.alloc, path)) return false;
+            if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(
+                self.alloc,
+                self.source.table_activity_threaded.io(),
+                path,
+            )) return false;
 
             if (!self.source.local_db_mutex.tryLock()) return true;
             if (self.source.hasDirtyWriteTableWithLocalDbLocked(self.table_name)) {
@@ -11771,6 +11776,7 @@ pub const ProvisionedTableWriteSource = struct {
         try backups_api.validateRestorableManifestLayout(plan.manifest);
         try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
         if (plan.reconcile_only and plan.replace_existing) return error.InvalidBackupRequest;
+        const restore_io = plan.io orelse self.table_activity_threaded.io();
 
         const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
         defer alloc.free(local_location);
@@ -11787,10 +11793,11 @@ pub const ProvisionedTableWriteSource = struct {
             .location = local_location,
             .identity_location = plan.source_location,
             .snapshot_path = source_shard.snapshot_path,
+            .authority = .staged_local,
             .expected_artifact_size_bytes = source_shard.artifact_size_bytes,
             .expected_artifact_sha256 = source_shard.artifact_sha256,
             .manifest = plan.manifest,
-            .io = plan.io,
+            .io = restore_io,
         };
 
         var all_groups_already_admitted = true;
@@ -11799,9 +11806,9 @@ pub const ProvisionedTableWriteSource = struct {
             all_groups_already_admitted = false;
         } else {
             const validation = if (plan.reconcile_only)
-                backup_restore.validateCommittedRestoreIdentity(alloc, path, group_id, restore_source)
+                backup_restore.validateCommittedRestoreIdentityWithIo(alloc, restore_io, path, group_id, restore_source)
             else
-                backup_restore.validateImportedRestoreIdentity(alloc, path, group_id, restore_source);
+                backup_restore.validateImportedRestoreIdentityWithIo(alloc, restore_io, path, group_id, restore_source);
             validation catch |err| switch (err) {
                 error.RestoreIdentityMismatch => {
                     admitted_identity_mismatch = true;
@@ -11813,13 +11820,11 @@ pub const ProvisionedTableWriteSource = struct {
         if (all_groups_already_admitted and plan.publication_hook == null) return;
         if (plan.reconcile_only and admitted_identity_mismatch) return error.RestoreIdentityMismatch;
 
-        var restore_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer restore_io_impl.deinit();
         const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
 
         const ready_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
         while (true) {
-            if (std.Io.Dir.cwd().statFile(restore_io_impl.io(), path, .{})) |_| break else |_| {}
+            if (std.Io.Dir.cwd().statFile(restore_io, path, .{})) |_| break else |_| {}
             if (platform_time.monotonicNs() >= ready_deadline_ns) break;
             sleepNs(50 * std.time.ns_per_ms);
         }
@@ -11888,7 +11893,14 @@ pub const ProvisionedTableWriteSource = struct {
         if (plan.reconcile_only) {
             var shard_transition = try transition.beginShardStorageTransition(path);
             defer shard_transition.deinit();
-            try backup_restore.reconcileCommittedRestoreWithExclusiveTransition(&shard_transition, alloc, path, group_id, restore_source);
+            try backup_restore.reconcileCommittedRestoreWithExclusiveTransitionWithIo(
+                &shard_transition,
+                alloc,
+                restore_io,
+                path,
+                group_id,
+                restore_source,
+            );
         } else if (prepared_generation) |*generation| {
             var shard_transition = try preparation.?.promote();
             defer shard_transition.deinit();

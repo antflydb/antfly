@@ -102,6 +102,7 @@ pub const TransitionCommand = union(enum) {
         source_ordinal: u32,
     },
     upsert_range: metadata.RangeRecord,
+    complete_restore_range: metadata.RestoreIntentIdentity,
     remove_range: struct {
         group_id: u64,
     },
@@ -183,6 +184,9 @@ pub const TransitionCommand = union(enum) {
             .upsert_range => |*record| {
                 metadata_table_manager.freeRange(alloc, record.*);
             },
+            .complete_restore_range => |*identity| {
+                metadata_table_manager.freeRestoreIntentIdentity(alloc, identity.*);
+            },
             .upsert_split_transition => |*record| {
                 if (record.split_key) |split_key| alloc.free(split_key);
                 if (record.source_range_end) |end| alloc.free(end);
@@ -239,6 +243,21 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         .upsert_restore_progress => |record| try group_ids.requireDataGroupId(record.group_id),
         .remove_restore_progress => |record| try group_ids.requireDataGroupId(record.group_id),
         .upsert_range => |record| try group_ids.requireDataGroupId(record.group_id),
+        .complete_restore_range => |identity| {
+            try group_ids.requireDataGroupId(identity.group_id);
+            if (identity.table_id == 0) return error.InvalidRestoreIntentIdentity;
+            const bootstrap = raft_catalog.BackupRestoreBootstrapRecord{
+                .backup_id = identity.backup_id,
+                .location = identity.location,
+                .snapshot_path = identity.snapshot_path,
+                .connection = identity.connection,
+                .artifact_size_bytes = identity.artifact_size_bytes,
+                .artifact_sha256 = identity.artifact_sha256,
+            };
+            bootstrap.validate() catch {
+                return error.InvalidRestoreIntentIdentity;
+            };
+        },
         .remove_range => |record| try group_ids.requireDataGroupId(record.group_id),
         .admit_split_transition => |admission| {
             try group_ids.requireDataGroupId(admission.record.source_group_id);
@@ -359,6 +378,53 @@ test "metadata raft apply store restore job transition encoding is append-only c
     try std.testing.expectEqual(@as(usize, 2), batch_decoded.remove_restore_jobs.keys.len);
     try std.testing.expectEqualStrings(keys[0], batch_decoded.remove_restore_jobs.keys[0]);
     try std.testing.expectEqualStrings(keys[1], batch_decoded.remove_restore_jobs.keys[1]);
+}
+
+test "metadata transition decoders reject unknown enum values" {
+    const unknown_transition = transition_magic ++ [_]u8{0xff};
+    try std.testing.expectError(
+        error.InvalidMetadataTransitionEncoding,
+        decodeTransitionCommand(std.testing.allocator, unknown_transition),
+    );
+
+    const bootstrap_mode_offset = @sizeOf(u64) * 4;
+    var placement = try encodePlacementIntent(std.testing.allocator, .{
+        .record = .{
+            .group_id = 7001,
+            .replica_id = 1,
+            .local_node_id = 2,
+        },
+    });
+    defer std.testing.allocator.free(placement);
+    const original_bootstrap_mode = placement[bootstrap_mode_offset];
+    placement[bootstrap_mode_offset] = 0xff;
+    try std.testing.expectError(
+        error.InvalidMetadataTransitionEncoding,
+        decodePlacementIntent(std.testing.allocator, placement),
+    );
+    placement[bootstrap_mode_offset] = original_bootstrap_mode;
+
+    const serving_state_offset = bootstrap_mode_offset + 1 + @sizeOf(u32) + @sizeOf(u64) + 1;
+    placement[serving_state_offset] = 0xff;
+    try std.testing.expectError(
+        error.InvalidMetadataTransitionEncoding,
+        decodePlacementIntent(std.testing.allocator, placement),
+    );
+
+    var merge = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_merge_transition = .{
+            .transition_id = 1,
+            .donor_group_id = 7001,
+            .receiver_group_id = 7002,
+        },
+    });
+    defer std.testing.allocator.free(merge);
+    const merge_phase_offset = transition_magic.len + 1 + @sizeOf(u64) * 3;
+    merge[merge_phase_offset] = 0xff;
+    try std.testing.expectError(
+        error.InvalidMetadataTransitionEncoding,
+        decodeTransitionCommand(std.testing.allocator, merge),
+    );
 }
 
 test "metadata raft apply store replicates restore job records" {
@@ -1542,7 +1608,7 @@ pub const RaftApplyStore = struct {
             .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
             .upsert_restore_progress, .remove_restore_progress => metadataSnapshotProjectionBit(.restore_progress),
             .upsert_replication_source_status, .remove_replication_source_status => metadataSnapshotProjectionBit(.replication_source_status),
-            .upsert_range, .remove_range => metadataSnapshotProjectionBit(.range),
+            .upsert_range, .complete_restore_range, .remove_range => metadataSnapshotProjectionBit(.range),
             .admit_split_transition => metadataSnapshotProjectionBit(.split_transition) | metadataSnapshotProjectionBit(.range),
             .upsert_split_transition, .remove_split_transition => metadataSnapshotProjectionBit(.split_transition),
             .upsert_merge_transition, .remove_merge_transition => metadataSnapshotProjectionBit(.merge_transition),
@@ -2158,6 +2224,32 @@ pub const RaftApplyStore = struct {
                     .table_name = table_name,
                     .table_id = record.table_id,
                     .group_id = record.group_id,
+                });
+            },
+            .complete_restore_range => |expected| complete: {
+                var key_buf: [160]u8 = undefined;
+                const key = try rangeKeyForGroup(&key_buf, group_id, expected.group_id);
+                const encoded = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => break :complete,
+                    else => return err,
+                };
+                var current = try decodeRangeRecord(self.alloc, encoded);
+                defer metadata_table_manager.freeRange(self.alloc, current);
+                if (!metadata_table_manager.restoreIntentMatchesRange(expected, current)) break :complete;
+
+                const table_name = try self.lookupTableNameTxn(txn, group_id, current.table_id);
+                defer if (table_name) |name| self.alloc.free(name);
+                try metadata_table_manager.clearOwnedRangeRestoreIntent(self.alloc, &current);
+                const value = try encodeRangeRecord(self.alloc, current);
+                defer self.alloc.free(value);
+                try txn.put(key, value);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{
+                    .kind = .range,
+                    .metadata_group_id = group_id,
+                    .table_name = table_name,
+                    .table_id = current.table_id,
+                    .group_id = current.group_id,
                 });
             },
             .remove_range => |record| {
@@ -2995,6 +3087,7 @@ const TransitionTag = enum(u8) {
     remove_restore_job = 42,
     remove_restore_jobs = 43,
     admit_split_transition = 44,
+    complete_restore_range = 46,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -3091,6 +3184,10 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .upsert_range => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_range));
             try appendRangeRecord(alloc, &out, record);
+        },
+        .complete_restore_range => |identity| {
+            try out.append(alloc, @intFromEnum(TransitionTag.complete_restore_range));
+            try appendRestoreIntentIdentity(alloc, &out, identity);
         },
         .remove_range => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_range));
@@ -3203,7 +3300,8 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
     if (!std.mem.eql(u8, encoded[0..transition_magic.len], transition_magic)) return null;
 
     var pos: usize = transition_magic.len;
-    const tag: TransitionTag = @enumFromInt(encoded[pos]);
+    const tag = std.enums.fromInt(TransitionTag, encoded[pos]) orelse
+        return error.InvalidMetadataTransitionEncoding;
     pos += 1;
 
     return switch (tag) {
@@ -3287,6 +3385,9 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         },
         .upsert_range => .{
             .upsert_range = try readRangeRecord(alloc, encoded, &pos),
+        },
+        .complete_restore_range => .{
+            .complete_restore_range = try readRestoreIntentIdentity(alloc, encoded, &pos),
         },
         .remove_range => .{
             .remove_range = .{ .group_id = try readInt(encoded, &pos, u64) },
@@ -4398,12 +4499,18 @@ fn appendPlacementIntent(
         },
         2 => {
             const backup = intent.record.backup_restore_bootstrap.?;
+            try backup.validate();
             try appendInt(alloc, out, u32, @intCast(backup.backup_id.len));
             try out.appendSlice(alloc, backup.backup_id);
             try appendInt(alloc, out, u32, @intCast(backup.location.len));
             try out.appendSlice(alloc, backup.location);
             try appendInt(alloc, out, u32, @intCast(backup.snapshot_path.len));
             try out.appendSlice(alloc, backup.snapshot_path);
+            try appendInt(alloc, out, u32, @intCast(backup.connection.len));
+            try out.appendSlice(alloc, backup.connection);
+            try appendInt(alloc, out, u64, backup.artifact_size_bytes);
+            try appendInt(alloc, out, u32, @intCast(backup.artifact_sha256.len));
+            try out.appendSlice(alloc, backup.artifact_sha256);
         },
         else => {},
     }
@@ -4834,6 +4941,50 @@ fn appendRequiredString(
     try out.appendSlice(alloc, value);
 }
 
+fn appendRestoreIntentIdentity(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    identity: metadata.RestoreIntentIdentity,
+) !void {
+    try appendInt(alloc, out, u64, identity.group_id);
+    try appendInt(alloc, out, u64, identity.table_id);
+    try appendRequiredString(alloc, out, identity.backup_id);
+    try appendRequiredString(alloc, out, identity.location);
+    try appendRequiredString(alloc, out, identity.snapshot_path);
+    try appendRequiredString(alloc, out, identity.connection);
+    try appendInt(alloc, out, u64, identity.artifact_size_bytes);
+    try appendRequiredString(alloc, out, identity.artifact_sha256);
+}
+
+fn readRestoreIntentIdentity(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata.RestoreIntentIdentity {
+    const group_id = try readInt(encoded, pos, u64);
+    const table_id = try readInt(encoded, pos, u64);
+    const backup_id = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(backup_id);
+    const location = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(location);
+    const snapshot_path = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(snapshot_path);
+    const connection = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(connection);
+    const artifact_size_bytes = try readInt(encoded, pos, u64);
+    const artifact_sha256 = try readRequiredString(alloc, encoded, pos);
+    return .{
+        .group_id = group_id,
+        .table_id = table_id,
+        .backup_id = backup_id,
+        .location = location,
+        .snapshot_path = snapshot_path,
+        .connection = connection,
+        .artifact_size_bytes = artifact_size_bytes,
+        .artifact_sha256 = artifact_sha256,
+    };
+}
+
 fn appendJsonRecord(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), record: anytype) !void {
     const json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(record, .{})});
     defer alloc.free(json);
@@ -5097,7 +5248,8 @@ fn readPlacementIntent(
     const local_node_id = try readInt(encoded, pos, u64);
     const metadata_version = try readInt(encoded, pos, u64);
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
-    const bootstrap_mode: raft_catalog.ReplicaBootstrapMode = @enumFromInt(encoded[pos.*]);
+    const bootstrap_mode = std.enums.fromInt(raft_catalog.ReplicaBootstrapMode, encoded[pos.*]) orelse
+        return error.InvalidMetadataTransitionEncoding;
     pos.* += 1;
     const peer_count = try readInt(encoded, pos, u32);
     const peer_node_ids = try alloc.alloc(u64, peer_count);
@@ -5132,11 +5284,21 @@ fn readPlacementIntent(
                 errdefer alloc.free(location);
                 const snapshot_path = try readRequiredString(alloc, encoded, pos);
                 errdefer alloc.free(snapshot_path);
+                const connection = try readRequiredString(alloc, encoded, pos);
+                errdefer alloc.free(connection);
+                const artifact_size_bytes = try readInt(encoded, pos, u64);
+                const artifact_sha256 = try readRequiredString(alloc, encoded, pos);
+                errdefer alloc.free(artifact_sha256);
                 backup_restore_bootstrap = .{
                     .backup_id = backup_id,
                     .location = location,
                     .snapshot_path = snapshot_path,
+                    .connection = connection,
+                    .artifact_size_bytes = artifact_size_bytes,
+                    .artifact_sha256 = artifact_sha256,
                 };
+                backup_restore_bootstrap.?.validate() catch
+                    return error.InvalidMetadataTransitionEncoding;
             },
             else => return error.InvalidMetadataTransitionEncoding,
         }
@@ -5150,7 +5312,8 @@ fn readPlacementIntent(
     var relocation_target_sequence: u64 = 0;
     var relocation_applied_sequence: u64 = 0;
     if (pos.* < encoded.len) {
-        serving_state = @enumFromInt(encoded[pos.*]);
+        serving_state = std.enums.fromInt(raft_reconciler.PlacementServingState, encoded[pos.*]) orelse
+            return error.InvalidMetadataTransitionEncoding;
         pos.* += 1;
         relocation_generation = try readInt(encoded, pos, u64);
         relocation_source_node_id = try readInt(encoded, pos, u64);
@@ -5222,7 +5385,8 @@ fn readMergeTransitionRecord(
     const donor_group_id = try readInt(encoded, pos, u64);
     const receiver_group_id = try readInt(encoded, pos, u64);
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
-    const phase: metadata.TransitionPhase = @enumFromInt(encoded[pos.*]);
+    const phase = std.enums.fromInt(metadata.TransitionPhase, encoded[pos.*]) orelse
+        return error.InvalidMetadataTransitionEncoding;
     pos.* += 1;
     const rollback_reason = try readOptionalString(alloc, encoded, pos);
     const allow_doc_identity_reassignment = if (pos.* < encoded.len) blk: {
@@ -6508,6 +6672,142 @@ test "metadata raft apply store projects table and range records from committed 
     );
 }
 
+test "metadata raft apply store completes only the matching restore intent and preserves topology" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-restore-cas-store", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const metadata_group_id: u64 = 41;
+    const data_group_id: u64 = 4101;
+    const old_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const new_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{ .table_id = 41, .name = "docs" },
+    });
+    defer std.testing.allocator.free(table_cmd);
+    const old_range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{
+            .group_id = data_group_id,
+            .range_id = 4101,
+            .table_id = 41,
+            .start_key = "a",
+            .end_key = "m",
+            .restore_backup_id = "old",
+            .restore_location = "s3://backups/old",
+            .restore_snapshot_path = "old/groups/4101.afb",
+            .restore_connection = "backup-store",
+            .restore_artifact_size_bytes = 100,
+            .restore_artifact_sha256 = old_hash,
+        },
+    });
+    defer std.testing.allocator.free(old_range_cmd);
+    const initial_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = old_range_cmd },
+    });
+    defer std.testing.allocator.free(initial_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 2,
+        .entries_bytes = initial_entries,
+    });
+
+    const replacement_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{
+            .group_id = data_group_id,
+            .range_id = 4201,
+            .table_id = 41,
+            .start_key = "b",
+            .end_key = "z",
+            .doc_identity_shard_id = 77,
+            .doc_identity_range_id = 88,
+            .split_attempt_epoch = 9,
+            .restore_backup_id = "new",
+            .restore_location = "s3://backups/new",
+            .restore_snapshot_path = "new/groups/4101.afb",
+            .restore_connection = "backup-store",
+            .restore_artifact_size_bytes = 200,
+            .restore_artifact_sha256 = new_hash,
+        },
+    });
+    defer std.testing.allocator.free(replacement_cmd);
+    const stale_completion_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .complete_restore_range = .{
+            .group_id = data_group_id,
+            .table_id = 41,
+            .backup_id = "old",
+            .location = "s3://backups/old",
+            .snapshot_path = "old/groups/4101.afb",
+            .connection = "backup-store",
+            .artifact_size_bytes = 100,
+            .artifact_sha256 = old_hash,
+        },
+    });
+    defer std.testing.allocator.free(stale_completion_cmd);
+    const replacement_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 3, .entry_type = .normal, .data = replacement_cmd },
+        .{ .term = 2, .index = 4, .entry_type = .normal, .data = stale_completion_cmd },
+    });
+    defer std.testing.allocator.free(replacement_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 4,
+        .entries_bytes = replacement_entries,
+    });
+
+    {
+        const ranges = try store.listRanges(std.testing.allocator, metadata_group_id);
+        defer store.freeRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings("new", ranges[0].restore_backup_id);
+        try std.testing.expectEqualStrings(new_hash, ranges[0].restore_artifact_sha256);
+    }
+
+    const matching_completion_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .complete_restore_range = .{
+            .group_id = data_group_id,
+            .table_id = 41,
+            .backup_id = "new",
+            .location = "s3://backups/new",
+            .snapshot_path = "new/groups/4101.afb",
+            .connection = "backup-store",
+            .artifact_size_bytes = 200,
+            .artifact_sha256 = new_hash,
+        },
+    });
+    defer std.testing.allocator.free(matching_completion_cmd);
+    const completion_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 3, .index = 5, .entry_type = .normal, .data = matching_completion_cmd },
+    });
+    defer std.testing.allocator.free(completion_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 5,
+        .entries_bytes = completion_entries,
+    });
+
+    const ranges = try store.listRanges(std.testing.allocator, metadata_group_id);
+    defer store.freeRanges(std.testing.allocator, ranges);
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqual(@as(u64, 4201), ranges[0].range_id);
+    try std.testing.expectEqualStrings("b", ranges[0].start_key);
+    try std.testing.expectEqualStrings("z", ranges[0].end_key.?);
+    try std.testing.expectEqual(@as(u64, 77), ranges[0].doc_identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 88), ranges[0].doc_identity_range_id);
+    try std.testing.expectEqual(@as(u64, 9), ranges[0].split_attempt_epoch);
+    try std.testing.expectEqualStrings("", ranges[0].restore_backup_id);
+    try std.testing.expectEqualStrings("", ranges[0].restore_location);
+    try std.testing.expectEqualStrings("", ranges[0].restore_snapshot_path);
+    try std.testing.expectEqualStrings("", ranges[0].restore_connection);
+    try std.testing.expectEqual(@as(u64, 0), ranges[0].restore_artifact_size_bytes);
+    try std.testing.expectEqualStrings("", ranges[0].restore_artifact_sha256);
+}
+
 test "metadata raft apply store rejects reserved data group ids in transition records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7473,6 +7773,9 @@ test "metadata raft apply store projects backup restore bootstrap source in plac
                     .backup_id = "snap-5201",
                     .location = "file:///tmp/backups",
                     .snapshot_path = "snap-5201/groups/5201",
+                    .connection = "backup-store",
+                    .artifact_size_bytes = 4096,
+                    .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                 },
             },
             .store_id = 45,
@@ -7506,6 +7809,12 @@ test "metadata raft apply store projects backup restore bootstrap source in plac
         try std.testing.expectEqualStrings("snap-5201", intents[0].record.backup_restore_bootstrap.?.backup_id);
         try std.testing.expectEqualStrings("file:///tmp/backups", intents[0].record.backup_restore_bootstrap.?.location);
         try std.testing.expectEqualStrings("snap-5201/groups/5201", intents[0].record.backup_restore_bootstrap.?.snapshot_path);
+        try std.testing.expectEqualStrings("backup-store", intents[0].record.backup_restore_bootstrap.?.connection);
+        try std.testing.expectEqual(@as(u64, 4096), intents[0].record.backup_restore_bootstrap.?.artifact_size_bytes);
+        try std.testing.expectEqualStrings(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            intents[0].record.backup_restore_bootstrap.?.artifact_sha256,
+        );
     }
 }
 

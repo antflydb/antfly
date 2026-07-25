@@ -7877,11 +7877,16 @@ pub const ApiHttpServer = struct {
         if (!self.cfg.deployment_mode.isStandalone()) {
             var manifest = backups_api.readManifestFromLocation(self.alloc, location, backup_id) catch |err| switch (err) {
                 error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
-                else => return error.InvalidBackupRequest,
+                else => if (backups_api.isArtifactIntegrityError(err))
+                    return error.BackupIntegrityFailure
+                else
+                    return error.InvalidBackupRequest,
             };
             defer manifest.deinit(self.alloc);
-            backups_api.validateRestoreManifest(self.alloc, &manifest, backup_id) catch
+            backups_api.validateRestoreManifest(self.alloc, &manifest, backup_id) catch |err| {
+                if (backups_api.isArtifactIntegrityError(err)) return error.BackupIntegrityFailure;
                 return error.InvalidBackupRequest;
+            };
             if (!std.mem.eql(u8, manifest.table_name, table_name))
                 return error.InvalidBackupRequest;
 
@@ -7911,6 +7916,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn mapExecuteRestoreError(err: anyerror) public_table_http.TableApi.ExecuteRestoreError {
+        if (backups_api.isArtifactIntegrityError(err)) return error.BackupIntegrityFailure;
         return switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => error.NotLeader,
             error.TableAlreadyExists => error.TableAlreadyExists,
@@ -8455,7 +8461,10 @@ pub const ApiHttpServer = struct {
 
         var manifest = backups_api.readClusterManifestFromLocation(op_alloc, location, req.backup_id) catch |err| switch (err) {
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
-            else => return error.InvalidRequest,
+            else => if (backups_api.isArtifactIntegrityError(err))
+                return error.BackupIntegrityFailure
+            else
+                return error.InvalidRequest,
         };
         defer manifest.deinit(op_alloc);
 
@@ -8559,7 +8568,10 @@ pub const ApiHttpServer = struct {
                 var table_manifest = backups_api.readManifestFromLocation(op_alloc, location, table_backup_id) catch |err| switch (err) {
                     error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
                     else => {
-                        statuses[i].@"error" = "invalid table backup manifest";
+                        statuses[i].@"error" = if (backups_api.isArtifactIntegrityError(err))
+                            backups_api.integrity_failure_message
+                        else
+                            "invalid table backup manifest";
                         continue;
                     },
                 };
@@ -8596,7 +8608,10 @@ pub const ApiHttpServer = struct {
                             error.TableNotFound => "not found",
                             error.InvalidBackupRequest => "invalid restore request",
                             error.BackupManifestTooLarge => backups_api.manifest_too_large_message,
-                            else => "restore failed",
+                            else => if (backups_api.isArtifactIntegrityError(err))
+                                backups_api.integrity_failure_message
+                            else
+                                "restore failed",
                         };
                         continue;
                     },
@@ -8641,7 +8656,10 @@ pub const ApiHttpServer = struct {
                     error.TableNotFound => "not found",
                     error.InvalidBackupRequest => "invalid restore request",
                     error.BackupManifestTooLarge => backups_api.manifest_too_large_message,
-                    else => "restore failed",
+                    else => if (backups_api.isArtifactIntegrityError(err))
+                        backups_api.integrity_failure_message
+                    else
+                        "restore failed",
                 };
                 if (err == error.RestoreDurabilityPending or err == error.GenerationDurabilityUncertain) {
                     self.checkpointRestoreTableDurabilityPending(cancellation, @intCast(i)) catch |checkpoint_err| {

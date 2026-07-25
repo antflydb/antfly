@@ -15,6 +15,7 @@
 const std = @import("std");
 const raft_engine = @import("raft_engine");
 const backups_api = @import("../api/backups.zig");
+const common_config = @import("../common/config.zig");
 const catalog = @import("catalog.zig");
 const data_storage = @import("../data/storage/mod.zig");
 const host_mod = @import("host.zig");
@@ -972,6 +973,20 @@ test "managed host restores replicas from file-backed catalog and persisted stat
     }
 }
 
+fn testRestoreNodeConfig(alloc: std.mem.Allocator) !common_config.Config {
+    return common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "test-backups": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["restore.read"],
+        \\      "external_io": { "protocol": "filesystem", "root": "/" }
+        \\    }
+        \\  }
+        \\}
+    );
+}
+
 test "managed host restores backup bootstrap replicas from file-backed catalog on restart" {
     const Factory = struct {
         alloc: std.mem.Allocator,
@@ -1069,6 +1084,8 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
         dest_root,
     );
     defer artifact_integrity.deinit(std.testing.allocator);
+    var node_config = try testRestoreNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
@@ -1107,6 +1124,10 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
                 .replica_root_dir = replica_root,
                 .replica_catalog_path = replica_catalog_path,
             },
+            .restore_open_options = .{
+                .node_config = &node_config,
+                .io = io_impl.io(),
+            },
         }, .{
             .host = .{ .descriptor_factory = factory.iface() },
         });
@@ -1121,6 +1142,9 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
                 .backup_id = "snap1",
                 .location = restore_location,
                 .snapshot_path = "snap1/groups/903",
+                .connection = "test-backups",
+                .artifact_size_bytes = artifact_integrity.size_bytes,
+                .artifact_sha256 = artifact_integrity.sha256,
             },
         });
     }
@@ -1133,6 +1157,10 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
                 .local_node_id = 1,
                 .replica_root_dir = replica_root,
                 .replica_catalog_path = replica_catalog_path,
+            },
+            .restore_open_options = .{
+                .node_config = &node_config,
+                .io = io_impl.io(),
             },
         }, .{
             .host = .{ .descriptor_factory = factory.iface() },
@@ -1967,6 +1995,9 @@ test "managed http host exposes backup bootstrap status from underlying host" {
             .backup_id = "snap-1205",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-1205/groups/1205",
+            .connection = "backup-store",
+            .artifact_size_bytes = 4096,
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     });
 

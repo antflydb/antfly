@@ -2197,20 +2197,6 @@ fn restoreImportMarkerPathAlloc(alloc: Allocator, path: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}/.restore-importing", .{path});
 }
 
-fn restoreRepairMarkerPathAlloc(alloc: Allocator, path: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}/.restore-runtime-repair-complete", .{path});
-}
-
-fn fileExists(path: []const u8) !bool {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    return true;
-}
-
 fn deleteFileIfExists(io: Io, path: []const u8) !void {
     std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
         error.FileNotFound => {},
@@ -2339,17 +2325,14 @@ fn validRestoreIdentity(identity: RestoreIdentity) bool {
         identity.group_id != 0;
 }
 
-fn writeRestoreMarkerAtomic(
+fn writeRestoreMarkerAtomicWithIo(
     alloc: Allocator,
+    io: Io,
     root: []const u8,
     path: []const u8,
     raw: []const u8,
 ) !void {
     if (raw.len > max_restore_marker_bytes) return error.RestoreMarkerTooLarge;
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    const io = io_impl.io();
-
     var entropy: [8]u8 = undefined;
     try io.randomSecure(&entropy);
     const nonce = std.fmt.bytesToHex(entropy, .lower);
@@ -2377,12 +2360,16 @@ fn writeRestoreMarkerAtomic(
 }
 
 fn readRestoreStateForPathAlloc(alloc: Allocator, path: []const u8) !?RestoreState {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    return try readRestoreStateForPathAllocWithIo(alloc, io_impl.io(), path);
+}
+
+fn readRestoreStateForPathAllocWithIo(alloc: Allocator, io: Io, path: []const u8) !?RestoreState {
     const state_path = try restoreStateMarkerPathAlloc(alloc, path);
     defer alloc.free(state_path);
 
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), state_path, alloc, .limited(max_restore_marker_bytes)) catch |err| switch (err) {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, state_path, alloc, .limited(max_restore_marker_bytes)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -2416,6 +2403,12 @@ fn readRestoreStateForPathAlloc(alloc: Allocator, path: []const u8) !?RestoreSta
 }
 
 fn writeRestoreStateForPath(alloc: Allocator, path: []const u8, state: RestoreState) !void {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    return try writeRestoreStateForPathWithIo(alloc, io_impl.io(), path, state);
+}
+
+fn writeRestoreStateForPathWithIo(alloc: Allocator, io: Io, path: []const u8, state: RestoreState) !void {
     if (!validRestoreIdentity(.{
         .backup_id = state.backup_id,
         .location = state.location,
@@ -2423,7 +2416,7 @@ fn writeRestoreStateForPath(alloc: Allocator, path: []const u8, state: RestoreSt
         .snapshot_path = state.snapshot_path,
         .group_id = state.group_id,
     }) or state.phase.len == 0) return error.InvalidRestoreState;
-    try ensureDirPath(path);
+    try fs_paths.createDirPathPortable(io, path);
     const state_path = try restoreStateMarkerPathAlloc(alloc, path);
     defer alloc.free(state_path);
     const raw = try std.json.Stringify.valueAlloc(alloc, RestoreStateDisk{
@@ -2438,16 +2431,20 @@ fn writeRestoreStateForPath(alloc: Allocator, path: []const u8, state: RestoreSt
         .last_error = state.last_error,
     }, .{});
     defer alloc.free(raw);
-    try writeRestoreMarkerAtomic(alloc, path, state_path, raw);
+    try writeRestoreMarkerAtomicWithIo(alloc, io, path, state_path, raw);
 }
 
 fn readRestoreImportStateAlloc(alloc: Allocator, path: []const u8) !?RestoreImportState {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    return try readRestoreImportStateAllocWithIo(alloc, io_impl.io(), path);
+}
+
+fn readRestoreImportStateAllocWithIo(alloc: Allocator, io: Io, path: []const u8) !?RestoreImportState {
     const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
     defer alloc.free(import_marker_path);
 
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), import_marker_path, alloc, .limited(max_restore_marker_bytes)) catch |err| switch (err) {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, import_marker_path, alloc, .limited(max_restore_marker_bytes)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -12586,8 +12583,21 @@ pub const DB = struct {
         try self.core.index_manager.syncAll(force);
     }
 
-    fn restoreSnapshotStoreTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions, restore_identity: ?RestoreIdentity) !void {
-        if (restore_identity) |identity| try beginRestoreImport(alloc, path, snapshot_root, identity);
+    fn restoreSnapshotStoreTo(
+        alloc: Allocator,
+        snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+        restore_identity: ?RestoreIdentity,
+        restore_io: ?Io,
+    ) !void {
+        const shared_io = restore_io orelse if (opts.backend_runtime) |runtime| runtime.io() else null;
+        if (restore_identity) |identity| {
+            if (shared_io) |io|
+                try beginRestoreImportWithIo(alloc, io, path, snapshot_root, identity)
+            else
+                try beginRestoreImport(alloc, path, snapshot_root, identity);
+        }
         var opened_primary = try openPrimaryStore(alloc, path, .{
             .map_size = opts.map_size,
             .no_sync = opts.no_sync,
@@ -12611,17 +12621,34 @@ pub const DB = struct {
         // that is sealed and atomically published, rather than an open-time
         // side effect after the generation becomes visible.
         if (opts.physical_root_mode == .filesystem_managed) {
-            _ = try loadOrCreateDurableRootIdentity(alloc, opts.backend_runtime, path);
+            _ = if (shared_io) |io|
+                try root_identity.loadOrCreate(alloc, io, path)
+            else
+                try loadOrCreateDurableRootIdentity(alloc, opts.backend_runtime, path);
         }
-        if (restore_identity) |identity| try markRestorePrimaryRestoredForPathWithArtifact(
-            alloc,
-            path,
-            identity.backup_id,
-            identity.location,
-            identity.artifact_sha256,
-            identity.snapshot_path,
-            identity.group_id,
-        );
+        if (restore_identity) |identity| {
+            if (shared_io) |io|
+                try markRestorePrimaryRestoredForPathWithArtifactWithIo(
+                    alloc,
+                    io,
+                    path,
+                    identity.backup_id,
+                    identity.location,
+                    identity.artifact_sha256,
+                    identity.snapshot_path,
+                    identity.group_id,
+                )
+            else
+                try markRestorePrimaryRestoredForPathWithArtifact(
+                    alloc,
+                    path,
+                    identity.backup_id,
+                    identity.location,
+                    identity.artifact_sha256,
+                    identity.snapshot_path,
+                    identity.group_id,
+                );
+        }
     }
 
     fn validateRestoredIdentityNamespace(store: *docstore_mod.DocStore, opts: OpenOptions) !void {
@@ -12631,7 +12658,7 @@ pub const DB = struct {
     }
 
     fn restoreSnapshotTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions) !void {
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null);
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null, null);
         // Graph reverse indexes are derived from stored outgoing edge keys, so
         // restore them after the logical store and derived log are rehydrated.
         var restored = try DB.open(alloc, path, opts);
@@ -12664,15 +12691,32 @@ pub const DB = struct {
         identity: RestoreIdentity,
     ) !void {
         try staged_generation.validatePath(path);
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity);
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, null);
+    }
+
+    pub fn restoreSnapshotToDeferredRuntimeRepairWithIo(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+        identity: RestoreIdentity,
+    ) !void {
+        try staged_generation.validatePath(path);
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, io);
     }
 
     fn beginRestoreImport(alloc: Allocator, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        return try beginRestoreImportWithIo(alloc, io_impl.io(), path, snapshot_root, identity);
+    }
+
+    fn beginRestoreImportWithIo(alloc: Allocator, io: Io, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
         if (snapshot_root.len == 0 or !validRestoreIdentity(identity))
             return error.InvalidRestoreImportMarker;
-        try ensureDirPath(path);
-        const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
-        defer alloc.free(repair_marker_path);
+        try fs_paths.createDirPathPortable(io, path);
         const restore_intent_path = try restoreIntentMarkerPathAlloc(alloc, path);
         defer alloc.free(restore_intent_path);
         const restore_state_path = try restoreStateMarkerPathAlloc(alloc, path);
@@ -12680,10 +12724,6 @@ pub const DB = struct {
         const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
         defer alloc.free(import_marker_path);
 
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        try deleteFileIfExists(io, repair_marker_path);
         try deleteFileIfExists(io, restore_intent_path);
         try deleteFileIfExists(io, restore_state_path);
         const marker = try std.json.Stringify.valueAlloc(alloc, RestoreImportDisk{
@@ -12695,17 +12735,28 @@ pub const DB = struct {
             .group_id = identity.group_id,
         }, .{});
         defer alloc.free(marker);
-        try writeRestoreMarkerAtomic(alloc, path, import_marker_path, marker);
+        try writeRestoreMarkerAtomicWithIo(alloc, io, path, import_marker_path, marker);
     }
 
     pub fn recoverIncompleteRestoreImportIfNeeded(alloc: Allocator, path: []const u8, opts: OpenOptions) !bool {
-        if (try readRestoreStateForPathAlloc(alloc, path)) |state_value| {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        return try recoverIncompleteRestoreImportIfNeededWithIo(alloc, io_impl.io(), path, opts);
+    }
+
+    pub fn recoverIncompleteRestoreImportIfNeededWithIo(
+        alloc: Allocator,
+        io: Io,
+        path: []const u8,
+        opts: OpenOptions,
+    ) !bool {
+        if (try readRestoreStateForPathAllocWithIo(alloc, io, path)) |state_value| {
             var state = state_value;
             state.deinit(alloc);
             return false;
         }
 
-        var import_state = (try readRestoreImportStateAlloc(alloc, path)) orelse return false;
+        var import_state = (try readRestoreImportStateAllocWithIo(alloc, io, path)) orelse return false;
         defer import_state.deinit(alloc);
         const identity_state = import_state.identity;
         const identity: RestoreIdentity = .{
@@ -12716,7 +12767,7 @@ pub const DB = struct {
             .group_id = identity_state.group_id,
         };
         std.log.warn("recovering incomplete restore import path={s} snapshot_root={s}", .{ path, import_state.snapshot_root });
-        try restoreSnapshotStoreTo(alloc, import_state.snapshot_root, path, opts, identity);
+        try restoreSnapshotStoreTo(alloc, import_state.snapshot_root, path, opts, identity, io);
         return true;
     }
 
@@ -12724,26 +12775,8 @@ pub const DB = struct {
         return try readRestoreStateForPathAlloc(alloc, path);
     }
 
-    pub fn markRestoreCompleteForPathWithArtifact(
-        alloc: Allocator,
-        path: []const u8,
-        backup_id: []const u8,
-        location: []const u8,
-        artifact_sha256: []const u8,
-        snapshot_path: []const u8,
-        group_id: u64,
-    ) !void {
-        var state = try restoreStateAlloc(alloc, backup_id, location, artifact_sha256, snapshot_path, group_id, "complete", true, true, "");
-        defer state.deinit(alloc);
-        try writeRestoreStateForPath(alloc, path, state);
-        const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
-        defer alloc.free(repair_marker_path);
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
-            .sub_path = repair_marker_path,
-            .data = "done\n",
-        });
+    pub fn readRestoreStateForPathWithIo(alloc: Allocator, io: Io, path: []const u8) !?RestoreState {
+        return try readRestoreStateForPathAllocWithIo(alloc, io, path);
     }
 
     pub fn markRestorePrimaryRestoredForPathWithArtifact(
@@ -12755,72 +12788,97 @@ pub const DB = struct {
         snapshot_path: []const u8,
         group_id: u64,
     ) !void {
-        var state = try restoreStateAlloc(alloc, backup_id, location, artifact_sha256, snapshot_path, group_id, "runtime_repair", true, false, "");
-        defer state.deinit(alloc);
-        try writeRestoreStateForPath(alloc, path, state);
-        const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
-        defer alloc.free(repair_marker_path);
-        const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
-        defer alloc.free(import_marker_path);
         var io_impl = threadedIo();
         defer io_impl.deinit();
-        const io = io_impl.io();
-        try deleteFileIfExists(io, repair_marker_path);
+        return try markRestorePrimaryRestoredForPathWithArtifactWithIo(
+            alloc,
+            io_impl.io(),
+            path,
+            backup_id,
+            location,
+            artifact_sha256,
+            snapshot_path,
+            group_id,
+        );
+    }
+
+    pub fn markRestorePrimaryRestoredForPathWithArtifactWithIo(
+        alloc: Allocator,
+        io: Io,
+        path: []const u8,
+        backup_id: []const u8,
+        location: []const u8,
+        artifact_sha256: []const u8,
+        snapshot_path: []const u8,
+        group_id: u64,
+    ) !void {
+        var state = try restoreStateAlloc(alloc, backup_id, location, artifact_sha256, snapshot_path, group_id, "runtime_repair", true, false, "");
+        defer state.deinit(alloc);
+        try writeRestoreStateForPathWithIo(alloc, io, path, state);
+        const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
+        defer alloc.free(import_marker_path);
         try deleteFileIfExists(io, import_marker_path);
     }
 
     pub fn restoreRuntimeRepairNeededForPath(alloc: Allocator, path: []const u8) !bool {
-        var state = (try readRestoreStateForPathAlloc(alloc, path)) orelse return false;
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        return try restoreRuntimeRepairNeededForPathWithIo(alloc, io_impl.io(), path);
+    }
+
+    pub fn restoreRuntimeRepairNeededForPathWithIo(alloc: Allocator, io: Io, path: []const u8) !bool {
+        var state = (try readRestoreStateForPathAllocWithIo(alloc, io, path)) orelse return false;
         defer state.deinit(alloc);
         return state.primary_restored and !state.runtime_repair_complete;
     }
 
     fn markRestoreRuntimeRepairNeeded(alloc: Allocator, path: []const u8) !void {
-        const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
-        defer alloc.free(repair_marker_path);
-        const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
-        defer alloc.free(import_marker_path);
         var io_impl = threadedIo();
         defer io_impl.deinit();
-        const io = io_impl.io();
-        try deleteFileIfExists(io, repair_marker_path);
+        return try markRestoreRuntimeRepairNeededWithIo(alloc, io_impl.io(), path);
+    }
 
-        var state = (try readRestoreStateForPathAlloc(alloc, path)) orelse return error.InvalidRestoreState;
+    fn markRestoreRuntimeRepairNeededWithIo(alloc: Allocator, io: Io, path: []const u8) !void {
+        const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
+        defer alloc.free(import_marker_path);
+
+        var state = (try readRestoreStateForPathAllocWithIo(alloc, io, path)) orelse return error.InvalidRestoreState;
         defer state.deinit(alloc);
         const new_phase = try alloc.dupe(u8, "runtime_repair");
         alloc.free(state.phase);
         state.phase = new_phase;
         state.primary_restored = true;
         state.runtime_repair_complete = false;
-        try writeRestoreStateForPath(alloc, path, state);
+        try writeRestoreStateForPathWithIo(alloc, io, path, state);
         try deleteFileIfExists(io, import_marker_path);
     }
 
-    fn markRestoreRuntimeRepairComplete(alloc: Allocator, path: []const u8) !void {
-        var state = (try readRestoreStateForPathAlloc(alloc, path)) orelse return error.InvalidRestoreState;
+    fn markRestoreRuntimeRepairCompleteWithIo(alloc: Allocator, io: Io, path: []const u8) !void {
+        var state = (try readRestoreStateForPathAllocWithIo(alloc, io, path)) orelse return error.InvalidRestoreState;
         defer state.deinit(alloc);
         const new_phase = try alloc.dupe(u8, "complete");
         alloc.free(state.phase);
         state.phase = new_phase;
         state.primary_restored = true;
         state.runtime_repair_complete = true;
-        try writeRestoreStateForPath(alloc, path, state);
-        const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
-        defer alloc.free(repair_marker_path);
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
-            .sub_path = repair_marker_path,
-            .data = "done\n",
-        });
+        try writeRestoreStateForPathWithIo(alloc, io, path, state);
     }
 
     pub fn restoreRuntimeRepairNeeded(self: *DB) !bool {
+        if (self.backend_runtime.io()) |io| {
+            return try restoreRuntimeRepairNeededForPathWithIo(self.alloc, io, self.core.path);
+        }
         return try restoreRuntimeRepairNeededForPath(self.alloc, self.core.path);
     }
 
-    fn updateRestoreRuntimeRepairPhase(self: *DB, alloc: Allocator, phase: []const u8, complete: bool) !void {
-        var state = (try readRestoreStateForPathAlloc(alloc, self.core.path)) orelse return error.InvalidRestoreState;
+    fn updateRestoreRuntimeRepairPhaseWithIo(
+        self: *DB,
+        alloc: Allocator,
+        io: Io,
+        phase: []const u8,
+        complete: bool,
+    ) !void {
+        var state = (try readRestoreStateForPathAllocWithIo(alloc, io, self.core.path)) orelse return error.InvalidRestoreState;
         defer state.deinit(alloc);
         const new_phase = try alloc.dupe(u8, phase);
         alloc.free(state.phase);
@@ -12830,33 +12888,41 @@ pub const DB = struct {
         const new_last_error = try alloc.dupe(u8, "");
         alloc.free(state.last_error);
         state.last_error = new_last_error;
-        try writeRestoreStateForPath(alloc, self.core.path, state);
+        try writeRestoreStateForPathWithIo(alloc, io, self.core.path, state);
     }
 
     pub fn repairRestoreRuntimeStateStepIfNeeded(self: *DB, alloc: Allocator) !bool {
-        if (!try self.restoreRuntimeRepairNeeded()) return false;
+        if (self.backend_runtime.io()) |io| {
+            return try self.repairRestoreRuntimeStateStepIfNeededWithIo(alloc, io);
+        }
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        return try self.repairRestoreRuntimeStateStepIfNeededWithIo(alloc, io_impl.io());
+    }
 
-        var state = (try readRestoreStateForPathAlloc(alloc, self.core.path)) orelse return false;
+    pub fn repairRestoreRuntimeStateStepIfNeededWithIo(self: *DB, alloc: Allocator, io: Io) !bool {
+        var state = (try readRestoreStateForPathAllocWithIo(alloc, io, self.core.path)) orelse return false;
         defer state.deinit(alloc);
+        if (!state.primary_restored or state.runtime_repair_complete) return false;
         const phase = state.phase;
 
         if (std.mem.eql(u8, phase, "runtime_repair") or std.mem.eql(u8, phase, "reset_watermarks")) {
             std.log.info("restore runtime repair reset managed index watermarks path={s}", .{self.core.path});
             try self.resetManagedIndexAppliedSequencesForRestoreRepair(alloc);
             try self.refreshManagedIndexWorkersLocked();
-            try self.updateRestoreRuntimeRepairPhase(alloc, "rebuild_graph", false);
+            try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "rebuild_graph", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "rebuild_graph")) {
             std.log.info("restore runtime repair rebuild graph state path={s}", .{self.core.path});
             _ = try self.rebuildGraphDerivedState();
-            try self.updateRestoreRuntimeRepairPhase(alloc, "rebuild_artifacts", false);
+            try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "rebuild_artifacts", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "rebuild_artifacts")) {
             std.log.info("restore runtime repair rebuild stored embedding artifacts path={s}", .{self.core.path});
             _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
-            try self.updateRestoreRuntimeRepairPhase(alloc, "replay_enrichments", false);
+            try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "replay_enrichments", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "replay_enrichments")) {
@@ -12865,7 +12931,7 @@ pub const DB = struct {
                 std.log.info("restore runtime repair replay generated enrichments path={s}", .{self.core.path});
                 _ = try self.replayGeneratedEnrichmentsFromStoredDocs(alloc);
             }
-            try self.updateRestoreRuntimeRepairPhase(alloc, "drain_async", false);
+            try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "drain_async", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "drain_async")) {
@@ -12875,14 +12941,14 @@ pub const DB = struct {
             } else {
                 std.log.info("restore runtime repair skip async drain without generated enrichment targets path={s}", .{self.core.path});
             }
-            try self.updateRestoreRuntimeRepairPhase(alloc, "rebuild_replayed_artifacts", false);
+            try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "rebuild_replayed_artifacts", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "rebuild_replayed_artifacts")) {
             std.log.info("restore runtime repair rebuild replayed embedding artifacts path={s}", .{self.core.path});
             _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
             _ = try self.rebuildSparseIndexesForTargetCoverage(alloc);
-            try self.updateRestoreRuntimeRepairPhase(alloc, "sync_indexes", false);
+            try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "sync_indexes", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "sync_indexes")) {
@@ -12901,7 +12967,7 @@ pub const DB = struct {
             try self.saveAllLiveIndexStatusSnapshots(alloc);
             try self.core.index_manager.syncAll(true);
             try self.core.syncStore(true);
-            try markRestoreRuntimeRepairComplete(alloc, self.core.path);
+            try markRestoreRuntimeRepairCompleteWithIo(alloc, io, self.core.path);
             std.log.info("restore runtime repair marked complete path={s}", .{self.core.path});
             return true;
         }
@@ -12909,9 +12975,17 @@ pub const DB = struct {
     }
 
     fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
+        if (self.backend_runtime.io()) |io| {
+            return try self.repairRestoreRuntimeStateIfNeededWithIo(alloc, io);
+        }
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        return try self.repairRestoreRuntimeStateIfNeededWithIo(alloc, io_impl.io());
+    }
+
+    fn repairRestoreRuntimeStateIfNeededWithIo(self: *DB, alloc: Allocator, io: Io) !bool {
         var repaired = false;
-        while (try self.restoreRuntimeRepairNeeded()) {
-            _ = try self.repairRestoreRuntimeStateStepIfNeeded(alloc);
+        while (try self.repairRestoreRuntimeStateStepIfNeededWithIo(alloc, io)) {
             repaired = true;
         }
         return repaired;
@@ -75950,9 +76024,10 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
     }
 
-    const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, std.mem.span(restore_path));
-    defer alloc.free(repair_marker_path);
-    try std.Io.Dir.cwd().access(std.testing.io, repair_marker_path, .{});
+    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(restore_path))).?;
+    defer restore_state.deinit(alloc);
+    try std.testing.expect(restore_state.runtime_repair_complete);
+    try std.testing.expectEqualStrings("complete", restore_state.phase);
 }
 
 test "db incomplete deferred restore import recovers before runtime repair" {

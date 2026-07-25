@@ -905,6 +905,9 @@ test "prepared reconcile failure never publishes an unprepared replica" {
                 .backup_id = "backup-503",
                 .location = "file:///unused",
                 .snapshot_path = "backup-503/groups/503",
+                .connection = "backup-store",
+                .artifact_size_bytes = 1,
+                .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             },
         },
     }});
@@ -986,6 +989,9 @@ test "blocked reconcile preparation does not block existing raft progress" {
                 .backup_id = "backup-505",
                 .location = "file:///unused",
                 .snapshot_path = "backup-505/groups/505",
+                .connection = "backup-store",
+                .artifact_size_bytes = 1,
+                .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             },
         },
     }});
@@ -1441,6 +1447,9 @@ test "cloneIntentOwned deep clones backup restore metadata" {
                 .backup_id = try std.testing.allocator.dupe(u8, "snap-52"),
                 .location = try std.testing.allocator.dupe(u8, "file:///tmp/backups"),
                 .snapshot_path = try std.testing.allocator.dupe(u8, "snap-52/groups/52"),
+                .connection = try std.testing.allocator.dupe(u8, "backup-store"),
+                .artifact_size_bytes = 4096,
+                .artifact_sha256 = try std.testing.allocator.dupe(u8, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
             },
         },
         .store_id = 21,
@@ -1456,6 +1465,8 @@ test "cloneIntentOwned deep clones backup restore metadata" {
     try std.testing.expect(cloned.record.backup_restore_bootstrap.?.backup_id.ptr != original.record.backup_restore_bootstrap.?.backup_id.ptr);
     try std.testing.expect(cloned.record.backup_restore_bootstrap.?.location.ptr != original.record.backup_restore_bootstrap.?.location.ptr);
     try std.testing.expect(cloned.record.backup_restore_bootstrap.?.snapshot_path.ptr != original.record.backup_restore_bootstrap.?.snapshot_path.ptr);
+    try std.testing.expect(cloned.record.backup_restore_bootstrap.?.connection.ptr != original.record.backup_restore_bootstrap.?.connection.ptr);
+    try std.testing.expect(cloned.record.backup_restore_bootstrap.?.artifact_sha256.ptr != original.record.backup_restore_bootstrap.?.artifact_sha256.ptr);
     try std.testing.expect(cloned.peer_node_ids.ptr != original.peer_node_ids.ptr);
     try std.testing.expect(cloned.learner_node_ids.ptr != original.learner_node_ids.ptr);
 }

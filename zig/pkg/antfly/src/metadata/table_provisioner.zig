@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const backups_api = @import("../api/backups.zig");
+const common_config = @import("../common/config.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const metadata_api = @import("api.zig");
 const table_manager = @import("table_manager.zig");
@@ -576,6 +577,64 @@ pub fn collectLocalRestoreProgress(
     tables: []const table_manager.TableRecord,
     ranges: []const table_manager.RangeRecord,
 ) ![]table_manager.RestoreProgressRecord {
+    return try collectLocalRestoreProgressUsingIo(
+        alloc,
+        null,
+        replica_root_dir,
+        metadata_group_id,
+        local_node_id,
+        hosted_group_ids,
+        tables,
+        ranges,
+    );
+}
+
+pub fn collectLocalRestoreProgressUsingIo(
+    alloc: std.mem.Allocator,
+    shared_io: ?std.Io,
+    replica_root_dir: []const u8,
+    metadata_group_id: u64,
+    local_node_id: u64,
+    hosted_group_ids: []const u64,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+) ![]table_manager.RestoreProgressRecord {
+    if (shared_io) |io| {
+        return try collectLocalRestoreProgressWithIo(
+            alloc,
+            io,
+            replica_root_dir,
+            metadata_group_id,
+            local_node_id,
+            hosted_group_ids,
+            tables,
+            ranges,
+        );
+    }
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    return try collectLocalRestoreProgressWithIo(
+        alloc,
+        io_impl.io(),
+        replica_root_dir,
+        metadata_group_id,
+        local_node_id,
+        hosted_group_ids,
+        tables,
+        ranges,
+    );
+}
+
+fn collectLocalRestoreProgressWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    replica_root_dir: []const u8,
+    metadata_group_id: u64,
+    local_node_id: u64,
+    hosted_group_ids: []const u64,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+) ![]table_manager.RestoreProgressRecord {
     var out = std.ArrayListUnmanaged(table_manager.RestoreProgressRecord).empty;
     errdefer {
         for (out.items) |record| table_manager.freeRestoreProgress(alloc, record);
@@ -590,7 +649,7 @@ pub fn collectLocalRestoreProgress(
 
         const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(path);
-        var state = (try db_mod.DB.readRestoreStateForPath(alloc, path)) orelse continue;
+        var state = (try db_mod.DB.readRestoreStateForPathWithIo(alloc, io, path)) orelse continue;
         defer state.deinit(alloc);
         if (!std.mem.eql(u8, state.backup_id, restore.backup_id)) continue;
         if (!std.mem.eql(u8, state.location, restore.location)) continue;
@@ -661,7 +720,7 @@ pub fn applyRestoreIntentIfNeededWithOptions(
         .backup_id = restore.backup_id,
         .location = restore.location,
         .snapshot_path = restore.snapshot_path,
-        .connection = restore.connection,
+        .authority = .{ .external = restore.connection },
         .expected_artifact_size_bytes = restore.artifact_size_bytes,
         .expected_artifact_sha256 = restore.artifact_sha256,
         .open_options = open_options,
@@ -2540,6 +2599,20 @@ test "table provisioner updates full text artifact mapping and cleans removed en
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
 }
 
+fn testRestoreNodeConfig(alloc: std.mem.Allocator) !common_config.Config {
+    return common_config.Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "test-backups": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["restore.read"],
+        \\      "external_io": { "protocol": "filesystem", "root": "/" }
+        \\    }
+        \\  }
+        \\}
+    );
+}
+
 test "table provisioner restores local shard data from metadata restore intent" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2596,6 +2669,8 @@ test "table provisioner restores local shard data from metadata restore intent" 
         dest_root,
     );
     defer artifact_integrity.deinit(std.testing.allocator);
+    var node_config = try testRestoreNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
@@ -2623,7 +2698,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
     }
     try backups_api.writeManifest(std.testing.allocator, backup_root, &manifest);
 
-    const summary = try reconcileReplicaRoot(
+    const summary = try reconcileReplicaRootWithOptions(
         std.testing.allocator,
         replica_root,
         100,
@@ -2643,9 +2718,16 @@ test "table provisioner restores local shard data from metadata restore intent" 
             .restore_backup_id = "snap1",
             .restore_location = restore_location,
             .restore_snapshot_path = "snap1/groups/2001",
+            .restore_connection = "test-backups",
             .restore_artifact_size_bytes = artifact_integrity.size_bytes,
             .restore_artifact_sha256 = artifact_integrity.sha256,
         }},
+        .{
+            .restore_open_options = .{
+                .node_config = &node_config,
+                .io = io_impl.io(),
+            },
+        },
     );
     try std.testing.expectEqual(@as(usize, 1), summary.groups_considered);
 
@@ -2771,6 +2853,8 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
         dest_root,
     );
     defer artifact_integrity.deinit(std.testing.allocator);
+    var node_config = try testRestoreNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
@@ -2798,7 +2882,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
     }
     try backups_api.writeManifest(std.testing.allocator, backup_root, &manifest);
 
-    try std.testing.expectError(error.IdentityNamespaceMismatch, reconcileReplicaRoot(
+    try std.testing.expectError(error.IdentityNamespaceMismatch, reconcileReplicaRootWithOptions(
         std.testing.allocator,
         replica_root,
         100,
@@ -2820,9 +2904,16 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
             .restore_backup_id = "snap1",
             .restore_location = restore_location,
             .restore_snapshot_path = "snap1/groups/2001",
+            .restore_connection = "test-backups",
             .restore_artifact_size_bytes = artifact_integrity.size_bytes,
             .restore_artifact_sha256 = artifact_integrity.sha256,
         }},
+        .{
+            .restore_open_options = .{
+                .node_config = &node_config,
+                .io = io_impl.io(),
+            },
+        },
     ));
 }
 

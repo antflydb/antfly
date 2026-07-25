@@ -1679,6 +1679,10 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_range = record });
     }
 
+    pub fn completeRestoreRange(self: *MetadataService, identity: metadata_table_manager.RestoreIntentIdentity) !void {
+        try self.proposeTransitionCommand(.{ .complete_restore_range = identity });
+    }
+
     pub fn removeRange(self: *MetadataService, group_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_range = .{ .group_id = group_id } });
     }
@@ -2418,8 +2422,9 @@ pub const MetadataService = struct {
     ) !void {
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.host.cfg.local_node_id;
-        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgress(
+        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgressUsingIo(
             self.alloc,
+            (try self.ensureBackendRuntime()).io(),
             replica_root_dir,
             self.metadata_group_id,
             local_node_id,
@@ -3163,6 +3168,10 @@ pub const MetadataHttpService = struct {
 
     pub fn upsertRange(self: *MetadataHttpService, record: metadata_table_manager.RangeRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_range = record });
+    }
+
+    pub fn completeRestoreRange(self: *MetadataHttpService, identity: metadata_table_manager.RestoreIntentIdentity) !void {
+        try self.proposeTransitionCommand(.{ .complete_restore_range = identity });
     }
 
     pub fn removeRange(self: *MetadataHttpService, group_id: u64) !void {
@@ -4570,8 +4579,9 @@ pub const MetadataHttpService = struct {
     ) !void {
         const replica_root_dir = self.replica_root_dir orelse return;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
-        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgress(
+        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgressUsingIo(
             self.alloc,
+            (try self.ensureBackendRuntime()).io(),
             replica_root_dir,
             self.metadata_group_id,
             local_node_id,
@@ -5010,41 +5020,8 @@ fn completeRestoreIntentsForService(
             progress,
         )) continue;
 
-        const cleared = try clearedRestoreRangeAlloc(service.alloc, range);
-        errdefer metadata_table_manager.freeRange(service.alloc, cleared);
-        try service.upsertRange(cleared);
-        metadata_table_manager.freeRange(service.alloc, cleared);
+        try service.completeRestoreRange(metadata_table_manager.restoreIntentIdentity(range));
     }
-}
-
-fn clearedRestoreRangeAlloc(
-    alloc: std.mem.Allocator,
-    range: metadata_table_manager.RangeRecord,
-) !metadata_table_manager.RangeRecord {
-    var cleared = try metadata_table_manager.cloneRange(alloc, range);
-    errdefer metadata_table_manager.freeRange(alloc, cleared);
-    const empty_backup_id = try alloc.dupe(u8, "");
-    errdefer alloc.free(empty_backup_id);
-    const empty_location = try alloc.dupe(u8, "");
-    errdefer alloc.free(empty_location);
-    const empty_snapshot_path = try alloc.dupe(u8, "");
-    errdefer alloc.free(empty_snapshot_path);
-    const empty_connection = try alloc.dupe(u8, "");
-    errdefer alloc.free(empty_connection);
-    const empty_artifact_sha256 = try alloc.dupe(u8, "");
-    errdefer alloc.free(empty_artifact_sha256);
-    alloc.free(cleared.restore_backup_id);
-    alloc.free(cleared.restore_location);
-    alloc.free(cleared.restore_snapshot_path);
-    alloc.free(cleared.restore_connection);
-    alloc.free(cleared.restore_artifact_sha256);
-    cleared.restore_backup_id = empty_backup_id;
-    cleared.restore_location = empty_location;
-    cleared.restore_snapshot_path = empty_snapshot_path;
-    cleared.restore_connection = empty_connection;
-    cleared.restore_artifact_size_bytes = 0;
-    cleared.restore_artifact_sha256 = empty_artifact_sha256;
-    return cleared;
 }
 
 fn rangeRestoreIntentComplete(
@@ -9936,6 +9913,9 @@ test "metadata service status reports repair and rebalance counts" {
                 .backup_id = "backup-8801",
                 .location = "file:///tmp/backups",
                 .snapshot_path = "backup-8801/groups/8801",
+                .connection = "backup-store",
+                .artifact_size_bytes = 4096,
+                .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             },
         },
         .peer_node_ids = &.{1},
@@ -10294,11 +10274,11 @@ test "metadata service clears restore intent once all placement replicas report 
         placements: []const raft_reconciler.PlacementIntent,
         progress: []const metadata_table_manager.RestoreProgressRecord,
         upserted_table: ?metadata_table_manager.TableRecord = null,
-        upserted_range: ?metadata_table_manager.RangeRecord = null,
+        completed_restore: ?metadata_table_manager.RestoreIntentIdentity = null,
 
         fn deinit(self: *@This()) void {
             if (self.upserted_table) |record| metadata_table_manager.freeTable(self.alloc, record);
-            if (self.upserted_range) |record| metadata_table_manager.freeRange(self.alloc, record);
+            if (self.completed_restore) |identity| metadata_table_manager.freeRestoreIntentIdentity(self.alloc, identity);
         }
 
         fn listProjectedTables(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
@@ -10356,9 +10336,9 @@ test "metadata service clears restore intent once all placement replicas report 
             self.upserted_table = try metadata_table_manager.cloneTable(self.alloc, record);
         }
 
-        fn upsertRange(self: *@This(), record: metadata_table_manager.RangeRecord) !void {
-            if (self.upserted_range) |existing| metadata_table_manager.freeRange(self.alloc, existing);
-            self.upserted_range = try metadata_table_manager.cloneRange(self.alloc, record);
+        fn completeRestoreRange(self: *@This(), identity: metadata_table_manager.RestoreIntentIdentity) !void {
+            if (self.completed_restore) |existing| metadata_table_manager.freeRestoreIntentIdentity(self.alloc, existing);
+            self.completed_restore = try metadata_table_manager.cloneRestoreIntentIdentity(self.alloc, identity);
         }
     };
 
@@ -10393,10 +10373,11 @@ test "metadata service clears restore intent once all placement replicas report 
     defer service.deinit();
 
     try completeRestoreIntentsForService(&service, null, null, null, null);
-    try std.testing.expect(service.upserted_range != null);
-    try std.testing.expectEqualStrings("", service.upserted_range.?.restore_backup_id);
-    try std.testing.expectEqualStrings("", service.upserted_range.?.restore_location);
-    try std.testing.expectEqualStrings("", service.upserted_range.?.restore_snapshot_path);
+    try std.testing.expect(service.completed_restore != null);
+    try std.testing.expectEqualStrings("snap1", service.completed_restore.?.backup_id);
+    try std.testing.expectEqualStrings("file:///tmp/backups", service.completed_restore.?.location);
+    try std.testing.expectEqualStrings("snap/groups/7001", service.completed_restore.?.snapshot_path);
+    try std.testing.expectEqualStrings("backups", service.completed_restore.?.connection);
     try std.testing.expect(service.upserted_table == null);
 }
 

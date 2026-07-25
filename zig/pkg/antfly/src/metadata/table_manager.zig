@@ -108,6 +108,105 @@ pub const RangeRecord = struct {
     restore_artifact_sha256: []const u8 = "",
 };
 
+/// Exact identity of a range-scoped restore intent. Completion commands carry
+/// this value so a delayed proposal cannot clear a superseding restore.
+pub const RestoreIntentIdentity = struct {
+    group_id: u64,
+    table_id: u64,
+    backup_id: []const u8,
+    location: []const u8,
+    snapshot_path: []const u8,
+    connection: []const u8,
+    artifact_size_bytes: u64,
+    artifact_sha256: []const u8,
+};
+
+pub fn restoreIntentIdentity(record: RangeRecord) RestoreIntentIdentity {
+    return .{
+        .group_id = record.group_id,
+        .table_id = record.table_id,
+        .backup_id = record.restore_backup_id,
+        .location = record.restore_location,
+        .snapshot_path = record.restore_snapshot_path,
+        .connection = record.restore_connection,
+        .artifact_size_bytes = record.restore_artifact_size_bytes,
+        .artifact_sha256 = record.restore_artifact_sha256,
+    };
+}
+
+pub fn restoreIntentMatchesRange(expected: RestoreIntentIdentity, record: RangeRecord) bool {
+    return expected.group_id == record.group_id and
+        expected.table_id == record.table_id and
+        std.mem.eql(u8, expected.backup_id, record.restore_backup_id) and
+        std.mem.eql(u8, expected.location, record.restore_location) and
+        std.mem.eql(u8, expected.snapshot_path, record.restore_snapshot_path) and
+        std.mem.eql(u8, expected.connection, record.restore_connection) and
+        expected.artifact_size_bytes == record.restore_artifact_size_bytes and
+        std.mem.eql(u8, expected.artifact_sha256, record.restore_artifact_sha256);
+}
+
+pub fn cloneRestoreIntentIdentity(
+    alloc: std.mem.Allocator,
+    identity: RestoreIntentIdentity,
+) !RestoreIntentIdentity {
+    const backup_id = try alloc.dupe(u8, identity.backup_id);
+    errdefer alloc.free(backup_id);
+    const location = try alloc.dupe(u8, identity.location);
+    errdefer alloc.free(location);
+    const snapshot_path = try alloc.dupe(u8, identity.snapshot_path);
+    errdefer alloc.free(snapshot_path);
+    const connection = try alloc.dupe(u8, identity.connection);
+    errdefer alloc.free(connection);
+    const artifact_sha256 = try alloc.dupe(u8, identity.artifact_sha256);
+    errdefer alloc.free(artifact_sha256);
+    return .{
+        .group_id = identity.group_id,
+        .table_id = identity.table_id,
+        .backup_id = backup_id,
+        .location = location,
+        .snapshot_path = snapshot_path,
+        .connection = connection,
+        .artifact_size_bytes = identity.artifact_size_bytes,
+        .artifact_sha256 = artifact_sha256,
+    };
+}
+
+pub fn freeRestoreIntentIdentity(
+    alloc: std.mem.Allocator,
+    identity: RestoreIntentIdentity,
+) void {
+    alloc.free(identity.backup_id);
+    alloc.free(identity.location);
+    alloc.free(identity.snapshot_path);
+    alloc.free(identity.connection);
+    alloc.free(identity.artifact_sha256);
+}
+
+pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeRecord) !void {
+    const backup_id = try alloc.dupe(u8, "");
+    errdefer alloc.free(backup_id);
+    const location = try alloc.dupe(u8, "");
+    errdefer alloc.free(location);
+    const snapshot_path = try alloc.dupe(u8, "");
+    errdefer alloc.free(snapshot_path);
+    const connection = try alloc.dupe(u8, "");
+    errdefer alloc.free(connection);
+    const artifact_sha256 = try alloc.dupe(u8, "");
+    errdefer alloc.free(artifact_sha256);
+
+    alloc.free(record.restore_backup_id);
+    alloc.free(record.restore_location);
+    alloc.free(record.restore_snapshot_path);
+    alloc.free(record.restore_connection);
+    alloc.free(record.restore_artifact_sha256);
+    record.restore_backup_id = backup_id;
+    record.restore_location = location;
+    record.restore_snapshot_path = snapshot_path;
+    record.restore_connection = connection;
+    record.restore_artifact_size_bytes = 0;
+    record.restore_artifact_sha256 = artifact_sha256;
+}
+
 pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
     return lhs.group_id == rhs.group_id and
         lhs.range_id == rhs.range_id and

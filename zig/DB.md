@@ -91,13 +91,24 @@ rejecting symlinks and other unsupported entries. Hashing is streaming with
 bounded memory and uses the server's shared I/O runtime.
 
 All shard transfers must complete before the manifest is conditionally
-published. Restore treats the manifest format as authoritative rather than
-guessing from a filename, rejects duplicate group or artifact identities and
-unbound artifacts, stages remote content locally, and verifies the staged bytes
-before any importer or generation publication can consume them. A mismatch is
-a terminal corrupt-backup result; the live generation and table definition
-remain unchanged. Restore accepts only the versioned, content-bound manifest;
-an unversioned or unsupported manifest fails closed before staging.
+published. For filesystem backups, every copied file is synced, destination
+directories are synced from leaves to root, and newly created ancestors are
+synced before the create-once manifest is file-synced, atomically renamed, and
+followed by a parent-directory sync. The manifest rename is therefore a real
+crash-durable commit point rather than only a namespace convention.
+
+Restore treats the manifest format as authoritative rather than guessing from a
+filename, rejects duplicate group or artifact identities and unbound artifacts,
+and copies both local and remote source content into an Antfly-owned staging
+root. It verifies that private copy before any importer or generation
+publication can consume it, so source mutation between verification and reopen
+cannot change the restored bytes. Portable archives are imported and counted
+block-by-block from a stable file descriptor; memory is bounded by one encoded
+block rather than the total archive size. A mismatch or source mutation is a
+terminal corrupt-backup result surfaced as an actionable integrity failure; the
+live generation and table definition remain unchanged. Restore accepts only the
+versioned, content-bound manifest; an unversioned or unsupported manifest fails
+closed before staging.
 
 External storage authority is preserved across distributed restore rather than
 collapsed into a URI. The ingress node resolves the caller's named
@@ -111,6 +122,13 @@ bootstrap record, local import marker, and completion progress all carry the
 same shard digest. Consequently retries and crash recovery are idempotent for
 specific immutable bytes, and stale completion from another artifact cannot
 clear or satisfy a newer intent.
+
+The low-level Raft host never resolves a backup URI or ambient credentials
+itself. It validates the bounded bootstrap identity and delegates restore I/O to
+the managed bootstrap owner, which carries the node configuration, secret
+store, capability requirement, and shared I/O runtime. A missing connection,
+missing owner, malformed relative path, or absent content digest fails closed
+before filesystem or object-store access.
 
 Restore identity is range-scoped; table definitions are not a second fallback
 source. Manifest admission sorts shard boundaries and requires every adjacent
@@ -199,6 +217,14 @@ Definition publication and rollback are full-definition compare-and-swap
 mutations. A concurrent schema, index, placement, or restore-intent update
 therefore makes the transition fail closed instead of being overwritten by a
 stale publish or rollback.
+
+Restore completion is also a replicated compare-and-clear operation, not an
+ordinary range upsert. Its command carries the exact table, group, backup,
+location, connection, snapshot path, byte count, and digest observed by the
+completion evaluator. The state machine reloads the current range in the same
+transaction, clears only matching restore fields, and preserves the current
+range ID, boundaries, document-identity namespace, split epoch, and all other
+topology. A delayed completion for a superseded artifact is an idempotent no-op.
 
 The API lifecycle above the generation manager is a bounded durable job. Public
 job identifiers are opaque strings even though the local scheduler uses integer

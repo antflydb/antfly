@@ -79,9 +79,51 @@ pub const BackupRestoreBootstrapRecord = struct {
     backup_id: []const u8,
     location: []const u8,
     snapshot_path: []const u8,
-    connection: []const u8 = "",
-    artifact_size_bytes: u64 = 0,
-    artifact_sha256: []const u8 = "",
+    connection: []const u8,
+    artifact_size_bytes: u64,
+    artifact_sha256: []const u8,
+
+    pub fn validate(self: BackupRestoreBootstrapRecord) !void {
+        if (self.backup_id.len == 0 or
+            self.backup_id.len > 128 or
+            self.location.len == 0 or
+            self.location.len > 4096 or
+            self.snapshot_path.len == 0 or
+            self.snapshot_path.len > 4096 or
+            self.connection.len == 0 or
+            self.connection.len > 256 or
+            self.artifact_sha256.len != std.crypto.hash.sha2.Sha256.digest_length * 2)
+        {
+            return error.InvalidBackupRestoreBootstrap;
+        }
+        for (self.backup_id) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.')
+                return error.InvalidBackupRestoreBootstrap;
+        }
+        if (std.mem.eql(u8, self.backup_id, ".") or
+            std.mem.eql(u8, self.backup_id, "..") or
+            std.mem.indexOfScalar(u8, self.location, 0) != null or
+            std.mem.indexOfScalar(u8, self.connection, 0) != null or
+            std.fs.path.isAbsolute(self.snapshot_path) or
+            std.mem.indexOfScalar(u8, self.snapshot_path, '\\') != null or
+            std.mem.indexOfScalar(u8, self.snapshot_path, 0) != null)
+        {
+            return error.InvalidBackupRestoreBootstrap;
+        }
+        var components = std.mem.splitScalar(u8, self.snapshot_path, '/');
+        while (components.next()) |component| {
+            if (component.len == 0 or
+                std.mem.eql(u8, component, ".") or
+                std.mem.eql(u8, component, ".."))
+            {
+                return error.InvalidBackupRestoreBootstrap;
+            }
+        }
+        for (self.artifact_sha256) |c| {
+            if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f'))
+                return error.InvalidBackupRestoreBootstrap;
+        }
+    }
 
     pub fn clone(self: BackupRestoreBootstrapRecord, alloc: std.mem.Allocator) !BackupRestoreBootstrapRecord {
         var cloned = BackupRestoreBootstrapRecord{
@@ -235,6 +277,7 @@ pub const ReplicaCatalog = struct {
     };
 
     pub fn upsertReplica(self: ReplicaCatalog, record: ReplicaRecord) !void {
+        try validateReplicaRecord(record);
         return try self.vtable.upsert_replica(self.ptr, record);
     }
 
@@ -256,6 +299,7 @@ pub const ReplicaCatalog = struct {
         upserts: []const ReplicaRecord,
         removals: []const u64,
     ) !void {
+        for (upserts) |record| try validateReplicaRecord(record);
         return try self.vtable.apply_batch(self.ptr, expected_revision, upserts, removals);
     }
 };
@@ -643,6 +687,9 @@ fn deinitReplicaMap(
 fn validateReplicaRecord(record: ReplicaRecord) !void {
     if (record.snapshot_bootstrap != null and record.backup_restore_bootstrap != null)
         return error.InvalidReplicaCatalog;
+    if (record.backup_restore_bootstrap) |restore| {
+        restore.validate() catch return error.InvalidReplicaCatalog;
+    }
 }
 
 fn writeCatalogAtomicallyDurable(
@@ -723,6 +770,56 @@ test "raft replica catalog storage module compiles" {
     _ = freeReplicaRecords;
     _ = freeRuntimeBootstrap;
     _ = runtimeBootstrapFromRecord;
+}
+
+test "replica catalog rejects invalid backup restore authority and integrity bindings" {
+    var replica_catalog = MemoryReplicaCatalog.init(std.testing.allocator);
+    defer replica_catalog.deinit();
+    const iface = replica_catalog.catalog();
+    const valid_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    try std.testing.expectError(error.InvalidReplicaCatalog, iface.upsertReplica(.{
+        .group_id = 11,
+        .replica_id = 1,
+        .local_node_id = 3,
+        .backup_restore_bootstrap = .{
+            .backup_id = "snap-11",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "../snap-11",
+            .connection = "backup-store",
+            .artifact_size_bytes = 1,
+            .artifact_sha256 = valid_hash,
+        },
+    }));
+    try std.testing.expectError(error.InvalidReplicaCatalog, iface.upsertReplica(.{
+        .group_id = 11,
+        .replica_id = 1,
+        .local_node_id = 3,
+        .backup_restore_bootstrap = .{
+            .backup_id = "snap-11",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "snap-11/groups/11",
+            .connection = "",
+            .artifact_size_bytes = 1,
+            .artifact_sha256 = valid_hash,
+        },
+    }));
+    try std.testing.expectError(error.InvalidReplicaCatalog, iface.upsertReplica(.{
+        .group_id = 11,
+        .replica_id = 1,
+        .local_node_id = 3,
+        .backup_restore_bootstrap = .{
+            .backup_id = "snap-11",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "snap-11/groups/11",
+            .connection = "backup-store",
+            .artifact_size_bytes = 1,
+            .artifact_sha256 = "not-a-sha256",
+        },
+    }));
+    const records = try iface.listReplicas(std.testing.allocator);
+    defer freeReplicaRecords(std.testing.allocator, records);
+    try std.testing.expectEqual(@as(usize, 0), records.len);
 }
 
 test "memory replica catalog stores and lists records" {
@@ -983,6 +1080,9 @@ test "file replica catalog persists backup restore bootstrap records across reop
                 .backup_id = "snap-22",
                 .location = "file:///tmp/backups",
                 .snapshot_path = "snap-22/groups/22",
+                .connection = "backup-store",
+                .artifact_size_bytes = 4096,
+                .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             },
         });
     }
@@ -997,6 +1097,12 @@ test "file replica catalog persists backup restore bootstrap records across reop
         try std.testing.expectEqualStrings("snap-22", records[0].backup_restore_bootstrap.?.backup_id);
         try std.testing.expectEqualStrings("file:///tmp/backups", records[0].backup_restore_bootstrap.?.location);
         try std.testing.expectEqualStrings("snap-22/groups/22", records[0].backup_restore_bootstrap.?.snapshot_path);
+        try std.testing.expectEqualStrings("backup-store", records[0].backup_restore_bootstrap.?.connection);
+        try std.testing.expectEqual(@as(u64, 4096), records[0].backup_restore_bootstrap.?.artifact_size_bytes);
+        try std.testing.expectEqualStrings(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            records[0].backup_restore_bootstrap.?.artifact_sha256,
+        );
     }
 }
 

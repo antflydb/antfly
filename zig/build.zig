@@ -1821,6 +1821,13 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, raft_runtime_test_mod, true, true);
 
+    const raft_restore_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft_restore_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, raft_restore_test_mod, true, true);
+
     const filesystem_capacity_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/filesystem_capacity_test_root.zig"),
         .target = target,
@@ -2584,6 +2591,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "export and import documents round trip",
             "file import rejects oversized portable blocks before allocation",
+            "document batch round-trip",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3377,6 +3385,24 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_raft_runtime_tests = addFilteredTestRunArtifact(b, raft_runtime_tests);
+
+    const raft_restore_tests = b.addTest(.{
+        .root_module = raft_restore_test_mod,
+        .filters = &.{
+            "host restores through an explicitly authorized bootstrap owner",
+            "host restores backup bootstrap replicas from file-backed catalog on restart",
+            "managed host restores backup bootstrap replicas from file-backed catalog on restart",
+            "host does not perform path restore without a bootstrap authority owner",
+            "host records backup restore bootstrap failure when no handler is available",
+            "file replica catalog persists backup restore bootstrap records across reopen",
+            "replica catalog rejects invalid backup restore authority and integrity bindings",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_raft_restore_tests = b.addRunArtifact(raft_restore_tests);
 
     const raft_ready_continuation_tests = b.addTest(.{
         .root_module = raft_engine_mod,
@@ -4869,6 +4895,7 @@ pub fn build(b: *std.Build) void {
             "public table query view handler maps doc identity unavailable errors",
             "public table backup handler accepts portable format",
             "public table restore handler maps unsupported multi-range error",
+            "public table restore handler reports artifact integrity failures",
             "public table restore handler reports committed durability pending",
             "public table restore handler reports confirmed durability",
             "public table query view handler maps HA read gate errors",
@@ -5144,6 +5171,7 @@ pub fn build(b: *std.Build) void {
             "api http server cluster overwrite stages before replacing metadata without dropping live table",
             "backup manifest validation rejects ambiguous or unbound artifacts",
             "portable backup integrity rejects changed staged bytes",
+            "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard",
             "db incomplete deferred restore import recovers before runtime repair",
             "db restore state uses strict structured content identity markers",
         },
@@ -5212,6 +5240,7 @@ pub fn build(b: *std.Build) void {
             "table workflow can remove a table topology from desired state",
             "table workflow can reconcile projected local placement intents",
             "metadata raft apply store ",
+            "metadata transition decoders reject unknown enum values",
             "metadata store observer ",
             "metadata state machine projects transitions through metadata apply store",
             "table provisioner restore rejects mismatched doc identity namespace",
@@ -5643,12 +5672,16 @@ pub fn build(b: *std.Build) void {
     const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
     raft_test_step.dependOn(&run_raft_runtime_tests.step);
+    raft_test_step.dependOn(&run_raft_restore_tests.step);
     raft_test_step.dependOn(&run_raft_library_tests.step);
     raft_test_step.dependOn(&run_raft_ready_continuation_tests.step);
 
     const raft_runtime_test_step = b.step("raft-runtime-test", "Run focused managed Raft runtime tests");
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
     raft_runtime_test_step.dependOn(&run_raft_ready_continuation_tests.step);
+
+    const raft_restore_test_step = b.step("raft-restore-test", "Run focused Raft restore authority and restart tests");
+    raft_restore_test_step.dependOn(&run_raft_restore_tests.step);
 
     const raft_transport_test_step = b.step("raft-transport-test", "Run raft transport unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
@@ -5701,6 +5734,7 @@ pub fn build(b: *std.Build) void {
     }
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_runtime_tests.step);
+    unit_test_step.dependOn(&run_raft_restore_tests.step);
     unit_test_step.dependOn(&run_raft_ready_continuation_tests.step);
 
     // Progress mode uses one union-filtered root artifact too. Storage and

@@ -64,6 +64,7 @@ pub const MetadataState = state.MetadataState;
 pub const TableRecord = table_manager.TableRecord;
 pub const PlacementClass = table_manager.PlacementClass;
 pub const RangeRecord = table_manager.RangeRecord;
+pub const RestoreIntentIdentity = table_manager.RestoreIntentIdentity;
 pub const NodeRecord = table_manager.NodeRecord;
 pub const StoreRecord = table_manager.StoreRecord;
 pub const GroupStatusReport = table_manager.GroupStatusReport;

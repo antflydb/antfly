@@ -51,6 +51,19 @@ pub const antfly_version = "zig-dev";
 pub const max_portable_backup_file_bytes: usize = 1024 * 1024 * 1024;
 pub const max_backup_manifest_bytes: usize = 16 * 1024 * 1024;
 pub const manifest_too_large_message = "backup manifest exceeds 16 MiB limit";
+pub const integrity_failure_message = "backup artifact failed integrity verification";
+
+pub fn isArtifactIntegrityError(err: anyerror) bool {
+    return switch (err) {
+        error.BackupIntegrityMissing,
+        error.BackupArtifactIntegrityMismatch,
+        error.RestoreArtifactIdentityMissing,
+        error.RestoreArtifactIdentityMismatch,
+        error.SourceFileChanged,
+        => true,
+        else => false,
+    };
+}
 pub const default_backup_list_limit: usize = 100;
 pub const max_backup_list_limit: usize = 1000;
 
@@ -1918,12 +1931,28 @@ pub fn copyDirectoryFromLocation(
     snapshot_path: []const u8,
     dest_path: []const u8,
 ) !void {
+    return try copyDirectoryFromLocationUsingIo(alloc, null, location, snapshot_path, dest_path);
+}
+
+pub fn copyDirectoryFromLocationUsingIo(
+    alloc: std.mem.Allocator,
+    shared_io: ?std.Io,
+    location: *BackupLocation,
+    snapshot_path: []const u8,
+    dest_path: []const u8,
+) !void {
     try validateArtifactRelativePath(snapshot_path);
     switch (location.*) {
         .file => |backup_root| {
             const src_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
             defer alloc.free(src_root);
-            try copyDirectoryRecursive(alloc, src_root, dest_path);
+            if (shared_io) |io|
+                try copyDirectoryRecursiveWithIo(alloc, io, src_root, dest_path, .transient)
+            else {
+                var io_impl = std.Io.Threaded.init(alloc, .{});
+                defer io_impl.deinit();
+                try copyDirectoryRecursiveWithIo(alloc, io_impl.io(), src_root, dest_path, .transient);
+            }
         },
         .remote => |*store| try store.downloadDirectoryRecursive(alloc, snapshot_path, dest_path),
     }
@@ -1935,12 +1964,25 @@ pub fn copyFileFromLocation(
     snapshot_path: []const u8,
     dest_path: []const u8,
 ) !void {
+    return try copyFileFromLocationUsingIo(alloc, null, location, snapshot_path, dest_path);
+}
+
+pub fn copyFileFromLocationUsingIo(
+    alloc: std.mem.Allocator,
+    shared_io: ?std.Io,
+    location: *BackupLocation,
+    snapshot_path: []const u8,
+    dest_path: []const u8,
+) !void {
     try validateArtifactRelativePath(snapshot_path);
     switch (location.*) {
         .file => |backup_root| {
             const src_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
             defer alloc.free(src_path);
-            try copyFileAbsolute(src_path, dest_path);
+            if (shared_io) |io|
+                try copyFileAbsoluteWithIoOptions(io, src_path, dest_path, .transient)
+            else
+                try copyFileAbsoluteWithDurability(src_path, dest_path, .transient);
         },
         .remote => |*store| {
             try store.readFile(alloc, trimLeftSlash(snapshot_path), dest_path);
@@ -2396,14 +2438,38 @@ pub fn copyDirectoryRecursiveUsingIo(
     src_path: []const u8,
     dest_path: []const u8,
 ) !void {
-    if (shared_io) |io| return try copyDirectoryRecursiveWithIo(alloc, io, src_path, dest_path);
+    if (shared_io) |io| return try copyDirectoryRecursiveWithIo(alloc, io, src_path, dest_path, .durable);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    return copyDirectoryRecursiveWithIo(alloc, io_impl.io(), src_path, dest_path);
+    return copyDirectoryRecursiveWithIo(alloc, io_impl.io(), src_path, dest_path, .durable);
 }
 
-fn copyDirectoryRecursiveWithIo(alloc: std.mem.Allocator, io: std.Io, src_path: []const u8, dest_path: []const u8) !void {
+const CopyDurability = enum {
+    transient,
+    durable,
+};
+
+fn copyDirectoryRecursiveWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    src_path: []const u8,
+    dest_path: []const u8,
+    durability: CopyDurability,
+) !void {
     try ensureDirPathWithIo(io, dest_path);
+
+    var durable_dirs = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (durable_dirs.items) |path| alloc.free(path);
+        durable_dirs.deinit(alloc);
+    }
+    if (durability == .durable) {
+        const owned_dest_path = try alloc.dupe(u8, dest_path);
+        durable_dirs.append(alloc, owned_dest_path) catch |err| {
+            alloc.free(owned_dest_path);
+            return err;
+        };
+    }
 
     var src_dir = try std.Io.Dir.cwd().openDir(io, src_path, .{ .iterate = true });
     defer src_dir.close(io);
@@ -2418,11 +2484,30 @@ fn copyDirectoryRecursiveWithIo(alloc: std.mem.Allocator, io: std.Io, src_path: 
         defer alloc.free(dest_entry_path);
 
         switch (entry.kind) {
-            .directory => try ensureDirPathWithIo(io, dest_entry_path),
-            .file => try copyFileAbsoluteWithIo(io, src_entry_path, dest_entry_path),
+            .directory => {
+                try ensureDirPathWithIo(io, dest_entry_path);
+                if (durability == .durable) {
+                    const owned_dir_path = try alloc.dupe(u8, dest_entry_path);
+                    durable_dirs.append(alloc, owned_dir_path) catch |err| {
+                        alloc.free(owned_dir_path);
+                        return err;
+                    };
+                }
+            },
+            .file => try copyFileAbsoluteWithIoOptions(io, src_entry_path, dest_entry_path, durability),
             else => return error.UnsupportedBackupArtifact,
         }
     }
+
+    if (durability == .transient) return;
+    std.mem.sort([]u8, durable_dirs.items, {}, struct {
+        fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
+            if (lhs.len != rhs.len) return lhs.len > rhs.len;
+            return std.mem.order(u8, lhs, rhs) == .gt;
+        }
+    }.lessThan);
+    for (durable_dirs.items) |dir_path| try fs_paths.syncDirPortable(io, dir_path);
+    try syncPathAncestorsWithIo(io, std.fs.path.dirname(dest_path) orelse ".");
 }
 
 fn writeFileAbsolute(path: []const u8, data: []const u8) !void {
@@ -2438,6 +2523,8 @@ fn writeFileAbsolute(path: []const u8, data: []const u8) !void {
     var writer = file.writer(io, &buf);
     try writer.interface.writeAll(data);
     try writer.end();
+    try file.sync(io);
+    try syncPathAncestorsWithIo(io, std.fs.path.dirname(path) orelse ".");
 }
 
 fn writeFileAbsoluteIfAbsent(alloc: std.mem.Allocator, path: []const u8, data: []const u8) !void {
@@ -2494,6 +2581,7 @@ fn writeFileAbsoluteIfAbsent(alloc: std.mem.Allocator, path: []const u8, data: [
         try std.Io.Dir.renameAbsolute(tmp_path, path, io)
     else
         try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    try syncPathAncestorsWithIo(io, std.fs.path.dirname(path) orelse ".");
 }
 
 fn readFileAbsoluteAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -2522,12 +2610,28 @@ fn pathExists(path: []const u8) !bool {
 }
 
 fn copyFileAbsolute(src_path: []const u8, dest_path: []const u8) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    return copyFileAbsoluteWithIo(io_impl.io(), src_path, dest_path);
+    return try copyFileAbsoluteWithDurability(src_path, dest_path, .durable);
 }
 
-fn copyFileAbsoluteWithIo(io: std.Io, src_path: []const u8, dest_path: []const u8) !void {
+fn copyFileAbsoluteWithDurability(
+    src_path: []const u8,
+    dest_path: []const u8,
+    durability: CopyDurability,
+) !void {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try copyFileAbsoluteWithIoOptions(io, src_path, dest_path, durability);
+    if (durability == .durable)
+        try syncPathAncestorsWithIo(io, std.fs.path.dirname(dest_path) orelse ".");
+}
+
+fn copyFileAbsoluteWithIoOptions(
+    io: std.Io,
+    src_path: []const u8,
+    dest_path: []const u8,
+    durability: CopyDurability,
+) !void {
     if (std.fs.path.dirname(dest_path)) |dir_name| try ensureDirPathWithIo(io, dir_name);
 
     var src = if (std.fs.path.isAbsolute(src_path))
@@ -2547,7 +2651,11 @@ fn copyFileAbsoluteWithIo(io: std.Io, src_path: []const u8, dest_path: []const u
         error.ReadFailed => return src_reader.err.?,
         error.WriteFailed => return writer.err.?,
     };
-    try writer.flush();
+    try writer.end();
+    const final_src_stat = try src.stat(io);
+    if (final_src_stat.size != src_stat.size or !std.meta.eql(final_src_stat.mtime, src_stat.mtime))
+        return error.SourceFileChanged;
+    if (durability == .durable) try dest.sync(io);
 }
 
 fn ensureDirPath(path: []const u8) !void {
@@ -2558,6 +2666,16 @@ fn ensureDirPath(path: []const u8) !void {
 
 fn ensureDirPathWithIo(io: std.Io, path: []const u8) !void {
     try fs_paths.createDirPathPortable(io, path);
+}
+
+fn syncPathAncestorsWithIo(io: std.Io, start_path: []const u8) !void {
+    var current = start_path;
+    while (true) {
+        try fs_paths.syncDirPortable(io, if (current.len == 0) "." else current);
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        current = parent;
+    }
 }
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
