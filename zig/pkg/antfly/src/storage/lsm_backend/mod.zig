@@ -42,11 +42,13 @@ pub const reader_pin_kind_count = impl.reader_pin_kind_count;
 pub const readerPinKindName = impl.readerPinKindName;
 pub const mutableSnapshotReasonName = impl.mutableSnapshotReasonName;
 
-test {
-    _ = impl;
-    _ = cache;
-    _ = storage_io;
-    _ = wal;
-    _ = background;
-    _ = compaction_scheduler;
+test "lsm backend module tests are reachable" {
+    const std = @import("std");
+    std.testing.refAllDecls(impl);
+    std.testing.refAllDecls(cache);
+    std.testing.refAllDecls(storage_io);
+    std.testing.refAllDecls(wal);
+    std.testing.refAllDecls(background);
+    std.testing.refAllDecls(compaction_scheduler);
+    std.testing.refAllDecls(@import("../sim_runtime.zig"));
 }

@@ -6251,6 +6251,12 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn abortLocalStructuralCachedDbMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        // The catalog is the durable structural authority. A multi-group
+        // mutation may have committed to an earlier DB before a later DB
+        // fails, so retire every cache-visible handle first, then hand the
+        // table to the bounded reconciler. This avoids expensive rollback
+        // writes and guarantees convergence without waiting for a foreground
+        // read to reopen each group.
         lockAtomic(&self.local_db_mutex);
         self.invalidateWriteCache(table_name);
         self.invalidateReadCache(table_name);
@@ -6258,6 +6264,12 @@ pub const ProvisionedTableWriteSource = struct {
         self.local_db_mutex.unlock();
         self.drainWriteCachePendingCloses();
         self.endStructuralTableActivity(table_name);
+        self.enqueueTableStructuralReconcile(table_name) catch |err| {
+            std.log.err("failed to enqueue structural recovery after cached mutation failure table={s} err={s}", .{
+                table_name,
+                @errorName(err),
+            });
+        };
     }
 
     fn abortLocalStructuralMutationUnlocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {

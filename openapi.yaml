@@ -10896,6 +10896,7 @@ components:
           example: portable
         table_names:
           type: array
+          minItems: 1
           maxItems: 256
           uniqueItems: true
           items:

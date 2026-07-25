@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
@@ -79,6 +80,22 @@ func TestFileBackupStoreReservationPermanentlyConsumesID(t *testing.T) {
 		backupStore.ReserveBackupID(context.Background(), "backup-1"),
 		ErrBackupAlreadyExists,
 	)
+}
+
+func TestFileBackupStoreCleanupReleasesReservationAfterArtifactsAreRemoved(t *testing.T) {
+	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "backup-1-1.tar.zst"),
+		[]byte("artifact"),
+		0o600,
+	))
+
+	require.NoError(t, backupStore.DeleteArtifact(context.Background(), "backup-1-1.tar.zst"))
+	require.NoError(t, backupStore.DeleteMetadata(context.Background(), "backup-1"))
+	require.NoError(t, backupStore.ReleaseBackupID(context.Background(), "backup-1"))
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
 }
 
 func TestFileBackupStoreDoesNotPublishAfterCancellation(t *testing.T) {
@@ -209,6 +226,23 @@ func TestClusterBackupMetadataRequiresVersionIDAndFormat(t *testing.T) {
 	}
 	require.NoError(t, validateClusterBackupMetadata("backup-1", valid))
 
+	legacy := *valid
+	legacy.Version = clusterBackupMetadataLegacyVersion
+	legacy.State = ""
+	legacy.ExpectedTableCount = 0
+	legacy.CompletedTableCount = 0
+	require.NoError(t, validateClusterBackupMetadata("backup-1", &legacy))
+
+	legacyFailed := legacy
+	legacyFailed.Tables = append([]ClusterBackupTableInfo(nil), legacy.Tables...)
+	legacyFailed.Tables[0].Status = "failed"
+	legacyFailed.Tables[0].Error = "interrupted"
+	require.ErrorContains(
+		t,
+		validateClusterBackupMetadata("backup-1", &legacyFailed),
+		"incomplete table entry",
+	)
+
 	invalidVersion := *valid
 	invalidVersion.Version = 0
 	require.ErrorContains(
@@ -249,4 +283,104 @@ func TestClusterBackupMetadataRequiresVersionIDAndFormat(t *testing.T) {
 		validateClusterBackupMetadata("backup-1", &failedTable),
 		"incomplete table entry",
 	)
+}
+
+func TestClusterBackupAttemptMarkersSelectNewestAttempt(t *testing.T) {
+	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
+	older := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-older",
+		BackupID:           "backup-1",
+		CreatedAt:          time.Now().UTC().Add(-time.Minute),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"documents-backup-1"},
+		ArtifactNames:      []string{"backup-1-1.afb"},
+	}
+	newer := *older
+	newer.AttemptID = "afba-newer"
+	newer.BackupID = "backup-2"
+	newer.CreatedAt = older.CreatedAt.Add(time.Second)
+
+	require.NoError(t, writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		older,
+	))
+	require.NoError(t, writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		&newer,
+	))
+	latest, err := latestClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		backupStore,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, latest)
+	assert.Equal(t, newer.AttemptID, latest.AttemptID)
+	assert.Equal(t, newer.BackupID, latest.BackupID)
+}
+
+func TestStaleClusterBackupAttemptReclaimsArtifactsAndReservation(t *testing.T) {
+	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "backup-1-1.afb"),
+		[]byte("artifact"),
+		0o600,
+	))
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-stale",
+		BackupID:           "backup-1",
+		CreatedAt:          time.Now().UTC().Add(-clusterBackupAttemptMaxAge - time.Minute),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"documents-backup-1"},
+		ArtifactNames:      []string{"backup-1-1.afb"},
+	}
+	require.NoError(t, writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	))
+
+	latest, err := latestClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		backupStore,
+	)
+	require.NoError(t, err)
+	require.Nil(t, latest)
+	require.NoFileExists(t, filepath.Join(root, "backup-1-1.afb"))
+	require.NoFileExists(t, filepath.Join(
+		root,
+		clusterBackupAttemptDir,
+		attempt.AttemptID+".json",
+	))
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+}
+
+func TestFileBackupStoreValidatesArtifactPresence(t *testing.T) {
+	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
+	require.Error(t, backupStore.ValidateArtifact(context.Background(), "missing.afb"))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "present.afb"),
+		[]byte("artifact"),
+		0o600,
+	))
+	require.NoError(t, backupStore.ValidateArtifact(context.Background(), "present.afb"))
+	require.Error(t, backupStore.ValidateArtifact(context.Background(), "../outside.afb"))
 }

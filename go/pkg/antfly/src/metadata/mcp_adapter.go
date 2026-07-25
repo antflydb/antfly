@@ -17,10 +17,12 @@ package metadata
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/blevesearch/bleve/v2/search/query"
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/ai"
@@ -444,6 +446,29 @@ func (a *mcpAdapter) Backup(
 	if err := metadataStore.ReserveBackupID(ctx, backupID); err != nil {
 		return err
 	}
+	committed := false
+	cleanupSafe := true
+	createdArtifacts := backupArtifactNamesForFormat(backupID, table, backup.Format)
+	defer func() {
+		if committed {
+			return
+		}
+		if !cleanupSafe {
+			a.t.logger.Error(
+				"MCP backup publication outcome is ambiguous; retaining fenced attempt",
+				zap.String("backup_id", backupID),
+			)
+			return
+		}
+		if err := cleanupBackupAttempt(
+			metadataStore,
+			backupID,
+			nil,
+			createdArtifacts,
+		); err != nil {
+			a.t.logger.Error("Failed to clean abandoned MCP backup", zap.String("backup_id", backupID), zap.Error(err))
+		}
+	}()
 	backup.ResolvedLocation = metadataStore.ResolvedLocation()
 	eg, egCtx := errgroup.WithContext(ctx)
 	for shardID := range table.Shards {
@@ -462,9 +487,13 @@ func (a *mcpAdapter) Backup(
 	}
 
 	// Write backup metadata
+	cleanupSafe = false
 	if err := metadataStore.WriteMetadata(ctx, backupID, table, backup.Format); err != nil {
+		cleanupSafe = errors.Is(err, ErrBackupAlreadyExists) ||
+			errors.Is(err, ErrBackupMetadataTooLarge)
 		return fmt.Errorf("writing backup metadata: %w", err)
 	}
+	committed = true
 
 	return nil
 }

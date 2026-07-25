@@ -36,6 +36,10 @@ import (
 type backupStore interface {
 	EnsureMetadataAbsent(ctx context.Context, id string) error
 	ReserveBackupID(ctx context.Context, id string) error
+	DeleteMetadata(ctx context.Context, id string) error
+	DeleteArtifact(ctx context.Context, name string) error
+	ValidateArtifact(ctx context.Context, name string) error
+	ReleaseBackupID(ctx context.Context, id string) error
 	WriteMetadata(ctx context.Context, id string, table *store.Table, format common.BackupFormat) error
 	ReadMetadata(ctx context.Context, id string) (*store.Table, common.BackupFormat, error)
 	ResolvedLocation() string
@@ -312,6 +316,67 @@ func (s *fileBackupStore) ReserveBackupID(ctx context.Context, id string) error 
 	return nil
 }
 
+func removeFileAndSyncDirectory(ctx context.Context, filePath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(filePath)) //#nosec G304 -- caller supplies an authorized backup path
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+	return dir.Sync()
+}
+
+func (s *fileBackupStore) DeleteMetadata(ctx context.Context, id string) error {
+	filePath, err := s.resolveAndValidate(id)
+	if err != nil {
+		return err
+	}
+	return removeFileAndSyncDirectory(ctx, filePath)
+}
+
+func (s *fileBackupStore) DeleteArtifact(ctx context.Context, name string) error {
+	if name == "" || filepath.Base(name) != name {
+		return fmt.Errorf("invalid backup artifact name %q", name)
+	}
+	root := strings.TrimPrefix(s.location, "file://")
+	return removeFileAndSyncDirectory(ctx, filepath.Join(root, name))
+}
+
+func (s *fileBackupStore) ValidateArtifact(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if name == "" || filepath.Base(name) != name {
+		return fmt.Errorf("invalid backup artifact name %q", name)
+	}
+	root := strings.TrimPrefix(s.location, "file://")
+	info, err := os.Stat(filepath.Join(root, name))
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 {
+		return fmt.Errorf("backup artifact %q is not a non-empty regular file", name)
+	}
+	return nil
+}
+
+func (s *fileBackupStore) ReleaseBackupID(ctx context.Context, id string) error {
+	filePath, err := s.resolveAndValidate(id)
+	if err != nil {
+		return err
+	}
+	reservationPath := strings.TrimSuffix(filePath, "-metadata.json") + "-reservation"
+	return removeFileAndSyncDirectory(ctx, reservationPath)
+}
+
 func (s *fileBackupStore) WriteMetadata(
 	ctx context.Context,
 	id string,
@@ -436,6 +501,70 @@ func (s *s3BackupStore) ReserveBackupID(ctx context.Context, id string) error {
 		return fmt.Errorf("reserving backup ID: %w", err)
 	}
 	return nil
+}
+
+func (s *s3BackupStore) artifactKey(name string) (string, error) {
+	if name == "" || path.Base(name) != name {
+		return "", fmt.Errorf("invalid backup artifact name %q", name)
+	}
+	if s.s3Config.Prefix == "" {
+		return name, nil
+	}
+	return path.Join(s.s3Config.Prefix, name), nil
+}
+
+func (s *s3BackupStore) removeObject(ctx context.Context, objectKey string) error {
+	client, err := s.s3Config.EnsureBucket(ctx)
+	if err != nil {
+		return err
+	}
+	return client.RemoveObject(ctx, s.s3Config.Bucket, objectKey, minio.RemoveObjectOptions{})
+}
+
+func (s *s3BackupStore) DeleteMetadata(ctx context.Context, id string) error {
+	if err := common.ValidateBackupID(id); err != nil {
+		return err
+	}
+	return s.removeObject(ctx, s.objectKey(id))
+}
+
+func (s *s3BackupStore) DeleteArtifact(ctx context.Context, name string) error {
+	key, err := s.artifactKey(name)
+	if err != nil {
+		return err
+	}
+	return s.removeObject(ctx, key)
+}
+
+func (s *s3BackupStore) ValidateArtifact(ctx context.Context, name string) error {
+	key, err := s.artifactKey(name)
+	if err != nil {
+		return err
+	}
+	client, err := s.s3Config.EnsureBucket(ctx)
+	if err != nil {
+		return err
+	}
+	info, err := client.StatObject(
+		ctx,
+		s.s3Config.Bucket,
+		key,
+		minio.StatObjectOptions{},
+	)
+	if err != nil {
+		return err
+	}
+	if info.Size <= 0 {
+		return fmt.Errorf("backup artifact %q is empty", name)
+	}
+	return nil
+}
+
+func (s *s3BackupStore) ReleaseBackupID(ctx context.Context, id string) error {
+	if err := common.ValidateBackupID(id); err != nil {
+		return err
+	}
+	return s.removeObject(ctx, s.reservationKey(id))
 }
 
 func (s *s3BackupStore) WriteMetadata(

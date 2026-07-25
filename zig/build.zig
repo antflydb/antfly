@@ -4492,6 +4492,9 @@ pub fn build(b: *std.Build) void {
             "backup manifest round trips through remote objectstore location",
             "remote backup metadata reads are size bounded",
             "cluster backup list uses top-level remote manifests without recursing into payloads",
+            "remote backup reservations fence duplicate execution and can be released after cleanup",
+            "stale cluster backup attempt reclamation is bounded and releases fenced artifacts",
+            "stale cluster backup attempt preserves aggregate referenced artifacts",
             "filesystem backup listing is bounded and cursor stable",
             "native backup directory copy preserves nested files",
             "remote portable file transfer uses objectstore file paths",
@@ -5308,7 +5311,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = compileFiltersWithAnchors(
             b,
-            &.{"storage.lsm_backend.mod.test_0"},
+            &.{"lsm backend module tests are reachable"},
             lsm_backend_runtime_filters,
         ),
         .test_runner = .{

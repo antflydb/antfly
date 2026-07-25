@@ -223,6 +223,10 @@ pub fn appendStateWithOptionsResult(
     var current_size = current.size;
     var index_syncs: u64 = 0;
     if (!current.index_exists) {
+        // Persist the WAL directory's own namespace entry once during
+        // initialization. Segment rotation only needs the already-durable WAL
+        // directory and does not add a steady-state parent sync.
+        if (sync) try storage.syncParentAbsolute(wal_dir);
         try writeCurrentSegment(storage, allocator, root_dir, segment, current_size);
         index_syncs += 1;
         try writeCheckpointIndex(storage, allocator, root_dir, .{
@@ -353,6 +357,7 @@ pub fn reset(storage: storage_io.Storage, allocator: Allocator, root_dir: []cons
     const wal_dir = try walDirPathAlloc(allocator, root_dir);
     defer allocator.free(wal_dir);
     try storage.createDirPath(wal_dir);
+    try storage.syncParentAbsolute(wal_dir);
 
     const current_segment = (readCurrentSegmentIfPresent(storage, allocator, root_dir) catch |err| switch (err) {
         error.FileNotFound => CurrentSegment{ .segment = 1, .size = 0, .index_exists = false },
@@ -540,6 +545,13 @@ pub fn appendReplay(
 
     const index = try readReplayIndex(storage, allocator, root_dir);
     if (!index.exists) {
+        // The replay segment is nested two directory levels below the root.
+        // Make both ancestors durable before publishing an index that can
+        // expose replay data after a crash.
+        if (sync) {
+            try storage.syncParentAbsolute(wal_dir);
+            try storage.syncParentAbsolute(replay_dir);
+        }
         try writeReplayIndex(storage, allocator, root_dir, .{
             .current_segment = 1,
             .next_sequence = index.next_sequence,
@@ -558,16 +570,19 @@ pub fn appendReplay(
         error.FileNotFound => 0,
         else => return err,
     };
+    var segment_became_nonempty = current_size == 0;
     if (current_size > 0 and current_size + record.len > options.segment_bytes) {
         segment += 1;
         allocator.free(segment_path);
         segment_path_owned = false;
         segment_path = try replaySegmentPathAlloc(allocator, root_dir, segment);
         segment_path_owned = true;
+        segment_became_nonempty = true;
     }
 
     try appendReplaySegmentEntryIfNeeded(storage, allocator, root_dir, segment, sequence, true);
     try storage.appendFileAbsolute(allocator, segment_path, record, sync);
+    if (sync and segment_became_nonempty) try storage.syncParentAbsolute(segment_path);
     try writeReplayIndex(storage, allocator, root_dir, .{
         .current_segment = segment,
         .next_sequence = sequence + 1,
@@ -1334,7 +1349,7 @@ fn appendMainReplaySegmentEntryIfNeeded(
             var raw: [committed_segment_entry_len]u8 = undefined;
             std.mem.writeInt(u64, raw[0..8], segment, .little);
             std.mem.writeInt(u64, raw[8..16], sequence, .little);
-            try storage.writeFileAbsolute(segments_path, &raw);
+            try replaceFileAtomically(storage, allocator, segments_path, &raw);
             return;
         },
         else => return err,
@@ -1344,7 +1359,7 @@ fn appendMainReplaySegmentEntryIfNeeded(
         var raw: [committed_segment_entry_len]u8 = undefined;
         std.mem.writeInt(u64, raw[0..8], segment, .little);
         std.mem.writeInt(u64, raw[8..16], sequence, .little);
-        try storage.writeFileAbsolute(segments_path, &raw);
+        try replaceFileAtomically(storage, allocator, segments_path, &raw);
         return;
     }
     if (size % committed_segment_entry_len != 0) return error.CorruptLsmWalIndex;
@@ -1384,7 +1399,7 @@ fn appendReplaySegmentEntryIfNeeded(
             var raw: [committed_segment_entry_len]u8 = undefined;
             std.mem.writeInt(u64, raw[0..8], segment, .little);
             std.mem.writeInt(u64, raw[8..16], sequence, .little);
-            try storage.writeFileAbsolute(segments_path, &raw);
+            try replaceFileAtomically(storage, allocator, segments_path, &raw);
             return;
         },
         else => return err,
@@ -1394,7 +1409,7 @@ fn appendReplaySegmentEntryIfNeeded(
         var raw: [committed_segment_entry_len]u8 = undefined;
         std.mem.writeInt(u64, raw[0..8], segment, .little);
         std.mem.writeInt(u64, raw[8..16], sequence, .little);
-        try storage.writeFileAbsolute(segments_path, &raw);
+        try replaceFileAtomically(storage, allocator, segments_path, &raw);
         return;
     }
     if (size % committed_segment_entry_len != 0) return error.CorruptLsmWalIndex;
@@ -1851,9 +1866,9 @@ test "lsm wal replay reads chunks into bounded pending buffer" {
             return self.backing.storage().appendFileAbsolute(std.testing.allocator, path, contents, sync);
         }
 
-        fn syncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.backing.storage().syncFileAbsolute(path);
+            return self.backing.storage().syncFileContentsAbsolute(path);
         }
 
         fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -1891,8 +1906,9 @@ test "lsm wal replay reads chunks into bounded pending buffer" {
         .read_file_trailer_alloc = CountingStorage.readFileTrailerAlloc,
         .write_file_absolute = CountingStorage.writeFileAbsolute,
         .append_file_absolute = CountingStorage.appendFileAbsolute,
-        .sync_file_absolute = CountingStorage.syncFileAbsolute,
+        .sync_contents_absolute = CountingStorage.syncFileContentsAbsolute,
         .sync_parent_absolute = CountingStorage.syncParentAbsolute,
+        .rename_is_atomic = true,
         .rename_absolute = CountingStorage.renameAbsolute,
         .delete_file_absolute = CountingStorage.deleteFileAbsolute,
         .delete_tree = CountingStorage.deleteTree,

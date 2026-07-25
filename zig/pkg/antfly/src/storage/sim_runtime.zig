@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const lsm_storage = @import("lsm_backend/storage_io.zig");
+const lsm_wal = @import("lsm_backend/wal.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -235,13 +236,51 @@ pub const Device = struct {
 };
 
 pub const ModeledDevice = struct {
+    const DurableBytes = struct {
+        refs: usize = 1,
+        bytes: []u8,
+
+        fn create(alloc: Allocator, bytes: []const u8) !?*DurableBytes {
+            if (bytes.len == 0) return null;
+            const snapshot = try alloc.create(DurableBytes);
+            errdefer alloc.destroy(snapshot);
+            snapshot.* = .{ .bytes = try alloc.dupe(u8, bytes) };
+            return snapshot;
+        }
+
+        fn retain(self: *DurableBytes) *DurableBytes {
+            std.debug.assert(self.refs < std.math.maxInt(usize));
+            self.refs += 1;
+            return self;
+        }
+
+        fn release(self: *DurableBytes, alloc: Allocator) void {
+            std.debug.assert(self.refs > 0);
+            self.refs -= 1;
+            if (self.refs != 0) return;
+            alloc.free(self.bytes);
+            alloc.destroy(self);
+        }
+    };
+
     const FileState = struct {
         volatile_bytes: []u8 = &.{},
-        durable_bytes: []u8 = &.{},
+        durable_bytes: ?*DurableBytes = null,
 
         fn deinit(self: *FileState, alloc: Allocator) void {
             if (self.volatile_bytes.len > 0) alloc.free(self.volatile_bytes);
-            if (self.durable_bytes.len > 0) alloc.free(self.durable_bytes);
+            if (self.durable_bytes) |snapshot| snapshot.release(alloc);
+            self.* = undefined;
+        }
+    };
+
+    const DirtyDirectory = struct {
+        paths: std.StringHashMapUnmanaged(void) = .empty,
+
+        fn deinit(self: *DirtyDirectory, alloc: Allocator) void {
+            var it = self.paths.keyIterator();
+            while (it.next()) |path| alloc.free(path.*);
+            self.paths.deinit(alloc);
             self.* = undefined;
         }
     };
@@ -249,7 +288,10 @@ pub const ModeledDevice = struct {
     alloc: Allocator,
     mutex: SpinMutex = .{},
     files: std.StringHashMapUnmanaged(FileState) = .empty,
-    durable_files: std.StringHashMapUnmanaged([]u8) = .empty,
+    durable_files: std.StringHashMapUnmanaged(?*DurableBytes) = .empty,
+    directories: std.StringHashMapUnmanaged(void) = .empty,
+    durable_directories: std.StringHashMapUnmanaged(void) = .empty,
+    dirty_directories: std.StringHashMapUnmanaged(DirtyDirectory) = .empty,
     tick: u64 = 1,
     fail_next_write: bool = false,
     fail_next_sync: bool = false,
@@ -275,9 +317,21 @@ pub const ModeledDevice = struct {
         var durable_it = self.durable_files.iterator();
         while (durable_it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
-            self.alloc.free(entry.value_ptr.*);
+            if (entry.value_ptr.*) |snapshot| snapshot.release(self.alloc);
         }
         self.durable_files.deinit(self.alloc);
+        var dir_it = self.directories.keyIterator();
+        while (dir_it.next()) |path| self.alloc.free(path.*);
+        self.directories.deinit(self.alloc);
+        var durable_dir_it = self.durable_directories.keyIterator();
+        while (durable_dir_it.next()) |path| self.alloc.free(path.*);
+        self.durable_directories.deinit(self.alloc);
+        var dirty_it = self.dirty_directories.iterator();
+        while (dirty_it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.alloc);
+        }
+        self.dirty_directories.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -389,51 +443,103 @@ pub const ModeledDevice = struct {
             self.drop_next_sync = false;
             return;
         }
-        const durable = try self.alloc.dupe(u8, file.volatile_bytes);
-        if (file.durable_bytes.len > 0) self.alloc.free(file.durable_bytes);
+        const durable = try DurableBytes.create(self.alloc, file.volatile_bytes);
+        if (file.durable_bytes) |old| old.release(self.alloc);
         file.durable_bytes = durable;
         if (self.durable_files.getPtr(path)) |durable_file| {
-            const persisted = try self.alloc.dupe(u8, file.volatile_bytes);
-            self.alloc.free(durable_file.*);
-            durable_file.* = persisted;
+            const published = if (durable) |snapshot| snapshot.retain() else null;
+            if (durable_file.*) |old| old.release(self.alloc);
+            durable_file.* = published;
         }
     }
 
     fn syncDirectoryLocked(self: *ModeledDevice, parent: []const u8) !void {
-        var obsolete = std.ArrayListUnmanaged([]const u8).empty;
-        defer obsolete.deinit(self.alloc);
-        var durable_it = self.durable_files.keyIterator();
-        while (durable_it.next()) |path| {
-            if (std.mem.eql(u8, parentPath(path.*), parent) and !self.files.contains(path.*)) {
-                try obsolete.append(self.alloc, path.*);
+        const dirty = self.dirty_directories.getPtr(parent) orelse return;
+        var dirty_it = dirty.paths.keyIterator();
+        while (dirty_it.next()) |path| {
+            if (self.files.get(path.*)) |file| {
+                try self.publishDurableFileLocked(path.*, file.durable_bytes);
+            } else if (self.directories.contains(path.*)) {
+                try self.publishDurableDirectoryLocked(path.*);
+            } else {
+                self.removeDurableFileLocked(path.*);
+                try self.removeDurableDirectoryTreeLocked(path.*);
             }
         }
-        for (obsolete.items) |path| {
-            const removed = self.durable_files.fetchRemove(path) orelse continue;
-            self.alloc.free(removed.key);
-            self.alloc.free(removed.value);
-        }
 
-        var volatile_it = self.files.iterator();
-        while (volatile_it.next()) |entry| {
-            if (!std.mem.eql(u8, parentPath(entry.key_ptr.*), parent)) continue;
-            try self.publishDurableFileLocked(entry.key_ptr.*, entry.value_ptr.durable_bytes);
-        }
+        const removed = self.dirty_directories.fetchRemove(parent).?;
+        self.alloc.free(removed.key);
+        var removed_dirty = removed.value;
+        removed_dirty.deinit(self.alloc);
     }
 
-    fn publishDurableFileLocked(self: *ModeledDevice, path: []const u8, bytes: []const u8) !void {
-        const durable_bytes = try self.alloc.dupe(u8, bytes);
-        errdefer self.alloc.free(durable_bytes);
+    fn publishDurableFileLocked(self: *ModeledDevice, path: []const u8, snapshot: ?*DurableBytes) !void {
         const owned_path = try self.alloc.dupe(u8, path);
         errdefer self.alloc.free(owned_path);
         const gop = try self.durable_files.getOrPut(self.alloc, owned_path);
         if (gop.found_existing) {
             self.alloc.free(owned_path);
-            self.alloc.free(gop.value_ptr.*);
+            if (gop.value_ptr.*) |old| old.release(self.alloc);
         } else {
             gop.key_ptr.* = owned_path;
         }
-        gop.value_ptr.* = durable_bytes;
+        gop.value_ptr.* = if (snapshot) |bytes| bytes.retain() else null;
+    }
+
+    fn removeDurableFileLocked(self: *ModeledDevice, path: []const u8) void {
+        const removed = self.durable_files.fetchRemove(path) orelse return;
+        self.alloc.free(removed.key);
+        if (removed.value) |snapshot| snapshot.release(self.alloc);
+    }
+
+    fn removeDurableDirectoryTreeLocked(self: *ModeledDevice, path: []const u8) !void {
+        var doomed = std.ArrayListUnmanaged([]const u8).empty;
+        defer doomed.deinit(self.alloc);
+        var file_it = self.durable_files.keyIterator();
+        while (file_it.next()) |file_path| {
+            if (pathContains(path, file_path.*)) try doomed.append(self.alloc, file_path.*);
+        }
+        for (doomed.items) |file_path| self.removeDurableFileLocked(file_path);
+
+        doomed.clearRetainingCapacity();
+        var dir_it = self.durable_directories.keyIterator();
+        while (dir_it.next()) |dir_path| {
+            if (pathContains(path, dir_path.*)) try doomed.append(self.alloc, dir_path.*);
+        }
+        for (doomed.items) |dir_path| {
+            const removed = self.durable_directories.fetchRemove(dir_path) orelse continue;
+            self.alloc.free(removed.key);
+        }
+    }
+
+    fn publishDurableDirectoryLocked(self: *ModeledDevice, path: []const u8) !void {
+        if (self.durable_directories.contains(path)) return;
+        const owned_path = try self.alloc.dupe(u8, path);
+        errdefer self.alloc.free(owned_path);
+        try self.durable_directories.put(self.alloc, owned_path, {});
+    }
+
+    fn ensureDirectoryLocked(self: *ModeledDevice, path: []const u8) !void {
+        if (path.len == 0 or std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, ".")) return;
+        if (self.directories.contains(path)) return;
+        const parent = parentPath(path);
+        const top_level = std.mem.eql(u8, parent, "/") or std.mem.eql(u8, parent, ".");
+        if (!top_level) try self.markNamespaceDirtyLocked(path);
+        const owned_path = try self.alloc.dupe(u8, path);
+        errdefer self.alloc.free(owned_path);
+        if (top_level and !self.durable_directories.contains(path)) {
+            const owned_durable_path = try self.alloc.dupe(u8, path);
+            errdefer self.alloc.free(owned_durable_path);
+            try self.directories.ensureUnusedCapacity(self.alloc, 1);
+            try self.durable_directories.ensureUnusedCapacity(self.alloc, 1);
+            self.directories.putAssumeCapacityNoClobber(owned_path, {});
+            self.durable_directories.putAssumeCapacityNoClobber(owned_durable_path, {});
+            return;
+        }
+        try self.directories.putNoClobber(self.alloc, owned_path, {});
+        // A top-level test/provisioned root is outside the modeled database
+        // lifecycle. Nested directories must cross an explicit parent sync.
+        if (top_level) std.debug.assert(self.durable_directories.contains(path));
     }
 
     fn truncate(ptr: *anyopaque, path: []const u8, len: usize) !void {
@@ -448,6 +554,12 @@ pub const ModeledDevice = struct {
         const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (!self.files.contains(old_path)) return error.FileNotFound;
+        try self.markNamespaceDirtyLocked(old_path);
+        try self.markNamespaceDirtyLocked(new_path);
+        const owned_new_path = try self.alloc.dupe(u8, new_path);
+        errdefer self.alloc.free(owned_new_path);
+        try self.files.ensureUnusedCapacity(self.alloc, 1);
         const removed = self.files.fetchRemove(old_path) orelse return error.FileNotFound;
         self.alloc.free(removed.key);
         if (self.files.fetchRemove(new_path)) |existing| {
@@ -455,9 +567,7 @@ pub const ModeledDevice = struct {
             var existing_file = existing.value;
             existing_file.deinit(self.alloc);
         }
-        const owned_new_path = try self.alloc.dupe(u8, new_path);
-        errdefer self.alloc.free(owned_new_path);
-        try self.files.put(self.alloc, owned_new_path, removed.value);
+        self.files.putAssumeCapacityNoClobber(owned_new_path, removed.value);
     }
 
     fn remove(ptr: *anyopaque, path: []const u8) !void {
@@ -465,6 +575,8 @@ pub const ModeledDevice = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.consumeFaultNeedle(&self.fail_next_delete_path_contains, path)) return error.InjectedDeleteFault;
+        if (!self.files.contains(path)) return;
+        try self.markNamespaceDirtyLocked(path);
         const removed = self.files.fetchRemove(path) orelse return;
         self.alloc.free(removed.key);
         var file = removed.value;
@@ -505,7 +617,22 @@ pub const ModeledDevice = struct {
         }
         var durable_it = self.durable_files.iterator();
         while (durable_it.next()) |entry| {
+            if (!self.durableAncestorsPresentLocked(entry.key_ptr.*)) continue;
             try cloneDurableFileInto(self.alloc, &restored, entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        var restored_directories: std.StringHashMapUnmanaged(void) = .empty;
+        errdefer {
+            var restored_dir_it = restored_directories.keyIterator();
+            while (restored_dir_it.next()) |path| self.alloc.free(path.*);
+            restored_directories.deinit(self.alloc);
+        }
+        var durable_dir_it = self.durable_directories.keyIterator();
+        while (durable_dir_it.next()) |path| {
+            if (!self.durableAncestorsPresentLocked(path.*)) continue;
+            const owned = try self.alloc.dupe(u8, path.*);
+            errdefer self.alloc.free(owned);
+            try restored_directories.put(self.alloc, owned, {});
         }
 
         var volatile_it = self.files.iterator();
@@ -515,19 +642,66 @@ pub const ModeledDevice = struct {
         }
         self.files.deinit(self.alloc);
         self.files = restored;
+        var volatile_dir_it = self.directories.keyIterator();
+        while (volatile_dir_it.next()) |path| self.alloc.free(path.*);
+        self.directories.deinit(self.alloc);
+        self.directories = restored_directories;
+        self.clearDirtyDirectoriesLocked();
     }
 
     fn ensureFile(self: *ModeledDevice, path: []const u8) !*FileState {
+        if (self.files.getPtr(path)) |file| return file;
+        try self.markNamespaceDirtyLocked(path);
         const owned_path = try self.alloc.dupe(u8, path);
         errdefer self.alloc.free(owned_path);
-        const gop = try self.files.getOrPut(self.alloc, owned_path);
-        if (gop.found_existing) {
-            self.alloc.free(owned_path);
-        } else {
-            gop.key_ptr.* = owned_path;
-            gop.value_ptr.* = .{};
+        try self.files.putNoClobber(self.alloc, owned_path, .{});
+        return self.files.getPtr(path).?;
+    }
+
+    fn markNamespaceDirtyLocked(self: *ModeledDevice, path: []const u8) !void {
+        const parent = parentPath(path);
+        if (self.dirty_directories.getPtr(parent)) |dirty| {
+            if (dirty.paths.contains(path)) return;
+            const owned_path = try self.alloc.dupe(u8, path);
+            dirty.paths.putNoClobber(self.alloc, owned_path, {}) catch |err| {
+                self.alloc.free(owned_path);
+                return err;
+            };
+            return;
         }
-        return gop.value_ptr;
+
+        var dirty: DirtyDirectory = .{};
+        errdefer dirty.deinit(self.alloc);
+        const owned_path = try self.alloc.dupe(u8, path);
+        dirty.paths.putNoClobber(self.alloc, owned_path, {}) catch |err| {
+            self.alloc.free(owned_path);
+            return err;
+        };
+        const owned_parent = try self.alloc.dupe(u8, parent);
+        self.dirty_directories.putNoClobber(self.alloc, owned_parent, dirty) catch |err| {
+            self.alloc.free(owned_parent);
+            return err;
+        };
+    }
+
+    fn durableAncestorsPresentLocked(self: *const ModeledDevice, path: []const u8) bool {
+        var parent = parentPath(path);
+        while (!std.mem.eql(u8, parent, "/") and !std.mem.eql(u8, parent, ".")) {
+            if (!self.durable_directories.contains(parent)) return false;
+            const next = parentPath(parent);
+            if (std.mem.eql(u8, next, parent)) break;
+            parent = next;
+        }
+        return true;
+    }
+
+    fn clearDirtyDirectoriesLocked(self: *ModeledDevice) void {
+        var dirty_it = self.dirty_directories.iterator();
+        while (dirty_it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.alloc);
+        }
+        self.dirty_directories.clearRetainingCapacity();
     }
 
     fn replaceFaultNeedle(self: *ModeledDevice, slot: *?[]u8, needle: []const u8) !void {
@@ -552,15 +726,30 @@ const modeled_storage_vtable: lsm_storage.Storage.VTable = .{
     .read_file_trailer_alloc = modeledReadFileTrailerAlloc,
     .write_file_absolute = modeledWriteFileAbsolute,
     .append_file_absolute = modeledAppendFileAbsolute,
-    .sync_file_absolute = modeledSyncFileAbsolute,
+    .sync_contents_absolute = modeledSyncFileContentsAbsolute,
     .sync_parent_absolute = modeledSyncParentAbsolute,
     .rename_absolute = modeledRenameAbsolute,
     .delete_file_absolute = modeledDeleteFileAbsolute,
     .delete_tree = modeledDeleteTree,
     .now_ns = modeledNowNs,
+    .rename_is_atomic = true,
 };
 
-fn modeledCreateDirPath(_: *anyopaque, _: []const u8) !void {}
+fn modeledCreateDirPath(ptr: *anyopaque, path: []const u8) !void {
+    const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    if (path.len == 0) return;
+
+    var i: usize = if (std.fs.path.isAbsolute(path)) 1 else 0;
+    while (i < path.len) : (i += 1) {
+        if (path[i] != '/') continue;
+        if (i > 0) try self.ensureDirectoryLocked(path[0..i]);
+    }
+    var end = path.len;
+    while (end > 1 and path[end - 1] == '/') end -= 1;
+    try self.ensureDirectoryLocked(path[0..end]);
+}
 
 fn modeledReadFileAlloc(ptr: *anyopaque, alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
@@ -597,10 +786,15 @@ fn modeledReadFileTrailerAlloc(ptr: *anyopaque, alloc: Allocator, path: []const 
 
 fn modeledWriteFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
     const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
-    const device = self.device();
-    try device.truncate(path, 0);
-    try device.write(path, 0, contents);
-    try device.sync(path);
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    if (self.fail_next_write or self.consumeFaultNeedle(&self.fail_next_write_path_contains, path)) {
+        self.fail_next_write = false;
+        return error.InjectedWriteFault;
+    }
+    const file = try self.ensureFile(path);
+    try resizeBuffer(self.alloc, &file.volatile_bytes, contents.len);
+    @memcpy(file.volatile_bytes, contents);
 }
 
 fn modeledAppendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, should_sync: bool) !void {
@@ -618,9 +812,11 @@ fn modeledAppendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []cons
     if (should_sync) try self.syncContentsLocked(path);
 }
 
-fn modeledSyncFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+fn modeledSyncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
-    try self.device().sync(path);
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    try self.syncContentsLocked(path);
 }
 
 fn modeledSyncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -662,12 +858,25 @@ fn modeledDeleteTree(ptr: *anyopaque, path: []const u8) !void {
         if (!pathContains(path, file_path.*)) continue;
         try doomed.append(self.alloc, file_path.*);
     }
+    for (doomed.items) |file_path| try self.markNamespaceDirtyLocked(file_path);
 
     for (doomed.items) |file_path| {
         const removed = self.files.fetchRemove(file_path) orelse continue;
         self.alloc.free(removed.key);
         var file = removed.value;
         file.deinit(self.alloc);
+    }
+
+    doomed.clearRetainingCapacity();
+    var dir_it = self.directories.keyIterator();
+    while (dir_it.next()) |dir_path| {
+        if (!pathContains(path, dir_path.*)) continue;
+        try doomed.append(self.alloc, dir_path.*);
+    }
+    for (doomed.items) |dir_path| try self.markNamespaceDirtyLocked(dir_path);
+    for (doomed.items) |dir_path| {
+        const removed = self.directories.fetchRemove(dir_path) orelse continue;
+        self.alloc.free(removed.key);
     }
 }
 
@@ -683,6 +892,7 @@ fn modeledNowNs(ptr: *anyopaque) u64 {
 fn pathContains(prefix: []const u8, path: []const u8) bool {
     if (!std.mem.startsWith(u8, path, prefix)) return false;
     if (path.len == prefix.len) return true;
+    if (std.mem.eql(u8, prefix, "/")) return true;
     return path[prefix.len] == '/';
 }
 
@@ -694,17 +904,18 @@ fn cloneDurableFileInto(
     alloc: Allocator,
     files: *std.StringHashMapUnmanaged(ModeledDevice.FileState),
     path: []const u8,
-    bytes: []const u8,
+    snapshot: ?*ModeledDevice.DurableBytes,
 ) !void {
+    const bytes = if (snapshot) |durable| durable.bytes else &.{};
     const owned_path = try alloc.dupe(u8, path);
     errdefer alloc.free(owned_path);
     const volatile_bytes = try alloc.dupe(u8, bytes);
     errdefer alloc.free(volatile_bytes);
-    const durable_bytes = try alloc.dupe(u8, bytes);
-    errdefer alloc.free(durable_bytes);
-    try files.put(alloc, owned_path, .{
+    const retained = if (snapshot) |durable| durable.retain() else null;
+    errdefer if (retained) |durable| durable.release(alloc);
+    try files.putNoClobber(alloc, owned_path, .{
         .volatile_bytes = volatile_bytes,
-        .durable_bytes = durable_bytes,
+        .durable_bytes = retained,
     });
 }
 
@@ -824,6 +1035,8 @@ test "modeled storage requires a directory sync for a newly created file" {
     defer device_model.deinit();
     const storage = device_model.storage();
 
+    try storage.createDirPath("/wal");
+    try storage.syncParentAbsolute("/wal");
     try storage.appendFileAbsolute(std.testing.allocator, "/wal/1.log", "first", true);
     try device_model.device().crash();
     try std.testing.expectError(
@@ -851,12 +1064,53 @@ test "modeled storage requires a directory sync for a newly created file" {
     try std.testing.expectEqualStrings("first", bytes);
 }
 
+test "modeled storage drops files below an unsynced nested directory" {
+    var device_model = ModeledDevice.init(std.testing.allocator);
+    defer device_model.deinit();
+    const storage = device_model.storage();
+
+    try storage.createDirPath("/root/wal/replay");
+    try storage.syncParentAbsolute("/root/wal");
+    // replay itself has not been published in /root/wal.
+    try storage.appendFileAbsolute(std.testing.allocator, "/root/wal/replay/1.log", "row", true);
+    try storage.syncParentAbsolute("/root/wal/replay/1.log");
+    try device_model.device().crash();
+    try std.testing.expectError(
+        error.FileNotFound,
+        storage.readFileAlloc(std.testing.allocator, "/root/wal/replay/1.log", 16),
+    );
+}
+
+test "modeled replay WAL survives initial publication and segment rotation" {
+    var device_model = ModeledDevice.init(std.testing.allocator);
+    defer device_model.deinit();
+    const storage = device_model.storage();
+    const root = "/replay-crash";
+    try storage.createDirPath(root);
+
+    _ = try lsm_wal.appendReplay(storage, std.testing.allocator, root, 1, "one", true, .{ .segment_bytes = 28 });
+    _ = try lsm_wal.appendReplay(storage, std.testing.allocator, root, 2, "two", true, .{ .segment_bytes = 28 });
+    try device_model.device().crash();
+
+    const entries = try lsm_wal.iterateReplayFrom(storage, std.testing.allocator, root, 1);
+    defer {
+        for (entries) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("one", entries[0].payload);
+    try std.testing.expectEqualStrings("two", entries[1].payload);
+}
+
 test "modeled storage rolls back an unsynced rename namespace" {
     var device_model = ModeledDevice.init(std.testing.allocator);
     defer device_model.deinit();
     const storage = device_model.storage();
 
+    try storage.createDirPath("/root");
     try storage.writeFileAbsolute("/root/old", "stable");
+    try storage.syncFileContentsAbsolute("/root/old");
+    try storage.syncParentAbsolute("/root/old");
     try storage.renameAbsolute("/root/old", "/root/new");
     try device_model.device().crash();
 
@@ -876,6 +1130,8 @@ test "modeled device exposes lsm storage view" {
 
     try storage.createDirPath("/root");
     try storage.writeFileAbsolute("/root/a", "abc");
+    try storage.syncFileContentsAbsolute("/root/a");
+    try storage.syncParentAbsolute("/root/a");
 
     const read = try storage.readFileAlloc(std.testing.allocator, "/root/a", 16);
     defer std.testing.allocator.free(read);

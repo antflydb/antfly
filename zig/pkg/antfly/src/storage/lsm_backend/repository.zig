@@ -496,7 +496,6 @@ pub fn persistManifestWithStorageCount(
     });
     defer allocator.free(encoded);
     try replaceFileAtomicallyAbsolute(storage, manifest_path, encoded);
-    try storage.syncFileAbsolute(manifest_path);
     return @intCast(encoded.len);
 }
 
@@ -819,38 +818,25 @@ fn joinPath(allocator: Allocator, root_dir: []const u8, suffix: []const u8) ![]u
 }
 
 fn replaceFileAtomicallyAbsolute(storage: storage_io.Storage, path: []const u8, contents: []const u8) !void {
-    const tmp_path = try tempSiblingPath(std.heap.page_allocator, path);
-    defer std.heap.page_allocator.free(tmp_path);
-    writeFileAbsoluteWithStorage(storage, tmp_path, contents) catch |err| {
+    var writer = storage.beginAtomicWrite(std.heap.page_allocator, path) catch |err| {
         if (!isInjectedStorageFault(err)) {
-            std.log.err("lsm replace write failed path={s} tmp_path={s} bytes={} err={s}", .{ path, tmp_path, contents.len, @errorName(err) });
+            std.log.err("lsm atomic replace begin failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(err) });
         }
-        deleteFileAbsoluteWithStorage(storage, tmp_path) catch {};
         return err;
     };
-
-    storage.renameAbsolute(tmp_path, path) catch |err| {
-        if (err == error.FileNotFound) {
-            writeFileAbsoluteWithStorage(storage, tmp_path, contents) catch |rewrite_err| {
-                if (!isInjectedStorageFault(rewrite_err)) {
-                    std.log.err("lsm replace rewrite failed path={s} tmp_path={s} bytes={} err={s}", .{ path, tmp_path, contents.len, @errorName(rewrite_err) });
-                }
-                deleteFileAbsoluteWithStorage(storage, tmp_path) catch {};
-                return rewrite_err;
-            };
-            storage.renameAbsolute(tmp_path, path) catch |retry_err| {
-                if (!isInjectedStorageFault(retry_err)) {
-                    std.log.err("lsm replace rename retry failed path={s} tmp_path={s} bytes={} err={s}", .{ path, tmp_path, contents.len, @errorName(retry_err) });
-                }
-                deleteFileAbsoluteWithStorage(storage, tmp_path) catch {};
-                return retry_err;
-            };
-            return;
-        }
+    var writer_open = true;
+    defer if (writer_open) writer.abort();
+    writer.appendSlice(contents) catch |err| {
         if (!isInjectedStorageFault(err)) {
-            std.log.err("lsm replace rename failed path={s} tmp_path={s} bytes={} err={s}", .{ path, tmp_path, contents.len, @errorName(err) });
+            std.log.err("lsm atomic replace write failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(err) });
         }
-        deleteFileAbsoluteWithStorage(storage, tmp_path) catch {};
+        return err;
+    };
+    writer_open = false;
+    writer.finish() catch |err| {
+        if (!isInjectedStorageFault(err)) {
+            std.log.err("lsm atomic replace publish failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(err) });
+        }
         return err;
     };
 }

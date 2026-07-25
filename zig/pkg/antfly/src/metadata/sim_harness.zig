@@ -4435,12 +4435,18 @@ fn applyDropIndexMutation(
 }
 
 const PublicApiLinearizableReadDriver = struct {
-    const request_context = "public-api-linearizable-read";
-
     cluster: ?*MetadataHttpClusterSimulation = null,
     node_index: usize,
     completed: std.atomic.Value(bool) = .init(false),
     max_rounds: usize = 48,
+    request_sequence: u64 = 0,
+    active_group_id: u64 = 0,
+    active_request_context: [96]u8 = undefined,
+    active_request_context_len: usize = 0,
+
+    fn activeRequestContext(self: *const @This()) []const u8 {
+        return self.active_request_context[0..self.active_request_context_len];
+    }
 
     fn observer(self: *@This()) raft_state_machine.ReadStateObserver {
         return .{
@@ -4449,8 +4455,10 @@ const PublicApiLinearizableReadDriver = struct {
         };
     }
 
-    fn onReadStates(ptr: *anyopaque, _: u64, read_states: []const raft_engine.core.ReadState) !void {
+    fn onReadStates(ptr: *anyopaque, group_id: u64, read_states: []const raft_engine.core.ReadState) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (group_id != self.active_group_id) return;
+        const request_context = self.activeRequestContext();
         for (read_states) |read_state| {
             if (std.mem.eql(u8, read_state.request_ctx, request_context)) {
                 self.completed.store(true, .release);
@@ -4462,9 +4470,18 @@ const PublicApiLinearizableReadDriver = struct {
     fn ensure(self: *@This()) !void {
         const cluster = self.cluster orelse return error.MetadataLinearizableReadTimeout;
         self.completed.store(false, .release);
+        self.request_sequence +%= 1;
+        if (self.request_sequence == 0) self.request_sequence = 1;
+        self.active_group_id = cluster.metadata_group_id;
+        const context = try std.fmt.bufPrint(
+            &self.active_request_context,
+            "public-api-linearizable-read/{d}/{d}",
+            .{ self.node_index, self.request_sequence },
+        );
+        self.active_request_context_len = context.len;
         cluster.cluster.node(self.node_index).runtime.svc.requestReadableLease(
             cluster.metadata_group_id,
-            request_context,
+            self.activeRequestContext(),
         ) catch |err| switch (err) {
             error.NotLeader => return error.NotLeader,
             else => return err,
