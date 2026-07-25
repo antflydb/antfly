@@ -1342,7 +1342,7 @@ fn metaSlidingPatternFromBoolArray(view: gguf_metadata.View, buf: *[96]u8, arch:
     }
 }
 
-fn detectFamily(model_type: []const u8) ModelFamily {
+pub fn detectFamily(model_type: []const u8) ModelFamily {
     const families = .{
         .{ "gpt2", ModelFamily.gpt2 },
         .{ "gpt_neo", ModelFamily.gpt_neo },
@@ -1491,27 +1491,60 @@ pub fn isGenerativeModel(model_type: []const u8) bool {
     return detectFamily(model_type) != .other;
 }
 
-/// Families whose GGUF tensor names can be mapped onto the HF-style names the runtime
-/// expects. Recognizing an architecture is not enough to run it from a GGUF: without a
-/// name mapping every layer tensor stays unresolved and the load fails with
-/// MissingRequiredWeights.
+/// How far a decoder family has actually been taken.
 ///
-/// This is the single source of truth. `normalizeGgufGptWeightKey` gates on it, the
-/// generation error path reports it, and the supported-model docs are written from it.
-pub fn ggufWeightMappingSupported(family: ModelFamily) bool {
+/// Recognizing an architecture is not enough to run it. `detectFamily` names seventeen
+/// families, but only some have a GGUF tensor-name mapping, and fewer still have been run
+/// against a real artifact. Collapsing that into one boolean meant families with no
+/// implementation at all still classified as generators and failed late with a confusing
+/// "missing tensors" error.
+pub const SupportLevel = enum {
+    /// Verified end to end against a real model.
+    supported,
+    /// Has a weight mapping and a runtime, but no artifact has been run through it.
+    /// Loads, with a warning.
+    experimental,
+    /// No weight mapping, or no runtime at all. Rejected before any load is attempted.
+    unsupported,
+};
+
+/// The single source of truth for decoder support. `normalizeGgufGptWeightKey` gates on
+/// it, the generation path rejects `unsupported` before loading, and the architecture
+/// lists below (used in error messages and the docs) are derived from it.
+pub fn supportLevel(family: ModelFamily) SupportLevel {
     return switch (family) {
-        .llama, .mistral, .qwen2, .qwen3, .gemma, .bitnet, .phi, .deepseek_v4 => true,
-        // qwen3_5 is recognized and has a linear-attention runtime, but its GGUF carries
-        // ssm_*/attn_qkv/attn_gate tensors with no mapping to that runtime yet.
-        .qwen3_5 => false,
-        .gpt2, .gpt_neo, .gpt_neox, .gptj, .falcon, .opt, .bloom, .other => false,
+        // Verified against real GGUF artifacts.
+        .llama, .qwen3, .gemma => .supported,
+
+        // Mapped and plumbed, but never run against a real model. deepseek_v4 in
+        // particular has a substantial architecture implementation whose only exercise
+        // is synthetic unit tests.
+        .mistral, .qwen2, .phi, .bitnet, .deepseek_v4 => .experimental,
+
+        // Recognized, but with nothing behind them. qwen3_5 has a linear-attention
+        // runtime whose GGUF ssm_*/attn_qkv/attn_gate tensors have no mapping; gpt2 and
+        // friends have mappings but no verified path; falcon/opt/bloom exist only as
+        // enum entries with family defaults and no weight mapping, required-weight list,
+        // or runtime.
+        .qwen3_5, .gpt2, .gpt_neo, .gpt_neox, .gptj, .falcon, .opt, .bloom, .other => .unsupported,
     };
 }
 
-/// Human-readable list of the architectures we can generate from, for error messages
-/// and docs. Kept adjacent to `ggufWeightMappingSupported` so the two cannot drift.
+/// Whether GGUF tensor names can be mapped onto the HF-style names the runtime expects.
+/// Without a mapping every layer tensor stays unresolved and the load fails with
+/// MissingRequiredWeights.
+pub fn ggufWeightMappingSupported(family: ModelFamily) bool {
+    return supportLevel(family) != .unsupported;
+}
+
+/// Architectures usable for generation, for error messages and docs.
 pub const gguf_supported_architectures =
-    "llama, mistral, mixtral, qwen2, qwen3, gemma, gemma2, gemma3, gemma4, phi, phi3, bitnet, deepseek-v4";
+    "llama, qwen3, gemma, gemma2, gemma3, gemma4";
+
+/// Architectures that will load but are unverified. Named separately so an error can
+/// point at them without implying the same confidence as the list above.
+pub const gguf_experimental_architectures =
+    "mistral, mixtral, qwen2, phi, phi3, bitnet, deepseek-v4";
 
 fn parseDeepseekV4ScoringFunc(value: []const u8) DeepseekV4ScoringFunc {
     if (std.mem.eql(u8, value, "sqrtsoftplus")) return .sqrtsoftplus;
