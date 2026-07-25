@@ -772,36 +772,23 @@ func (sc *StoreClient) StartShard(
 	var contentType string
 
 	if restoreConfig := shardStartReq.RestoreConfig; restoreConfig != nil {
-		location := restoreConfig.Location
+		location, locationErr := common.EffectiveFilesystemLocation(*restoreConfig)
+		if locationErr != nil {
+			return locationErr
+		}
 		if strings.HasPrefix(location, "file://") {
-			if restoreConfig.ResolvedLocation != "" {
-				location = restoreConfig.ResolvedLocation
-			} else if restoreConfig.Connection != "" {
-				return errors.New("filesystem restore requires a coordinator-resolved location")
-			}
-			if !strings.HasPrefix(location, "file://") {
-				return errors.New("resolved filesystem restore location must use file://")
-			}
 			backupID := restoreConfig.BackupID
 			// Local file: stream as multipart
 			localDir := strings.TrimPrefix(location, "file://")
-			format := common.NormalizeBackupFormat(restoreConfig.Format)
+			format, formatErr := common.ValidateBackupFormat(restoreConfig.Format)
+			if formatErr != nil {
+				return formatErr
+			}
 			backupFileName := common.ShardBackupFileName(backupID, shardID)
 			if format == common.BackupFormatPortable {
 				backupFileName = common.ShardPortableBackupFileName(backupID, shardID)
 			}
 			fullBackupFilePath := filepath.Join(localDir, backupFileName)
-			if _, statErr := os.Stat(fullBackupFilePath); os.IsNotExist(statErr) {
-				alternateBackupFileName := common.ShardBackupFileName(backupID, shardID)
-				if format == common.BackupFormatNative {
-					alternateBackupFileName = common.ShardPortableBackupFileName(backupID, shardID)
-				}
-				alternatePath := filepath.Join(localDir, alternateBackupFileName)
-				if _, alternateErr := os.Stat(alternatePath); alternateErr == nil {
-					backupFileName = alternateBackupFileName
-					fullBackupFilePath = alternatePath
-				}
-			}
 
 			// Use a pipe to avoid loading the whole file into memory
 			pipeR, pipeW := io.Pipe()

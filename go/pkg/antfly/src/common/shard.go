@@ -17,8 +17,10 @@ package common
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"go.etcd.io/raft/v3"
@@ -43,6 +45,35 @@ func NormalizeBackupFormat(format BackupFormat) BackupFormat {
 		return DefaultBackupFormat
 	}
 	return format
+}
+
+func ValidateBackupFormat(format BackupFormat) (BackupFormat, error) {
+	normalized := NormalizeBackupFormat(format)
+	switch normalized {
+	case BackupFormatNative, BackupFormatPortable:
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("unsupported backup format %q", normalized)
+	}
+}
+
+// EffectiveFilesystemLocation returns the coordinator-authorized location for
+// a file backup or restore. A named connection must never fall back to the
+// user-supplied logical URI when its resolved path is missing.
+func EffectiveFilesystemLocation(config BackupConfig) (string, error) {
+	if !strings.HasPrefix(config.Location, "file://") {
+		return config.Location, nil
+	}
+	if config.ResolvedLocation != "" {
+		if !strings.HasPrefix(config.ResolvedLocation, "file://") {
+			return "", errors.New("resolved filesystem location must use file://")
+		}
+		return config.ResolvedLocation, nil
+	}
+	if config.Connection != "" {
+		return "", errors.New("filesystem operation requires a coordinator-resolved location")
+	}
+	return config.Location, nil
 }
 
 type BackupConfig struct {

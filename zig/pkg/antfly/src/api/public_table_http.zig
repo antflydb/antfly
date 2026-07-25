@@ -245,6 +245,7 @@ pub const TableApi = struct {
             table_name: []const u8,
             backup_id: []const u8,
             location_uri: []const u8,
+            connection: []const u8,
             location: *backups_api.BackupLocation,
         ) ExecuteRestoreError!void,
         execute_table_list_indexes: *const fn (
@@ -365,9 +366,10 @@ pub const TableApi = struct {
         table_name: []const u8,
         backup_id: []const u8,
         location_uri: []const u8,
+        connection: []const u8,
         location: *backups_api.BackupLocation,
     ) ExecuteRestoreError!void {
-        return try self.vtable.execute_table_restore(self.ptr, alloc, table_name, backup_id, location_uri, location);
+        return try self.vtable.execute_table_restore(self.ptr, alloc, table_name, backup_id, location_uri, connection, location);
     }
 
     pub fn executeTableListIndexes(
@@ -807,7 +809,14 @@ pub fn handleTableRestore(
     };
     defer location.deinit(alloc);
 
-    api.executeTableRestore(alloc, table_name, parsed_req.value.backup_id, parsed_req.value.location, &location) catch |err| switch (err) {
+    api.executeTableRestore(
+        alloc,
+        table_name,
+        parsed_req.value.backup_id,
+        parsed_req.value.location,
+        parsed_req.value.connection,
+        &location,
+    ) catch |err| switch (err) {
         error.NotLeader => return err,
         error.TableAlreadyExists => return .{ .status = 400, .body = try alloc.dupe(u8, "restore target already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
@@ -1418,6 +1427,7 @@ fn unsupportedDeleteIndex(
 fn unsupportedRestore(
     _: *anyopaque,
     _: std.mem.Allocator,
+    _: []const u8,
     _: []const u8,
     _: []const u8,
     _: []const u8,
@@ -2674,6 +2684,7 @@ test "public table restore handler maps target already exists" {
             _: []const u8,
             _: []const u8,
             _: []const u8,
+            _: []const u8,
             _: *backups_api.BackupLocation,
         ) TableApi.ExecuteRestoreError!void {
             return error.TableAlreadyExists;
@@ -2719,6 +2730,7 @@ test "public table restore handler maps unsupported multi-range error" {
         fn executeTableRestore(
             _: *anyopaque,
             _: std.mem.Allocator,
+            _: []const u8,
             _: []const u8,
             _: []const u8,
             _: []const u8,
@@ -2770,6 +2782,7 @@ test "public table restore handler reports committed durability pending" {
             _: []const u8,
             _: []const u8,
             _: []const u8,
+            _: []const u8,
             _: *backups_api.BackupLocation,
         ) TableApi.ExecuteRestoreError!void {
             return error.RestoreDurabilityPending;
@@ -2815,6 +2828,7 @@ test "public table restore handler reports confirmed durability" {
         fn executeTableRestore(
             _: *anyopaque,
             _: std.mem.Allocator,
+            _: []const u8,
             _: []const u8,
             _: []const u8,
             _: []const u8,

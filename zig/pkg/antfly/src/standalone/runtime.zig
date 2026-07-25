@@ -675,16 +675,20 @@ const LocalStandaloneMetadata = struct {
         };
     }
 
-    fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+    fn restoreTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        manifest: *const antfly.public_api.backups.TableBackupManifest,
+    ) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        var location = try antfly.public_api.backups.openBackupLocation(alloc, location_uri);
-        defer location.deinit(alloc);
-        var manifest = antfly.public_api.backups.readManifestFromLocation(alloc, &location, backup_id) catch return error.InvalidBackupRequest;
-        defer manifest.deinit(alloc);
+        try antfly.public_api.backups.validateTableManifest(alloc, manifest, manifest.backup_id);
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
-        var table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, &manifest);
+        var table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest);
         defer antfly.metadata.table_manager.freeTable(alloc, table);
-        const ranges = try antfly.public_api.backups.deriveRestoreRanges(alloc, table.table_id, location_uri, &manifest);
+        const ranges = try antfly.public_api.backups.deriveRestoreRanges(alloc, table.table_id, location_uri, connection, manifest);
         defer {
             for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
             alloc.free(ranges);

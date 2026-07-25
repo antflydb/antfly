@@ -79,18 +79,28 @@ pub const BackupRestoreBootstrapRecord = struct {
     backup_id: []const u8,
     location: []const u8,
     snapshot_path: []const u8,
+    connection: []const u8 = "",
+    artifact_size_bytes: u64 = 0,
+    artifact_sha256: []const u8 = "",
 
     pub fn clone(self: BackupRestoreBootstrapRecord, alloc: std.mem.Allocator) !BackupRestoreBootstrapRecord {
         var cloned = BackupRestoreBootstrapRecord{
             .backup_id = "",
             .location = "",
             .snapshot_path = "",
+            .connection = "",
+            .artifact_size_bytes = self.artifact_size_bytes,
+            .artifact_sha256 = "",
         };
         cloned.backup_id = try alloc.dupe(u8, self.backup_id);
         errdefer alloc.free(cloned.backup_id);
         cloned.location = try alloc.dupe(u8, self.location);
         errdefer alloc.free(cloned.location);
         cloned.snapshot_path = try alloc.dupe(u8, self.snapshot_path);
+        errdefer alloc.free(cloned.snapshot_path);
+        cloned.connection = try alloc.dupe(u8, self.connection);
+        errdefer alloc.free(cloned.connection);
+        cloned.artifact_sha256 = try alloc.dupe(u8, self.artifact_sha256);
         return cloned;
     }
 
@@ -98,6 +108,8 @@ pub const BackupRestoreBootstrapRecord = struct {
         alloc.free(self.backup_id);
         alloc.free(self.location);
         alloc.free(self.snapshot_path);
+        alloc.free(self.connection);
+        alloc.free(self.artifact_sha256);
         self.* = undefined;
     }
 };
@@ -170,6 +182,9 @@ pub fn eqlReplicaRecord(left: ReplicaRecord, right: ReplicaRecord) bool {
         if (!std.mem.eql(u8, backup.backup_id, other.backup_id)) return false;
         if (!std.mem.eql(u8, backup.location, other.location)) return false;
         if (!std.mem.eql(u8, backup.snapshot_path, other.snapshot_path)) return false;
+        if (!std.mem.eql(u8, backup.connection, other.connection)) return false;
+        if (backup.artifact_size_bytes != other.artifact_size_bytes) return false;
+        if (!std.mem.eql(u8, backup.artifact_sha256, other.artifact_sha256)) return false;
     }
     return true;
 }

@@ -3737,6 +3737,11 @@ pub const DataServer = struct {
         _ = self.read_source.withIo(&self.query_io_impl.?);
         _ = self.read_source.withSecretStore(api_server_cfg.secret_store);
         _ = self.write_source.withSecretStore(api_server_cfg.secret_store);
+        const restore_io = if (self.backend_runtime) |runtime|
+            if (runtime.apiIoImpl()) |io_impl| io_impl.io() else null
+        else
+            null;
+        _ = self.write_source.withRestoreAccess(api_server_cfg.node_config, restore_io);
         _ = self.read_source.withRemoteContent(api_server_cfg.remote_content);
         _ = self.write_source.withRemoteContent(api_server_cfg.remote_content);
         if (self.backend_runtime) |runtime| {
@@ -3754,6 +3759,7 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| {
             apply_sm.attachProvisionedStorage(&self.provisioned_storage);
             _ = apply_sm.write_source.withSecretStore(api_server_cfg.secret_store);
+            _ = apply_sm.write_source.withRestoreAccess(api_server_cfg.node_config, restore_io);
             _ = apply_sm.write_source.withRemoteContent(api_server_cfg.remote_content);
             _ = try apply_sm.write_source.withHAWriteGate(ha_write_gate);
             _ = try apply_sm.write_source.withHAMirror(ha_primary_mirror);
@@ -4565,7 +4571,6 @@ pub const DataServer = struct {
         _ = self.write_source.withAntflyProvider(null);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withAntflyProvider(null);
-            apply_sm.write_cache.antfly_provider = null;
         }
     }
 
@@ -10817,36 +10822,47 @@ pub const DataServer = struct {
                     raft_backend_runtime,
                 );
 
-                data_raft = try alloc.create(antfly.raft.ManagedHttpHostService);
-                data_raft.?.* = try antfly.raft.ManagedHttpHostService.init(alloc, .{
-                    .http = .{
-                        .host = .{
-                            .local_node_id = registration.node_id,
-                            .runtime = dataRaftRuntimeConfig(),
-                            .replica_root_dir = cfg.replica_root_dir,
-                            .replica_catalog_path = cfg.replica_catalog_path,
-                            .replica_state_backend = cfg.data_raft_state_backend,
-                        },
-                        .listener = antfly.raft.httpListenerConfig(cfg.raft_bind_host, cfg.raft_bind_port),
-                        .transport = .{
-                            .snapshot = .{
-                                .root_dir = cfg.snapshot_root_dir orelse cfg.replica_root_dir,
+                const initialized_data_raft = blk: {
+                    const raft = try alloc.create(antfly.raft.ManagedHttpHostService);
+                    errdefer alloc.destroy(raft);
+                    raft.* = try antfly.raft.ManagedHttpHostService.init(alloc, .{
+                        .http = .{
+                            .host = .{
+                                .local_node_id = registration.node_id,
+                                .runtime = dataRaftRuntimeConfig(),
+                                .replica_root_dir = cfg.replica_root_dir,
+                                .replica_catalog_path = cfg.replica_catalog_path,
+                                .replica_state_backend = cfg.data_raft_state_backend,
+                            },
+                            .listener = antfly.raft.httpListenerConfig(cfg.raft_bind_host, cfg.raft_bind_port),
+                            .transport = .{
+                                .snapshot = .{
+                                    .root_dir = cfg.snapshot_root_dir orelse cfg.replica_root_dir,
+                                },
                             },
                         },
-                    },
-                }, .{
-                    .http = .{
-                        .backend_runtime = raft_backend_runtime,
-                        .host = .{
-                            .descriptor_factory = data_raft_factory.?.iface(),
-                            .runtime_hooks = .{
-                                .state_machine = data_raft_apply.?.stateMachine(),
+                        .restore_open_options = .{
+                            .secret_store = cfg.api_server_cfg.secret_store,
+                            .node_config = cfg.api_server_cfg.node_config,
+                            .required_capability = "restore.read",
+                            .io = api_io_impl.io(),
+                        },
+                    }, .{
+                        .http = .{
+                            .backend_runtime = raft_backend_runtime,
+                            .host = .{
+                                .descriptor_factory = data_raft_factory.?.iface(),
+                                .runtime_hooks = .{
+                                    .state_machine = data_raft_apply.?.stateMachine(),
+                                },
                             },
                         },
-                    },
-                }, .{}, .{
-                    .transition_runtime = null,
-                });
+                    }, .{}, .{
+                        .transition_runtime = null,
+                    });
+                    break :blk raft;
+                };
+                data_raft = initialized_data_raft;
             }
         }
 
@@ -11559,9 +11575,21 @@ const RemoteMetadataSource = struct {
         self.invalidateCache();
     }
 
-    fn remoteRestoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+    fn remoteRestoreTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        manifest: *const antfly.public_api.backups.TableBackupManifest,
+    ) !void {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
-        const body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"{s}\",\"location\":\"{s}\"}}", .{ backup_id, location_uri });
+        const body = try std.json.Stringify.valueAlloc(alloc, .{
+            .backup_id = manifest.backup_id,
+            .location = location_uri,
+            .connection = connection,
+            .manifest = manifest.*,
+        }, .{});
         defer alloc.free(body);
         try self.withMetadataApiClient(void, struct {
             fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
@@ -11811,6 +11839,10 @@ const RemoteMetadataSource = struct {
                 try client.upsertNode(base_uri, ctx);
             }
         }.call, body);
+        // Registration is immediately followed by a visibility check. Do not
+        // let a pre-registration snapshot turn a committed registration into
+        // a false negative for the cache TTL.
+        self.invalidateCache();
     }
 
     fn reportNodeStatus(self: *RemoteMetadataSource, report: antfly.metadata.table_manager.StoreStatusReport) !void {

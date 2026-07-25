@@ -4191,7 +4191,7 @@ pub const BoundTableWriteSource = struct {
         defer alloc.free(snapshot_root);
         const dest_root = try backups_api.shardSnapshotPath(alloc, plan.backup_root, plan.backup_id, 0);
         defer alloc.free(dest_root);
-        try backups_api.copyDirectoryRecursive(alloc, snapshot_root, dest_root);
+        try backups_api.copyDirectoryRecursiveUsingIo(alloc, plan.io, snapshot_root, dest_root);
 
         const rel_path = try backups_api.shardSnapshotRelPath(alloc, plan.backup_id, 0);
         errdefer alloc.free(rel_path);
@@ -4203,6 +4203,8 @@ pub const BoundTableWriteSource = struct {
             .end_key = if (byte_range.end.len > 0) try alloc.dupe(u8, byte_range.end) else null,
             .snapshot_path = rel_path,
         };
+        errdefer shards[0].deinit(alloc);
+        try backups_api.populateShardArtifactIntegrity(alloc, plan.io, .native, dest_root, &shards[0]);
         return shards;
     }
 
@@ -4215,11 +4217,20 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try backups_api.validateRestorableManifestLayout(plan.manifest);
+        try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
         if (plan.reconcile_only) return error.RestoreIdentityMismatch;
         const db = try self.activeDb();
 
-        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, plan.manifest.shards[0].snapshot_path });
+        const shard = &plan.manifest.shards[0];
+        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, shard.snapshot_path });
         defer alloc.free(snapshot_root);
+        try backups_api.verifyShardArtifactIntegrity(
+            alloc,
+            plan.io,
+            plan.manifest.format,
+            snapshot_root,
+            shard,
+        );
 
         const db_path = try alloc.dupe(u8, db.core.path);
         defer alloc.free(db_path);
@@ -4250,7 +4261,7 @@ pub const BoundTableWriteSource = struct {
             alloc,
             snapshot_root,
             db_path,
-            std.mem.endsWith(u8, plan.manifest.shards[0].snapshot_path, ".afb"),
+            plan.manifest.format,
             restored_open_options,
             plan.io,
         ) catch |restore_err| {
@@ -4279,7 +4290,7 @@ pub const BoundTableWriteSource = struct {
         alloc: std.mem.Allocator,
         snapshot_root: []const u8,
         live_path: []const u8,
-        portable: bool,
+        format: backups_api.BackupFormat,
         open_options: db_mod.OpenOptions,
         shared_io: ?std.Io,
     ) !db_mod.generation_lifecycle.PublicationOutcome {
@@ -4288,8 +4299,8 @@ pub const BoundTableWriteSource = struct {
         var staged = try transition.beginStaging();
         defer staged.deinit();
 
-        if (portable) {
-            {
+        switch (format) {
+            .portable => {
                 var staged_open_options = open_options;
                 staged_open_options.staged_generation = &staged;
                 var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
@@ -4299,9 +4310,14 @@ pub const BoundTableWriteSource = struct {
                 _ = try restored.rebuildSparseIndexesForTargetCoverage(alloc);
                 try restored.rebuildGraphIndexesForTargetCoverage(alloc);
                 try restored.syncIndexes(true);
-            }
-        } else {
-            try db_mod.DB.restoreSnapshotToStagedGeneration(&staged, alloc, snapshot_root, staged.path(), open_options);
+            },
+            .native => try db_mod.DB.restoreSnapshotToStagedGeneration(
+                &staged,
+                alloc,
+                snapshot_root,
+                staged.path(),
+                open_options,
+            ),
         }
         return try staged.publish();
     }
@@ -4587,30 +4603,8 @@ pub const ProvisionedTableWriteSource = struct {
         identity_namespace: doc_identity.Namespace,
 
         fn clone(alloc: std.mem.Allocator, table_id: u64, range: metadata_table_manager.RangeRecord) !@This() {
-            const start_key = try alloc.dupe(u8, range.start_key);
-            errdefer alloc.free(start_key);
-            const end_key = if (range.end_key) |value| try alloc.dupe(u8, value) else null;
-            errdefer if (end_key) |value| alloc.free(value);
-            const restore_backup_id = try alloc.dupe(u8, range.restore_backup_id);
-            errdefer alloc.free(restore_backup_id);
-            const restore_location = try alloc.dupe(u8, range.restore_location);
-            errdefer alloc.free(restore_location);
-            const restore_snapshot_path = try alloc.dupe(u8, range.restore_snapshot_path);
-            errdefer alloc.free(restore_snapshot_path);
-
-            const owned_range = metadata_table_manager.RangeRecord{
-                .group_id = range.group_id,
-                .range_id = range.range_id,
-                .table_id = table_id,
-                .start_key = start_key,
-                .end_key = end_key,
-                .doc_identity_shard_id = range.doc_identity_shard_id,
-                .doc_identity_range_id = range.doc_identity_range_id,
-                .split_attempt_epoch = range.split_attempt_epoch,
-                .restore_backup_id = restore_backup_id,
-                .restore_location = restore_location,
-                .restore_snapshot_path = restore_snapshot_path,
-            };
+            var owned_range = try metadata_table_manager.cloneRange(alloc, range);
+            owned_range.table_id = table_id;
             return .{
                 .range = owned_range,
                 .identity_namespace = tableIdentityNamespaceForRangeId(table_id, range),
@@ -4618,11 +4612,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-            alloc.free(self.range.start_key);
-            if (self.range.end_key) |value| alloc.free(value);
-            alloc.free(self.range.restore_backup_id);
-            alloc.free(self.range.restore_location);
-            alloc.free(self.range.restore_snapshot_path);
+            metadata_table_manager.freeRange(alloc, self.range);
             self.* = undefined;
         }
     };
@@ -4742,6 +4732,7 @@ pub const ProvisionedTableWriteSource = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
+    restore_open_options: backups_api.OpenOptions = .{},
     remote_content: ?*const scraping.RemoteContentConfig = null,
     resolution_candidate_source: ?db_mod.CandidateSource = null,
     entity_sink: ?db_mod.EntitySink = null,
@@ -4975,8 +4966,19 @@ pub const ProvisionedTableWriteSource = struct {
         secret_store: ?*common_secrets.FileStore,
     ) *ProvisionedTableWriteSource {
         self.secret_store = secret_store;
+        self.restore_open_options.secret_store = secret_store;
         if (self.write_cache) |cache| cache.secret_store = secret_store;
         if (self.startup_write_cache) |cache| cache.secret_store = secret_store;
+        return self;
+    }
+
+    pub fn withRestoreAccess(
+        self: *ProvisionedTableWriteSource,
+        node_config: ?*const @import("../common/config.zig").Config,
+        io: ?std.Io,
+    ) *ProvisionedTableWriteSource {
+        self.restore_open_options.node_config = node_config;
+        self.restore_open_options.io = io;
         return self;
     }
 
@@ -7304,7 +7306,10 @@ pub const ProvisionedTableWriteSource = struct {
             hosted_group_ids,
             tables,
             ranges,
-            .{ .backend_runtime = backend_runtime },
+            .{
+                .backend_runtime = backend_runtime,
+                .restore_open_options = self.restore_open_options,
+            },
         );
 
         if (cache.backend_runtime == null) cache.backend_runtime = backend_runtime orelse self.backend_runtime;
@@ -7326,7 +7331,14 @@ pub const ProvisionedTableWriteSource = struct {
             var io_impl = std.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try fs_paths.createDirPathPortable(io_impl.io(), path);
-            try metadata_table_provisioner.applyRestoreIntentIfNeeded(alloc, path, group_id, table, range);
+            try metadata_table_provisioner.applyRestoreIntentIfNeededWithOptions(
+                alloc,
+                path,
+                group_id,
+                table,
+                range,
+                self.restore_open_options,
+            );
 
             const lsm_root_generation = self.visibleRootGeneration(group_id);
             const identity_namespace = doc_identity.Namespace{
@@ -11668,6 +11680,7 @@ pub const ProvisionedTableWriteSource = struct {
     const NativeBackupShardSnapshot = struct {
         snapshot_root: []const u8,
         dest_root: []const u8,
+        io: ?std.Io,
         shard: backups_api.ShardSnapshot,
         owns_shard: bool = true,
 
@@ -11715,6 +11728,7 @@ pub const ProvisionedTableWriteSource = struct {
         return .{
             .snapshot_root = snapshot_root,
             .dest_root = dest_root,
+            .io = plan.io,
             .shard = .{
                 .group_id = group_id,
                 .start_key = start_key,
@@ -11729,7 +11743,19 @@ pub const ProvisionedTableWriteSource = struct {
         native_snapshot: *NativeBackupShardSnapshot,
     ) ![]backups_api.ShardSnapshot {
         runTestBeforeNativeBackupCopyHook();
-        try backups_api.copyDirectoryRecursive(alloc, native_snapshot.snapshot_root, native_snapshot.dest_root);
+        try backups_api.copyDirectoryRecursiveUsingIo(
+            alloc,
+            native_snapshot.io,
+            native_snapshot.snapshot_root,
+            native_snapshot.dest_root,
+        );
+        try backups_api.populateShardArtifactIntegrity(
+            alloc,
+            native_snapshot.io,
+            .native,
+            native_snapshot.dest_root,
+            &native_snapshot.shard,
+        );
         return try native_snapshot.toShardsAlloc(alloc);
     }
 
@@ -11743,6 +11769,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.localWriteOwnerSource()) |owner| return try owner.restoreTableReserved(alloc, table_name, plan);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         try backups_api.validateRestorableManifestLayout(plan.manifest);
+        try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
         if (plan.reconcile_only and plan.replace_existing) return error.InvalidBackupRequest;
 
         const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
@@ -11760,7 +11787,10 @@ pub const ProvisionedTableWriteSource = struct {
             .location = local_location,
             .identity_location = plan.source_location,
             .snapshot_path = source_shard.snapshot_path,
+            .expected_artifact_size_bytes = source_shard.artifact_size_bytes,
+            .expected_artifact_sha256 = source_shard.artifact_sha256,
             .manifest = plan.manifest,
+            .io = plan.io,
         };
 
         var all_groups_already_admitted = true;
@@ -18921,6 +18951,8 @@ fn exportPortableBackupShard(
         .end_key = if (byte_range.end.len > 0) try alloc.dupe(u8, byte_range.end) else null,
         .snapshot_path = rel_path,
     };
+    errdefer shards[0].deinit(alloc);
+    try backups_api.populateShardArtifactIntegrity(alloc, shared_io, .portable, dest_path, &shards[0]);
     return shards;
 }
 
@@ -19004,6 +19036,11 @@ fn cloneShardSnapshots(
             .start_key = try alloc.dupe(u8, shard.start_key),
             .end_key = if (shard.end_key) |value| try alloc.dupe(u8, value) else null,
             .snapshot_path = try alloc.dupe(u8, shard.snapshot_path),
+            .artifact_size_bytes = shard.artifact_size_bytes,
+            .artifact_sha256 = if (shard.artifact_sha256.len > 0)
+                try alloc.dupe(u8, shard.artifact_sha256)
+            else
+                "",
         };
         initialized += 1;
     }
@@ -20479,7 +20516,7 @@ test "bound table write source backs up and restores a local table" {
     })).?;
     defer freeBackupShards(alloc, shards);
 
-    var manifest = try backups_api.createManifest(alloc, "snap1", &.{
+    var manifest = try backups_api.createManifest(alloc, "snap1", .native, &.{
         .table_id = 1,
         .name = "docs",
         .description = "docs table",
@@ -20551,7 +20588,7 @@ test "bound table write source backs up and restores a portable local table" {
     defer afb_file.close(io_impl.io());
     try std.testing.expect((try afb_file.stat(io_impl.io())).size > 0);
 
-    var manifest = try backups_api.createManifest(alloc, "portable-snap", &.{
+    var manifest = try backups_api.createManifest(alloc, "portable-snap", .portable, &.{
         .table_id = 1,
         .name = "docs",
         .description = "docs table",
@@ -20649,7 +20686,7 @@ test "provisioned table write source backs up and restores a local table" {
     })).?;
     defer freeBackupShards(alloc, shards);
 
-    var manifest = try backups_api.createManifest(alloc, "snap1", &.{
+    var manifest = try backups_api.createManifest(alloc, "snap1", .native, &.{
         .table_id = 7,
         .name = "docs",
         .description = "docs table",
@@ -20708,6 +20745,7 @@ test "provisioned table restore rejects multi-range manifests before opening sto
         .{ .group_id = 7002, .start_key = "m", .snapshot_path = "snap/groups/7002" },
     };
     const manifest = backups_api.TableBackupManifest{
+        .format = .native,
         .backup_id = "snap",
         .table_name = "docs",
         .description = "",
@@ -20808,7 +20846,7 @@ test "provisioned table restore retry skips exact incomplete restore state with 
     })).?;
     defer freeBackupShards(alloc, shards);
 
-    var manifest = try backups_api.createManifest(alloc, "snap1", &.{
+    var manifest = try backups_api.createManifest(alloc, "snap1", .native, &.{
         .table_id = 7,
         .name = "docs",
         .description = "docs table",
@@ -20829,7 +20867,15 @@ test "provisioned table restore retry skips exact incomplete restore state with 
 
     const location = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root});
     defer alloc.free(location);
-    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, db_path, "snap1", location, shards[0].snapshot_path, 7001);
+    try db_mod.DB.markRestorePrimaryRestoredForPathWithArtifact(
+        alloc,
+        db_path,
+        "snap1",
+        location,
+        shards[0].artifact_sha256,
+        shards[0].snapshot_path,
+        7001,
+    );
 
     var cached = try write_cache.getOrOpenLocked(db_path, FakeCatalog.iface(), 7001, 0, "docs");
     defer cached.deinit(alloc);
@@ -20911,7 +20957,15 @@ test "provisioned restore repair source deinit cancels sleeping retry worker" {
         .timestamp_ns = 1,
     });
 
-    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, db_path, "snap1", "local", "snap1/groups/7001", 7001);
+    try db_mod.DB.markRestorePrimaryRestoredForPathWithArtifact(
+        alloc,
+        db_path,
+        "snap1",
+        "local",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "snap1/groups/7001",
+        7001,
+    );
     try std.testing.expect(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path));
     source.testingMarkGroupOperationActive("docs", 7001);
 
@@ -21074,7 +21128,7 @@ test "provisioned table restore rejects mismatched doc identity namespace" {
     };
     defer freeBackupShards(alloc, shards);
 
-    var manifest = try backups_api.createManifest(alloc, "snap1", &.{
+    var manifest = try backups_api.createManifest(alloc, "snap1", .native, &.{
         .table_id = 7,
         .name = "docs",
         .description = "docs table",
@@ -21214,7 +21268,7 @@ test "provisioned table write source backs up and restores full_text writes from
     })).?;
     defer freeBackupShards(alloc, shards);
 
-    var manifest = try backups_api.createManifest(alloc, "snap1", &.{
+    var manifest = try backups_api.createManifest(alloc, "snap1", .native, &.{
         .table_id = 7,
         .name = "docs",
         .description = "docs table",
@@ -21484,7 +21538,7 @@ test "provisioned native backup restore repeats through shared read and write ow
         })).?;
         defer freeBackupShards(alloc, shards);
 
-        var manifest = try backups_api.createManifest(alloc, backup_id, &.{
+        var manifest = try backups_api.createManifest(alloc, backup_id, .native, &.{
             .table_id = 7,
             .name = "docs",
             .description = "docs table",
@@ -27324,6 +27378,7 @@ test "table write source restore acquires lifecycle unless caller reserves it" {
     };
 
     const manifest = backups_api.TableBackupManifest{
+        .format = .native,
         .backup_id = "backup",
         .table_name = "docs",
         .description = "",
@@ -32625,7 +32680,15 @@ test "managed startup catch-up preserves restore repair debt while index load is
         );
         defer db.close();
     }
-    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, path, "snap1", "local", "snap1/groups/7001", 7001);
+    try db_mod.DB.markRestorePrimaryRestoredForPathWithArtifact(
+        alloc,
+        path,
+        "snap1",
+        "local",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "snap1/groups/7001",
+        7001,
+    );
     try std.testing.expect(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path));
 
     const NoCatalog = struct {
@@ -34417,7 +34480,7 @@ test "provisioned table write source restore table does not hold local db mutex 
     })).?;
     defer freeBackupShards(alloc, shards);
 
-    var manifest = try backups_api.createManifest(alloc, "snap1", &.{
+    var manifest = try backups_api.createManifest(alloc, "snap1", .native, &.{
         .table_id = 7,
         .name = "docs",
         .description = "docs table",

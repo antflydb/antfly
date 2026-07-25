@@ -3953,8 +3953,13 @@ pub fn supportedJoinRequestFromOpenApi(
         alloc.destroy(nested);
     };
     if (join.nested_join) |value| {
-        nested_join = try alloc.create(SupportedJoinRequest);
-        nested_join.?.* = try parseSupportedJoinClauseValue(alloc, value);
+        const initialized_nested = blk: {
+            const nested = try alloc.create(SupportedJoinRequest);
+            errdefer alloc.destroy(nested);
+            nested.* = try parseSupportedJoinClauseValue(alloc, value);
+            break :blk nested;
+        };
+        nested_join = initialized_nested;
     }
 
     return .{

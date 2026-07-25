@@ -414,7 +414,14 @@ pub const StatusSource = struct {
         free_admin_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
-        restore_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void = null,
+        restore_table: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            location_uri: []const u8,
+            connection: []const u8,
+            manifest: *const backups_api.TableBackupManifest,
+        ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
@@ -470,9 +477,16 @@ pub const StatusSource = struct {
         return try fn_ptr(self.ptr, expected, replacement);
     }
 
-    pub fn restoreTable(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !bool {
+    pub fn restoreTable(
+        self: StatusSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        manifest: *const backups_api.TableBackupManifest,
+    ) !bool {
         const fn_ptr = self.vtable.restore_table orelse return false;
-        try fn_ptr(self.ptr, alloc, table_name, location_uri, backup_id);
+        try fn_ptr(self.ptr, alloc, table_name, location_uri, connection, manifest);
         return true;
     }
 
@@ -616,8 +630,15 @@ pub const StatusSource = struct {
                 return try replaceTableDefinitionOnService(cast(ptr), expected, replacement);
             }
 
-            fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void {
-                return try persistRestoreTableIntent(cast(ptr), alloc, table_name, location_uri, backup_id, serviceSecretStore(cast(ptr)));
+            fn restoreTable(
+                ptr: *anyopaque,
+                alloc: std.mem.Allocator,
+                table_name: []const u8,
+                location_uri: []const u8,
+                connection: []const u8,
+                manifest: *const backups_api.TableBackupManifest,
+            ) anyerror!void {
+                return try persistRestoreTableIntent(cast(ptr), alloc, table_name, location_uri, connection, manifest);
             }
 
             fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
@@ -754,12 +775,10 @@ pub const StatusSource = struct {
 };
 
 const RestoreMetadataSpec = struct {
-    manifest: backups_api.TableBackupManifest,
     table: metadata_table_manager.TableRecord,
     ranges: []metadata_table_manager.RangeRecord,
 
     fn deinit(self: *RestoreMetadataSpec, alloc: std.mem.Allocator) void {
-        self.manifest.deinit(alloc);
         metadata_table_manager.freeTable(alloc, self.table);
         for (self.ranges) |record| metadata_table_manager.freeRange(alloc, record);
         alloc.free(self.ranges);
@@ -767,33 +786,26 @@ const RestoreMetadataSpec = struct {
     }
 };
 
-fn loadRestoreMetadataSpec(
+fn deriveRestoreMetadataSpec(
     alloc: std.mem.Allocator,
     table_name: []const u8,
     location_uri: []const u8,
-    backup_id: []const u8,
-    secret_store: ?*common_secrets.FileStore,
+    connection: []const u8,
+    manifest: *const backups_api.TableBackupManifest,
 ) !RestoreMetadataSpec {
-    var location = try backups_api.openBackupLocationWithSecrets(alloc, location_uri, secret_store);
-    defer location.deinit(alloc);
-    var manifest = backups_api.readManifestFromLocation(alloc, &location, backup_id) catch |err| switch (err) {
-        error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
-        else => return error.InvalidBackupRequest,
-    };
-    errdefer manifest.deinit(alloc);
+    try backups_api.validateRestoreManifest(alloc, manifest, manifest.backup_id);
     if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
-    const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, &manifest) catch |err| switch (err) {
+    const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest) catch |err| switch (err) {
         error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
         else => return err,
     };
     errdefer metadata_table_manager.freeTable(alloc, table);
-    const ranges = try backups_api.deriveRestoreRanges(alloc, table.table_id, location_uri, &manifest);
+    const ranges = try backups_api.deriveRestoreRanges(alloc, table.table_id, location_uri, connection, manifest);
     errdefer {
         for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
         alloc.free(ranges);
     }
     return .{
-        .manifest = manifest,
         .table = table,
         .ranges = ranges,
     };
@@ -915,17 +927,15 @@ fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, tab
     try svc.runRound();
 }
 
-fn serviceSecretStore(service: anytype) ?*common_secrets.FileStore {
-    const Ptr = @TypeOf(service);
-    const Service = std.meta.Child(Ptr);
-    if (comptime @hasField(Service, "secret_store")) {
-        return service.secret_store;
-    }
-    return null;
-}
-
-fn persistRestoreTableIntent(service: anytype, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8, secret_store: ?*common_secrets.FileStore) !void {
-    var spec = try loadRestoreMetadataSpec(alloc, table_name, location_uri, backup_id, secret_store);
+fn persistRestoreTableIntent(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    location_uri: []const u8,
+    connection: []const u8,
+    manifest: *const backups_api.TableBackupManifest,
+) !void {
+    var spec = try deriveRestoreMetadataSpec(alloc, table_name, location_uri, connection, manifest);
     defer spec.deinit(alloc);
 
     var snapshot = try service.adminSnapshot();
@@ -6410,7 +6420,7 @@ pub const ApiHttpServer = struct {
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
         if (try table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, location_uri, connection, backup_location)) |shards| {
             defer freeBackupShards(self.alloc, shards);
-            var manifest = try backups_api.createManifest(self.alloc, backup_id, &table, shards);
+            var manifest = try backups_api.createManifest(self.alloc, backup_id, format, &table, shards);
             defer manifest.deinit(self.alloc);
             try backups_api.writeManifestToLocation(self.alloc, backup_location, &manifest);
             return;
@@ -6440,20 +6450,26 @@ pub const ApiHttpServer = struct {
             for (shards) |shard| {
                 const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
                 defer self.alloc.free(snapshot_root);
-                if (std.mem.endsWith(u8, shard.snapshot_path, ".afb"))
-                    try backups_api.copyFileToLocation(
+                switch (format) {
+                    .portable => try backups_api.copyFileToLocation(
                         self.alloc,
                         backup_location,
                         shard.snapshot_path,
                         snapshot_root,
                         "application/vnd.antfly.backup",
-                    )
-                else
-                    try backups_api.copyDirectoryToLocation(self.alloc, backup_location, artifact_backup_id, shard.group_id, snapshot_root);
+                    ),
+                    .native => try backups_api.copyDirectoryToLocation(
+                        self.alloc,
+                        backup_location,
+                        artifact_backup_id,
+                        shard.group_id,
+                        snapshot_root,
+                    ),
+                }
             }
         }
 
-        var manifest = try backups_api.createManifest(self.alloc, backup_id, &table, shards);
+        var manifest = try backups_api.createManifest(self.alloc, backup_id, format, &table, shards);
         defer manifest.deinit(self.alloc);
         try backups_api.writeManifestToLocation(self.alloc, backup_location, &manifest);
     }
@@ -6541,10 +6557,10 @@ pub const ApiHttpServer = struct {
             for (manifest.shards) |shard| {
                 const dest_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
                 defer self.alloc.free(dest_root);
-                if (std.mem.endsWith(u8, shard.snapshot_path, ".afb"))
-                    try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root)
-                else
-                    try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
+                switch (manifest.format) {
+                    .portable => try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root),
+                    .native => try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root),
+                }
             }
         }
 
@@ -6665,10 +6681,10 @@ pub const ApiHttpServer = struct {
             for (manifest.shards) |shard| {
                 const dest_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
                 defer self.alloc.free(dest_root);
-                if (std.mem.endsWith(u8, shard.snapshot_path, ".afb"))
-                    try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root)
-                else
-                    try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
+                switch (manifest.format) {
+                    .portable => try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root),
+                    .native => try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root),
+                }
             }
         }
 
@@ -6704,11 +6720,12 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         location_uri: []const u8,
-        backup_id: []const u8,
+        connection: []const u8,
+        manifest: *const backups_api.TableBackupManifest,
     ) !bool {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
-            return self.source.restoreTable(alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
+            return self.source.restoreTable(alloc, table_name, location_uri, connection, manifest) catch |err| switch (err) {
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return err,
                 error.InvalidBackupRequest,
                 error.BackupManifestTooLarge,
@@ -6723,7 +6740,7 @@ pub const ApiHttpServer = struct {
                     // A reconciliation plan publishes the table and ranges as
                     // separate proposals. Any error after one proposal may be
                     // an interrupted exact restore intent, not a clean abort.
-                    switch (self.distributedRestoreIntentState(table_name, location_uri, backup_id) catch |state_err| switch (state_err) {
+                    switch (self.distributedRestoreIntentState(table_name, location_uri, manifest.backup_id) catch |state_err| switch (state_err) {
                         error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return state_err,
                         else => .missing,
                     }) {
@@ -6755,10 +6772,11 @@ pub const ApiHttpServer = struct {
         for (snapshot.ranges) |range| {
             if (range.table_id != table.table_id) continue;
             found_range = true;
-            const active_backup_id = if (range.restore_backup_id.len > 0) range.restore_backup_id else table.restore_backup_id;
-            const active_location = if (range.restore_location.len > 0) range.restore_location else table.restore_location;
-            if (active_backup_id.len == 0 and active_location.len == 0) continue;
-            if (!std.mem.eql(u8, active_backup_id, backup_id) or !std.mem.eql(u8, active_location, location_uri)) return .conflicting;
+            if (range.restore_backup_id.len == 0 and range.restore_location.len == 0) continue;
+            if (range.restore_backup_id.len == 0 or range.restore_location.len == 0)
+                return .conflicting;
+            if (!std.mem.eql(u8, range.restore_backup_id, backup_id) or
+                !std.mem.eql(u8, range.restore_location, location_uri)) return .conflicting;
             found_pending = true;
         }
         if (!found_range) return .conflicting;
@@ -7852,11 +7870,22 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         backup_id: []const u8,
         location_uri: []const u8,
+        connection: []const u8,
         location: *backups_api.BackupLocation,
     ) public_table_http.TableApi.ExecuteRestoreError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         if (!self.cfg.deployment_mode.isStandalone()) {
-            if (self.restoreMetadataTableWithRetry(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
+            var manifest = backups_api.readManifestFromLocation(self.alloc, location, backup_id) catch |err| switch (err) {
+                error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+                else => return error.InvalidBackupRequest,
+            };
+            defer manifest.deinit(self.alloc);
+            backups_api.validateRestoreManifest(self.alloc, &manifest, backup_id) catch
+                return error.InvalidBackupRequest;
+            if (!std.mem.eql(u8, manifest.table_name, table_name))
+                return error.InvalidBackupRequest;
+
+            if (self.restoreMetadataTableWithRetry(self.alloc, table_name, location_uri, connection, &manifest) catch |err| switch (err) {
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                 error.UnsupportedOperation => false,
                 error.InvalidBackupRequest => {
@@ -8419,6 +8448,8 @@ pub const ApiHttpServer = struct {
     ) cluster_api_http.ClusterApi.ExecuteRestoreError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const op_alloc = self.alloc;
+        const restore_connection = req.connection orelse return error.InvalidRequest;
+        if (restore_connection.len == 0 or restore_connection.len > 256) return error.InvalidRequest;
 
         try self.ensureRestoreActive(cancellation);
 
@@ -8525,7 +8556,26 @@ pub const ApiHttpServer = struct {
             // Overwrite publication is local and generation-aware. New-table
             // restores may delegate to metadata in distributed deployments.
             if (!is_overwrite and !self.cfg.deployment_mode.isStandalone()) {
-                const restored_via_metadata = self.restoreMetadataTableWithRetry(alloc, table_name, req.location, table_backup_id) catch |err| switch (err) {
+                var table_manifest = backups_api.readManifestFromLocation(op_alloc, location, table_backup_id) catch |err| switch (err) {
+                    error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+                    else => {
+                        statuses[i].@"error" = "invalid table backup manifest";
+                        continue;
+                    },
+                };
+                defer table_manifest.deinit(op_alloc);
+                if (!std.mem.eql(u8, table_manifest.table_name, table_name)) {
+                    statuses[i].@"error" = "table backup manifest does not match table";
+                    continue;
+                }
+
+                const restored_via_metadata = self.restoreMetadataTableWithRetry(
+                    alloc,
+                    table_name,
+                    req.location,
+                    restore_connection,
+                    &table_manifest,
+                ) catch |err| switch (err) {
                     error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                     error.UnsupportedOperation => false,
                     else => {
@@ -9915,7 +9965,15 @@ pub const ApiHttpServer = struct {
                         };
                     }
                     restored_via_metadata = true;
-                    executePublicTableRestore(self, self.alloc, table_name, state.backup_id, state.location, &location) catch |err| switch (err) {
+                    executePublicTableRestore(
+                        self,
+                        self.alloc,
+                        table_name,
+                        state.backup_id,
+                        state.location,
+                        state.connection,
+                        &location,
+                    ) catch |err| switch (err) {
                         // The local owned-table path reports durable completion as
                         // a sentinel because the public callback otherwise has no
                         // result channel. Preserve that distinction: only a normal
@@ -26765,10 +26823,11 @@ test "api http server durability-pending restore preserves committed metadata" {
         .start_key = try alloc.dupe(u8, ""),
         .end_key = null,
         .snapshot_path = try backups_api.shardSnapshotRelPath(alloc, "snap1", 1),
+        .artifact_sha256 = try alloc.dupe(u8, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
     };
     defer freeBackupShards(alloc, shards);
 
-    var manifest = try backups_api.createManifest(alloc, "snap1", &.{
+    var manifest = try backups_api.createManifest(alloc, "snap1", .native, &.{
         .table_id = 1,
         .name = "docs",
         .description = "docs table",
@@ -26779,10 +26838,21 @@ test "api http server durability-pending restore preserves committed metadata" {
     }, shards);
     defer manifest.deinit(alloc);
     const multi_shards = [_]backups_api.ShardSnapshot{
-        .{ .group_id = 1, .start_key = "", .end_key = "m", .snapshot_path = "snap1/groups/1" },
-        .{ .group_id = 2, .start_key = "m", .snapshot_path = "snap1/groups/2" },
+        .{
+            .group_id = 1,
+            .start_key = "",
+            .end_key = "m",
+            .snapshot_path = "snap1/groups/1",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        },
+        .{
+            .group_id = 2,
+            .start_key = "m",
+            .snapshot_path = "snap1/groups/2",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        },
     };
-    var multi_manifest = try backups_api.createManifest(alloc, "snap1", &.{
+    var multi_manifest = try backups_api.createManifest(alloc, "snap1", .native, &.{
         .table_id = 1,
         .name = "docs",
         .description = "docs table",
@@ -27044,10 +27114,11 @@ test "api http server cluster overwrite stages before replacing metadata without
         .start_key = try alloc.dupe(u8, ""),
         .end_key = null,
         .snapshot_path = try backups_api.shardSnapshotRelPath(alloc, table_backup_id, 42),
+        .artifact_sha256 = try alloc.dupe(u8, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
     };
     defer freeBackupShards(alloc, shards);
 
-    var table_manifest = try backups_api.createManifest(alloc, table_backup_id, &.{
+    var table_manifest = try backups_api.createManifest(alloc, table_backup_id, .native, &.{
         .table_id = 1,
         .name = "docs",
         .description = "restored docs table",
@@ -27787,17 +27858,7 @@ test "api http server retries interrupted metadata restore publication" {
 test "api http server restore metadata spec uses range-scoped restore intent" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-spec", .{tmp.sub_path});
-    defer alloc.free(backup_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
-    defer alloc.free(cwd);
-    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
-    defer alloc.free(backup_root_abs);
-    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
-    defer alloc.free(location_uri);
+    const location_uri = "s3://backups/tables/docs";
 
     const shards = [_]backups_api.ShardSnapshot{
         .{
@@ -27805,11 +27866,13 @@ test "api http server restore metadata spec uses range-scoped restore intent" {
             .start_key = "",
             .end_key = null,
             .snapshot_path = "snap/groups/7001",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     };
     var manifest = try backups_api.createManifest(
         alloc,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -27822,9 +27885,7 @@ test "api http server restore metadata spec uses range-scoped restore intent" {
         &shards,
     );
     defer manifest.deinit(alloc);
-    try backups_api.writeManifest(alloc, backup_root, &manifest);
-
-    var spec = try loadRestoreMetadataSpec(alloc, "docs", location_uri, "snap1", null);
+    var spec = try deriveRestoreMetadataSpec(alloc, "docs", location_uri, "production-backups", &manifest);
     defer spec.deinit(alloc);
 
     try std.testing.expectEqualStrings("", spec.table.restore_backup_id);
@@ -27833,6 +27894,8 @@ test "api http server restore metadata spec uses range-scoped restore intent" {
     try std.testing.expectEqualStrings("snap1", spec.ranges[0].restore_backup_id);
     try std.testing.expectEqualStrings(location_uri, spec.ranges[0].restore_location);
     try std.testing.expectEqualStrings("snap/groups/7001", spec.ranges[0].restore_snapshot_path);
+    try std.testing.expectEqualStrings("production-backups", spec.ranges[0].restore_connection);
+    try std.testing.expectEqualStrings(shards[0].artifact_sha256, spec.ranges[0].restore_artifact_sha256);
 }
 
 test "api http server join planner uses snapshot stats for low-selectivity lookup joins" {

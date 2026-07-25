@@ -99,6 +99,13 @@ pub const RangeRecord = struct {
     restore_backup_id: []const u8 = "",
     restore_location: []const u8 = "",
     restore_snapshot_path: []const u8 = "",
+    /// Cluster-local authority used to resolve `restore_location`. This is an
+    /// identifier only; credentials remain in each node's secret/config store.
+    restore_connection: []const u8 = "",
+    /// Content identity captured from the immutable backup manifest at
+    /// admission. New restores require a SHA-256 binding.
+    restore_artifact_size_bytes: u64 = 0,
+    restore_artifact_sha256: []const u8 = "",
 };
 
 pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
@@ -113,7 +120,10 @@ pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
         lhs.split_attempt_epoch == rhs.split_attempt_epoch and
         std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
         std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
-        std.mem.eql(u8, lhs.restore_snapshot_path, rhs.restore_snapshot_path);
+        std.mem.eql(u8, lhs.restore_snapshot_path, rhs.restore_snapshot_path) and
+        std.mem.eql(u8, lhs.restore_connection, rhs.restore_connection) and
+        lhs.restore_artifact_size_bytes == rhs.restore_artifact_size_bytes and
+        std.mem.eql(u8, lhs.restore_artifact_sha256, rhs.restore_artifact_sha256);
 }
 
 /// Returns true when an existing topology is either the exact requested
@@ -426,6 +436,7 @@ pub const RestoreProgressRecord = struct {
     backup_id: []const u8,
     location: []const u8 = "",
     snapshot_path: []const u8 = "",
+    artifact_sha256: []const u8 = "",
     primary_restored: bool = false,
     runtime_repair_complete: bool = false,
     phase: []const u8 = "",
@@ -1088,6 +1099,10 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
     errdefer alloc.free(restore_location);
     const restore_snapshot_path = try alloc.dupe(u8, record.restore_snapshot_path);
     errdefer alloc.free(restore_snapshot_path);
+    const restore_connection = try alloc.dupe(u8, record.restore_connection);
+    errdefer alloc.free(restore_connection);
+    const restore_artifact_sha256 = try alloc.dupe(u8, record.restore_artifact_sha256);
+    errdefer alloc.free(restore_artifact_sha256);
     return .{
         .group_id = record.group_id,
         .range_id = if (record.range_id == 0) record.group_id else record.range_id,
@@ -1100,6 +1115,9 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
         .restore_backup_id = restore_backup_id,
         .restore_location = restore_location,
         .restore_snapshot_path = restore_snapshot_path,
+        .restore_connection = restore_connection,
+        .restore_artifact_size_bytes = record.restore_artifact_size_bytes,
+        .restore_artifact_sha256 = restore_artifact_sha256,
     };
 }
 
@@ -1118,6 +1136,8 @@ pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
     alloc.free(record.restore_backup_id);
     alloc.free(record.restore_location);
     alloc.free(record.restore_snapshot_path);
+    alloc.free(record.restore_connection);
+    alloc.free(record.restore_artifact_sha256);
 }
 
 pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) !RestoreProgressRecord {
@@ -1127,6 +1147,8 @@ pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRec
     errdefer alloc.free(location);
     const snapshot_path = try alloc.dupe(u8, record.snapshot_path);
     errdefer alloc.free(snapshot_path);
+    const artifact_sha256 = try alloc.dupe(u8, record.artifact_sha256);
+    errdefer alloc.free(artifact_sha256);
     const phase = try alloc.dupe(u8, record.phase);
     errdefer alloc.free(phase);
     const last_error = try alloc.dupe(u8, record.last_error);
@@ -1138,6 +1160,7 @@ pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRec
         .backup_id = backup_id,
         .location = location,
         .snapshot_path = snapshot_path,
+        .artifact_sha256 = artifact_sha256,
         .primary_restored = record.primary_restored,
         .runtime_repair_complete = record.runtime_repair_complete,
         .phase = phase,
@@ -1150,6 +1173,7 @@ pub fn freeRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressReco
     alloc.free(record.backup_id);
     alloc.free(record.location);
     alloc.free(record.snapshot_path);
+    alloc.free(record.artifact_sha256);
     alloc.free(record.phase);
     alloc.free(record.last_error);
 }

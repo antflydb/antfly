@@ -922,40 +922,42 @@ fn overlayRestoreReadiness(
     for (merged) |*status| {
         const range = findRangeForGroup(ranges, status.group_id) orelse continue;
         const table = findTableForId(tables, range.table_id) orelse continue;
-        const restore_backup_id = restoreBackupIdForRange(range, table) orelse continue;
-        const restore_location = if (range.restore_location.len > 0) range.restore_location else table.restore_location;
-        status.restore_pending = groupRestorePending(table.table_id, restore_backup_id, restore_location, placement_intents, restore_progresses, status.group_id);
+        if (range.restore_backup_id.len == 0 or range.restore_location.len == 0) continue;
+        status.restore_pending = groupRestorePending(
+            table.table_id,
+            range,
+            placement_intents,
+            restore_progresses,
+        );
     }
 }
 
 fn groupRestorePending(
     table_id: u64,
-    restore_backup_id: []const u8,
-    restore_location: []const u8,
+    range: metadata_table_manager.RangeRecord,
     placement_intents: []const raft_reconciler.PlacementIntent,
     restore_progresses: []const metadata_table_manager.RestoreProgressRecord,
-    group_id: u64,
 ) bool {
     var expected: usize = 0;
     var restored: usize = 0;
     for (placement_intents) |intent| {
-        if (intent.record.group_id != group_id) continue;
+        if (intent.record.group_id != range.group_id) continue;
         expected += 1;
-        if (findRestoreProgress(restore_progresses, table_id, intent.record.local_node_id, group_id, restore_backup_id, restore_location)) |progress| {
+        if (findRestoreProgress(
+            restore_progresses,
+            table_id,
+            intent.record.local_node_id,
+            range.group_id,
+            range.restore_backup_id,
+            range.restore_location,
+            range.restore_snapshot_path,
+            range.restore_artifact_sha256,
+        )) |progress| {
             if (!progress.runtime_repair_complete) continue;
             restored += 1;
         }
     }
     return expected > 0 and restored < expected;
-}
-
-fn restoreBackupIdForRange(
-    range: metadata_table_manager.RangeRecord,
-    table: metadata_table_manager.TableRecord,
-) ?[]const u8 {
-    if (range.restore_backup_id.len > 0) return range.restore_backup_id;
-    if (table.restore_backup_id.len > 0) return table.restore_backup_id;
-    return null;
 }
 
 fn findRangeForGroup(
@@ -985,6 +987,8 @@ fn findRestoreProgress(
     group_id: u64,
     backup_id: []const u8,
     location: []const u8,
+    snapshot_path: []const u8,
+    artifact_sha256: []const u8,
 ) ?metadata_table_manager.RestoreProgressRecord {
     for (records) |record| {
         if (record.table_id != table_id) continue;
@@ -992,6 +996,8 @@ fn findRestoreProgress(
         if (record.group_id != group_id) continue;
         if (!std.mem.eql(u8, record.backup_id, backup_id)) continue;
         if (!std.mem.eql(u8, record.location, location)) continue;
+        if (!std.mem.eql(u8, record.snapshot_path, snapshot_path)) continue;
+        if (!std.mem.eql(u8, record.artifact_sha256, artifact_sha256)) continue;
         return record;
     }
     return null;
@@ -2105,19 +2111,45 @@ test "metadata state marks restore-pending groups as not yet ready" {
             .table_id = 88,
             .name = "docs",
             .placement_role = "data",
-            .restore_backup_id = "snap1",
-            .restore_location = "file:///tmp/backups",
         },
     };
     const ranges = [_]metadata_table_manager.RangeRecord{
-        .{ .group_id = 8801, .table_id = 88, .start_key = "", .end_key = null },
+        .{
+            .group_id = 8801,
+            .table_id = 88,
+            .start_key = "",
+            .end_key = null,
+            .restore_backup_id = "snap1",
+            .restore_location = "file:///tmp/backups",
+            .restore_snapshot_path = "snap1/groups/8801",
+            .restore_artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        },
     };
     const placement_intents = [_]raft_reconciler.PlacementIntent{
         .{ .record = .{ .group_id = 8801, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .peer_node_ids = &.{2} },
         .{ .record = .{ .group_id = 8801, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .peer_node_ids = &.{1} },
     };
     const restore_progresses = [_]metadata_table_manager.RestoreProgressRecord{
-        .{ .table_id = 88, .node_id = 1, .group_id = 8801, .backup_id = "snap1", .location = "file:///tmp/backups" },
+        .{
+            .table_id = 88,
+            .node_id = 1,
+            .group_id = 8801,
+            .backup_id = "snap1",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "snap1/groups/8801",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            .runtime_repair_complete = true,
+        },
+        .{
+            .table_id = 88,
+            .node_id = 2,
+            .group_id = 8801,
+            .backup_id = "snap1",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "snap1/groups/8801",
+            .artifact_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .runtime_repair_complete = true,
+        },
     };
     const stores = [_]metadata_table_manager.StoreRecord{
         .{

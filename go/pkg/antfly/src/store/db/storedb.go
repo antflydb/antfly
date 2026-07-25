@@ -17,6 +17,7 @@ package db
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -1187,6 +1188,66 @@ func publishLocalBackup(ctx context.Context, sourcePath, targetPath string) erro
 	return nil
 }
 
+const nativeBackupStageIntentVersion = 1
+
+type nativeBackupStageIntent struct {
+	Version    int    `json:"version"`
+	BackupID   string `json:"backup_id"`
+	Location   string `json:"location"`
+	Connection string `json:"connection,omitempty"`
+}
+
+func readNativeBackupStageIntent(path string) (nativeBackupStageIntent, bool, error) {
+	raw, err := os.ReadFile(filepath.Clean(path)) //nolint:gosec // internal snapshot path
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nativeBackupStageIntent{}, false, nil
+		}
+		return nativeBackupStageIntent{}, false, err
+	}
+	var intent nativeBackupStageIntent
+	if err := json.Unmarshal(raw, &intent); err != nil {
+		return nativeBackupStageIntent{}, false, fmt.Errorf("decoding backup stage intent: %w", err)
+	}
+	return intent, true, nil
+}
+
+func writeNativeBackupStageIntent(path string, intent nativeBackupStageIntent) error {
+	raw, err := json.Marshal(intent)
+	if err != nil {
+		return fmt.Errorf("encoding backup stage intent: %w", err)
+	}
+	file, err := os.OpenFile(filepath.Clean(path), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // internal snapshot path
+	if err != nil {
+		return err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = file.Close()
+		}
+	}()
+	if _, err := file.Write(raw); err != nil {
+		return fmt.Errorf("writing backup stage intent: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("syncing backup stage intent: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("closing backup stage intent: %w", err)
+	}
+	closed = true
+	dir, err := os.Open(filepath.Dir(path)) //nolint:gosec // internal snapshot path
+	if err != nil {
+		return fmt.Errorf("opening backup stage directory: %w", err)
+	}
+	defer func() { _ = dir.Close() }()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("syncing backup stage directory: %w", err)
+	}
+	return nil
+}
+
 func (s *StoreDB) applyOpBackup(ctx context.Context, backup *BackupOp) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1235,6 +1296,49 @@ func (s *StoreDB) applyOpBackup(ctx context.Context, backup *BackupOp) error {
 	stagedExists := statErr == nil
 	if statErr != nil && !os.IsNotExist(statErr) {
 		return fmt.Errorf("checking staged backup: %w", statErr)
+	}
+	intentPath := stagedArchive + ".intent.json"
+	expectedIntent := nativeBackupStageIntent{
+		Version:    nativeBackupStageIntentVersion,
+		BackupID:   backupID,
+		Location:   location,
+		Connection: connection,
+	}
+	stagedIntent, intentExists, err := readNativeBackupStageIntent(intentPath)
+	if err != nil {
+		return fmt.Errorf("reading staged backup intent: %w", err)
+	}
+	if stagedExists && (!intentExists || stagedIntent != expectedIntent) {
+		return fmt.Errorf(
+			"%w: backup ID %q is bound to another staged operation",
+			common.ErrBackupAlreadyExists,
+			backupID,
+		)
+	}
+	if intentExists && stagedIntent != expectedIntent {
+		return fmt.Errorf(
+			"%w: backup ID %q is bound to another staged operation",
+			common.ErrBackupAlreadyExists,
+			backupID,
+		)
+	}
+	if !intentExists {
+		if err := writeNativeBackupStageIntent(intentPath, expectedIntent); err != nil {
+			if !os.IsExist(err) {
+				return fmt.Errorf("recording staged backup intent: %w", err)
+			}
+			stagedIntent, intentExists, err = readNativeBackupStageIntent(intentPath)
+			if err != nil {
+				return fmt.Errorf("reading concurrently staged backup intent: %w", err)
+			}
+			if !intentExists || stagedIntent != expectedIntent {
+				return fmt.Errorf(
+					"%w: backup ID %q is bound to another staged operation",
+					common.ErrBackupAlreadyExists,
+					backupID,
+				)
+			}
+		}
 	}
 
 	snapshotTime := time.Now()
@@ -1440,6 +1544,12 @@ func (s *StoreDB) applyOpSplit(_ context.Context, split *SplitOp) error {
 	archiveInfo, err := common.CreateArchiveWithOptions(combinedStagingDir, tmpArchiveFile, common.CreateArchiveOptions{
 		ArchiveType: common.ArchiveZstd,
 		Metadata: &common.ArchiveMetadata{
+			Shard: common.NewShardInfo(
+				newShardID,
+				nodeID,
+				types.Range{medianKey, oldByteRange[1]},
+				"",
+			),
 			Split: &common.SplitMetadata{
 				ParentShardID:  shardID.String(),
 				ReplayFenceSeq: replayFenceSeq,
@@ -2282,6 +2392,9 @@ func (s *StoreDB) loadPersistentSnapshot(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("extracting snapshot %s: %w", snapID, err)
 	}
+	if err := s.validateRestoredArchiveMetadata(metadata); err != nil {
+		return fmt.Errorf("validating snapshot %s identity: %w", snapID, err)
+	}
 	s.restoredArchiveMetadata = metadata
 
 	// Log metadata if present
@@ -2345,6 +2458,41 @@ func (s *StoreDB) loadPersistentSnapshot(ctx context.Context) error {
 		zap.Uint64("size", size),
 		zap.String("snapID", snapID),
 		zap.String("pebbleDir", targetPebbleDir))
+	return nil
+}
+
+func (s *StoreDB) validateRestoredArchiveMetadata(metadata *common.ArchiveMetadata) error {
+	if metadata == nil {
+		return errors.New("archive metadata is required")
+	}
+	if metadata.Shard == nil {
+		return errors.New("archive shard identity is required")
+	}
+	shardID, _, err := common.ParseStorageDBDir(s.dbDir)
+	if err != nil {
+		return fmt.Errorf("parsing target shard identity: %w", err)
+	}
+	if metadata.Shard.ShardID != shardID.String() {
+		return fmt.Errorf(
+			"archive shard %q does not match target shard %q",
+			metadata.Shard.ShardID,
+			shardID,
+		)
+	}
+	s.byteRangeMu.RLock()
+	expectedRange := s.byteRange
+	s.byteRangeMu.RUnlock()
+	expectedStart := base64.StdEncoding.EncodeToString(expectedRange[0])
+	expectedEnd := base64.StdEncoding.EncodeToString(expectedRange[1])
+	if metadata.Shard.RangeStart != expectedStart || metadata.Shard.RangeEnd != expectedEnd {
+		return fmt.Errorf(
+			"archive range [%q,%q) does not match target range [%q,%q)",
+			metadata.Shard.RangeStart,
+			metadata.Shard.RangeEnd,
+			expectedStart,
+			expectedEnd,
+		)
+	}
 	return nil
 }
 

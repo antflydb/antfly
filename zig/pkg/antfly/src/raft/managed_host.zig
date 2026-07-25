@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const raft_engine = @import("raft_engine");
+const backups_api = @import("../api/backups.zig");
 const catalog = @import("catalog.zig");
 const data_storage = @import("../data/storage/mod.zig");
 const host_mod = @import("host.zig");
@@ -32,6 +33,7 @@ pub const ManagedHostConfig = struct {
     host: host_mod.HostConfig,
     wal_replica_state: storage.WalReplicaStateConfig = .{},
     wal_flush_on_deinit: bool = true,
+    restore_open_options: backups_api.OpenOptions = .{},
 };
 
 pub const ManagedHostDeps = struct {
@@ -47,6 +49,7 @@ pub const ManagedHttpHostConfig = struct {
     wal_replica_state: storage.WalReplicaStateConfig = .{},
     wal_flush_on_deinit: bool = true,
     replica_apply_store_no_sync: bool = false,
+    restore_open_options: backups_api.OpenOptions = .{},
 };
 
 pub const ManagedHttpHostDeps = struct {
@@ -91,6 +94,7 @@ pub const ManagedHost = struct {
             cfg.wal_flush_on_deinit,
             false,
             null,
+            cfg.restore_open_options,
             deps.host,
             deps.metadata_snapshot_builder,
             deps.data_snapshot_builder,
@@ -313,6 +317,7 @@ pub const ManagedHttpHost = struct {
             cfg.wal_flush_on_deinit,
             cfg.replica_apply_store_no_sync,
             deps.http.backend_runtime,
+            cfg.restore_open_options,
             deps.http.host,
             deps.metadata_snapshot_builder,
             deps.data_snapshot_builder,
@@ -583,10 +588,16 @@ const PreparedHostDeps = struct {
 
 const ReplicaBackupRestoreBootstrapper = struct {
     replica_root_dir: []u8,
+    open_options: backups_api.OpenOptions,
 
-    fn init(alloc: std.mem.Allocator, replica_root_dir: []const u8) !ReplicaBackupRestoreBootstrapper {
+    fn init(
+        alloc: std.mem.Allocator,
+        replica_root_dir: []const u8,
+        open_options: backups_api.OpenOptions,
+    ) !ReplicaBackupRestoreBootstrapper {
         return .{
             .replica_root_dir = try alloc.dupe(u8, replica_root_dir),
+            .open_options = open_options,
         };
     }
 
@@ -607,11 +618,12 @@ const ReplicaBackupRestoreBootstrapper = struct {
     fn prepareBackupRestore(ptr: *anyopaque, record: catalog.ReplicaRecord) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const restore = record.backup_restore_bootstrap orelse return;
-        try metadata_table_provisioner.applyBackupRestoreBootstrap(
+        try metadata_table_provisioner.applyBackupRestoreBootstrapWithOptions(
             std.heap.page_allocator,
             self.replica_root_dir,
             record.group_id,
             restore,
+            self.open_options,
         );
     }
 };
@@ -623,6 +635,7 @@ fn prepareHostDeps(
     wal_flush_on_deinit: bool,
     replica_apply_store_no_sync: bool,
     backend_runtime: ?*background_runtime.BackendRuntime,
+    restore_open_options: backups_api.OpenOptions,
     base: host_mod.HostDeps,
     metadata_snapshot_builder: ?state_machine.SnapshotBuilder,
     data_snapshot_builder: ?state_machine.SnapshotBuilder,
@@ -647,7 +660,11 @@ fn prepareHostDeps(
         if (prepared.host.backup_restore_bootstrapper == null) {
             const bootstrapper = try alloc.create(ReplicaBackupRestoreBootstrapper);
             errdefer alloc.destroy(bootstrapper);
-            bootstrapper.* = try ReplicaBackupRestoreBootstrapper.init(alloc, replica_root_dir);
+            bootstrapper.* = try ReplicaBackupRestoreBootstrapper.init(
+                alloc,
+                replica_root_dir,
+                restore_open_options,
+            );
             prepared.owned_backup_restore_bootstrapper = bootstrapper;
             prepared.host.backup_restore_bootstrapper = bootstrapper.iface();
         }
@@ -1000,8 +1017,6 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
     };
 
     const db_mod = @import("../storage/db/mod.zig");
-    const backups_api = @import("../api/backups.zig");
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1047,10 +1062,18 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
     defer std.testing.allocator.free(backup_root_abs);
     const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
     defer std.testing.allocator.free(restore_location);
+    var artifact_integrity = try backups_api.artifactIntegrityAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .native,
+        dest_root,
+    );
+    defer artifact_integrity.deinit(std.testing.allocator);
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -1063,6 +1086,8 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
             .start_key = "doc:a",
             .end_key = null,
             .snapshot_path = "snap1/groups/903",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     defer {

@@ -870,7 +870,10 @@ fn backupRestoreBootstrapEqual(
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?.backup_id, b.?.backup_id) and
         std.mem.eql(u8, a.?.location, b.?.location) and
-        std.mem.eql(u8, a.?.snapshot_path, b.?.snapshot_path);
+        std.mem.eql(u8, a.?.snapshot_path, b.?.snapshot_path) and
+        std.mem.eql(u8, a.?.connection, b.?.connection) and
+        a.?.artifact_size_bytes == b.?.artifact_size_bytes and
+        std.mem.eql(u8, a.?.artifact_sha256, b.?.artifact_sha256);
 }
 
 fn findPlacementIntent(intents: []const raft_reconciler.PlacementIntent, group_id: u64, local_node_id: u64) ?raft_reconciler.PlacementIntent {
@@ -889,9 +892,17 @@ fn normalizeRestoreBootstrapIntent(
     var effective = intent;
     const range = findRangeRecord(ranges, intent.record.group_id) orelse return effective;
     const table = findTableRecord(tables, range.table_id) orelse return effective;
-    const restore_backup_id = restoreBackupIdForRange(range, table) orelse return effective;
-    const restore_location = if (range.restore_location.len > 0) range.restore_location else table.restore_location;
-    if (findRestoreProgress(current.restore_progresses, table.table_id, intent.record.local_node_id, intent.record.group_id, restore_backup_id, restore_location)) |progress| {
+    if (range.restore_backup_id.len == 0 or range.restore_location.len == 0) return effective;
+    if (findRestoreProgress(
+        current.restore_progresses,
+        table.table_id,
+        intent.record.local_node_id,
+        intent.record.group_id,
+        range.restore_backup_id,
+        range.restore_location,
+        range.restore_snapshot_path,
+        range.restore_artifact_sha256,
+    )) |progress| {
         if (!progress.primary_restored) return effective;
         effective.record.bootstrap_mode = .persisted;
         effective.record.snapshot_bootstrap = null;
@@ -900,9 +911,12 @@ fn normalizeRestoreBootstrapIntent(
         effective.record.bootstrap_mode = .fetch_snapshot;
         effective.record.snapshot_bootstrap = null;
         effective.record.backup_restore_bootstrap = .{
-            .backup_id = restore_backup_id,
-            .location = restore_location,
+            .backup_id = range.restore_backup_id,
+            .location = range.restore_location,
             .snapshot_path = range.restore_snapshot_path,
+            .connection = range.restore_connection,
+            .artifact_size_bytes = range.restore_artifact_size_bytes,
+            .artifact_sha256 = range.restore_artifact_sha256,
         };
     }
     return effective;
@@ -1525,6 +1539,8 @@ fn findRestoreProgress(
     group_id: u64,
     backup_id: []const u8,
     location: []const u8,
+    snapshot_path: []const u8,
+    artifact_sha256: []const u8,
 ) ?table_manager.RestoreProgressRecord {
     for (records) |record| {
         if (record.table_id != table_id) continue;
@@ -1532,6 +1548,8 @@ fn findRestoreProgress(
         if (record.group_id != group_id) continue;
         if (!std.mem.eql(u8, record.backup_id, backup_id)) continue;
         if (!std.mem.eql(u8, record.location, location)) continue;
+        if (!std.mem.eql(u8, record.snapshot_path, snapshot_path)) continue;
+        if (!std.mem.eql(u8, record.artifact_sha256, artifact_sha256)) continue;
         return record;
     }
     return null;
@@ -2539,15 +2557,6 @@ fn tableRecordsEqual(a: table_manager.TableRecord, b: table_manager.TableRecord)
         std.mem.eql(u8, a.name, b.name);
 }
 
-fn restoreBackupIdForRange(
-    range: table_manager.RangeRecord,
-    table: table_manager.TableRecord,
-) ?[]const u8 {
-    if (range.restore_backup_id.len > 0) return range.restore_backup_id;
-    if (table.restore_backup_id.len > 0) return table.restore_backup_id;
-    return null;
-}
-
 fn maybeFinalizeSchemaMigration(
     alloc: std.mem.Allocator,
     current: CurrentMetadataState,
@@ -2656,6 +2665,9 @@ fn rangeRecordsEqual(a: table_manager.RangeRecord, b: table_manager.RangeRecord)
         std.mem.eql(u8, a.restore_backup_id, b.restore_backup_id) and
         std.mem.eql(u8, a.restore_location, b.restore_location) and
         std.mem.eql(u8, a.restore_snapshot_path, b.restore_snapshot_path) and
+        std.mem.eql(u8, a.restore_connection, b.restore_connection) and
+        a.restore_artifact_size_bytes == b.restore_artifact_size_bytes and
+        std.mem.eql(u8, a.restore_artifact_sha256, b.restore_artifact_sha256) and
         a.split_attempt_epoch == b.split_attempt_epoch;
 }
 
@@ -7306,18 +7318,31 @@ test "metadata reconciler marks restore-active placements with fetch_snapshot un
     try manager.upsertTable(.{
         .table_id = 490,
         .name = "docs",
-        .restore_backup_id = "snap1",
-        .restore_location = "file:///tmp/backups",
     });
     try manager.upsertRange(.{
         .group_id = 4901,
         .table_id = 490,
         .start_key = "",
         .end_key = null,
+        .restore_backup_id = "snap1",
+        .restore_location = "file:///tmp/backups",
+        .restore_snapshot_path = "snap1/groups/4901",
+        .restore_connection = "backups",
+        .restore_artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     });
 
     const progress = [_]table_manager.RestoreProgressRecord{
-        .{ .table_id = 490, .node_id = 1, .group_id = 4901, .backup_id = "snap1", .location = "file:///tmp/backups", .primary_restored = true, .phase = "runtime_repair" },
+        .{
+            .table_id = 490,
+            .node_id = 1,
+            .group_id = 4901,
+            .backup_id = "snap1",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "snap1/groups/4901",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            .primary_restored = true,
+            .phase = "runtime_repair",
+        },
     };
 
     var reconciler = Reconciler.init(std.testing.allocator);

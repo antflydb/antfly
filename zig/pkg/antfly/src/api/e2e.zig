@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const platform = @import("antfly_platform");
+const common_config = @import("../common/config.zig");
 const group_ids = @import("../common/group_ids.zig");
 const raft_engine = @import("raft_engine");
 const metadata_mod = @import("../metadata/mod.zig");
@@ -55,6 +56,55 @@ fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !
 
 fn parseJsonBodyIgnoreUnknown(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
     return try std.json.parseFromSlice(T, alloc, body, .{ .ignore_unknown_fields = true });
+}
+
+fn runMetadataUntilIncarnationReady(svc: *metadata_service.MetadataService) !void {
+    for (0..32) |_| {
+        if (try svc.metadataIncarnation() != null) return;
+        try svc.runRound();
+    }
+    return error.MetadataIncarnationUnavailable;
+}
+
+fn metadataServiceProgressSource(svc: *metadata_service.MetadataService) raft_mod.ProgressSource {
+    return .{
+        .ptr = svc,
+        .run_once = runMetadataServiceProgress,
+    };
+}
+
+fn runMetadataServiceProgress(ptr: *anyopaque) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    try svc.runRound();
+}
+
+fn dataServerProgressSource(data_server: *data_runtime.DataServer) raft_mod.ProgressSource {
+    return .{
+        .ptr = data_server,
+        .run_once = runDataServerProgress,
+    };
+}
+
+fn runDataServerProgress(ptr: *anyopaque) !void {
+    const data_server: *data_runtime.DataServer = @ptrCast(@alignCast(ptr));
+    try data_server.runRound();
+}
+
+fn registerDataServerUntilVisible(
+    data_server: *data_runtime.DataServer,
+    io: std.Io,
+) !void {
+    for (0..32) |_| {
+        data_server.registerNodeIfConfigured() catch |err| switch (err) {
+            error.StoreRegistrationNotVisible => {
+                try io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+    return error.StoreRegistrationNotVisible;
 }
 
 fn jsonValueContainsText(value: std.json.Value, needle: []const u8) bool {
@@ -1761,9 +1811,9 @@ test "public api e2e rejects table restore for migration-state backup manifests"
     defer std.testing.allocator.free(backup_body);
     var backup_resp = try client.fetchBackupTable(base_uri, "docs", backup_body);
     defer backup_resp.deinit(std.testing.allocator);
-    var parsed_backup = try parseJsonBody(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body);
+    var parsed_backup = try parseJsonBody(struct { backup: []const u8 }, std.testing.allocator, backup_resp.body);
     defer parsed_backup.deinit();
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqualStrings("successful", parsed_backup.value.backup);
 
     var manifest = try backups_api.readManifest(std.testing.allocator, backup_root, "restore-migration-snap");
     defer manifest.deinit(std.testing.allocator);
@@ -2339,7 +2389,7 @@ test "public api e2e backs up drops and restores a table" {
 
     var lookup = try client.fetchLookup(base_uri, "docs", "doc:a", null);
     defer lookup.deinit(std.testing.allocator);
-    var parsed_lookup = try parseJsonBody(LookupTitle, std.testing.allocator, lookup.body);
+    var parsed_lookup = try parseJsonBodyIgnoreUnknown(LookupTitle, std.testing.allocator, lookup.body);
     defer parsed_lookup.deinit();
     try std.testing.expectEqualStrings("alpha", parsed_lookup.value.title);
 }
@@ -2391,7 +2441,7 @@ test "public api split e2e backs up drops and restores a table" {
         .bootstrap_mode = .empty,
     });
     try svc.campaignMetadataGroup();
-    try svc.runRound();
+    try runMetadataUntilIncarnationReady(&svc);
 
     var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_listener: std_http_listener.StdHttpListener = undefined;
@@ -2483,8 +2533,10 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-root", .{tmp.sub_path});
-    defer std.testing.allocator.free(replica_root);
+    const metadata_replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-metadata-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(metadata_replica_root);
+    const data_replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-data-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(data_replica_root);
     const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-catalog.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_catalog_path);
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-out", .{tmp.sub_path});
@@ -2492,12 +2544,34 @@ test "public api standalone-like e2e backs up drops and restores a table" {
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), metadata_replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), data_replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), backup_root);
+    const backup_root_absolute = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), backup_root, std.testing.allocator);
+    defer std.testing.allocator.free(backup_root_absolute);
     defer {
-        std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), metadata_replica_root) catch {};
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), data_replica_root) catch {};
         std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
     }
+    const node_config_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{
+        \\  "connections": {{
+        \\    "test-backups": {{
+        \\      "kind": "external_io",
+        \\      "capabilities": ["backup.write", "restore.read"],
+        \\      "external_io": {{ "protocol": "filesystem", "root": "{s}" }}
+        \\    }}
+        \\  }}
+        \\}}
+    ,
+        .{backup_root_absolute},
+    );
+    defer std.testing.allocator.free(node_config_json);
+    var node_config = try common_config.Config.parseFromSlice(std.testing.allocator, node_config_json);
+    defer node_config.deinit();
 
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
@@ -2507,7 +2581,7 @@ test "public api standalone-like e2e backs up drops and restores a table" {
         .host = .{
             .local_node_id = 1,
             .metadata_group_id = 2116,
-            .replica_root_dir = replica_root,
+            .replica_root_dir = metadata_replica_root,
             .replica_catalog_path = replica_catalog_path,
         },
     }, .{
@@ -2528,7 +2602,7 @@ test "public api standalone-like e2e backs up drops and restores a table" {
         .bootstrap_mode = .empty,
     });
     try svc.campaignMetadataGroup();
-    try svc.runRound();
+    try runMetadataUntilIncarnationReady(&svc);
 
     var metadata_admin_server: metadata_http_server.MetadataHttpServer = undefined;
     var metadata_admin_listener: std_http_listener.StdHttpListener = undefined;
@@ -2542,17 +2616,37 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     defer metadata_admin_listener.deinit();
     defer metadata_admin_server.deinit();
 
+    var metadata_progress = raft_mod.ManagedProgressDriver.init(
+        io_impl.io(),
+        metadataServiceProgressSource(&svc),
+        std.time.ns_per_ms,
+    );
+    defer metadata_progress.deinit();
+    try metadata_progress.start();
+
     var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(process_alloc, .{
-        .replica_root_dir = replica_root,
+        .replica_root_dir = data_replica_root,
         .store_registration = .{
             .node_id = 1,
             .store_id = 1,
             .role = "data",
         },
+        .api_server_cfg = .{
+            .deployment_mode = .standalone,
+            .node_config = &node_config,
+        },
     }, metadata_api);
     defer data_server.deinit();
     try data_server.start();
-    try data_server.registerNodeIfConfigured();
+    try registerDataServerUntilVisible(&data_server, io_impl.io());
+
+    var data_progress = raft_mod.ManagedProgressDriver.init(
+        io_impl.io(),
+        dataServerProgressSource(&data_server),
+        std.time.ns_per_ms,
+    );
+    defer data_progress.deinit();
+    try data_progress.start();
     svc.setLocalGroupStatusProvider(data_server.localGroupStatusProvider());
     defer svc.setLocalGroupStatusProvider(null);
 
@@ -2567,12 +2661,6 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     defer std.testing.allocator.free(create_body);
     var created = try client.createTable(base_uri, "docs", create_body);
     defer created.deinit(std.testing.allocator);
-
-    var rounds: usize = 0;
-    while (rounds < 12) : (rounds += 1) {
-        try data_server.runRound();
-        try svc.runRound();
-    }
 
     const batch_uri = try raft_routes.Routes.join(std.testing.allocator, base_uri, "/tables/docs/batch");
     defer std.testing.allocator.free(batch_uri);
@@ -2590,31 +2678,44 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     );
     defer query_resp.deinit(std.testing.allocator);
 
-    const backup_body = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"backup_id\":\"standalone-like-roundtrip-snap\",\"location\":\"file://{s}\"}}",
-        .{backup_root},
-    );
-    defer std.testing.allocator.free(backup_body);
-    var backup_resp = try client.fetchBackupTable(base_uri, "docs", backup_body);
+    const backup_body =
+        \\{"backup_id":"standalone-like-roundtrip-snap","location":"file:///","connection":"test-backups"}
+    ;
+    const backup_uri = try raft_routes.Routes.join(std.testing.allocator, base_uri, "/tables/docs/backup");
+    defer std.testing.allocator.free(backup_uri);
+    var backup_resp = try executor.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = backup_uri,
+        .content_type = "application/json",
+        .body = backup_body,
+    });
     defer backup_resp.deinit(std.testing.allocator);
-    var parsed_backup = try parseJsonBody(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body);
+    if (backup_resp.status != 201) {
+        std.debug.print("standalone-like backup status={d} body={s}\n", .{ backup_resp.status, backup_resp.body });
+    }
+    try std.testing.expectEqual(@as(u16, 201), backup_resp.status);
+    var parsed_backup = try parseJsonBody(struct { backup: []const u8 }, std.testing.allocator, backup_resp.body);
     defer parsed_backup.deinit();
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqualStrings("successful", parsed_backup.value.backup);
+    var backup_manifest = try backups_api.readManifest(
+        std.testing.allocator,
+        backup_root_absolute,
+        "standalone-like-roundtrip-snap",
+    );
+    defer backup_manifest.deinit(std.testing.allocator);
+    try backups_api.validateRestoreManifest(
+        std.testing.allocator,
+        &backup_manifest,
+        "standalone-like-roundtrip-snap",
+    );
+    try backups_api.validateRestorableManifestLayout(&backup_manifest);
+    try std.testing.expectEqualStrings("docs", backup_manifest.table_name);
 
     _ = try client.dropTable(base_uri, "docs");
-    rounds = 0;
-    while (rounds < 24) : (rounds += 1) {
-        try data_server.runRound();
-        try svc.runRound();
-    }
 
-    const restore_body = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"backup_id\":\"standalone-like-roundtrip-snap\",\"location\":\"file://{s}\"}}",
-        .{backup_root},
-    );
-    defer std.testing.allocator.free(restore_body);
+    const restore_body =
+        \\{"backup_id":"standalone-like-roundtrip-snap","location":"file:///","connection":"test-backups"}
+    ;
     const restore_uri = try raft_routes.Routes.join(std.testing.allocator, base_uri, "/tables/docs/restore");
     defer std.testing.allocator.free(restore_uri);
     var restore_resp = try executor.executor().execute(std.testing.allocator, .{
@@ -2625,25 +2726,62 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     });
     defer restore_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    var accepted_restore = try parseJsonBodyIgnoreUnknown(
+        struct {
+            job_id: []const u8,
+            phase: []const u8,
+            @"error": ?[]const u8 = null,
+        },
+        std.testing.allocator,
+        restore_resp.body,
+    );
+    defer accepted_restore.deinit();
+    const restore_job_uri = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/restore/jobs/{s}",
+        .{ base_uri, accepted_restore.value.job_id },
+    );
+    defer std.testing.allocator.free(restore_job_uri);
 
-    rounds = 0;
-    while (rounds < 40) : (rounds += 1) {
-        try data_server.runRound();
-        try svc.runRound();
-        var lookup = client.fetchLookup(base_uri, "docs", "doc:a", null) catch |err| switch (err) {
-            error.HttpNotFound => {
-                continue;
+    var restore_succeeded = false;
+    for (0..30_000) |_| {
+        try metadata_progress.check();
+        try data_progress.check();
+        var job_resp = try executor.executor().execute(std.testing.allocator, .{
+            .method = .GET,
+            .uri = restore_job_uri,
+        });
+        defer job_resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 200), job_resp.status);
+        var job = try parseJsonBodyIgnoreUnknown(
+            struct {
+                phase: []const u8,
+                @"error": ?[]const u8 = null,
             },
-            else => return err,
-        };
-        defer lookup.deinit(std.testing.allocator);
-        var parsed_lookup = try parseJsonBody(LookupTitle, std.testing.allocator, lookup.body);
-        defer parsed_lookup.deinit();
-        try std.testing.expectEqualStrings("alpha", parsed_lookup.value.title);
-        return;
+            std.testing.allocator,
+            job_resp.body,
+        );
+        defer job.deinit();
+        if (std.mem.eql(u8, job.value.phase, "succeeded")) {
+            restore_succeeded = true;
+            break;
+        }
+        if (std.mem.eql(u8, job.value.phase, "failed") or std.mem.eql(u8, job.value.phase, "canceled")) {
+            std.debug.print(
+                "standalone-like restore terminal phase={s} error={s}\n",
+                .{ job.value.phase, job.value.@"error" orelse "none" },
+            );
+            return error.RestoreJobFailed;
+        }
+        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
     }
+    if (!restore_succeeded) return error.RestoreJobTimeout;
 
-    return error.TestExpectedEqual;
+    var lookup = try client.fetchLookup(base_uri, "docs", "doc:a", null);
+    defer lookup.deinit(std.testing.allocator);
+    var parsed_lookup = try parseJsonBodyIgnoreUnknown(LookupTitle, std.testing.allocator, lookup.body);
+    defer parsed_lookup.deinit();
+    try std.testing.expectEqualStrings("alpha", parsed_lookup.value.title);
 }
 
 test "split data runtime registers a store with metadata" {

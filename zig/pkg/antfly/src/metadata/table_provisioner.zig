@@ -73,6 +73,7 @@ pub const ProvisionSummary = struct {
 pub const ReconcileReplicaRootOptions = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
+    restore_open_options: backups_api.OpenOptions = .{},
 };
 
 fn provisioningDbOpenOptions() db_mod.OpenOptions {
@@ -97,6 +98,9 @@ const RestoreIntentSource = struct {
     backup_id: []const u8,
     location: []const u8,
     snapshot_path: []const u8 = "",
+    connection: []const u8 = "",
+    artifact_size_bytes: u64 = 0,
+    artifact_sha256: []const u8 = "",
 };
 
 pub fn groupDbPathFromReplicaRoot(alloc: std.mem.Allocator, replica_root_dir: []const u8, group_id: u64) ![]u8 {
@@ -109,7 +113,23 @@ pub fn applyBackupRestoreBootstrap(
     group_id: u64,
     restore: raft_catalog.BackupRestoreBootstrapRecord,
 ) !void {
-    try backup_restore.applyBackupRestoreFromRecord(alloc, replica_root_dir, group_id, restore);
+    return try applyBackupRestoreBootstrapWithOptions(alloc, replica_root_dir, group_id, restore, .{});
+}
+
+pub fn applyBackupRestoreBootstrapWithOptions(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    group_id: u64,
+    restore: raft_catalog.BackupRestoreBootstrapRecord,
+    open_options: backups_api.OpenOptions,
+) !void {
+    try backup_restore.applyBackupRestoreFromRecordWithOptions(
+        alloc,
+        replica_root_dir,
+        group_id,
+        restore,
+        open_options,
+    );
 }
 
 pub fn provisioningFingerprint(
@@ -127,7 +147,11 @@ pub fn provisioningFingerprint(
         const range = findRange(ranges, group_id) orelse continue;
         const table = findTable(tables, range.table_id) orelse continue;
         hasher.update(std.mem.asBytes(&range.group_id));
+        hasher.update(std.mem.asBytes(&range.range_id));
         hasher.update(std.mem.asBytes(&range.table_id));
+        hasher.update(std.mem.asBytes(&range.doc_identity_shard_id));
+        hasher.update(std.mem.asBytes(&range.doc_identity_range_id));
+        hasher.update(std.mem.asBytes(&range.split_attempt_epoch));
         hashBytes(&hasher, range.start_key);
         if (range.end_key) |end_key| {
             hasher.update(&[_]u8{1});
@@ -138,6 +162,9 @@ pub fn provisioningFingerprint(
         hashBytes(&hasher, range.restore_backup_id);
         hashBytes(&hasher, range.restore_location);
         hashBytes(&hasher, range.restore_snapshot_path);
+        hashBytes(&hasher, range.restore_connection);
+        hasher.update(std.mem.asBytes(&range.restore_artifact_size_bytes));
+        hashBytes(&hasher, range.restore_artifact_sha256);
         hasher.update(std.mem.asBytes(&table.table_id));
         hashBytes(&hasher, table.name);
         hashBytes(&hasher, table.schema_json);
@@ -188,7 +215,14 @@ pub fn reconcileReplicaRootWithOptions(
         var io_impl = std.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         try fs_paths.createDirPathPortable(io_impl.io(), path);
-        try applyRestoreIntentIfNeeded(alloc, path, group_id, table, range);
+        try applyRestoreIntentIfNeededWithOptions(
+            alloc,
+            path,
+            group_id,
+            table,
+            range,
+            options.restore_open_options,
+        );
 
         const runtime_schema = try runtimeTableSchemaFromJson(alloc, table.schema_json);
         defer if (runtime_schema) |schema| @import("../storage/schema.zig").freeSchema(alloc, schema);
@@ -560,6 +594,7 @@ pub fn collectLocalRestoreProgress(
         defer state.deinit(alloc);
         if (!std.mem.eql(u8, state.backup_id, restore.backup_id)) continue;
         if (!std.mem.eql(u8, state.location, restore.location)) continue;
+        if (!std.mem.eql(u8, state.artifact_sha256, restore.artifact_sha256)) continue;
         if (restore.snapshot_path.len > 0 and !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path)) continue;
         if (state.group_id != group_id) continue;
 
@@ -575,6 +610,7 @@ pub fn collectLocalRestoreProgress(
                 .backup_id = progress_backup_id,
                 .location = progress_location,
                 .snapshot_path = &.{},
+                .artifact_sha256 = &.{},
                 .primary_restored = state.primary_restored,
                 .runtime_repair_complete = state.runtime_repair_complete,
                 .phase = &.{},
@@ -585,6 +621,7 @@ pub fn collectLocalRestoreProgress(
         var appended = false;
         errdefer if (!appended) table_manager.freeRestoreProgress(alloc, record);
         record.snapshot_path = try alloc.dupe(u8, state.snapshot_path);
+        record.artifact_sha256 = try alloc.dupe(u8, state.artifact_sha256);
         record.phase = try alloc.dupe(u8, state.phase);
         record.last_error = try alloc.dupe(u8, state.last_error);
         try out.append(alloc, record);
@@ -608,11 +645,26 @@ pub fn applyRestoreIntentIfNeeded(
     table: table_manager.TableRecord,
     range: table_manager.RangeRecord,
 ) !void {
+    return try applyRestoreIntentIfNeededWithOptions(alloc, path, group_id, table, range, .{});
+}
+
+pub fn applyRestoreIntentIfNeededWithOptions(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    table: table_manager.TableRecord,
+    range: table_manager.RangeRecord,
+    open_options: backups_api.OpenOptions,
+) !void {
     const restore = resolveRestoreIntent(range, table) orelse return;
     try backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
         .backup_id = restore.backup_id,
         .location = restore.location,
         .snapshot_path = restore.snapshot_path,
+        .connection = restore.connection,
+        .expected_artifact_size_bytes = restore.artifact_size_bytes,
+        .expected_artifact_sha256 = restore.artifact_sha256,
+        .open_options = open_options,
     }, .{
         .expected_table_name = table.name,
         .expected_identity_namespace = doc_identity.Namespace{
@@ -638,14 +690,12 @@ fn resolveRestoreIntent(
             .backup_id = range.restore_backup_id,
             .location = range.restore_location,
             .snapshot_path = range.restore_snapshot_path,
+            .connection = range.restore_connection,
+            .artifact_size_bytes = range.restore_artifact_size_bytes,
+            .artifact_sha256 = range.restore_artifact_sha256,
         };
     }
-    if (table.restore_backup_id.len > 0 and table.restore_location.len > 0) {
-        return .{
-            .backup_id = table.restore_backup_id,
-            .location = table.restore_location,
-        };
-    }
+    _ = table;
     return null;
 }
 
@@ -2539,10 +2589,18 @@ test "table provisioner restores local shard data from metadata restore intent" 
     defer std.testing.allocator.free(backup_root_abs);
     const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
     defer std.testing.allocator.free(restore_location);
+    var artifact_integrity = try backups_api.artifactIntegrityAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .native,
+        dest_root,
+    );
+    defer artifact_integrity.deinit(std.testing.allocator);
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -2555,6 +2613,8 @@ test "table provisioner restores local shard data from metadata restore intent" 
             .start_key = "doc:a",
             .end_key = null,
             .snapshot_path = "snap1/groups/2001",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     defer {
@@ -2580,6 +2640,11 @@ test "table provisioner restores local shard data from metadata restore intent" 
             .table_id = 7,
             .start_key = "doc:a",
             .end_key = null,
+            .restore_backup_id = "snap1",
+            .restore_location = restore_location,
+            .restore_snapshot_path = "snap1/groups/2001",
+            .restore_artifact_size_bytes = artifact_integrity.size_bytes,
+            .restore_artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     try std.testing.expectEqual(@as(usize, 1), summary.groups_considered);
@@ -2699,10 +2764,18 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
     defer std.testing.allocator.free(backup_root_abs);
     const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
     defer std.testing.allocator.free(restore_location);
+    var artifact_integrity = try backups_api.artifactIntegrityAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .native,
+        dest_root,
+    );
+    defer artifact_integrity.deinit(std.testing.allocator);
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -2715,6 +2788,8 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
             .start_key = "doc:a",
             .end_key = null,
             .snapshot_path = "snap1/groups/2001",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     defer {
@@ -2742,6 +2817,11 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
             .start_key = "doc:a",
             .end_key = null,
             .range_id = 2001,
+            .restore_backup_id = "snap1",
+            .restore_location = restore_location,
+            .restore_snapshot_path = "snap1/groups/2001",
+            .restore_artifact_size_bytes = artifact_integrity.size_bytes,
+            .restore_artifact_sha256 = artifact_integrity.sha256,
         }},
     ));
 }

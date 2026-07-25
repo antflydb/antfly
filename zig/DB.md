@@ -78,6 +78,48 @@ namespace. After durable publication, the exchanged old root is submitted to
 the shared backend runtime's cleanup lane; recursive reclamation is not part of
 the admission-critical publication path.
 
+Backup publication has a separate immutable commit point. The caller's
+`backup_id` names only the create-once table manifest; shard artifacts live
+under a cryptographically random internal operation generation, so an
+interrupted attempt cannot make a later request reuse or overwrite stale bytes.
+Version 2 manifests record the explicit `native` or `portable` format and bind
+every shard's group, range, relative artifact path, byte count, and SHA-256
+digest. Portable digests cover the exact AFB bytes. Native digests cover a
+canonical tree encoding of sorted normalized paths, file sizes, and contents,
+which makes the identity independent of directory enumeration order while
+rejecting symlinks and other unsupported entries. Hashing is streaming with
+bounded memory and uses the server's shared I/O runtime.
+
+All shard transfers must complete before the manifest is conditionally
+published. Restore treats the manifest format as authoritative rather than
+guessing from a filename, rejects duplicate group or artifact identities and
+unbound artifacts, stages remote content locally, and verifies the staged bytes
+before any importer or generation publication can consume them. A mismatch is
+a terminal corrupt-backup result; the live generation and table definition
+remain unchanged. Restore accepts only the versioned, content-bound manifest;
+an unversioned or unsupported manifest fails closed before staging.
+
+External storage authority is preserved across distributed restore rather than
+collapsed into a URI. The ingress node resolves the caller's named
+`external_io` connection, checks `restore.read`, reads and validates the
+manifest once, and submits only the connection identifier plus the validated
+per-shard path, size, and digest to metadata. Credentials are never written to
+Raft. Each replica resolves that identifier against its local configuration
+before opening the artifact, so bucket, prefix, and capability policy remains
+effective at the node that performs I/O. The range restore intent, replica
+bootstrap record, local import marker, and completion progress all carry the
+same shard digest. Consequently retries and crash recovery are idempotent for
+specific immutable bytes, and stale completion from another artifact cannot
+clear or satisfy a newer intent.
+
+Restore identity is range-scoped; table definitions are not a second fallback
+source. Manifest admission sorts shard boundaries and requires every adjacent
+pair to meet exactly, rejecting gaps and overlaps before topology publication.
+Local import and repair progress use strict versioned JSON markers whose
+artifact digest is mandatory. Marker updates are file-synced, atomically
+renamed, and followed by a parent-directory sync, so partial writes cannot be
+interpreted as valid crash-recovery state.
+
 Data-Raft snapshot apply follows the same generation boundary. The apply path
 validates the canonical snapshot stream without materializing document values
 or a descriptor per document, builds a fresh staged DB in fixed-size borrowed

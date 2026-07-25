@@ -434,6 +434,7 @@ func (c *LocalStoreClient) StartShard(ctx context.Context, shardID types.ID, req
 	return s.StartRaftGroup(shardID, req.Peers, req.Join, &store.ShardStartConfig{
 		ShardConfig: req.ShardConfig,
 		Timestamp:   req.Timestamp,
+		Context:     ctx,
 	})
 }
 

@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const common_secrets = @import("../common/secrets.zig");
 const group_ids = @import("../common/group_ids.zig");
 const metadata_api = @import("api.zig");
 const metadata_admin = @import("admin.zig");
@@ -110,7 +109,14 @@ pub const AdminSource = struct {
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
-        restore_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void = null,
+        restore_table: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            location_uri: []const u8,
+            connection: []const u8,
+            manifest: *const backups_api.TableBackupManifest,
+        ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
@@ -180,9 +186,16 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, expected, replacement);
     }
 
-    pub fn restoreTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+    pub fn restoreTable(
+        self: AdminSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        manifest: *const backups_api.TableBackupManifest,
+    ) !void {
         const fn_ptr = self.vtable.restore_table orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, location_uri, backup_id);
+        return try fn_ptr(self.ptr, alloc, table_name, location_uri, connection, manifest);
     }
 
     pub fn dropTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8) !void {
@@ -471,9 +484,16 @@ pub const AdminSource = struct {
         try flushMetadataServiceMutation(svc);
     }
 
-    fn metadataServiceRestoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+    fn metadataServiceRestoreTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        manifest: *const backups_api.TableBackupManifest,
+    ) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, backup_id);
+        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, connection, manifest);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -792,9 +812,16 @@ pub const AdminSource = struct {
         try flushMetadataHttpServiceMutation(svc);
     }
 
-    fn metadataHttpServiceRestoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+    fn metadataHttpServiceRestoreTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        manifest: *const backups_api.TableBackupManifest,
+    ) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, backup_id);
+        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, connection, manifest);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -1318,7 +1345,13 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableRestore(req.uri)) |table| {
                     var restore_req = parseInternalTableRestoreRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid restore request");
                     defer restore_req.deinit();
-                    self.source.restoreTable(alloc, table.table_name, restore_req.value.location, restore_req.value.backup_id) catch |err| {
+                    self.source.restoreTable(
+                        alloc,
+                        table.table_name,
+                        restore_req.value.location,
+                        restore_req.value.connection,
+                        &restore_req.value.manifest,
+                    ) catch |err| {
                         if (backups_api.backupLocationErrorMessage(err)) |msg| {
                             return try textResponse(alloc, 400, msg);
                         }
@@ -1737,16 +1770,22 @@ fn cloneValues(
 const InternalTableRestoreRequest = struct {
     backup_id: []const u8,
     location: []const u8,
+    connection: []const u8,
+    manifest: backups_api.TableBackupManifest,
 };
 
-/// Metadata-to-metadata restore dispatch is an internal control-plane request.
-/// It deliberately does not carry a public named connection: the data node
-/// resolves the location using its own configured storage authority.
+/// The ingress data node validates and content-binds the manifest using the
+/// named connection. Metadata persists that authority identifier and exact
+/// artifact identity without requiring backup credentials itself.
 fn parseInternalTableRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(InternalTableRestoreRequest) {
     const parsed = try std.json.parseFromSlice(InternalTableRestoreRequest, alloc, body, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
     try backups_api.validateBackupId(parsed.value.backup_id);
     if (parsed.value.location.len == 0 or parsed.value.location.len > 4096) return error.InvalidBackupRequest;
+    if (parsed.value.connection.len == 0 or parsed.value.connection.len > 256) return error.InvalidBackupRequest;
+    if (!std.mem.eql(u8, parsed.value.backup_id, parsed.value.manifest.backup_id))
+        return error.InvalidBackupRequest;
+    try backups_api.validateTableManifest(alloc, &parsed.value.manifest, parsed.value.backup_id);
     return parsed;
 }
 
@@ -1945,19 +1984,16 @@ fn loadRestoreMetadataSpec(
     alloc: std.mem.Allocator,
     table_name: []const u8,
     location_uri: []const u8,
-    backup_id: []const u8,
-    secret_store: ?*common_secrets.FileStore,
+    connection: []const u8,
+    manifest: *const backups_api.TableBackupManifest,
 ) !RestoreMetadataSpec {
-    var location = try backups_api.openBackupLocationWithSecrets(alloc, location_uri, secret_store);
-    defer location.deinit(alloc);
-    var manifest = backups_api.readManifestFromLocation(alloc, &location, backup_id) catch return error.InvalidBackupRequest;
-    defer manifest.deinit(alloc);
-
-    const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, &manifest) catch {
+    try backups_api.validateTableManifest(alloc, manifest, manifest.backup_id);
+    if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+    const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest) catch {
         return error.InvalidBackupRequest;
     };
     errdefer metadata_table_manager.freeTable(alloc, table);
-    const ranges = try backups_api.deriveRestoreRanges(alloc, table.table_id, location_uri, &manifest);
+    const ranges = try backups_api.deriveRestoreRanges(alloc, table.table_id, location_uri, connection, manifest);
     errdefer {
         for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
         alloc.free(ranges);
@@ -1968,17 +2004,15 @@ fn loadRestoreMetadataSpec(
     };
 }
 
-fn serviceSecretStore(service_impl: anytype) ?*common_secrets.FileStore {
-    const Ptr = @TypeOf(service_impl);
-    const Service = std.meta.Child(Ptr);
-    if (comptime @hasField(Service, "secret_store")) {
-        return service_impl.secret_store;
-    }
-    return null;
-}
-
-fn persistRestoreTableIntent(service_impl: anytype, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
-    var spec = try loadRestoreMetadataSpec(alloc, table_name, location_uri, backup_id, serviceSecretStore(service_impl));
+fn persistRestoreTableIntent(
+    service_impl: anytype,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    location_uri: []const u8,
+    connection: []const u8,
+    manifest: *const backups_api.TableBackupManifest,
+) !void {
+    var spec = try loadRestoreMetadataSpec(alloc, table_name, location_uri, connection, manifest);
     defer spec.deinit(alloc);
 
     var snapshot = try service_impl.adminSnapshot();

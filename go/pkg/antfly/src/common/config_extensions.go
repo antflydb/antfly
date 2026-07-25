@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"weak"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/minio/minio-go/v7"
@@ -82,17 +83,23 @@ type (
 
 var metadataCache = make(map[*MetadataInfo]*metadataInfoExtension)
 var metadataCacheMu sync.Mutex
-var configRuntimeCache = make(map[*Config]*configRuntimeExtension)
+var configRuntimeCache = make(map[weak.Pointer[Config]]*configRuntimeExtension)
 var configRuntimeCacheMu sync.Mutex
 
 func (c *Config) s3Runtime(connectionID string) *s3ConnectionRuntime {
+	key := weak.Make(c)
 	configRuntimeCacheMu.Lock()
-	ext, ok := configRuntimeCache[c]
+	ext, ok := configRuntimeCache[key]
 	if !ok {
+		for candidate := range configRuntimeCache {
+			if candidate.Value() == nil {
+				delete(configRuntimeCache, candidate)
+			}
+		}
 		ext = &configRuntimeExtension{
 			s3Connections: make(map[string]*s3ConnectionRuntime),
 		}
-		configRuntimeCache[c] = ext
+		configRuntimeCache[key] = ext
 	}
 	configRuntimeCacheMu.Unlock()
 

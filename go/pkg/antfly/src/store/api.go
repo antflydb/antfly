@@ -427,7 +427,10 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 			if err := common.ValidateBackupID(restoreConf.BackupID); err != nil {
 				return fmt.Errorf("%w: invalid backup ID: %v", ErrBadRequest, err)
 			}
-			format := common.NormalizeBackupFormat(restoreConf.Format)
+			format, err := common.ValidateBackupFormat(restoreConf.Format)
+			if err != nil {
+				return fmt.Errorf("%w: %v", ErrBadRequest, err)
+			}
 			// newShardID is the shardID for this node, restoreConf.BackupID is the ID given by the leader.
 			backupFileName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
 			if format == common.BackupFormatPortable {
@@ -453,35 +456,14 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 				if err != nil {
 					return fmt.Errorf("%w: invalid destination backup path: %v", ErrBadRequest, err)
 				}
-				// Don't cancel the download if the request context is canceled,
-				// it could take a while.
-				if err := downloadFromS3(context.Background(), h.logger, backupFileName, destPath, &s3Info); err != nil {
-					alternateName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
-					if format == common.BackupFormatNative {
-						alternateName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
-					}
-					alternateDestPath, alternatePathErr := safeJoinUnder(snapDir, alternateName)
-					if alternatePathErr != nil {
-						alternateDestPath = destPath
-					}
-					alternateErr := downloadFromS3(context.Background(), h.logger, alternateName, alternateDestPath, &s3Info)
-					if alternateErr != nil {
-						h.logger.Error(
-							"Failed to download backup from S3 for shard",
-							zap.Stringer("newShardID", newShardID),
-							zap.Error(err),
-							zap.NamedError("fallbackError", alternateErr),
-						)
-						return fmt.Errorf(
-							"downloading s3 backup (%s, object: %s): %w; fallback object %s: %v",
-							restoreConf.Location,
-							backupFileName,
-							err,
-							alternateName,
-							alternateErr,
-						)
-					}
-					backupFileName = alternateName
+				if err := downloadFromS3(r.Context(), h.logger, backupFileName, destPath, &s3Info); err != nil {
+					return fmt.Errorf(
+						"downloading %s backup from %s (object: %s): %w",
+						format,
+						restoreConf.Location,
+						backupFileName,
+						err,
+					)
 				}
 				initWithDBArchive = initArchiveFromBackupFile(backupFileName)
 			} else if strings.HasPrefix(restoreConf.Location, "file://") {
@@ -501,19 +483,6 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 					return fmt.Errorf("%w: invalid restore path: %v", ErrBadRequest, err)
 				}
 
-				if _, statErr := os.Stat(srcPath); os.IsNotExist(statErr) {
-					alternateName := common.ShardBackupFileName(restoreConf.BackupID, newShardID)
-					if format == common.BackupFormatNative {
-						alternateName = common.ShardPortableBackupFileName(restoreConf.BackupID, newShardID)
-					}
-					alternatePath, alternatePathErr := safeJoinUnder(localBasePath, alternateName)
-					if alternatePathErr == nil {
-						if _, alternateErr := os.Stat(alternatePath); alternateErr == nil {
-							backupFileName = alternateName
-							srcPath = alternatePath
-						}
-					}
-				}
 				destPath, err := safeJoinUnder(snapDir, backupFileName)
 				if err != nil {
 					return fmt.Errorf("%w: invalid destination backup path: %v", ErrBadRequest, err)
@@ -1114,12 +1083,6 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	} else if req.Location == "" {
 		streamResponse = true
 	}
-	destPath, err := safeJoinUnder(destDir, fileName)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Invalid backup path: %v", err), http.StatusBadRequest)
-		return
-	}
-
 	if err := os.MkdirAll(destDir, 0o750); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create backup dir: %v", err), http.StatusInternalServerError)
 		return
@@ -1156,28 +1119,6 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, fmt.Sprintf("Portable backup was interrupted: %v", err), http.StatusRequestTimeout)
 		return
 	}
-	if err := os.Link(tempPath, filepath.Clean(destPath)); err != nil {
-		if !os.IsExist(err) {
-			http.Error(w, fmt.Sprintf("Failed to publish portable backup: %v", err), http.StatusInternalServerError)
-			return
-		}
-	} else {
-		dir, err := os.Open(destDir) //nolint:gosec // internal snapshot directory
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to open portable backup directory for sync: %v", err), http.StatusInternalServerError)
-			return
-		}
-		if err := dir.Sync(); err != nil {
-			_ = dir.Close()
-			http.Error(w, fmt.Sprintf("Failed to sync portable backup directory: %v", err), http.StatusInternalServerError)
-			return
-		}
-		if err := dir.Close(); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to close portable backup directory: %v", err), http.StatusInternalServerError)
-			return
-		}
-	}
-
 	if strings.HasPrefix(req.Location, "s3://") {
 		s3Info, err := h.antflyConfig.ResolveS3Info(
 			req.Connection,
@@ -1188,7 +1129,7 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 			http.Error(w, fmt.Sprintf("Invalid S3 backup location: %v", err), http.StatusBadRequest)
 			return
 		}
-		if err := db.WriteBackupToBlobStore(r.Context(), destPath, &s3Info); err != nil {
+		if err := db.WriteBackupToBlobStore(r.Context(), tempPath, &s3Info); err != nil {
 			status := http.StatusInternalServerError
 			if errors.Is(err, common.ErrBackupAlreadyExists) {
 				status = http.StatusConflict
@@ -1205,7 +1146,7 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	}
 
 	// Stream the file back in the response
-	file, err = os.Open(filepath.Clean(destPath)) //nolint:gosec // internal path
+	file, err = os.Open(filepath.Clean(tempPath)) //nolint:gosec // internal path
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to open backup file: %v", err), http.StatusNotFound)
 		return

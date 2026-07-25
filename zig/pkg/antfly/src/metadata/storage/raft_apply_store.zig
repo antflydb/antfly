@@ -289,13 +289,21 @@ test "metadata raft apply store decodes range values before split attempt epochs
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(encoded.len >= @sizeOf(u64));
 
-    const legacy = encoded[0 .. encoded.len - @sizeOf(u64)];
+    const appended_fields_size =
+        @sizeOf(u64) + // split_attempt_epoch
+        @sizeOf(u32) + // empty restore_connection
+        @sizeOf(u64) + // restore_artifact_size_bytes
+        @sizeOf(u32); // empty restore_artifact_sha256
+    const legacy = encoded[0 .. encoded.len - appended_fields_size];
     const decoded = try decodeRangeRecord(std.testing.allocator, legacy);
     defer metadata_table_manager.freeRange(std.testing.allocator, decoded);
     try std.testing.expectEqual(@as(u64, 901), decoded.group_id);
     try std.testing.expectEqual(@as(u64, 902), decoded.range_id);
     try std.testing.expectEqual(@as(u64, 903), decoded.table_id);
     try std.testing.expectEqual(@as(u64, 0), decoded.split_attempt_epoch);
+    try std.testing.expectEqualStrings("", decoded.restore_connection);
+    try std.testing.expectEqual(@as(u64, 0), decoded.restore_artifact_size_bytes);
+    try std.testing.expectEqualStrings("", decoded.restore_artifact_sha256);
 }
 
 fn validateRestoreJobLogicalKey(key: []const u8) !void {
@@ -4468,6 +4476,8 @@ fn appendRestoreProgressRecord(
     try appendInt(alloc, out, u32, @intCast(record.last_error.len));
     try out.appendSlice(alloc, record.last_error);
     try appendInt(alloc, out, u64, record.updated_at_ms);
+    try appendInt(alloc, out, u32, @intCast(record.artifact_sha256.len));
+    try out.appendSlice(alloc, record.artifact_sha256);
 }
 
 fn appendReplicationSourceStatusRecord(
@@ -4536,6 +4546,11 @@ fn appendRangeRecord(
     try appendInt(alloc, out, u64, record.doc_identity_shard_id);
     try appendInt(alloc, out, u64, record.doc_identity_range_id);
     try appendInt(alloc, out, u64, record.split_attempt_epoch);
+    try appendInt(alloc, out, u32, @intCast(record.restore_connection.len));
+    try out.appendSlice(alloc, record.restore_connection);
+    try appendInt(alloc, out, u64, record.restore_artifact_size_bytes);
+    try appendInt(alloc, out, u32, @intCast(record.restore_artifact_sha256.len));
+    try out.appendSlice(alloc, record.restore_artifact_sha256);
 }
 
 fn appendSplitTransitionRecord(
@@ -4910,6 +4925,20 @@ fn readRangeRecord(
         try readInt(encoded, pos, u64)
     else
         0;
+    const restore_connection = if (pos.* < encoded.len)
+        try readRequiredString(alloc, encoded, pos)
+    else
+        try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_connection);
+    const restore_artifact_size_bytes = if (pos.* < encoded.len)
+        try readInt(encoded, pos, u64)
+    else
+        0;
+    const restore_artifact_sha256 = if (pos.* < encoded.len)
+        try readRequiredString(alloc, encoded, pos)
+    else
+        try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_artifact_sha256);
     return .{
         .group_id = group_id,
         .range_id = if (range_id == 0) group_id else range_id,
@@ -4922,6 +4951,9 @@ fn readRangeRecord(
         .restore_backup_id = restore_backup_id,
         .restore_location = restore_location,
         .restore_snapshot_path = restore_snapshot_path,
+        .restore_connection = restore_connection,
+        .restore_artifact_size_bytes = restore_artifact_size_bytes,
+        .restore_artifact_sha256 = restore_artifact_sha256,
     };
 }
 
@@ -4969,6 +5001,11 @@ fn readRestoreProgressRecord(
     const last_error = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(last_error);
     const updated_at_ms = try readInt(encoded, pos, u64);
+    const artifact_sha256 = if (pos.* < encoded.len)
+        try readRequiredString(alloc, encoded, pos)
+    else
+        try alloc.dupe(u8, "");
+    errdefer alloc.free(artifact_sha256);
     return .{
         .table_id = table_id,
         .node_id = node_id,
@@ -4976,6 +5013,7 @@ fn readRestoreProgressRecord(
         .backup_id = backup_id,
         .location = location,
         .snapshot_path = snapshot_path,
+        .artifact_sha256 = artifact_sha256,
         .primary_restored = primary_restored,
         .runtime_repair_complete = runtime_repair_complete,
         .phase = phase,
@@ -6418,6 +6456,12 @@ test "metadata raft apply store projects table and range records from committed 
             .end_key = "doc:z",
             .doc_identity_shard_id = 4001,
             .doc_identity_range_id = 9001,
+            .restore_backup_id = "nightly",
+            .restore_location = "s3://backups/tables/docs",
+            .restore_snapshot_path = "nightly/groups/4101.afb",
+            .restore_connection = "production-backups",
+            .restore_artifact_size_bytes = 4096,
+            .restore_artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     });
     defer std.testing.allocator.free(range_cmd);
@@ -6453,6 +6497,15 @@ test "metadata raft apply store projects table and range records from committed 
     try std.testing.expectEqual(@as(u64, 4001), ranges[0].doc_identity_shard_id);
     try std.testing.expectEqual(@as(u64, 9001), ranges[0].doc_identity_range_id);
     try std.testing.expectEqualStrings("doc:a", ranges[0].start_key);
+    try std.testing.expectEqualStrings("nightly", ranges[0].restore_backup_id);
+    try std.testing.expectEqualStrings("s3://backups/tables/docs", ranges[0].restore_location);
+    try std.testing.expectEqualStrings("nightly/groups/4101.afb", ranges[0].restore_snapshot_path);
+    try std.testing.expectEqualStrings("production-backups", ranges[0].restore_connection);
+    try std.testing.expectEqual(@as(u64, 4096), ranges[0].restore_artifact_size_bytes);
+    try std.testing.expectEqualStrings(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ranges[0].restore_artifact_sha256,
+    );
 }
 
 test "metadata raft apply store rejects reserved data group ids in transition records" {
@@ -7048,6 +7101,7 @@ test "metadata restore progress transition command round-trips" {
             .group_id = 4101,
             .backup_id = "snap1",
             .location = "s3://archive/snap1",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
     };
 
@@ -7064,6 +7118,10 @@ test "metadata restore progress transition command round-trips" {
     try std.testing.expectEqual(@as(u64, 4101), decoded.?.upsert_restore_progress.group_id);
     try std.testing.expectEqualStrings("snap1", decoded.?.upsert_restore_progress.backup_id);
     try std.testing.expectEqualStrings("s3://archive/snap1", decoded.?.upsert_restore_progress.location);
+    try std.testing.expectEqualStrings(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        decoded.?.upsert_restore_progress.artifact_sha256,
+    );
 }
 
 test "metadata replication source status transition command round-trips" {

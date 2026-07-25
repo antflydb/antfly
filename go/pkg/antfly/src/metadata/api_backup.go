@@ -40,6 +40,18 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+func (t *TableApi) acquireBackupTransfer(ctx context.Context) (func(), error) {
+	t.backupTransferOnce.Do(func() {
+		t.backupTransfers = make(chan struct{}, innerFanOutLimit)
+	})
+	select {
+	case t.backupTransfers <- struct{}{}:
+		return func() { <-t.backupTransfers }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName string) {
 	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
 		return
@@ -86,6 +98,11 @@ func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName
 	g, _ := workerpool.NewGroup(ctx, t.pool)
 	for shardID := range table.Shards {
 		g.Go(func(ctx context.Context) error {
+			release, err := t.acquireBackupTransfer(ctx)
+			if err != nil {
+				return err
+			}
+			defer release()
 			// Forward the insert to the appropriate shard
 			if err := t.ln.forwardBackupToShard(ctx, shardID, backupConfig); err != nil {
 				if !errors.Is(err, context.Canceled) {
@@ -593,6 +610,11 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 			shardEg.SetLimit(innerFanOutLimit)
 			for shardID := range table.Shards {
 				shardEg.Go(func() error {
+					release, err := t.acquireBackupTransfer(shardCtx)
+					if err != nil {
+						return err
+					}
+					defer release()
 					if err := t.ln.forwardBackupToShard(shardCtx, shardID, backupConfig); err != nil {
 						if !errors.Is(err, context.Canceled) {
 							t.logger.Error("Error forwarding backup", zap.String("table", tableName), zap.Error(err))

@@ -5130,12 +5130,26 @@ pub fn build(b: *std.Build) void {
     lib_api_docid_test_step.dependOn(lib_metadata_public_chaos_test_step);
     lib_api_docid_test_step.dependOn(&run_lib_db_result_shape_tests.step);
 
+    const api_backup_restore_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_backup_restore_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_backup_restore_test_mod, true, true);
     const lib_api_standalone_backup_restore_tests = b.addTest(.{
-        .root_module = lib_test_mod,
+        .root_module = api_backup_restore_test_mod,
         .filters = &.{
             "public api standalone-like e2e backs up drops and restores a table",
             "api restore rollback preserves a concurrently replaced table definition",
             "api http server cluster overwrite stages before replacing metadata without dropping live table",
+            "backup manifest validation rejects ambiguous or unbound artifacts",
+            "portable backup integrity rejects changed staged bytes",
+            "db incomplete deferred restore import recovers before runtime repair",
+            "db restore state uses strict structured content identity markers",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
     });
     const run_lib_api_standalone_backup_restore_tests = addFilteredTestRunArtifact(b, lib_api_standalone_backup_restore_tests);

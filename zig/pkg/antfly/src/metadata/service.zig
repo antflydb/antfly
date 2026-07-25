@@ -731,11 +731,14 @@ const ProjectedCoreSnapshot = struct {
         for (self.placement_intents) |intent| {
             out.estimated_bytes += @sizeOf(u64) * intent.peer_node_ids.len;
             if (intent.record.snapshot_bootstrap) |record| out.estimated_bytes += record.snapshot_id.len + record.uri.len;
-            if (intent.record.backup_restore_bootstrap) |record| out.estimated_bytes += record.backup_id.len + record.location.len + record.snapshot_path.len;
+            if (intent.record.backup_restore_bootstrap) |record| {
+                out.estimated_bytes += record.backup_id.len + record.location.len + record.snapshot_path.len +
+                    record.connection.len + record.artifact_sha256.len;
+            }
         }
         for (self.restore_progresses) |record| {
             out.estimated_bytes += record.backup_id.len + record.location.len + record.snapshot_path.len +
-                record.phase.len + record.last_error.len;
+                record.artifact_sha256.len + record.phase.len + record.last_error.len;
         }
         for (self.replication_source_statuses) |record| {
             out.estimated_bytes += record.source_kind.len + record.external_table.len + record.cutover_mode.len +
@@ -777,7 +780,8 @@ const CatalogValidationSnapshot = struct {
         }
         for (self.ranges) |record| {
             out.estimated_bytes += record.start_key.len + optionalLen(record.end_key) +
-                record.restore_backup_id.len + record.restore_location.len + record.restore_snapshot_path.len;
+                record.restore_backup_id.len + record.restore_location.len + record.restore_snapshot_path.len +
+                record.restore_connection.len + record.restore_artifact_sha256.len;
         }
     }
 };
@@ -4941,6 +4945,7 @@ fn restoreProgressEquivalent(a: metadata_table_manager.RestoreProgressRecord, b:
     return std.mem.eql(u8, a.backup_id, b.backup_id) and
         std.mem.eql(u8, a.location, b.location) and
         std.mem.eql(u8, a.snapshot_path, b.snapshot_path) and
+        std.mem.eql(u8, a.artifact_sha256, b.artifact_sha256) and
         a.primary_restored == b.primary_restored and
         a.runtime_repair_complete == b.runtime_repair_complete and
         std.mem.eql(u8, a.phase, b.phase) and
@@ -4995,58 +5000,56 @@ fn completeRestoreIntentsForService(
 
     for (ranges) |range| {
         const table = findProjectedTableById(tables, range.table_id) orelse continue;
-        const restore_backup_id = restoreBackupIdForRange(range, table) orelse continue;
-        const restore_location = restoreLocationForRange(range, table) orelse continue;
-        if (!rangeRestoreIntentComplete(table.table_id, range.group_id, restore_backup_id, restore_location, placements, progress)) continue;
-        if (range.restore_backup_id.len == 0 and range.restore_location.len == 0) continue;
+        if (range.restore_backup_id.len == 0 or range.restore_location.len == 0) continue;
+        if (!rangeRestoreIntentComplete(
+            table.table_id,
+            range,
+            range.restore_backup_id,
+            range.restore_location,
+            placements,
+            progress,
+        )) continue;
 
-        var cleared = try metadata_table_manager.cloneRange(service.alloc, range);
+        const cleared = try clearedRestoreRangeAlloc(service.alloc, range);
         errdefer metadata_table_manager.freeRange(service.alloc, cleared);
-        service.alloc.free(cleared.restore_backup_id);
-        service.alloc.free(cleared.restore_location);
-        service.alloc.free(cleared.restore_snapshot_path);
-        cleared.restore_backup_id = try service.alloc.dupe(u8, "");
-        cleared.restore_location = try service.alloc.dupe(u8, "");
-        cleared.restore_snapshot_path = try service.alloc.dupe(u8, "");
         try service.upsertRange(cleared);
         metadata_table_manager.freeRange(service.alloc, cleared);
     }
-
-    for (tables) |table| {
-        if (table.restore_backup_id.len == 0) continue;
-        if (!restoreIntentComplete(table, ranges, placements, progress)) continue;
-
-        var cleared = try metadata_table_manager.cloneTable(service.alloc, table);
-        errdefer metadata_table_manager.freeTable(service.alloc, cleared);
-        service.alloc.free(cleared.restore_backup_id);
-        service.alloc.free(cleared.restore_location);
-        cleared.restore_backup_id = try service.alloc.dupe(u8, "");
-        cleared.restore_location = try service.alloc.dupe(u8, "");
-        try service.upsertTable(cleared);
-        metadata_table_manager.freeTable(service.alloc, cleared);
-    }
 }
 
-fn restoreIntentComplete(
-    table: metadata_table_manager.TableRecord,
-    ranges: []const metadata_table_manager.RangeRecord,
-    placements: []const raft_reconciler.PlacementIntent,
-    progress: []const metadata_table_manager.RestoreProgressRecord,
-) bool {
-    var found_any_range = false;
-    for (ranges) |range| {
-        if (range.table_id != table.table_id) continue;
-        const restore_backup_id = restoreBackupIdForRange(range, table) orelse continue;
-        const restore_location = restoreLocationForRange(range, table) orelse return false;
-        found_any_range = true;
-        if (!rangeRestoreIntentComplete(table.table_id, range.group_id, restore_backup_id, restore_location, placements, progress)) return false;
-    }
-    return found_any_range;
+fn clearedRestoreRangeAlloc(
+    alloc: std.mem.Allocator,
+    range: metadata_table_manager.RangeRecord,
+) !metadata_table_manager.RangeRecord {
+    var cleared = try metadata_table_manager.cloneRange(alloc, range);
+    errdefer metadata_table_manager.freeRange(alloc, cleared);
+    const empty_backup_id = try alloc.dupe(u8, "");
+    errdefer alloc.free(empty_backup_id);
+    const empty_location = try alloc.dupe(u8, "");
+    errdefer alloc.free(empty_location);
+    const empty_snapshot_path = try alloc.dupe(u8, "");
+    errdefer alloc.free(empty_snapshot_path);
+    const empty_connection = try alloc.dupe(u8, "");
+    errdefer alloc.free(empty_connection);
+    const empty_artifact_sha256 = try alloc.dupe(u8, "");
+    errdefer alloc.free(empty_artifact_sha256);
+    alloc.free(cleared.restore_backup_id);
+    alloc.free(cleared.restore_location);
+    alloc.free(cleared.restore_snapshot_path);
+    alloc.free(cleared.restore_connection);
+    alloc.free(cleared.restore_artifact_sha256);
+    cleared.restore_backup_id = empty_backup_id;
+    cleared.restore_location = empty_location;
+    cleared.restore_snapshot_path = empty_snapshot_path;
+    cleared.restore_connection = empty_connection;
+    cleared.restore_artifact_size_bytes = 0;
+    cleared.restore_artifact_sha256 = empty_artifact_sha256;
+    return cleared;
 }
 
 fn rangeRestoreIntentComplete(
     table_id: u64,
-    group_id: u64,
+    range: metadata_table_manager.RangeRecord,
     restore_backup_id: []const u8,
     restore_location: []const u8,
     placements: []const raft_reconciler.PlacementIntent,
@@ -5054,32 +5057,16 @@ fn rangeRestoreIntentComplete(
 ) bool {
     var found_any_placement = false;
     for (placements) |intent| {
-        if (intent.record.group_id != group_id) continue;
+        if (intent.record.group_id != range.group_id) continue;
         found_any_placement = true;
-        const restored = findRestoreProgress(progress, table_id, intent.record.local_node_id, group_id) orelse return false;
+        const restored = findRestoreProgress(progress, table_id, intent.record.local_node_id, range.group_id) orelse return false;
         if (!std.mem.eql(u8, restored.backup_id, restore_backup_id)) return false;
         if (!std.mem.eql(u8, restored.location, restore_location)) return false;
+        if (!std.mem.eql(u8, restored.snapshot_path, range.restore_snapshot_path)) return false;
+        if (!std.mem.eql(u8, restored.artifact_sha256, range.restore_artifact_sha256)) return false;
         if (!restored.primary_restored or !restored.runtime_repair_complete) return false;
     }
     return found_any_placement;
-}
-
-fn restoreBackupIdForRange(
-    range: metadata_table_manager.RangeRecord,
-    table: metadata_table_manager.TableRecord,
-) ?[]const u8 {
-    if (range.restore_backup_id.len > 0) return range.restore_backup_id;
-    if (table.restore_backup_id.len > 0) return table.restore_backup_id;
-    return null;
-}
-
-fn restoreLocationForRange(
-    range: metadata_table_manager.RangeRecord,
-    table: metadata_table_manager.TableRecord,
-) ?[]const u8 {
-    if (range.restore_location.len > 0) return range.restore_location;
-    if (table.restore_location.len > 0) return table.restore_location;
-    return null;
 }
 
 fn collectProjectedSplitObservations(
@@ -6712,14 +6699,14 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
     defer service.freeProjectedTables(alloc, tables);
     for (tables) |table| {
         hasher.update(std.mem.asBytes(&table.table_id));
-        hasher.update(table.name);
-        hasher.update(table.schema_json);
-        hasher.update(table.read_schema_json);
-        hasher.update(table.indexes_json);
-        hasher.update(table.replication_sources_json);
-        hasher.update(table.placement_role);
-        hasher.update(table.restore_backup_id);
-        hasher.update(table.restore_location);
+        hashProjectedProvisioningBytes(&hasher, table.name);
+        hashProjectedProvisioningBytes(&hasher, table.schema_json);
+        hashProjectedProvisioningBytes(&hasher, table.read_schema_json);
+        hashProjectedProvisioningBytes(&hasher, table.indexes_json);
+        hashProjectedProvisioningBytes(&hasher, table.replication_sources_json);
+        hashProjectedProvisioningBytes(&hasher, table.placement_role);
+        hashProjectedProvisioningBytes(&hasher, table.restore_backup_id);
+        hashProjectedProvisioningBytes(&hasher, table.restore_location);
         hasher.update(std.mem.asBytes(&table.desired_replica_count));
         hasher.update(std.mem.asBytes(&table.min_ranges));
     }
@@ -6728,17 +6715,24 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
     defer service.freeProjectedRanges(alloc, ranges);
     for (ranges) |range| {
         hasher.update(std.mem.asBytes(&range.group_id));
+        hasher.update(std.mem.asBytes(&range.range_id));
         hasher.update(std.mem.asBytes(&range.table_id));
-        hasher.update(range.start_key);
+        hasher.update(std.mem.asBytes(&range.doc_identity_shard_id));
+        hasher.update(std.mem.asBytes(&range.doc_identity_range_id));
+        hasher.update(std.mem.asBytes(&range.split_attempt_epoch));
+        hashProjectedProvisioningBytes(&hasher, range.start_key);
         if (range.end_key) |end_key| {
             hasher.update(&.{1});
-            hasher.update(end_key);
+            hashProjectedProvisioningBytes(&hasher, end_key);
         } else {
             hasher.update(&.{0});
         }
-        hasher.update(range.restore_backup_id);
-        hasher.update(range.restore_location);
-        hasher.update(range.restore_snapshot_path);
+        hashProjectedProvisioningBytes(&hasher, range.restore_backup_id);
+        hashProjectedProvisioningBytes(&hasher, range.restore_location);
+        hashProjectedProvisioningBytes(&hasher, range.restore_snapshot_path);
+        hashProjectedProvisioningBytes(&hasher, range.restore_connection);
+        hasher.update(std.mem.asBytes(&range.restore_artifact_size_bytes));
+        hashProjectedProvisioningBytes(&hasher, range.restore_artifact_sha256);
     }
 
     const placements = try service.listProjectedPlacementIntents(alloc);
@@ -6756,22 +6750,31 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
             hasher.update(&.{1});
             hasher.update(std.mem.asBytes(&snapshot.from_node_id));
             hasher.update(std.mem.asBytes(&snapshot.term));
-            hasher.update(snapshot.snapshot_id);
-            hasher.update(snapshot.uri);
+            hashProjectedProvisioningBytes(&hasher, snapshot.snapshot_id);
+            hashProjectedProvisioningBytes(&hasher, snapshot.uri);
         } else {
             hasher.update(&.{0});
         }
         if (intent.record.backup_restore_bootstrap) |restore| {
             hasher.update(&.{1});
-            hasher.update(restore.backup_id);
-            hasher.update(restore.location);
-            hasher.update(restore.snapshot_path);
+            hashProjectedProvisioningBytes(&hasher, restore.backup_id);
+            hashProjectedProvisioningBytes(&hasher, restore.location);
+            hashProjectedProvisioningBytes(&hasher, restore.snapshot_path);
+            hashProjectedProvisioningBytes(&hasher, restore.connection);
+            hasher.update(std.mem.asBytes(&restore.artifact_size_bytes));
+            hashProjectedProvisioningBytes(&hasher, restore.artifact_sha256);
         } else {
             hasher.update(&.{0});
         }
     }
 
     return hasher.final();
+}
+
+fn hashProjectedProvisioningBytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    const len: u64 = @intCast(bytes.len);
+    hasher.update(std.mem.asBytes(&len));
+    hasher.update(bytes);
 }
 
 pub fn snapshotStatus(
@@ -10364,8 +10367,6 @@ test "metadata service clears restore intent once all placement replicas report 
         .table = .{
             .table_id = 7,
             .name = "docs",
-            .restore_backup_id = "snap1",
-            .restore_location = "file:///tmp/backups",
         },
         .ranges = &.{
             .{
@@ -10376,6 +10377,8 @@ test "metadata service clears restore intent once all placement replicas report 
                 .restore_backup_id = "snap1",
                 .restore_location = "file:///tmp/backups",
                 .restore_snapshot_path = "snap/groups/7001",
+                .restore_connection = "backups",
+                .restore_artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             },
         },
         .placements = &.{
@@ -10383,8 +10386,8 @@ test "metadata service clears restore intent once all placement replicas report 
             .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2 } },
         },
         .progress = &.{
-            .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
-            .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+            .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+            .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
         },
     };
     defer service.deinit();
@@ -10394,9 +10397,7 @@ test "metadata service clears restore intent once all placement replicas report 
     try std.testing.expectEqualStrings("", service.upserted_range.?.restore_backup_id);
     try std.testing.expectEqualStrings("", service.upserted_range.?.restore_location);
     try std.testing.expectEqualStrings("", service.upserted_range.?.restore_snapshot_path);
-    try std.testing.expect(service.upserted_table != null);
-    try std.testing.expectEqualStrings("", service.upserted_table.?.restore_backup_id);
-    try std.testing.expectEqualStrings("", service.upserted_table.?.restore_location);
+    try std.testing.expect(service.upserted_table == null);
 }
 
 test "metadata service keeps restore intent until runtime repair completes" {
@@ -10409,7 +10410,24 @@ test "metadata service keeps restore intent until runtime repair completes" {
         .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = false, .phase = "runtime_repair" },
     };
 
-    try std.testing.expect(!rangeRestoreIntentComplete(7, 7001, "snap1", "file:///tmp/backups", &placements, &progress));
+    try std.testing.expect(!rangeRestoreIntentComplete(7, .{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+        .restore_snapshot_path = "snap/groups/7001",
+    }, "snap1", "file:///tmp/backups", &placements, &progress));
+
+    const stale_progress = [_]metadata_table_manager.RestoreProgressRecord{
+        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "old-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "old-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+    };
+    try std.testing.expect(!rangeRestoreIntentComplete(7, .{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+        .restore_snapshot_path = "snap/groups/7001",
+        .restore_artifact_sha256 = "new-artifact",
+    }, "snap1", "file:///tmp/backups", &placements, &stale_progress));
 }
 
 test "metadata http service catalog cache is independent from volatile projection traffic" {

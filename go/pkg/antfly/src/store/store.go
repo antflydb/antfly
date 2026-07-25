@@ -538,6 +538,7 @@ type ShardStartConfig struct {
 
 	Timestamp         []byte // Timestamp of the shard start, used for conf changes
 	InitWithDBArchive string
+	Context           context.Context
 }
 
 func (m *Store) StartRaftGroup(
@@ -610,9 +611,17 @@ func (m *Store) StartRaftGroup(
 	// If RestoreConfig is set but InitWithDBArchive is not (local client path),
 	// copy the backup file from the source location to the snap directory.
 	if conf.InitWithDBArchive == "" && conf.RestoreConfig != nil {
-		if after, ok := strings.CutPrefix(conf.RestoreConfig.Location, "file://"); ok {
+		effectiveLocation, locationErr := common.EffectiveFilesystemLocation(*conf.RestoreConfig)
+		if locationErr != nil {
+			return fmt.Errorf("resolving local restore location: %w", locationErr)
+		}
+		if after, ok := strings.CutPrefix(effectiveLocation, "file://"); ok {
+			restoreCtx := conf.Context
+			if restoreCtx == nil {
+				restoreCtx = context.Background()
+			}
 			archiveName, copyErr := copyLocalBackupToSnapDir(
-				lg, snapStore, shardID, after,
+				restoreCtx, lg, snapStore, shardID, after,
 				conf.RestoreConfig.BackupID, conf.RestoreConfig.Format,
 			)
 			if copyErr != nil {
@@ -820,6 +829,7 @@ func (m *Store) StartRaftGroup(
 // the local-client restore path (standalone mode) where the HTTP multipart upload
 // path in api.go is not used.
 func copyLocalBackupToSnapDir(
+	ctx context.Context,
 	lg *zap.Logger,
 	snapStore snapstore.SnapStore,
 	shardID types.ID,
@@ -828,23 +838,15 @@ func copyLocalBackupToSnapDir(
 	format common.BackupFormat,
 ) (string, error) {
 	backupFileName := common.ShardBackupFileName(backupID, shardID)
-	format = common.NormalizeBackupFormat(format)
+	var err error
+	format, err = common.ValidateBackupFormat(format)
+	if err != nil {
+		return "", err
+	}
 	if format == common.BackupFormatPortable {
 		backupFileName = common.ShardPortableBackupFileName(backupID, shardID)
 	}
 	srcPath := filepath.Join(localDir, backupFileName)
-
-	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
-		alternateName := common.ShardBackupFileName(backupID, shardID)
-		if format == common.BackupFormatNative {
-			alternateName = common.ShardPortableBackupFileName(backupID, shardID)
-		}
-		alternatePath := filepath.Join(localDir, alternateName)
-		if _, alternateErr := os.Stat(alternatePath); alternateErr == nil {
-			backupFileName = alternateName
-			srcPath = alternatePath
-		}
-	}
 
 	f, err := os.Open(filepath.Clean(srcPath))
 	if err != nil {
@@ -852,7 +854,7 @@ func copyLocalBackupToSnapDir(
 	}
 	defer func() { _ = f.Close() }()
 
-	if err := snapStore.Put(context.Background(), backupFileName, f); err != nil {
+	if err := snapStore.Put(ctx, backupFileName, f); err != nil {
 		return "", fmt.Errorf("storing backup in snap dir: %w", err)
 	}
 

@@ -423,6 +423,10 @@ type DBImpl struct {
 	traceShardIDStr string // cached shard ID for trace events; set lazily
 
 	cache *pebbleutils.Cache // shared Pebble block cache (may be nil)
+
+	lifecycleMu     sync.Mutex
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
 }
 
 // NewDBImpl creates a new DBImpl instance with the given configuration.
@@ -1651,6 +1655,13 @@ func (db *DBImpl) OpenIndexes(dir string) error {
 
 func (s *DBImpl) Close() (err error) {
 	defer pebbleutils.RecoverPebbleClosed(&err)
+	s.lifecycleMu.Lock()
+	if s.lifecycleCancel != nil {
+		s.lifecycleCancel()
+		s.lifecycleCancel = nil
+		s.lifecycleCtx = nil
+	}
+	s.lifecycleMu.Unlock()
 	var closeErr error
 	if err := s.CloseShadowIndexManager(); err != nil {
 		closeErr = errors.Join(closeErr, fmt.Errorf("closing shadow indexes: %w", err))
@@ -1679,6 +1690,15 @@ func (s *DBImpl) Close() (err error) {
 		}
 	}
 	return closeErr
+}
+
+func (db *DBImpl) ownedLifecycleContext() context.Context {
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
+	if db.lifecycleCtx == nil || db.lifecycleCtx.Err() != nil {
+		db.lifecycleCtx, db.lifecycleCancel = context.WithCancel(context.Background()) //nolint:gosec // owned and canceled by DBImpl.Close
+	}
+	return db.lifecycleCtx
 }
 
 // getPebbleOpts creates and configures Pebble options, including S3 storage if enabled.
@@ -1723,7 +1743,9 @@ func (db *DBImpl) configureS3Storage(pebbleOpts *pebble.Options) error {
 	)
 
 	// Create Minio client for S3 operations
-	minioClient, err := s3Info.EnsureBucket(context.Background())
+	bucketCtx, cancelBucket := context.WithTimeout(db.ownedLifecycleContext(), 30*time.Second)
+	defer cancelBucket()
+	minioClient, err := s3Info.EnsureBucket(bucketCtx)
 	if err != nil {
 		return fmt.Errorf("preparing S3 bucket: %w", err)
 	}
@@ -3623,18 +3645,23 @@ func (s *DBImpl) Snapshot(ctx context.Context, id string) (int64, error) {
 	}
 
 	// Pause IndexManager (and all indexes) before checkpoint
-	indexesPaused := false
+	var pausedIndexManager *IndexManager
 	if im := s.getIndexManager(); im != nil {
 		pauseCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		if err := im.Pause(pauseCtx); err != nil {
+		pauseErr := im.Pause(pauseCtx)
+		cancel()
+		if pauseErr != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return 0, ctxErr
 			}
-			s.logger.Warn("Failed to pause IndexManager, snapshot without indexes", zap.Error(err))
+			s.logger.Warn("Failed to pause IndexManager, snapshot without indexes", zap.Error(pauseErr))
 		} else {
-			indexesPaused = true
-			defer im.Resume()
+			pausedIndexManager = im
+			defer func() {
+				if pausedIndexManager != nil {
+					pausedIndexManager.Resume()
+				}
+			}()
 		}
 	}
 
@@ -3659,11 +3686,14 @@ func (s *DBImpl) Snapshot(ctx context.Context, id string) (int64, error) {
 	}
 
 	// Copy indexes directory (only if paused successfully)
-	if indexesPaused {
-		indexDir := s.getIndexManager().GetDir()
+	if pausedIndexManager != nil {
+		indexDir := pausedIndexManager.GetDir()
 		if indexDir != "" {
 			indexStagingDir := filepath.Join(stagingDir, "indexes")
-			if err := common.CopyDir(indexDir, indexStagingDir); err != nil {
+			if err := common.CopyDirContext(ctx, indexDir, indexStagingDir); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return 0, ctxErr
+				}
 				s.logger.Warn("Failed to copy indexes, will rebuild on restore", zap.Error(err))
 				_ = os.RemoveAll(indexStagingDir)
 			} else {
@@ -3672,10 +3702,12 @@ func (s *DBImpl) Snapshot(ctx context.Context, id string) (int64, error) {
 					zap.String("stagingIndexDir", indexStagingDir))
 			}
 		}
+		pausedIndexManager.Resume()
+		pausedIndexManager = nil
 	}
 
 	// Parse shard and node IDs from directory path for snapshot metadata
-	nodeID, shardID, err := common.ParseStorageDBDir(s.dir)
+	shardID, nodeID, err := common.ParseStorageDBDir(s.dir)
 	if err != nil {
 		s.logger.Warn("Failed to parse storage dir for snapshot metadata", zap.Error(err))
 	}

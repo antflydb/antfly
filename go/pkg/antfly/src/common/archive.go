@@ -1032,6 +1032,17 @@ func readMetadataEntry(tr *tar.Reader, size int64) (*ArchiveMetadata, error) {
 // The destination directory is created if it doesn't exist.
 // Symlinks are copied as symlinks, not followed.
 func CopyDir(src, dst string) error {
+	return CopyDirContext(context.Background(), src, dst)
+}
+
+// CopyDirContext recursively copies a directory while observing cancellation
+// between entries and during file transfer. Callers holding a write or index
+// pause must use this variant so shutdown and request cancellation bound the
+// pause duration.
+func CopyDirContext(ctx context.Context, src, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	srcInfo, err := os.Stat(src)
 	if err != nil {
 		return fmt.Errorf("stat source: %w", err)
@@ -1048,6 +1059,9 @@ func CopyDir(src, dst string) error {
 	// Walk the source directory
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 
@@ -1077,12 +1091,19 @@ func CopyDir(src, dst string) error {
 		}
 
 		// Handle regular files
-		return copyFile(path, dstPath, info.Mode())
+		return copyFileContext(ctx, path, dstPath, info.Mode())
 	})
 }
 
 // copyFile copies a single file from src to dst with the specified permissions.
 func copyFile(src, dst string, mode os.FileMode) error {
+	return copyFileContext(context.Background(), src, dst, mode)
+}
+
+func copyFileContext(ctx context.Context, src, dst string, mode os.FileMode) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	srcFile, err := os.Open(src) //nolint:gosec // G304: internal file I/O, not user-controlled
 	if err != nil {
 		return fmt.Errorf("opening source file: %w", err)
@@ -1095,7 +1116,7 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	}
 	defer func() { _ = dstFile.Close() }()
 
-	if _, err := io.Copy(dstFile, srcFile); err != nil {
+	if _, err := io.Copy(dstFile, &contextReader{ctx: ctx, reader: srcFile}); err != nil {
 		return fmt.Errorf("copying file contents: %w", err)
 	}
 

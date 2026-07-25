@@ -396,6 +396,9 @@ fn catalogRangeTopologyDigest(range: table_manager.RangeRecord) [std.crypto.hash
     hashCatalogTopologyBytes(&hasher, range.restore_backup_id);
     hashCatalogTopologyBytes(&hasher, range.restore_location);
     hashCatalogTopologyBytes(&hasher, range.restore_snapshot_path);
+    hashCatalogTopologyBytes(&hasher, range.restore_connection);
+    hasher.update(std.mem.asBytes(&range.restore_artifact_size_bytes));
+    hashCatalogTopologyBytes(&hasher, range.restore_artifact_sha256);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     return digest;

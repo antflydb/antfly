@@ -85,6 +85,9 @@ type TableApi struct {
 	foreignPool    *foreign.PoolManager
 	prunerCache    sync.Map // documentRenderer string → *ai.Pruner
 	baseIndexCache sync.Map // baseIndexPlanKey (uint64) → *indexes.BaseShardIndexPlan
+
+	backupTransferOnce sync.Once
+	backupTransfers    chan struct{}
 }
 type ClusterApi struct {
 	ln     *MetadataStore

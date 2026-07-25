@@ -2221,6 +2221,7 @@ fn deleteFileIfExists(io: Io, path: []const u8) !void {
 pub const RestoreState = struct {
     backup_id: []u8,
     location: []u8,
+    artifact_sha256: []u8,
     snapshot_path: []u8,
     group_id: u64,
     phase: []u8,
@@ -2231,6 +2232,7 @@ pub const RestoreState = struct {
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.backup_id);
         alloc.free(self.location);
+        alloc.free(self.artifact_sha256);
         alloc.free(self.snapshot_path);
         alloc.free(self.phase);
         alloc.free(self.last_error);
@@ -2241,6 +2243,33 @@ pub const RestoreState = struct {
 pub const RestoreIdentity = struct {
     backup_id: []const u8,
     location: []const u8,
+    artifact_sha256: []const u8,
+    snapshot_path: []const u8,
+    group_id: u64,
+};
+
+const restore_marker_format_version: u32 = 1;
+const max_restore_marker_bytes: usize = 64 * 1024;
+
+const RestoreStateDisk = struct {
+    format_version: u32 = restore_marker_format_version,
+    backup_id: []const u8,
+    location: []const u8,
+    artifact_sha256: []const u8,
+    snapshot_path: []const u8,
+    group_id: u64,
+    phase: []const u8,
+    primary_restored: bool,
+    runtime_repair_complete: bool,
+    last_error: []const u8,
+};
+
+const RestoreImportDisk = struct {
+    format_version: u32 = restore_marker_format_version,
+    snapshot_root: []const u8,
+    backup_id: []const u8,
+    location: []const u8,
+    artifact_sha256: []const u8,
     snapshot_path: []const u8,
     group_id: u64,
 };
@@ -2249,6 +2278,7 @@ fn restoreStateAlloc(
     alloc: Allocator,
     backup_id: []const u8,
     location: []const u8,
+    artifact_sha256: []const u8,
     snapshot_path: []const u8,
     group_id: u64,
     phase: []const u8,
@@ -2260,6 +2290,8 @@ fn restoreStateAlloc(
     errdefer alloc.free(backup_id_owned);
     const location_owned = try alloc.dupe(u8, location);
     errdefer alloc.free(location_owned);
+    const artifact_sha256_owned = try alloc.dupe(u8, artifact_sha256);
+    errdefer alloc.free(artifact_sha256_owned);
     const snapshot_path_owned = try alloc.dupe(u8, snapshot_path);
     errdefer alloc.free(snapshot_path_owned);
     const phase_owned = try alloc.dupe(u8, phase);
@@ -2270,6 +2302,7 @@ fn restoreStateAlloc(
     return .{
         .backup_id = backup_id_owned,
         .location = location_owned,
+        .artifact_sha256 = artifact_sha256_owned,
         .snapshot_path = snapshot_path_owned,
         .group_id = group_id,
         .phase = phase_owned,
@@ -2281,19 +2314,66 @@ fn restoreStateAlloc(
 
 const RestoreImportState = struct {
     snapshot_root: []u8,
-    identity: ?RestoreState = null,
+    identity: RestoreState,
 
     fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.snapshot_root);
-        if (self.identity) |*identity| identity.deinit(alloc);
+        self.identity.deinit(alloc);
         self.* = undefined;
     }
 };
 
-fn parseRestoreStateBool(value: []const u8) !bool {
-    if (std.mem.eql(u8, value, "1")) return true;
-    if (std.mem.eql(u8, value, "0")) return false;
-    return error.InvalidRestoreState;
+fn validRestoreArtifactSha256(value: []const u8) bool {
+    if (value.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return false;
+    for (value) |c| {
+        if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
+    }
+    return true;
+}
+
+fn validRestoreIdentity(identity: RestoreIdentity) bool {
+    return identity.backup_id.len > 0 and
+        identity.location.len > 0 and
+        validRestoreArtifactSha256(identity.artifact_sha256) and
+        identity.snapshot_path.len > 0 and
+        identity.group_id != 0;
+}
+
+fn writeRestoreMarkerAtomic(
+    alloc: Allocator,
+    root: []const u8,
+    path: []const u8,
+    raw: []const u8,
+) !void {
+    if (raw.len > max_restore_marker_bytes) return error.RestoreMarkerTooLarge;
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var entropy: [8]u8 = undefined;
+    try io.randomSecure(&entropy);
+    const nonce = std.fmt.bytesToHex(entropy, .lower);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{s}", .{ path, &nonce });
+    defer alloc.free(tmp_path);
+    errdefer if (std.fs.path.isAbsolute(tmp_path))
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var writer_buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &writer_buffer);
+        try writer.interface.writeAll(raw);
+        try writer.end();
+        try file.sync(io);
+    }
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    try fs_paths.syncDirPortable(io, root);
 }
 
 fn readRestoreStateForPathAlloc(alloc: Allocator, path: []const u8) !?RestoreState {
@@ -2302,106 +2382,63 @@ fn readRestoreStateForPathAlloc(alloc: Allocator, path: []const u8) !?RestoreSta
 
     var io_impl = threadedIo();
     defer io_impl.deinit();
-    const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), state_path, alloc, .limited(64 * 1024)) catch |err| switch (err) {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), state_path, alloc, .limited(max_restore_marker_bytes)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer alloc.free(raw);
-
-    var backup_id: ?[]u8 = null;
-    errdefer if (backup_id) |value| alloc.free(value);
-    var location: ?[]u8 = null;
-    errdefer if (location) |value| alloc.free(value);
-    var snapshot_path: ?[]u8 = null;
-    errdefer if (snapshot_path) |value| alloc.free(value);
-    var group_id: ?u64 = null;
-    var phase: ?[]u8 = null;
-    errdefer if (phase) |value| alloc.free(value);
-    var primary_restored: ?bool = null;
-    var runtime_repair_complete: ?bool = null;
-    var last_error: ?[]u8 = null;
-    errdefer if (last_error) |value| alloc.free(value);
-
-    var lines = std.mem.splitScalar(u8, raw, '\n');
-    const version = lines.next() orelse return error.InvalidRestoreState;
-    if (!std.mem.eql(u8, version, "restore_state_v2")) return error.InvalidRestoreState;
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidRestoreState;
-        const key = line[0..eq];
-        const value = line[eq + 1 ..];
-        if (std.mem.eql(u8, key, "backup_id")) {
-            if (backup_id) |old| alloc.free(old);
-            backup_id = null;
-            backup_id = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "location")) {
-            if (location) |old| alloc.free(old);
-            location = null;
-            location = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "snapshot_path")) {
-            if (snapshot_path) |old| alloc.free(old);
-            snapshot_path = null;
-            snapshot_path = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "group_id")) {
-            group_id = try std.fmt.parseInt(u64, value, 10);
-        } else if (std.mem.eql(u8, key, "phase")) {
-            if (phase) |old| alloc.free(old);
-            phase = null;
-            phase = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "primary_restored")) {
-            primary_restored = try parseRestoreStateBool(value);
-        } else if (std.mem.eql(u8, key, "runtime_repair_complete")) {
-            runtime_repair_complete = try parseRestoreStateBool(value);
-        } else if (std.mem.eql(u8, key, "last_error")) {
-            if (last_error) |old| alloc.free(old);
-            last_error = null;
-            last_error = try alloc.dupe(u8, value);
-        }
+    var parsed = std.json.parseFromSlice(RestoreStateDisk, alloc, raw, .{ .allocate = .alloc_always }) catch
+        return error.InvalidRestoreState;
+    defer parsed.deinit();
+    const disk = parsed.value;
+    if (disk.format_version != restore_marker_format_version or
+        disk.backup_id.len == 0 or
+        disk.location.len == 0 or
+        !validRestoreArtifactSha256(disk.artifact_sha256) or
+        disk.snapshot_path.len == 0 or
+        disk.group_id == 0 or
+        disk.phase.len == 0)
+    {
+        return error.InvalidRestoreState;
     }
-
-    if (backup_id == null) backup_id = try alloc.dupe(u8, "");
-    if (location == null) location = try alloc.dupe(u8, "");
-    if (snapshot_path == null) snapshot_path = try alloc.dupe(u8, "");
-    if (phase == null) phase = try alloc.dupe(u8, "accepted");
-    if (last_error == null) last_error = try alloc.dupe(u8, "");
-
-    return .{
-        .backup_id = backup_id.?,
-        .location = location.?,
-        .snapshot_path = snapshot_path.?,
-        .group_id = group_id orelse 0,
-        .phase = phase.?,
-        .primary_restored = primary_restored orelse false,
-        .runtime_repair_complete = runtime_repair_complete orelse false,
-        .last_error = last_error.?,
-    };
+    return try restoreStateAlloc(
+        alloc,
+        disk.backup_id,
+        disk.location,
+        disk.artifact_sha256,
+        disk.snapshot_path,
+        disk.group_id,
+        disk.phase,
+        disk.primary_restored,
+        disk.runtime_repair_complete,
+        disk.last_error,
+    );
 }
 
 fn writeRestoreStateForPath(alloc: Allocator, path: []const u8, state: RestoreState) !void {
+    if (!validRestoreIdentity(.{
+        .backup_id = state.backup_id,
+        .location = state.location,
+        .artifact_sha256 = state.artifact_sha256,
+        .snapshot_path = state.snapshot_path,
+        .group_id = state.group_id,
+    }) or state.phase.len == 0) return error.InvalidRestoreState;
     try ensureDirPath(path);
     const state_path = try restoreStateMarkerPathAlloc(alloc, path);
     defer alloc.free(state_path);
-    const raw = try std.fmt.allocPrint(
-        alloc,
-        "restore_state_v2\nbackup_id={s}\nlocation={s}\nsnapshot_path={s}\ngroup_id={d}\nphase={s}\nprimary_restored={d}\nruntime_repair_complete={d}\nlast_error={s}\n",
-        .{
-            state.backup_id,
-            state.location,
-            state.snapshot_path,
-            state.group_id,
-            state.phase,
-            @as(u8, if (state.primary_restored) 1 else 0),
-            @as(u8, if (state.runtime_repair_complete) 1 else 0),
-            state.last_error,
-        },
-    );
+    const raw = try std.json.Stringify.valueAlloc(alloc, RestoreStateDisk{
+        .backup_id = state.backup_id,
+        .location = state.location,
+        .artifact_sha256 = state.artifact_sha256,
+        .snapshot_path = state.snapshot_path,
+        .group_id = state.group_id,
+        .phase = state.phase,
+        .primary_restored = state.primary_restored,
+        .runtime_repair_complete = state.runtime_repair_complete,
+        .last_error = state.last_error,
+    }, .{});
     defer alloc.free(raw);
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
-        .sub_path = state_path,
-        .data = raw,
-    });
+    try writeRestoreMarkerAtomic(alloc, path, state_path, raw);
 }
 
 fn readRestoreImportStateAlloc(alloc: Allocator, path: []const u8) !?RestoreImportState {
@@ -2410,80 +2447,41 @@ fn readRestoreImportStateAlloc(alloc: Allocator, path: []const u8) !?RestoreImpo
 
     var io_impl = threadedIo();
     defer io_impl.deinit();
-    const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), import_marker_path, alloc, .limited(64 * 1024)) catch |err| switch (err) {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), import_marker_path, alloc, .limited(max_restore_marker_bytes)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer alloc.free(raw);
-
-    var snapshot_root: ?[]u8 = null;
-    errdefer if (snapshot_root) |value| alloc.free(value);
-    var backup_id: ?[]u8 = null;
-    errdefer if (backup_id) |value| alloc.free(value);
-    var location: ?[]u8 = null;
-    errdefer if (location) |value| alloc.free(value);
-    var snapshot_path: ?[]u8 = null;
-    errdefer if (snapshot_path) |value| alloc.free(value);
-    var group_id: ?u64 = null;
-
-    var lines = std.mem.splitScalar(u8, raw, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0 or std.mem.eql(u8, line, "restore_import_v1")) continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidRestoreImportMarker;
-        const key = line[0..eq];
-        const value = line[eq + 1 ..];
-        if (std.mem.eql(u8, key, "snapshot_root")) {
-            if (snapshot_root) |old| alloc.free(old);
-            snapshot_root = null;
-            snapshot_root = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "backup_id")) {
-            if (backup_id) |old| alloc.free(old);
-            backup_id = null;
-            backup_id = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "location")) {
-            if (location) |old| alloc.free(old);
-            location = null;
-            location = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "snapshot_path")) {
-            if (snapshot_path) |old| alloc.free(old);
-            snapshot_path = null;
-            snapshot_path = try alloc.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "group_id")) {
-            group_id = try std.fmt.parseInt(u64, value, 10);
-        }
+    var parsed = std.json.parseFromSlice(RestoreImportDisk, alloc, raw, .{ .allocate = .alloc_always }) catch
+        return error.InvalidRestoreImportMarker;
+    defer parsed.deinit();
+    const disk = parsed.value;
+    if (disk.format_version != restore_marker_format_version or
+        disk.snapshot_root.len == 0 or
+        disk.backup_id.len == 0 or
+        disk.location.len == 0 or
+        !validRestoreArtifactSha256(disk.artifact_sha256) or
+        disk.snapshot_path.len == 0 or
+        disk.group_id == 0)
+    {
+        return error.InvalidRestoreImportMarker;
     }
-
-    const root = snapshot_root orelse return error.InvalidRestoreImportMarker;
-    snapshot_root = null;
-    const identity = if (backup_id != null or location != null or snapshot_path != null or group_id != null) blk: {
-        const backup = backup_id orelse return error.InvalidRestoreImportMarker;
-        const loc = location orelse return error.InvalidRestoreImportMarker;
-        const snap = snapshot_path orelse return error.InvalidRestoreImportMarker;
-        const gid = group_id orelse return error.InvalidRestoreImportMarker;
-        backup_id = null;
-        location = null;
-        snapshot_path = null;
-        errdefer alloc.free(backup);
-        errdefer alloc.free(loc);
-        errdefer alloc.free(snap);
-        const phase = try alloc.dupe(u8, "runtime_repair");
-        errdefer alloc.free(phase);
-        const last_error = try alloc.dupe(u8, "");
-        errdefer alloc.free(last_error);
-        break :blk RestoreState{
-            .backup_id = backup,
-            .location = loc,
-            .snapshot_path = snap,
-            .group_id = gid,
-            .phase = phase,
-            .primary_restored = true,
-            .runtime_repair_complete = false,
-            .last_error = last_error,
-        };
-    } else null;
-
+    const snapshot_root = try alloc.dupe(u8, disk.snapshot_root);
+    errdefer alloc.free(snapshot_root);
+    const identity = try restoreStateAlloc(
+        alloc,
+        disk.backup_id,
+        disk.location,
+        disk.artifact_sha256,
+        disk.snapshot_path,
+        disk.group_id,
+        "runtime_repair",
+        true,
+        false,
+        "",
+    );
     return .{
-        .snapshot_root = root,
+        .snapshot_root = snapshot_root,
         .identity = identity,
     };
 }
@@ -12615,11 +12613,12 @@ pub const DB = struct {
         if (opts.physical_root_mode == .filesystem_managed) {
             _ = try loadOrCreateDurableRootIdentity(alloc, opts.backend_runtime, path);
         }
-        if (restore_identity) |identity| try markRestorePrimaryRestoredForPath(
+        if (restore_identity) |identity| try markRestorePrimaryRestoredForPathWithArtifact(
             alloc,
             path,
             identity.backup_id,
             identity.location,
+            identity.artifact_sha256,
             identity.snapshot_path,
             identity.group_id,
         );
@@ -12669,6 +12668,8 @@ pub const DB = struct {
     }
 
     fn beginRestoreImport(alloc: Allocator, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
+        if (snapshot_root.len == 0 or !validRestoreIdentity(identity))
+            return error.InvalidRestoreImportMarker;
         try ensureDirPath(path);
         const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
         defer alloc.free(repair_marker_path);
@@ -12685,22 +12686,16 @@ pub const DB = struct {
         try deleteFileIfExists(io, repair_marker_path);
         try deleteFileIfExists(io, restore_intent_path);
         try deleteFileIfExists(io, restore_state_path);
-        const marker = try std.fmt.allocPrint(
-            alloc,
-            "restore_import_v1\nsnapshot_root={s}\nbackup_id={s}\nlocation={s}\nsnapshot_path={s}\ngroup_id={d}\n",
-            .{
-                snapshot_root,
-                identity.backup_id,
-                identity.location,
-                identity.snapshot_path,
-                identity.group_id,
-            },
-        );
+        const marker = try std.json.Stringify.valueAlloc(alloc, RestoreImportDisk{
+            .snapshot_root = snapshot_root,
+            .backup_id = identity.backup_id,
+            .location = identity.location,
+            .artifact_sha256 = identity.artifact_sha256,
+            .snapshot_path = identity.snapshot_path,
+            .group_id = identity.group_id,
+        }, .{});
         defer alloc.free(marker);
-        try std.Io.Dir.cwd().writeFile(io, .{
-            .sub_path = import_marker_path,
-            .data = marker,
-        });
+        try writeRestoreMarkerAtomic(alloc, path, import_marker_path, marker);
     }
 
     pub fn recoverIncompleteRestoreImportIfNeeded(alloc: Allocator, path: []const u8, opts: OpenOptions) !bool {
@@ -12712,10 +12707,11 @@ pub const DB = struct {
 
         var import_state = (try readRestoreImportStateAlloc(alloc, path)) orelse return false;
         defer import_state.deinit(alloc);
-        const identity_state = import_state.identity orelse return error.InvalidRestoreImportMarker;
+        const identity_state = import_state.identity;
         const identity: RestoreIdentity = .{
             .backup_id = identity_state.backup_id,
             .location = identity_state.location,
+            .artifact_sha256 = identity_state.artifact_sha256,
             .snapshot_path = identity_state.snapshot_path,
             .group_id = identity_state.group_id,
         };
@@ -12728,15 +12724,16 @@ pub const DB = struct {
         return try readRestoreStateForPathAlloc(alloc, path);
     }
 
-    pub fn markRestoreCompleteForPath(
+    pub fn markRestoreCompleteForPathWithArtifact(
         alloc: Allocator,
         path: []const u8,
         backup_id: []const u8,
         location: []const u8,
+        artifact_sha256: []const u8,
         snapshot_path: []const u8,
         group_id: u64,
     ) !void {
-        var state = try restoreStateAlloc(alloc, backup_id, location, snapshot_path, group_id, "complete", true, true, "");
+        var state = try restoreStateAlloc(alloc, backup_id, location, artifact_sha256, snapshot_path, group_id, "complete", true, true, "");
         defer state.deinit(alloc);
         try writeRestoreStateForPath(alloc, path, state);
         const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
@@ -12749,15 +12746,16 @@ pub const DB = struct {
         });
     }
 
-    pub fn markRestorePrimaryRestoredForPath(
+    pub fn markRestorePrimaryRestoredForPathWithArtifact(
         alloc: Allocator,
         path: []const u8,
         backup_id: []const u8,
         location: []const u8,
+        artifact_sha256: []const u8,
         snapshot_path: []const u8,
         group_id: u64,
     ) !void {
-        var state = try restoreStateAlloc(alloc, backup_id, location, snapshot_path, group_id, "runtime_repair", true, false, "");
+        var state = try restoreStateAlloc(alloc, backup_id, location, artifact_sha256, snapshot_path, group_id, "runtime_repair", true, false, "");
         defer state.deinit(alloc);
         try writeRestoreStateForPath(alloc, path, state);
         const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
@@ -75477,6 +75475,7 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
             .{
                 .backup_id = "restore-chaos",
                 .location = "local",
+                .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                 .snapshot_path = "snap1",
                 .group_id = @intCast(i + 1),
             },
@@ -75614,6 +75613,7 @@ test "db deferred restore rejects strict doc identity namespace mismatch" {
         .{
             .backup_id = "backup-a",
             .location = "local",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             .snapshot_path = "snap1",
             .group_id = 99,
         },
@@ -75872,11 +75872,12 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         .primary_backend = primary_backend,
     });
 
-    try DB.markRestorePrimaryRestoredForPath(
+    try DB.markRestorePrimaryRestoredForPathWithArtifact(
         alloc,
         std.mem.span(restore_path),
         "snap1",
         "file:///tmp/backups",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "snapshots/snap1",
         7001,
     );
@@ -75991,6 +75992,7 @@ test "db incomplete deferred restore import recovers before runtime repair" {
     try DB.beginRestoreImport(alloc, std.mem.span(restore_path), snapshot_root, .{
         .backup_id = "snap1",
         .location = "file:///tmp/backups",
+        .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         .snapshot_path = "snapshots/snap1",
         .group_id = 7001,
     });
@@ -76002,6 +76004,10 @@ test "db incomplete deferred restore import recovers before runtime repair" {
         defer state.deinit(alloc);
         try std.testing.expectEqualStrings("snap1", state.backup_id);
         try std.testing.expectEqualStrings("file:///tmp/backups", state.location);
+        try std.testing.expectEqualStrings(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            state.artifact_sha256,
+        );
         try std.testing.expectEqualStrings("snapshots/snap1", state.snapshot_path);
         try std.testing.expectEqual(@as(u64, 7001), state.group_id);
         try std.testing.expect(state.primary_restored);
@@ -76015,6 +76021,45 @@ test "db incomplete deferred restore import recovers before runtime repair" {
         defer value.deinit(alloc);
         try std.testing.expect(std.mem.indexOf(u8, value.json, "\"alpha\"") != null);
     }
+}
+
+test "db restore state uses strict structured content identity markers" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const location = "file:///tmp/backups?note=line\nphase=complete";
+    const artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    try DB.markRestorePrimaryRestoredForPathWithArtifact(
+        alloc,
+        std.mem.span(path),
+        "snap1",
+        location,
+        artifact_sha256,
+        "snapshots/snap1",
+        7001,
+    );
+    {
+        var state = (try DB.readRestoreStateForPath(alloc, std.mem.span(path))).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqualStrings(location, state.location);
+        try std.testing.expectEqualStrings(artifact_sha256, state.artifact_sha256);
+        try std.testing.expectEqualStrings("runtime_repair", state.phase);
+    }
+
+    const state_path = try restoreStateMarkerPathAlloc(alloc, std.mem.span(path));
+    defer alloc.free(state_path);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = state_path,
+        .data = "restore_state_v2\nbackup_id=snap1\nlocation=file:///tmp/backups\n",
+    });
+    try std.testing.expectError(
+        error.InvalidRestoreState,
+        DB.readRestoreStateForPath(alloc, std.mem.span(path)),
+    );
 }
 
 test "db rebuild dense indexes preserves corrupt stored embedding artifacts" {

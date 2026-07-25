@@ -1933,10 +1933,18 @@ test "host falls back to replica root backup restore when no bootstrapper is ins
     defer std.testing.allocator.free(backup_root_abs);
     const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
     defer std.testing.allocator.free(restore_location);
+    var artifact_integrity = try backups_api.artifactIntegrityAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .native,
+        dest_root,
+    );
+    defer artifact_integrity.deinit(std.testing.allocator);
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -1949,6 +1957,8 @@ test "host falls back to replica root backup restore when no bootstrapper is ins
             .start_key = "doc:a",
             .end_key = null,
             .snapshot_path = "snap1/groups/91",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     defer {
@@ -2080,10 +2090,18 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
     defer std.testing.allocator.free(backup_root_abs);
     const restore_location = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{backup_root_abs});
     defer std.testing.allocator.free(restore_location);
+    var artifact_integrity = try backups_api.artifactIntegrityAlloc(
+        std.testing.allocator,
+        std.testing.io,
+        .native,
+        dest_root,
+    );
+    defer artifact_integrity.deinit(std.testing.allocator);
 
     const manifest = try backups_api.createManifest(
         std.testing.allocator,
         "snap1",
+        .native,
         &.{
             .table_id = 7,
             .name = "docs",
@@ -2096,6 +2114,8 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
             .start_key = "doc:a",
             .end_key = null,
             .snapshot_path = "snap1/groups/92",
+            .artifact_size_bytes = artifact_integrity.size_bytes,
+            .artifact_sha256 = artifact_integrity.sha256,
         }},
     );
     defer {
