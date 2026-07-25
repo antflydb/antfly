@@ -2138,6 +2138,11 @@ fn tensorTypeSupported(tensor_type: gguf_mod.tensor_types.TensorType) bool {
             .TL1,
             .IQ4_NL,
             .IQ4_XS,
+            // Integer index tables rather than weights. DeepSeek V4 stores its hash-MoE
+            // token-to-expert routing (ffn_gate_tid2eid) as I32, and quant_codec already
+            // materializes it via materializePassthrough; only this gate was missing, so
+            // inspection rejected the file before the runtime ever saw it.
+            .I32,
             => true,
             else => false,
         },
@@ -6330,4 +6335,17 @@ test "architecture strings named in errors resolve to their advertised level" {
             gpt_mod.supportLevel(gpt_mod.detectFamily(arch)),
         );
     }
+}
+
+test "deepseek v4 gguf architecture name is recognized" {
+    // llama.cpp writes "deepseek4", not any of the HF config.json spellings. Without
+    // this the whole deepseek_v4 implementation is unreachable from GGUF.
+    try std.testing.expectEqual(gpt_mod.ModelFamily.deepseek_v4, gpt_mod.detectFamily("deepseek4"));
+    try std.testing.expect(gpt_mod.isGenerativeModel("deepseek4"));
+}
+
+test "i32 index tables pass gguf tensor type inspection" {
+    // DeepSeek V4 stores hash-MoE routing tables as I32. They are indices, not weights,
+    // and quant_codec materializes them; inspection must not reject the file.
+    try std.testing.expect(tensorTypeSupported(.{ .known = .I32 }));
 }

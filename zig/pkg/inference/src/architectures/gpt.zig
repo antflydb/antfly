@@ -2596,6 +2596,11 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     errdefer if (owns_hidden) cb.free(hidden);
 
     if (config.family == .deepseek_v4 and config.deepseek_v4_hc_mult > 0) {
+        // Ownership of hidden_input transfers to the callee, which frees it as soon as
+        // it has split the hyper-connection streams. Leaving owns_hidden set means any
+        // later error in there comes back here and frees it a second time, so the real
+        // failure is replaced by a segfault in freeTensor.
+        owns_hidden = false;
         return forwardDeepSeekV4FinalHiddenWithStreams(
             cb,
             allocator,
