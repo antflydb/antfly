@@ -1895,9 +1895,57 @@ fn attachArtifactEnrichmentsToTableStatus(alloc: std.mem.Allocator, value: *std.
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidTableIndexMetadata;
-    const enrichments = parsed.value.object.get("enrichments") orelse return;
-    if (enrichments != .array or enrichments.array.items.len == 0) return;
-    try value.object.put(alloc, try alloc.dupe(u8, "artifact_enrichments"), try cloneJsonValueAlloc(alloc, enrichments));
+
+    var enrichments = std.json.Array.init(alloc);
+    errdefer {
+        var owned: std.json.Value = .{ .array = enrichments };
+        deinitJsonValue(alloc, &owned);
+    }
+    try collectArtifactEnrichmentSummaries(alloc, parsed.value, &enrichments);
+    if (enrichments.items.len == 0) return;
+
+    const key = try alloc.dupe(u8, "artifact_enrichments");
+    errdefer alloc.free(key);
+    try value.object.put(alloc, key, .{ .array = enrichments });
+}
+
+fn collectArtifactEnrichmentSummaries(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    out: *std.json.Array,
+) !void {
+    switch (value) {
+        .object => |object| {
+            if (object.get("enrichments")) |enrichments| {
+                if (enrichments == .array) {
+                    for (enrichments.array.items) |item| {
+                        if (item != .object) continue;
+                        const name = item.object.get("name") orelse continue;
+                        if (name != .string or artifactEnrichmentSummaryContains(out.*, name.string)) continue;
+                        try out.append(try cloneJsonValueAlloc(alloc, item));
+                    }
+                }
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                try collectArtifactEnrichmentSummaries(alloc, entry.value_ptr.*, out);
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| try collectArtifactEnrichmentSummaries(alloc, item, out);
+        },
+        else => {},
+    }
+}
+
+fn artifactEnrichmentSummaryContains(enrichments: std.json.Array, name: []const u8) bool {
+    for (enrichments.items) |item| {
+        if (item != .object) continue;
+        const existing_name = item.object.get("name") orelse continue;
+        if (existing_name == .string and std.mem.eql(u8, existing_name.string, name)) return true;
+    }
+    return false;
 }
 
 fn inferIndexType(index_name: []const u8, config: std.json.Value) ?ApiIndexType {
