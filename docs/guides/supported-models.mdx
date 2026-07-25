@@ -54,7 +54,7 @@ These load, but we do not stand behind their output for 0.2.0.
 | BitNet | `bitnet-b1.58-2B-4T` loads and generates, but degenerates into repetition. |
 | Phi | The tensor mapping works for the separate-projection layout, but **Phi-3 GGUFs cannot load** — they pack attention into a fused `attn_qkv.weight` and the FFN into a fused `ffn_up.weight`, which reports 257 missing tensors. |
 | Mistral / Mixtral | Weights load cleanly (no missing tensors), but generation emits only `<unk>`. The cause is the tokenizer, not the weights — see the embedded-SentencePiece caveat below. |
-| DeepSeek V4 | A substantial implementation (MoE routing, compressed/sparse attention) whose only exercise is synthetic unit tests. No artifact small enough to verify. |
+| DeepSeek V4 | Loads from a real GGUF and resolves all tensors, but execution still fails on a shape mismatch in the grouped output projection. Verified against a 99GB DeepSeek-V4-Flash Q2_K. |
 
 ## Unsupported
 
