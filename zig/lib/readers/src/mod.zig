@@ -81,9 +81,9 @@ pub const Request = struct {
     images: []const []const u8,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
-    /// Internal-only correlation for opt-in inference profiling. Remote
-    /// reader providers deliberately do not serialize this value.
-    correlation_id: ?[]const u8 = null,
+    /// Stable source fingerprint for opt-in inference profiling. Remote reader
+    /// providers deliberately do not serialize this internal-only value.
+    source_fingerprint: ?[]const u8 = null,
 };
 
 pub const Result = struct {

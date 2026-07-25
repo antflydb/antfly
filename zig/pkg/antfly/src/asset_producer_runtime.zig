@@ -341,7 +341,7 @@ pub const Runtime = struct {
                 .images = chunk_images,
                 .prompt = shared_prompt,
                 .max_tokens = cfg_parsed.value.max_tokens,
-                .correlation_id = requests[0].correlation_id,
+                .source_fingerprint = requests[0].source_fingerprint,
             });
             if (chunk_results.len != chunk_images.len) {
                 for (chunk_results) |*result| readers.deinitResult(alloc, result);
@@ -416,7 +416,7 @@ pub const Runtime = struct {
             .images = source.images,
             .prompt = source.prompt orelse cfg_parsed.value.prompt,
             .max_tokens = cfg_parsed.value.max_tokens,
-            .correlation_id = request.correlation_id,
+            .source_fingerprint = request.source_fingerprint,
         });
         defer {
             for (results) |*result| readers.deinitResult(alloc, result);

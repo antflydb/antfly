@@ -1842,7 +1842,7 @@ fn projectInlineEnrichmentConfigsInTableStatusJson(alloc: std.mem.Allocator, enc
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
     var parsed = try std.json.parseFromSlice(std.json.Value, arena, encoded, .{});
-    redactInlineEnrichmentProducerConfigs(&parsed.value);
+    redactInlineEnrichmentProducerConfigsFromTableStatuses(&parsed.value);
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
 }
 
@@ -1852,24 +1852,40 @@ fn projectSingleTableStatusJson(alloc: std.mem.Allocator, encoded: []const u8, i
     const arena = arena_impl.allocator();
     var parsed = try std.json.parseFromSlice(std.json.Value, arena, encoded, .{});
     try attachArtifactEnrichmentsToTableStatus(arena, &parsed.value, indexes_json);
-    redactInlineEnrichmentProducerConfigs(&parsed.value);
+    redactInlineEnrichmentProducerConfigsFromTableStatuses(&parsed.value);
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
 }
 
 /// Producer configuration is accepted on writes but is deliberately omitted
 /// from table-status responses. Besides provider credentials, producer_json
 /// can contain arbitrary nested reader configuration supplied by a client.
-fn redactInlineEnrichmentProducerConfigs(value: *std.json.Value) void {
+fn redactInlineEnrichmentProducerConfigsFromTableStatuses(value: *std.json.Value) void {
     switch (value.*) {
         .array => |*array| {
-            for (array.items) |*item| redactInlineEnrichmentProducerConfigs(item);
+            for (array.items) |*item| redactInlineEnrichmentProducerConfigsFromTableStatus(item);
         },
-        .object => |*object| {
-            _ = object.swapRemove("producer_json");
-            var it = object.iterator();
-            while (it.next()) |entry| redactInlineEnrichmentProducerConfigs(entry.value_ptr);
-        },
+        .object => redactInlineEnrichmentProducerConfigsFromTableStatus(value),
         else => {},
+    }
+}
+
+fn redactInlineEnrichmentProducerConfigsFromTableStatus(value: *std.json.Value) void {
+    if (value.* != .object) return;
+    if (value.object.getPtr("indexes")) |indexes| {
+        if (indexes.* == .object) {
+            var it = indexes.object.iterator();
+            while (it.next()) |entry| redactProducerConfigsFromEnrichmentArray(entry.value_ptr, "enrichments");
+        }
+    }
+    redactProducerConfigsFromEnrichmentArray(value, "artifact_enrichments");
+}
+
+fn redactProducerConfigsFromEnrichmentArray(container: *std.json.Value, key: []const u8) void {
+    if (container.* != .object) return;
+    const enrichments = container.object.getPtr(key) orelse return;
+    if (enrichments.* != .array) return;
+    for (enrichments.array.items) |*enrichment| {
+        if (enrichment.* == .object) _ = enrichment.object.swapRemove("producer_json");
     }
 }
 
@@ -3525,6 +3541,9 @@ test "metadata.table status merges observed capabilities conservatively" {
 }
 
 test "metadata.table status encoder preserves enrichment summaries without producer configuration" {
+    const schema_json =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"producer_json":{"type":"string"}}}}}}
+    ;
     const indexes_json =
         \\{
         \\  "document_text":{
@@ -3548,7 +3567,14 @@ test "metadata.table status encoder preserves enrichment summaries without produ
     ;
     const snapshot: metadata_api.AdminSnapshot = .{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },
-        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .indexes_json = indexes_json, .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = schema_json,
+            .indexes_json = indexes_json,
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
         .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
         .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
@@ -3558,11 +3584,36 @@ test "metadata.table status encoder preserves enrichment summaries without produ
 
     const encoded = (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "docs")).?;
     defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const indexes = parsed.value.object.get("indexes").?;
+    const document_text = indexes.object.get("document_text").?;
+    const document_enrichments = document_text.object.get("enrichments").?;
+    try std.testing.expect(document_enrichments.array.items[0].object.get("producer_json") == null);
+    const artifact_enrichments = parsed.value.object.get("artifact_enrichments").?;
+    try std.testing.expect(artifact_enrichments.array.items[0].object.get("producer_json") == null);
+
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"enrichments\":[{\"name\":\"document_units_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "{\"name\":\"document_chunks_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"enrichments\":[{\"name\":\"document_chunk_dense_v1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "producer_json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"producer_json\":{\"type\":\"string\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "do-not-return") == null);
+}
+
+test "metadata.table list projection redacts only enrichment producer configuration" {
+    const encoded =
+        \\[{"schema":{"properties":{"producer_json":{"type":"string"}}},"indexes":{"document_text":{"enrichments":[{"name":"units","producer_json":"secret"}]}}}]
+    ;
+    const projected = try projectInlineEnrichmentConfigsInTableStatusJson(std.testing.allocator, encoded);
+    defer std.testing.allocator.free(projected);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, projected, .{});
+    defer parsed.deinit();
+    const status = parsed.value.array.items[0];
+    try std.testing.expect(status.object.get("schema").?.object.get("properties").?.object.get("producer_json") != null);
+    const enrichment = status.object.get("indexes").?.object.get("document_text").?.object.get("enrichments").?.array.items[0];
+    try std.testing.expect(enrichment.object.get("producer_json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "secret") == null);
 }
 
 test "metadata.table debug encoder emits runtime schemas and index bindings" {
