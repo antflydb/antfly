@@ -6281,3 +6281,53 @@ test "Gemma resident embeddings retain CUDA-supported quantized formats" {
     const llama_cfg: gpt_mod.Config = .{ .family = .llama };
     try std.testing.expect(!shouldKeepResidentGptEmbeddingQuantizedOnly(llama_cfg, .{ .known = .Q6_K }));
 }
+
+test "support level separates verified, experimental, and unsupported families" {
+    // Verified against real GGUF artifacts.
+    try std.testing.expectEqual(gpt_mod.SupportLevel.supported, gpt_mod.supportLevel(.llama));
+    try std.testing.expectEqual(gpt_mod.SupportLevel.supported, gpt_mod.supportLevel(.qwen3));
+    try std.testing.expectEqual(gpt_mod.SupportLevel.supported, gpt_mod.supportLevel(.gemma));
+
+    // Mapped and plumbed, but never run against a real model.
+    try std.testing.expectEqual(gpt_mod.SupportLevel.experimental, gpt_mod.supportLevel(.mistral));
+    try std.testing.expectEqual(gpt_mod.SupportLevel.experimental, gpt_mod.supportLevel(.deepseek_v4));
+
+    // falcon/opt/bloom are enum entries with no weight mapping or runtime at all, so
+    // they must not present as generators that merely happen to be missing tensors.
+    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.falcon));
+    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.opt));
+    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.bloom));
+    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.qwen3_5));
+}
+
+test "experimental families keep their gguf weight mapping" {
+    // `unsupported` gates the normalizer; `experimental` must not, or a family we are
+    // merely unsure about would fail as though it had no mapping.
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "model.layers.3.self_attn.q_proj.weight",
+        normalizeGgufGptWeightKey(.{ .family = .mistral }, "blk.3.attn_q.weight", &buf).?,
+    );
+    try std.testing.expect(normalizeGgufGptWeightKey(
+        .{ .family = .falcon },
+        "blk.3.attn_q.weight",
+        &buf,
+    ) == null);
+}
+
+test "architecture strings named in errors resolve to their advertised level" {
+    // The error message lists these by name, so a typo or a rename would silently
+    // advertise something the gate rejects.
+    for ([_][]const u8{ "llama", "qwen3", "gemma", "gemma2", "gemma3", "gemma4" }) |arch| {
+        try std.testing.expectEqual(
+            gpt_mod.SupportLevel.supported,
+            gpt_mod.supportLevel(gpt_mod.detectFamily(arch)),
+        );
+    }
+    for ([_][]const u8{ "mistral", "mixtral", "qwen2", "phi", "phi3", "bitnet", "deepseek_v4" }) |arch| {
+        try std.testing.expectEqual(
+            gpt_mod.SupportLevel.experimental,
+            gpt_mod.supportLevel(gpt_mod.detectFamily(arch)),
+        );
+    }
+}

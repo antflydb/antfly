@@ -590,6 +590,48 @@ fn modelArchitectureName(
     return "unknown";
 }
 
+/// Decoder support level for a model directory, resolved without loading any weights.
+///
+/// `detectFamily` names more architectures than the runtime can actually run, so a model
+/// with no implementation still classifies as a generator. Checking before the load turns
+/// that into an honest "unsupported architecture" instead of a downstream complaint about
+/// missing tensors, and covers the SafeTensors path, which has no other gate.
+fn modelSupportLevel(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    arch_out: *?[]const u8,
+    scratch: *?c_file.MmapRegion,
+) gpt_model_mod.SupportLevel {
+    var man = manifest_mod.loadListingFromDir(allocator, model_path) catch return .supported;
+    defer man.deinit();
+
+    // Non-decoders (embedders, readers, ...) are not this gate's business.
+    if (man.model_type != .generator) return .supported;
+
+    const arch = modelArchitectureName(&man, scratch);
+    if (std.mem.eql(u8, arch, "unknown")) return .supported;
+
+    // `arch` may borrow from the manifest, which is freed on return; the mmap scratch
+    // outlives us, so only a GGUF-sourced name can be handed back directly.
+    arch_out.* = if (scratch.* != null) arch else allocator.dupe(u8, arch) catch null;
+    return gpt_model_mod.supportLevel(gpt_model_mod.detectFamily(arch));
+}
+
+/// Support level for a listing entry, as a static string. Empty for non-decoders, which
+/// this tiering does not describe.
+///
+/// Uses the manifest already in hand: `config_model_arch` when config.json supplied one,
+/// otherwise a cheap `general.architecture` read that skips the rest of the GGUF metadata.
+fn listingSupportLevel(allocator: std.mem.Allocator, man: manifest_mod.ModelManifest) []const u8 {
+    if (man.model_type != .generator) return "";
+
+    var region: ?c_file.MmapRegion = null;
+    defer if (region) |*value| value.deinit();
+    const arch = modelArchitectureName(&man, &region);
+    if (std.mem.eql(u8, arch, "unknown")) return "";
+    _ = allocator;
+    return @tagName(gpt_model_mod.supportLevel(gpt_model_mod.detectFamily(arch)));
+}
 fn appendOpenAiModelEntry(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -626,6 +668,8 @@ const DiscoveredModelListing = struct {
     entry_index: usize,
     manifest: manifest_mod.ModelManifest,
     reader_supported: bool,
+    /// `@tagName` of the decoder support level, or empty for non-decoders.
+    support_level: []const u8,
 
     fn deinit(self: *@This()) void {
         self.manifest.deinit();
@@ -2263,6 +2307,34 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, model_name, "generators") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
+        // Reject architectures we cannot run before paying for a load. Without this the
+        // failure surfaces much later as missing tensors, which reads as a broken model
+        // rather than an unsupported one.
+        {
+            var gate_arch: ?[]const u8 = null;
+            var gate_region: ?c_file.MmapRegion = null;
+            defer if (gate_region) |*region| region.deinit();
+            switch (modelSupportLevel(ctx.allocator, model_path, &gate_arch, &gate_region)) {
+                .unsupported => return ctx.status(400).json(.{
+                    .@"error" = "UNSUPPORTED_ARCHITECTURE",
+                    .message = try std.fmt.allocPrint(
+                        ctx.allocator,
+                        "model architecture \"{s}\" is not supported for generation; supported: {s}; experimental: {s}",
+                        .{
+                            gate_arch orelse "unknown",
+                            gpt_model_mod.gguf_supported_architectures,
+                            gpt_model_mod.gguf_experimental_architectures,
+                        },
+                    ),
+                }),
+                .experimental => std.log.warn(
+                    "model architecture \"{s}\" is experimental and unverified; generation may fail or produce poor output",
+                    .{gate_arch orelse "unknown"},
+                ),
+                .supported => {},
+            }
+        }
+
         // Extract messages from request body
         var messages = std.ArrayListUnmanaged(generation.Message).empty;
         defer messages.deinit(ctx.allocator);
@@ -2777,8 +2849,12 @@ pub const Node = struct {
                 .@"error" = "UNSUPPORTED_ARCHITECTURE",
                 .message = try std.fmt.allocPrint(
                     ctx.allocator,
-                    "model architecture \"{s}\" is not supported for generation; supported architectures: {s}",
-                    .{ arch, gpt_model_mod.gguf_supported_architectures },
+                    "model architecture \"{s}\" is not supported for generation; supported: {s}; experimental: {s}",
+                    .{
+                        arch,
+                        gpt_model_mod.gguf_supported_architectures,
+                        gpt_model_mod.gguf_experimental_architectures,
+                    },
                 ),
             });
         };
@@ -5649,6 +5725,7 @@ pub const Node = struct {
                 .entry_index = entry_index,
                 .manifest = manifest,
                 .reader_supported = reader_candidate and readers_mod.isSupportedModelDir(a, entry.path),
+                .support_level = listingSupportLevel(a, manifest),
             });
         }
 
@@ -5705,6 +5782,7 @@ pub const Node = struct {
                     has_visual,
                     has_audio,
                     chat_template_failed,
+                    listing.support_level,
                 );
                 if (isOpenAiListTask(task)) {
                     try appendUniqueOpenAiModelEntry(
@@ -5748,6 +5826,7 @@ pub const Node = struct {
                         model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
                         model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
                         model.chat_template_failed,
+                        listingSupportLevel(a, model.manifest),
                     );
                     if (isOpenAiListTask(task)) {
                         try appendUniqueOpenAiModelEntry(
@@ -6794,6 +6873,9 @@ fn appendModelInfo(
     /// Set when the model shipped a chat template we could not parse. Without this the
     /// degradation to raw prompting is invisible to API clients.
     chat_template_failed: bool,
+    /// Decoder support level, so clients can tell a verified generator from one that
+    /// merely loads. Empty for non-decoders.
+    support_level: []const u8,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
     const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
@@ -6803,7 +6885,18 @@ fn appendModelInfo(
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
 
     if (capabilities.len == 0 and !inferred_classification and !inferred_relations and !inferred_extraction and !has_known_inputs) {
-        try buf.appendSlice(allocator, if (chat_template_failed) "{\"chat_template\":false}" else "{}");
+        if (!chat_template_failed and support_level.len == 0) {
+            try buf.appendSlice(allocator, "{}");
+            return;
+        }
+        try buf.append(allocator, '{');
+        if (chat_template_failed) try buf.appendSlice(allocator, "\"chat_template\":false");
+        if (support_level.len > 0) {
+            if (chat_template_failed) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "\"support\":");
+            try jsonEncodeString(buf, allocator, support_level);
+        }
+        try buf.append(allocator, '}');
         return;
     }
 
@@ -6839,6 +6932,10 @@ fn appendModelInfo(
     }
     try buf.append(allocator, ']');
     if (chat_template_failed) try buf.appendSlice(allocator, ",\"chat_template\":false");
+    if (support_level.len > 0) {
+        try buf.appendSlice(allocator, ",\"support\":");
+        try jsonEncodeString(buf, allocator, support_level);
+    }
     try buf.append(allocator, '}');
 }
 
