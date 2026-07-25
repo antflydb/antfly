@@ -8953,9 +8953,7 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn asyncIndexingStatsBestEffort(self: *ProvisionedTableWriteSource) db_mod.types.AsyncIndexingStats {
         const startup_active = self.startup_catch_up_active.load(.monotonic);
         if (!self.local_db_mutex.tryLock()) {
-            if (startup_active) {
-                if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().async_indexing;
-            }
+            if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().async_indexing;
             return .{};
         }
         defer self.local_db_mutex.unlock();
@@ -9001,13 +8999,24 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn textMergeStatsBestEffort(self: *ProvisionedTableWriteSource) db_mod.types.TextMergeStats {
-        if (!self.local_db_mutex.tryLock()) return .{};
+        if (!self.local_db_mutex.tryLock()) {
+            if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().text_merge;
+            return .{};
+        }
         defer self.local_db_mutex.unlock();
-        const cache = self.write_cache orelse return .{};
+        const cache = self.write_cache orelse {
+            if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().text_merge;
+            return .{};
+        };
         var stats = db_mod.types.TextMergeStats{};
+        var observed = false;
         for (cache.entries.items) |entry| {
             const entry_stats = entry.db.trySnapshotTextMergeStats() orelse continue;
+            observed = true;
             db_mod.types.accumulateTextMergeStats(&stats, entry_stats);
+        }
+        if (!observed) {
+            if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().text_merge;
         }
         return stats;
     }
@@ -28475,7 +28484,7 @@ test "provisioned table write source managed writer probe is unknown while sourc
     try std.testing.expectEqual(@as(ProvisionedTableWriteSource.ManagedWriterGroupProbe, .unknown), source.probeManagedWriterGroupBestEffort("docs", 7001));
 }
 
-test "provisioned table write source runtime status stays null while dirty and busy during startup catch-up" {
+test "provisioned table write source metrics serve cached snapshot while write cache lock is busy" {
     const alloc = std.testing.allocator;
 
     const NoCatalog = struct {
@@ -28506,7 +28515,17 @@ test "provisioned table write source runtime status stays null while dirty and b
             .doc_count = 9,
             .index_count = 1,
             .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
+            .text_merge = .{
+                .completed_merges = 42,
+            },
             .async_indexing = .{
+                .derived_workers = .{
+                    .workers = 1,
+                    .workers_with_replay_debt = 1,
+                    .max_replay_lag_sequences = 5,
+                    .recoverable_retries = 7,
+                    .writer_locked_retries = 7,
+                },
                 .startup = .{
                     .active = true,
                     .phase = .artifact_rebuild,
@@ -28558,6 +28577,13 @@ test "provisioned table write source runtime status stays null while dirty and b
     try std.testing.expectEqual(@as(u64, 99), async_stats.startup.wal_retained_bytes);
     try std.testing.expect(async_stats.dense_catch_up.active);
     try std.testing.expectEqual(@as(u64, 9), async_stats.dense_catch_up.current_target_sequence);
+
+    source.startup_catch_up_active.store(false, .monotonic);
+    const steady_state_async_stats = source.asyncIndexingStatsBestEffort();
+    try std.testing.expectEqual(@as(u64, 1), steady_state_async_stats.derived_workers.workers_with_replay_debt);
+    try std.testing.expectEqual(@as(u64, 7), steady_state_async_stats.derived_workers.writer_locked_retries);
+    const text_merge_stats = source.textMergeStatsBestEffort();
+    try std.testing.expectEqual(@as(u64, 42), text_merge_stats.completed_merges);
 }
 
 test "provisioned table write source runtime status serves cached snapshot when request is idle" {
