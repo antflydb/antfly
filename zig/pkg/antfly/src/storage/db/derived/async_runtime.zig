@@ -1141,6 +1141,8 @@ const DenseTargetAdvanceSessionCapture = struct {
     target_advance_calls: std.atomic.Value(u64) = .init(0),
     persist_calls: std.atomic.Value(u64) = .init(0),
     persisted_sequence: std.atomic.Value(u64) = .init(0),
+    truncate_calls: std.atomic.Value(u64) = .init(0),
+    truncated_sequence: std.atomic.Value(u64) = .init(0),
 };
 
 fn testDenseTargetAdvanceSessionApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !bool {
@@ -1158,6 +1160,12 @@ fn testDenseTargetAdvanceSessionPersist(ctx: *anyopaque, index_name: []const u8,
     _ = capture.persist_calls.fetchAdd(1, .monotonic);
     capture.persisted_sequence.store(sequence, .monotonic);
     return true;
+}
+
+fn testDenseTargetAdvanceSessionTruncate(ctx: *anyopaque, sequence: u64) !void {
+    const capture: *DenseTargetAdvanceSessionCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.truncate_calls.fetchAdd(1, .monotonic);
+    capture.truncated_sequence.store(sequence, .monotonic);
 }
 
 fn testDenseTargetAdvanceSessionBegin(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
@@ -1211,7 +1219,7 @@ test "async dense workers advance zero-applied target while catch-up sessions ar
         &capture,
         testDenseTargetAdvanceSessionApply,
         testDenseTargetAdvanceSessionPersist,
-        testRuntimeTruncate,
+        testDenseTargetAdvanceSessionTruncate,
         testDenseTargetAdvanceSessionBegin,
         testDenseTargetAdvanceSessionFinish,
         testDenseTargetAdvanceWhileSessionOpen,
@@ -1234,6 +1242,8 @@ test "async dense workers advance zero-applied target while catch-up sessions ar
     try std.testing.expectEqual(@as(u64, 2), capture.finish_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), capture.active_sessions.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
+    try std.testing.expect(capture.truncate_calls.load(.monotonic) >= 1);
+    try std.testing.expectEqual(@as(u64, 1), capture.truncated_sequence.load(.monotonic));
 }
 
 test "async dense publish NotFound retries without failing runtime" {
