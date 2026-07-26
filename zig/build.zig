@@ -2955,12 +2955,20 @@ pub fn build(b: *std.Build) void {
     lib_reranking_runtime_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
 
     const lib_common_default_filters = [_][]const u8{ "provider registry", "std http listener", "std http executor", "threaded connector" };
-    const lib_common_filters = selectTestFilters(b, &lib_common_default_filters);
+    const lib_common_runtime_filters = selectTestFilters(b, &lib_common_default_filters);
     const lib_common_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = lib_common_filters,
+        .filters = compileFiltersWithAnchors(
+            b,
+            &.{"common."},
+            lib_common_runtime_filters,
+        ),
     });
-    const run_lib_common_tests = addFilteredTestRunArtifact(b, lib_common_tests);
+    const run_lib_common_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lib_common_tests,
+        lib_common_runtime_filters,
+    );
     const lib_common_test_step = b.step("lib-common-test", "Run common/provider registry tests");
     lib_common_test_step.dependOn(&run_lib_common_tests.step);
 
@@ -5311,16 +5319,24 @@ pub fn build(b: *std.Build) void {
         "metadata http server returns 400 for invalid internal restore backup locations",
         "metadata http server returns retryable authority response when reconcile lease is not held",
     };
-    const lib_metadata_logic_filters = selectTestFilters(b, &lib_metadata_logic_default_filters);
+    const lib_metadata_logic_runtime_filters = selectTestFilters(b, &lib_metadata_logic_default_filters);
     const lib_metadata_logic_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = lib_metadata_logic_filters,
+        .filters = compileFiltersWithAnchors(
+            b,
+            &.{"metadata."},
+            lib_metadata_logic_runtime_filters,
+        ),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lib_metadata_logic_tests = addFilteredTestRunArtifact(b, lib_metadata_logic_tests);
+    const run_lib_metadata_logic_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lib_metadata_logic_tests,
+        lib_metadata_logic_runtime_filters,
+    );
     const lib_metadata_logic_test_step = b.step("lib-metadata-logic-test", "Run metadata logic/state/planner tests");
     lib_metadata_logic_test_step.dependOn(&run_lib_metadata_logic_tests.step);
 
