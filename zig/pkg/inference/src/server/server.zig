@@ -198,6 +198,7 @@ pub const NodeConfig = struct {
     prompt_cache: PromptCacheConfig = .{},
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
     tokenizer_cache: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig = .{},
+    tokenizer_parallel_bpe: hf_tokenizer_mod.HfTokenizer.ParallelBpeConfig = .{},
     /// Permit artifacts whose compatibility cannot be proven by this build.
     /// Known incompatible or unsafe artifacts remain blocked.
     allow_unknown_models: bool = false,
@@ -1000,6 +1001,8 @@ pub const Node = struct {
             .scratch_limit_bytes = config.generation_budget_overrides.scratch_limit_bytes,
         });
         node.model_manager.tokenizer_cache_config = config.tokenizer_cache;
+        node.model_manager.tokenizer_parallel_bpe_config =
+            config.tokenizer_parallel_bpe;
         node.updateQueueMetrics();
         return node;
     }
@@ -1011,6 +1014,17 @@ pub const Node = struct {
     ) !void {
         try self.model_manager.configureTokenizerCaches(config);
         self.config.tokenizer_cache = config;
+    }
+
+    /// Configure the std.Io tokenizer scheduler and optional consumer-local
+    /// tables before model load. Table memory is admitted by the cache
+    /// resource budget configured above.
+    pub fn configureTokenizerParallelBpe(
+        self: *Node,
+        config: hf_tokenizer_mod.HfTokenizer.ParallelBpeConfig,
+    ) !void {
+        try self.model_manager.configureTokenizerParallelBpe(config);
+        self.config.tokenizer_parallel_bpe = config;
     }
 
     pub fn deinit(self: *Node) void {

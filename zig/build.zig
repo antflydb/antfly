@@ -6472,6 +6472,12 @@ pub fn build(b: *std.Build) void {
         .name = "tokenizer_benchmark",
         .root_module = tokenizer_bench_mod,
     });
+    const install_tokenizer_bench = b.addInstallArtifact(tokenizer_bench, .{});
+    const tokenizer_bench_build_step = b.step(
+        "bench-tokenizer-build",
+        "Build the native Zig HuggingFace tokenizer benchmark binary",
+    );
+    tokenizer_bench_build_step.dependOn(&install_tokenizer_bench.step);
     const run_tokenizer_bench = b.addRunArtifact(tokenizer_bench);
     if (b.args) |args| {
         run_tokenizer_bench.addArgs(args);
