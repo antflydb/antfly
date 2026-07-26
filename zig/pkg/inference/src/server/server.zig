@@ -38,6 +38,7 @@ const model_manager_mod = @import("model_manager.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const gpt_model_mod = @import("../models/gpt.zig");
+const model_support = @import("../models/support.zig");
 const chunking_mod = @import("../pipelines/chunking.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
@@ -62,7 +63,6 @@ const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const tabular_mod = @import("../tabular/root.zig");
 const c_file = @import("../util/c_file.zig");
-const gguf_format = @import("../gguf/format.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
@@ -193,6 +193,9 @@ pub const NodeConfig = struct {
     prompt_cache: PromptCacheConfig = .{},
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
     tokenizer_cache: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig = .{},
+    /// Permit unrecognized/experimental model architectures in the serving process.
+    /// Known unsafe or unusable models remain blocked.
+    allow_experimental_models: bool = false,
 };
 
 pub const WarmModelKind = enum {
@@ -560,120 +563,79 @@ fn estimateParsedDenseEmbedPromptTokens(inputs: *const ParsedDenseEmbedInputs) u
     return total;
 }
 
-/// Message for an architecture we cannot generate with.
-///
-/// The experimental list is empty whenever no family qualifies as working-but-early, so
-/// it is only mentioned when it has something in it.
-fn unsupportedArchitectureMessage(allocator: std.mem.Allocator, arch: []const u8) ![]u8 {
-    if (gpt_model_mod.gguf_experimental_architectures.len == 0) {
-        return std.fmt.allocPrint(
-            allocator,
-            "model architecture \"{s}\" is not supported for generation; supported: {s}",
-            .{ arch, gpt_model_mod.gguf_supported_architectures },
-        );
-    }
-    return std.fmt.allocPrint(
-        allocator,
-        "model architecture \"{s}\" is not supported for generation; supported: {s}; experimental: {s}",
-        .{ arch, gpt_model_mod.gguf_supported_architectures, gpt_model_mod.gguf_experimental_architectures },
-    );
-}
-
 fn isOpenAiListTask(task: []const u8) bool {
     return std.mem.eql(u8, task, "generators") or std.mem.eql(u8, task, "embedders");
 }
 
-/// Best-effort architecture name for a model, for error messages.
-///
-/// `config_model_arch` comes from config.json, which GGUF-only bundles do not have. In
-/// that case fall back to reading `general.architecture` out of the GGUF, which is cheap
-/// because `readArchitecture` skips the rest of the metadata table.
-///
-/// The returned slice borrows from `man` or from `scratch`; it is valid until either is
-/// released.
-fn modelArchitectureName(
-    man: *const manifest_mod.ModelManifest,
-    scratch: *?c_file.MmapRegion,
-) []const u8 {
-    if (man.config_model_arch.len > 0) return man.config_model_arch;
+const SupportSummary = struct {
+    level: model_support.Level,
+    reason: []const u8,
+};
 
-    const gguf_path = man.gguf_path orelse return "unknown";
-    var region = c_file.MmapRegion.init(man.allocator, gguf_path) catch return "unknown";
-    const arch = gguf_format.readArchitecture(region.data) catch null;
-    if (arch) |value| {
-        scratch.* = region;
-        return value;
-    }
-    region.deinit();
-    return "unknown";
+fn supportSummaryForManifest(
+    allocator: std.mem.Allocator,
+    man: *const manifest_mod.ModelManifest,
+) !SupportSummary {
+    var inspection = try model_support.inspectAlloc(allocator, man);
+    defer inspection.deinit(allocator);
+    const assessment = model_support.assessInspection(man, inspection);
+    return .{ .level = assessment.level, .reason = assessment.reason };
 }
 
-/// Decoder support level for a model directory, resolved without loading any weights.
-///
-/// `detectFamily` names more architectures than the runtime can actually run, so a model
-/// with no implementation still classifies as a generator. Checking before the load turns
-/// that into an honest "unsupported architecture" instead of a downstream complaint about
-/// missing tensors, and covers the SafeTensors path, which has no other gate.
-fn modelSupportLevel(
+fn supportSummaryForDir(
     allocator: std.mem.Allocator,
     model_path: []const u8,
-    arch_out: *?[]const u8,
-    scratch: *?c_file.MmapRegion,
-) gpt_model_mod.SupportLevel {
-    var man = manifest_mod.loadListingFromDir(allocator, model_path) catch return .supported;
+) !SupportSummary {
+    var man = try manifest_mod.loadListingFromDir(allocator, model_path);
     defer man.deinit();
-
-    // Non-decoders (embedders, readers, ...) are not this gate's business.
-    if (man.model_type != .generator) return .supported;
-
-    const arch = modelArchitectureName(&man, scratch);
-    if (std.mem.eql(u8, arch, "unknown")) return .supported;
-
-    // `arch` may borrow from the manifest, which is freed on return; the mmap scratch
-    // outlives us, so only a GGUF-sourced name can be handed back directly.
-    arch_out.* = if (scratch.* != null) arch else allocator.dupe(u8, arch) catch null;
-    return gpt_model_mod.supportLevel(gpt_model_mod.detectFamily(arch));
+    return supportSummaryForManifest(allocator, &man);
 }
 
-/// Support level for a listing entry, as a static string. Empty for non-decoders, which
-/// this tiering does not describe.
-///
-/// Uses the manifest already in hand: `config_model_arch` when config.json supplied one,
-/// otherwise a cheap `general.architecture` read that skips the rest of the GGUF metadata.
-fn listingSupportLevel(allocator: std.mem.Allocator, man: manifest_mod.ModelManifest) []const u8 {
-    _ = allocator;
-    if (man.model_type != .generator) return @tagName(model_caps.modelClassSupportLevel(&man));
-
-    var region: ?c_file.MmapRegion = null;
-    defer if (region) |*value| value.deinit();
-    const arch = modelArchitectureName(&man, &region);
-    if (std.mem.eql(u8, arch, "unknown")) return "";
-    return @tagName(gpt_model_mod.supportLevel(gpt_model_mod.detectFamily(arch)));
-}
-
-/// Reject a model class we cannot serve, before anything is loaded.
-///
-/// Unlike the generation gate this is not about honesty alone: the blocked classes crash
-/// the process (unbounded allocation in the ONNX vision path, a rank assertion while
-/// importing an ONNX seq2seq graph), so reaching them turns one bad request into a dead
-/// server for every other caller.
-fn rejectUnsupportedModelClass(
+/// Apply the serving policy before model loading. `ModelManager` repeats this check as a
+/// safety backstop so a new endpoint or direct Node helper cannot bypass it.
+fn rejectDisallowedModel(
+    self: *Node,
     ctx: *httpx.Context,
-    allocator: std.mem.Allocator,
     model_path: []const u8,
 ) !?httpx.Response {
-    var man = manifest_mod.loadListingFromDir(allocator, model_path) catch return null;
-    defer man.deinit();
-    if (model_caps.modelClassSupportLevel(&man) != .unsupported) return null;
+    const summary = supportSummaryForDir(ctx.allocator, model_path) catch {
+        if (self.config.allow_experimental_models) return null;
+        return try ctx.status(400).json(.{
+            .@"error" = "EXPERIMENTAL_MODEL_DISABLED",
+            .message = "model compatibility could not be determined; restart with --allow-experimental-models to opt in",
+        });
+    };
+    switch (summary.level) {
+        .supported => return null,
+        .experimental => {
+            if (self.config.allow_experimental_models) return null;
+            return try ctx.status(400).json(.{
+                .@"error" = "EXPERIMENTAL_MODEL_DISABLED",
+                .message = summary.reason,
+            });
+        },
+        .unsupported => return try ctx.status(400).json(.{
+            .@"error" = "UNSUPPORTED_MODEL",
+            .message = summary.reason,
+        }),
+    }
+}
 
-    return try ctx.status(400).json(.{
-        .@"error" = "UNSUPPORTED_MODEL",
-        .message = try std.fmt.allocPrint(
-            allocator,
-            "model is not supported for {s}; see https://antfly.io/docs/guides/supported-models",
-            .{@tagName(man.model_type)},
-        ),
-    });
+fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    return switch (err) {
+        error.ExperimentalModelDisabled => ctx.status(400).json(.{
+            .@"error" = "EXPERIMENTAL_MODEL_DISABLED",
+            .message = "model architecture is experimental; restart with --allow-experimental-models to opt in",
+        }),
+        error.UnsupportedModel => ctx.status(400).json(.{
+            .@"error" = "UNSUPPORTED_MODEL",
+            .message = "model architecture is known to be unsafe or unusable in this release",
+        }),
+        else => ctx.status(500).json(.{
+            .@"error" = "MODEL_LOAD_FAILED",
+            .message = @errorName(err),
+        }),
+    };
 }
 
 /// A discovered model resolved once, so the ten task passes in `listModelsJsonAlloc` can
@@ -686,6 +648,7 @@ const DiscoveredModelListing = struct {
     readers_supported: bool,
     /// `@tagName` of the decoder support level, or empty for non-decoders.
     support_level: []const u8,
+    support_reason: []const u8,
 };
 
 fn appendOpenAiModelEntry(
@@ -693,16 +656,41 @@ fn appendOpenAiModelEntry(
     allocator: std.mem.Allocator,
     model_id: []const u8,
     created: i64,
+    support_level: []const u8,
+    support_reason: []const u8,
 ) !void {
     try buf.appendSlice(allocator, "{\"id\":");
     try jsonEncodeString(buf, allocator, model_id);
     const metadata = try std.fmt.allocPrint(
         allocator,
-        ",\"object\":\"model\",\"created\":{d},\"owned_by\":\"antfly\"}}",
+        ",\"object\":\"model\",\"created\":{d},\"owned_by\":\"antfly\",\"support\":",
         .{created},
     );
     defer allocator.free(metadata);
     try buf.appendSlice(allocator, metadata);
+    try jsonEncodeString(buf, allocator, support_level);
+    try buf.appendSlice(allocator, ",\"support_reason\":");
+    try jsonEncodeString(buf, allocator, support_reason);
+    try buf.append(allocator, '}');
+}
+
+test "OpenAI model entries expose serving support metadata" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    defer buf.deinit(allocator);
+
+    try appendOpenAiModelEntry(
+        &buf,
+        allocator,
+        "owner/model",
+        42,
+        "experimental",
+        "unknown architecture",
+    );
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"owner/model\",\"object\":\"model\",\"created\":42,\"owned_by\":\"antfly\",\"support\":\"experimental\",\"support_reason\":\"unknown architecture\"}",
+        buf.items,
+    );
 }
 
 const ModelCounts = struct {
@@ -773,11 +761,13 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         }
     }
 
+    node.model_manager.lockLoadedModels();
+    defer node.model_manager.unlockLoadedModels();
     var it = node.model_manager.loaded.iterator();
     while (it.next()) |entry| {
         var already_listed = false;
         for (discovered) |d| {
-            if (std.mem.eql(u8, d.path, entry.key_ptr.*)) {
+            if (std.mem.eql(u8, d.path, entry.value_ptr.*.model_dir)) {
                 already_listed = true;
                 break;
             }
@@ -864,6 +854,9 @@ pub const Node = struct {
             .metrics = metrics_mod.Metrics.default,
             .request_queue = request_queue_mod.RequestQueue.init(config.max_concurrent_requests),
         };
+        node.model_manager.configureServingPolicy(.{
+            .allow_experimental = config.allow_experimental_models,
+        });
         node.model_manager.tokenizer_cache_config = config.tokenizer_cache;
         node.updateQueueMetrics();
         return node;
@@ -1922,13 +1915,10 @@ pub const Node = struct {
                 .message = "model not found; specify 'model' as a path or owner/name",
             });
 
-        if (try rejectUnsupportedModelClass(ctx, ctx.allocator, model_path)) |response| return response;
+        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
 
         const model = self.model_manager.loadFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{
-                .@"error" = "MODEL_LOAD_FAILED",
-                .message = @errorName(err),
-            });
+            return modelLoadFailureResponse(ctx, err);
 
         if (model.manifest.hasCapability("sparse")) {
             const sparse_texts = parseSparseEmbedInputs(ctx.allocator, request.input) catch {
@@ -2162,7 +2152,7 @@ pub const Node = struct {
             });
 
         const model = self.model_manager.loadFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return modelLoadFailureResponse(ctx, err);
 
         var pipeline = model.rerankingPipeline(ctx.allocator);
         const scores = pipeline.rerank(body.query, body.prompts) catch |err|
@@ -2197,7 +2187,7 @@ pub const Node = struct {
             });
 
         const model = self.model_manager.loadFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return modelLoadFailureResponse(ctx, err);
 
         var parsed_docs = std.ArrayListUnmanaged(ParsedMultimodalRerankDocument).empty;
         defer {
@@ -2324,25 +2314,7 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, model_name, "generators") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
-        // Reject architectures we cannot run before paying for a load. Without this the
-        // failure surfaces much later as missing tensors, which reads as a broken model
-        // rather than an unsupported one.
-        {
-            var gate_arch: ?[]const u8 = null;
-            var gate_region: ?c_file.MmapRegion = null;
-            defer if (gate_region) |*region| region.deinit();
-            switch (modelSupportLevel(ctx.allocator, model_path, &gate_arch, &gate_region)) {
-                .unsupported => return ctx.status(400).json(.{
-                    .@"error" = "UNSUPPORTED_ARCHITECTURE",
-                    .message = try unsupportedArchitectureMessage(ctx.allocator, gate_arch orelse "unknown"),
-                }),
-                .experimental => std.log.warn(
-                    "model architecture \"{s}\" is experimental and unverified; generation may fail or produce poor output",
-                    .{gate_arch orelse "unknown"},
-                ),
-                .supported => {},
-            }
-        }
+        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
 
         // Extract messages from request body
         var messages = std.ArrayListUnmanaged(generation.Message).empty;
@@ -2655,7 +2627,7 @@ pub const Node = struct {
             }
 
             var pipeline = onnx_decoder_only_vlm.Pipeline.load(ctx.allocator, model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return modelLoadFailureResponse(ctx, err);
             defer pipeline.deinit();
             pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
 
@@ -2719,7 +2691,7 @@ pub const Node = struct {
             defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
             if (ort_model_dir) |prepared_model_dir| {
                 var ort_manifest = manifest_mod.loadFromDir(ctx.allocator, prepared_model_dir) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                    return modelLoadFailureResponse(ctx, err);
                 defer ort_manifest.deinit();
 
                 const use_functiongemma_prompt_override = if (tool_parser) |*parser|
@@ -2756,7 +2728,7 @@ pub const Node = struct {
                 }
 
                 var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                    return modelLoadFailureResponse(ctx, err);
                 defer gen_model.deinit();
 
                 var pipeline = generation.GenerationPipeline{
@@ -2825,9 +2797,9 @@ pub const Node = struct {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
             configureGenerateBackendPreference(&request_session_manager, backend_selection);
             break :blk self.model_manager.loadFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return modelLoadFailureResponse(ctx, err);
         } else self.model_manager.loadFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return modelLoadFailureResponse(ctx, err);
         model.lockNativeGeneration();
         defer model.unlockNativeGeneration();
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
@@ -2851,12 +2823,17 @@ pub const Node = struct {
             // architecture was never recognized and the model fell through to the
             // default encoder path. Name it, so the caller can tell "unsupported model"
             // apart from "Antfly is broken".
-            var arch_region: ?c_file.MmapRegion = null;
-            defer if (arch_region) |*region| region.deinit();
-            const arch = modelArchitectureName(&model.manifest, &arch_region);
+            var inspection: model_support.Inspection = model_support.inspectAlloc(ctx.allocator, &model.manifest) catch .{
+                .architecture = try ctx.allocator.dupe(u8, "unknown"),
+            };
+            defer inspection.deinit(ctx.allocator);
             return ctx.status(400).json(.{
-                .@"error" = "UNSUPPORTED_ARCHITECTURE",
-                .message = try unsupportedArchitectureMessage(ctx.allocator, arch),
+                .@"error" = "UNSUPPORTED_MODEL",
+                .message = try std.fmt.allocPrint(
+                    ctx.allocator,
+                    "model architecture \"{s}\" does not provide a generation runtime",
+                    .{inspection.architecture},
+                ),
             });
         };
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
@@ -2926,7 +2903,7 @@ pub const Node = struct {
                 var load_draft_backend = true;
                 if (config.speculation_policy == .auto) {
                     var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                        return modelLoadFailureResponse(ctx, err);
                     defer draft_manifest.deinit();
                     const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch |err|
                         return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
@@ -2940,9 +2917,9 @@ pub const Node = struct {
                         var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                         configureGenerateBackendPreference(&request_session_manager, backend_selection);
                         break :blk self.model_manager.loadFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
-                            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                            return modelLoadFailureResponse(ctx, err);
                     } else self.model_manager.loadFromDir(draft_model_path) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                        return modelLoadFailureResponse(ctx, err);
                     const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
                         return ctx.status(400).json(.{
                             .@"error" = "INVALID_MODEL",
@@ -3590,6 +3567,28 @@ pub const Node = struct {
                 if (!std.mem.eql(u8, candidate.compiled_target orelse "", first_body.compiled_target orelse "")) continue;
                 if (!std.mem.eql(u8, candidate.cache_dtype orelse "", first_body.cache_dtype orelse "")) continue;
                 try group_indices.append(ctx.allocator, idx);
+            }
+
+            const support_summary = supportSummaryForDir(ctx.allocator, model_path) catch SupportSummary{
+                .level = .experimental,
+                .reason = "model compatibility could not be determined",
+            };
+            const support_blocked = support_summary.level == .unsupported or
+                (support_summary.level == .experimental and !self.config.allow_experimental_models);
+            if (support_blocked) {
+                const code = if (support_summary.level == .unsupported)
+                    "UNSUPPORTED_MODEL"
+                else
+                    "EXPERIMENTAL_MODEL_DISABLED";
+                for (group_indices.items) |idx| {
+                    results[idx].@"error" = .{
+                        .code = code,
+                        .message = support_summary.reason,
+                        .retryable = false,
+                    };
+                    pending[idx] = false;
+                }
+                continue;
             }
 
             const model = if (selection.native_choice != .auto) blk: {
@@ -4490,7 +4489,7 @@ pub const Node = struct {
         }
 
         const model = self.model_manager.loadFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return modelLoadFailureResponse(ctx, err);
 
         // Use GLiNER pipeline for GLiNER models, standard NER for BIO models
         if (model.isGlinerModel()) {
@@ -4549,18 +4548,18 @@ pub const Node = struct {
         defer hf_tok.deinitSelf();
 
         var config = rebel_mod.loadConfig(ctx.allocator, model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return modelLoadFailureResponse(ctx, err);
 
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         if (dec_config.max_length > 0) config.max_length = dec_config.max_length;
 
         const sessions = blk: {
             var encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return modelLoadFailureResponse(ctx, err);
             errdefer encoder_session.close();
 
             const decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return modelLoadFailureResponse(ctx, err);
 
             break :blk .{
                 .encoder = encoder_session,
@@ -4767,7 +4766,7 @@ pub const Node = struct {
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         if (self.resolveModelPath(ctx.io, model_name, "classifiers")) |model_path| {
             const model = self.model_manager.loadFromDir(model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return modelLoadFailureResponse(ctx, err);
 
             // Detect entailment index from id2label (varies by NLI model)
             const entailment_idx: ?usize = if (model.manifest.id2label) |labels| blk: {
@@ -4802,7 +4801,7 @@ pub const Node = struct {
 
         if (self.resolveModelPath(ctx.io, model_name, "recognizers")) |model_path| {
             const model = self.model_manager.loadFromDir(model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return modelLoadFailureResponse(ctx, err);
             if (!model.isGlinerModel() or !model.supportsClassification()) {
                 return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
             }
@@ -4854,7 +4853,7 @@ pub const Node = struct {
         defer ctx.allocator.free(checkpoint_path);
 
         var head = document_classification.Head.load(ctx.allocator, checkpoint_path, prefix) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return modelLoadFailureResponse(ctx, err);
         defer head.deinit();
 
         const num_tokens: usize = std.math.cast(usize, body.num_tokens) orelse
@@ -4955,7 +4954,7 @@ pub const Node = struct {
         defer ctx.allocator.free(checkpoint_path);
 
         var head = document_token_classification.Head.load(ctx.allocator, checkpoint_path, prefix) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return modelLoadFailureResponse(ctx, err);
         defer head.deinit();
 
         const tokens = try ctx.allocator.alloc(document_token_classification.TokenBox, body.tokens.len);
@@ -5087,7 +5086,7 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, model_name, "rewriters") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
-        if (try rejectUnsupportedModelClass(ctx, ctx.allocator, model_path)) |response| return response;
+        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
 
         // Check if this is an encoder-decoder model and find ONNX file paths
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
@@ -5112,11 +5111,11 @@ pub const Node = struct {
         defer if (close_decoder) decoder_session.close();
 
         encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return modelLoadFailureResponse(ctx, err);
         close_encoder = true;
 
         decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return modelLoadFailureResponse(ctx, err);
         close_decoder = true;
 
         // Parse decoder config
@@ -5218,7 +5217,7 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, model_name, "readers") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
-        if (try rejectUnsupportedModelClass(ctx, ctx.allocator, model_path)) |response| return response;
+        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
 
         var reader = readers_mod.LoadedReader.loadFromDir(
             ctx.allocator,
@@ -5401,11 +5400,11 @@ pub const Node = struct {
             defer ctx.allocator.free(paths.decoder);
 
             encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return modelLoadFailureResponse(ctx, err);
             close_encoder = true;
 
             decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return modelLoadFailureResponse(ctx, err);
             close_decoder = true;
 
             const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
@@ -5423,7 +5422,7 @@ pub const Node = struct {
             }
         } else |_| {
             const model = self.model_manager.loadFromDir(model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return modelLoadFailureResponse(ctx, err);
             if (session_factory.getWhisperConfig(model.session) == null) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_MODEL",
@@ -5729,6 +5728,10 @@ pub const Node = struct {
                 man.deinit();
                 continue;
             }
+            const support_summary = supportSummaryForManifest(a, &man) catch SupportSummary{
+                .level = .experimental,
+                .reason = "model compatibility could not be determined",
+            };
             listings.appendAssumeCapacity(.{
                 .entry = entry,
                 .manifest = man,
@@ -5738,7 +5741,8 @@ pub const Node = struct {
                 // when its own model_manifest.json says otherwise.
                 .kind = @tagName(man.model_type),
                 .readers_supported = readers_mod.isSupportedManifest(a, entry.path, man),
-                .support_level = listingSupportLevel(a, man),
+                .support_level = @tagName(support_summary.level),
+                .support_reason = support_summary.reason,
             });
         }
 
@@ -5770,56 +5774,92 @@ pub const Node = struct {
                 try body.append(a, ':');
                 // Discovery does not parse chat templates (that is what made this handler
                 // slow), so only models already loaded can report a template failure.
-                const chat_template_failed = if (self.model_manager.loaded.get(listing.entry.path)) |loaded|
+                const chat_template_failed = if (self.model_manager.getLoadedModel(listing.entry.path)) |loaded|
                     loaded.chat_template_failed
                 else
                     false;
-                try appendModelInfo(&body, a, listing.kind, man.gliner_model_type, man.capabilities, man.inputs, has_visual, has_audio, chat_template_failed, listing.support_level);
+                try appendModelInfo(&body, a, listing.kind, man.gliner_model_type, man.capabilities, man.inputs, has_visual, has_audio, chat_template_failed, listing.support_level, listing.support_reason);
                 if (isOpenAiListTask(task)) {
-                    if (openai_data_count > 0) try openai_data.append(a, ',');
-                    try appendOpenAiModelEntry(&openai_data, a, listing.entry.name, list_created);
-                    openai_data_count += 1;
+                    const enabled = listing.support_level.len > 0 and
+                        (!std.mem.eql(u8, listing.support_level, "experimental") or self.config.allow_experimental_models) and
+                        !std.mem.eql(u8, listing.support_level, "unsupported");
+                    if (enabled) {
+                        if (openai_data_count > 0) try openai_data.append(a, ',');
+                        try appendOpenAiModelEntry(&openai_data, a, listing.entry.name, list_created, listing.support_level, listing.support_reason);
+                        openai_data_count += 1;
+                    }
                 }
                 model_count += 1;
             }
 
             // Add loaded models not yet listed (loaded by path, not discovered by name)
-            var it = self.model_manager.loaded.iterator();
-            while (it.next()) |entry| {
-                const model = entry.value_ptr.*;
-                const model_task = @tagName(model.manifest.model_type);
-                if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
+            {
+                self.model_manager.lockLoadedModels();
+                defer self.model_manager.unlockLoadedModels();
+                var loaded_paths_seen = std.ArrayListUnmanaged([]const u8).empty;
+                defer loaded_paths_seen.deinit(a);
+                var it = self.model_manager.loaded.iterator();
+                while (it.next()) |entry| {
+                    const model = entry.value_ptr.*;
+                    const model_task = @tagName(model.manifest.model_type);
+                    if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
 
-                // Skip if already listed from discovery
-                var already_listed = false;
-                for (discovered) |d| {
-                    if (std.mem.eql(u8, d.path, entry.key_ptr.*)) {
-                        already_listed = true;
-                        break;
+                    // Skip if already listed from discovery
+                    var already_listed = false;
+                    for (discovered) |d| {
+                        if (std.mem.eql(u8, d.path, model.model_dir)) {
+                            already_listed = true;
+                            break;
+                        }
                     }
-                }
-                if (!already_listed) {
-                    if (model_count > 0) try body.append(a, ',');
-                    try jsonEncodeString(&body, a, entry.key_ptr.*);
-                    try body.append(a, ':');
-                    try appendModelInfo(
-                        &body,
-                        a,
-                        model_task,
-                        model.manifest.gliner_model_type,
-                        model.manifest.capabilities,
-                        model.manifest.inputs,
-                        model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
-                        model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
-                        model.chat_template_failed,
-                        listingSupportLevel(a, model.manifest),
-                    );
-                    if (isOpenAiListTask(task)) {
-                        if (openai_data_count > 0) try openai_data.append(a, ',');
-                        try appendOpenAiModelEntry(&openai_data, a, entry.key_ptr.*, list_created);
-                        openai_data_count += 1;
+                    if (!already_listed) {
+                        for (loaded_paths_seen.items) |path| {
+                            if (std.mem.eql(u8, path, model.model_dir)) {
+                                already_listed = true;
+                                break;
+                            }
+                        }
                     }
-                    model_count += 1;
+                    if (!already_listed) {
+                        try loaded_paths_seen.append(a, model.model_dir);
+                        if (model_count > 0) try body.append(a, ',');
+                        try jsonEncodeString(&body, a, model.model_dir);
+                        try body.append(a, ':');
+                        const loaded_support = supportSummaryForManifest(a, &model.manifest) catch SupportSummary{
+                            .level = .experimental,
+                            .reason = "model compatibility could not be determined",
+                        };
+                        try appendModelInfo(
+                            &body,
+                            a,
+                            model_task,
+                            model.manifest.gliner_model_type,
+                            model.manifest.capabilities,
+                            model.manifest.inputs,
+                            model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
+                            model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+                            model.chat_template_failed,
+                            @tagName(loaded_support.level),
+                            loaded_support.reason,
+                        );
+                        if (isOpenAiListTask(task)) {
+                            const enabled = loaded_support.level == .supported or
+                                (loaded_support.level == .experimental and self.config.allow_experimental_models);
+                            if (enabled) {
+                                if (openai_data_count > 0) try openai_data.append(a, ',');
+                                try appendOpenAiModelEntry(
+                                    &openai_data,
+                                    a,
+                                    model.model_dir,
+                                    list_created,
+                                    @tagName(loaded_support.level),
+                                    loaded_support.reason,
+                                );
+                                openai_data_count += 1;
+                            }
+                        }
+                        model_count += 1;
+                    }
                 }
             }
 
@@ -5968,6 +6008,8 @@ pub const Node = struct {
         try @constCast(&node.metrics).render(&writer.writer);
 
         // Scheduler metrics (computed on-the-fly from loaded models)
+        node.model_manager.lockLoadedModels();
+        defer node.model_manager.unlockLoadedModels();
         const aggregate = runtime.scheduler.native_generate.aggregateStats(node.model_manager.loaded);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_waiting_requests", "gauge", "Waiting native scheduler requests across loaded models", aggregate.snapshot.waiting_requests);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_prefill_requests", "gauge", "Prefill-phase native scheduler requests across loaded models", aggregate.snapshot.prefill_requests);
@@ -6823,9 +6865,9 @@ fn appendModelInfo(
     /// Set when the model shipped a chat template we could not parse. Without this the
     /// degradation to raw prompting is invisible to API clients.
     chat_template_failed: bool,
-    /// Decoder support level, so clients can tell a verified generator from one that
-    /// merely loads. Empty for non-decoders.
+    /// Release serving policy and its concise explanation.
     support_level: []const u8,
+    support_reason: []const u8,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
     const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
@@ -6845,6 +6887,8 @@ fn appendModelInfo(
             if (chat_template_failed) try buf.append(allocator, ',');
             try buf.appendSlice(allocator, "\"support\":");
             try jsonEncodeString(buf, allocator, support_level);
+            try buf.appendSlice(allocator, ",\"support_reason\":");
+            try jsonEncodeString(buf, allocator, support_reason);
         }
         try buf.append(allocator, '}');
         return;
@@ -6885,6 +6929,8 @@ fn appendModelInfo(
     if (support_level.len > 0) {
         try buf.appendSlice(allocator, ",\"support\":");
         try jsonEncodeString(buf, allocator, support_level);
+        try buf.appendSlice(allocator, ",\"support_reason\":");
+        try jsonEncodeString(buf, allocator, support_reason);
     }
     try buf.append(allocator, '}');
 }

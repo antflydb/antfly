@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const manifest_mod = @import("manifest.zig");
+const support_mod = @import("support.zig");
 
 pub fn hasCapability(capabilities: []const []const u8, capability: []const u8) bool {
     for (capabilities) |cap| {
@@ -101,12 +102,12 @@ test "modelKindAcceptsInput infers text and image modalities" {
     try std.testing.expect(!modelKindAcceptsInput("recognizer", "", &.{"image"}, false, false, "text"));
 }
 
-/// How far a non-decoder model class has been taken, mirroring `gpt.SupportLevel`.
+/// Release serving level for a non-decoder model class.
 ///
 /// Decoder families are tiered by `ModelFamily` in models/gpt.zig. Everything else --
 /// embedders, rerankers, readers, rewriters -- is identified by architecture instead, so
 /// it needs its own lookup over what the listing manifest already carries.
-pub const SupportLevel = enum { supported, experimental, unsupported };
+pub const SupportLevel = support_mod.Level;
 
 /// Tier for a model class other than generation.
 ///
@@ -122,34 +123,7 @@ pub const SupportLevel = enum { supported, experimental, unsupported };
 ///   ONNX seq2seq     the rewrite path panics on a rank assertion while importing the
 ///                    graph (lib/ml/src/graph/shape.zig `axis < self.rank_`).
 pub fn modelClassSupportLevel(man: *const manifest_mod.ModelManifest) SupportLevel {
-    // ClipClap is the supported multimodal bundle and shares the clip/clap arch hints,
-    // so it has to be recognized before those are rejected.
-    if (man.isClipclapGgufBundle()) return .supported;
-
-    switch (man.model_type) {
-        // No rewriter model loads: the ONNX encoder/decoder import panics.
-        .rewriter => return .unsupported,
-        .reader => {
-            // Florence-2 is the verified reader. Other encoder/decoder readers OOM.
-            if (man.native_arch_hint == .florence) return .supported;
-            return .unsupported;
-        },
-        .embedder => {
-            switch (man.native_arch_hint) {
-                .clip, .clap => return .unsupported,
-                else => {},
-            }
-            return .supported;
-        },
-        .classifier => {
-            // layoutlmv3 ships vocab.json + merges.txt with no tokenizer.json, which the
-            // manifest accepts as a HuggingFace tokenizer but the loader rejects.
-            if (man.native_arch_hint == .layoutlmv3) return .unsupported;
-            return .supported;
-        },
-        .reranker, .chunker, .recognizer, .transcriber => return .supported,
-        .generator => return .supported,
-    }
+    return support_mod.assess(man, man.config_model_arch).level;
 }
 
 test "clipclap stays supported while standalone clip and clap do not" {
@@ -166,7 +140,7 @@ test "clipclap stays supported while standalone clip and clap do not" {
 
     var plain = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     plain.model_type = .embedder;
-    try std.testing.expectEqual(SupportLevel.supported, modelClassSupportLevel(&plain));
+    try std.testing.expectEqual(SupportLevel.experimental, modelClassSupportLevel(&plain));
 }
 
 test "florence reads but other encoder-decoder readers are blocked" {

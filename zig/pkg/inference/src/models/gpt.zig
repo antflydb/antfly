@@ -1573,70 +1573,6 @@ pub fn isGenerativeModel(model_type: []const u8) bool {
     return detectFamily(model_type) != .other;
 }
 
-/// How far a decoder family has actually been taken.
-///
-/// Recognizing an architecture is not enough to run it. `detectFamily` names seventeen
-/// families, but only some have a GGUF tensor-name mapping, and fewer still have been run
-/// against a real artifact. Collapsing that into one boolean meant families with no
-/// implementation at all still classified as generators and failed late with a confusing
-/// "missing tensors" error.
-pub const SupportLevel = enum {
-    /// Verified end to end against a real model.
-    supported,
-    /// Works, but is early: it produces correct results and is simply less proven, or
-    /// covers a narrower set of artifacts than we want to promise.
-    ///
-    /// This tier is deliberately empty right now, and it must not be used as a soft
-    /// landing for anything broken. A family that loads and emits garbage is worse for a
-    /// user than one that refuses, because the failure is silent -- that belongs in
-    /// `unsupported`.
-    experimental,
-    /// Cannot be relied on: no mapping, no runtime, or a runtime that does not produce
-    /// usable output. Rejected before any load is attempted.
-    unsupported,
-};
-
-/// The single source of truth for decoder support. `normalizeGgufGptWeightKey` gates on
-/// it, the generation path rejects `unsupported` before loading, and the architecture
-/// lists below (used in error messages and the docs) are derived from it.
-pub fn supportLevel(family: ModelFamily) SupportLevel {
-    return switch (family) {
-        // Verified against real GGUF artifacts.
-        .llama, .qwen3, .gemma => .supported,
-
-
-        // Recognized, but nothing behind them.
-        //
-        // Every family below was measured against a real artifact and does not produce
-        // usable output, so none of them qualify as experimental:
-        //
-        //   qwen2    renders a correct ChatML prompt with correct special-token ids and
-        //            terminates cleanly, then answers a different question than the one
-        //            asked (Qwen2.5-0.5B-Instruct, greedy: "capital of France" -> "the
-        //            capital of the People's Republic of China is Beijing"), and emits
-        //            token soup over /ai/v1/chat/completions. Qwen3 answers "Paris" on
-        //            the same engine.
-        //   bitnet   loads and generates, then degenerates into repetition.
-        //   mistral  loads with zero missing tensors and emits only <unk>. Not a
-        //            tokenizer fault: the prompt encodes correctly (Mistral chat template
-        //            -> 28792/16289/28793 for [INST]), and the model then argmaxes to
-        //            token id 0 on every step, on both the native and Metal backends.
-        //            The forward pass is degenerate, somewhere shared by both.
-        //   phi      has a working mapping for the separate-projection layout, but Phi-3
-        //            GGUFs fuse attn_qkv and ffn_up and report 257 missing tensors.
-        //
-        // deepseek_v4 now loads a real GGUF and resolves all of its tensors, but
-        // execution dies on a shape mismatch in the grouped output projection --
-        // std.debug.assert, so it panics rather than returning an error, which would
-        // take the server process down with it. Blocked until that path works.
-        //
-        // qwen3_5 has a linear-attention runtime whose GGUF ssm_*/attn_qkv/attn_gate
-        // tensors have no mapping. falcon/opt/bloom exist only as enum entries with
-        // family defaults -- no weight mapping, no required-weight list, no runtime.
-        .qwen2, .bitnet, .mistral, .phi, .deepseek_v4, .qwen3_5, .gpt2, .gpt_neo, .gpt_neox, .gptj, .falcon, .opt, .bloom, .other => .unsupported,
-    };
-}
-
 /// Whether GGUF tensor names can be mapped onto the HF-style names the runtime expects.
 ///
 /// This is a mechanical fact about the code, deliberately independent of `supportLevel`.
@@ -1650,14 +1586,6 @@ pub fn ggufWeightMappingSupported(family: ModelFamily) bool {
         .qwen3_5, .gpt2, .gpt_neo, .gpt_neox, .gptj, .falcon, .opt, .bloom, .other => false,
     };
 }
-
-/// Architectures usable for generation, for error messages and docs.
-pub const gguf_supported_architectures =
-    "llama, qwen3, gemma, gemma2, gemma3, gemma4";
-
-/// Architectures that work but are early. Empty for 0.2.0: every family that fell short
-/// of `supported` did so by producing unusable output, which is `unsupported`.
-pub const gguf_experimental_architectures = "";
 
 fn parseDeepseekV4ScoringFunc(value: []const u8) DeepseekV4ScoringFunc {
     if (std.mem.eql(u8, value, "sqrtsoftplus")) return .sqrtsoftplus;

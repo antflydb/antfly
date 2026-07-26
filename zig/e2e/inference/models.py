@@ -222,7 +222,6 @@ GENERATOR_MODELS = [
         name="Qwen3-1.7B-GGUF",
         repo="unsloth/Qwen3-1.7B-GGUF",
         task="generators",
-        large=True,
     ),
     ModelSpec(
         name="Llama-3.2-1B-Instruct-GGUF",
@@ -230,32 +229,10 @@ GENERATOR_MODELS = [
         task="generators",
         large=True,
     ),
-    # Experimental tier. Pulled so the tier stays evidence-based: qwen2 answers
-    # unreliably and bitnet degenerates, and a regression either way should be visible.
-    ModelSpec(
-        name="Qwen2.5-0.5B-Instruct-GGUF",
-        repo="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-        task="generators",
-    ),
-    ModelSpec(
-        name="bitnet-b1.58-2B-4T-gguf",
-        repo="microsoft/bitnet-b1.58-2B-4T-gguf",
-        task="generators",
-        large=True,
-    ),
-    # Weights load with no missing tensors, but the GGUF-embedded SentencePiece
-    # tokenizer yields only <unk>, so generation is unusable. Kept so that path has
-    # an artifact behind it.
-    ModelSpec(
-        name="Mistral-7B-Instruct-v0.2-GGUF",
-        repo="TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
-        task="generators",
-        large=True,
-    ),
 ]
 
 
-DEFAULT_GENERATOR_MODEL = "openai-community/gpt2"
+DEFAULT_GENERATOR_MODEL = "unsloth/Qwen3-1.7B-GGUF"
 DEFAULT_TOOL_GENERATOR_MODEL = "ggml-org/gemma-4-e2b-it-gguf"
 DEFAULT_MULTIMODAL_GENERATOR_MODEL = "ggml-org/gemma-4-e2b-it-gguf"
 

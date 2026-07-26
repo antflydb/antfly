@@ -15,24 +15,25 @@ tags: [inference, models, embedding, reranking, generation, gguf]
 - Which models should I start with?
 </Questions>
 
-Antfly is a database first and an inference engine second. It certifies the models needed
-to turn unstructured data into searchable, ranked, structured knowledge, and interoperates
-with general-purpose generators rather than trying to run all of them.
+Antfly is a database first and an inference engine second. It enables the model runtime
+paths needed to turn unstructured data into searchable, ranked, structured knowledge,
+without claiming compatibility with every artifact published under a model-family name.
 
-Every model reports its tier in `/ai/v1/models` as a `support` field. The tables below and
-that field come from the same source in the code, so they cannot drift apart.
+Every discovered model reports its runtime tier and explanation in `/ai/v1/models` as
+`support` and `support_reason`. Those runtime fields are authoritative; the tables below
+are release guidance and may not enumerate newly published architectures.
 
 ## Tiers
 
 | Tier | Meaning | Behaviour |
 |---|---|---|
-| **Supported** | Verified end to end against a real model, with the result checked for correctness rather than just a 200. | Runs. |
-| **Experimental** | Works, but early: correct output, less proven. | Runs, with a warning. |
-| **Unsupported** | Cannot be relied on — no mapping, no runtime, or a runtime that does not produce usable output. | Rejected with HTTP 400 before any load. |
+| **Supported** | Antfly enables the architecture and runtime path by default in this release. This is not a certification of every quant, conversion, or set of model files. | Runs by default. |
+| **Experimental** | The architecture is unknown to this Antfly release. It may work, but has no release support decision yet. | Rejected by default; opt in with `--allow-experimental-models`. |
+| **Unsupported** | A known missing, unsafe, or unusable path. | Rejected before load, even when experimental models are enabled. |
 
-**Nothing is `experimental` in 0.2.0.** Every model that fell short of supported did so by
-failing outright, and a model that loads and emits garbage is worse than one that refuses,
-because the failure is silent.
+This fail-closed split lets new architectures be tried deliberately without allowing an
+unknown model to surprise a production server. The opt-in does not override known safety
+blocks.
 
 ## Start here
 
@@ -57,9 +58,11 @@ antfly inference pull hf:antflydb/clipclap:gguf:Q4_K --tasks embed
 antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF --tasks generate
 ```
 
-## Supported, with evidence
+## Tested examples
 
-Each was checked for a correct result, not merely a successful response.
+These particular artifacts were checked for a meaningful result rather than merely a
+successful response. That evidence explains the recommendations above; it is not the
+definition of the `supported` tier.
 
 | Capability | Model | Verified by |
 |---|---|---|
@@ -108,6 +111,8 @@ otherwise crash the server, so blocking them protects every other caller.
 | Mistral / Mixtral | Loads with zero missing tensors, then argmaxes to token 0 on every step on both backends. The prompt tokenizes correctly, so the fault is in the forward pass. |
 | Phi | The mapping works for the separate-projection layout, but Phi-3 GGUFs fuse `attn_qkv` and `ffn_up` and report 257 missing tensors. |
 | BitNet | Loads and generates, then degenerates into repetition. |
+| Gemma 4 12B unified exports | The unified layout has unresolved required weights. Gemma 4 E4B uses a different dense layout and remains supported. |
+| Gemma 4 26B-A4B MoE exports | The GGUF declares experts, but the 0.2.0 Gemma 4 MoE runtime is not enabled. |
 | DeepSeek V4 (`deepseek4`) | Loads and resolves all 1328 tensors, then panics on a shape mismatch in the grouped output projection. llama.cpp runs the same file, so this is ours to fix. |
 | `qwen35`, `qwen3next`, `qwen35moe` | Hybrid linear attention; the GGUF `ssm_*` tensors have no mapping. |
 | `falcon`, `opt`, `bloom` | Recognised by name only — no tensor mapping and no runtime. |
@@ -117,9 +122,16 @@ A rejected generation request looks like:
 
 ```json
 {
-  "error": "UNSUPPORTED_ARCHITECTURE",
-  "message": "model architecture \"qwen3_next\" is not supported for generation; supported: llama, qwen3, gemma, gemma2, gemma3, gemma4"
+  "error": "UNSUPPORTED_MODEL",
+  "message": "the current decoder path is known to be missing, unsafe, or to produce unusable output"
 }
+```
+
+An unrecognised architecture instead returns `EXPERIMENTAL_MODEL_DISABLED`. To try it
+deliberately:
+
+```bash
+antfly inference run --allow-experimental-models
 ```
 
 ## Licensing
@@ -140,8 +152,11 @@ report `"chat_template": false` in `/ai/v1/models`.
 cleanly through `antfly inference generate`, but can fail to stop through
 `/ai/v1/chat/completions`. Prefer `gemma-3-4b` or larger for chat.
 
-**Gemma 4 on Metal.** Some Gemma 4 bundles crash the Metal paged-KV kernel. Pass
-`--backend native` to avoid it, at a cost in speed.
+**Gemma 4 artifacts and quants differ.** The recommended
+`ggml-org/gemma-4-E4B-it-GGUF` Q4_K_M artifact runs on native and Metal. A tested
+third-party Q4_1 conversion completed with empty decoded output on both rc.23 and current
+main, so the family-level support label must not be read as a guarantee for every
+conversion. Keep one quant per directory and prefer the recommended artifact.
 
 **Mixed-variant model directories.** Pulling a second variant into a directory that already
 holds another leaves both in place, and different parts of a model can then resolve to
