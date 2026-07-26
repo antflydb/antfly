@@ -1,6 +1,6 @@
 ---
-title: Supported models
-description: Which models Antfly inference runs locally, and how far each has been verified
+title: Local model compatibility
+description: How Antfly checks local model compatibility, resource fit, and tested artifacts
 prerequisites:
   - Antfly installed and running
 difficulty: beginner
@@ -9,31 +9,40 @@ tags: [inference, models, embedding, reranking, generation, gguf]
 ---
 
 <Questions>
-- Which models does Antfly actually support?
+- How does Antfly decide whether a local artifact can load?
 - Why was my model rejected?
-- What does the `support` field in /ai/v1/models mean?
-- Which models should I start with?
+- What does the `compatibility` field in `/ai/v1/models` mean?
+- Which thoroughly tested models should I start with?
 </Questions>
 
 Antfly is a database first and an inference engine second. It enables the model runtime
 paths needed to turn unstructured data into searchable, ranked, structured knowledge,
 without claiming compatibility with every artifact published under a model-family name.
 
-Every discovered model reports its runtime tier and explanation in `/ai/v1/models` as
-`support` and `support_reason`. Those runtime fields are authoritative; the tables below
-are release guidance and may not enumerate newly published architectures.
+Every discovered model reports `compatibility` in `/ai/v1/models`. Compatibility is a
+property of the actual artifact and this Antfly build, not a certification label attached
+to a repository name. Antfly checks the bundle contract, architecture runtime, required
+sidecars, GGUF tensor names and encodings, available backends, and resource admission before
+loading weights.
 
-## Tiers
+## Compatibility states
 
-| Tier | Meaning | Behaviour |
+| State | Meaning | Behaviour |
 |---|---|---|
-| **Supported** | Antfly enables the architecture and runtime path by default in this release. This is not a certification of every quant, conversion, or set of model files. | Runs by default. |
-| **Experimental** | The architecture is unknown to this Antfly release. It may work, but has no release support decision yet. | Rejected by default; opt in with `--allow-experimental-models`. |
-| **Unsupported** | A known missing, unsafe, or unusable path. | Rejected before load, even when experimental models are enabled. |
+| **`compatible`** | Static checks found a viable runtime path for this artifact and build. | May load, subject to resource admission. |
+| **`unknown`** | Antfly cannot prove compatibility or incompatibility without trying an unrecognized contract. | Rejected by default; opt in with `--allow-unknown-models`. |
+| **`incompatible`** | A required artifact/backend is missing, a tensor contract cannot be materialized, or the path is known unsafe or unusable. | Always rejected before load; the unknown-model opt-in cannot override it. |
 
-This fail-closed split lets new architectures be tried deliberately without allowing an
-unknown model to surprise a production server. The opt-in does not override known safety
-blocks.
+Resource fit is separate from compatibility. Model weights are admitted against stable host
+and accelerator limits before load; KV-cache and scratch estimates join the same shared
+reservation ledger for each request. A request that can never fit returns
+`MODEL_RESOURCE_LIMIT`; temporary contention returns `MODEL_RESOURCE_BUSY`. A one-shot live
+memory-pressure check protects the process without making the published compatibility state
+flap with momentary system load.
+
+Automatic backend selection may fall back to another compatible backend (for example, from
+Metal to native when a quant is not implemented on Metal). An explicitly requested backend
+is strict and never silently falls back.
 
 ## Start here
 
@@ -58,11 +67,12 @@ antfly inference pull hf:antflydb/clipclap:gguf:Q4_K --tasks embed
 antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF --tasks generate
 ```
 
-## Tested examples
+## Thoroughly tested artifacts (documentation certification)
 
 These particular artifacts were checked for a meaningful result rather than merely a
-successful response. That evidence explains the recommendations above; it is not the
-definition of the `supported` tier.
+successful response. This is the certification matrix for operators, maintained in the
+documentation rather than baked into runtime policy. A certified artifact must still pass
+the same compatibility and resource-fit checks as every other artifact.
 
 | Capability | Model | Verified by |
 |---|---|---|
@@ -93,7 +103,7 @@ definition of the `supported` tier.
 Text only. Multimodal projector sidecars (`mmproj-*.gguf`) are not used by the generation
 path; a bundle containing one still runs as a text model.
 
-## Unsupported
+## Known incompatible artifacts and families
 
 Rejected with HTTP 400 before any load. Some of these do not merely fail — they would
 otherwise crash the server, so blocking them protects every other caller.
@@ -104,6 +114,7 @@ otherwise crash the server, so blocking them protects every other caller.
 | Standalone CLAP (`Xenova/clap-htsat-unfused`) | `ShapeMismatch` converting the audio encoder. Use `antflydb/clipclap`. |
 | TrOCR-style readers (`Xenova/trocr-base-printed`) | ONNX encoder/decoder readers exhaust memory the same way as CLIP. Use `antflydb/Florence-2-base`. |
 | Seq2seq rewriters (`/rewrite`) | Importing an ONNX encoder/decoder graph panics on a rank assertion. No rewriter model currently works. |
+| `Babelscape/rebel-large` | Uses the same unsafe BART encoder-decoder graph-import path. Its relation parser has unit coverage, but the real model is not release-safe. It is also CC-BY-NC-SA. |
 | `microsoft/layoutlmv3-base` | Ships the legacy `vocab.json` + `merges.txt` pair with no `tokenizer.json`; the manifest accepts it but the loader rejects it. |
 | `monkt/paddleocr-onnx` | No backend accepts the model. |
 | `nomic-ai/nomic-embed-text-v1.5-GGUF` | `NoTokenizerFound`. |
@@ -111,35 +122,37 @@ otherwise crash the server, so blocking them protects every other caller.
 | Mistral / Mixtral | Loads with zero missing tensors, then argmaxes to token 0 on every step on both backends. The prompt tokenizes correctly, so the fault is in the forward pass. |
 | Phi | The mapping works for the separate-projection layout, but Phi-3 GGUFs fuse `attn_qkv` and `ffn_up` and report 257 missing tensors. |
 | BitNet | Loads and generates, then degenerates into repetition. |
-| Gemma 4 12B unified exports | The unified layout has unresolved required weights. Gemma 4 E4B uses a different dense layout and remains supported. |
+| Gemma 4 12B unified exports | The unified layout has unresolved required weights. Gemma 4 E4B uses a different dense layout and remains compatible. |
 | Gemma 4 26B-A4B MoE exports | The GGUF declares experts, but the 0.2.0 Gemma 4 MoE runtime is not enabled. |
 | DeepSeek V4 (`deepseek4`) | Loads and resolves all 1328 tensors, then panics on a shape mismatch in the grouped output projection. llama.cpp runs the same file, so this is ours to fix. |
 | `qwen35`, `qwen3next`, `qwen35moe` | Hybrid linear attention; the GGUF `ssm_*` tensors have no mapping. |
 | `falcon`, `opt`, `bloom` | Recognised by name only — no tensor mapping and no runtime. |
 | `gpt2`, `gpt_neo`, `gpt_neox`, `gptj`, `t5` | No verified generation path. T5 has an encoder-decoder implementation but no generation path. |
 
-A rejected generation request looks like:
+A known-incompatible generation request returns HTTP 400:
 
 ```json
 {
-  "error": "UNSUPPORTED_MODEL",
+  "error": "INCOMPATIBLE_MODEL",
   "message": "the current decoder path is known to be missing, unsafe, or to produce unusable output"
 }
 ```
 
-An unrecognised architecture instead returns `EXPERIMENTAL_MODEL_DISABLED`. To try it
-deliberately:
+An artifact whose compatibility cannot be determined instead returns
+`UNKNOWN_MODEL_COMPATIBILITY`. To try it deliberately:
 
 ```bash
-antfly inference run --allow-experimental-models
+antfly inference run --allow-unknown-models
 ```
+
+The flag does not bypass `INCOMPATIBLE_MODEL` or resource limits.
 
 ## Licensing
 
-`Babelscape/rebel-large` is **CC-BY-NC-SA — non-commercial only**, and about 3 GB. It
-appears in our test suite for relation extraction, but it is not part of any default bundle
-and must not be deployed commercially. `antflydb/gliner2-base-v1` is the recommended
-extraction model.
+`Babelscape/rebel-large` is **CC-BY-NC-SA — non-commercial only**, and about 3 GB. Its
+relation-output parser has unit coverage, but the actual BART inference path is incompatible
+with 0.2.0. It is not part of any default bundle and must not be deployed commercially.
+`antflydb/gliner2-base-v1` is the recommended extraction model.
 
 ## Known caveats
 
@@ -153,10 +166,11 @@ cleanly through `antfly inference generate`, but can fail to stop through
 `/ai/v1/chat/completions`. Prefer `gemma-3-4b` or larger for chat.
 
 **Gemma 4 artifacts and quants differ.** The recommended
-`ggml-org/gemma-4-E4B-it-GGUF` Q4_K_M artifact runs on native and Metal. A tested
-third-party Q4_1 conversion completed with empty decoded output on both rc.23 and current
-main, so the family-level support label must not be read as a guarantee for every
-conversion. Keep one quant per directory and prefer the recommended artifact.
+`ggml-org/gemma-4-E4B-it-GGUF` Q4_K_M artifact runs on native and Metal. Google QAT Q4_0
+and tested third-party Q4_1/Q4_K_M variants also produce a clean final channel after the
+GGUF-over-sidecar structural fix. A tested `UD-Q4_K_XL` contains `IQ4_XS`; Metal rejects
+that quant before generation and automatic selection falls back to native. Keep one quant
+per directory and prefer the recommended artifact.
 
 **Mixed-variant model directories.** Pulling a second variant into a directory that already
 holds another leaves both in place, and different parts of a model can then resolve to

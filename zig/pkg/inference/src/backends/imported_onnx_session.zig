@@ -710,6 +710,41 @@ pub fn createSession(allocator: std.mem.Allocator, onnx_path: []const u8, reques
     return createSessionWithOptions(allocator, onnx_path, requested_backend, .{});
 }
 
+/// Parse and normalize an ONNX graph without constructing backend buffers.
+///
+/// Discovery uses this as a cached compatibility preflight when no external ONNX
+/// Runtime backend is compiled in. It stops before optimization and backend allocation:
+/// malformed external-data references, unsupported operators, and invalid graph topology
+/// fail early without constant-folding a potentially large model during listing.
+pub fn inspectGraphCompatibility(allocator: std.mem.Allocator, onnx_path: []const u8) !void {
+    var mapped = try c_file.MmapRegion.init(allocator, onnx_path);
+    defer mapped.deinit();
+    if (mapped.data.len > max_onnx_model_bytes) return error.FileTooLarge;
+    mapped.adviseSequentialPrefix(@min(mapped.data.len, 16 * 1024 * 1024));
+
+    const model_dir = std.fs.path.dirname(onnx_path) orelse ".";
+    var model = try onnx_graph.parseLazyAsModelWithBaseDir(allocator, mapped.data, model_dir);
+    defer model.deinit();
+
+    var clipclap_dim_overrides: onnx_graph.DimOverrides = .empty;
+    defer clipclap_dim_overrides.deinit(allocator);
+    var use_clipclap_dim_overrides = false;
+    if (shouldSpecializeClipclapAudioInputTime(onnx_path)) {
+        try clipclap_dim_overrides.put(allocator, "time", clipclap_audio_input_frames);
+        use_clipclap_dim_overrides = true;
+    }
+    if (shouldSpecializeClipclapTextInputShape(onnx_path)) {
+        try clipclap_dim_overrides.put(allocator, "batch_size", clipclap_text_batch);
+        try clipclap_dim_overrides.put(allocator, "sequence_length", clipclap_text_sequence_length);
+        use_clipclap_dim_overrides = true;
+    }
+    const dim_overrides: ?*const onnx_graph.DimOverrides = if (use_clipclap_dim_overrides) &clipclap_dim_overrides else null;
+
+    var converted = try model.convertToGraphWithDims(allocator, dim_overrides);
+    defer converted.deinit(allocator);
+    try validateImportedGraph(&converted.graph, "convert");
+}
+
 pub const ImportedOnnxSessionOptions = struct {
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
     shared_backend_ctx: ?*SharedBackendContext = null,

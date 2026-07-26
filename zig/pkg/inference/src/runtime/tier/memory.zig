@@ -345,9 +345,140 @@ pub const RunBudget = struct {
     }
 };
 
+/// Process-wide resource admission. `RunBudget` protects one execution; this
+/// controller accounts for resident models and concurrent executions together.
+pub const AdmissionAmounts = struct {
+    host_weight_bytes: usize = 0,
+    backend_weight_bytes: usize = 0,
+    host_kv_bytes: usize = 0,
+    backend_kv_bytes: usize = 0,
+    host_scratch_bytes: usize = 0,
+    backend_scratch_bytes: usize = 0,
+
+    pub fn hostTotalBytes(self: @This()) usize {
+        return self.host_weight_bytes + self.host_kv_bytes + self.host_scratch_bytes;
+    }
+
+    pub fn backendTotalBytes(self: @This()) usize {
+        return self.backend_weight_bytes + self.backend_kv_bytes + self.backend_scratch_bytes;
+    }
+
+    pub fn kvTotalBytes(self: @This()) usize {
+        return self.host_kv_bytes + self.backend_kv_bytes;
+    }
+
+    pub fn scratchTotalBytes(self: @This()) usize {
+        return self.host_scratch_bytes + self.backend_scratch_bytes;
+    }
+};
+
+pub const AdmissionLease = struct {
+    controller: ?*AdmissionController,
+    amounts: AdmissionAmounts,
+
+    pub fn release(self: *AdmissionLease) void {
+        const controller = self.controller orelse return;
+        controller.release(self.amounts);
+        self.controller = null;
+        self.amounts = .{};
+    }
+};
+
+pub const AdmissionController = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    admitted: AdmissionAmounts = .{},
+
+    pub fn tryAcquire(
+        self: *AdmissionController,
+        limits: Limits,
+        amounts: AdmissionAmounts,
+        check_live_memory: bool,
+    ) !AdmissionLease {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+
+        const next = addAdmissionAmounts(self.admitted, amounts) orelse
+            return error.ResourceLimitExceeded;
+        const request_host = amounts.hostTotalBytes();
+        const request_backend = amounts.backendTotalBytes();
+        const request_combined = std.math.add(usize, request_host, request_backend) catch
+            return error.ResourceLimitExceeded;
+        const request_kv = amounts.kvTotalBytes();
+        const request_scratch = amounts.scratchTotalBytes();
+        const next_host = next.hostTotalBytes();
+        const next_backend = next.backendTotalBytes();
+        const next_combined = std.math.add(usize, next_host, next_backend) catch
+            return error.ResourceLimitExceeded;
+        const next_kv = next.kvTotalBytes();
+        const next_scratch = next.scratchTotalBytes();
+
+        try checkAdmissionLimit(request_host, next_host, limits.host_limit_bytes);
+        try checkAdmissionLimit(request_backend, next_backend, limits.backend_limit_bytes);
+        try checkAdmissionLimit(request_combined, next_combined, limits.combined_limit_bytes);
+        try checkAdmissionLimit(request_kv, next_kv, limits.kv_limit_bytes);
+        try checkAdmissionLimit(request_scratch, next_scratch, limits.scratch_limit_bytes);
+
+        if (check_live_memory) try checkLiveHostMemory(request_combined);
+        self.admitted = next;
+        return .{ .controller = self, .amounts = amounts };
+    }
+
+    pub fn snapshot(self: *AdmissionController) AdmissionAmounts {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        return self.admitted;
+    }
+
+    fn release(self: *AdmissionController, amounts: AdmissionAmounts) void {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        self.admitted.host_weight_bytes -|= amounts.host_weight_bytes;
+        self.admitted.backend_weight_bytes -|= amounts.backend_weight_bytes;
+        self.admitted.host_kv_bytes -|= amounts.host_kv_bytes;
+        self.admitted.backend_kv_bytes -|= amounts.backend_kv_bytes;
+        self.admitted.host_scratch_bytes -|= amounts.host_scratch_bytes;
+        self.admitted.backend_scratch_bytes -|= amounts.backend_scratch_bytes;
+    }
+};
+
+fn spinLockAdmission(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn addAdmissionAmounts(a: AdmissionAmounts, b: AdmissionAmounts) ?AdmissionAmounts {
+    return .{
+        .host_weight_bytes = std.math.add(usize, a.host_weight_bytes, b.host_weight_bytes) catch return null,
+        .backend_weight_bytes = std.math.add(usize, a.backend_weight_bytes, b.backend_weight_bytes) catch return null,
+        .host_kv_bytes = std.math.add(usize, a.host_kv_bytes, b.host_kv_bytes) catch return null,
+        .backend_kv_bytes = std.math.add(usize, a.backend_kv_bytes, b.backend_kv_bytes) catch return null,
+        .host_scratch_bytes = std.math.add(usize, a.host_scratch_bytes, b.host_scratch_bytes) catch return null,
+        .backend_scratch_bytes = std.math.add(usize, a.backend_scratch_bytes, b.backend_scratch_bytes) catch return null,
+    };
+}
+
+fn checkAdmissionLimit(request: usize, next: usize, limit: usize) !void {
+    if (limit == 0 or next <= limit) return;
+    if (request > limit) return error.ResourceLimitExceeded;
+    return error.ResourceTemporarilyUnavailable;
+}
+
+fn checkLiveHostMemory(incremental_bytes: usize) !void {
+    const info = currentSystemMemoryInfo() orelse return;
+    const available = info.available_bytes orelse return;
+    const headroom = clampBytes(@max(info.total_bytes / 4, gib(6)), gib(4), gib(24));
+    const required = std.math.add(usize, incremental_bytes, headroom) catch
+        return error.ResourceLimitExceeded;
+    if (available < required) return error.ResourceTemporarilyUnavailable;
+}
+
 pub fn defaultLimitsForBackend(backend: BackendClass) Limits {
     if (currentSystemMemoryInfo()) |info| {
-        return deriveLimitsForBackend(backend, info);
+        // Admission policy is stable for the lifetime of a machine configuration.
+        // Current pressure is checked separately immediately before allocation.
+        return deriveLimitsForBackend(backend, .{
+            .total_bytes = info.total_bytes,
+            .available_bytes = info.total_bytes,
+        });
     }
     return staticLimitsForBackend(backend);
 }
@@ -501,6 +632,34 @@ pub fn estimateGptGeneration(
             .metal, .cuda => .backend,
         },
     };
+}
+
+test "shared admission accounts for concurrent leases and releases capacity" {
+    var controller = AdmissionController{};
+    const limits = Limits{
+        .host_limit_bytes = 100,
+        .combined_limit_bytes = 100,
+        .kv_limit_bytes = 100,
+        .scratch_limit_bytes = 100,
+    };
+    var first = try controller.tryAcquire(limits, .{ .host_weight_bytes = 60 }, false);
+    defer first.release();
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        controller.tryAcquire(limits, .{ .host_kv_bytes = 50 }, false),
+    );
+    first.release();
+    var second = try controller.tryAcquire(limits, .{ .host_kv_bytes = 50 }, false);
+    defer second.release();
+    try std.testing.expectEqual(@as(usize, 50), controller.snapshot().hostTotalBytes());
+}
+
+test "single admission larger than policy is a resource limit" {
+    var controller = AdmissionController{};
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        controller.tryAcquire(.{ .host_limit_bytes = 100 }, .{ .host_weight_bytes = 101 }, false),
+    );
 }
 
 test "run budget enforces kv and scratch separately from host total" {

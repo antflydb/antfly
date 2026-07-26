@@ -24,7 +24,7 @@ const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
-const model_support = @import("../models/support.zig");
+const model_compatibility = @import("../models/compatibility.zig");
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
@@ -742,6 +742,7 @@ pub const LoadedModel = struct {
     resident_projection_stats: embedding_mod.AtomicResidentProjectionStats = .{},
     cleanup_head: ?*cleanup_model_mod.CleanupHead = null,
     cleanup_head_loaded: bool = false,
+    resource_lease: ?runtime.tier.memory.AdmissionLease = null,
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
         if (self.hf_tok) |ht| return ht.tokenizer();
@@ -1002,6 +1003,7 @@ pub const LoadedModel = struct {
             head.deinit();
             self.allocator.destroy(head);
         }
+        if (self.resource_lease) |*lease| lease.release();
         self.manifest.deinit();
         self.allocator.free(self.model_dir);
     }
@@ -1022,7 +1024,10 @@ pub const ModelManager = struct {
     allocator: std.mem.Allocator,
     session_manager: backends.SessionManager,
     /// Null for diagnostic/offline CLIs. Serving Nodes set this before any model load.
-    serving_policy: ?model_support.Policy = null,
+    serving_policy: ?model_compatibility.Policy = null,
+    admission: runtime.tier.memory.AdmissionController = .{},
+    admission_enabled: bool = false,
+    admission_limit_overrides: runtime.tier.memory.Limits = .{},
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
     /// Model construction mutates the caches below and initializes shared backend state.
@@ -1042,9 +1047,56 @@ pub const ModelManager = struct {
         };
     }
 
-    pub fn configureServingPolicy(self: *ModelManager, policy: model_support.Policy) void {
+    pub fn configureServingPolicy(self: *ModelManager, policy: model_compatibility.Policy) void {
         std.debug.assert(self.loaded.count() == 0);
         self.serving_policy = policy;
+        self.admission_enabled = true;
+    }
+
+    pub fn acquireRunResources(
+        self: *ModelManager,
+        limits: runtime.tier.memory.Limits,
+        estimate: runtime.tier.memory.Estimate,
+    ) !runtime.tier.memory.AdmissionLease {
+        const amounts: runtime.tier.memory.AdmissionAmounts = switch (estimate.kv_tier) {
+            .disk => .{},
+            .host => .{
+                .host_kv_bytes = estimate.kv_bytes,
+                .host_scratch_bytes = if (estimate.scratch_tier == .host) estimate.scratch_bytes else 0,
+                .backend_scratch_bytes = if (estimate.scratch_tier == .backend) estimate.scratch_bytes else 0,
+            },
+            .backend => .{
+                .backend_kv_bytes = estimate.kv_bytes,
+                .host_scratch_bytes = if (estimate.scratch_tier == .host) estimate.scratch_bytes else 0,
+                .backend_scratch_bytes = if (estimate.scratch_tier == .backend) estimate.scratch_bytes else 0,
+            },
+        };
+        return self.admission.tryAcquire(limits, amounts, true);
+    }
+
+    pub fn configureAdmissionLimits(
+        self: *ModelManager,
+        overrides: runtime.tier.memory.Limits,
+    ) void {
+        std.debug.assert(self.loaded.count() == 0);
+        self.admission_limit_overrides = overrides;
+    }
+
+    fn admissionLimitsForBackend(
+        self: *const ModelManager,
+        backend: backends.BackendType,
+    ) runtime.tier.memory.Limits {
+        var limits = runtime.tier.memory.defaultLimitsForBackend(switch (backend) {
+            .metal, .cuda => .gpu,
+            else => .cpu,
+        });
+        const overrides = self.admission_limit_overrides;
+        if (overrides.host_limit_bytes > 0) limits.host_limit_bytes = overrides.host_limit_bytes;
+        if (overrides.backend_limit_bytes > 0) limits.backend_limit_bytes = overrides.backend_limit_bytes;
+        if (overrides.combined_limit_bytes > 0) limits.combined_limit_bytes = overrides.combined_limit_bytes;
+        if (overrides.kv_limit_bytes > 0) limits.kv_limit_bytes = overrides.kv_limit_bytes;
+        if (overrides.scratch_limit_bytes > 0) limits.scratch_limit_bytes = overrides.scratch_limit_bytes;
+        return limits;
     }
 
     pub fn lockLoadedModels(self: *ModelManager) void {
@@ -1192,14 +1244,27 @@ pub const ModelManager = struct {
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         errdefer man.deinit();
         if (self.serving_policy) |policy| {
-            var inspection = try model_support.inspectAlloc(self.allocator, &man);
+            if (!isManifestPotentiallyLoadableInCurrentBuild(man))
+                return error.IncompatibleModel;
+            var inspection = try model_compatibility.inspectAlloc(self.allocator, &man);
             defer inspection.deinit(self.allocator);
-            const assessment = model_support.assessInspection(&man, inspection);
+            const assessment = model_compatibility.assessInspection(&man, inspection);
             switch (assessment.level) {
-                .supported => {},
-                .experimental => if (!policy.allow_experimental)
-                    return error.ExperimentalModelDisabled,
-                .unsupported => return error.UnsupportedModel,
+                .compatible => {},
+                .unknown => if (!policy.allow_unknown)
+                    return error.UnknownModelCompatibility,
+                .incompatible => return error.IncompatibleModel,
+            }
+            if (man.gguf_path != null) {
+                var maybe_report = try session_factory.inspectGgufModel(self.allocator, model_dir);
+                if (maybe_report) |*report| {
+                    defer report.deinit();
+                    if (report.unsupported_tensor_types.len > 0 or
+                        report.missing_required_tensors.len > 0)
+                    {
+                        return error.IncompatibleModel;
+                    }
+                }
             }
         }
         if (man.hasIncompleteGlinerBundle()) return error.IncompleteGlinerBundle;
@@ -1241,8 +1306,10 @@ pub const ModelManager = struct {
             },
         }
 
-        // Load session.
-        const session = try loadSessionForPreferredBackends(self.allocator, sm.preferred_backends, model_dir, man, sm);
+        // Plan and reserve resources before the backend begins allocating weights.
+        var loaded_session = try loadSessionForPreferredBackends(self, sm.preferred_backends, model_dir, man, sm);
+        errdefer if (loaded_session.resource_lease) |*lease| lease.release();
+        const session = loaded_session.session;
 
         // Load chat template if available (for generator models)
         var chat_template_failed = false;
@@ -1321,7 +1388,9 @@ pub const ModelManager = struct {
             .text_projection = null,
             .visual_projection = null,
             .audio_projection = null,
+            .resource_lease = loaded_session.resource_lease,
         };
+        loaded_session.resource_lease = null;
 
         if (build_options.enable_metal and shouldUseMetalWholeModelExecutor(session)) {
             if (session_factory.getGptConfig(session)) |gpt_config| {
@@ -1403,13 +1472,107 @@ fn sessionManagerForPreferredBackends(
     };
 }
 
+const LoadedSessionPlan = struct {
+    session: backends.Session,
+    resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+};
+
+fn addArtifactBytes(total: *usize, allocator: std.mem.Allocator, maybe_path: ?[]const u8) !void {
+    const path = maybe_path orelse return;
+    const size = std.math.cast(usize, try c_file.fileSize(allocator, path)) orelse
+        return error.ResourceLimitExceeded;
+    total.* = std.math.add(usize, total.*, size) catch return error.ResourceLimitExceeded;
+}
+
+fn estimateModelArtifactBytes(
+    man: manifest_mod.ModelManifest,
+    backend: backends.BackendType,
+) !usize {
+    var total: usize = 0;
+    const uses_native_weights = backend != .onnx and manifestHasNativeAssets(man);
+    if (uses_native_weights) {
+        const native_weight_bytes = std.math.cast(
+            usize,
+            try session_factory.estimateNativeWeightBytes(man.allocator, man),
+        ) orelse return error.ResourceLimitExceeded;
+        total = std.math.add(usize, total, native_weight_bytes) catch
+            return error.ResourceLimitExceeded;
+        try addArtifactBytes(&total, man.allocator, man.gguf_projector_path);
+    } else {
+        try addArtifactBytes(&total, man.allocator, man.onnx_path);
+    }
+
+    // Composite bundles load these alongside the selected primary artifact.
+    const component_paths = [_]?[]const u8{
+        man.visual_model_path,
+        man.audio_model_path,
+        man.text_projection_path,
+        man.visual_projection_path,
+        man.audio_projection_path,
+    };
+    for (component_paths, 0..) |maybe_path, index| {
+        const path = maybe_path orelse continue;
+        if (!uses_native_weights and man.onnx_path != null and
+            std.mem.eql(u8, path, man.onnx_path.?)) continue;
+        var duplicate = false;
+        for (component_paths[0..index]) |prior| {
+            if (prior != null and std.mem.eql(u8, path, prior.?)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) try addArtifactBytes(&total, man.allocator, path);
+    }
+    if (total == 0) return error.NoModelFileFound;
+    return total;
+}
+
+fn estimateModelLoadAdmission(
+    man: manifest_mod.ModelManifest,
+    backend: backends.BackendType,
+) !runtime.tier.memory.AdmissionAmounts {
+    const weights = try estimateModelArtifactBytes(man, backend);
+    const uses_onnx_artifact = backend == .onnx or !manifestHasNativeAssets(man);
+    if (uses_onnx_artifact) {
+        return switch (backend) {
+            .metal, .cuda => .{
+                // The importer retains encoded host bytes while constructing device
+                // parameters and graph metadata.
+                .backend_weight_bytes = weights,
+                .host_weight_bytes = weights,
+            },
+            .native, .onnx, .wasm => .{
+                // The current ONNX path reads the encoded protobuf and then owns the
+                // converted parameter storage, so reserve both copies.
+                .host_weight_bytes = std.math.mul(usize, weights, 2) catch
+                    return error.ResourceLimitExceeded,
+            },
+            .pjrt => return error.UnsupportedBackend,
+        };
+    }
+    return switch (backend) {
+        .metal, .cuda => .{
+            // Device weights plus conservative host-side import/repacking staging.
+            .backend_weight_bytes = weights,
+            .host_weight_bytes = weights / 4,
+        },
+        .native, .onnx, .wasm => .{
+            // Native and ONNX importers may retain a source mapping while materializing
+            // or repacking weights, so account for 25% above the encoded artifact size.
+            .host_weight_bytes = std.math.add(usize, weights, weights / 4) catch
+                return error.ResourceLimitExceeded,
+        },
+        .pjrt => return error.UnsupportedBackend,
+    };
+}
+
 fn loadSessionForPreferredBackends(
-    allocator: std.mem.Allocator,
+    manager: *ModelManager,
     preferred_backends: []const backends.BackendType,
     model_dir: []const u8,
     man: manifest_mod.ModelManifest,
     source_session_manager: *const backends.SessionManager,
-) !backends.Session {
+) !LoadedSessionPlan {
     var effective_scratch: [7]backends.BackendType = undefined;
     const effective_backends = effectiveLoadBackends(&effective_scratch, preferred_backends, man);
     // Keep the first real failure. Reporting a blanket NoModelFileFound hides the
@@ -1420,10 +1583,26 @@ fn loadSessionForPreferredBackends(
         if (!backend.supportsDirectSessionLoad()) continue;
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
         var single_backend = [_]backends.BackendType{backend};
-        var backend_session_manager = sessionManagerForPreferredBackends(allocator, single_backend[0..], source_session_manager);
+        var backend_session_manager = sessionManagerForPreferredBackends(manager.allocator, single_backend[0..], source_session_manager);
+        var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
+        if (manager.admission_enabled) {
+            const amounts = estimateModelLoadAdmission(man, backend) catch |err| {
+                if (first_err == null) first_err = err;
+                continue;
+            };
+            resource_lease = manager.admission.tryAcquire(
+                manager.admissionLimitsForBackend(backend),
+                amounts,
+                true,
+            ) catch |err| {
+                if (first_err == null) first_err = err;
+                continue;
+            };
+        }
         if (backend_session_manager.loadModel(candidate_path)) |session| {
-            return session;
+            return .{ .session = session, .resource_lease = resource_lease };
         } else |err| {
+            if (resource_lease) |*lease| lease.release();
             std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });
             if (first_err == null) first_err = err;
         }
@@ -1749,10 +1928,10 @@ test "ModelManager serving policy fails closed before loading generator weights"
     defer manager.deinit();
     manager.configureServingPolicy(.{});
 
-    try std.testing.expectError(error.ExperimentalModelDisabled, manager.loadFromDir(dir_path));
+    try std.testing.expectError(error.UnknownModelCompatibility, manager.loadFromDir(dir_path));
 }
 
-test "experimental opt in does not enable a known unsupported generator" {
+test "unknown opt in does not enable a known incompatible generator" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1774,9 +1953,9 @@ test "experimental opt in does not enable a known unsupported generator" {
         .preferred_backends = &.{.native},
     });
     defer manager.deinit();
-    manager.configureServingPolicy(.{ .allow_experimental = true });
+    manager.configureServingPolicy(.{ .allow_unknown = true });
 
-    try std.testing.expectError(error.UnsupportedModel, manager.loadFromDir(dir_path));
+    try std.testing.expectError(error.IncompatibleModel, manager.loadFromDir(dir_path));
 }
 
 test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipeline" {
