@@ -768,6 +768,10 @@ pub const Client = struct {
         return if (err == error.StreamDataOverflow) error.ResponseTooLarge else err;
     }
 
+    fn configureH2ResponseStream(self: *const Self, stream: *Stream, req: *const Request) void {
+        stream.max_data_size = self.responseSizeLimit(req);
+    }
+
     fn mayRetryConnectionError(err: anyerror) bool {
         // Local response-policy failures are deterministic. Retrying them
         // wastes bandwidth and, for writer requests, could duplicate output.
@@ -1304,7 +1308,7 @@ pub const Client = struct {
             return error.ConnectionClosed;
         }
         const stream = try h2.stream_manager.createStream();
-        stream.max_data_size = self.responseSizeLimit(req);
+        self.configureH2ResponseStream(stream, req);
         const stream_id = stream.id;
         errdefer h2.stream_manager.removeStream(stream_id);
 
@@ -1459,7 +1463,7 @@ pub const Client = struct {
                     }
                     return n;
                 }
-                if (self.stream.stream_error) |err| return err;
+                if (self.stream.stream_error) |err| return normalizeH2ResponseError(err);
                 if (self.stream.completed) return 0;
 
                 // Reset event, re-check buffer (handles race with receive loop),
@@ -1467,7 +1471,7 @@ pub const Client = struct {
                 self.data_event.reset();
                 const avail2 = self.stream.data_buf.items.len - self.stream.read_offset;
                 if (avail2 > 0) continue;
-                if (self.stream.stream_error) |err| return err;
+                if (self.stream.stream_error) |err| return normalizeH2ResponseError(err);
                 if (self.stream.completed) return 0;
 
                 self.data_event.waitTimeout(self.io, self.read_timeout) catch |err| switch (err) {
@@ -1531,6 +1535,7 @@ pub const Client = struct {
             return error.ConnectionClosed;
         }
         const stream = try h2.stream_manager.createStream();
+        self.configureH2ResponseStream(stream, req);
         const stream_id = stream.id;
         errdefer h2.stream_manager.removeStream(stream_id);
 
@@ -1612,7 +1617,7 @@ pub const Client = struct {
                 error.Canceled => return error.Canceled,
             };
         }
-        if (stream.stream_error) |err| return err;
+        if (stream.stream_error) |err| return normalizeH2ResponseError(err);
 
         // Headers were decoded in deliverToMailbox (receive loop) to avoid
         // concurrent HPACK decode races on the shared hpack_ctx.
@@ -2598,6 +2603,9 @@ test "Client per-request response limit only lowers the configured ceiling" {
     try std.testing.expectEqual(@as(usize, 1024), client.responseSizeLimit(&request));
     request.max_response_size = 0;
     try std.testing.expectEqual(@as(usize, 0), client.responseSizeLimit(&request));
+    var stream = Stream.init(1);
+    client.configureH2ResponseStream(&stream, &request);
+    try std.testing.expectEqual(@as(?usize, 0), stream.max_data_size);
     try std.testing.expectEqual(
         @as(usize, 16),
         try Client.checkedResponseSize(8, 8, 16),

@@ -2564,6 +2564,13 @@ fn backupAttemptHeadPath(alloc: std.mem.Allocator, backup_root: []const u8) ![]u
     return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, backup_attempt_head_name });
 }
 
+fn backupAttemptReclaimCursorPath(alloc: std.mem.Allocator, backup_root: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+        backup_root,
+        backup_attempt_reclaim_cursor_name,
+    });
+}
+
 fn validateClusterBackupAttemptHead(head: *const ClusterBackupAttemptHead) !void {
     if (head.format_version != backup_attempt_head_version)
         return error.UnsupportedBackupFormat;
@@ -3465,16 +3472,88 @@ pub fn reclaimStaleClusterBackupAttempts(
                 else => return err,
             };
             defer dir.close(io);
+
+            // Filesystem directory iteration has no stable portable seek
+            // cookie. Serialize cursor advancement and select the next
+            // lexicographic page with a bounded max-heap. Enumeration is O(n),
+            // but memory and expensive marker/artifact work remain O(page),
+            // and no directory ordering can permanently starve later entries.
+            const cursor_path = try backupAttemptReclaimCursorPath(alloc, backup_root);
+            defer alloc.free(cursor_path);
+            const cursor_lock_path = try std.fmt.allocPrint(alloc, "{s}.publish.lock", .{cursor_path});
+            defer alloc.free(cursor_lock_path);
+            var cursor_lock = if (std.fs.path.isAbsolute(cursor_lock_path))
+                try std.Io.Dir.createFileAbsolute(io, cursor_lock_path, .{ .truncate = false })
+            else
+                try std.Io.Dir.cwd().createFile(io, cursor_lock_path, .{ .truncate = false });
+            defer cursor_lock.close(io);
+            try cursor_lock.lock(io, .exclusive);
+            defer cursor_lock.unlock(io);
+
+            const cursor_body = readFileAbsoluteAllocWithIo(
+                alloc,
+                io,
+                cursor_path,
+                max_backup_attempt_cursor_bytes,
+            ) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            defer if (cursor_body) |value| alloc.free(value);
+            const cursor: ?[]const u8 = if (cursor_body) |value| blk: {
+                const trimmed = std.mem.trim(u8, value, "\r\n");
+                validateBackupId(trimmed) catch break :blk null;
+                break :blk trimmed;
+            } else null;
+            if (cursor_body != null and cursor == null) try deletePathDurably(io, cursor_path);
+
+            var after_cursor = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (after_cursor.items) |attempt_id| alloc.free(attempt_id);
+                after_cursor.deinit(alloc);
+            }
+            var wrapped = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (wrapped.items) |attempt_id| alloc.free(attempt_id);
+                wrapped.deinit(alloc);
+            }
             var iterator = dir.iterate();
-            var scanned: usize = 0;
-            while (scanned < backup_attempt_reclaim_scan_budget and
-                reclaimed < backup_attempt_reclaim_batch_size)
-            {
-                const entry = try iterator.next(io) orelse break;
-                scanned += 1;
+            while (try iterator.next(io)) |entry| {
                 if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
                 const attempt_id = entry.name[0 .. entry.name.len - ".json".len];
                 validateBackupId(attempt_id) catch continue;
+                if (cursor) |position| {
+                    if (std.mem.order(u8, attempt_id, position) == .gt)
+                        try retainSmallestBackupId(
+                            alloc,
+                            &after_cursor,
+                            backup_attempt_reclaim_scan_budget,
+                            attempt_id,
+                        )
+                    else
+                        try retainSmallestBackupId(
+                            alloc,
+                            &wrapped,
+                            backup_attempt_reclaim_scan_budget,
+                            attempt_id,
+                        );
+                } else {
+                    try retainSmallestBackupId(
+                        alloc,
+                        &after_cursor,
+                        backup_attempt_reclaim_scan_budget,
+                        attempt_id,
+                    );
+                }
+            }
+
+            const selected = if (after_cursor.items.len > 0 or cursor == null)
+                &after_cursor
+            else
+                &wrapped;
+            std.mem.sort([]u8, selected.items, {}, backupIdLessThan);
+            for (selected.items) |attempt_id| {
+                if (reclaimed >= backup_attempt_reclaim_batch_size) break;
                 if (reclaimClusterBackupAttemptById(
                     alloc,
                     io,
@@ -3489,6 +3568,17 @@ pub fn reclaimStaleClusterBackupAttempts(
                 }) {
                     reclaimed += 1;
                 }
+            }
+
+            if (selected.items.len == backup_attempt_reclaim_scan_budget) {
+                try replaceFileAbsoluteUnderHeldLock(
+                    alloc,
+                    io,
+                    cursor_path,
+                    selected.items[selected.items.len - 1],
+                );
+            } else {
+                try deletePathDurably(io, cursor_path);
             }
         },
         .remote => |*store| {
@@ -7578,6 +7668,93 @@ test "filesystem cluster backup lease supports the maximum owner identity" {
         "cluster-snap",
         &attempt_id,
     ));
+}
+
+test "filesystem stale attempt reclamation cursor prevents directory-order starvation" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/reclaim-cursor",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(root);
+    var location: BackupLocation = .{ .file = root };
+
+    const now_unix_ns = backup_attempt_reclaim_age_ns + 1;
+    for (0..backup_attempt_reclaim_scan_budget) |i| {
+        const attempt_id = try std.fmt.allocPrint(alloc, "a-{d:0>3}", .{i});
+        defer alloc.free(attempt_id);
+        const cluster_id = try std.fmt.allocPrint(alloc, "cluster-{d:0>3}", .{i});
+        defer alloc.free(cluster_id);
+        const table_id = try std.fmt.allocPrint(alloc, "table-{d:0>3}", .{i});
+        defer alloc.free(table_id);
+        const artifact_id = try std.fmt.allocPrint(alloc, "artifact-{d:0>3}", .{i});
+        defer alloc.free(artifact_id);
+        const tables = [_]ClusterBackupAttemptTable{.{
+            .name = "docs",
+            .table_backup_id = table_id,
+            .artifact_backup_id = artifact_id,
+        }};
+        const marker: ClusterBackupAttemptMarker = .{
+            .attempt_id = attempt_id,
+            .cluster_backup_id = cluster_id,
+            .created_at_unix_ns = now_unix_ns,
+            .format = .portable,
+            .tables = &tables,
+        };
+        try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
+    }
+    const stale_tables = [_]ClusterBackupAttemptTable{.{
+        .name = "docs",
+        .table_backup_id = "z-stale-table",
+        .artifact_backup_id = "z-stale-artifact",
+    }};
+    const stale_marker: ClusterBackupAttemptMarker = .{
+        .attempt_id = "z-stale",
+        .cluster_backup_id = "z-stale-cluster",
+        .created_at_unix_ns = 1,
+        .format = .portable,
+        .tables = &stale_tables,
+    };
+    try writeClusterBackupAttemptMarker(alloc, io, &location, &stale_marker);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try reclaimStaleClusterBackupAttempts(alloc, io, &location, now_unix_ns),
+    );
+    const cursor_path = try backupAttemptReclaimCursorPath(alloc, root);
+    defer alloc.free(cursor_path);
+    const cursor = try readFileAbsoluteAllocWithIo(
+        alloc,
+        io,
+        cursor_path,
+        max_backup_attempt_cursor_bytes,
+    );
+    defer alloc.free(cursor);
+    try std.testing.expectEqualStrings("a-063", cursor);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try reclaimStaleClusterBackupAttempts(alloc, io, &location, now_unix_ns),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        readClusterBackupAttemptMarker(alloc, io, &location, stale_marker.attempt_id),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        readFileAbsoluteAllocWithIo(
+            alloc,
+            io,
+            cursor_path,
+            max_backup_attempt_cursor_bytes,
+        ),
+    );
 }
 
 test "remote stale attempt reclamation cursor prevents prefix starvation" {
