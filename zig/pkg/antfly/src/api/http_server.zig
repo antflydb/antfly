@@ -1635,7 +1635,8 @@ pub const ApiHttpServer = struct {
     restore_schedule_mutex: std.atomic.Mutex = .unlocked,
     scheduled_restore_jobs: std.AutoHashMapUnmanaged(u64, void) = .empty,
     repair_job_owner_id: u64 = 0,
-    restore_job_owner_id: u64 = 0,
+    restore_job_owner_id: std.atomic.Value(u64) = .init(0),
+    restore_retry_wakeup_in_flight: std.atomic.Value(bool) = .init(false),
     restore_jobs_resumed: std.atomic.Value(bool) = .init(false),
     restore_jobs_closing: std.atomic.Value(bool) = .init(false),
     restore_leadership_term: std.atomic.Value(u64) = .init(0),
@@ -1754,7 +1755,7 @@ pub const ApiHttpServer = struct {
             else
                 restore_jobs.Store.init(owner_alloc),
             .repair_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
-            .restore_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
+            .restore_job_owner_id = .init(if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0),
             .session_maintenance_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .backup_maintenance_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .connections_cache = connections_api.Cache.init(owner_alloc),
@@ -1917,7 +1918,8 @@ pub const ApiHttpServer = struct {
         self.backup_maintenance_closing.store(true, .release);
         if (self.cfg.backend_runtime) |runtime| {
             if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
-            if (self.restore_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.restore_job_owner_id);
+            const restore_owner_id = self.restore_job_owner_id.load(.acquire);
+            if (restore_owner_id != 0) runtime.durable_jobs.closeOwner(restore_owner_id);
             if (self.session_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
             if (self.backup_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.backup_maintenance_owner_id);
         }
@@ -1974,15 +1976,14 @@ pub const ApiHttpServer = struct {
 
     fn prepareRestoreLeadershipLocked(self: *ApiHttpServer, runtime: *db_mod.background_runtime.BackendRuntime, leadership_term: u64) !void {
         self.restore_leadership_term.store(0, .release);
-        const previous_owner_id = self.restore_job_owner_id;
-        self.restore_job_owner_id = 0;
+        const previous_owner_id = self.restore_job_owner_id.swap(0, .acq_rel);
         if (previous_owner_id != 0) runtime.durable_jobs.closeOwner(previous_owner_id);
         platform_sync.lockYielding(&self.restore_schedule_mutex);
         self.scheduled_restore_jobs.clearRetainingCapacity();
         self.restore_schedule_mutex.unlock();
         self.restore_jobs_resumed.store(false, .release);
         try self.restore_job_store.prepareReplicatedLeadership(self.alloc);
-        self.restore_job_owner_id = runtime.allocOwnerId();
+        self.restore_job_owner_id.store(runtime.allocOwnerId(), .release);
         self.restore_leadership_term.store(leadership_term, .release);
         self.restore_dispatch_paused.store(false, .release);
         self.restore_dispatch_requested.store(true, .release);
@@ -9416,6 +9417,22 @@ pub const ApiHttpServer = struct {
                     else => error.InternalFailure,
                 };
             };
+            if (!(backups_api.commitClusterBackupAttemptHeadIfOwned(
+                op_alloc,
+                backup_io,
+                location,
+                attempt_id,
+            ) catch |err| blk: {
+                // The immutable aggregate above is the commit point. Preserve
+                // success after an ambiguous terminal-head update: active-head
+                // admission validates the same marker, manifest, and artifact
+                // identities and maintenance never treats a present commit as
+                // an unpublished attempt.
+                std.log.warn("cluster backup committed head update deferred class={s}", .{@errorName(err)});
+                break :blk false;
+            })) {
+                std.log.warn("cluster backup committed with superseded attempt head", .{});
+            }
             // The immutable aggregate is now the commit record. Stop renewal
             // before conditionally releasing the repository-global mutation
             // lease; a cleanup failure is safe because the lease expires and
@@ -10941,6 +10958,7 @@ pub const ApiHttpServer = struct {
             self.restore_jobs_resumed.store(false, .release);
             return err;
         };
+        try self.ensureRestoreRetryWakeup();
     }
 
     /// Cheap supervisor tick: the durable FIFO makes this O(available slots),
@@ -10948,12 +10966,15 @@ pub const ApiHttpServer = struct {
     /// requiring another client request.
     pub fn pollRestoreJobsOnce(self: *ApiHttpServer) !void {
         try self.schedulePendingRestoreJobs();
+        try self.ensureRestoreRetryWakeup();
     }
 
     fn ensureAsyncRestoreWorker(self: *ApiHttpServer) !void {
         if (self.restore_jobs_closing.load(.acquire)) return error.AsyncRestoreUnavailable;
         const runtime = self.cfg.backend_runtime orelse return error.AsyncRestoreUnavailable;
-        if (runtime.threaded_jobs == null or self.restore_job_owner_id == 0) return error.AsyncRestoreUnavailable;
+        if (runtime.threaded_jobs == null or
+            self.restore_job_owner_id.load(.acquire) == 0)
+            return error.AsyncRestoreUnavailable;
         if (!self.restore_job_store.hasPersistence()) return error.RestoreJobPersistenceUnavailable;
     }
 
@@ -10977,7 +10998,9 @@ pub const ApiHttpServer = struct {
         while (self.restore_dispatch_requested.swap(false, .acq_rel)) {
             if (self.restore_jobs_closing.load(.acquire) or !self.restoreExecutionPermitted()) break;
             const runtime = self.cfg.backend_runtime orelse break;
-            if (runtime.threaded_jobs == null or self.restore_job_owner_id == 0) break;
+            if (runtime.threaded_jobs == null or
+                self.restore_job_owner_id.load(.acquire) == 0)
+                break;
             platform_sync.lockYielding(&self.restore_schedule_mutex);
             const scheduled_count = self.scheduled_restore_jobs.count();
             self.restore_schedule_mutex.unlock();
@@ -10997,7 +11020,9 @@ pub const ApiHttpServer = struct {
 
     fn submitRestoreJob(self: *ApiHttpServer, job_id: u64) !void {
         const runtime = self.cfg.backend_runtime orelse return error.AsyncRestoreUnavailable;
-        if (runtime.threaded_jobs == null or self.restore_job_owner_id == 0) return error.AsyncRestoreUnavailable;
+        const owner_id = self.restore_job_owner_id.load(.acquire);
+        if (runtime.threaded_jobs == null or owner_id == 0)
+            return error.AsyncRestoreUnavailable;
         platform_sync.lockYielding(&self.restore_schedule_mutex);
         if (self.scheduled_restore_jobs.contains(job_id)) {
             self.restore_schedule_mutex.unlock();
@@ -11020,7 +11045,7 @@ pub const ApiHttpServer = struct {
         const work = try self.alloc.create(RestoreJobWork);
         work.* = .{ .server = self, .job_id = job_id };
         runtime.durable_jobs.submit(.{
-            .owner_id = self.restore_job_owner_id,
+            .owner_id = owner_id,
             .class = .maintenance,
             .ptr = work,
             .run = RestoreJobWork.run,
@@ -11036,6 +11061,43 @@ pub const ApiHttpServer = struct {
         if (!self.restore_jobs_closing.load(.acquire)) self.schedulePendingRestoreJobs() catch |err| {
             std.log.err("failed to schedule pending restore jobs err={s}", .{@errorName(err)});
         };
+        if (!self.restore_jobs_closing.load(.acquire)) self.ensureRestoreRetryWakeup() catch |err| {
+            std.log.err("failed to schedule restore retry wakeup err={s}", .{@errorName(err)});
+        };
+    }
+
+    /// Maintain one bounded shared timer for all delayed restores. Contended jobs
+    /// leave the scarce execution slots immediately; the timer wakes the FIFO
+    /// at the earliest durable eligibility deadline.
+    fn ensureRestoreRetryWakeup(self: *ApiHttpServer) !void {
+        if (self.restore_jobs_closing.load(.acquire)) return;
+        const delay_ms = self.restore_job_store.nextPendingDelayMs() orelse return;
+        if (delay_ms == 0) return;
+        if (self.restore_retry_wakeup_in_flight.cmpxchgStrong(
+            false,
+            true,
+            .acq_rel,
+            .acquire,
+        ) != null) return;
+        errdefer self.restore_retry_wakeup_in_flight.store(false, .release);
+        const runtime = self.cfg.backend_runtime orelse
+            return error.AsyncRestoreUnavailable;
+        const owner_id = self.restore_job_owner_id.load(.acquire);
+        if (runtime.threaded_jobs == null or owner_id == 0)
+            return error.AsyncRestoreUnavailable;
+        const work = try self.alloc.create(RestoreRetryWakeWork);
+        errdefer self.alloc.destroy(work);
+        work.* = .{
+            .server = self,
+            .owner_id = owner_id,
+        };
+        try runtime.durable_jobs.submit(.{
+            .owner_id = owner_id,
+            .class = .maintenance,
+            .ptr = work,
+            .run = RestoreRetryWakeWork.run,
+            .deinit = RestoreRetryWakeWork.deinit,
+        });
     }
 
     fn unmarkScheduledRestoreJob(self: *ApiHttpServer, job_id: u64) void {
@@ -11161,16 +11223,18 @@ pub const ApiHttpServer = struct {
                 .restore_mode = state.restore_mode,
             }, &location, state.restore_mode, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                 if (err == error.BackupRepositoryBusy) {
-                    sleepNs(restoreRepositoryRetryDelayNs(
+                    const retry_delay_ns = restoreRepositoryRetryDelayNs(
                         state.job_id,
                         state.attempt_id,
-                    ));
+                    );
                     const retried = try self.restore_job_store.retryRunning(
                         self.alloc,
                         state,
                         @errorName(err),
+                        retry_delay_ns,
                     );
                     self.alloc.free(retried);
+                    try self.ensureRestoreRetryWakeup();
                     return;
                 }
                 if (err == error.NotLeader or err == error.RestoreJobFenced) {
@@ -11369,6 +11433,52 @@ pub const ApiHttpServer = struct {
             response.headers[1] = try ownedHeader(self.alloc, "Retry-After", "1");
         }
         return response;
+    }
+};
+
+const RestoreRetryWakeWork = struct {
+    server: *ApiHttpServer,
+    owner_id: u64,
+
+    fn run(ptr: *anyopaque) !void {
+        const self: *RestoreRetryWakeWork = @ptrCast(@alignCast(ptr));
+        const io = self.server.sharedApiIo() orelse
+            return error.AsyncRestoreUnavailable;
+        while (!self.server.restore_jobs_closing.load(.acquire) and
+            self.server.restore_job_owner_id.load(.acquire) == self.owner_id)
+        {
+            const delay_ms = self.server.restore_job_store.nextPendingDelayMs() orelse
+                return;
+            if (delay_ms == 0) {
+                try self.server.schedulePendingRestoreJobs();
+                return;
+            }
+            // Bound shutdown latency while retaining one timer regardless of
+            // the number of delayed jobs.
+            io.sleep(
+                std.Io.Duration.fromMilliseconds(@min(delay_ms, 100)),
+                .awake,
+            ) catch |err| switch (err) {
+                error.Canceled => return,
+            };
+        }
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *RestoreRetryWakeWork = @ptrCast(@alignCast(ptr));
+        const server = self.server;
+        server.alloc.destroy(self);
+        server.restore_retry_wakeup_in_flight.store(false, .release);
+        if (server.restore_jobs_closing.load(.acquire)) return;
+        if (server.restore_job_owner_id.load(.acquire) == 0) return;
+        if ((server.restore_job_store.nextPendingDelayMs() orelse 0) == 0) return;
+        // A leadership handoff closes the old owner while this bounded sleeper
+        // is still in flight. Once its shared slot is released, transfer the
+        // wakeup responsibility to the current owner instead of waiting for an
+        // unrelated request or supervisor tick.
+        server.ensureRestoreRetryWakeup() catch |err| {
+            std.log.err("failed to reschedule restore retry wakeup err={s}", .{@errorName(err)});
+        };
     }
 };
 

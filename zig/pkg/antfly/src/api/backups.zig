@@ -56,7 +56,7 @@ pub const max_backup_attempt_cursor_bytes: usize = 8 * 1024;
 const max_backup_attempt_lease_bytes: usize = 256;
 pub const max_cluster_backup_attempt_tables: usize = 4096;
 pub const backup_attempt_marker_version: u32 = 1;
-pub const backup_attempt_head_version: u32 = 2;
+pub const backup_attempt_head_version: u32 = 3;
 pub const backup_attempt_reclaim_age_ns: u64 = 24 * std.time.ns_per_hour;
 pub const backup_attempt_reclaim_batch_size: usize = 2;
 pub const backup_attempt_reclaim_scan_budget: usize = 64;
@@ -1450,7 +1450,8 @@ pub const ClusterBackupAttemptMarker = struct {
 
 pub const ClusterBackupAttemptState = enum {
     active,
-    handled,
+    committed,
+    failed,
 };
 
 pub const ClusterBackupAttemptHead = struct {
@@ -2901,17 +2902,18 @@ fn readClusterBackupAttemptHead(
     return parsed;
 }
 
-/// Mark the mutable attempt head handled only if it still names `attempt_id`.
-/// A handled tombstone preserves the global attempt linearization order while
-/// allowing restore admission after exact cleanup. This avoids falling back to
-/// producer wall clocks when concurrent attempts finish out of order.
-pub fn retireClusterBackupAttemptHeadIfOwned(
+/// Conditionally transition the authoritative attempt head. Only an active
+/// attempt can reach a terminal state; this prevents delayed cleanup from
+/// converting a committed attempt into a failure (or vice versa).
+fn transitionClusterBackupAttemptHeadIfOwned(
     alloc: std.mem.Allocator,
     io: std.Io,
     location: *BackupLocation,
     attempt_id: []const u8,
+    target_state: ClusterBackupAttemptState,
 ) !bool {
     try validateBackupId(attempt_id);
+    std.debug.assert(target_state != .active);
     return switch (location.*) {
         .file => |backup_root| blk: {
             const path = try backupAttemptHeadPath(alloc, backup_root);
@@ -2946,13 +2948,14 @@ pub fn retireClusterBackupAttemptHeadIfOwned(
             try validateClusterBackupAttemptHead(&parsed.value);
             if (!std.mem.eql(u8, parsed.value.attempt_id, attempt_id))
                 break :blk false;
-            if (parsed.value.state == .handled) break :blk true;
-            const handled: ClusterBackupAttemptHead = .{
+            if (parsed.value.state == target_state) break :blk true;
+            if (parsed.value.state != .active) break :blk false;
+            const updated: ClusterBackupAttemptHead = .{
                 .attempt_id = attempt_id,
-                .state = .handled,
+                .state = target_state,
                 .generation = try nextClusterBackupAttemptHeadGeneration(parsed.value.generation),
             };
-            const encoded = try stringifyJsonAlloc(alloc, handled);
+            const encoded = try stringifyJsonAlloc(alloc, updated);
             defer alloc.free(encoded);
             try ensureManifestSize(encoded, max_backup_attempt_marker_bytes);
             try replaceFileAbsoluteUnderHeldLock(alloc, io, path, encoded);
@@ -2985,13 +2988,14 @@ pub fn retireClusterBackupAttemptHeadIfOwned(
             try validateClusterBackupAttemptHead(&parsed.value);
             if (!std.mem.eql(u8, parsed.value.attempt_id, attempt_id))
                 break :blk false;
-            if (parsed.value.state == .handled) break :blk true;
-            const handled: ClusterBackupAttemptHead = .{
+            if (parsed.value.state == target_state) break :blk true;
+            if (parsed.value.state != .active) break :blk false;
+            const updated: ClusterBackupAttemptHead = .{
                 .attempt_id = attempt_id,
-                .state = .handled,
+                .state = target_state,
                 .generation = try nextClusterBackupAttemptHeadGeneration(parsed.value.generation),
             };
-            const encoded = try stringifyJsonAlloc(alloc, handled);
+            const encoded = try stringifyJsonAlloc(alloc, updated);
             defer alloc.free(encoded);
             try ensureManifestSize(encoded, max_backup_attempt_marker_bytes);
             const etag = result.metadata.etag orelse
@@ -3007,6 +3011,42 @@ pub fn retireClusterBackupAttemptHeadIfOwned(
             break :blk true;
         },
     };
+}
+
+/// Preserve failed-attempt evidence after exact artifact cleanup. Restore
+/// health remains failed until a later attempt publishes a new authoritative
+/// head and complete aggregate manifest.
+pub fn retireClusterBackupAttemptHeadIfOwned(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    attempt_id: []const u8,
+) !bool {
+    return transitionClusterBackupAttemptHeadIfOwned(
+        alloc,
+        io,
+        location,
+        attempt_id,
+        .failed,
+    );
+}
+
+/// Record normal completion after the immutable aggregate manifest has become
+/// durable. The aggregate remains the commit point; a lost terminal-state
+/// update is safe because active admission still validates that exact commit.
+pub fn commitClusterBackupAttemptHeadIfOwned(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    attempt_id: []const u8,
+) !bool {
+    return transitionClusterBackupAttemptHeadIfOwned(
+        alloc,
+        io,
+        location,
+        attempt_id,
+        .committed,
+    );
 }
 
 fn validateClusterBackupAttemptMarker(
@@ -3650,9 +3690,9 @@ pub fn cleanupClusterBackupAttemptAtLocation(
         };
     }
     if (cleanup_error) |err| return err;
-    // Once exact artifacts are gone, release the admission fence and retire
-    // this failed attempt. Conditional head removal cannot erase a retry that
-    // has already become authoritative.
+    // Once exact artifacts are gone, release the mutation lease and preserve a
+    // failed admission tombstone. The conditional head transition cannot erase
+    // a retry that has already become authoritative.
     const reservation_released = try cleanupClusterReservationIfOwnedAtLocation(
         alloc,
         io,
@@ -4858,8 +4898,8 @@ pub fn verifyTableBackupArtifactsIntegrityAtLocation(
 
 /// Cryptographically verifies a complete cluster backup with bounded memory.
 /// Callers use this for the exact backup being materialized; repository-wide
-/// admission intentionally remains metadata-only so a restore never downloads
-/// an unrelated backup merely because it is the newest published attempt.
+/// admission intentionally remains metadata-only so a historical restore never
+/// downloads an unrelated newest backup.
 pub fn verifyClusterBackupArtifactsIntegrityAtLocation(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -4888,7 +4928,7 @@ fn ensureClusterBackupAttemptHeadRestorable(
     head: *const ClusterBackupAttemptHead,
 ) !void {
     try validateClusterBackupAttemptHead(head);
-    if (head.state == .handled) return;
+    if (head.state == .failed) return error.IncompleteClusterBackup;
     var marker = try readClusterBackupAttemptMarker(alloc, io, location, head.attempt_id);
     defer marker.deinit();
     var manifest = readClusterManifestFromLocation(
@@ -8116,8 +8156,27 @@ test "attempt head generation detects publication and retirement ABA" {
         return error.TestUnexpectedResult;
     defer retired.deinit();
     try std.testing.expectEqual(@as(u64, 3), retired.value.generation);
-    try std.testing.expectEqual(ClusterBackupAttemptState.handled, retired.value.state);
+    try std.testing.expectEqual(ClusterBackupAttemptState.failed, retired.value.state);
     try std.testing.expect(!clusterBackupAttemptHeadsEqual(&second.value, &retired.value));
+
+    try writeClusterBackupAttemptHead(alloc, io, &location, "attempt-c");
+    try std.testing.expect(try commitClusterBackupAttemptHeadIfOwned(
+        alloc,
+        io,
+        &location,
+        "attempt-c",
+    ));
+    try std.testing.expect(!try retireClusterBackupAttemptHeadIfOwned(
+        alloc,
+        io,
+        &location,
+        "attempt-c",
+    ));
+    var committed = (try readClusterBackupAttemptHead(alloc, io, &location)) orelse
+        return error.TestUnexpectedResult;
+    defer committed.deinit();
+    try std.testing.expectEqual(@as(u64, 5), committed.value.generation);
+    try std.testing.expectEqual(ClusterBackupAttemptState.committed, committed.value.state);
 }
 
 test "newest attempt admission is metadata bounded and exact integrity detects corruption" {
@@ -8162,9 +8221,11 @@ test "newest attempt admission is metadata bounded and exact integrity detects c
     defer alloc.free(artifact_path);
     try writeFileAbsolute(artifact_path, "PAYLOAD");
 
-    // Repository admission checks that the newest attempt is complete and its
-    // immutable artifact identities are present, without reading payload bytes.
-    try ensureNewestClusterBackupAttemptRestorable(alloc, io, &location);
+    try ensureNewestClusterBackupAttemptRestorable(
+        alloc,
+        io,
+        &location,
+    );
     try std.testing.expectError(
         error.BackupArtifactIntegrityMismatch,
         verifyClusterBackupArtifactsIntegrityAtLocation(
@@ -8345,12 +8406,15 @@ test "stale owned cluster backup attempt releases fences and retires authoritati
         error.FileNotFound,
         readClusterBackupAttemptMarker(alloc, io, &location, "attempt-snap"),
     );
-    var handled_head = (try readClusterBackupAttemptHead(alloc, io, &location)) orelse
+    var failed_head = (try readClusterBackupAttemptHead(alloc, io, &location)) orelse
         return error.TestUnexpectedResult;
-    defer handled_head.deinit();
-    try std.testing.expectEqual(ClusterBackupAttemptState.handled, handled_head.value.state);
-    try std.testing.expectEqualStrings(marker.attempt_id, handled_head.value.attempt_id);
-    try ensureNewestClusterBackupAttemptRestorable(alloc, io, &location);
+    defer failed_head.deinit();
+    try std.testing.expectEqual(ClusterBackupAttemptState.failed, failed_head.value.state);
+    try std.testing.expectEqualStrings(marker.attempt_id, failed_head.value.attempt_id);
+    try std.testing.expectError(
+        error.IncompleteClusterBackup,
+        ensureNewestClusterBackupAttemptRestorable(alloc, io, &location),
+    );
     try reserveClusterBackupAttemptLeaseAtLocation(
         alloc,
         io,
