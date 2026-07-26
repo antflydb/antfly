@@ -4553,6 +4553,7 @@ pub fn build(b: *std.Build) void {
             "filesystem backup listing is bounded and cursor stable",
             "native backup directory copy preserves nested files",
             "native artifact verification consistently rejects empty directories",
+            "native verification receipt rejects membership changes after exact pass",
             "remote portable file transfer uses objectstore file paths",
             "remote backup directory download paginates and enforces segment prefix",
             "api http server lists cluster backups through public route",

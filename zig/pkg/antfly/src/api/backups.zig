@@ -2327,18 +2327,19 @@ fn parseGoPortableTableManifest(
     };
     if (table_name.len == 0 or table_name.len > 4096) return error.InvalidBackupRequest;
 
+    var manifest_owns_backing = false;
     const schema_json = try stringifyOptionalGoTableField(alloc, table.get("schema"), "{}");
-    errdefer alloc.free(schema_json);
+    errdefer if (!manifest_owns_backing) alloc.free(schema_json);
     const read_schema_json = try stringifyOptionalGoTableField(alloc, table.get("read_schema"), "");
-    errdefer alloc.free(read_schema_json);
+    errdefer if (!manifest_owns_backing) alloc.free(read_schema_json);
     const indexes_json = try normalizeGoPortableIndexesJson(alloc, table.get("indexes"));
-    errdefer alloc.free(indexes_json);
+    errdefer if (!manifest_owns_backing) alloc.free(indexes_json);
     const replication_sources_json = try stringifyOptionalGoTableField(
         alloc,
         table.get("replication_sources"),
         "[]",
     );
-    errdefer alloc.free(replication_sources_json);
+    errdefer if (!manifest_owns_backing) alloc.free(replication_sources_json);
     const description = if (table.get("description")) |value|
         switch (value) {
             .null => "",
@@ -2412,8 +2413,10 @@ fn parseGoPortableTableManifest(
     const shards = try alloc.alloc(ShardSnapshot, shards_list.items.len);
     var initialized: usize = 0;
     errdefer {
-        for (shards[0..initialized]) |shard| shard.deinit(alloc);
-        alloc.free(shards);
+        if (!manifest_owns_backing) {
+            for (shards[0..initialized]) |shard| shard.deinit(alloc);
+            alloc.free(shards);
+        }
     }
     for (shards_list.items, 0..) |portable_shard, i| {
         const start_key = try alloc.dupe(u8, portable_shard.start_key);
@@ -2438,18 +2441,32 @@ fn parseGoPortableTableManifest(
         initialized += 1;
     }
 
+    const identity = identity: {
+        const owned_backup_id = try alloc.dupe(u8, backup_id);
+        errdefer alloc.free(owned_backup_id);
+        const owned_table_name = try alloc.dupe(u8, table_name);
+        errdefer alloc.free(owned_table_name);
+        const owned_description = try alloc.dupe(u8, description);
+        errdefer alloc.free(owned_description);
+        break :identity .{
+            .backup_id = owned_backup_id,
+            .table_name = owned_table_name,
+            .description = owned_description,
+        };
+    };
     var manifest: TableBackupManifest = .{
         .format = .portable,
         .artifact_integrity_mode = .declared,
-        .backup_id = try alloc.dupe(u8, backup_id),
-        .table_name = try alloc.dupe(u8, table_name),
-        .description = try alloc.dupe(u8, description),
+        .backup_id = identity.backup_id,
+        .table_name = identity.table_name,
+        .description = identity.description,
         .schema_json = schema_json,
         .read_schema_json = read_schema_json,
         .indexes_json = indexes_json,
         .replication_sources_json = replication_sources_json,
         .shards = shards,
     };
+    manifest_owns_backing = true;
     errdefer manifest.deinit(alloc);
     try validateTableManifest(alloc, &manifest, backup_id);
     return manifest;
@@ -5737,6 +5754,34 @@ fn artifactVerificationCacheKey(
     return digest;
 }
 
+fn recordArtifactVerificationReceiptAfterFence(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    format: BackupFormat,
+    shard: *const ShardSnapshot,
+    cache: *ArtifactVerificationCache,
+    receipt_key: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    exact_identity: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) !void {
+    // The exact pass binds every payload byte, while this metadata-only pass
+    // fences directory membership and object identity changes that overlap
+    // verification. Cache misses therefore require no second payload read.
+    const final_identity = artifactVerificationCacheKey(
+        alloc,
+        io,
+        location,
+        format,
+        shard,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return error.BackupArtifactMissing,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, &exact_identity, &final_identity))
+        return error.SourceFileChanged;
+    try cache.record(alloc, receipt_key, final_identity);
+}
+
 /// Cryptographically verifies one table backup with bounded memory. Restore
 /// admission uses this immediately before publication so the exact requested
 /// artifact, rather than an unrelated newer backup, is bound to the restore.
@@ -5850,8 +5895,13 @@ pub fn verifyTableBackupArtifactsIntegrityAtLocationWithCache(
         if (receipt_key) |key| {
             var exact_identity: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
             exact_identity_hasher.final(&exact_identity);
-            try cache.?.record(
+            try recordArtifactVerificationReceiptAfterFence(
                 alloc,
+                io,
+                location,
+                table_manifest.format,
+                shard,
+                cache.?,
                 key,
                 exact_identity,
             );
@@ -7076,6 +7126,7 @@ fn directoryArtifactIntegrityAllocWithIdentity(
             else => return error.UnsupportedBackupArtifact,
         }
     }
+    if (files.items.len == 0) return error.BackupArtifactMissing;
     std.mem.sort(NativeArtifactFile, files.items, {}, nativeArtifactFileLessThan);
 
     var total_size: u64 = 0;
@@ -8194,6 +8245,24 @@ test "current Go portable metadata envelope materializes into a verified Zig man
             "{\"version\":1,\"format\":\"portable\",\"table\":{}}",
             "go-snap",
         ),
+    );
+}
+
+test "current Go portable metadata parsing is allocation failure safe" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const body =
+                \\{"version":2,"format":"portable","artifacts":[{"name":"go-snap-1.afb","size_bytes":12,"sha256":"ff45daa2dbf814d8ad252fae57bc62d1980fe8e3f2cff145af1072208db937cf"}],"table":{"name":"docs","description":"documents","schema":{"version":0},"indexes":{"embedding":{"provider":"termite"}},"shards":{"1":{"byte_range":["",""]}}}}
+            ;
+            var manifest = try parseTableBackupManifest(alloc, body, "go-snap");
+            defer manifest.deinit(alloc);
+            try std.testing.expectEqualStrings("docs", manifest.table_name);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Runner.run,
+        .{},
     );
 }
 
@@ -10447,6 +10516,91 @@ test "native backup directory copy preserves nested files" {
         error.BackupArtifactIntegrityMismatch,
         verifyShardArtifactIntegrity(alloc, null, .native, dst, &expected),
     );
+}
+
+test "native artifact verification consistently rejects empty directories" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const empty = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/empty-native",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(empty);
+    try ensureDirPathWithIo(io, empty);
+
+    try std.testing.expectError(
+        error.BackupArtifactMissing,
+        directoryArtifactIntegrityAllocWithIdentity(alloc, io, empty, null),
+    );
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    try std.testing.expectError(
+        error.BackupArtifactMissing,
+        hashLocalNativeArtifactIdentity(alloc, io, empty, &hasher),
+    );
+}
+
+test "native verification receipt rejects membership changes after exact pass" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const artifact_root = try std.fmt.allocPrint(alloc, "{s}/native", .{root});
+    defer alloc.free(artifact_root);
+    const initial_path = try std.fmt.allocPrint(alloc, "{s}/initial.sst", .{artifact_root});
+    defer alloc.free(initial_path);
+    try writeFileAbsolute(initial_path, "initial");
+
+    var integrity = try directoryArtifactIntegrityAlloc(alloc, io, artifact_root);
+    defer integrity.deinit(alloc);
+    const shard: ShardSnapshot = .{
+        .group_id = 7,
+        .start_key = "",
+        .snapshot_path = "native",
+        .artifact_size_bytes = integrity.size_bytes,
+        .artifact_sha256 = integrity.sha256,
+    };
+    var location: BackupLocation = .{ .file = root };
+    const receipt_key = artifactVerificationReceiptLookupKey(
+        &location,
+        .native,
+        &shard,
+    );
+    const exact_identity = try artifactVerificationCacheKey(
+        alloc,
+        io,
+        &location,
+        .native,
+        &shard,
+    );
+
+    const added_path = try std.fmt.allocPrint(alloc, "{s}/added.sst", .{artifact_root});
+    defer alloc.free(added_path);
+    try writeFileAbsolute(added_path, "added");
+    var cache: ArtifactVerificationCache = .{};
+    defer cache.deinit(alloc);
+    try std.testing.expectError(
+        error.SourceFileChanged,
+        recordArtifactVerificationReceiptAfterFence(
+            alloc,
+            io,
+            &location,
+            .native,
+            &shard,
+            &cache,
+            receipt_key,
+            exact_identity,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
 }
 
 test "backup manifest validation rejects ambiguous or unbound artifacts" {

@@ -17,6 +17,8 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +35,7 @@ import (
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/schema"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/snapstore"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes"
 	"github.com/blevesearch/bleve/v2"
@@ -998,8 +1001,11 @@ func TestHandleStartShard_Success_Multipart_WithFile(t *testing.T) {
 
 	startReq := ShardStartRequest{
 		ShardConfig: ShardConfig{
-			ByteRange:     types.Range{[]byte("e"), []byte("f")},
-			RestoreConfig: &common.BackupConfig{BackupID: backupID},
+			ByteRange: types.Range{[]byte("e"), []byte("f")},
+			RestoreConfig: &common.BackupConfig{
+				BackupID: backupID,
+				Format:   common.BackupFormatNative,
+			},
 		},
 		Peers: []common.Peer{{ID: 3}},
 	}
@@ -1042,6 +1048,149 @@ func TestHandleStartShard_Success_Multipart_WithFile(t *testing.T) {
 	mockStore.AssertExpectations(t)
 }
 
+func TestHandleStartShard_PortableMultipartVerifiesArtifactIntegrity(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		corrupt    bool
+		statusCode int
+	}{
+		{name: "valid", statusCode: http.StatusOK},
+		{name: "corrupt", corrupt: true, statusCode: http.StatusInternalServerError},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			api, mockStore, baseDir := setupStoreAPI(t, types.ID(1))
+			newShardID := types.ID(0x302)
+			backupID := "portable-backup"
+			fileName := common.ShardPortableBackupFileName(backupID, newShardID)
+			payload := []byte("portable backup data")
+			digest := sha256.Sum256(payload)
+			declaredDigest := digest
+			if testCase.corrupt {
+				declaredDigest[0] ^= 0xff
+			}
+			startReq := ShardStartRequest{
+				ShardConfig: ShardConfig{
+					ByteRange: types.Range{[]byte("e"), []byte("f")},
+					RestoreConfig: &common.BackupConfig{
+						BackupID: backupID,
+						Format:   common.BackupFormatPortable,
+						Artifact: &common.BackupArtifactIntegrity{
+							Name:      fileName,
+							SizeBytes: uint64(len(payload)),
+							SHA256:    hex.EncodeToString(declaredDigest[:]),
+						},
+					},
+				},
+				Peers: []common.Peer{{ID: 3}},
+			}
+			payloadBytes, err := json.Marshal(startReq)
+			require.NoError(t, err)
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			require.NoError(t, writer.WriteField("payload", string(payloadBytes)))
+			fileWriter, err := writer.CreateFormFile("backup_file", fileName)
+			require.NoError(t, err)
+			_, err = fileWriter.Write(payload)
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+
+			mockStore.On("Shard", newShardID).Return(nil, false)
+			var started <-chan struct{}
+			if !testCase.corrupt {
+				signal := signalOnCall(mockStore.On(
+					"StartRaftGroup",
+					newShardID,
+					startReq.Peers,
+					startReq.Join,
+					mock.MatchedBy(func(config *ShardStartConfig) bool {
+						return config.InitWithDBArchive == fileName
+					}),
+				).Return())
+				started = signal
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/shard", &body)
+			req.Header.Set("X-Raft-Shard-Id", newShardID.String())
+			req.Header.Set("Content-Type", writer.FormDataContentType())
+			response := httptest.NewRecorder()
+			api.ServeHTTP(response, req)
+			require.Equal(t, testCase.statusCode, response.Code)
+			if started != nil {
+				<-started
+				require.FileExists(t, filepath.Join(
+					common.SnapDir(baseDir, newShardID, mockStore.ID()),
+					fileName,
+				))
+			} else {
+				mockStore.AssertNotCalled(t, "StartRaftGroup")
+			}
+			mockStore.AssertExpectations(t)
+		})
+	}
+}
+
+func TestCopyLocalBackupToSnapDirVerifiesBeforePublishing(t *testing.T) {
+	const backupID = "portable-local"
+	shardID := types.ID(0x302)
+	nodeID := types.ID(1)
+	sourceDir := t.TempDir()
+	payload := []byte("portable local backup")
+	fileName := common.ShardPortableBackupFileName(backupID, shardID)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(sourceDir, fileName),
+		payload,
+		0o600,
+	))
+	digest := sha256.Sum256(payload)
+	config := &common.BackupConfig{
+		BackupID: backupID,
+		Format:   common.BackupFormatPortable,
+		Artifact: &common.BackupArtifactIntegrity{
+			Name:      fileName,
+			SizeBytes: uint64(len(payload)),
+			SHA256:    hex.EncodeToString(digest[:]),
+		},
+	}
+	snapStore, err := snapstore.NewLocalSnapStore(t.TempDir(), shardID, nodeID)
+	require.NoError(t, err)
+
+	archiveName, err := copyLocalBackupToSnapDir(
+		context.Background(),
+		zaptest.NewLogger(t),
+		snapStore,
+		shardID,
+		sourceDir,
+		config,
+	)
+	require.NoError(t, err)
+	require.Equal(t, fileName, archiveName)
+	stored, err := snapStore.Get(context.Background(), fileName)
+	require.NoError(t, err)
+	defer func() { _ = stored.Close() }()
+	storedPayload, err := io.ReadAll(stored)
+	require.NoError(t, err)
+	require.Equal(t, payload, storedPayload)
+
+	corruptStore, err := snapstore.NewLocalSnapStore(t.TempDir(), shardID, nodeID)
+	require.NoError(t, err)
+	corruptConfig := *config
+	corruptArtifact := *config.Artifact
+	corruptArtifact.SHA256 = strings.Repeat("0", sha256.Size*2)
+	corruptConfig.Artifact = &corruptArtifact
+	_, err = copyLocalBackupToSnapDir(
+		context.Background(),
+		zaptest.NewLogger(t),
+		corruptStore,
+		shardID,
+		sourceDir,
+		&corruptConfig,
+	)
+	require.ErrorIs(t, err, common.ErrBackupArtifactIntegrityMismatch)
+	exists, err := corruptStore.Exists(context.Background(), fileName)
+	require.NoError(t, err)
+	require.False(t, exists)
+}
+
 func TestHandleStartShard_RejectsS3RestoreWithoutAuthorizedConnection(t *testing.T) {
 	api, mockStore, _ := setupStoreAPI(t, types.ID(1))
 	newShardID := types.ID(103)
@@ -1055,8 +1204,12 @@ func TestHandleStartShard_RejectsS3RestoreWithoutAuthorizedConnection(t *testing
 
 	startReq := ShardStartRequest{
 		ShardConfig: ShardConfig{
-			ByteRange:     types.Range{[]byte("g"), []byte("h")},
-			RestoreConfig: &common.BackupConfig{BackupID: backupID, Location: restoreLocation},
+			ByteRange: types.Range{[]byte("g"), []byte("h")},
+			RestoreConfig: &common.BackupConfig{
+				BackupID: backupID,
+				Location: restoreLocation,
+				Format:   common.BackupFormatNative,
+			},
 		},
 		Peers: []common.Peer{{ID: 4}},
 	}
@@ -1111,8 +1264,12 @@ func TestHandleStartShard_Success_RestoreConfig_File(t *testing.T) {
 
 	startReq := ShardStartRequest{
 		ShardConfig: ShardConfig{
-			ByteRange:     types.Range{[]byte("i"), []byte("j")},
-			RestoreConfig: &common.BackupConfig{BackupID: backupID, Location: restoreLocation},
+			ByteRange: types.Range{[]byte("i"), []byte("j")},
+			RestoreConfig: &common.BackupConfig{
+				BackupID: backupID,
+				Location: restoreLocation,
+				Format:   common.BackupFormatNative,
+			},
 		},
 		Peers: []common.Peer{{ID: 5}},
 	}
@@ -1357,7 +1514,11 @@ func TestHandleStartShard_Failure_RestoreFromFile_SrcNotFound(t *testing.T) {
 			ByteRange: types.Range{[]byte("o"), []byte("p")},
 			// FIXME (ajr) Why doesn't the below line work with the DeepEqual of assert.ObjectsAreEqual?
 			// ByteRange:     types.Range{[]byte{0x00}, []byte{0xFF}},
-			RestoreConfig: &common.BackupConfig{BackupID: backupID, Location: restoreLocation},
+			RestoreConfig: &common.BackupConfig{
+				BackupID: backupID,
+				Location: restoreLocation,
+				Format:   common.BackupFormatNative,
+			},
 		},
 		Peers: []common.Peer{{ID: 1}},
 	}
@@ -1400,7 +1561,10 @@ func TestHandleStartShard_Failure_Multipart_CreateSnapDirFails(t *testing.T) {
 
 	startReq := ShardStartRequest{
 		ShardConfig: ShardConfig{
-			RestoreConfig: &common.BackupConfig{BackupID: backupID},
+			RestoreConfig: &common.BackupConfig{
+				BackupID: backupID,
+				Format:   common.BackupFormatNative,
+			},
 		},
 	}
 	payloadBytes, _ := json.Marshal(startReq)
@@ -1423,7 +1587,7 @@ func TestHandleStartShard_Failure_Multipart_CreateSnapDirFails(t *testing.T) {
 	api.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusInternalServerError, rr.Code)
-	assert.Contains(t, rr.Body.String(), "creating snapshot directory")
+	assert.Contains(t, rr.Body.String(), "creating restore directory")
 	mockStore.AssertNotCalled(
 		t,
 		"StartRaftGroup",

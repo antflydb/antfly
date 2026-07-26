@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
 	json "github.com/antflydb/antfly/go/pkg/libaf/json"
@@ -41,6 +42,10 @@ type backupStore interface {
 	DeleteMetadata(ctx context.Context, id string) error
 	DeleteArtifact(ctx context.Context, name string) error
 	ValidateArtifact(ctx context.Context, name string) error
+	ValidateArtifactIdentity(
+		ctx context.Context,
+		artifact common.BackupArtifactIntegrity,
+	) error
 	ReleaseBackupID(ctx context.Context, id string) error
 	WriteMetadata(
 		ctx context.Context,
@@ -49,7 +54,7 @@ type backupStore interface {
 		format common.BackupFormat,
 		artifacts []common.BackupArtifactIntegrity,
 	) error
-	ReadMetadata(ctx context.Context, id string) (*store.Table, common.BackupFormat, error)
+	ReadMetadata(ctx context.Context, id string) (*backupMetadata, error)
 	ResolvedLocation() string
 }
 
@@ -137,10 +142,12 @@ func validatePortableArtifactIntegrities(
 	table *store.Table,
 	artifacts []common.BackupArtifactIntegrity,
 ) error {
-	if table == nil || len(artifacts) != len(table.Shards) {
+	if table == nil || len(table.Shards) == 0 || len(artifacts) != len(table.Shards) {
 		return errors.New("portable backup artifact identities do not match table shards")
 	}
-	seen := make(map[string]struct{}, len(artifacts))
+	seenNames := make(map[string]struct{}, len(artifacts))
+	seenShards := make(map[types.ID]struct{}, len(artifacts))
+	var artifactBackupID string
 	for _, artifact := range artifacts {
 		decoded, err := hex.DecodeString(artifact.SHA256)
 		if err != nil || len(decoded) != sha256.Size ||
@@ -151,38 +158,65 @@ func validatePortableArtifactIntegrities(
 			strings.ContainsAny(artifact.Name, `/\`) {
 			return fmt.Errorf("invalid portable backup artifact identity %q", artifact.Name)
 		}
-		if _, duplicate := seen[artifact.Name]; duplicate {
+		if _, duplicate := seenNames[artifact.Name]; duplicate {
 			return fmt.Errorf("duplicate portable backup artifact identity %q", artifact.Name)
 		}
-		seen[artifact.Name] = struct{}{}
+		seenNames[artifact.Name] = struct{}{}
+
+		stem, ok := strings.CutSuffix(artifact.Name, ".afb")
+		separator := strings.LastIndexByte(stem, '-')
+		if !ok || separator <= 0 || separator == len(stem)-1 {
+			return fmt.Errorf("portable backup artifact %q is not bound to a shard", artifact.Name)
+		}
+		backupID := stem[:separator]
+		if err := common.ValidateBackupID(backupID); err != nil {
+			return fmt.Errorf("portable backup artifact %q has an invalid backup ID: %w", artifact.Name, err)
+		}
+		if artifactBackupID == "" {
+			artifactBackupID = backupID
+		} else if backupID != artifactBackupID {
+			return errors.New("portable backup artifacts do not share one backup ID")
+		}
+		shardID, err := types.IDFromString(stem[separator+1:])
+		_, shardExists := table.Shards[shardID]
+		if err != nil || !shardExists {
+			return fmt.Errorf("portable backup artifact %q references an unknown shard", artifact.Name)
+		}
+		if artifact.Name != common.ShardPortableBackupFileName(backupID, shardID) {
+			return fmt.Errorf("portable backup artifact %q is not canonically named", artifact.Name)
+		}
+		if _, duplicate := seenShards[shardID]; duplicate {
+			return fmt.Errorf("portable backup artifacts contain duplicate shard %s", shardID)
+		}
+		seenShards[shardID] = struct{}{}
 	}
 	return nil
 }
 
-func decodeBackupMetadata(data []byte) (*store.Table, common.BackupFormat, error) {
+func decodeBackupMetadata(data []byte) (*backupMetadata, error) {
 	var metadata backupMetadata
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return nil, "", fmt.Errorf("unmarshalling backup metadata: %w", err)
+		return nil, fmt.Errorf("unmarshalling backup metadata: %w", err)
 	}
 	if metadata.Version != backupMetadataVersion {
-		return nil, "", fmt.Errorf("unsupported backup metadata version %d", metadata.Version)
+		return nil, fmt.Errorf("unsupported backup metadata version %d", metadata.Version)
 	}
 	if metadata.Table == nil {
-		return nil, "", fmt.Errorf("backup metadata is missing table")
+		return nil, fmt.Errorf("backup metadata is missing table")
 	}
 	switch metadata.Format {
 	case common.BackupFormatNative:
 		if len(metadata.Artifacts) != 0 {
-			return nil, "", errors.New("native backup metadata declares portable artifacts")
+			return nil, errors.New("native backup metadata declares portable artifacts")
 		}
 	case common.BackupFormatPortable:
 		if err := validatePortableArtifactIntegrities(metadata.Table, metadata.Artifacts); err != nil {
-			return nil, "", err
+			return nil, err
 		}
 	default:
-		return nil, "", fmt.Errorf("unsupported backup format %q", metadata.Format)
+		return nil, fmt.Errorf("unsupported backup format %q", metadata.Format)
 	}
-	return metadata.Table, metadata.Format, nil
+	return &metadata, nil
 }
 
 func writeJSONFileAtomically(ctx context.Context, filePath string, value any) error {
@@ -448,6 +482,73 @@ func (s *fileBackupStore) ValidateArtifact(ctx context.Context, name string) err
 	return nil
 }
 
+func (s *fileBackupStore) ValidateArtifactIdentity(
+	ctx context.Context,
+	artifact common.BackupArtifactIntegrity,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := common.ValidateBackupArtifactIntegrity(&artifact); err != nil {
+		return err
+	}
+	if artifact.Name == "" || filepath.Base(artifact.Name) != artifact.Name {
+		return fmt.Errorf("invalid backup artifact name %q", artifact.Name)
+	}
+	rootPath := strings.TrimPrefix(s.location, "file://")
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return fmt.Errorf("opening backup root: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	file, err := root.Open(artifact.Name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	initial, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !initial.Mode().IsRegular() || initial.Size() <= 0 ||
+		uint64(initial.Size()) != artifact.SizeBytes {
+		return fmt.Errorf(
+			"%w: %s has an unexpected file identity",
+			common.ErrBackupArtifactIntegrityMismatch,
+			artifact.Name,
+		)
+	}
+	if err := common.VerifyBackupArtifact(ctx, file, artifact); err != nil {
+		return err
+	}
+	verified, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	currentFile, err := root.Open(artifact.Name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = currentFile.Close() }()
+	current, err := currentFile.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(initial, verified) ||
+		!os.SameFile(initial, current) ||
+		verified.Size() != initial.Size() ||
+		!verified.ModTime().Equal(initial.ModTime()) ||
+		current.Size() != initial.Size() ||
+		!current.ModTime().Equal(initial.ModTime()) {
+		return fmt.Errorf(
+			"%w: %s changed during verification",
+			common.ErrBackupArtifactIntegrityMismatch,
+			artifact.Name,
+		)
+	}
+	return nil
+}
+
 func (s *fileBackupStore) ReleaseBackupID(ctx context.Context, id string) error {
 	filePath, err := s.resolveAndValidate(id)
 	if err != nil {
@@ -464,6 +565,9 @@ func (s *fileBackupStore) WriteMetadata(
 	format common.BackupFormat,
 	artifacts []common.BackupArtifactIntegrity,
 ) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	metadata, err := newBackupMetadata(table, format, artifacts)
 	if err != nil {
 		return err
@@ -478,28 +582,28 @@ func (s *fileBackupStore) WriteMetadata(
 func (s *fileBackupStore) ReadMetadata(
 	ctx context.Context,
 	id string,
-) (*store.Table, common.BackupFormat, error) {
+) (*backupMetadata, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	filePath, err := s.resolveAndValidate(id)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	file, err := os.Open(filePath) //#nosec G304 -- path validated by resolveAndValidate
 	if err != nil {
-		return nil, "", fmt.Errorf("reading metadata file %s: %w", filePath, err)
+		return nil, fmt.Errorf("reading metadata file %s: %w", filePath, err)
 	}
 	defer func() { _ = file.Close() }()
 	data, err := readBackupMetadata(file)
 	if err != nil {
-		return nil, "", fmt.Errorf("reading metadata file %s: %w", filePath, err)
+		return nil, fmt.Errorf("reading metadata file %s: %w", filePath, err)
 	}
-	table, format, err := decodeBackupMetadata(data)
+	metadata, err := decodeBackupMetadata(data)
 	if err != nil {
-		return nil, "", fmt.Errorf("decoding table metadata from %s: %w", filePath, err)
+		return nil, fmt.Errorf("decoding table metadata from %s: %w", filePath, err)
 	}
-	return table, format, nil
+	return metadata, nil
 }
 
 // s3BackupStore reads/writes backup metadata to an S3-compatible object store.
@@ -641,6 +745,77 @@ func (s *s3BackupStore) ValidateArtifact(ctx context.Context, name string) error
 	return nil
 }
 
+func (s *s3BackupStore) ValidateArtifactIdentity(
+	ctx context.Context,
+	artifact common.BackupArtifactIntegrity,
+) error {
+	if err := common.ValidateBackupArtifactIntegrity(&artifact); err != nil {
+		return err
+	}
+	key, err := s.artifactKey(artifact.Name)
+	if err != nil {
+		return err
+	}
+	client, err := s.s3Config.EnsureBucket(ctx)
+	if err != nil {
+		return err
+	}
+	info, err := client.StatObject(
+		ctx,
+		s.s3Config.Bucket,
+		key,
+		minio.StatObjectOptions{},
+	)
+	if err != nil {
+		return err
+	}
+	if info.Size <= 0 || uint64(info.Size) != artifact.SizeBytes {
+		return fmt.Errorf(
+			"%w: %s has an unexpected object identity",
+			common.ErrBackupArtifactIntegrityMismatch,
+			artifact.Name,
+		)
+	}
+	options := minio.GetObjectOptions{}
+	if info.ETag != "" {
+		options.SetMatchETag(info.ETag)
+	}
+	object, err := client.GetObject(
+		ctx,
+		s.s3Config.Bucket,
+		key,
+		options,
+	)
+	if err != nil {
+		return err
+	}
+	verifyErr := common.VerifyBackupArtifact(ctx, object, artifact)
+	closeErr := object.Close()
+	if verifyErr != nil {
+		return verifyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	current, err := client.StatObject(
+		ctx,
+		s.s3Config.Bucket,
+		key,
+		minio.StatObjectOptions{},
+	)
+	if err != nil {
+		return err
+	}
+	if current.Size != info.Size || current.ETag != info.ETag {
+		return fmt.Errorf(
+			"%w: %s changed during verification",
+			common.ErrBackupArtifactIntegrityMismatch,
+			artifact.Name,
+		)
+	}
+	return nil
+}
+
 func (s *s3BackupStore) ReleaseBackupID(ctx context.Context, id string) error {
 	if err := common.ValidateBackupID(id); err != nil {
 		return err
@@ -655,6 +830,9 @@ func (s *s3BackupStore) WriteMetadata(
 	format common.BackupFormat,
 	artifacts []common.BackupArtifactIntegrity,
 ) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := common.ValidateBackupID(id); err != nil {
 		return err
 	}
@@ -688,29 +866,29 @@ func (s *s3BackupStore) WriteMetadata(
 func (s *s3BackupStore) ReadMetadata(
 	ctx context.Context,
 	id string,
-) (*store.Table, common.BackupFormat, error) {
+) (*backupMetadata, error) {
 	if err := common.ValidateBackupID(id); err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	bucket := s.s3Config.Bucket
 	minioClient, err := s.s3Config.NewMinioClient()
 	if err != nil {
-		return nil, "", fmt.Errorf("creating S3 client: %w", err)
+		return nil, fmt.Errorf("creating S3 client: %w", err)
 	}
 	objectKey := s.objectKey(id)
 	obj, err := minioClient.GetObject(ctx, bucket, objectKey, minio.GetObjectOptions{})
 	if err != nil {
-		return nil, "", fmt.Errorf("getting object %s from bucket %s: %w", objectKey, bucket, err)
+		return nil, fmt.Errorf("getting object %s from bucket %s: %w", objectKey, bucket, err)
 	}
 	defer func() { _ = obj.Close() }()
 
 	data, err := readBackupMetadata(obj)
 	if err != nil {
-		return nil, "", fmt.Errorf("reading object data for %s from bucket %s: %w", objectKey, bucket, err)
+		return nil, fmt.Errorf("reading object data for %s from bucket %s: %w", objectKey, bucket, err)
 	}
-	table, format, err := decodeBackupMetadata(data)
+	metadata, err := decodeBackupMetadata(data)
 	if err != nil {
-		return nil, "", fmt.Errorf("decoding table metadata for %s from bucket %s: %w", objectKey, bucket, err)
+		return nil, fmt.Errorf("decoding table metadata for %s from bucket %s: %w", objectKey, bucket, err)
 	}
-	return table, format, nil
+	return metadata, nil
 }

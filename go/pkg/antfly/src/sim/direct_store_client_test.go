@@ -16,6 +16,9 @@ package sim
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -82,4 +85,49 @@ func TestDirectStoreClientBackupWritesRequestedFileArchive(t *testing.T) {
 
 	archiveFile := filepath.Join(backupDir, common.ShardBackupFileName(backupID, shardID))
 	require.FileExists(t, archiveFile)
+}
+
+func TestDirectStoreClientBackupStreamsPortableArtifactIntegrity(t *testing.T) {
+	h, err := NewHarness(HarnessConfig{
+		BaseDir:           t.TempDir(),
+		Start:             time.Unix(1_700_320_000, 0).UTC(),
+		MetadataIDs:       []types.ID{100},
+		StoreIDs:          []types.ID{1},
+		ReplicationFactor: 1,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, h.Close())
+	})
+
+	table, err := h.CreateTable("docs", tablemgr.TableConfig{
+		NumShards: 1,
+		StartID:   0x2800,
+	})
+	require.NoError(t, err)
+	startTableOnAllStores(t, h, "docs")
+
+	var shardID types.ID
+	for id := range table.Shards {
+		shardID = id
+	}
+	require.NotZero(t, shardID)
+
+	client := newDirectStoreClient(h, 1)
+	backupDir := t.TempDir()
+	backupID := "portable_seed_test"
+	integrity, err := client.Backup(context.Background(), shardID, common.BackupConfig{
+		BackupID: backupID,
+		Location: "file://" + backupDir,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, integrity)
+	require.Equal(t, common.ShardPortableBackupFileName(backupID, shardID), integrity.Name)
+	require.Positive(t, integrity.SizeBytes)
+
+	artifact, err := os.ReadFile(filepath.Join(backupDir, integrity.Name))
+	require.NoError(t, err)
+	require.Equal(t, uint64(len(artifact)), integrity.SizeBytes)
+	digest := sha256.Sum256(artifact)
+	require.Equal(t, hex.EncodeToString(digest[:]), integrity.SHA256)
 }

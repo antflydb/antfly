@@ -57,6 +57,12 @@ func (s *cleanupOrderBackupStore) DeleteArtifact(context.Context, string) error 
 	return nil
 }
 func (*cleanupOrderBackupStore) ValidateArtifact(context.Context, string) error { return nil }
+func (*cleanupOrderBackupStore) ValidateArtifactIdentity(
+	context.Context,
+	common.BackupArtifactIntegrity,
+) error {
+	return nil
+}
 func (s *cleanupOrderBackupStore) ReleaseBackupID(context.Context, string) error {
 	if s.artifactsDeleted.Load() != s.expectedArtifacts {
 		s.phaseViolation.Store(true)
@@ -72,8 +78,8 @@ func (*cleanupOrderBackupStore) WriteMetadata(
 ) error {
 	return nil
 }
-func (*cleanupOrderBackupStore) ReadMetadata(context.Context, string) (*store.Table, common.BackupFormat, error) {
-	return nil, "", errors.New("not implemented")
+func (*cleanupOrderBackupStore) ReadMetadata(context.Context, string) (*backupMetadata, error) {
+	return nil, errors.New("not implemented")
 }
 func (*cleanupOrderBackupStore) ResolvedLocation() string { return "" }
 
@@ -90,10 +96,10 @@ func TestFileBackupStorePersistsFormatInVersionedEnvelope(t *testing.T) {
 		nil,
 	))
 
-	restored, format, err := backupStore.ReadMetadata(context.Background(), "backup-1")
+	metadata, err := backupStore.ReadMetadata(context.Background(), "backup-1")
 	require.NoError(t, err)
-	assert.Equal(t, common.BackupFormatNative, format)
-	assert.Equal(t, table.Name, restored.Name)
+	assert.Equal(t, common.BackupFormatNative, metadata.Format)
+	assert.Equal(t, table.Name, metadata.Table.Name)
 }
 
 func TestFileBackupStorePersistsPortableArtifactIntegrity(t *testing.T) {
@@ -123,9 +129,9 @@ func TestFileBackupStorePersistsPortableArtifactIntegrity(t *testing.T) {
 	require.Equal(t, uint32(2), envelope.Version)
 	require.Equal(t, artifacts, envelope.Artifacts)
 
-	_, format, err := backupStore.ReadMetadata(context.Background(), "backup-1")
+	metadata, err := backupStore.ReadMetadata(context.Background(), "backup-1")
 	require.NoError(t, err)
-	require.Equal(t, common.BackupFormatPortable, format)
+	require.Equal(t, common.BackupFormatPortable, metadata.Format)
 }
 
 func TestFileBackupStoreRejectsIncompletePortableArtifactIntegrity(t *testing.T) {
@@ -143,6 +149,163 @@ func TestFileBackupStoreRejectsIncompletePortableArtifactIntegrity(t *testing.T)
 		nil,
 	)
 	require.ErrorContains(t, err, "do not match table shards")
+}
+
+func TestFileBackupStoreBindsPortableArtifactsToCanonicalShardNames(t *testing.T) {
+	backupStore := &fileBackupStore{location: t.TempDir()}
+	table := &store.Table{
+		Name: "documents",
+		Shards: map[types.ID]*store.ShardConfig{
+			0xa: {},
+			0xb: {},
+		},
+	}
+	validDigest := strings.Repeat("0", sha256.Size*2)
+	valid := []common.BackupArtifactIntegrity{
+		{Name: "backup-prod-a.afb", SizeBytes: 1, SHA256: validDigest},
+		{Name: "backup-prod-b.afb", SizeBytes: 1, SHA256: validDigest},
+	}
+	require.NoError(t, backupStore.WriteMetadata(
+		context.Background(),
+		"backup-1",
+		table,
+		common.BackupFormatPortable,
+		valid,
+	))
+
+	testCases := []struct {
+		name      string
+		artifacts []common.BackupArtifactIntegrity
+		errorText string
+	}{
+		{
+			name: "unknown shard",
+			artifacts: []common.BackupArtifactIntegrity{
+				{Name: "backup-prod-a.afb", SizeBytes: 1, SHA256: validDigest},
+				{Name: "backup-prod-c.afb", SizeBytes: 1, SHA256: validDigest},
+			},
+			errorText: "unknown shard",
+		},
+		{
+			name: "mixed backup ids",
+			artifacts: []common.BackupArtifactIntegrity{
+				{Name: "backup-prod-a.afb", SizeBytes: 1, SHA256: validDigest},
+				{Name: "other-b.afb", SizeBytes: 1, SHA256: validDigest},
+			},
+			errorText: "one backup ID",
+		},
+		{
+			name: "duplicate shard",
+			artifacts: []common.BackupArtifactIntegrity{
+				{Name: "backup-prod-a.afb", SizeBytes: 1, SHA256: validDigest},
+				{Name: "backup-prod-0a.afb", SizeBytes: 1, SHA256: validDigest},
+			},
+			errorText: "canonically named",
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validatePortableArtifactIntegrities(table, testCase.artifacts)
+			require.ErrorContains(t, err, testCase.errorText)
+		})
+	}
+}
+
+func TestFileBackupStoreRejectsPortableMetadataWithoutShards(t *testing.T) {
+	err := validatePortableArtifactIntegrities(
+		&store.Table{Name: "documents"},
+		nil,
+	)
+	require.ErrorContains(t, err, "do not match table shards")
+}
+
+func TestFileBackupStoreValidatesPortableArtifactIdentity(t *testing.T) {
+	root := t.TempDir()
+	body := []byte("portable-artifact")
+	digest := sha256.Sum256(body)
+	artifact := common.BackupArtifactIntegrity{
+		Name:      "backup-1-1.afb",
+		SizeBytes: uint64(len(body)),
+		SHA256:    hex.EncodeToString(digest[:]),
+	}
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, artifact.Name),
+		body,
+		0o600,
+	))
+	backupStore := &fileBackupStore{location: root}
+	require.NoError(t, backupStore.ValidateArtifactIdentity(
+		context.Background(),
+		artifact,
+	))
+
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, artifact.Name),
+		body[:len(body)-1],
+		0o600,
+	))
+	require.ErrorIs(
+		t,
+		backupStore.ValidateArtifactIdentity(context.Background(), artifact),
+		common.ErrBackupArtifactIntegrityMismatch,
+	)
+
+	corrupt := append([]byte(nil), body...)
+	corrupt[0] ^= 0xff
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, artifact.Name),
+		corrupt,
+		0o600,
+	))
+	require.ErrorIs(
+		t,
+		backupStore.ValidateArtifactIdentity(context.Background(), artifact),
+		common.ErrBackupArtifactIntegrityMismatch,
+	)
+}
+
+func TestPortableArtifactIdentityValidationBindsRequestedBackupID(t *testing.T) {
+	root := t.TempDir()
+	body := []byte("portable-artifact")
+	digest := sha256.Sum256(body)
+	const requestedBackupID = "backup-1"
+	const artifactBackupID = "other-backup"
+	shardID := types.ID(1)
+	artifact := common.BackupArtifactIntegrity{
+		Name: common.ShardPortableBackupFileName(
+			artifactBackupID,
+			shardID,
+		),
+		SizeBytes: uint64(len(body)),
+		SHA256:    hex.EncodeToString(digest[:]),
+	}
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, artifact.Name),
+		body,
+		0o600,
+	))
+
+	err := validateBackupMetadataArtifactIdentities(
+		context.Background(),
+		&fileBackupStore{location: root},
+		requestedBackupID,
+		&backupMetadata{
+			Version: backupMetadataVersion,
+			Format:  common.BackupFormatPortable,
+			Table: &store.Table{
+				Name: "documents",
+				Shards: map[types.ID]*store.ShardConfig{
+					shardID: {},
+				},
+			},
+			Artifacts: []common.BackupArtifactIntegrity{artifact},
+		},
+	)
+	require.ErrorContains(
+		t,
+		err,
+		common.ShardPortableBackupFileName(requestedBackupID, shardID),
+	)
 }
 
 func TestFileBackupStorePublishesMetadataCreateOnly(t *testing.T) {
@@ -167,9 +330,9 @@ func TestFileBackupStorePublishesMetadataCreateOnly(t *testing.T) {
 	)
 	require.ErrorIs(t, err, ErrBackupAlreadyExists)
 
-	restored, _, err := backupStore.ReadMetadata(context.Background(), "backup-1")
+	metadata, err := backupStore.ReadMetadata(context.Background(), "backup-1")
 	require.NoError(t, err)
-	assert.Equal(t, first.Name, restored.Name)
+	assert.Equal(t, first.Name, metadata.Table.Name)
 }
 
 func TestFileBackupStoreReservationPermanentlyConsumesID(t *testing.T) {
@@ -305,7 +468,7 @@ func TestFileBackupStoreRejectsOversizedMetadata(t *testing.T) {
 		0o600,
 	))
 
-	_, _, err := backupStore.ReadMetadata(context.Background(), "backup-1")
+	_, err := backupStore.ReadMetadata(context.Background(), "backup-1")
 	require.ErrorIs(t, err, ErrBackupMetadataTooLarge)
 }
 
@@ -370,7 +533,7 @@ func TestFileBackupStoreRejectsUnversionedMetadata(t *testing.T) {
 		0o600,
 	))
 
-	_, _, err := backupStore.ReadMetadata(context.Background(), "backup-1")
+	_, err := backupStore.ReadMetadata(context.Background(), "backup-1")
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "unsupported backup metadata version")
 }
@@ -941,7 +1104,7 @@ func TestClusterBackupAttemptRejectsOverlappingIdentifiers(t *testing.T) {
 	)
 }
 
-func TestStaleUncommittedClusterBackupAttemptIsRetainedWithoutLeaseAuthority(t *testing.T) {
+func TestStaleClusterBackupAttemptWithoutLeaseIsClaimedAndReclaimed(t *testing.T) {
 	root := t.TempDir()
 	backupStore := &fileBackupStore{location: root}
 	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
@@ -954,7 +1117,7 @@ func TestStaleUncommittedClusterBackupAttemptIsRetainedWithoutLeaseAuthority(t *
 		Version:            clusterBackupAttemptVersion,
 		AttemptID:          "afba-stale",
 		BackupID:           "backup-1",
-		CreatedAt:          time.Now().UTC().Add(-clusterBackupAttemptMaxAge - time.Minute),
+		CreatedAt:          time.Now().UTC().Add(-clusterBackupAttemptReclaimGrace - time.Minute),
 		Format:             common.BackupFormatPortable,
 		ExpectedTableCount: 1,
 		TableNames:         []string{"documents"},
@@ -979,17 +1142,277 @@ func TestStaleUncommittedClusterBackupAttemptIsRetainedWithoutLeaseAuthority(t *
 	)
 	require.NoError(t, err)
 	require.Nil(t, latest)
-	require.FileExists(t, filepath.Join(root, "backup-1-1.afb"))
+	require.NoFileExists(t, filepath.Join(root, "backup-1-1.afb"))
+	require.NoFileExists(t, filepath.Join(
+		root,
+		clusterBackupAttemptDir,
+		attempt.AttemptID+".json",
+	))
+	require.NoFileExists(t, clusterBackupAttemptLeasePath(
+		"file://"+root,
+		attempt.AttemptID,
+	))
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+}
+
+func TestExpiredLeasedClusterBackupAttemptIsFencedAndReclaimed(t *testing.T) {
+	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "backup-1-1.afb"),
+		[]byte("artifact"),
+		0o600,
+	))
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-stale",
+		BackupID:           "backup-1",
+		CreatedAt:          time.Now().UTC().Add(-clusterBackupAttemptReclaimGrace - time.Minute),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"documents-backup-1"},
+		ArtifactNames:      []string{"backup-1-1.afb"},
+	}
+	_, err := writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+	require.NoError(t, createClusterBackupAttemptLease(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt.AttemptID,
+		time.Now().UTC().Add(-clusterBackupAttemptLeaseDuration-time.Minute),
+	))
+
+	latest, err := latestClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		backupStore,
+		clusterBackupAttemptScanLimit,
+		false,
+	)
+	require.NoError(t, err)
+	require.Nil(t, latest)
+	require.NoFileExists(t, filepath.Join(root, "backup-1-1.afb"))
+	require.NoFileExists(t, filepath.Join(
+		root,
+		clusterBackupAttemptDir,
+		attempt.AttemptID+".json",
+	))
+	require.NoFileExists(t, clusterBackupAttemptLeasePath(
+		"file://"+root,
+		attempt.AttemptID,
+	))
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+}
+
+func TestClusterBackupAttemptLeaseCannotRenewAfterReclamationClaim(t *testing.T) {
+	root := t.TempDir()
+	location := "file://" + root
+	attemptID := "afba-lease"
+	startedAt := time.Now().UTC()
+	require.NoError(t, createClusterBackupAttemptLease(
+		context.Background(),
+		location,
+		nil,
+		attemptID,
+		startedAt,
+	))
+
+	claimed, err := claimExpiredClusterBackupAttemptLease(
+		context.Background(),
+		location,
+		nil,
+		attemptID,
+		startedAt.Add(clusterBackupAttemptLeaseDuration-time.Second),
+	)
+	require.NoError(t, err)
+	require.False(t, claimed)
+
+	expiresAt, owned, err := renewClusterBackupAttemptLease(
+		context.Background(),
+		location,
+		nil,
+		attemptID,
+		startedAt.Add(time.Minute),
+	)
+	require.NoError(t, err)
+	require.True(t, owned)
+	require.Equal(t, startedAt.Add(time.Minute+clusterBackupAttemptLeaseDuration), expiresAt)
+
+	claimed, err = claimExpiredClusterBackupAttemptLease(
+		context.Background(),
+		location,
+		nil,
+		attemptID,
+		expiresAt.Add(time.Second),
+	)
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	_, owned, err = renewClusterBackupAttemptLease(
+		context.Background(),
+		location,
+		nil,
+		attemptID,
+		expiresAt.Add(2*time.Second),
+	)
+	require.NoError(t, err)
+	require.False(t, owned)
+}
+
+func TestExpiredAuthoritativeAttemptRetiresHeadBeforeKeepingJournal(t *testing.T) {
+	root := t.TempDir()
+	location := "file://" + root
+	backupStore := &fileBackupStore{location: root}
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-authoritative",
+		BackupID:           "backup-1",
+		CreatedAt:          time.Now().UTC().Add(-clusterBackupAttemptReclaimGrace - time.Minute),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"documents-backup-1"},
+		ArtifactNames:      []string{"backup-1-1.afb"},
+	}
+	digest, err := writeClusterBackupAttempt(
+		context.Background(),
+		location,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+	_, err = publishClusterBackupAttemptHead(
+		context.Background(),
+		location,
+		nil,
+		ClusterBackupAttemptHead{
+			AttemptID:    attempt.AttemptID,
+			BackupID:     attempt.BackupID,
+			MarkerSHA256: hex.EncodeToString(digest[:]),
+		},
+	)
+	require.NoError(t, err)
+	require.NoError(t, createClusterBackupAttemptLease(
+		context.Background(),
+		location,
+		nil,
+		attempt.AttemptID,
+		time.Now().UTC().Add(-clusterBackupAttemptLeaseDuration-time.Minute),
+	))
+
+	latest, err := latestClusterBackupAttempt(
+		context.Background(),
+		location,
+		nil,
+		backupStore,
+		clusterBackupAttemptScanLimit,
+		false,
+	)
+	require.NoError(t, err)
+	require.Nil(t, latest)
 	require.FileExists(t, filepath.Join(
 		root,
 		clusterBackupAttemptDir,
 		attempt.AttemptID+".json",
 	))
+	head, err := readClusterBackupAttemptHeadFile(filepath.Join(
+		root,
+		clusterBackupAttemptHeadName,
+	))
+	require.NoError(t, err)
+	require.Equal(t, clusterBackupAttemptStateFailed, head.State)
+	require.NoFileExists(t, clusterBackupAttemptLeasePath(location, attempt.AttemptID))
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+}
+
+func TestExpiredCommittedHeadRetainsCorruptionAuthorityWithoutAggregate(t *testing.T) {
+	root := t.TempDir()
+	location := "file://" + root
+	backupStore := &fileBackupStore{location: root}
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-committed-head",
+		BackupID:           "backup-1",
+		CreatedAt:          time.Now().UTC().Add(-clusterBackupAttemptReclaimGrace - time.Minute),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"documents-backup-1"},
+		ArtifactNames:      []string{"backup-1-1.afb"},
+	}
+	digest, err := writeClusterBackupAttempt(
+		context.Background(),
+		location,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+	_, err = publishClusterBackupAttemptHead(
+		context.Background(),
+		location,
+		nil,
+		ClusterBackupAttemptHead{
+			AttemptID:    attempt.AttemptID,
+			BackupID:     attempt.BackupID,
+			MarkerSHA256: hex.EncodeToString(digest[:]),
+		},
+	)
+	require.NoError(t, err)
+	owned, err := transitionClusterBackupAttemptHead(
+		context.Background(),
+		location,
+		nil,
+		attempt.AttemptID,
+		clusterBackupAttemptStateCommitted,
+	)
+	require.NoError(t, err)
+	require.True(t, owned)
+	require.NoError(t, createClusterBackupAttemptLease(
+		context.Background(),
+		location,
+		nil,
+		attempt.AttemptID,
+		time.Now().UTC().Add(-clusterBackupAttemptLeaseDuration-time.Minute),
+	))
+
+	latest, err := latestClusterBackupAttempt(
+		context.Background(),
+		location,
+		nil,
+		backupStore,
+		clusterBackupAttemptScanLimit,
+		false,
+	)
+	require.NoError(t, err)
+	require.Nil(t, latest)
+	require.FileExists(t, filepath.Join(
+		root,
+		clusterBackupAttemptDir,
+		attempt.AttemptID+".json",
+	))
+	require.NoFileExists(t, clusterBackupAttemptLeasePath(location, attempt.AttemptID))
 	require.ErrorIs(
 		t,
-		backupStore.ReserveBackupID(context.Background(), "backup-1"),
+		backupStore.ReserveBackupID(context.Background(), attempt.BackupID),
 		ErrBackupAlreadyExists,
 	)
+	head, err := readClusterBackupAttemptHeadFile(filepath.Join(
+		root,
+		clusterBackupAttemptHeadName,
+	))
+	require.NoError(t, err)
+	require.Equal(t, clusterBackupAttemptStateCommitted, head.State)
 }
 
 func TestStaleCommittedClusterBackupAttemptRetainsPermanentReservation(t *testing.T) {
@@ -1000,7 +1423,7 @@ func TestStaleCommittedClusterBackupAttemptRetainsPermanentReservation(t *testin
 		Version:            clusterBackupAttemptVersion,
 		AttemptID:          "afba-stale",
 		BackupID:           "backup-1",
-		CreatedAt:          time.Now().UTC().Add(-clusterBackupAttemptMaxAge - time.Minute),
+		CreatedAt:          time.Now().UTC().Add(-clusterBackupAttemptReclaimGrace - time.Minute),
 		Format:             common.BackupFormatPortable,
 		ExpectedTableCount: 1,
 		TableNames:         []string{"documents"},

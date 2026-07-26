@@ -15,12 +15,17 @@
 package common
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"go.etcd.io/raft/v3"
@@ -39,6 +44,17 @@ const (
 )
 
 var ErrBackupAlreadyExists = errors.New("backup already exists")
+
+var ErrBackupArtifactIntegrityMismatch = errors.New("backup artifact integrity mismatch")
+
+const backupArtifactVerificationBufferBytes = 256 * 1024
+
+var backupArtifactVerificationBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, backupArtifactVerificationBufferBytes)
+		return &buffer
+	},
+}
 
 func NormalizeBackupFormat(format BackupFormat) BackupFormat {
 	if format == "" {
@@ -82,6 +98,9 @@ type BackupConfig struct {
 	Location         string       `json:"location"`
 	Format           BackupFormat `json:"format,omitempty"`
 	ResolvedLocation string       `json:"-"`
+	// Artifact binds a portable restore request to the exact shard payload
+	// declared by the immutable table backup metadata.
+	Artifact *BackupArtifactIntegrity `json:"artifact,omitempty"`
 }
 
 // BackupArtifactIntegrity binds an immutable backup object to the bytes
@@ -92,6 +111,73 @@ type BackupArtifactIntegrity struct {
 	Name      string `json:"name"`
 	SizeBytes uint64 `json:"size_bytes"`
 	SHA256    string `json:"sha256"`
+}
+
+func ValidateBackupArtifactIntegrity(artifact *BackupArtifactIntegrity) error {
+	if artifact == nil ||
+		artifact.Name == "" ||
+		artifact.SizeBytes == 0 {
+		return errors.New("backup artifact identity is incomplete")
+	}
+	decoded, err := hex.DecodeString(artifact.SHA256)
+	if err != nil || len(decoded) != sha256.Size ||
+		hex.EncodeToString(decoded) != artifact.SHA256 {
+		return fmt.Errorf("backup artifact %q has an invalid SHA-256 digest", artifact.Name)
+	}
+	return nil
+}
+
+// VerifyBackupArtifact streams an artifact through SHA-256 with bounded,
+// pooled memory and checks cancellation between reads.
+func VerifyBackupArtifact(
+	ctx context.Context,
+	reader io.Reader,
+	artifact BackupArtifactIntegrity,
+) error {
+	if err := ValidateBackupArtifactIntegrity(&artifact); err != nil {
+		return err
+	}
+	bufferPtr := backupArtifactVerificationBufferPool.Get().(*[]byte)
+	defer backupArtifactVerificationBufferPool.Put(bufferPtr)
+	buffer := *bufferPtr
+	hasher := sha256.New()
+	var total uint64
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, readErr := reader.Read(buffer)
+		if n > 0 {
+			next := total + uint64(n)
+			if next < total || next > artifact.SizeBytes {
+				return fmt.Errorf(
+					"%w: %s has an unexpected size",
+					ErrBackupArtifactIntegrityMismatch,
+					artifact.Name,
+				)
+			}
+			total = next
+			_, _ = hasher.Write(buffer[:n])
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
+	}
+	if total != artifact.SizeBytes ||
+		hex.EncodeToString(hasher.Sum(nil)) != artifact.SHA256 {
+		return fmt.Errorf(
+			"%w: %s",
+			ErrBackupArtifactIntegrityMismatch,
+			artifact.Name,
+		)
+	}
+	return nil
 }
 
 const (
@@ -105,7 +191,15 @@ func (rc *BackupConfig) Equal(other *BackupConfig) bool {
 		rc.BackupID == other.BackupID &&
 		rc.Connection == other.Connection &&
 		rc.Location == other.Location &&
-		NormalizeBackupFormat(rc.Format) == NormalizeBackupFormat(other.Format)
+		NormalizeBackupFormat(rc.Format) == NormalizeBackupFormat(other.Format) &&
+		rc.Artifact.Equal(other.Artifact)
+}
+
+func (a *BackupArtifactIntegrity) Equal(other *BackupArtifactIntegrity) bool {
+	return a == nil && other == nil || a != nil && other != nil &&
+		a.Name == other.Name &&
+		a.SizeBytes == other.SizeBytes &&
+		a.SHA256 == other.SHA256
 }
 
 type PeerSet map[types.ID]struct{}

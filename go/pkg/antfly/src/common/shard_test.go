@@ -15,6 +15,11 @@
 package common
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -38,6 +43,34 @@ func TestBackupConfigDoesNotSerializeResolvedLocation(t *testing.T) {
 	if strings.Contains(string(data), "private/authorized") ||
 		strings.Contains(string(data), "resolved") {
 		t.Fatalf("resolved location leaked into serialized backup config: %s", data)
+	}
+}
+
+func TestVerifyBackupArtifactRejectsSameSizeCorruption(t *testing.T) {
+	body := []byte("portable-artifact")
+	digest := sha256.Sum256(body)
+	artifact := BackupArtifactIntegrity{
+		Name:      "backup-1-1.afb",
+		SizeBytes: uint64(len(body)),
+		SHA256:    hex.EncodeToString(digest[:]),
+	}
+	if err := VerifyBackupArtifact(
+		context.Background(),
+		bytes.NewReader(body),
+		artifact,
+	); err != nil {
+		t.Fatalf("verify valid artifact: %v", err)
+	}
+
+	corrupt := append([]byte(nil), body...)
+	corrupt[0] ^= 0xff
+	err := VerifyBackupArtifact(
+		context.Background(),
+		bytes.NewReader(corrupt),
+		artifact,
+	)
+	if !errors.Is(err, ErrBackupArtifactIntegrityMismatch) {
+		t.Fatalf("expected integrity mismatch, got %v", err)
 	}
 }
 

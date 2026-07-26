@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -622,7 +623,7 @@ func (m *Store) StartRaftGroup(
 			}
 			archiveName, copyErr := copyLocalBackupToSnapDir(
 				restoreCtx, lg, snapStore, shardID, after,
-				conf.RestoreConfig.BackupID, conf.RestoreConfig.Format,
+				conf.RestoreConfig,
 			)
 			if copyErr != nil {
 				return fmt.Errorf("copying local backup for restore: %w", copyErr)
@@ -834,17 +835,22 @@ func copyLocalBackupToSnapDir(
 	snapStore snapstore.SnapStore,
 	shardID types.ID,
 	localDir string,
-	backupID string,
-	format common.BackupFormat,
+	restoreConfig *common.BackupConfig,
 ) (string, error) {
-	backupFileName := common.ShardBackupFileName(backupID, shardID)
-	var err error
-	format, err = common.ValidateBackupFormat(format)
+	if restoreConfig == nil {
+		return "", errors.New("restore configuration is required")
+	}
+	format, err := common.ValidateBackupFormat(restoreConfig.Format)
 	if err != nil {
 		return "", err
 	}
+	backupFileName := common.ShardBackupFileName(restoreConfig.BackupID, shardID)
 	if format == common.BackupFormatPortable {
-		backupFileName = common.ShardPortableBackupFileName(backupID, shardID)
+		backupFileName = common.ShardPortableBackupFileName(restoreConfig.BackupID, shardID)
+	}
+	artifact, err := restoreArtifactForFile(restoreConfig, backupFileName)
+	if err != nil {
+		return "", err
 	}
 	srcPath := filepath.Join(localDir, backupFileName)
 
@@ -854,8 +860,34 @@ func copyLocalBackupToSnapDir(
 	}
 	defer func() { _ = f.Close() }()
 
-	if err := snapStore.Put(ctx, backupFileName, f); err != nil {
-		return "", fmt.Errorf("storing backup in snap dir: %w", err)
+	reader := io.Reader(f)
+	var (
+		pipeReader *io.PipeReader
+		verifyDone chan error
+	)
+	if artifact != nil {
+		pipeReader, pipeWriter := io.Pipe()
+		verifyDone = make(chan error, 1)
+		go func() {
+			verifyErr := common.VerifyBackupArtifact(
+				ctx,
+				io.TeeReader(f, pipeWriter),
+				*artifact,
+			)
+			_ = pipeWriter.CloseWithError(verifyErr)
+			verifyDone <- verifyErr
+		}()
+		reader = pipeReader
+	}
+	putErr := snapStore.Put(ctx, backupFileName, reader)
+	if pipeReader != nil {
+		_ = pipeReader.CloseWithError(putErr)
+		if verifyErr := <-verifyDone; verifyErr != nil && putErr == nil {
+			putErr = verifyErr
+		}
+	}
+	if putErr != nil {
+		return "", fmt.Errorf("storing backup in snap dir: %w", putErr)
 	}
 
 	lg.Info("Copied local backup to snap directory",

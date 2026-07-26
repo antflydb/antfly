@@ -513,14 +513,23 @@ func (a *mcpAdapter) Restore(
 	if err != nil {
 		return err
 	}
-	tableMetadata, format, err := metadataStore.ReadMetadata(ctx, backupID)
+	metadata, err := metadataStore.ReadMetadata(ctx, backupID)
 	if err != nil {
 		return fmt.Errorf("reading backup metadata: %w", err)
 	}
+	tableMetadata := metadata.Table
 
 	if tableMetadata.Name != tableName {
 		return fmt.Errorf("table name mismatch: expected %s, but backup metadata is for %s",
 			tableName, tableMetadata.Name)
+	}
+	if err := validateBackupMetadataArtifactIdentities(
+		ctx,
+		metadataStore,
+		backupID,
+		metadata,
+	); err != nil {
+		return fmt.Errorf("validating backup artifacts: %w", err)
 	}
 
 	if err := a.t.tm.RestoreTable(tableMetadata, &common.BackupConfig{
@@ -528,8 +537,8 @@ func (a *mcpAdapter) Restore(
 		ResolvedLocation: metadataStore.ResolvedLocation(),
 		Connection:       connection,
 		BackupID:         backupID,
-		Format:           format,
-	}); err != nil {
+		Format:           metadata.Format,
+	}, metadata.Artifacts); err != nil {
 		return fmt.Errorf("restoring table: %w", err)
 	}
 

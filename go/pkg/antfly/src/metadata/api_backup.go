@@ -76,6 +76,78 @@ func backupArtifactNamesForFormat(
 	return names
 }
 
+var backupArtifactIdentityChecks = make(chan struct{}, innerFanOutLimit)
+
+func validateBackupMetadataArtifactIdentities(
+	ctx context.Context,
+	metadataStore backupStore,
+	artifactBackupID string,
+	metadata *backupMetadata,
+) error {
+	if metadata == nil || metadata.Table == nil {
+		return errors.New("backup metadata is missing table")
+	}
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(innerFanOutLimit)
+	switch metadata.Format {
+	case common.BackupFormatNative:
+		for _, artifactName := range backupArtifactNamesForFormat(
+			artifactBackupID,
+			metadata.Table,
+			metadata.Format,
+		) {
+			artifactName := artifactName
+			group.Go(func() error {
+				select {
+				case backupArtifactIdentityChecks <- struct{}{}:
+					defer func() { <-backupArtifactIdentityChecks }()
+				case <-groupCtx.Done():
+					return groupCtx.Err()
+				}
+				return metadataStore.ValidateArtifact(groupCtx, artifactName)
+			})
+		}
+	case common.BackupFormatPortable:
+		if err := common.ValidateBackupID(artifactBackupID); err != nil {
+			return err
+		}
+		artifactsByName := make(
+			map[string]common.BackupArtifactIntegrity,
+			len(metadata.Artifacts),
+		)
+		for _, artifact := range metadata.Artifacts {
+			artifactsByName[artifact.Name] = artifact
+		}
+		for shardID := range metadata.Table.Shards {
+			expectedName := common.ShardPortableBackupFileName(
+				artifactBackupID,
+				shardID,
+			)
+			if _, ok := artifactsByName[expectedName]; !ok {
+				return fmt.Errorf(
+					"portable backup artifact %q is missing",
+					expectedName,
+				)
+			}
+		}
+		for _, artifact := range metadata.Artifacts {
+			artifact := artifact
+			group.Go(func() error {
+				select {
+				case backupArtifactIdentityChecks <- struct{}{}:
+					defer func() { <-backupArtifactIdentityChecks }()
+				case <-groupCtx.Done():
+					return groupCtx.Err()
+				}
+				return metadataStore.ValidateArtifactIdentity(groupCtx, artifact)
+			})
+		}
+	default:
+		return fmt.Errorf("unsupported backup format %q", metadata.Format)
+	}
+	return group.Wait()
+}
+
 func (t *TableApi) backupShardsWithIntegrity(
 	ctx context.Context,
 	table *store.Table,
@@ -305,11 +377,13 @@ func (t *TableApi) RestoreTable(
 		errorResponse(w, fmt.Sprintf("Invalid restore location: %v", err), http.StatusBadRequest)
 		return
 	}
-	tableMetadata, backupFormat, err := metadataStore.ReadMetadata(ctx, rr.BackupId)
+	metadata, err := metadataStore.ReadMetadata(ctx, rr.BackupId)
 	if err != nil {
 		errorResponse(w, fmt.Sprintf("Failed to read backup metadata: %v", err), http.StatusInternalServerError)
 		return
 	}
+	tableMetadata := metadata.Table
+	backupFormat := metadata.Format
 
 	if tableMetadata.Name != tableName {
 		errorResponse(
@@ -320,6 +394,19 @@ func (t *TableApi) RestoreTable(
 				tableMetadata.Name,
 			),
 			http.StatusBadRequest,
+		)
+		return
+	}
+	if err := validateBackupMetadataArtifactIdentities(
+		ctx,
+		metadataStore,
+		rr.BackupId,
+		metadata,
+	); err != nil {
+		errorResponse(
+			w,
+			fmt.Sprintf("Backup artifact validation failed: %v", err),
+			http.StatusInternalServerError,
 		)
 		return
 	}
@@ -336,7 +423,7 @@ func (t *TableApi) RestoreTable(
 		Connection:       rr.Connection,
 		BackupID:         rr.BackupId,
 		Format:           backupFormat,
-	}); err != nil {
+	}, metadata.Artifacts); err != nil {
 		errorResponse(
 			w,
 			fmt.Sprintf("Failed to restore table structure: %v", err),
@@ -430,7 +517,9 @@ const (
 	clusterBackupAttemptHeadName     = ".antfly-go-backup-attempt-head.json"
 	zigClusterBackupAttemptHeadName  = ".antfly-backup-attempt-head.json"
 	clusterBackupAttemptHeadVersion  = 1
-	clusterBackupAttemptMaxAge       = 24 * time.Hour
+	clusterBackupAttemptReclaimGrace = clusterBackupAttemptLeaseDuration +
+		clusterBackupAttemptLeaseSafetyMargin
+	clusterBackupCommitTimeout       = 2 * time.Minute
 	clusterBackupAttemptScanLimit    = 64
 	clusterBackupHealthScanLimit     = 10_000
 	clusterBackupAttemptReclaimLimit = 2
@@ -1389,14 +1478,117 @@ func reclaimStaleClusterBackupAttempt(
 		// permit an older backup to mask current health.
 		return false, nil
 	case availabilityErr == nil:
-		// Age is not proof that an attempt is abandoned: a large backup may
-		// legitimately outlive this process or the previous scan window. Keep
-		// its reservation, journal, and artifacts until a renewable lease or
-		// an explicitly authorized cleanup operation can prove ownership.
-		return false, nil
+		claimed, err := claimExpiredClusterBackupAttemptLease(
+			ctx,
+			resolvedLocation,
+			s3Info,
+			attempt.AttemptID,
+			time.Now().UTC(),
+		)
+		if err != nil || !claimed {
+			return false, err
+		}
+		head, err := currentClusterBackupAttemptHead(
+			ctx,
+			resolvedLocation,
+			s3Info,
+		)
+		if err != nil {
+			return false, err
+		}
+		retainJournal := false
+		if head != nil && head.AttemptID == attempt.AttemptID {
+			switch head.State {
+			case clusterBackupAttemptStateCommitted:
+				// A committed head remains the repository's durable health
+				// authority even if its aggregate was externally removed.
+				// Never turn that corruption into an apparently empty slot.
+				if err := deleteClusterBackupAttemptLease(
+					ctx,
+					resolvedLocation,
+					s3Info,
+					attempt.AttemptID,
+				); err != nil {
+					return false, err
+				}
+				return false, nil
+			case clusterBackupAttemptStateFailed:
+				retainJournal = true
+			case clusterBackupAttemptStateActive:
+				owned, err := transitionClusterBackupAttemptHead(
+					ctx,
+					resolvedLocation,
+					s3Info,
+					attempt.AttemptID,
+					clusterBackupAttemptStateFailed,
+				)
+				if err != nil {
+					return false, err
+				}
+				retainJournal = owned
+			}
+		}
+		// Claiming the expired lease fences a paused or restarted owner before
+		// removing commit records, artifacts, and finally the reservation.
+		// A reclaiming lease is durable, so a later scan can safely retry an
+		// interrupted cleanup without reviving the producer.
+		if err := cleanupBackupAttemptContents(
+			ctx,
+			metadataStore,
+			attempt.MetadataIDs,
+			attempt.ArtifactNames,
+		); err != nil {
+			return false, err
+		}
+		if err := metadataStore.ReleaseBackupID(ctx, attempt.BackupID); err != nil {
+			return false, err
+		}
+		if !retainJournal {
+			if err := deleteClusterBackupAttempt(
+				ctx,
+				resolvedLocation,
+				s3Info,
+				attempt.AttemptID,
+			); err != nil {
+				return false, err
+			}
+		}
+		if err := deleteClusterBackupAttemptLease(
+			ctx,
+			resolvedLocation,
+			s3Info,
+			attempt.AttemptID,
+		); err != nil {
+			return false, err
+		}
+		return true, nil
 	default:
 		return false, availabilityErr
 	}
+}
+
+func currentClusterBackupAttemptHead(
+	ctx context.Context,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+) (*ClusterBackupAttemptHead, error) {
+	if s3Info != nil {
+		client, err := s3Info.NewMinioClient()
+		if err != nil {
+			return nil, err
+		}
+		head, _, err := readClusterBackupAttemptHeadObject(
+			ctx,
+			client,
+			s3Info.Bucket,
+			path.Join(s3Info.Prefix, clusterBackupAttemptHeadName),
+		)
+		return head, err
+	}
+	return readClusterBackupAttemptHeadFile(filepath.Join(
+		strings.TrimPrefix(resolvedLocation, "file://"),
+		clusterBackupAttemptHeadName,
+	))
 }
 
 func latestClusterBackupAttempt(
@@ -1498,7 +1690,7 @@ func latestClusterBackupAttempt(
 				}
 				continue
 			}
-			if !strict && time.Since(attempt.CreatedAt) >= clusterBackupAttemptMaxAge {
+			if !strict && time.Since(attempt.CreatedAt) >= clusterBackupAttemptReclaimGrace {
 				if reclaimed >= clusterBackupAttemptReclaimLimit {
 					continue
 				}
@@ -1568,7 +1760,7 @@ func latestClusterBackupAttempt(
 				}
 				continue
 			}
-			if !strict && time.Since(attempt.CreatedAt) >= clusterBackupAttemptMaxAge {
+			if !strict && time.Since(attempt.CreatedAt) >= clusterBackupAttemptReclaimGrace {
 				if reclaimed >= clusterBackupAttemptReclaimLimit {
 					continue
 				}
@@ -1608,17 +1800,20 @@ func validateClusterBackupArtifacts(
 		tableInfo := tableInfo
 		group.Go(func() error {
 			metadataID := tableBackupMetadataID(tableInfo.Name, meta.BackupID)
-			table, format, err := metadataStore.ReadMetadata(ctx, metadataID)
+			metadata, err := metadataStore.ReadMetadata(ctx, metadataID)
 			if err != nil {
 				return err
 			}
-			if format != meta.Format || table.Name != tableInfo.Name {
+			if metadata.Format != meta.Format || metadata.Table.Name != tableInfo.Name {
 				return errors.New("cluster backup table metadata mismatch")
 			}
-			for _, artifactName := range backupArtifactNamesForFormat(meta.BackupID, table, format) {
-				if err := metadataStore.ValidateArtifact(ctx, artifactName); err != nil {
-					return err
-				}
+			if err := validateBackupMetadataArtifactIdentities(
+				ctx,
+				metadataStore,
+				meta.BackupID,
+				metadata,
+			); err != nil {
+				return err
 			}
 			return nil
 		})
@@ -1775,6 +1970,19 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		)
 		return
 	}
+	if _, err := latestClusterBackupAttempt(
+		ctx,
+		resolvedLocation,
+		s3Info,
+		metadataStore,
+		clusterBackupAttemptScanLimit,
+		false,
+	); err != nil {
+		// Reclamation is bounded maintenance. It must not make new, unrelated
+		// backup IDs unavailable when the repository itself is otherwise
+		// writable.
+		t.logger.Warn("Deferred stale Go backup attempt reclamation", zap.Error(err))
+	}
 
 	// Get list of tables to backup
 	var tableNames []string
@@ -1890,9 +2098,25 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 	committed := false
 	cleanupSafe := true
 	headPublished := false
+	var attemptLease *clusterBackupAttemptLeaseController
 	cleanupMetadataPublished := make([]bool, len(tableNames))
 	defer func() {
+		attemptLease.Stop()
 		if committed {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := deleteClusterBackupAttemptLease(
+				cleanupCtx,
+				resolvedLocation,
+				s3Info,
+				attemptID,
+			); err != nil {
+				t.logger.Warn(
+					"Committed backup attempt lease cleanup deferred",
+					zap.String("attempt_id", attemptID),
+					zap.Error(err),
+				)
+			}
+			cleanupCancel()
 			return
 		}
 		if !cleanupSafe {
@@ -1947,23 +2171,39 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 					zap.String("attempt_id", attemptID),
 					zap.Error(err),
 				)
+				return
+			}
+			if err := deleteClusterBackupAttemptLease(
+				cleanupCtx,
+				resolvedLocation,
+				s3Info,
+				attemptID,
+			); err != nil {
+				t.logger.Warn(
+					"Unpublished backup attempt lease cleanup deferred",
+					zap.String("attempt_id", attemptID),
+					zap.Error(err),
+				)
 			}
 			return
 		}
-		if owned, err := transitionClusterBackupAttemptHead(
+		owned, transitionErr := transitionClusterBackupAttemptHead(
 			cleanupCtx,
 			resolvedLocation,
 			s3Info,
 			attemptID,
 			clusterBackupAttemptStateFailed,
-		); err != nil {
+		)
+		if transitionErr != nil {
 			t.logger.Error(
 				"Failed to retire abandoned cluster backup attempt head",
 				zap.String("backup_id", req.BackupId),
 				zap.String("attempt_id", attemptID),
-				zap.Error(err),
+				zap.Error(transitionErr),
 			)
-		} else if err := compactClusterBackupAttemptIfSuperseded(
+			return
+		}
+		if err := compactClusterBackupAttemptIfSuperseded(
 			cleanupCtx,
 			resolvedLocation,
 			s3Info,
@@ -1978,8 +2218,32 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 				zap.String("attempt_id", attemptID),
 				zap.Error(err),
 			)
+			return
+		}
+		if err := deleteClusterBackupAttemptLease(
+			cleanupCtx,
+			resolvedLocation,
+			s3Info,
+			attemptID,
+		); err != nil {
+			t.logger.Warn(
+				"Abandoned backup attempt lease cleanup deferred",
+				zap.String("attempt_id", attemptID),
+				zap.Error(err),
+			)
 		}
 	}()
+	attemptLease, err = startClusterBackupAttemptLease(
+		ctx,
+		cancel,
+		resolvedLocation,
+		s3Info,
+		attemptID,
+	)
+	if err != nil {
+		writeBackupError(w, "Failed to establish backup attempt lease", err)
+		return
+	}
 	expectedHead := ClusterBackupAttemptHead{
 		Version:      clusterBackupAttemptHeadVersion,
 		AttemptID:    attemptID,
@@ -2166,23 +2430,56 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 	// The cluster manifest is the final commit point. Publish it only after
 	// every requested table artifact and table manifest is durable.
 	if failedCount == 0 {
+		_, leaseOwned, leaseErr := renewClusterBackupAttemptLease(
+			ctx,
+			resolvedLocation,
+			s3Info,
+			attemptID,
+			time.Now().UTC(),
+		)
+		if leaseErr != nil {
+			writeBackupError(w, "Failed to renew backup attempt lease", leaseErr)
+			return
+		}
+		if !leaseOwned {
+			writeBackupError(
+				w,
+				"Backup attempt lease was fenced",
+				context.Canceled,
+			)
+			return
+		}
 		clusterMeta.CompletedTableCount = len(results)
 		cleanupSafe = false
+		commitCtx, commitCancel := context.WithTimeout(ctx, clusterBackupCommitTimeout)
 		if strings.HasPrefix(req.Location, "s3://") {
-			if err := writeClusterMetadataToBlobStore(ctx, req.BackupId, clusterMeta, s3Info); err != nil {
+			if err := writeClusterMetadataToBlobStore(
+				commitCtx,
+				req.BackupId,
+				clusterMeta,
+				s3Info,
+			); err != nil {
+				commitCancel()
 				cleanupSafe = errors.Is(err, ErrBackupAlreadyExists) ||
 					errors.Is(err, ErrBackupMetadataTooLarge)
 				writeBackupError(w, "Failed to write cluster metadata", err)
 				return
 			}
 		} else {
-			if err := writeClusterMetadataToFile(ctx, resolvedLocation, req.BackupId, clusterMeta); err != nil {
+			if err := writeClusterMetadataToFile(
+				commitCtx,
+				resolvedLocation,
+				req.BackupId,
+				clusterMeta,
+			); err != nil {
+				commitCancel()
 				cleanupSafe = errors.Is(err, ErrBackupAlreadyExists) ||
 					errors.Is(err, ErrBackupMetadataTooLarge)
 				writeBackupError(w, "Failed to write cluster metadata", err)
 				return
 			}
 		}
+		commitCancel()
 		headOwned, headTransitionErr := transitionClusterBackupAttemptHead(
 			ctx,
 			resolvedLocation,
@@ -2374,6 +2671,7 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request, _ RestorePara
 	// restore and makes fail_if_exists an operation-wide admission check.
 	results := make([]TableRestoreStatus, len(tablesToRestore))
 	tableMetadata := make([]*store.Table, len(tablesToRestore))
+	tableArtifacts := make([][]common.BackupArtifactIntegrity, len(tablesToRestore))
 	tableExists := make([]bool, len(tablesToRestore))
 	preflight, _ := workerpool.NewGroup(ctx, t.pool)
 	for i, tableName := range tablesToRestore {
@@ -2403,7 +2701,7 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request, _ RestorePara
 			}
 
 			tableBackupID := tableBackupMetadataID(tableName, req.BackupId)
-			metadata, tableFormat, err := metadataStore.ReadMetadata(ctx, tableBackupID)
+			metadata, err := metadataStore.ReadMetadata(ctx, tableBackupID)
 			if err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return err
@@ -2415,28 +2713,48 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request, _ RestorePara
 				}
 				return nil
 			}
-			if tableFormat != restoreFormat {
+			if metadata.Format != restoreFormat {
 				results[i] = TableRestoreStatus{
 					Name:   tableName,
 					Status: TableRestoreStatusStatusFailed,
 					Error: fmt.Sprintf(
 						"backup format mismatch: cluster metadata has %q, table metadata has %q",
 						restoreFormat,
-						tableFormat,
+						metadata.Format,
 					),
 				}
 				return nil
 			}
 
-			if metadata.Name != tableName {
+			if metadata.Table.Name != tableName {
 				results[i] = TableRestoreStatus{
 					Name:   tableName,
 					Status: TableRestoreStatusStatusFailed,
-					Error:  fmt.Sprintf("table name mismatch: expected %s, got %s", tableName, metadata.Name),
+					Error:  fmt.Sprintf("table name mismatch: expected %s, got %s", tableName, metadata.Table.Name),
 				}
 				return nil
 			}
-			tableMetadata[i] = metadata
+			if err := validateBackupMetadataArtifactIdentities(
+				ctx,
+				metadataStore,
+				req.BackupId,
+				metadata,
+			); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return err
+				}
+				results[i] = TableRestoreStatus{
+					Name:   tableName,
+					Status: TableRestoreStatusStatusFailed,
+					Error:  "backup artifact validation failed",
+				}
+				return nil
+			}
+			tableMetadata[i] = metadata.Table
+			tableArtifacts[i] = append(
+				[]common.BackupArtifactIntegrity(nil),
+				metadata.Artifacts...,
+			)
 			return nil
 		})
 	}
@@ -2488,7 +2806,7 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request, _ RestorePara
 				Connection:       req.Connection,
 				BackupID:         req.BackupId,
 				Format:           restoreFormat,
-			}); err != nil {
+			}, tableArtifacts[i]); err != nil {
 				results[i] = TableRestoreStatus{
 					Name:   tableName,
 					Status: TableRestoreStatusStatusFailed,

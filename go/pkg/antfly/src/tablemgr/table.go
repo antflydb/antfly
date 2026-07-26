@@ -1278,18 +1278,68 @@ func (tm *TableManager) CreateTable(name string, tc TableConfig) (*store.Table, 
 func (tm *TableManager) RestoreTable(
 	table *store.Table,
 	restoreConfig *common.BackupConfig,
+	artifacts []common.BackupArtifactIntegrity,
 ) error {
 	if _, err := tm.GetTable(table.Name); err == nil {
 		return ErrTableExists
 	} else if !errors.Is(err, ErrNotFound) {
 		return fmt.Errorf("checking for existing table %s: %w", table.Name, err)
 	}
+	if restoreConfig == nil {
+		return errors.New("restore configuration is required")
+	}
+	format, err := common.ValidateBackupFormat(restoreConfig.Format)
+	if err != nil {
+		return err
+	}
+	artifactsByName := make(map[string]common.BackupArtifactIntegrity, len(artifacts))
+	switch format {
+	case common.BackupFormatNative:
+		if len(artifacts) != 0 {
+			return errors.New("native restore must not declare portable artifacts")
+		}
+	case common.BackupFormatPortable:
+		if len(artifacts) != len(table.Shards) {
+			return errors.New("portable restore artifacts do not match table shards")
+		}
+		for _, artifact := range artifacts {
+			if err := common.ValidateBackupArtifactIntegrity(&artifact); err != nil {
+				return err
+			}
+			if _, duplicate := artifactsByName[artifact.Name]; duplicate {
+				return fmt.Errorf("duplicate portable restore artifact %q", artifact.Name)
+			}
+			artifactsByName[artifact.Name] = artifact
+		}
+		for shardID := range table.Shards {
+			expectedName := common.ShardPortableBackupFileName(
+				restoreConfig.BackupID,
+				shardID,
+			)
+			if _, ok := artifactsByName[expectedName]; !ok {
+				return fmt.Errorf(
+					"portable restore artifact %q is missing",
+					expectedName,
+				)
+			}
+		}
+	}
 
 	newShardStatuses := make(map[types.ID]*store.ShardStatus, len(table.Shards))
 	for id, conf := range table.Shards {
 		conf.Indexes = table.Indexes
 		conf.Schema = table.Schema
-		conf.RestoreConfig = restoreConfig
+		shardRestoreConfig := *restoreConfig
+		if format == common.BackupFormatPortable {
+			artifact := artifactsByName[common.ShardPortableBackupFileName(
+				restoreConfig.BackupID,
+				id,
+			)]
+			shardRestoreConfig.Artifact = &artifact
+		} else {
+			shardRestoreConfig.Artifact = nil
+		}
+		conf.RestoreConfig = &shardRestoreConfig
 		newShardStatuses[id] = &store.ShardStatus{
 			ID: id,
 			ShardInfo: store.ShardInfo{
