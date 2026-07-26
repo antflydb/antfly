@@ -7575,9 +7575,16 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, auto_default));
     try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, auto_default));
 
-    const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
-    try std.testing.expect(metal_eager.eager_mode_requested);
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, metal_eager));
+    if (build_options.enable_metal) {
+        const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
+        try std.testing.expect(metal_eager.eager_mode_requested);
+        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, metal_eager));
+    } else {
+        try std.testing.expectError(
+            error.BackendUnavailable,
+            parseGenerateBackendSelection(.metal, "eager", null),
+        );
+    }
 
     try std.testing.expectError(error.InvalidGenerateMode, parseGenerateBackendSelection(null, "graph", null));
     try std.testing.expectError(error.InvalidCompiledTarget, parseGenerateBackendSelection(null, "compiled", "full"));

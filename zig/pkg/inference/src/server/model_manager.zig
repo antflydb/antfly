@@ -1230,8 +1230,6 @@ pub const ModelManager = struct {
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         errdefer man.deinit();
         if (self.serving_policy) |policy| {
-            if (!isManifestPotentiallyLoadableInCurrentBuild(man))
-                return error.IncompatibleModel;
             var inspection = try model_compatibility.inspectAlloc(self.allocator, &man);
             defer inspection.deinit(self.allocator);
             const assessment = model_compatibility.assessInspection(&man, inspection);
@@ -1241,6 +1239,12 @@ pub const ModelManager = struct {
                     return error.UnknownModelCompatibility,
                 .incompatible => return error.IncompatibleModel,
             }
+            // Preserve the compatibility classification before checking whether this
+            // particular bundle has an artifact usable by the current build. Unknown
+            // models require an explicit opt-in, but that opt-in must not make an
+            // incomplete or otherwise unloadable bundle servable.
+            if (!isManifestPotentiallyLoadableInCurrentBuild(man))
+                return error.IncompatibleModel;
             if (man.gguf_path != null) {
                 var maybe_report = try session_factory.inspectGgufModel(self.allocator, model_dir);
                 if (maybe_report) |*report| {
@@ -1912,6 +1916,33 @@ test "ModelManager serving policy fails closed before loading generator weights"
     manager.configureServingPolicy(.{});
 
     try std.testing.expectError(error.UnknownModelCompatibility, manager.loadFromDir(dir_path));
+}
+
+test "unknown opt in still rejects a generator without a loadable artifact" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "model_manifest.json",
+        .data = "{\"type\":\"generator\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"brand_new_decoder\"}",
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(dir_path);
+
+    var manager = ModelManager.init(allocator, .{
+        .allocator = allocator,
+        .preferred_backends = &.{.native},
+    });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+
+    try std.testing.expectError(error.IncompatibleModel, manager.loadFromDir(dir_path));
 }
 
 test "unknown opt in does not enable a known incompatible generator" {
