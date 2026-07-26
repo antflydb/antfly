@@ -662,11 +662,12 @@ const RemoteBackupStore = struct {
     }
 
     fn keyAlloc(self: *const RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) ![]u8 {
+        const canonical_prefix = trimRightSlash(self.prefix);
         const trimmed_suffix = trimLeftSlash(suffix);
         if (trimmed_suffix.len > 0) try validateArtifactRelativePath(trimmed_suffix);
-        if (self.prefix.len == 0) return try alloc.dupe(u8, trimmed_suffix);
-        if (trimmed_suffix.len == 0) return try alloc.dupe(u8, self.prefix);
-        return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.prefix, trimmed_suffix });
+        if (canonical_prefix.len == 0) return try alloc.dupe(u8, trimmed_suffix);
+        if (trimmed_suffix.len == 0) return try alloc.dupe(u8, canonical_prefix);
+        return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ canonical_prefix, trimmed_suffix });
     }
 
     fn keyPrefixAlloc(self: *const RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8) ![]u8 {
@@ -749,9 +750,13 @@ const RemoteBackupStore = struct {
     }
 
     fn readBytesAllocLimited(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, max_bytes: usize) ![]u8 {
-        if (max_bytes == std.math.maxInt(usize)) return error.InvalidBackupManifestLimit;
         const key = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key);
+        return try self.readKeyBytesAllocLimited(alloc, key, max_bytes);
+    }
+
+    fn readKeyBytesAllocLimited(self: *RemoteBackupStore, alloc: std.mem.Allocator, key: []const u8, max_bytes: usize) ![]u8 {
+        if (max_bytes == std.math.maxInt(usize)) return error.InvalidBackupManifestLimit;
         var result = try self.client.getObject(self.bucket, key, .{
             // Fetch one sentinel byte beyond the accepted limit. The range is
             // authoritative for buffering even when a provider client also
@@ -2219,12 +2224,31 @@ pub fn readClusterManifestFromLocation(
             defer alloc.free(suffix);
             const body = try store.readBytesAllocLimited(alloc, trimLeftSlash(suffix), max_backup_manifest_bytes);
             defer alloc.free(body);
-            var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
-            defer parsed.deinit();
-            try validateClusterManifest(alloc, &parsed.value, backup_id);
-            return try cloneClusterBackupManifest(alloc, parsed.value);
+            return try parseClusterManifestBytes(alloc, body, backup_id);
         },
     }
+}
+
+fn readClusterManifestFromRemoteKey(
+    alloc: std.mem.Allocator,
+    store: *RemoteBackupStore,
+    key: []const u8,
+    backup_id: []const u8,
+) !ClusterBackupManifest {
+    const body = try store.readKeyBytesAllocLimited(alloc, key, max_backup_manifest_bytes);
+    defer alloc.free(body);
+    return try parseClusterManifestBytes(alloc, body, backup_id);
+}
+
+fn parseClusterManifestBytes(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    backup_id: []const u8,
+) !ClusterBackupManifest {
+    var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try validateClusterManifest(alloc, &parsed.value, backup_id);
+    return try cloneClusterBackupManifest(alloc, parsed.value);
 }
 
 pub fn clusterManifestExistsAtLocation(alloc: std.mem.Allocator, location: *BackupLocation, backup_id: []const u8) !bool {
@@ -2428,6 +2452,10 @@ fn retainSmallestBackupId(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged
     maxHeapSiftDown(ids.items, 0);
 }
 
+fn couldRetainSmallestBackupId(ids: *const std.ArrayListUnmanaged([]u8), capacity: usize, backup_id: []const u8) bool {
+    return ids.items.len < capacity or std.mem.order(u8, backup_id, ids.items[0]) == .lt;
+}
+
 fn backupIdLessThan(_: void, lhs: []u8, rhs: []u8) bool {
     return std.mem.order(u8, lhs, rhs) == .lt;
 }
@@ -2483,15 +2511,28 @@ pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, loc
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, "-cluster-metadata.json")) continue;
         const backup_id = entry.name[0 .. entry.name.len - "-cluster-metadata.json".len];
-        validateBackupId(backup_id) catch continue;
-        if (cursor_name) |cursor| if (std.mem.order(u8, entry.name, cursor) != .gt) continue;
-        // Validate before admitting the key into the bounded selection heap.
-        // Otherwise corrupt manifests can consume page capacity and make valid
-        // backups beyond them unreachable without a misleading cursor.
-        var validated = readClusterManifest(alloc, backup_root, backup_id) catch |err| {
-            std.log.warn("skipping invalid cluster backup manifest backup_id={s} err={s}", .{ backup_id, @errorName(err) });
+        validateBackupId(backup_id) catch {
+            std.log.warn("cluster backup list skipped manifest phase=key_validation class=invalid_manifest", .{});
             continue;
         };
+        if (cursor_name) |cursor| if (std.mem.order(u8, entry.name, cursor) != .gt) continue;
+        if (!couldRetainSmallestBackupId(&backup_ids, options.limit + 1, entry.name)) continue;
+        // Validate before admitting the key into the bounded selection heap.
+        // Otherwise corrupt manifests can consume page capacity and make valid
+        // backups beyond them unreachable. Noncompetitive keys do not incur a
+        // manifest read.
+        var validated = readClusterManifest(alloc, backup_root, backup_id) catch |err| {
+            if (!isSkippableBackupListManifestError(err)) {
+                std.log.err("cluster backup list failed phase=manifest_read class={s}", .{backupListManifestErrorClass(err)});
+                return err;
+            }
+            std.log.warn("cluster backup list skipped manifest phase=manifest_read class={s}", .{backupListManifestErrorClass(err)});
+            continue;
+        };
+        if (validated.format_version != cluster_format_version) {
+            validated.deinit(alloc);
+            continue;
+        }
         validated.deinit(alloc);
         try retainSmallestBackupId(alloc, &backup_ids, options.limit + 1, entry.name);
     }
@@ -2508,10 +2549,15 @@ pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, loc
     for (backup_ids.items) |manifest_name| {
         const backup_id = backupIdFromClusterMetadataKey(manifest_name);
         var manifest = readClusterManifest(alloc, backup_root, backup_id) catch |err| {
-            std.log.warn("skipping invalid cluster backup manifest backup_id={s} err={s}", .{ backup_id, @errorName(err) });
+            if (!isSkippableBackupListManifestError(err)) {
+                std.log.err("cluster backup list failed phase=manifest_read class={s}", .{backupListManifestErrorClass(err)});
+                return err;
+            }
+            std.log.warn("cluster backup list skipped manifest phase=manifest_read class={s}", .{backupListManifestErrorClass(err)});
             continue;
         };
         defer manifest.deinit(alloc);
+        if (manifest.format_version != cluster_format_version) continue;
         infos.appendAssumeCapacity(try backupInfoFromManifest(alloc, &manifest, location));
     }
     const next_cursor = if (has_more and infos.items.len > 0) try alloc.dupe(u8, infos.items[infos.items.len - 1].backup_id) else null;
@@ -2532,6 +2578,104 @@ pub fn listClusterBackupsFromLocation(
     }
 
     return try listClusterBackupsFromOpenedLocation(alloc, &location, location_uri, options);
+}
+
+pub fn backupListErrorClass(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound => "not_found",
+        error.AccessDenied, error.Unauthorized => "access_denied",
+        error.Timeout,
+        error.ConnectionTimeout,
+        error.ConnectionTimedOut,
+        => "timeout",
+        error.RemoteUnavailable,
+        error.RateLimited,
+        error.UnexpectedHttpStatus,
+        error.ConnectionFailed,
+        error.ConnectionReset,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.ConnectionClosed,
+        error.NetworkUnreachable,
+        error.NetworkDown,
+        error.HostUnreachable,
+        error.DnsResolutionFailed,
+        error.TlsHandshakeFailed,
+        error.TlsCertificateError,
+        error.TlsError,
+        error.RecvFailed,
+        error.SendFailed,
+        error.ProtocolError,
+        error.StreamError,
+        error.FlowControlError,
+        error.FrameError,
+        error.CompressionError,
+        error.Http2Error,
+        error.Http3Error,
+        error.QuicError,
+        => "transport",
+        else => "internal",
+    };
+}
+
+fn backupListManifestErrorClass(err: anyerror) []const u8 {
+    if (isInvalidBackupListManifestError(err)) return "invalid_manifest";
+    return backupListErrorClass(err);
+}
+
+fn isSkippableBackupListManifestError(err: anyerror) bool {
+    return err == error.FileNotFound or isInvalidBackupListManifestError(err);
+}
+
+fn isInvalidBackupListManifestError(err: anyerror) bool {
+    return switch (err) {
+        error.SyntaxError,
+        error.UnexpectedEndOfInput,
+        error.UnexpectedToken,
+        error.InvalidNumber,
+        error.InvalidCharacter,
+        error.Overflow,
+        error.InvalidEnumTag,
+        error.DuplicateField,
+        error.UnknownField,
+        error.MissingField,
+        error.LengthMismatch,
+        error.ValueTooLong,
+        error.BufferUnderrun,
+        error.UnsupportedBackupFormat,
+        error.InvalidBackupId,
+        error.InvalidBackupRequest,
+        error.IncompleteClusterBackup,
+        error.BackupManifestTooLarge,
+        => true,
+        else => false,
+    };
+}
+
+fn backupIdFromListedRemoteClusterMetadataKey(
+    store: *const RemoteBackupStore,
+    key: []const u8,
+) ?[]const u8 {
+    const canonical_prefix = trimRightSlash(store.prefix);
+    const relative = if (canonical_prefix.len == 0)
+        key
+    else blk: {
+        if (!std.mem.startsWith(u8, key, canonical_prefix) or
+            key.len <= canonical_prefix.len or
+            key[canonical_prefix.len] != '/')
+        {
+            return null;
+        }
+        break :blk key[canonical_prefix.len + 1 ..];
+    };
+    const suffix = "-cluster-metadata.json";
+    if (relative.len <= suffix.len or
+        std.mem.indexOfScalar(u8, relative, '/') != null or
+        !std.mem.endsWith(u8, relative, suffix))
+    {
+        return null;
+    }
+    return relative[0 .. relative.len - suffix.len];
 }
 
 pub fn listClusterBackupsFromOpenedLocation(
@@ -2562,24 +2706,42 @@ pub fn listClusterBackupsFromOpenedLocation(
     defer if (start_after) |value| alloc.free(value);
     var has_more = false;
     while (true) {
-        var listed = try location.remote.listTopLevelObjectsPage(alloc, if (continuation_token == null) start_after else null, continuation_token);
+        var listed = location.remote.listTopLevelObjectsPage(
+            alloc,
+            if (continuation_token == null) start_after else null,
+            continuation_token,
+        ) catch |err| {
+            std.log.err("cluster backup list failed phase=enumerate class={s}", .{backupListErrorClass(err)});
+            return err;
+        };
         defer listed.deinit(alloc);
         var next_token: ?[]u8 = null;
         defer if (next_token) |token| alloc.free(token);
 
         for (listed.entries) |entry| {
             if (!std.mem.endsWith(u8, entry.key, "-cluster-metadata.json")) continue;
-            const backup_id = backupIdFromClusterMetadataKey(entry.key);
-            validateBackupId(backup_id) catch continue;
+            const backup_id = backupIdFromListedRemoteClusterMetadataKey(&location.remote, entry.key) orelse {
+                std.log.warn("cluster backup list skipped manifest phase=key_validation class=invalid_manifest", .{});
+                continue;
+            };
+            validateBackupId(backup_id) catch {
+                std.log.warn("cluster backup list skipped manifest phase=key_validation class=invalid_manifest", .{});
+                continue;
+            };
+            var manifest = readClusterManifestFromRemoteKey(alloc, &location.remote, entry.key, backup_id) catch |err| {
+                if (!isSkippableBackupListManifestError(err)) {
+                    std.log.err("cluster backup list failed phase=manifest_read class={s}", .{backupListManifestErrorClass(err)});
+                    return err;
+                }
+                std.log.warn("cluster backup list skipped manifest phase=manifest_read class={s}", .{backupListManifestErrorClass(err)});
+                continue;
+            };
+            defer manifest.deinit(alloc);
+            if (manifest.format_version != cluster_format_version) continue;
             if (infos.items.len == options.limit) {
                 has_more = true;
                 break;
             }
-            var manifest = readClusterManifestFromLocation(alloc, location, backup_id) catch |err| {
-                std.log.warn("skipping invalid cluster backup manifest backup_id={s} err={s}", .{ backup_id, @errorName(err) });
-                continue;
-            };
-            defer manifest.deinit(alloc);
             infos.appendAssumeCapacity(try backupInfoFromManifest(alloc, &manifest, location_uri));
         }
 
@@ -3981,6 +4143,61 @@ test "remote backup metadata reads are size bounded" {
     try std.testing.expectEqualStrings("0123456789abcdef", body);
 }
 
+test "remote backup key joins canonicalize only the prefix boundary" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+
+    inline for (&.{
+        .{ "backups/prod", "snap-cluster-metadata.json", "backups/prod/snap-cluster-metadata.json" },
+        .{ "backups/prod/", "/snap-cluster-metadata.json", "backups/prod/snap-cluster-metadata.json" },
+        .{ "/", "/snap-cluster-metadata.json", "snap-cluster-metadata.json" },
+        .{ "backups//prod/", "snap-cluster-metadata.json", "backups//prod/snap-cluster-metadata.json" },
+    }) |case| {
+        var store = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", case[0]);
+        defer store.deinit();
+        const key = try store.keyAlloc(alloc, case[1]);
+        defer alloc.free(key);
+        try std.testing.expectEqualStrings(case[2], key);
+    }
+
+    var trailing = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups/prod/");
+    defer trailing.deinit();
+    try std.testing.expectEqualStrings(
+        "snap",
+        backupIdFromListedRemoteClusterMetadataKey(
+            &trailing,
+            "backups/prod/snap-cluster-metadata.json",
+        ).?,
+    );
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        backupIdFromListedRemoteClusterMetadataKey(
+            &trailing,
+            "backups/prod/snap/groups/7/nested-cluster-metadata.json",
+        ),
+    );
+
+    try std.testing.expectEqualStrings("not_found", backupListErrorClass(error.FileNotFound));
+    try std.testing.expectEqualStrings("access_denied", backupListErrorClass(error.AccessDenied));
+    try std.testing.expectEqualStrings("timeout", backupListErrorClass(error.Timeout));
+    try std.testing.expectEqualStrings("timeout", backupListErrorClass(error.ConnectionTimeout));
+    try std.testing.expectEqualStrings("transport", backupListErrorClass(error.RemoteUnavailable));
+    try std.testing.expectEqualStrings("transport", backupListErrorClass(error.ConnectionFailed));
+    try std.testing.expectEqualStrings("transport", backupListErrorClass(error.ConnectionReset));
+    try std.testing.expectEqualStrings("transport", backupListErrorClass(error.DnsResolutionFailed));
+    try std.testing.expectEqualStrings("transport", backupListErrorClass(error.TlsHandshakeFailed));
+    try std.testing.expectEqualStrings("transport", backupListErrorClass(error.RecvFailed));
+    try std.testing.expectEqualStrings("invalid_manifest", backupListManifestErrorClass(error.SyntaxError));
+    try std.testing.expect(isSkippableBackupListManifestError(error.SyntaxError));
+    try std.testing.expect(isSkippableBackupListManifestError(error.FileNotFound));
+    try std.testing.expect(!isSkippableBackupListManifestError(error.OutOfMemory));
+    try std.testing.expect(!isSkippableBackupListManifestError(error.AccessDenied));
+    try std.testing.expect(!isSkippableBackupListManifestError(error.InputOutput));
+    try std.testing.expectEqualStrings("internal", backupListManifestErrorClass(error.OutOfMemory));
+    try std.testing.expectEqualStrings("internal", backupListManifestErrorClass(error.InputOutput));
+}
+
 test "remote portable file transfer uses objectstore file paths" {
     const alloc = std.testing.allocator;
     const root = ".zig-cache/test-backup-file-transfer-store";
@@ -4090,6 +4307,13 @@ test "cluster backup list uses top-level remote manifests without recursing into
         .{ .content_type = "application/octet-stream" },
     );
     defer nested.deinit(std.testing.allocator);
+    var corrupt = try raw_client.putObject(
+        "bucket",
+        "backups/prod/prod-snap-z-cluster-metadata.json",
+        "{not-json",
+        .{ .content_type = "application/json" },
+    );
+    defer corrupt.deinit(std.testing.allocator);
 
     var first = try listClusterBackupsFromOpenedLocation(std.testing.allocator, &location, "s3://bucket/backups/prod", .{ .limit = 2 });
     defer first.deinit(std.testing.allocator);
@@ -4104,7 +4328,7 @@ test "cluster backup list uses top-level remote manifests without recursing into
     try std.testing.expect(std.mem.indexOf(u8, first_json, "\"next_cursor\":\"prod-snap-3\"") != null);
 
     var second = try listClusterBackupsFromOpenedLocation(std.testing.allocator, &location, "s3://bucket/backups/prod", .{
-        .limit = 2,
+        .limit = 1,
         .cursor = first.next_cursor,
     });
     defer second.deinit(std.testing.allocator);
@@ -4114,6 +4338,294 @@ test "cluster backup list uses top-level remote manifests without recursing into
     const second_json = try encodeBackupListResponse(std.testing.allocator, &second);
     defer std.testing.allocator.free(second_json);
     try std.testing.expect(std.mem.indexOf(u8, second_json, "next_cursor") == null);
+}
+
+test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
+    const alloc = std.testing.allocator;
+    const backup_ids = [_][]const u8{ "snap-a", "snap-b", "snap-c" };
+    const entries = [_]ClusterTableBackupEntry{
+        .{ .name = "docs", .table_backup_id = "docs-snap" },
+    };
+    var encoded_manifests: [backup_ids.len][]u8 = undefined;
+    var encoded_count: usize = 0;
+    defer for (encoded_manifests[0..encoded_count]) |encoded| alloc.free(encoded);
+    for (backup_ids, 0..) |backup_id, index| {
+        var manifest = try createClusterManifest(
+            alloc,
+            backup_id,
+            "s3://bucket/backups/prod",
+            &entries,
+        );
+        defer manifest.deinit(alloc);
+        encoded_manifests[index] = try stringifyJsonAlloc(alloc, manifest);
+        encoded_count += 1;
+    }
+
+    const FakeS3 = struct {
+        manifests: *const [backup_ids.len][]u8,
+        list_requests: usize = 0,
+        manifest_head_requests: usize = 0,
+        manifest_get_requests: usize = 0,
+
+        fn manifestForKey(self: *@This(), key: []const u8) ?[]const u8 {
+            inline for (backup_ids, 0..) |backup_id, index| {
+                var expected_buf: [128]u8 = undefined;
+                const expected = std.fmt.bufPrint(
+                    &expected_buf,
+                    "backups/prod/{s}-cluster-metadata.json",
+                    .{backup_id},
+                ) catch unreachable;
+                if (std.mem.eql(u8, key, expected)) return self.manifests[index];
+            }
+            return null;
+        }
+
+        fn request(
+            ctx: ?*anyopaque,
+            request_alloc: std.mem.Allocator,
+            method: object_storage.S3.HttpMethod,
+            url: []const u8,
+            headers: []const object_storage.S3.HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+        ) !object_storage.S3.TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const parsed = try std.Uri.parse(url);
+            const encoded_path = parsed.path.percent_encoded;
+            const path_buf = try request_alloc.dupe(u8, encoded_path);
+            defer request_alloc.free(path_buf);
+            const path = std.Uri.percentDecodeInPlace(path_buf);
+
+            if (method == .GET and parsed.query != null) {
+                try std.testing.expectEqualStrings("/bucket", path);
+                const encoded_query = parsed.query.?.percent_encoded;
+                const query_buf = try request_alloc.dupe(u8, encoded_query);
+                defer request_alloc.free(query_buf);
+                const query = std.Uri.percentDecodeInPlace(query_buf);
+                try std.testing.expect(std.mem.indexOf(u8, query, "delimiter=/") != null);
+                try std.testing.expect(std.mem.indexOf(u8, query, "prefix=backups/prod/") != null);
+                try std.testing.expect(std.mem.indexOf(u8, query, "backups/prod//") == null);
+                self.list_requests += 1;
+
+                const page = if (std.mem.indexOf(u8, query, "continuation-token=page-2") != null or
+                    std.mem.indexOf(u8, query, "start-after=backups/prod/snap-b-cluster-metadata.json") != null)
+                    "<ListBucketResult><Contents><Key>backups/prod/snap-c-cluster-metadata.json</Key><ETag>\"c\"</ETag><Size>1</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"
+                else
+                    "<ListBucketResult><Contents><Key>backups/prod/snap-a-cluster-metadata.json</Key><ETag>\"a\"</ETag><Size>1</Size></Contents><Contents><Key>backups/prod/snap-b-cluster-metadata.json</Key><ETag>\"b\"</ETag><Size>1</Size></Contents><CommonPrefixes><Prefix>backups/prod/snap-a/</Prefix></CommonPrefixes><IsTruncated>true</IsTruncated><NextContinuationToken>page-2</NextContinuationToken></ListBucketResult>";
+                return .{
+                    .status = 200,
+                    .body = try request_alloc.dupe(u8, page),
+                };
+            }
+
+            const object_path_prefix = "/bucket/";
+            try std.testing.expect(std.mem.startsWith(u8, path, object_path_prefix));
+            const key = path[object_path_prefix.len..];
+            try std.testing.expect(std.mem.indexOf(u8, key, "backups/prod//") == null);
+            const manifest_body = self.manifestForKey(key) orelse return error.UnexpectedS3ObjectKey;
+            return switch (method) {
+                .HEAD => blk: {
+                    self.manifest_head_requests += 1;
+                    break :blk .{
+                        .status = 200,
+                        .body = try request_alloc.alloc(u8, 0),
+                        .etag = try request_alloc.dupe(u8, "\"manifest\""),
+                        .content_length = @intCast(manifest_body.len),
+                        .content_type = try request_alloc.dupe(u8, "application/json"),
+                    };
+                },
+                .GET => blk: {
+                    var has_bounded_range = false;
+                    for (headers) |header| {
+                        if (std.ascii.eqlIgnoreCase(header[0], "Range")) {
+                            has_bounded_range = std.mem.startsWith(u8, header[1], "bytes=0-");
+                        }
+                    }
+                    try std.testing.expect(has_bounded_range);
+                    self.manifest_get_requests += 1;
+                    break :blk .{
+                        .status = 206,
+                        .body = try request_alloc.dupe(u8, manifest_body),
+                        .etag = try request_alloc.dupe(u8, "\"manifest\""),
+                        .content_type = try request_alloc.dupe(u8, "application/json"),
+                    };
+                },
+                else => error.UnexpectedS3Method,
+            };
+        }
+    };
+
+    var fake = FakeS3{ .manifests = &encoded_manifests };
+    const s3_config = object_storage.S3.Config{
+        .credentials = .{
+            .endpoint = try alloc.dupe(u8, "s3.test.invalid"),
+            .use_ssl = false,
+            .access_key_id = try alloc.dupe(u8, "test-key"),
+            .secret_access_key = try alloc.dupe(u8, "test-secret"),
+            .region = try alloc.dupe(u8, "us-east-1"),
+        },
+        .addressing_style = .path,
+    };
+    var s3_impl = object_storage.S3.Client.initWithRequestFn(
+        alloc,
+        s3_config,
+        &fake,
+        FakeS3.request,
+    );
+    var s3_client = s3_impl.client();
+    defer s3_client.deinit();
+
+    var canonical_uri = try remote_uri.bucketPathFromS3UriAlloc(alloc, "s3://bucket/backups/prod");
+    defer canonical_uri.deinit(alloc);
+    var trailing_uri = try remote_uri.bucketPathFromS3UriAlloc(alloc, "s3://bucket/backups/prod/");
+    defer trailing_uri.deinit(alloc);
+    try std.testing.expectEqualStrings(canonical_uri.prefix, trailing_uri.prefix);
+
+    var canonical: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(
+            alloc,
+            s3_impl.client(),
+            canonical_uri.bucket,
+            canonical_uri.prefix,
+        ),
+    };
+    defer canonical.deinit(alloc);
+    var trailing: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(
+            alloc,
+            s3_impl.client(),
+            trailing_uri.bucket,
+            trailing_uri.prefix,
+        ),
+    };
+    defer trailing.deinit(alloc);
+
+    var canonical_first = try listClusterBackupsFromOpenedLocation(
+        alloc,
+        &canonical,
+        "s3://bucket/backups/prod",
+        .{ .limit = 2 },
+    );
+    defer canonical_first.deinit(alloc);
+    var trailing_first = try listClusterBackupsFromOpenedLocation(
+        alloc,
+        &trailing,
+        "s3://bucket/backups/prod/",
+        .{ .limit = 2 },
+    );
+    defer trailing_first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), canonical_first.backups.len);
+    try std.testing.expectEqual(canonical_first.backups.len, trailing_first.backups.len);
+    for (canonical_first.backups, trailing_first.backups) |canonical_info, trailing_info| {
+        try std.testing.expectEqualStrings(canonical_info.backup_id, trailing_info.backup_id);
+    }
+    try std.testing.expectEqualStrings(canonical_first.next_cursor.?, trailing_first.next_cursor.?);
+
+    var canonical_second = try listClusterBackupsFromOpenedLocation(
+        alloc,
+        &canonical,
+        "s3://bucket/backups/prod",
+        .{ .limit = 2, .cursor = canonical_first.next_cursor },
+    );
+    defer canonical_second.deinit(alloc);
+    var trailing_second = try listClusterBackupsFromOpenedLocation(
+        alloc,
+        &trailing,
+        "s3://bucket/backups/prod/",
+        .{ .limit = 2, .cursor = trailing_first.next_cursor },
+    );
+    defer trailing_second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), canonical_second.backups.len);
+    try std.testing.expectEqualStrings(
+        canonical_second.backups[0].backup_id,
+        trailing_second.backups[0].backup_id,
+    );
+    try std.testing.expectEqual(@as(?[]u8, null), canonical_second.next_cursor);
+    try std.testing.expectEqual(@as(?[]u8, null), trailing_second.next_cursor);
+    try std.testing.expectEqual(@as(usize, 6), fake.list_requests);
+    try std.testing.expectEqual(@as(usize, 8), fake.manifest_head_requests);
+    try std.testing.expectEqual(@as(usize, 8), fake.manifest_get_requests);
+}
+
+test "cluster backup list canonicalizes trailing remote prefix slash" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var canonical: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups/prod"),
+    };
+    defer canonical.deinit(alloc);
+    var trailing: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups/prod/"),
+    };
+    defer trailing.deinit(alloc);
+
+    const entries = [_]ClusterTableBackupEntry{
+        .{ .name = "docs", .table_backup_id = "docs-snap" },
+    };
+    inline for (&.{ "snap-a", "snap-b", "snap-c" }, 0..) |backup_id, index| {
+        var manifest = try createClusterManifest(
+            alloc,
+            backup_id,
+            if (index % 2 == 0) "s3://bucket/backups/prod" else "s3://bucket/backups/prod/",
+            &entries,
+        );
+        defer manifest.deinit(alloc);
+        const writer = if (index % 2 == 0) &canonical else &trailing;
+        try writeClusterManifestToLocation(alloc, writer, &manifest);
+    }
+
+    var raw_client = memory.client();
+    var listed = try raw_client.listObjects("bucket", .{
+        .prefix = "backups/prod/",
+        .recursive = true,
+    });
+    defer listed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), listed.entries.len);
+    for (listed.entries) |entry| {
+        try std.testing.expect(std.mem.indexOf(u8, entry.key, "backups/prod//") == null);
+    }
+
+    var canonical_first = try listClusterBackupsFromOpenedLocation(
+        alloc,
+        &canonical,
+        "s3://bucket/backups/prod",
+        .{ .limit = 2 },
+    );
+    defer canonical_first.deinit(alloc);
+    var trailing_first = try listClusterBackupsFromOpenedLocation(
+        alloc,
+        &trailing,
+        "s3://bucket/backups/prod/",
+        .{ .limit = 2 },
+    );
+    defer trailing_first.deinit(alloc);
+    try std.testing.expectEqual(canonical_first.backups.len, trailing_first.backups.len);
+    for (canonical_first.backups, trailing_first.backups) |canonical_info, trailing_info| {
+        try std.testing.expectEqualStrings(canonical_info.backup_id, trailing_info.backup_id);
+    }
+    try std.testing.expectEqualStrings(canonical_first.next_cursor.?, trailing_first.next_cursor.?);
+
+    var canonical_second = try listClusterBackupsFromOpenedLocation(
+        alloc,
+        &canonical,
+        "s3://bucket/backups/prod",
+        .{ .limit = 2, .cursor = canonical_first.next_cursor },
+    );
+    defer canonical_second.deinit(alloc);
+    var trailing_second = try listClusterBackupsFromOpenedLocation(
+        alloc,
+        &trailing,
+        "s3://bucket/backups/prod/",
+        .{ .limit = 2, .cursor = trailing_first.next_cursor },
+    );
+    defer trailing_second.deinit(alloc);
+    try std.testing.expectEqual(canonical_second.backups.len, trailing_second.backups.len);
+    for (canonical_second.backups, trailing_second.backups) |canonical_info, trailing_info| {
+        try std.testing.expectEqualStrings(canonical_info.backup_id, trailing_info.backup_id);
+    }
+    try std.testing.expectEqual(@as(?[]u8, null), canonical_second.next_cursor);
+    try std.testing.expectEqual(@as(?[]u8, null), trailing_second.next_cursor);
 }
 
 test "remote backup reservations fence duplicate execution and can be released after cleanup" {
