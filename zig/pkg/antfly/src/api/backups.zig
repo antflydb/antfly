@@ -86,6 +86,7 @@ const backup_attempt_reclaim_cursor_name = ".antfly-backup-reclaim-cursor";
 const backup_attempt_reclaim_index_name = ".antfly-backup-reclaim-index-v1";
 const current_go_backup_attempt_version: u32 = 1;
 const current_go_backup_attempt_scan_limit: usize = 10_000;
+const current_go_backup_attempt_total_bytes_limit: usize = 64 * 1024 * 1024;
 const current_go_backup_attempt_max_artifacts: usize = 1_000_000;
 pub const manifest_too_large_message = "backup manifest exceeds 16 MiB limit";
 pub const integrity_failure_message = "backup artifact failed integrity verification";
@@ -3234,6 +3235,7 @@ const ParsedCurrentGoClusterBackupAttempt = struct {
 const CurrentGoAttemptRepositorySnapshot = struct {
     fingerprint: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0),
     marker_count: usize = 0,
+    parsed_bytes: usize = 0,
     latest: ?ParsedCurrentGoClusterBackupAttempt = null,
 
     fn deinit(self: *@This()) void {
@@ -3484,9 +3486,15 @@ fn absorbCurrentGoAttemptMarker(
     attempt_id: []const u8,
     body: []const u8,
 ) !void {
+    const parsed_bytes = std.math.add(usize, snapshot.parsed_bytes, body.len) catch
+        return error.BackupRepositoryHealthScanLimitExceeded;
+    if (parsed_bytes > current_go_backup_attempt_total_bytes_limit)
+        return error.BackupRepositoryHealthScanLimitExceeded;
+
     var parsed = try parseCurrentGoClusterBackupAttempt(alloc, body, attempt_id);
     var parsed_owned = true;
     defer if (parsed_owned) parsed.deinit();
+    snapshot.parsed_bytes = parsed_bytes;
 
     const replace_latest = if (snapshot.latest) |*latest| blk: {
         const timestamp_order = currentGoAttemptTimestampOrder(
@@ -10492,6 +10500,25 @@ test "current Go attempt snapshot marker-count budget fails closed" {
             "afba-budget",
             1024,
             "\"etag\"",
+        ),
+    );
+}
+
+test "current Go attempt snapshot parsed-byte budget fails closed" {
+    const alloc = std.testing.allocator;
+    const marker =
+        "{\"version\":1,\"attempt_id\":\"afba-budget\",\"backup_id\":\"go-budget\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-85ebc63c34b2947dfb825fd107b98a347971125de92cb3893a95333d6ada7cbd\"],\"artifact_names\":[\"go-budget-1.afb\"]}";
+    var snapshot: CurrentGoAttemptRepositorySnapshot = .{
+        .parsed_bytes = current_go_backup_attempt_total_bytes_limit,
+    };
+    defer snapshot.deinit();
+    try std.testing.expectError(
+        error.BackupRepositoryHealthScanLimitExceeded,
+        absorbCurrentGoAttemptMarker(
+            alloc,
+            &snapshot,
+            "afba-budget",
+            marker,
         ),
     );
 }
