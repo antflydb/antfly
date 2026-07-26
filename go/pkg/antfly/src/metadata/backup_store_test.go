@@ -252,6 +252,11 @@ func TestTableBackupMetadataIDIsStableAndPathSafe(t *testing.T) {
 	assert.NotEqual(t, first, tableBackupMetadataID("tenant/table", "with spaces\x00backup-1"))
 	require.NoError(t, common.ValidateBackupID(first))
 	assert.Len(t, first, len("table-")+64)
+	assert.Equal(
+		t,
+		"table-77cfb73404d45d27f72ecbfb232c3fbaf6efbb64592b5ae78fca3e5c544fd3d4",
+		tableBackupMetadataID("docs", "go-cluster"),
+	)
 }
 
 func TestValidateBackupTableNamesRejectsAmbiguousSelections(t *testing.T) {

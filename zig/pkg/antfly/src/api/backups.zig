@@ -969,6 +969,8 @@ const RemoteBackupStore = struct {
                 defer alloc.free(key);
                 var metadata = try self.client.statObject(self.bucket, key);
                 defer metadata.deinit(alloc);
+                if (metadata.content_length == 0)
+                    return error.BackupArtifactMissing;
                 if (integrity_mode == .declared and
                     metadata.content_length != shard.artifact_size_bytes)
                 {
@@ -3293,7 +3295,7 @@ fn parseCurrentGoAttemptTimestamp(text: []const u8) !CurrentGoAttemptTimestamp {
     } else if (text[19] != 'Z') {
         return error.InvalidBackupRequest;
     }
-    return .{
+    const timestamp: CurrentGoAttemptTimestamp = .{
         .year = year,
         .month = month,
         .day = day,
@@ -3302,6 +3304,14 @@ fn parseCurrentGoAttemptTimestamp(text: []const u8) !CurrentGoAttemptTimestamp {
         .second = second,
         .nanosecond = nanosecond,
     };
+    // Go rejects time.Time{} attempt timestamps before publication.
+    if (timestamp.year == 1 and timestamp.month == 1 and timestamp.day == 1 and
+        timestamp.hour == 0 and timestamp.minute == 0 and timestamp.second == 0 and
+        timestamp.nanosecond == 0)
+    {
+        return error.InvalidBackupRequest;
+    }
+    return timestamp;
 }
 
 fn currentGoAttemptTimestampOrder(
@@ -3343,6 +3353,33 @@ fn currentGoTableNameHasContent(name: []const u8) bool {
     return false;
 }
 
+fn validateCurrentGoBackupId(value: []const u8) !void {
+    try validateBackupId(value);
+    if (std.mem.indexOf(u8, value, "..") != null)
+        return error.InvalidBackupId;
+}
+
+fn currentGoTableBackupMetadataIdMatches(
+    table_name: []const u8,
+    backup_id: []const u8,
+    metadata_id: []const u8,
+) bool {
+    const prefix = "table-";
+    if (metadata_id.len != prefix.len + std.crypto.hash.sha2.Sha256.digest_length * 2 or
+        !std.mem.startsWith(u8, metadata_id, prefix))
+    {
+        return false;
+    }
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(table_name);
+    hasher.update(&[_]u8{0});
+    hasher.update(backup_id);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.mem.eql(u8, metadata_id[prefix.len..], &hex);
+}
+
 fn validateCurrentGoClusterBackupAttempt(
     alloc: std.mem.Allocator,
     marker: *const CurrentGoClusterBackupAttemptMarker,
@@ -3353,8 +3390,8 @@ fn validateCurrentGoClusterBackupAttempt(
     {
         return error.InvalidBackupRequest;
     }
-    try validateBackupId(marker.attempt_id);
-    try validateBackupId(marker.backup_id);
+    try validateCurrentGoBackupId(marker.attempt_id);
+    try validateCurrentGoBackupId(marker.backup_id);
     if (std.mem.eql(u8, marker.attempt_id, marker.backup_id) or
         marker.expected_table_count == 0 or
         marker.expected_table_count > max_cluster_backup_attempt_tables or
@@ -3385,8 +3422,14 @@ fn validateCurrentGoClusterBackupAttempt(
     try identities.ensureTotalCapacity(alloc, @intCast(identity_count));
     identities.putAssumeCapacity(marker.attempt_id, {});
     identities.putAssumeCapacity(marker.backup_id, {});
-    for (marker.metadata_ids) |metadata_id| {
-        try validateBackupId(metadata_id);
+    for (marker.metadata_ids, 0..) |metadata_id, i| {
+        try validateCurrentGoBackupId(metadata_id);
+        if (!currentGoTableBackupMetadataIdMatches(
+            marker.table_names[i],
+            marker.backup_id,
+            metadata_id,
+        ))
+            return error.InvalidBackupRequest;
         const entry = try identities.getOrPut(alloc, metadata_id);
         if (entry.found_existing) return error.InvalidBackupRequest;
     }
@@ -3408,19 +3451,15 @@ fn parseCurrentGoClusterBackupAttempt(
     body: []const u8,
     expected_attempt_id: []const u8,
 ) !ParsedCurrentGoClusterBackupAttempt {
-    var value = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
-    defer value.deinit();
-    const root = switch (value.value) {
-        .object => |object| object,
-        else => return error.InvalidBackupRequest,
-    };
-    if (root.count() != 9) return error.InvalidBackupRequest;
-
     var parsed = try std.json.parseFromSlice(
         CurrentGoClusterBackupAttemptMarker,
         alloc,
         body,
-        .{ .allocate = .alloc_always },
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+            .ignore_unknown_fields = false,
+        },
     );
     errdefer parsed.deinit();
     return .{
@@ -5255,6 +5294,8 @@ fn validateLocalArtifactAvailable(
     switch (format) {
         .portable => {
             const stat = try std.Io.Dir.cwd().statFile(io, artifact_path, .{});
+            if (stat.kind != .file or stat.size == 0)
+                return error.BackupArtifactMissing;
             if (integrity_mode == .declared and stat.size != shard.artifact_size_bytes)
                 return error.BackupArtifactIntegrityMismatch;
         },
@@ -5273,9 +5314,9 @@ fn validateLocalArtifactAvailable(
 
 /// Performs bounded metadata-only admission for a restorable cluster backup.
 /// Table manifests are fully parsed and every referenced artifact is checked
-/// for presence; portable artifacts additionally bind the advertised byte
-/// length. Full SHA-256 verification remains part of restore/materialization so
-/// listing never downloads multi-gigabyte backup payloads.
+/// for a non-empty regular payload; portable artifacts additionally bind the
+/// advertised byte length. Full SHA-256 verification remains part of
+/// restore/materialization so listing never downloads multi-gigabyte payloads.
 pub fn validateClusterBackupArtifactsAtLocation(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -9985,7 +10026,7 @@ test "restore admission validates the stable newest current Go attempt" {
     try location.remote.writeBytes(
         alloc,
         go_manifest_path,
-        "{\"version\":2,\"state\":\"complete\",\"backup_id\":\"go-cluster\",\"timestamp\":\"2026-07-25T12:00:00Z\",\"antfly_version\":\"go-current\",\"format\":\"portable\",\"expected_table_count\":1,\"completed_table_count\":1,\"tables\":[{\"name\":\"docs\",\"backup_location\":\"s3://archive/prod/table-a-metadata.json\",\"shard_count\":1,\"status\":\"completed\"}]}",
+        "{\"version\":2,\"state\":\"complete\",\"backup_id\":\"go-cluster\",\"timestamp\":\"2026-07-25T12:00:00Z\",\"antfly_version\":\"go-current\",\"format\":\"portable\",\"expected_table_count\":1,\"completed_table_count\":1,\"tables\":[{\"name\":\"docs\",\"backup_location\":\"s3://archive/prod/table-77cfb73404d45d27f72ecbfb232c3fbaf6efbb64592b5ae78fca3e5c544fd3d4-metadata.json\",\"shard_count\":1,\"status\":\"completed\"}]}",
         "application/json",
     );
     try std.testing.expectError(
@@ -10000,7 +10041,7 @@ test "restore admission validates the stable newest current Go attempt" {
 
     try location.remote.writeBytes(
         alloc,
-        "table-a-metadata.json",
+        "table-77cfb73404d45d27f72ecbfb232c3fbaf6efbb64592b5ae78fca3e5c544fd3d4-metadata.json",
         "{\"version\":1,\"format\":\"portable\",\"table\":{\"name\":\"docs\",\"shards\":{\"1\":{\"byte_range\":[\"\",\"\"]}}}}",
         "application/json",
     );
@@ -10013,7 +10054,7 @@ test "restore admission validates the stable newest current Go attempt" {
     try location.remote.writeBytes(
         alloc,
         ".antfly-incomplete/afba-go.json",
-        "{\"version\":1,\"attempt_id\":\"afba-go\",\"backup_id\":\"go-cluster\",\"created_at\":\"2026-07-25T12:00:00.25Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-a\"],\"artifact_names\":[\"go-cluster-1.afb\"]}",
+        "{\"version\":1,\"attempt_id\":\"afba-go\",\"backup_id\":\"go-cluster\",\"created_at\":\"2026-07-25T12:00:00.25Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-77cfb73404d45d27f72ecbfb232c3fbaf6efbb64592b5ae78fca3e5c544fd3d4\"],\"artifact_names\":[\"go-cluster-1.afb\"]}",
         "application/json",
     );
 
@@ -10025,7 +10066,32 @@ test "restore admission validates the stable newest current Go attempt" {
     );
     defer admitted.deinit(alloc);
     try std.testing.expectEqualStrings(go_backup_id, admitted.backup_id);
-    try std.testing.expectEqualStrings("table-a", admitted.tables[0].table_backup_id);
+    try std.testing.expectEqualStrings(
+        "table-77cfb73404d45d27f72ecbfb232c3fbaf6efbb64592b5ae78fca3e5c544fd3d4",
+        admitted.tables[0].table_backup_id,
+    );
+
+    try location.remote.writeBytes(
+        alloc,
+        "go-cluster-1.afb",
+        "",
+        "application/octet-stream",
+    );
+    try std.testing.expectError(
+        error.BackupArtifactMissing,
+        readClusterManifestForRestoreAdmission(
+            alloc,
+            io,
+            &location,
+            go_backup_id,
+        ),
+    );
+    try location.remote.writeBytes(
+        alloc,
+        "go-cluster-1.afb",
+        "portable-artifact",
+        "application/octet-stream",
+    );
 
     const zig_backup_id = "zig-cluster";
     const zig_tables = [_]ClusterTableBackupEntry{.{
@@ -10053,7 +10119,7 @@ test "restore admission validates the stable newest current Go attempt" {
     try location.remote.writeBytes(
         alloc,
         ".antfly-incomplete/afba-newer.json",
-        "{\"version\":1,\"attempt_id\":\"afba-newer\",\"backup_id\":\"newer-cluster\",\"created_at\":\"2026-07-25T12:00:00.3Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"events\"],\"metadata_ids\":[\"table-b\"],\"artifact_names\":[\"newer-cluster-1.afb\"]}",
+        "{\"version\":1,\"attempt_id\":\"afba-newer\",\"backup_id\":\"newer-cluster\",\"created_at\":\"2026-07-25T12:00:00.3Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"events\"],\"metadata_ids\":[\"table-b2aa693bbed89e7783245e7a6b468282bff526817c1285fd6bb3b8707b3187b7\"],\"artifact_names\":[\"newer-cluster-1.afb\"]}",
         "application/json",
     );
     try std.testing.expectError(
@@ -10089,7 +10155,130 @@ test "current Go attempt timestamps preserve RFC3339Nano ordering" {
         error.InvalidBackupRequest,
         parseCurrentGoAttemptTimestamp("2025-02-29T12:00:00Z"),
     );
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        parseCurrentGoAttemptTimestamp("0001-01-01T00:00:00Z"),
+    );
     _ = try parseCurrentGoAttemptTimestamp("2024-02-29T12:00:00Z");
+}
+
+test "current Go table metadata identity matches the producer derivation" {
+    try std.testing.expect(currentGoTableBackupMetadataIdMatches(
+        "docs",
+        "go-cluster",
+        "table-77cfb73404d45d27f72ecbfb232c3fbaf6efbb64592b5ae78fca3e5c544fd3d4",
+    ));
+    try std.testing.expect(!currentGoTableBackupMetadataIdMatches(
+        "docs",
+        "go-cluster",
+        "table-a",
+    ));
+    try std.testing.expectError(
+        error.InvalidBackupId,
+        validateCurrentGoBackupId("go..cluster"),
+    );
+}
+
+test "current Go attempt parser is strict in one pass" {
+    const alloc = std.testing.allocator;
+    const valid =
+        "{\"version\":1,\"attempt_id\":\"afba-go\",\"backup_id\":\"go-cluster\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-77cfb73404d45d27f72ecbfb232c3fbaf6efbb64592b5ae78fca3e5c544fd3d4\"],\"artifact_names\":[\"go-cluster-1.afb\"]}";
+    var parsed = try parseCurrentGoClusterBackupAttempt(alloc, valid, "afba-go");
+    parsed.deinit();
+    try std.testing.expectError(
+        error.UnknownField,
+        parseCurrentGoClusterBackupAttempt(
+            alloc,
+            "{\"version\":1,\"attempt_id\":\"afba-go\",\"backup_id\":\"go-cluster\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-77cfb73404d45d27f72ecbfb232c3fbaf6efbb64592b5ae78fca3e5c544fd3d4\"],\"artifact_names\":[\"go-cluster-1.afb\"],\"future\":true}",
+            "afba-go",
+        ),
+    );
+    try std.testing.expectError(
+        error.DuplicateField,
+        parseCurrentGoClusterBackupAttempt(
+            alloc,
+            "{\"version\":1,\"version\":1,\"attempt_id\":\"afba-go\",\"backup_id\":\"go-cluster\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-77cfb73404d45d27f72ecbfb232c3fbaf6efbb64592b5ae78fca3e5c544fd3d4\"],\"artifact_names\":[\"go-cluster-1.afb\"]}",
+            "afba-go",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        parseCurrentGoClusterBackupAttempt(
+            alloc,
+            "{\"version\":1,\"attempt_id\":\"afba-go\",\"backup_id\":\"go-cluster\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-a\"],\"artifact_names\":[\"go-cluster-1.afb\"]}",
+            "afba-go",
+        ),
+    );
+}
+
+test "portable artifact availability rejects empty and non-regular local payloads" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const backup_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/artifact-availability",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(backup_root);
+
+    const empty_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/empty.afb",
+        .{backup_root},
+    );
+    defer alloc.free(empty_path);
+    try writeFileAbsolute(empty_path, "");
+    var shard: ShardSnapshot = .{
+        .group_id = 1,
+        .start_key = "",
+        .snapshot_path = "empty.afb",
+    };
+    try std.testing.expectError(
+        error.BackupArtifactMissing,
+        validateLocalArtifactAvailable(
+            alloc,
+            io,
+            backup_root,
+            .portable,
+            .derive_after_materialization,
+            &shard,
+        ),
+    );
+
+    const directory_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/directory.afb",
+        .{backup_root},
+    );
+    defer alloc.free(directory_path);
+    try ensureDirPathWithIo(io, directory_path);
+    shard.snapshot_path = "directory.afb";
+    try std.testing.expectError(
+        error.BackupArtifactMissing,
+        validateLocalArtifactAvailable(
+            alloc,
+            io,
+            backup_root,
+            .portable,
+            .derive_after_materialization,
+            &shard,
+        ),
+    );
+
+    try writeFileAbsolute(empty_path, "portable-artifact");
+    shard.snapshot_path = "empty.afb";
+    try validateLocalArtifactAvailable(
+        alloc,
+        io,
+        backup_root,
+        .portable,
+        .derive_after_materialization,
+        &shard,
+    );
 }
 
 test "current Go attempt validation matches Unicode table-name trimming" {
@@ -10129,7 +10318,7 @@ test "current Go filesystem attempt snapshots detect repository changes" {
     defer alloc.free(first_marker);
     try writeFileAbsolute(
         first_marker,
-        "{\"version\":1,\"attempt_id\":\"afba-first\",\"backup_id\":\"go-first\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-a\"],\"artifact_names\":[\"go-first-1.afb\"]}",
+        "{\"version\":1,\"attempt_id\":\"afba-first\",\"backup_id\":\"go-first\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-e150363fdd37b27622c0201dd5f470c2be2398d3a9ec07e32e7ea3a0979e39fd\"],\"artifact_names\":[\"go-first-1.afb\"]}",
     );
 
     var location: BackupLocation = .{
@@ -10152,7 +10341,7 @@ test "current Go filesystem attempt snapshots detect repository changes" {
     defer alloc.free(second_marker);
     try writeFileAbsolute(
         second_marker,
-        "{\"version\":1,\"attempt_id\":\"afba-second\",\"backup_id\":\"go-second\",\"created_at\":\"2026-07-25T12:00:01Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"events\"],\"metadata_ids\":[\"table-b\"],\"artifact_names\":[\"go-second-1.afb\"]}",
+        "{\"version\":1,\"attempt_id\":\"afba-second\",\"backup_id\":\"go-second\",\"created_at\":\"2026-07-25T12:00:01Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"events\"],\"metadata_ids\":[\"table-259f93136a109153d3193dca4409ca22ca1088f68c9821342eee129373b101c5\"],\"artifact_names\":[\"go-second-1.afb\"]}",
     );
     var after = try scanCurrentGoAttemptRepository(alloc, io, &location);
     defer after.deinit();
@@ -10166,7 +10355,7 @@ test "current Go filesystem attempt snapshots detect repository changes" {
 test "current Go attempt snapshot budgets fail closed" {
     const alloc = std.testing.allocator;
     const marker =
-        "{\"version\":1,\"attempt_id\":\"afba-budget\",\"backup_id\":\"go-budget\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-a\"],\"artifact_names\":[\"go-budget-1.afb\"]}";
+        "{\"version\":1,\"attempt_id\":\"afba-budget\",\"backup_id\":\"go-budget\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-85ebc63c34b2947dfb825fd107b98a347971125de92cb3893a95333d6ada7cbd\"],\"artifact_names\":[\"go-budget-1.afb\"]}";
 
     var count_exhausted: CurrentGoAttemptRepositorySnapshot = .{
         .marker_count = current_go_backup_attempt_scan_limit,
