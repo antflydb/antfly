@@ -376,7 +376,6 @@ func TestClusterBackupMetadataRequiresVersionIDAndFormat(t *testing.T) {
 
 func TestClusterBackupAttemptMarkersSelectNewestAttempt(t *testing.T) {
 	root := t.TempDir()
-	backupStore := &fileBackupStore{location: root}
 	older := &ClusterBackupAttempt{
 		Version:            clusterBackupAttemptVersion,
 		AttemptID:          "afba-older",
@@ -409,7 +408,6 @@ func TestClusterBackupAttemptMarkersSelectNewestAttempt(t *testing.T) {
 		context.Background(),
 		"file://"+root,
 		nil,
-		backupStore,
 		clusterBackupAttemptScanLimit,
 	)
 	require.NoError(t, err)
@@ -476,13 +474,72 @@ func TestStaleUncommittedClusterBackupAttemptRemainsFenced(t *testing.T) {
 		context.Background(),
 		"file://"+root,
 		nil,
-		backupStore,
 		clusterBackupAttemptScanLimit,
 	)
 	require.NoError(t, err)
 	require.Nil(t, latest)
 	require.FileExists(t, filepath.Join(root, "backup-1-1.afb"))
 	require.FileExists(t, filepath.Join(
+		root,
+		clusterBackupAttemptDir,
+		attempt.AttemptID+".json",
+	))
+	require.ErrorIs(
+		t,
+		backupStore.ReserveBackupID(context.Background(), "backup-1"),
+		ErrBackupAlreadyExists,
+	)
+}
+
+func TestStaleCommittedClusterBackupAttemptRetainsPermanentReservation(t *testing.T) {
+	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-stale",
+		BackupID:           "backup-1",
+		CreatedAt:          time.Now().UTC().Add(-clusterBackupAttemptMaxAge - time.Minute),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"documents-backup-1"},
+		ArtifactNames:      []string{"backup-1-1.afb"},
+	}
+	require.NoError(t, writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	))
+	require.NoError(t, writeClusterMetadataToFile(
+		context.Background(),
+		"file://"+root,
+		"backup-1",
+		&ClusterBackupMetadata{
+			Version:             clusterBackupMetadataVersion,
+			State:               clusterBackupStateComplete,
+			BackupID:            "backup-1",
+			Format:              common.BackupFormatPortable,
+			ExpectedTableCount:  1,
+			CompletedTableCount: 1,
+			Tables: []ClusterBackupTableInfo{{
+				Name:           "documents",
+				BackupLocation: "file:///backups/documents-backup-1-metadata.json",
+				Status:         "completed",
+			}},
+		},
+	))
+
+	latest, err := latestClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		clusterBackupAttemptScanLimit,
+	)
+	require.NoError(t, err)
+	require.Nil(t, latest)
+	require.NoFileExists(t, filepath.Join(
 		root,
 		clusterBackupAttemptDir,
 		attempt.AttemptID+".json",

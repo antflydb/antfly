@@ -797,7 +797,6 @@ func deleteClusterBackupAttempt(
 }
 
 func reclaimStaleClusterBackupAttempt(
-	metadataStore backupStore,
 	resolvedLocation string,
 	s3Info *common.S3Info,
 	attempt *ClusterBackupAttempt,
@@ -823,11 +822,10 @@ func reclaimStaleClusterBackupAttempt(
 	default:
 		return false, availabilityErr
 	}
-	// A committed aggregate manifest permanently fences same-ID publication,
-	// so the reservation can be removed before the retryable marker deletion.
-	if err := metadataStore.ReleaseBackupID(ctx, attempt.BackupID); err != nil {
-		return false, err
-	}
+	// Keep the committed reservation as the pre-execution same-ID fence.
+	// Write-only object-store connections cannot inspect the aggregate
+	// manifest, so deleting this reservation would permit a duplicate request
+	// to repeat every table backup before its final conditional publish fails.
 	if err := deleteClusterBackupAttempt(ctx, resolvedLocation, s3Info, attempt.AttemptID); err != nil {
 		return false, err
 	}
@@ -838,7 +836,6 @@ func latestClusterBackupAttempt(
 	ctx context.Context,
 	resolvedLocation string,
 	s3Info *common.S3Info,
-	metadataStore backupStore,
 	scanLimit int,
 ) (*ClusterBackupAttempt, error) {
 	var latest *ClusterBackupAttempt
@@ -910,7 +907,6 @@ func latestClusterBackupAttempt(
 				}
 				{
 					didReclaim, err := reclaimStaleClusterBackupAttempt(
-						metadataStore,
 						resolvedLocation,
 						s3Info,
 						&attempt,
@@ -974,7 +970,6 @@ func latestClusterBackupAttempt(
 				}
 				{
 					didReclaim, err := reclaimStaleClusterBackupAttempt(
-						metadataStore,
 						resolvedLocation,
 						s3Info,
 						attempt,
@@ -1073,7 +1068,6 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		reclaimCtx,
 		resolvedLocation,
 		s3Info,
-		metadataStore,
 		clusterBackupAttemptScanLimit,
 	); reclaimErr != nil {
 		t.logger.Warn("Stale cluster backup reclamation deferred", zap.Error(reclaimErr))
@@ -1202,21 +1196,23 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 			t.logger.Error("Failed to clean abandoned cluster backup", zap.String("backup_id", req.BackupId), zap.Error(err))
 			return
 		}
-		if err := deleteClusterBackupAttempt(cleanupCtx, resolvedLocation, s3Info, attemptID); err != nil {
-			// The reservation remains a fail-closed retry fence until marker
-			// deletion can be confirmed.
+		if err := metadataStore.ReleaseBackupID(cleanupCtx, req.BackupId); err != nil {
+			// Keep the marker as the durable recovery authority until retry
+			// admission is possible. A later maintenance pass may safely
+			// inspect it without confusing this failed attempt with a retry.
 			t.logger.Error(
-				"Failed to remove abandoned cluster backup marker",
+				"Failed to release abandoned cluster backup reservation",
 				zap.String("backup_id", req.BackupId),
 				zap.String("attempt_id", attemptID),
 				zap.Error(err),
 			)
 			return
 		}
-		if err := metadataStore.ReleaseBackupID(cleanupCtx, req.BackupId); err != nil {
+		if err := deleteClusterBackupAttempt(cleanupCtx, resolvedLocation, s3Info, attemptID); err != nil {
 			t.logger.Error(
-				"Failed to release abandoned cluster backup reservation",
+				"Failed to remove abandoned cluster backup marker",
 				zap.String("backup_id", req.BackupId),
+				zap.String("attempt_id", attemptID),
 				zap.Error(err),
 			)
 		}
@@ -1400,19 +1396,12 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		committed = true
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cleanupCancel()
-		if err := metadataStore.ReleaseBackupID(cleanupCtx, req.BackupId); err != nil {
-			// Leave the marker as a retryable cleanup journal. The committed
-			// manifest remains the immutable conflict fence.
-			t.logger.Warn(
-				"Committed cluster backup reservation cleanup deferred",
-				zap.String("backup_id", req.BackupId),
-				zap.Error(err),
-			)
-		} else if err := deleteClusterBackupAttempt(
+		if err := deleteClusterBackupAttempt(
 			cleanupCtx, resolvedLocation, s3Info, attemptID,
 		); err != nil {
-			// The aggregate manifest is the commit point. A stale marker is
-			// harmless and bounded admission maintenance can reclaim it.
+			// The aggregate manifest is the commit point and the permanent
+			// reservation remains the write-only admission fence. A stale
+			// marker is harmless and bounded maintenance can reclaim it.
 			t.logger.Warn(
 				"Committed cluster backup marker cleanup deferred",
 				zap.String("backup_id", req.BackupId),

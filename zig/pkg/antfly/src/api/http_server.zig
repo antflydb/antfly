@@ -8654,36 +8654,21 @@ pub const ApiHttpServer = struct {
                 };
             };
             cluster_committed = true;
-            var reservation_cleaned = true;
-            backups_api.cleanupClusterReservationAtLocation(
+            backups_api.deleteClusterBackupAttemptMarker(
                 op_alloc,
                 backup_io,
                 location,
-                attempt_marker.cluster_backup_id,
+                attempt_marker.attempt_id,
             ) catch |err| {
-                std.log.warn("committed cluster backup reservation cleanup deferred backup_id={s} err={s}", .{
+                // The aggregate manifest is authoritative and the permanent
+                // reservation remains the write-only admission fence. The
+                // bounded reclaimer can safely retire a stale marker.
+                std.log.warn("committed cluster backup marker cleanup deferred backup_id={s} attempt_id={s} err={s}", .{
                     req.backup_id,
+                    attempt_marker.attempt_id,
                     @errorName(err),
                 });
-                reservation_cleaned = false;
             };
-            if (reservation_cleaned) {
-                backups_api.deleteClusterBackupAttemptMarker(
-                    op_alloc,
-                    backup_io,
-                    location,
-                    attempt_marker.attempt_id,
-                ) catch |err| {
-                    // The aggregate manifest is authoritative. The bounded
-                    // reclaimer preserves referenced table attempts before
-                    // removing a stale marker.
-                    std.log.warn("committed cluster backup marker cleanup deferred backup_id={s} attempt_id={s} err={s}", .{
-                        req.backup_id,
-                        attempt_marker.attempt_id,
-                        @errorName(err),
-                    });
-                };
-            }
         } else {
             // A partial aggregate is not a restore candidate. Reclaim every
             // completed table attempt before releasing the cluster reservation
@@ -26477,10 +26462,15 @@ test "api http server lists cluster backups through public route" {
         },
     };
     const artifact_rel_path = "docs-snap1.afb";
+    const artifact_payload = "payload";
+    var artifact_integrity = try backups_api.portableBytesIntegrityAlloc(alloc, artifact_payload);
+    defer artifact_integrity.deinit(alloc);
     const shards = [_]backups_api.ShardSnapshot{.{
         .group_id = 1,
         .start_key = "",
         .snapshot_path = artifact_rel_path,
+        .artifact_size_bytes = artifact_integrity.size_bytes,
+        .artifact_sha256 = artifact_integrity.sha256,
     }};
     const table_record: metadata_table_manager.TableRecord = .{
         .table_id = 1,
@@ -26495,17 +26485,17 @@ test "api http server lists cluster backups through public route" {
         &shards,
     );
     defer table_manifest.deinit(alloc);
-    table_manifest.artifact_integrity_mode = .derive_after_materialization;
-    try backups_api.writeManifest(alloc, backup_root, &table_manifest);
     const artifact_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
         backup_root,
         artifact_rel_path,
     });
     defer alloc.free(artifact_path);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, backup_root);
     var artifact_file = try std.Io.Dir.cwd().createFile(std.testing.io, artifact_path, .{ .truncate = true });
-    try artifact_file.writePositionalAll(std.testing.io, "payload", 0);
+    try artifact_file.writePositionalAll(std.testing.io, artifact_payload, 0);
     try artifact_file.sync(std.testing.io);
     artifact_file.close(std.testing.io);
+    try backups_api.writeManifest(alloc, backup_root, &table_manifest);
     var manifest = try backups_api.createClusterManifest(alloc, "snap1", location_uri, &table_entries);
     defer manifest.deinit(alloc);
     try backups_api.writeClusterManifest(alloc, backup_root, &manifest);
