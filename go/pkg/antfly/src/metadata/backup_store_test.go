@@ -673,7 +673,7 @@ func TestClusterBackupAttemptPublicationReconciliationIsExact(t *testing.T) {
 	require.False(t, matches)
 }
 
-func TestClusterBackupAttemptCompactsSupersededActiveMarker(t *testing.T) {
+func TestClusterBackupAttemptCompactsOnlyTerminalSupersededMarker(t *testing.T) {
 	root := t.TempDir()
 	attempt := &ClusterBackupAttempt{
 		Version:            clusterBackupAttemptVersion,
@@ -703,32 +703,87 @@ func TestClusterBackupAttemptCompactsSupersededActiveMarker(t *testing.T) {
 	)
 	require.NoError(t, err)
 
+	previous := &ClusterBackupAttemptHead{
+		Version:      clusterBackupAttemptHeadVersion,
+		Generation:   1,
+		AttemptID:    "afba-old-active",
+		BackupID:     "backup-old",
+		State:        clusterBackupAttemptStateActive,
+		MarkerSHA256: strings.Repeat("0", sha256.Size*2),
+	}
 	require.NoError(t, compactSupersededClusterBackupAttempt(
 		context.Background(),
 		"file://"+root,
 		nil,
-		&ClusterBackupAttemptHead{
-			Version:      clusterBackupAttemptHeadVersion,
-			Generation:   1,
-			AttemptID:    "afba-old-active",
-			BackupID:     "backup-old",
-			State:        clusterBackupAttemptStateActive,
-			MarkerSHA256: strings.Repeat("0", sha256.Size*2),
-		},
+		previous,
 		attempt.AttemptID,
 	))
-	_, err = os.Stat(filepath.Join(
+	oldMarker := filepath.Join(
 		root,
 		clusterBackupAttemptDir,
 		"afba-old-active.json",
+	)
+	require.FileExists(t, oldMarker)
+
+	previous.State = clusterBackupAttemptStateCommitted
+	require.NoError(t, compactSupersededClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		previous,
+		attempt.AttemptID,
 	))
-	require.ErrorIs(t, err, os.ErrNotExist)
+	require.NoFileExists(t, oldMarker)
 	_, err = os.Stat(filepath.Join(
 		root,
 		clusterBackupAttemptDir,
 		attempt.AttemptID+".json",
 	))
 	require.NoError(t, err)
+}
+
+func TestClusterBackupAttemptOwnerCompactsItsSupersededMarker(t *testing.T) {
+	root := t.TempDir()
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-owner",
+		BackupID:           "backup-owner",
+		CreatedAt:          time.Now().UTC(),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"documents-backup-owner"},
+		ArtifactNames:      []string{"backup-owner-1.afb"},
+	}
+	_, err := writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+	markerPath := filepath.Join(
+		root,
+		clusterBackupAttemptDir,
+		attempt.AttemptID+".json",
+	)
+
+	require.NoError(t, compactClusterBackupAttemptIfSuperseded(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt.AttemptID,
+		true,
+	))
+	require.FileExists(t, markerPath)
+	require.NoError(t, compactClusterBackupAttemptIfSuperseded(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt.AttemptID,
+		false,
+	))
+	require.NoFileExists(t, markerPath)
 }
 
 func TestClusterBackupAttemptHeadSerializesConcurrentFilePublishers(t *testing.T) {

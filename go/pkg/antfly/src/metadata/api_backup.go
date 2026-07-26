@@ -1135,7 +1135,9 @@ func publishClusterBackupAttemptHead(
 				if common.IsS3CreateConflict(err) {
 					continue
 				}
-				return nil, err
+				// Preserve the observed predecessor so an ambiguous successful
+				// publication can still compact the journal it superseded.
+				return previous, err
 			}
 			return previous, nil
 		}
@@ -1166,7 +1168,10 @@ func publishClusterBackupAttemptHead(
 		return nil, err
 	}
 	if err := writeBytesFileAtomically(ctx, headPath, body, true); err != nil {
-		return nil, err
+		// Atomic rename may have completed before a directory sync failure.
+		// The caller reconciles the published head and still needs this value
+		// to retire the predecessor without scanning the journal directory.
+		return previous, err
 	}
 	return previous, nil
 }
@@ -1291,7 +1296,8 @@ func compactSupersededClusterBackupAttempt(
 	currentAttemptID string,
 ) error {
 	if previous == nil ||
-		previous.AttemptID == currentAttemptID {
+		previous.AttemptID == currentAttemptID ||
+		previous.State == clusterBackupAttemptStateActive {
 		return nil
 	}
 	return deleteClusterBackupAttempt(
@@ -1300,6 +1306,19 @@ func compactSupersededClusterBackupAttempt(
 		s3Info,
 		previous.AttemptID,
 	)
+}
+
+func compactClusterBackupAttemptIfSuperseded(
+	ctx context.Context,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+	attemptID string,
+	headOwned bool,
+) error {
+	if headOwned {
+		return nil
+	}
+	return deleteClusterBackupAttempt(ctx, resolvedLocation, s3Info, attemptID)
 }
 
 func readClusterBackupAttemptFile(pathname, attemptID string) (*ClusterBackupAttempt, error) {
@@ -1944,22 +1963,21 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 				zap.String("attempt_id", attemptID),
 				zap.Error(err),
 			)
-		} else if !owned {
+		} else if err := compactClusterBackupAttemptIfSuperseded(
+			cleanupCtx,
+			resolvedLocation,
+			s3Info,
+			attemptID,
+			owned,
+		); err != nil {
 			// The head read proved this attempt is no longer authoritative.
 			// Its artifacts and reservation are already absent, so retire the
 			// otherwise-unreachable journal without any repository scan.
-			if err := deleteClusterBackupAttempt(
-				cleanupCtx,
-				resolvedLocation,
-				s3Info,
-				attemptID,
-			); err != nil {
-				t.logger.Warn(
-					"Superseded abandoned backup journal compaction deferred",
-					zap.String("attempt_id", attemptID),
-					zap.Error(err),
-				)
-			}
+			t.logger.Warn(
+				"Superseded abandoned backup journal compaction deferred",
+				zap.String("attempt_id", attemptID),
+				zap.Error(err),
+			)
 		}
 	}()
 	expectedHead := ClusterBackupAttemptHead{
@@ -2201,15 +2219,16 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 				zap.Error(err),
 			)
 		}
-		if headTransitionErr == nil && !headOwned {
+		if headTransitionErr == nil {
 			// This attempt committed after another writer superseded its active
 			// head. Historical restore needs only the immutable aggregate and
 			// table manifests, so its unreferenced journal can be removed now.
-			if err := deleteClusterBackupAttempt(
+			if err := compactClusterBackupAttemptIfSuperseded(
 				maintenanceCtx,
 				resolvedLocation,
 				s3Info,
 				attemptID,
+				headOwned,
 			); err != nil {
 				t.logger.Warn(
 					"Superseded committed backup journal compaction deferred",

@@ -2394,9 +2394,11 @@ fn parseGoPortableTableManifest(
         _ = artifacts.remove(snapshot_path);
         const artifact_sha256 = try alloc.dupe(u8, artifact.sha256);
         errdefer alloc.free(artifact_sha256);
+        const shard_id = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(shard_id);
         try shards_list.append(alloc, .{
             .group_id = group_ids.dataGroupIdFromHash(raw_group_id),
-            .shard_id = try alloc.dupe(u8, entry.key_ptr.*),
+            .shard_id = shard_id,
             .start_key = start_key,
             .end_key = end_key,
             .snapshot_path = snapshot_path,
@@ -2414,13 +2416,24 @@ fn parseGoPortableTableManifest(
         alloc.free(shards);
     }
     for (shards_list.items, 0..) |portable_shard, i| {
+        const start_key = try alloc.dupe(u8, portable_shard.start_key);
+        errdefer alloc.free(start_key);
+        const end_key = if (portable_shard.end_key) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (end_key) |value| alloc.free(value);
+        const snapshot_path = try alloc.dupe(u8, portable_shard.snapshot_path);
+        errdefer alloc.free(snapshot_path);
+        const artifact_sha256 = try alloc.dupe(u8, portable_shard.artifact_sha256);
+        errdefer alloc.free(artifact_sha256);
         shards[i] = .{
             .group_id = portable_shard.group_id,
-            .start_key = try alloc.dupe(u8, portable_shard.start_key),
-            .end_key = if (portable_shard.end_key) |value| try alloc.dupe(u8, value) else null,
-            .snapshot_path = try alloc.dupe(u8, portable_shard.snapshot_path),
+            .start_key = start_key,
+            .end_key = end_key,
+            .snapshot_path = snapshot_path,
             .artifact_size_bytes = portable_shard.artifact_size_bytes,
-            .artifact_sha256 = try alloc.dupe(u8, portable_shard.artifact_sha256),
+            .artifact_sha256 = artifact_sha256,
         };
         initialized += 1;
     }
@@ -7048,6 +7061,8 @@ fn directoryArtifactIntegrityAllocWithIdentity(
         switch (entry.kind) {
             .directory => {},
             .file => {
+                if (files.items.len == backup_integrity_max_native_files)
+                    return error.BackupArtifactTooLarge;
                 const stat = try dir.statFile(io, entry.path, .{});
                 const normalized = try alloc.dupe(u8, entry.path);
                 errdefer alloc.free(normalized);
@@ -10320,11 +10335,16 @@ test "filesystem backup listing is bounded and cursor stable" {
 
 test "native backup directory copy preserves nested files" {
     const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const src = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/copy-src", .{tmp.sub_path});
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const src = try std.fmt.allocPrint(alloc, "{s}/copy-src", .{root});
     defer alloc.free(src);
-    const dst = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/copy-dst", .{tmp.sub_path});
+    const dst = try std.fmt.allocPrint(alloc, "{s}/copy-dst", .{root});
     defer alloc.free(dst);
     const top = try std.fmt.allocPrint(alloc, "{s}/top.sst", .{src});
     defer alloc.free(top);
@@ -10361,17 +10381,66 @@ test "native backup directory copy preserves nested files" {
         .artifact_sha256 = copied_integrity.sha256,
     };
 
+    var local_location: BackupLocation = .{ .file = root };
+    var local_expected = expected;
+    local_expected.snapshot_path = "copy-dst";
+    var local_exact_hasher = artifactVerificationCacheKeyHasher(
+        &local_location,
+        .native,
+        &local_expected,
+    );
+    var local_exact = try directoryArtifactIntegrityAllocWithIdentity(
+        alloc,
+        io,
+        dst,
+        &local_exact_hasher,
+    );
+    defer local_exact.deinit(alloc);
+    try std.testing.expectEqual(local_expected.artifact_size_bytes, local_exact.size_bytes);
+    try std.testing.expectEqualStrings(local_expected.artifact_sha256, local_exact.sha256);
+    var local_exact_receipt: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    local_exact_hasher.final(&local_exact_receipt);
+    const local_probe_receipt = try artifactVerificationCacheKey(
+        alloc,
+        io,
+        &local_location,
+        .native,
+        &local_expected,
+    );
+    try std.testing.expectEqualSlices(u8, &local_exact_receipt, &local_probe_receipt);
+
     var memory = object_storage.MemoryObjectStorage.init(alloc);
     defer memory.deinit();
-    var remote = try RemoteBackupStore.initWithClient(
-        alloc,
-        memory.client(),
-        "bucket",
-        "backups",
+    var remote_location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(
+            alloc,
+            memory.client(),
+            "bucket",
+            "backups",
+        ),
+    };
+    defer remote_location.deinit(alloc);
+    try remote_location.remote.uploadDirectoryRecursive(alloc, src, expected.snapshot_path);
+    var remote_exact_hasher = artifactVerificationCacheKeyHasher(
+        &remote_location,
+        .native,
+        &expected,
     );
-    defer remote.deinit();
-    try remote.uploadDirectoryRecursive(alloc, src, expected.snapshot_path);
-    try remote.verifyNativeArtifactIntegrity(alloc, &expected);
+    try remote_location.remote.verifyNativeArtifactIntegrityWithIdentity(
+        alloc,
+        &expected,
+        &remote_exact_hasher,
+    );
+    var remote_exact_receipt: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    remote_exact_hasher.final(&remote_exact_receipt);
+    const remote_probe_receipt = try artifactVerificationCacheKey(
+        alloc,
+        io,
+        &remote_location,
+        .native,
+        &expected,
+    );
+    try std.testing.expectEqualSlices(u8, &remote_exact_receipt, &remote_probe_receipt);
 
     try writeFileAbsolute(copied_nested_path, "corrupt");
     try std.testing.expectError(
