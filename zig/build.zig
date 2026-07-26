@@ -4495,7 +4495,7 @@ pub fn build(b: *std.Build) void {
             "backup manifest round trips through remote objectstore location",
             "current Go portable metadata envelope materializes into a verified Zig manifest",
             "current Go portable cluster envelope resolves table metadata ids",
-            "restore admission accepts headless current Go portable cluster manifests only",
+            "restore admission validates the stable newest current Go attempt",
             "remote uri canonicalizes object prefix separators",
             "remote backup metadata reads are size bounded",
             "remote backup key joins canonicalize only the prefix boundary",

@@ -84,6 +84,10 @@ const incomplete_backup_prefix = ".antfly-incomplete";
 const backup_attempt_head_name = ".antfly-backup-attempt-head.json";
 const backup_attempt_reclaim_cursor_name = ".antfly-backup-reclaim-cursor";
 const backup_attempt_reclaim_index_name = ".antfly-backup-reclaim-index-v1";
+const current_go_backup_attempt_version: u32 = 1;
+const current_go_backup_attempt_scan_limit: usize = 10_000;
+const current_go_backup_attempt_total_bytes_limit: usize = 64 * 1024 * 1024;
+const current_go_backup_attempt_max_artifacts: usize = 1_000_000;
 pub const manifest_too_large_message = "backup manifest exceeds 16 MiB limit";
 pub const integrity_failure_message = "backup artifact failed integrity verification";
 
@@ -3191,6 +3195,458 @@ fn readClusterBackupAttemptMarker(
     return parsed;
 }
 
+const CurrentGoClusterBackupAttemptMarker = struct {
+    version: u32,
+    attempt_id: []const u8,
+    backup_id: []const u8,
+    created_at: []const u8,
+    format: BackupFormat,
+    expected_table_count: usize,
+    table_names: []const []const u8,
+    metadata_ids: []const []const u8,
+    artifact_names: []const []const u8,
+};
+
+const CurrentGoAttemptTimestamp = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    nanosecond: u32,
+};
+
+const ParsedCurrentGoClusterBackupAttempt = struct {
+    parsed: std.json.Parsed(CurrentGoClusterBackupAttemptMarker),
+    created_at: CurrentGoAttemptTimestamp,
+
+    fn deinit(self: *@This()) void {
+        self.parsed.deinit();
+        self.* = undefined;
+    }
+};
+
+const CurrentGoAttemptRepositorySnapshot = struct {
+    fingerprint: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0),
+    marker_count: usize = 0,
+    total_bytes: usize = 0,
+    latest: ?ParsedCurrentGoClusterBackupAttempt = null,
+
+    fn deinit(self: *@This()) void {
+        if (self.latest) |*latest| latest.deinit();
+        self.* = undefined;
+    }
+};
+
+fn parseFixedWidthDecimal(comptime T: type, text: []const u8) !T {
+    if (text.len == 0) return error.InvalidBackupRequest;
+    for (text) |byte| if (byte < '0' or byte > '9')
+        return error.InvalidBackupRequest;
+    return std.fmt.parseInt(T, text, 10) catch error.InvalidBackupRequest;
+}
+
+fn isLeapYear(year: u16) bool {
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0);
+}
+
+fn daysInMonth(year: u16, month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) 29 else 28,
+        else => 0,
+    };
+}
+
+/// Go's time.Time JSON encoder emits UTC RFC3339Nano for the current backup
+/// producer. Requiring that exact canonical zone keeps ordering deterministic
+/// without accepting historical timestamp dialects.
+fn parseCurrentGoAttemptTimestamp(text: []const u8) !CurrentGoAttemptTimestamp {
+    if (text.len < 20 or text.len > 30 or
+        text[4] != '-' or text[7] != '-' or text[10] != 'T' or
+        text[13] != ':' or text[16] != ':' or text[text.len - 1] != 'Z')
+    {
+        return error.InvalidBackupRequest;
+    }
+    const year = try parseFixedWidthDecimal(u16, text[0..4]);
+    const month = try parseFixedWidthDecimal(u8, text[5..7]);
+    const day = try parseFixedWidthDecimal(u8, text[8..10]);
+    const hour = try parseFixedWidthDecimal(u8, text[11..13]);
+    const minute = try parseFixedWidthDecimal(u8, text[14..16]);
+    const second = try parseFixedWidthDecimal(u8, text[17..19]);
+    if (year == 0 or day == 0 or day > daysInMonth(year, month) or
+        hour > 23 or minute > 59 or second > 59)
+    {
+        return error.InvalidBackupRequest;
+    }
+
+    var nanosecond: u32 = 0;
+    if (text.len > 20) {
+        if (text[19] != '.') return error.InvalidBackupRequest;
+        const fractional = text[20 .. text.len - 1];
+        if (fractional.len == 0 or fractional.len > 9)
+            return error.InvalidBackupRequest;
+        nanosecond = try parseFixedWidthDecimal(u32, fractional);
+        var padding = 9 - fractional.len;
+        while (padding > 0) : (padding -= 1) nanosecond *= 10;
+    } else if (text[19] != 'Z') {
+        return error.InvalidBackupRequest;
+    }
+    return .{
+        .year = year,
+        .month = month,
+        .day = day,
+        .hour = hour,
+        .minute = minute,
+        .second = second,
+        .nanosecond = nanosecond,
+    };
+}
+
+fn currentGoAttemptTimestampOrder(
+    lhs: CurrentGoAttemptTimestamp,
+    rhs: CurrentGoAttemptTimestamp,
+) std.math.Order {
+    inline for (std.meta.fields(CurrentGoAttemptTimestamp)) |field| {
+        const order = std.math.order(@field(lhs, field.name), @field(rhs, field.name));
+        if (order != .eq) return order;
+    }
+    return .eq;
+}
+
+fn isGoUnicodeWhitespace(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x0009...0x000d,
+        0x0020,
+        0x0085,
+        0x00a0,
+        0x1680,
+        0x2000...0x200a,
+        0x2028,
+        0x2029,
+        0x202f,
+        0x205f,
+        0x3000,
+        => true,
+        else => false,
+    };
+}
+
+/// Mirrors Go's strings.TrimSpace(name) != "" admission check without
+/// allocating a normalized copy.
+fn currentGoTableNameHasContent(name: []const u8) bool {
+    var iterator = (std.unicode.Utf8View.init(name) catch return false).iterator();
+    while (iterator.nextCodepoint()) |codepoint| {
+        if (!isGoUnicodeWhitespace(codepoint)) return true;
+    }
+    return false;
+}
+
+fn validateCurrentGoClusterBackupAttempt(
+    alloc: std.mem.Allocator,
+    marker: *const CurrentGoClusterBackupAttemptMarker,
+    expected_attempt_id: []const u8,
+) !CurrentGoAttemptTimestamp {
+    if (marker.version != current_go_backup_attempt_version or
+        !std.mem.eql(u8, marker.attempt_id, expected_attempt_id))
+    {
+        return error.InvalidBackupRequest;
+    }
+    try validateBackupId(marker.attempt_id);
+    try validateBackupId(marker.backup_id);
+    if (std.mem.eql(u8, marker.attempt_id, marker.backup_id) or
+        marker.expected_table_count == 0 or
+        marker.expected_table_count > max_cluster_backup_attempt_tables or
+        marker.table_names.len != marker.expected_table_count or
+        marker.metadata_ids.len != marker.expected_table_count or
+        marker.artifact_names.len > current_go_backup_attempt_max_artifacts)
+    {
+        return error.InvalidBackupRequest;
+    }
+
+    var table_names = std.StringHashMapUnmanaged(void).empty;
+    defer table_names.deinit(alloc);
+    try table_names.ensureTotalCapacity(alloc, @intCast(marker.table_names.len));
+    for (marker.table_names) |name| {
+        if (name.len > 4096 or !currentGoTableNameHasContent(name))
+            return error.InvalidBackupRequest;
+        const entry = try table_names.getOrPut(alloc, name);
+        if (entry.found_existing) return error.InvalidBackupRequest;
+    }
+
+    const identity_count = std.math.add(
+        usize,
+        2 + marker.metadata_ids.len,
+        marker.artifact_names.len,
+    ) catch return error.InvalidBackupRequest;
+    var identities = std.StringHashMapUnmanaged(void).empty;
+    defer identities.deinit(alloc);
+    try identities.ensureTotalCapacity(alloc, @intCast(identity_count));
+    identities.putAssumeCapacity(marker.attempt_id, {});
+    identities.putAssumeCapacity(marker.backup_id, {});
+    for (marker.metadata_ids) |metadata_id| {
+        try validateBackupId(metadata_id);
+        const entry = try identities.getOrPut(alloc, metadata_id);
+        if (entry.found_existing) return error.InvalidBackupRequest;
+    }
+    for (marker.artifact_names) |artifact_name| {
+        if (artifact_name.len == 0 or artifact_name.len > 4096 or
+            std.mem.indexOfAny(u8, artifact_name, "/\\") != null)
+        {
+            return error.InvalidBackupRequest;
+        }
+        try validateArtifactRelativePath(artifact_name);
+        const entry = try identities.getOrPut(alloc, artifact_name);
+        if (entry.found_existing) return error.InvalidBackupRequest;
+    }
+    return parseCurrentGoAttemptTimestamp(marker.created_at);
+}
+
+fn parseCurrentGoClusterBackupAttempt(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    expected_attempt_id: []const u8,
+) !ParsedCurrentGoClusterBackupAttempt {
+    var value = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer value.deinit();
+    const root = switch (value.value) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+    if (root.count() != 9) return error.InvalidBackupRequest;
+
+    var parsed = try std.json.parseFromSlice(
+        CurrentGoClusterBackupAttemptMarker,
+        alloc,
+        body,
+        .{ .allocate = .alloc_always },
+    );
+    errdefer parsed.deinit();
+    return .{
+        .created_at = try validateCurrentGoClusterBackupAttempt(
+            alloc,
+            &parsed.value,
+            expected_attempt_id,
+        ),
+        .parsed = parsed,
+    };
+}
+
+fn absorbCurrentGoAttemptMarker(
+    alloc: std.mem.Allocator,
+    snapshot: *CurrentGoAttemptRepositorySnapshot,
+    attempt_id: []const u8,
+    body: []const u8,
+) !void {
+    if (snapshot.marker_count == current_go_backup_attempt_scan_limit)
+        return error.BackupRepositoryHealthScanLimitExceeded;
+    const total_bytes = std.math.add(usize, snapshot.total_bytes, body.len) catch
+        return error.BackupRepositoryHealthScanLimitExceeded;
+    if (total_bytes > current_go_backup_attempt_total_bytes_limit)
+        return error.BackupRepositoryHealthScanLimitExceeded;
+
+    var parsed = try parseCurrentGoClusterBackupAttempt(alloc, body, attempt_id);
+    var parsed_owned = true;
+    defer if (parsed_owned) parsed.deinit();
+
+    var leaf_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    leaf_hasher.update("antfly-current-go-attempt-snapshot-v1");
+    hashArtifactBytes(&leaf_hasher, attempt_id);
+    hashArtifactBytes(&leaf_hasher, body);
+    var leaf_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    leaf_hasher.final(&leaf_digest);
+    for (&snapshot.fingerprint, leaf_digest) |*aggregate, leaf|
+        aggregate.* ^= leaf;
+    snapshot.marker_count += 1;
+    snapshot.total_bytes = total_bytes;
+
+    const replace_latest = if (snapshot.latest) |*latest| blk: {
+        const timestamp_order = currentGoAttemptTimestampOrder(
+            parsed.created_at,
+            latest.created_at,
+        );
+        break :blk timestamp_order == .gt or
+            (timestamp_order == .eq and
+                std.mem.order(
+                    u8,
+                    parsed.parsed.value.attempt_id,
+                    latest.parsed.value.attempt_id,
+                ) == .gt);
+    } else true;
+    if (replace_latest) {
+        if (snapshot.latest) |*latest| latest.deinit();
+        snapshot.latest = parsed;
+        parsed_owned = false;
+    }
+}
+
+fn scanCurrentGoAttemptRepository(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+) !CurrentGoAttemptRepositorySnapshot {
+    var snapshot: CurrentGoAttemptRepositorySnapshot = .{};
+    errdefer snapshot.deinit();
+    switch (location.*) {
+        .file => |backup_root| {
+            const marker_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+                backup_root,
+                incomplete_backup_prefix,
+            });
+            defer alloc.free(marker_root);
+            const dir = if (std.fs.path.isAbsolute(marker_root))
+                std.Io.Dir.openDirAbsolute(io, marker_root, .{ .iterate = true })
+            else
+                std.Io.Dir.cwd().openDir(io, marker_root, .{ .iterate = true });
+            var opened = dir catch |err| switch (err) {
+                error.FileNotFound => return snapshot,
+                else => return err,
+            };
+            defer opened.close(io);
+            var iterator = opened.iterate();
+            var listed_entries: usize = 0;
+            while (try iterator.next(io)) |entry| {
+                listed_entries += 1;
+                if (listed_entries > current_go_backup_attempt_scan_limit)
+                    return error.BackupRepositoryHealthScanLimitExceeded;
+                if (entry.kind == .directory or
+                    !std.mem.endsWith(u8, entry.name, ".json"))
+                {
+                    continue;
+                }
+                if (entry.kind != .file) return error.InvalidBackupRequest;
+                const attempt_id = entry.name[0 .. entry.name.len - ".json".len];
+                try validateBackupId(attempt_id);
+                const marker_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+                    marker_root,
+                    entry.name,
+                });
+                defer alloc.free(marker_path);
+                const body = try readFileAbsoluteAllocWithIo(
+                    alloc,
+                    io,
+                    marker_path,
+                    max_backup_manifest_bytes,
+                );
+                defer alloc.free(body);
+                try absorbCurrentGoAttemptMarker(
+                    alloc,
+                    &snapshot,
+                    attempt_id,
+                    body,
+                );
+            }
+        },
+        .remote => |*store| {
+            const key_prefix = try store.keyPrefixAlloc(
+                alloc,
+                incomplete_backup_prefix,
+            );
+            defer alloc.free(key_prefix);
+            var continuation_token: ?[]u8 = null;
+            defer if (continuation_token) |token| alloc.free(token);
+            var previous_key: ?[]u8 = null;
+            defer if (previous_key) |key| alloc.free(key);
+            var listed_entries: usize = 0;
+            var page_count: usize = 0;
+            while (true) {
+                // A conforming provider needs at most one page per listed
+                // entry (plus a final empty page). This also bounds a broken
+                // provider that rotates non-progressing continuation tokens.
+                if (page_count > current_go_backup_attempt_scan_limit)
+                    return error.InvalidContinuationToken;
+                page_count += 1;
+                var listed = try store.client.listObjects(store.bucket, .{
+                    .prefix = key_prefix,
+                    .recursive = true,
+                    .max_keys = 1000,
+                    .continuation_token = continuation_token,
+                });
+                defer listed.deinit(alloc);
+                var next_token = if (listed.next_continuation_token) |token|
+                    try alloc.dupe(u8, token)
+                else
+                    null;
+                errdefer if (next_token) |token| alloc.free(token);
+
+                for (listed.entries) |entry| {
+                    listed_entries += 1;
+                    if (listed_entries > current_go_backup_attempt_scan_limit)
+                        return error.BackupRepositoryHealthScanLimitExceeded;
+                    if (!std.mem.startsWith(u8, entry.key, key_prefix))
+                        return error.InvalidBackupArtifactPath;
+                    if (previous_key) |key| {
+                        if (std.mem.order(u8, key, entry.key) != .lt)
+                            return error.InvalidContinuationToken;
+                    }
+                    if (previous_key) |key| alloc.free(key);
+                    previous_key = try alloc.dupe(u8, entry.key);
+
+                    const name = entry.key[key_prefix.len..];
+                    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+                        if (std.mem.endsWith(u8, name, ".json"))
+                            return error.InvalidBackupRequest;
+                        continue;
+                    }
+                    if (!std.mem.endsWith(u8, name, ".json")) continue;
+                    const attempt_id = name[0 .. name.len - ".json".len];
+                    try validateBackupId(attempt_id);
+                    const body = try store.readKeyBytesAllocLimited(
+                        alloc,
+                        entry.key,
+                        max_backup_manifest_bytes,
+                        .{
+                            .known_size = entry.size,
+                            .skip_metadata_probe = true,
+                        },
+                    );
+                    defer alloc.free(body);
+                    if (body.len != entry.size) return error.SourceFileChanged;
+                    try absorbCurrentGoAttemptMarker(
+                        alloc,
+                        &snapshot,
+                        attempt_id,
+                        body,
+                    );
+                }
+
+                if (continuation_token != null and next_token != null and
+                    std.mem.eql(u8, continuation_token.?, next_token.?))
+                {
+                    return error.InvalidContinuationToken;
+                }
+                if (continuation_token) |token| alloc.free(token);
+                continuation_token = next_token;
+                next_token = null;
+                if (continuation_token == null) break;
+            }
+        },
+    }
+    return snapshot;
+}
+
+fn currentGoAttemptSnapshotsEqual(
+    lhs: *const CurrentGoAttemptRepositorySnapshot,
+    rhs: *const CurrentGoAttemptRepositorySnapshot,
+) bool {
+    if (lhs.marker_count != rhs.marker_count or
+        lhs.total_bytes != rhs.total_bytes or
+        !std.mem.eql(u8, &lhs.fingerprint, &rhs.fingerprint))
+    {
+        return false;
+    }
+    if ((lhs.latest == null) != (rhs.latest == null)) return false;
+    if (lhs.latest) |latest| {
+        return std.mem.eql(
+            u8,
+            latest.parsed.value.attempt_id,
+            rhs.latest.?.parsed.value.attempt_id,
+        );
+    }
+    return true;
+}
+
 fn deleteFileOrTreeWithIo(io: std.Io, path: []const u8) !bool {
     const result = if (std.fs.path.isAbsolute(path))
         std.Io.Dir.deleteFileAbsolute(io, path)
@@ -4977,6 +5433,158 @@ pub fn ensureNewestClusterBackupAttemptRestorable(
     try ensureClusterBackupAttemptHeadRestorable(alloc, io, location, &head.value);
 }
 
+fn validateNewestCurrentGoBackupAttempt(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    marker: *const CurrentGoClusterBackupAttemptMarker,
+) !ClusterBackupManifest {
+    if (marker.format != .portable) return error.UnsupportedBackupFormat;
+
+    var decoded = readClusterManifestFromLocationDecoded(
+        alloc,
+        io,
+        location,
+        marker.backup_id,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return error.IncompleteClusterBackup,
+        else => return err,
+    };
+    errdefer decoded.manifest.deinit(alloc);
+    if (decoded.encoding != .go_portable_v2 or
+        decoded.manifest.expected_table_count != marker.expected_table_count or
+        decoded.manifest.completed_table_count != marker.expected_table_count)
+    {
+        return error.IncompleteClusterBackup;
+    }
+
+    var metadata_by_table = std.StringHashMapUnmanaged([]const u8).empty;
+    defer metadata_by_table.deinit(alloc);
+    try metadata_by_table.ensureTotalCapacity(
+        alloc,
+        @intCast(marker.table_names.len),
+    );
+    for (marker.table_names, marker.metadata_ids) |table_name, metadata_id|
+        metadata_by_table.putAssumeCapacity(table_name, metadata_id);
+
+    var expected_artifacts = std.StringHashMapUnmanaged(void).empty;
+    defer expected_artifacts.deinit(alloc);
+    try expected_artifacts.ensureTotalCapacity(
+        alloc,
+        @intCast(marker.artifact_names.len),
+    );
+    for (marker.artifact_names) |artifact_name|
+        expected_artifacts.putAssumeCapacity(artifact_name, {});
+
+    for (decoded.manifest.tables) |table| {
+        const metadata_id = metadata_by_table.get(table.name) orelse
+            return error.IncompleteClusterBackup;
+        if (!std.mem.eql(u8, metadata_id, table.table_backup_id))
+            return error.IncompleteClusterBackup;
+        _ = metadata_by_table.remove(table.name);
+
+        var table_manifest = readManifestFromLocationWithArtifactBackupId(
+            alloc,
+            location,
+            table.table_backup_id,
+            marker.backup_id,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.IncompleteClusterBackup,
+            else => return err,
+        };
+        defer table_manifest.deinit(alloc);
+        if (table_manifest.format != .portable or
+            table_manifest.artifact_integrity_mode != .derive_after_materialization or
+            !std.mem.eql(u8, table_manifest.table_name, table.name))
+        {
+            return error.IncompleteClusterBackup;
+        }
+        for (table_manifest.shards) |*shard| {
+            if (!expected_artifacts.remove(shard.snapshot_path))
+                return error.IncompleteClusterBackup;
+            switch (location.*) {
+                .file => |backup_root| validateLocalArtifactAvailable(
+                    alloc,
+                    io,
+                    backup_root,
+                    table_manifest.format,
+                    table_manifest.artifact_integrity_mode,
+                    shard,
+                ) catch |err| switch (err) {
+                    error.FileNotFound => return error.BackupArtifactMissing,
+                    else => return err,
+                },
+                .remote => |*store| store.validateArtifactAvailable(
+                    alloc,
+                    table_manifest.format,
+                    table_manifest.artifact_integrity_mode,
+                    shard,
+                ) catch |err| switch (err) {
+                    error.FileNotFound => return error.BackupArtifactMissing,
+                    else => return err,
+                },
+            }
+        }
+    }
+    if (metadata_by_table.count() != 0 or expected_artifacts.count() != 0)
+        return error.IncompleteClusterBackup;
+    return decoded.manifest;
+}
+
+fn readCurrentGoManifestForRestoreAdmission(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+) !ClusterBackupManifest {
+    var before = try scanCurrentGoAttemptRepository(alloc, io, location);
+    defer before.deinit();
+    const newest = if (before.latest) |*latest|
+        &latest.parsed.value
+    else
+        return error.IncompleteClusterBackup;
+
+    // A Zig producer may have started while the compatibility scan was in
+    // progress. Yield to the O(1) authoritative head path instead of mixing
+    // the two repository protocols in one admission transaction.
+    var intermediate_head = try readClusterBackupAttemptHead(alloc, io, location);
+    defer if (intermediate_head) |*head| head.deinit();
+    if (intermediate_head != null) return error.BackupRepositoryBusy;
+
+    var newest_manifest = try validateNewestCurrentGoBackupAttempt(
+        alloc,
+        io,
+        location,
+        newest,
+    );
+    var decoded: DecodedClusterManifest = if (std.mem.eql(
+        u8,
+        backup_id,
+        newest.backup_id,
+    ))
+        .{ .manifest = newest_manifest, .encoding = .go_portable_v2 }
+    else blk: {
+        newest_manifest.deinit(alloc);
+        break :blk try readClusterManifestFromLocationDecoded(
+            alloc,
+            io,
+            location,
+            backup_id,
+        );
+    };
+    errdefer decoded.manifest.deinit(alloc);
+    if (decoded.encoding != .go_portable_v2)
+        return error.IncompleteClusterBackup;
+
+    var after = try scanCurrentGoAttemptRepository(alloc, io, location);
+    defer after.deinit();
+    var final_head = try readClusterBackupAttemptHead(alloc, io, location);
+    defer if (final_head) |*head| head.deinit();
+    if (final_head != null or !currentGoAttemptSnapshotsEqual(&before, &after))
+        return error.BackupRepositoryBusy;
+    return decoded.manifest;
+}
+
 /// Restore admission is intentionally repository-scoped: the newest published
 /// attempt must be complete and intact before any requested historical
 /// manifest may be selected. Keeping both operations behind one API prevents a
@@ -4987,31 +5595,22 @@ pub fn readClusterManifestForRestoreAdmission(
     location: *BackupLocation,
     backup_id: []const u8,
 ) !ClusterBackupManifest {
-    // The Zig head generation supplies an optimistic read transaction across
-    // repository health verification and requested-manifest selection. The
-    // exact current Go portable envelope predates that head, so a headless Go
-    // repository is admitted only when the head remains absent across the
-    // bounded manifest read. Current Zig manifests without a head remain
-    // rejected; this is a narrow cross-runtime bridge, not legacy fallback.
+    // Zig repositories stay on the O(1) monotonic-head path. Headless current
+    // Go repositories use their exact retained attempt journal with a bounded,
+    // fail-closed snapshot scan; no legacy manifest or marker is inferred.
     var attempt: usize = 0;
     while (attempt < 4) : (attempt += 1) {
         const before = try readClusterBackupAttemptHead(alloc, io, location);
         if (before == null) {
-            var decoded = try readClusterManifestFromLocationDecoded(
+            return readCurrentGoManifestForRestoreAdmission(
                 alloc,
                 io,
                 location,
                 backup_id,
-            );
-            errdefer decoded.manifest.deinit(alloc);
-            if (decoded.encoding != .go_portable_v2)
-                return error.IncompleteClusterBackup;
-
-            var after = try readClusterBackupAttemptHead(alloc, io, location);
-            defer if (after) |*head| head.deinit();
-            if (after == null) return decoded.manifest;
-            decoded.manifest.deinit(alloc);
-            continue;
+            ) catch |err| switch (err) {
+                error.BackupRepositoryBusy => continue,
+                else => return err,
+            };
         }
         var stable_before = before.?;
         defer stable_before.deinit();
@@ -9363,7 +9962,7 @@ test "restore manifest preserves trusted coverage incarnation metadata" {
     );
 }
 
-test "restore admission accepts headless current Go portable cluster manifests only" {
+test "restore admission validates the stable newest current Go attempt" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -9387,6 +9986,34 @@ test "restore admission accepts headless current Go portable cluster manifests o
         alloc,
         go_manifest_path,
         "{\"version\":2,\"state\":\"complete\",\"backup_id\":\"go-cluster\",\"timestamp\":\"2026-07-25T12:00:00Z\",\"antfly_version\":\"go-current\",\"format\":\"portable\",\"expected_table_count\":1,\"completed_table_count\":1,\"tables\":[{\"name\":\"docs\",\"backup_location\":\"s3://archive/prod/table-a-metadata.json\",\"shard_count\":1,\"status\":\"completed\"}]}",
+        "application/json",
+    );
+    try std.testing.expectError(
+        error.IncompleteClusterBackup,
+        readClusterManifestForRestoreAdmission(
+            alloc,
+            io,
+            &location,
+            go_backup_id,
+        ),
+    );
+
+    try location.remote.writeBytes(
+        alloc,
+        "table-a-metadata.json",
+        "{\"version\":1,\"format\":\"portable\",\"table\":{\"name\":\"docs\",\"shards\":{\"1\":{\"byte_range\":[\"\",\"\"]}}}}",
+        "application/json",
+    );
+    try location.remote.writeBytes(
+        alloc,
+        "go-cluster-1.afb",
+        "portable-artifact",
+        "application/octet-stream",
+    );
+    try location.remote.writeBytes(
+        alloc,
+        ".antfly-incomplete/afba-go.json",
+        "{\"version\":1,\"attempt_id\":\"afba-go\",\"backup_id\":\"go-cluster\",\"created_at\":\"2026-07-25T12:00:00.25Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-a\"],\"artifact_names\":[\"go-cluster-1.afb\"]}",
         "application/json",
     );
 
@@ -9420,6 +10047,152 @@ test "restore admission accepts headless current Go portable cluster manifests o
             io,
             &location,
             zig_backup_id,
+        ),
+    );
+
+    try location.remote.writeBytes(
+        alloc,
+        ".antfly-incomplete/afba-newer.json",
+        "{\"version\":1,\"attempt_id\":\"afba-newer\",\"backup_id\":\"newer-cluster\",\"created_at\":\"2026-07-25T12:00:00.3Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"events\"],\"metadata_ids\":[\"table-b\"],\"artifact_names\":[\"newer-cluster-1.afb\"]}",
+        "application/json",
+    );
+    try std.testing.expectError(
+        error.IncompleteClusterBackup,
+        readClusterManifestForRestoreAdmission(
+            alloc,
+            io,
+            &location,
+            go_backup_id,
+        ),
+    );
+}
+
+test "current Go attempt timestamps preserve RFC3339Nano ordering" {
+    const whole_second = try parseCurrentGoAttemptTimestamp(
+        "2026-07-25T12:00:00Z",
+    );
+    const fractional = try parseCurrentGoAttemptTimestamp(
+        "2026-07-25T12:00:00.9Z",
+    );
+    const next_second = try parseCurrentGoAttemptTimestamp(
+        "2026-07-25T12:00:01.000000001Z",
+    );
+    try std.testing.expectEqual(
+        std.math.Order.lt,
+        currentGoAttemptTimestampOrder(whole_second, fractional),
+    );
+    try std.testing.expectEqual(
+        std.math.Order.lt,
+        currentGoAttemptTimestampOrder(fractional, next_second),
+    );
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        parseCurrentGoAttemptTimestamp("2025-02-29T12:00:00Z"),
+    );
+    _ = try parseCurrentGoAttemptTimestamp("2024-02-29T12:00:00Z");
+}
+
+test "current Go attempt validation matches Unicode table-name trimming" {
+    const alloc = std.testing.allocator;
+    const marker =
+        "{\"version\":1,\"attempt_id\":\"afba-space\",\"backup_id\":\"go-space\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"\\u3000\"],\"metadata_ids\":[\"table-a\"],\"artifact_names\":[]}";
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        parseCurrentGoClusterBackupAttempt(alloc, marker, "afba-space"),
+    );
+}
+
+test "current Go filesystem attempt snapshots detect repository changes" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const backup_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/go-attempt-snapshot",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(backup_root);
+    const marker_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+        backup_root,
+        incomplete_backup_prefix,
+    });
+    defer alloc.free(marker_root);
+    try ensureDirPathWithIo(io, marker_root);
+    const first_marker = try std.fmt.allocPrint(
+        alloc,
+        "{s}/afba-first.json",
+        .{marker_root},
+    );
+    defer alloc.free(first_marker);
+    try writeFileAbsolute(
+        first_marker,
+        "{\"version\":1,\"attempt_id\":\"afba-first\",\"backup_id\":\"go-first\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-a\"],\"artifact_names\":[\"go-first-1.afb\"]}",
+    );
+
+    var location: BackupLocation = .{
+        .file = try alloc.dupe(u8, backup_root),
+    };
+    defer location.deinit(alloc);
+    var before = try scanCurrentGoAttemptRepository(alloc, io, &location);
+    defer before.deinit();
+    try std.testing.expectEqual(@as(usize, 1), before.marker_count);
+    try std.testing.expectEqualStrings(
+        "afba-first",
+        before.latest.?.parsed.value.attempt_id,
+    );
+
+    const second_marker = try std.fmt.allocPrint(
+        alloc,
+        "{s}/afba-second.json",
+        .{marker_root},
+    );
+    defer alloc.free(second_marker);
+    try writeFileAbsolute(
+        second_marker,
+        "{\"version\":1,\"attempt_id\":\"afba-second\",\"backup_id\":\"go-second\",\"created_at\":\"2026-07-25T12:00:01Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"events\"],\"metadata_ids\":[\"table-b\"],\"artifact_names\":[\"go-second-1.afb\"]}",
+    );
+    var after = try scanCurrentGoAttemptRepository(alloc, io, &location);
+    defer after.deinit();
+    try std.testing.expect(!currentGoAttemptSnapshotsEqual(&before, &after));
+    try std.testing.expectEqualStrings(
+        "afba-second",
+        after.latest.?.parsed.value.attempt_id,
+    );
+}
+
+test "current Go attempt snapshot budgets fail closed" {
+    const alloc = std.testing.allocator;
+    const marker =
+        "{\"version\":1,\"attempt_id\":\"afba-budget\",\"backup_id\":\"go-budget\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-a\"],\"artifact_names\":[\"go-budget-1.afb\"]}";
+
+    var count_exhausted: CurrentGoAttemptRepositorySnapshot = .{
+        .marker_count = current_go_backup_attempt_scan_limit,
+    };
+    defer count_exhausted.deinit();
+    try std.testing.expectError(
+        error.BackupRepositoryHealthScanLimitExceeded,
+        absorbCurrentGoAttemptMarker(
+            alloc,
+            &count_exhausted,
+            "afba-budget",
+            marker,
+        ),
+    );
+
+    var bytes_exhausted: CurrentGoAttemptRepositorySnapshot = .{
+        .total_bytes = current_go_backup_attempt_total_bytes_limit,
+    };
+    defer bytes_exhausted.deinit();
+    try std.testing.expectError(
+        error.BackupRepositoryHealthScanLimitExceeded,
+        absorbCurrentGoAttemptMarker(
+            alloc,
+            &bytes_exhausted,
+            "afba-budget",
+            marker,
         ),
     );
 }
