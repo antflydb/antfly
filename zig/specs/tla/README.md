@@ -381,6 +381,7 @@ suite's NDJSON trace families as one self-contained HTML swimlane timeline
 ```bash
 make tla-viz-trace JSON=specs/tla/example.ndjson OUT=/tmp/raft.html
 make tla-viz-trace JSON=specs/tla/traces/split_bridge_cutover.ndjson OUT=/tmp/split.html
+make tla-viz-traces   # every fixture in one browsable file (sidebar per family)
 ```
 
 A timeline's useful encodings are domain knowledge (what is an actor, what

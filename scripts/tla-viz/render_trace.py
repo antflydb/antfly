@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -255,7 +256,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   body.viz-root {
     margin: 0; background: var(--page); color: var(--text-primary);
     font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    overflow: hidden;
   }
+  #app { display: flex; height: 100vh; }
+  nav#sidebar { width: 250px; flex: none; overflow-y: auto;
+    border-right: 1px solid var(--grid); padding: 8px 0 24px;
+    background: var(--surface-1); }
+  nav#sidebar h3 { font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.04em; color: var(--text-muted); margin: 14px 12px 4px; }
+  nav#sidebar .entry { display: block; padding: 4px 12px 4px 14px;
+    font-size: 12.5px; color: var(--text-secondary); cursor: pointer;
+    border-left: 2px solid transparent;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  nav#sidebar .entry:hover { background: var(--page); }
+  nav#sidebar .entry.active { color: var(--text-primary);
+    border-left-color: #2a78d6; background: var(--page); }
+  nav#sidebar .entry .meta { color: var(--text-muted); font-size: 11px; }
+  #main { flex: 1; overflow-y: auto; min-width: 0; }
   header {
     position: sticky; top: 0; z-index: 3; background: var(--page);
     padding: 10px 16px 8px; border-bottom: 1px solid var(--grid);
@@ -317,9 +334,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </style>
 </head>
 <body class="viz-root">
+<div id="app">
+<nav id="sidebar" class="hidden"></nav>
+<div id="main">
 <header>
-  <h1>__TITLE__</h1>
-  <div class="sub">__SUBTITLE__</div>
+  <h1 id="title"></h1>
+  <div class="sub" id="subtitle"></div>
   <div class="controls">
     <div class="group" id="cat-filters"></div>
     <div class="group" id="lane-filters"></div>
@@ -328,16 +348,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 </header>
 <div id="charts"></div>
+</div>
+</div>
 <div id="tooltip"></div>
 <script>
-const DATA = __DATA__;
+// One or more traces; with several, a sidebar switches between them.
+const TRACES = __DATA__;
 
-// Small traces get a "narrated" layout: taller rows, every event labeled
-// with its name and the state fields it changed.
-const SPARSE = DATA.sparse;
-const ROW_H = SPARSE ? 24 : 12, LANE_W = SPARSE ? 240 : 130,
-      GUTTER = 46, TOP_PAD = 10;
-const CATS = DATA.categories;         // [{label, color, shape}] x5
+// Per-trace globals, set by buildUI(). Small traces get a "narrated" layout:
+// taller rows, every event labeled with its name and the state fields it
+// changed.
+let CUR, SPARSE, ROW_H, LANE_W, CATS, state;
+const GUTTER = 46, TOP_PAD = 10;
 const FAULT = 4;
 const SVG = "http://www.w3.org/2000/svg";
 
@@ -373,14 +395,8 @@ function drawMark(parent, cat, x, y) {
                      fill: c, class: "mark"}, parent);
 }
 
-const state = {
-  cats: new Set(CATS.map((_, i) => i)),
-  lanes: new Set(DATA.segments.flatMap(s => s.lanes)),
-  table: false,
-};
-
 function laneX(seg, lane) { return GUTTER + seg.lanes.indexOf(lane) * LANE_W + LANE_W / 2; }
-function laneName(lane) { return DATA.lanePrefix + lane; }
+function laneName(lane) { return CUR.lanePrefix + lane; }
 
 function renderSegment(seg, idx) {
   const wrap = document.createElement("section");
@@ -389,7 +405,7 @@ function renderSegment(seg, idx) {
   const w = GUTTER + seg.lanes.length * LANE_W + (SPARSE ? 460 : 10);
 
   const title = document.createElement("h2");
-  title.textContent = DATA.segments.length > 1
+  title.textContent = CUR.segments.length > 1
     ? `Segment ${idx + 1} — ${events.length} events, ${seg.lanes.length} lanes`
     : `${events.length} events, ${seg.lanes.length} lanes`;
   wrap.appendChild(title);
@@ -413,16 +429,16 @@ function renderSegment(seg, idx) {
   // Tenure bands: per-lane washes for actor state, or one full-width strip
   // per span for global protocol state (bandGlobal).
   const bands = el("g", {}, svg);
-  const bandLanes = DATA.bandGlobal ? [null] : seg.lanes;
+  const bandLanes = CUR.bandGlobal ? [null] : seg.lanes;
   for (const lane of bandLanes) {
     let start = null, band = null;
     const bx = lane === null ? GUTTER - 6 : laneX(seg, lane) - LANE_W / 2 + 4;
     const bw = lane === null ? w - GUTTER - 8 : LANE_W - 8;
     const flush = (endIdx) => {
-      if (band !== null && DATA.bands[band] && !DATA.bandQuiet.includes(band)) {
+      if (band !== null && CUR.bands[band] && !CUR.bandQuiet.includes(band)) {
         const attrs = {x: bx, y: TOP_PAD + start * ROW_H - 5,
                        width: bw, height: (endIdx - start) * ROW_H,
-                       fill: DATA.bands[band] + "30"};
+                       fill: CUR.bands[band] + "30"};
         if (lane !== null) attrs["data-lane"] = lane;
         el("rect", attrs, bands);
       }
@@ -502,7 +518,7 @@ function renderSegment(seg, idx) {
   const table = document.createElement("table");
   table.className = "events hidden";
   table.innerHTML = "<thead><tr><th>#</th><th>Lane</th><th>Event</th>" +
-    (DATA.bandField ? `<th>${DATA.bandField}</th>` : "") +
+    (CUR.bandField ? `<th>${CUR.bandField}</th>` : "") +
     (hasMsg ? "<th>Message</th>" : "") +
     "<th>Changed</th></tr></thead>";
   const tbody = document.createElement("tbody");
@@ -510,7 +526,7 @@ function renderSegment(seg, idx) {
     const tr = document.createElement("tr");
     tr.dataset.cat = ev.cat; tr.dataset.lane = ev.lane;
     const cells = [i, ev.lane, (ev.cat === FAULT ? "⚠ " : "") + ev.name];
-    if (DATA.bandField) cells.push(ev.band ?? "");
+    if (CUR.bandField) cells.push(ev.band ?? "");
     if (hasMsg) cells.push(ev.msg ? `${ev.msg.type} ${ev.msg.from}→${ev.msg.to}` : "");
     cells.push((ev.changes || []).join("; "));
     for (const v of cells) {
@@ -557,50 +573,103 @@ function chip(parent, label, swatchColor, onToggle) {
 }
 
 const SHAPE_GLYPH = {circle: "●", diamond: "◆", square: "■", triangle: "▲", cross: "✕"};
-const usedCats = new Set(DATA.segments.flatMap(s => s.events.map(e => e.cat)));
-const catBox = document.getElementById("cat-filters");
-CATS.forEach((cat, i) => {
-  if (!usedCats.has(i)) return;
-  chip(catBox, `${cat.label} ${SHAPE_GLYPH[cat.shape]}`, cat.color,
-       on => on ? state.cats.add(i) : state.cats.delete(i));
-});
-const laneBox = document.getElementById("lane-filters");
-const allLanes = [...state.lanes];
-if (allLanes.length > 1 && allLanes.length <= 12) {
-  for (const lane of allLanes) {
-    chip(laneBox, laneName(lane), null,
-         on => on ? state.lanes.add(lane) : state.lanes.delete(lane));
+
+function buildSidebar() {
+  if (TRACES.length < 2) return;
+  const nav = document.getElementById("sidebar");
+  nav.classList.remove("hidden");
+  const groups = new Map();
+  TRACES.forEach((t, i) => {
+    if (!groups.has(t.label)) groups.set(t.label, []);
+    groups.get(t.label).push(i);
+  });
+  for (const [label, idxs] of groups) {
+    const h = document.createElement("h3");
+    h.textContent = label;
+    nav.appendChild(h);
+    for (const i of idxs) {
+      const a = document.createElement("a");
+      a.className = "entry";
+      a.title = TRACES[i].name;
+      a.dataset.idx = i;
+      const n = TRACES[i].data.segments.reduce((s, seg) => s + seg.events.length, 0);
+      a.appendChild(document.createTextNode(TRACES[i].name + " "));
+      const meta = document.createElement("span");
+      meta.className = "meta";
+      meta.textContent = `· ${n}`;
+      a.appendChild(meta);
+      a.addEventListener("click", () => buildUI(i));
+      nav.appendChild(a);
+    }
   }
 }
 
-// Band (phase) legend: colors shared with the model's state diagram.
-const bandBox = document.getElementById("band-legend");
-const bandEntries = Object.entries(DATA.bands);
-if (bandEntries.length) {
-  const label = document.createElement("span");
-  label.textContent = DATA.bandField + ":";
-  bandBox.appendChild(label);
-  for (const [value, color] of bandEntries) {
-    const item = document.createElement("span");
-    const quiet = DATA.bandQuiet.includes(value);
-    const sw = document.createElement("span");
-    sw.className = "swatch";
-    sw.style.background = quiet ? "transparent" : color + "60";
-    item.appendChild(sw);
-    item.appendChild(document.createTextNode(" " + value +
-      (quiet ? " (untinted)" : "")));
-    bandBox.appendChild(item);
-  }
-}
+function buildUI(idx) {
+  CUR = TRACES[idx].data;
+  SPARSE = CUR.sparse;
+  ROW_H = SPARSE ? 24 : 12;
+  LANE_W = SPARSE ? 240 : 130;
+  CATS = CUR.categories;
+  state = {
+    cats: new Set(CATS.map((_, i) => i)),
+    lanes: new Set(CUR.segments.flatMap(s => s.lanes)),
+    table: false,
+  };
+  document.getElementById("title").textContent = TRACES[idx].name;
+  document.getElementById("subtitle").textContent = TRACES[idx].subtitle;
+  document.getElementById("viewbtn").textContent = "Table view";
+  for (const id of ["cat-filters", "lane-filters", "band-legend", "charts"])
+    document.getElementById(id).replaceChildren();
 
-const charts = document.getElementById("charts");
-DATA.segments.forEach((seg, i) => charts.appendChild(renderSegment(seg, i)));
+  const usedCats = new Set(CUR.segments.flatMap(s => s.events.map(e => e.cat)));
+  const catBox = document.getElementById("cat-filters");
+  CATS.forEach((cat, i) => {
+    if (!usedCats.has(i)) return;
+    chip(catBox, `${cat.label} ${SHAPE_GLYPH[cat.shape]}`, cat.color,
+         on => on ? state.cats.add(i) : state.cats.delete(i));
+  });
+  const laneBox = document.getElementById("lane-filters");
+  const allLanes = [...state.lanes];
+  if (allLanes.length > 1 && allLanes.length <= 12) {
+    for (const lane of allLanes) {
+      chip(laneBox, laneName(lane), null,
+           on => on ? state.lanes.add(lane) : state.lanes.delete(lane));
+    }
+  }
+
+  // Band (phase) legend: colors shared with the model's state diagram.
+  const bandBox = document.getElementById("band-legend");
+  const bandEntries = Object.entries(CUR.bands);
+  if (bandEntries.length) {
+    const label = document.createElement("span");
+    label.textContent = CUR.bandField + ":";
+    bandBox.appendChild(label);
+    for (const [value, color] of bandEntries) {
+      const item = document.createElement("span");
+      const quiet = CUR.bandQuiet.includes(value);
+      const sw = document.createElement("span");
+      sw.className = "swatch";
+      sw.style.background = quiet ? "transparent" : color + "60";
+      item.appendChild(sw);
+      item.appendChild(document.createTextNode(" " + value +
+        (quiet ? " (untinted)" : "")));
+      bandBox.appendChild(item);
+    }
+  }
+
+  const charts = document.getElementById("charts");
+  CUR.segments.forEach((seg, i) => charts.appendChild(renderSegment(seg, i)));
+
+  for (const e of document.querySelectorAll("#sidebar .entry"))
+    e.classList.toggle("active", Number(e.dataset.idx) === idx);
+  document.getElementById("main").scrollTop = 0;
+  syncHeaderHeight();
+}
 
 function syncHeaderHeight() {
   const h = document.querySelector("header").offsetHeight;
   document.documentElement.style.setProperty("--header-h", h + "px");
 }
-syncHeaderHeight();
 window.addEventListener("resize", syncHeaderHeight);
 
 document.getElementById("viewbtn").addEventListener("click", (e) => {
@@ -611,45 +680,31 @@ document.getElementById("viewbtn").addEventListener("click", (e) => {
   for (const t of document.querySelectorAll("table.events"))
     t.classList.toggle("hidden", !state.table);
 });
+
+buildSidebar();
+buildUI(0);
 </script>
 </body>
 </html>
 """
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("trace", type=Path, help="ndjson trace file")
-    ap.add_argument("-o", "--output", type=Path,
-                    help="output HTML path (default: <trace>.html)")
-    ap.add_argument("--bindings", type=Path,
-                    help="viz.json binding table (default: found next to the "
-                         "trace or under specs/tla/traces/)")
-    ap.add_argument("--max-events", type=int, default=20000,
-                    help="refuse to render more events than this (default 20000); "
-                         "pre-split large traces with scripts/tla-segment-*.py")
-    args = ap.parse_args()
-
-    objs = list(parse_lines(args.trace))
+def prepare_trace(path: Path, bindings: dict[str, "Binding"],
+                  specs_dir: Path | None, max_events: int) -> dict | None:
+    """Parse and lay out one trace file into a sidebar entry, or None with a
+    warning if it is empty or oversized."""
+    objs = list(parse_lines(path))
     if not objs:
-        print(f"{args.trace}: no trace events found", file=sys.stderr)
-        return 1
-    if len(objs) > args.max_events:
-        print(f"{args.trace}: {len(objs)} events exceeds --max-events="
-              f"{args.max_events}; segment the trace first "
+        print(f"skip {path}: no trace events found", file=sys.stderr)
+        return None
+    if len(objs) > max_events:
+        print(f"skip {path}: {len(objs)} events exceeds --max-events="
+              f"{max_events}; segment it first "
               "(scripts/tla-segment-raft-trace.py)", file=sys.stderr)
-        return 1
+        return None
 
     kind = objs[0]["tag"]
-    bindings_path = archetypes.find_bindings_file(args.trace, args.bindings)
-    specs_dir = None
-    if bindings_path is not None:
-        bindings = archetypes.load_bindings(bindings_path)
-        binding = bindings.get(kind) or archetypes.fallback(kind)
-        specs_dir = bindings_path.parent.parent
-    else:
-        binding = archetypes.fallback(kind)
-
+    binding = bindings.get(kind) or archetypes.fallback(kind)
     segments = build_segments(objs, binding)
     band_colors = resolve_band_colors(binding, segments, specs_dir)
 
@@ -666,19 +721,6 @@ def main() -> int:
         seg_data.append({"lanes": lane_order(events, binding),
                          "events": events, "arrows": arrows})
 
-    data = {
-        "kind": kind,
-        "sparse": len(objs) <= 200,
-        "lanePrefix": binding.lane_prefix,
-        "categories": binding.category_legend(),
-        "bandField": binding.band_field,
-        "bandGlobal": binding.band_global,
-        "bands": band_colors,
-        "bandQuiet": binding.band_quiet,
-        "segments": seg_data,
-    }
-
-    title = f"TLA+ trace — {args.trace.name}"
     n_arrows = sum(len(s["arrows"]) for s in seg_data)
     subtitle = (
         f"{len(objs)} events, {len(segments)} segment(s) — {binding.label} trace, "
@@ -688,13 +730,82 @@ def main() -> int:
            " No viz binding for this tag — rendered with the generic narrative "
            "preset; add one in specs/tla/traces/viz.json.")
     )
-    out = args.output or args.trace.with_suffix(".html")
+    return {
+        "name": path.name,
+        "label": binding.label,
+        "subtitle": subtitle,
+        "data": {
+            "kind": kind,
+            "sparse": len(objs) <= 200,
+            "lanePrefix": binding.lane_prefix,
+            "categories": binding.category_legend(),
+            "bandField": binding.band_field,
+            "bandGlobal": binding.band_global,
+            "bands": band_colors,
+            "bandQuiet": binding.band_quiet,
+            "segments": seg_data,
+        },
+    }
+
+
+def expand_inputs(paths: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    for p in paths:
+        if p.is_dir():
+            files += sorted(f for f in p.rglob("*.ndjson"))
+        else:
+            files.append(p)
+    return list(dict.fromkeys(files))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("traces", type=Path, nargs="+",
+                    help="ndjson trace file(s) and/or directories to scan; "
+                         "several inputs produce one HTML with a sidebar")
+    ap.add_argument("-o", "--output", type=Path,
+                    help="output HTML path (default: <trace>.html)")
+    ap.add_argument("--bindings", type=Path,
+                    help="viz.json binding table (default: found next to the "
+                         "first trace or under specs/tla/traces/)")
+    ap.add_argument("--max-events", type=int, default=20000,
+                    help="skip traces with more events than this (default "
+                         "20000); pre-split with scripts/tla-segment-*.py")
+    args = ap.parse_args()
+
+    files = expand_inputs(args.traces)
+    if not files:
+        print("no .ndjson files found", file=sys.stderr)
+        return 1
+
+    bindings_path = archetypes.find_bindings_file(files[0], args.bindings)
+    bindings, specs_dir = {}, None
+    if bindings_path is not None:
+        bindings = archetypes.load_bindings(bindings_path)
+        specs_dir = bindings_path.parent.parent
+
+    pairs = [(f, e) for f in files
+             if (e := prepare_trace(f, bindings, specs_dir, args.max_events))]
+    if not pairs:
+        print("no renderable traces", file=sys.stderr)
+        return 1
+    entries = [e for _, e in pairs]
+
+    # Sidebar names: paths relative to the inputs' common directory.
+    if len(pairs) > 1:
+        common = os.path.commonpath([str(f.parent) for f, _ in pairs])
+        for f, e in pairs:
+            e["name"] = os.path.relpath(f, common)
+
+    title = (f"TLA+ trace — {entries[0]['name']}" if len(entries) == 1
+             else f"TLA+ traces — {len(entries)} files")
+    out = args.output or files[0].with_suffix(".html")
     page = (HTML_TEMPLATE
             .replace("__TITLE__", html.escape(title))
-            .replace("__SUBTITLE__", html.escape(subtitle))
-            .replace("__DATA__", json.dumps(data).replace("</", "<\\/")))
+            .replace("__DATA__", json.dumps(entries).replace("</", "<\\/")))
     out.write_text(page)
-    print(f"wrote {out} ({out.stat().st_size // 1024} KiB)")
+    print(f"wrote {out} ({out.stat().st_size // 1024} KiB, "
+          f"{len(entries)} trace(s))")
     return 0
 
 
