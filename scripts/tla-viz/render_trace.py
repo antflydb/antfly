@@ -96,11 +96,41 @@ def is_state_reset(seg_events: list[dict], ev: dict) -> bool:
     return False
 
 
+def flatten_event(ev: dict) -> dict:
+    """Scalar view of an event's state for per-lane diffing. Nested dicts get
+    dotted keys; lists are inlined when short. The message payload is excluded
+    (it changes every event and is shown in the tooltip/table instead)."""
+    out: dict = {}
+
+    def add(key, val):
+        if isinstance(val, (str, int, float, bool)) or val is None:
+            out[key] = val
+        elif isinstance(val, list):
+            s = json.dumps(val)
+            out[key] = s if len(s) <= 24 else f"[{len(val)} items]"
+        elif isinstance(val, dict):
+            for k2, v2 in val.items():
+                add(f"{key}.{k2}", v2)
+
+    for k, v in ev.items():
+        if k not in ("name", "msg"):
+            add(k, v)
+    # "after.status" -> "status": the writers' post-state envelope adds noise.
+    return {(k[6:] if k.startswith("after.") else k): v for k, v in out.items()}
+
+
+def fmt(val) -> str:
+    if isinstance(val, str) and val[:1] in ("[", "{"):
+        return val  # already a compact JSON literal from flatten_event
+    return json.dumps(val) if isinstance(val, (bool, str)) or val is None else str(val)
+
+
 def build_segments(objs) -> list[list[dict]]:
     """Flatten trace objects into per-segment event records."""
     segments: list[list[dict]] = []
     current: list[dict] = []
     init_nodes: set[str] = set()
+    lane_state: dict[str, dict] = {}
 
     for obj in objs:
         ev = obj["event"]
@@ -117,9 +147,20 @@ def build_segments(objs) -> list[list[dict]]:
             )
             if new_run:
                 segments.append(current)
-                current, init_nodes = [], set()
+                current, init_nodes, lane_state = [], set(), {}
             if name == "InitState":
                 init_nodes.add(lane)
+
+        # What changed in this lane's observable state, for direct labels.
+        snap = flatten_event(ev)
+        prev = lane_state.get(lane)
+        if prev is None:
+            changes = [f"{k}={fmt(v)}" for k, v in snap.items()][:6]
+        else:
+            changes = [f"{k}: {fmt(prev[k])}→{fmt(v)}"
+                       for k, v in snap.items() if k in prev and prev[k] != v]
+            changes += [f"{k}={fmt(v)}" for k, v in snap.items() if k not in prev]
+        lane_state[lane] = {**(prev or {}), **snap}
 
         state = ev.get("state") or {}
         rec = {
@@ -132,6 +173,7 @@ def build_segments(objs) -> list[list[dict]]:
             "log": ev.get("log"),
             "msg": ev.get("msg"),
             "txn": ev.get("txnId"),
+            "changes": changes,
             "detail": json.dumps(ev, indent=1),
         }
         current.append(rec)
@@ -239,7 +281,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     border: 1px solid var(--border); }
   svg.timeline text { fill: var(--text-muted); font-size: 10px;
     font-variant-numeric: tabular-nums; }
-  svg.timeline text.evlabel { fill: var(--text-secondary); font-size: 10px; }
+  svg.timeline text.evlabel { fill: var(--text-primary); font-size: 11px; }
+  svg.timeline text.chlabel { fill: var(--text-muted); font-size: 9.5px;
+    font-variant-numeric: tabular-nums; }
   .lane-line { stroke: var(--grid); stroke-width: 1; }
   .mark { stroke: var(--surface-1); stroke-width: 1; }
   .hit { fill: transparent; cursor: pointer; }
@@ -281,7 +325,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <script>
 const DATA = __DATA__;
 
-const ROW_H = 12, LANE_W = 130, GUTTER = 46, TOP_PAD = 10;
+// Small traces get a "narrated" layout: taller rows, every event labeled
+// with its name and the state fields it changed.
+const SPARSE = DATA.sparse;
+const ROW_H = SPARSE ? 24 : 12, LANE_W = SPARSE ? 240 : 130,
+      GUTTER = 46, TOP_PAD = 10;
 const CAT_COLOR = {
   replication: "var(--cat-replication)",
   election: "var(--cat-election)",
@@ -334,7 +382,7 @@ function renderSegment(seg, idx) {
   const wrap = document.createElement("section");
   const events = seg.events;
   const h = TOP_PAD + events.length * ROW_H + 20;
-  const w = GUTTER + seg.lanes.length * LANE_W + 10;
+  const w = GUTTER + seg.lanes.length * LANE_W + (SPARSE ? 460 : 10);
 
   const title = document.createElement("h2");
   title.textContent = DATA.segments.length > 1
@@ -383,7 +431,7 @@ function renderSegment(seg, idx) {
     el("line", {x1: x, y1: TOP_PAD - 6, x2: x, y2: h - 10,
                 class: "lane-line", "data-lane": lane}, svg);
   }
-  for (let i = 0; i < events.length; i += 50) {
+  for (let i = 0; i < events.length; i += (SPARSE ? 5 : 50)) {
     el("text", {x: 4, y: TOP_PAD + i * ROW_H + 3}, svg).textContent = String(i);
   }
 
@@ -413,7 +461,15 @@ function renderSegment(seg, idx) {
     const x = laneX(seg, ev.lane), y = TOP_PAD + i * ROW_H;
     const g = el("g", {"data-cat": ev.cat, "data-lane": ev.lane}, marksG);
     drawMark(g, ev.cat, x, y);
-    if (ev.name.startsWith("Become") || ev.name === "InitState") {
+    if (SPARSE) {
+      el("text", {x: x + 10, y: y, class: "evlabel"}, g).textContent = ev.name;
+      if (ev.changes && ev.changes.length) {
+        const maxCh = seg.lanes.length > 1 ? 42 : 120;
+        const txt = ev.changes.join("   ");
+        el("text", {x: x + 10, y: y + 11, class: "chlabel"}, g).textContent =
+          txt.length > maxCh ? txt.slice(0, maxCh - 1) + "…" : txt;
+      }
+    } else if (ev.name.startsWith("Become") || ev.name === "InitState") {
       el("text", {x: x + 8, y: y + 3, class: "evlabel"}, g).textContent =
         `${ev.name} (t${ev.term ?? "?"})`;
     }
@@ -549,6 +605,7 @@ def main() -> int:
     segments = build_segments(objs)
     data = {
         "kind": kind,
+        "sparse": len(objs) <= 200,
         "segments": [
             {
                 "lanes": lane_order(events),
