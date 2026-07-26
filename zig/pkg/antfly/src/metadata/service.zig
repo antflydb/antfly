@@ -5548,26 +5548,21 @@ fn collectLocalGroupStatusReport(
         .disk_bytes = try directoryUsageBytes(alloc, db_path),
         .empty = stats.doc_count == 0,
         .created_at_millis = created_at_millis,
-        .updated_at_millis = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)),
-        .local_leader = serviceGroupLocalLeader(service, group_id),
+        .updated_at_millis = now_realtime_ms,
+        .local_leader = membership.local_leader,
         .local_voter = membership.local_voter,
         .voter_count = membership.voter_count,
         .voter_set_known = membership.voter_set_known,
         .voter_set_fingerprint = membership.voter_set_fingerprint,
         .joint_consensus = membership.joint_consensus,
+        .raft_term = membership.raft_term,
+        .raft_membership_index = membership.raft_membership_index,
         .transition_pending = readiness.transition_pending,
         .replay_required = readiness.replay_required,
         .replay_caught_up = readiness.replay_caught_up,
         .cutover_ready = readiness.cutover_ready,
         .reads_ready_after_cutover = readiness.reads_ready_after_cutover,
     };
-}
-
-fn serviceGroupLocalLeader(service: anytype, group_id: u64) bool {
-    const Service = @TypeOf(service);
-    if (Service == *MetadataService) return service.raft.host.host.isLocalLeader(group_id);
-    if (Service == *MetadataHttpService) return service.raft.host.http_host.host.isLocalLeader(group_id);
-    return false;
 }
 
 const ServiceGroupRaftObservation = struct {
@@ -5667,11 +5662,14 @@ fn raftRoleName(role: raft_engine.core.types.StateRole) []const u8 {
 }
 
 const ServiceGroupMembership = struct {
+    local_leader: bool = false,
     local_voter: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
     voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint = [_]u8{0} ** metadata_table_manager.voter_set_fingerprint_len,
     joint_consensus: bool = false,
+    raft_term: u64 = 0,
+    raft_membership_index: u64 = 0,
 };
 
 fn serviceGroupMembership(service: anytype, group_id: u64) ServiceGroupMembership {
@@ -5686,11 +5684,15 @@ fn serviceGroupMembership(service: anytype, group_id: u64) ServiceGroupMembershi
             }
         }
         return .{
+            .local_leader = raft_status.soft.role == .leader and
+                raft_status.soft.leader_id == raft_status.id,
             .local_voter = local_voter,
             .voter_count = @intCast(raft_status.conf_state.voters.len),
             .voter_set_known = true,
             .voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(raft_status.conf_state.voters, null),
             .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
+            .raft_term = raft_status.hard.current_term,
+            .raft_membership_index = raft_status.applied_index,
         };
     }
     if (Service == *MetadataHttpService) {
@@ -5703,11 +5705,15 @@ fn serviceGroupMembership(service: anytype, group_id: u64) ServiceGroupMembershi
             }
         }
         return .{
+            .local_leader = raft_status.soft.role == .leader and
+                raft_status.soft.leader_id == raft_status.id,
             .local_voter = local_voter,
             .voter_count = @intCast(raft_status.conf_state.voters.len),
             .voter_set_known = true,
             .voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(raft_status.conf_state.voters, null),
             .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
+            .raft_term = raft_status.hard.current_term,
+            .raft_membership_index = raft_status.applied_index,
         };
     }
     return .{};

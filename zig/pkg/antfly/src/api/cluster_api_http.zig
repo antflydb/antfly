@@ -33,6 +33,7 @@ pub const ClusterApi = struct {
         InvalidRequest,
         NoTables,
         BackupAlreadyExists,
+        BackupRepositoryBusy,
         BackupManifestTooLarge,
         MethodNotAllowed,
         InternalFailure,
@@ -41,6 +42,7 @@ pub const ClusterApi = struct {
     pub const ExecuteRestoreError = error{
         NotLeader,
         InvalidRequest,
+        BackupRepositoryBusy,
         BackupManifestTooLarge,
         BackupIntegrityFailure,
         TableAlreadyExists,
@@ -185,6 +187,7 @@ pub fn handleClusterBackup(
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") },
         error.NoTables => return .{ .status = 400, .body = try alloc.dupe(u8, "no tables to backup") },
         error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, "backup id already exists") },
+        error.BackupRepositoryBusy => return .{ .status = 409, .body = try alloc.dupe(u8, "backup repository is busy; retry later") },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "backup failed") },
@@ -229,6 +232,7 @@ pub fn handleClusterRestore(
     const result = api.executeClusterRestore(alloc, req, &location, restore_mode) catch |err| switch (err) {
         error.NotLeader => return err,
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
+        error.BackupRepositoryBusy => return .{ .status = 409, .body = try alloc.dupe(u8, "backup repository is busy; retry later") },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.BackupIntegrityFailure => return .{ .status = 422, .body = try alloc.dupe(u8, backups_api.integrity_failure_message) },
         error.TableAlreadyExists => return .{ .status = 400, .body = try alloc.dupe(u8, "table already exists") },

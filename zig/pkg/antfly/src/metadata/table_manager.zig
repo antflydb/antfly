@@ -371,6 +371,13 @@ pub const GroupStatusReport = struct {
     /// Highest data-Raft log index applied to this store's local state
     /// machine for the group.
     raft_applied_index: u64 = 0,
+    /// Raft term observed with the membership and leadership fields below.
+    /// Unlike report timestamps, terms are comparable across replicas.
+    raft_term: u64 = 0,
+    /// Applied Raft index at which this replica observed `voter_set_fingerprint`.
+    /// Conflicting membership from a lower index is stale evidence, while a
+    /// leader may resolve a conflict only after observing at least this index.
+    raft_membership_index: u64 = 0,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     disk_bytes_known: bool = false,
@@ -399,34 +406,131 @@ pub const ResolvedVoterSetEvidence = struct {
     from_leader: bool,
 };
 
+pub const GroupLeaderCandidate = struct {
+    store_id: u64,
+    report: GroupStatusReport,
+};
+
+/// Selects a leader report using Raft evidence that is comparable across
+/// replicas. Reporter timestamps are deliberately excluded: they are useful
+/// for freshness, but cannot establish authority across hosts.
+pub const GroupLeaderEvidence = struct {
+    relocation_generation: u64 = 0,
+    max_raft_term: u64 = 0,
+    max_membership_index: u64 = 0,
+    candidate: ?GroupLeaderCandidate = null,
+    ambiguous: bool = false,
+
+    pub fn observe(
+        self: *@This(),
+        store_id: u64,
+        report: GroupStatusReport,
+    ) void {
+        if (report.relocation_generation > self.relocation_generation) {
+            self.* = .{ .relocation_generation = report.relocation_generation };
+        } else if (report.relocation_generation < self.relocation_generation) {
+            return;
+        }
+
+        self.max_membership_index = @max(
+            self.max_membership_index,
+            report.raft_membership_index,
+        );
+        if (report.raft_term > self.max_raft_term) {
+            self.max_raft_term = report.raft_term;
+            self.candidate = null;
+            self.ambiguous = false;
+        } else if (report.raft_term < self.max_raft_term) {
+            return;
+        }
+        if (!report.local_leader) return;
+
+        if (self.candidate) |current| {
+            if (current.report.raft_term < report.raft_term) {
+                self.candidate = .{ .store_id = store_id, .report = report };
+                self.ambiguous = false;
+                return;
+            }
+            if (current.store_id != store_id) {
+                // Two stores claiming leadership in the same generation and
+                // term is contradictory Raft evidence. Fail closed until a
+                // higher term resolves it.
+                self.ambiguous = true;
+                return;
+            }
+            if (report.raft_membership_index > current.report.raft_membership_index or
+                (report.raft_membership_index == current.report.raft_membership_index and
+                    report.raft_applied_index > current.report.raft_applied_index) or
+                (report.raft_membership_index == current.report.raft_membership_index and
+                    report.raft_applied_index == current.report.raft_applied_index and
+                    report.updated_at_millis > current.report.updated_at_millis))
+            {
+                self.candidate = .{ .store_id = store_id, .report = report };
+            }
+            return;
+        }
+        self.candidate = .{ .store_id = store_id, .report = report };
+    }
+
+    pub fn resolve(self: @This()) ?GroupLeaderCandidate {
+        if (self.ambiguous) return null;
+        const candidate = self.candidate orelse return null;
+        if (candidate.report.relocation_generation != self.relocation_generation or
+            candidate.report.raft_term != self.max_raft_term or
+            candidate.report.raft_membership_index < self.max_membership_index)
+        {
+            return null;
+        }
+        return candidate;
+    }
+};
+
 /// Merges membership observations without allowing a reporter that explicitly
 /// lacks Raft voter-set knowledge to poison authoritative evidence. A count
 /// from such a reporter remains useful as a conservative fallback; once any
 /// fingerprint-qualified evidence exists, only qualified reports can conflict
 /// with it.
 pub const VoterSetEvidence = struct {
+    relocation_generation: u64 = 0,
     fallback_voter_count: ?u16 = null,
+    fallback_membership_index: u64 = 0,
     ambiguous_fallback_voter_count: bool = false,
     known_voter_count: ?u16 = null,
     known_voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
+    known_membership_index: u64 = 0,
     has_known_voter_set: bool = false,
     ambiguous_known_voter_set: bool = false,
 
     pub fn observe(self: *@This(), report: GroupStatusReport) void {
+        if (report.relocation_generation > self.relocation_generation) {
+            self.* = .{ .relocation_generation = report.relocation_generation };
+        } else if (report.relocation_generation < self.relocation_generation) {
+            return;
+        }
         if (report.voter_count == 0) return;
-        if (self.fallback_voter_count) |existing| {
-            if (existing != report.voter_count) self.ambiguous_fallback_voter_count = true;
-        } else {
+        if (self.fallback_voter_count == null or
+            report.raft_membership_index > self.fallback_membership_index)
+        {
             self.fallback_voter_count = report.voter_count;
+            self.fallback_membership_index = report.raft_membership_index;
+            self.ambiguous_fallback_voter_count = false;
+        } else if (report.raft_membership_index == self.fallback_membership_index) {
+            if (self.fallback_voter_count.? != report.voter_count)
+                self.ambiguous_fallback_voter_count = true;
         }
         if (!report.voter_set_known) return;
 
-        if (!self.has_known_voter_set) {
+        if (!self.has_known_voter_set or
+            report.raft_membership_index > self.known_membership_index)
+        {
             self.known_voter_count = report.voter_count;
             self.known_voter_set_fingerprint = report.voter_set_fingerprint;
+            self.known_membership_index = report.raft_membership_index;
             self.has_known_voter_set = true;
+            self.ambiguous_known_voter_set = false;
             return;
         }
+        if (report.raft_membership_index < self.known_membership_index) return;
         if (self.known_voter_count.? != report.voter_count or
             !std.mem.eql(
                 u8,
@@ -443,7 +547,11 @@ pub const VoterSetEvidence = struct {
         authoritative_leader: ?GroupStatusReport,
     ) ResolvedVoterSetEvidence {
         if (authoritative_leader) |leader| {
-            if (leader.voter_set_known and leader.voter_count > 0) {
+            if (leader.voter_set_known and
+                leader.voter_count > 0 and
+                (!self.has_known_voter_set or
+                    leader.raft_membership_index >= self.known_membership_index))
+            {
                 return .{
                     .voter_count_known = true,
                     .voter_count = leader.voter_count,
@@ -451,7 +559,9 @@ pub const VoterSetEvidence = struct {
                 };
             }
         }
-        if (self.has_known_voter_set) {
+        if (self.has_known_voter_set and
+            self.known_membership_index >= self.fallback_membership_index)
+        {
             return .{
                 .voter_count_known = !self.ambiguous_known_voter_set,
                 .voter_count = self.known_voter_count.?,
@@ -466,6 +576,36 @@ pub const VoterSetEvidence = struct {
         };
     }
 };
+
+test "table manager voter set evidence is order independent when newer reports lack fingerprints" {
+    const older_known: GroupStatusReport = .{
+        .group_id = 1,
+        .voter_count = 3,
+        .voter_set_known = true,
+        .voter_set_fingerprint = [_]u8{0x11} ** voter_set_fingerprint_len,
+        .raft_membership_index = 10,
+    };
+    const newer_unqualified: GroupStatusReport = .{
+        .group_id = 1,
+        .voter_count = 5,
+        .raft_membership_index = 20,
+    };
+
+    var forward: VoterSetEvidence = .{};
+    forward.observe(older_known);
+    forward.observe(newer_unqualified);
+    const forward_result = forward.resolve(null);
+
+    var reverse: VoterSetEvidence = .{};
+    reverse.observe(newer_unqualified);
+    reverse.observe(older_known);
+    const reverse_result = reverse.resolve(null);
+
+    try std.testing.expectEqual(forward_result, reverse_result);
+    try std.testing.expect(forward_result.voter_count_known);
+    try std.testing.expectEqual(@as(u16, 5), forward_result.voter_count);
+    try std.testing.expect(!forward_result.from_leader);
+}
 
 pub fn normalizedVoterCount(node_ids: []const u64, required_node_id: ?u64) usize {
     var count: usize = 0;
@@ -591,6 +731,8 @@ pub const RuntimeGroupStatusReport = struct {
     group_id: u64 = 0,
     store_id: u64 = 0,
     node_id: u64 = 0,
+    /// Unix/realtime observation time. This report crosses process boundaries;
+    /// monotonic clocks from different hosts are not comparable.
     updated_at_ns: u64 = 0,
     source: []const u8 = "unknown",
     freshness: []const u8 = "unknown",
@@ -1588,6 +1730,8 @@ pub fn cloneGroupStatus(alloc: std.mem.Allocator, record: GroupStatusReport) !Gr
         .group_id = record.group_id,
         .relocation_generation = record.relocation_generation,
         .raft_applied_index = record.raft_applied_index,
+        .raft_term = record.raft_term,
+        .raft_membership_index = record.raft_membership_index,
         .doc_count = record.doc_count,
         .disk_bytes = record.disk_bytes,
         .disk_bytes_known = record.disk_bytes_known,

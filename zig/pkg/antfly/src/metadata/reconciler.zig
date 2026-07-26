@@ -203,6 +203,7 @@ pub const Reconciler = struct {
         auto_range_transition_per_table_limit: u32 = 1,
         auto_range_transition_cluster_limit: u32 = 1,
         stats_stale_after_millis: u64 = 60 * std.time.ms_per_s,
+        stats_clock_skew_millis: u64 = 30 * std.time.ms_per_s,
         shard_cooldown_millis: u64 = 60 * std.time.ms_per_s,
         min_shard_merge_age_millis: u64 = 5 * 60 * std.time.ms_per_s,
         median_key_lookup: ?MedianKeyLookup = null,
@@ -671,7 +672,7 @@ pub const Reconciler = struct {
                     const left_status = mergedGroupStatus(current, left.group_id) orelse continue;
                     const right_status = mergedGroupStatus(current, right.group_id) orelse continue;
                     if (!groupHasFullHealthyPlacement(current, left.group_id, left_status) or !groupHasFullHealthyPlacement(current, right.group_id, right_status)) continue;
-                    if (!groupStatusFresh(self.config, left_status, now_monotonic_ms) or !groupStatusFresh(self.config, right_status, now_monotonic_ms)) continue;
+                    if (!groupStatusFresh(self.config, left_status, now_realtime_ms) or !groupStatusFresh(self.config, right_status, now_realtime_ms)) continue;
                     if (!groupStatusReadyForAutomaticPlanning(left_status) or !groupStatusReadyForAutomaticPlanning(right_status)) continue;
                     if (!self.groupOldEnoughForMerge(left_status, now_realtime_ms) or !self.groupOldEnoughForMerge(right_status, now_realtime_ms)) continue;
                     if (!docIdentityNamespacesCompatibleForAutomaticMerge(left_status, right_status)) continue;
@@ -706,7 +707,7 @@ pub const Reconciler = struct {
                 if (self.isShardInCooldown(range.group_id, now_monotonic_ms)) continue;
                 const status = mergedGroupStatus(current, range.group_id) orelse continue;
                 if (!groupHasFullHealthyPlacement(current, range.group_id, status)) continue;
-                if (!groupStatusFresh(self.config, status, now_monotonic_ms)) continue;
+                if (!groupStatusFresh(self.config, status, now_realtime_ms)) continue;
                 if (!groupStatusReadyForAutomaticPlanning(status)) continue;
                 if (!docIdentityNamespaceReadyForAutomaticSplit(status)) continue;
                 if (status.disk_bytes <= self.config.max_shard_size_bytes) continue;
@@ -2220,32 +2221,9 @@ fn storeHasPlacement(placements: []const raft_reconciler.PlacementIntent, group_
     return false;
 }
 
-fn latestHealthyGroupStatus(stores: []const table_manager.StoreRecord, group_id: u64) ?table_manager.GroupStatusReport {
-    var latest_leader: ?table_manager.GroupStatusReport = null;
-    var latest: ?table_manager.GroupStatusReport = null;
-    for (stores) |store| {
-        if (!store.live) continue;
-        if (!std.mem.eql(u8, store.health_class, "healthy")) continue;
-        for (store.group_statuses) |group_status| {
-            if (group_status.group_id != group_id) continue;
-            if (group_status.local_leader) {
-                if (latest_leader == null or group_status.updated_at_millis >= latest_leader.?.updated_at_millis) {
-                    latest_leader = group_status;
-                }
-            }
-            if (latest == null or group_status.updated_at_millis >= latest.?.updated_at_millis) {
-                latest = group_status;
-            }
-        }
-    }
-    return latest_leader orelse latest;
-}
-
 fn mergeHealthyGroupStatusFallback(stores: []const table_manager.StoreRecord, group_id: u64) ?MergedGroupStatus {
     var latest: ?table_manager.GroupStatusReport = null;
-    var latest_leader: ?table_manager.GroupStatusReport = null;
-    var latest_leader_store_id: u64 = 0;
-    var ambiguous_leader = false;
+    var leader_evidence: table_manager.GroupLeaderEvidence = .{};
     var voter_set_evidence: table_manager.VoterSetEvidence = .{};
     var healthy_voter_reports: u16 = 0;
     var transition_pending = false;
@@ -2269,6 +2247,7 @@ fn mergeHealthyGroupStatusFallback(stores: []const table_manager.StoreRecord, gr
                 healthy_voter_reports +|= 1;
                 counted_voter_for_store = true;
             }
+            leader_evidence.observe(store.store_id, status);
             voter_set_evidence.observe(status);
             transition_pending = transition_pending or status.transition_pending;
             replay_required = replay_required or status.replay_required;
@@ -2276,27 +2255,14 @@ fn mergeHealthyGroupStatusFallback(stores: []const table_manager.StoreRecord, gr
             cutover_ready = cutover_ready or status.cutover_ready;
             reads_ready_after_cutover = reads_ready_after_cutover or status.reads_ready_after_cutover;
             joint_consensus = joint_consensus or status.joint_consensus;
-            if (status.local_leader) {
-                if (latest_leader) |existing| {
-                    if (status.updated_at_millis > existing.updated_at_millis) {
-                        latest_leader = status;
-                        latest_leader_store_id = store.store_id;
-                        ambiguous_leader = false;
-                    } else if (status.updated_at_millis == existing.updated_at_millis and latest_leader_store_id != store.store_id) {
-                        ambiguous_leader = true;
-                    }
-                } else {
-                    latest_leader = status;
-                    latest_leader_store_id = store.store_id;
-                    ambiguous_leader = false;
-                }
-            }
         }
     }
 
     const base = latest orelse return null;
-    const authoritative_leader = if (!ambiguous_leader) latest_leader else null;
-    const voter_set = voter_set_evidence.resolve(authoritative_leader);
+    const authoritative_leader = leader_evidence.resolve();
+    const voter_set = voter_set_evidence.resolve(
+        if (authoritative_leader) |candidate| candidate.report else null,
+    );
     var merged: MergedGroupStatus = .{
         .group_id = base.group_id,
         .doc_count = base.doc_count,
@@ -2318,20 +2284,18 @@ fn mergeHealthyGroupStatusFallback(stores: []const table_manager.StoreRecord, gr
         .cutover_ready = cutover_ready,
         .reads_ready_after_cutover = reads_ready_after_cutover,
     };
-    if (!ambiguous_leader) {
-        if (latest_leader) |leader| {
-            merged.leader_known = true;
-            merged.leader_store_id = latest_leader_store_id;
-            merged.readiness_from_leader = true;
-            if (voter_set.from_leader) {
-                merged.joint_consensus = leader.joint_consensus;
-            }
-            merged.transition_pending = leader.transition_pending;
-            merged.replay_required = leader.replay_required;
-            merged.replay_caught_up = leader.replay_caught_up;
-            merged.cutover_ready = leader.cutover_ready;
-            merged.reads_ready_after_cutover = leader.reads_ready_after_cutover;
+    if (authoritative_leader) |leader| {
+        merged.leader_known = true;
+        merged.leader_store_id = leader.store_id;
+        merged.readiness_from_leader = true;
+        if (voter_set.from_leader) {
+            merged.joint_consensus = leader.report.joint_consensus;
         }
+        merged.transition_pending = leader.report.transition_pending;
+        merged.replay_required = leader.report.replay_required;
+        merged.replay_caught_up = leader.report.replay_caught_up;
+        merged.cutover_ready = leader.report.cutover_ready;
+        merged.reads_ready_after_cutover = leader.report.reads_ready_after_cutover;
     }
     return merged;
 }
@@ -2388,8 +2352,32 @@ fn groupStatusFresh(
     now_ms: u64,
 ) bool {
     if (status.updated_at_millis == 0) return false;
-    if (now_ms < status.updated_at_millis) return true;
+    if (now_ms < status.updated_at_millis) {
+        return status.updated_at_millis - now_ms <= config.stats_clock_skew_millis;
+    }
     return now_ms - status.updated_at_millis <= config.stats_stale_after_millis;
+}
+
+test "metadata reconciler bounds future-skewed group status freshness" {
+    const config: Reconciler.Config = .{
+        .stats_stale_after_millis = 60_000,
+        .stats_clock_skew_millis = 5_000,
+    };
+    try std.testing.expect(groupStatusFresh(
+        config,
+        .{ .group_id = 1, .updated_at_millis = 104_999 },
+        100_000,
+    ));
+    try std.testing.expect(!groupStatusFresh(
+        config,
+        .{ .group_id = 1, .updated_at_millis = 105_001 },
+        100_000,
+    ));
+    try std.testing.expect(!groupStatusFresh(
+        config,
+        .{ .group_id = 1, .updated_at_millis = 39_999 },
+        100_000,
+    ));
 }
 
 fn groupStatusReadyForAutomaticPlanning(status: MergedGroupStatus) bool {
@@ -4902,7 +4890,7 @@ test "metadata reconciler plans an automatic split from fresh group status" {
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -4960,7 +4948,7 @@ test "metadata reconciler plans an automatic split from disk size when doc count
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -5052,7 +5040,7 @@ test "metadata reconciler does not automatically split stale doc identity namesp
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const updated_at_ns = now_ms * std.time.ns_per_ms;
     const stores = [_]table_manager.StoreRecord{
         .{
@@ -5121,7 +5109,7 @@ test "metadata reconciler does not automatically split ordinal exhausted doc ide
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const updated_at_ns = now_ms * std.time.ns_per_ms;
     const stores = [_]table_manager.StoreRecord{
         .{
@@ -5190,7 +5178,7 @@ test "metadata reconciler does not split when a replica is missing healthy group
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -5248,7 +5236,7 @@ test "metadata reconciler does not split when authoritative voter reports are in
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -5303,7 +5291,7 @@ test "metadata reconciler does not split under-replicated groups when placement 
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -5380,7 +5368,7 @@ test "metadata reconciler does not split during joint consensus" {
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -5449,7 +5437,7 @@ test "metadata reconciler plans an automatic merge from adjacent small fresh gro
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -5582,7 +5570,7 @@ test "metadata reconciler does not automatically merge incompatible doc identity
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const updated_at_ns = now_ms * std.time.ns_per_ms;
     const stores = [_]table_manager.StoreRecord{
         .{
@@ -5684,7 +5672,7 @@ test "metadata reconciler does not automatically merge stale doc identity range 
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const updated_at_ns = now_ms * std.time.ns_per_ms;
     const stores = [_]table_manager.StoreRecord{
         .{
@@ -5793,7 +5781,7 @@ test "metadata reconciler allows explicit merge with doc identity reassignment o
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const statuses = [_]MergedGroupStatus{
         .{
             .group_id = 4141,
@@ -5982,7 +5970,7 @@ test "metadata reconciler rolls back existing merge with incompatible doc identi
     const desired_merges = try manager.listDesiredMergeTransitions(std.testing.allocator);
     defer manager.freeMergeTransitions(std.testing.allocator, desired_merges);
 
-    const now_ms = monotonicMillis();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const statuses = [_]MergedGroupStatus{
         .{
             .group_id = 4131,
@@ -6054,7 +6042,7 @@ test "metadata reconciler does not merge when a replica is missing healthy group
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6130,7 +6118,7 @@ test "metadata reconciler does not merge when authoritative voter reports are in
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6203,7 +6191,7 @@ test "metadata reconciler does not merge under-replicated groups when placement 
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6317,7 +6305,6 @@ test "metadata reconciler does not merge shards that are younger than the merge 
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
     var manual_clock = platform_clock.ManualClock{};
     manual_clock.setRealtimeNs(10 * 60 * std.time.ns_per_s);
     const now_realtime_ms = manual_clock.clock().nowRealtimeMs();
@@ -6336,7 +6323,7 @@ test "metadata reconciler does not merge shards that are younger than the merge 
                     .disk_bytes = 20,
                     .empty = false,
                     .created_at_millis = now_realtime_ms - 30 * std.time.ms_per_s,
-                    .updated_at_millis = now_ms,
+                    .updated_at_millis = now_realtime_ms,
                     .local_leader = true,
                 },
                 .{
@@ -6345,7 +6332,7 @@ test "metadata reconciler does not merge shards that are younger than the merge 
                     .disk_bytes = 15,
                     .empty = false,
                     .created_at_millis = now_realtime_ms - 30 * std.time.ms_per_s,
-                    .updated_at_millis = now_ms,
+                    .updated_at_millis = now_realtime_ms,
                     .local_leader = true,
                 },
             })[0..]),
@@ -6393,7 +6380,6 @@ test "metadata reconciler merges shards once they are older than the merge age t
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
     var manual_clock = platform_clock.ManualClock{};
     manual_clock.setRealtimeNs(10 * 60 * std.time.ns_per_s);
     const now_realtime_ms = manual_clock.clock().nowRealtimeMs();
@@ -6412,7 +6398,7 @@ test "metadata reconciler merges shards once they are older than the merge age t
                     .disk_bytes = 20,
                     .empty = false,
                     .created_at_millis = now_realtime_ms - 2 * 60 * std.time.ms_per_s,
-                    .updated_at_millis = now_ms,
+                    .updated_at_millis = now_realtime_ms,
                     .local_leader = true,
                 },
                 .{
@@ -6421,7 +6407,7 @@ test "metadata reconciler merges shards once they are older than the merge age t
                     .disk_bytes = 15,
                     .empty = false,
                     .created_at_millis = now_realtime_ms - 2 * 60 * std.time.ms_per_s,
-                    .updated_at_millis = now_ms,
+                    .updated_at_millis = now_realtime_ms,
                     .local_leader = true,
                 },
             })[0..]),
@@ -6465,7 +6451,7 @@ test "metadata reconciler does not split past max shards per table" {
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6524,7 +6510,7 @@ test "metadata reconciler does not merge below min shards per table" {
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6593,7 +6579,7 @@ test "metadata reconciler enforces per-table automatic transition budget" {
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6665,7 +6651,7 @@ test "metadata reconciler enforces cluster automatic transition budget" {
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6730,7 +6716,7 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6799,7 +6785,7 @@ test "metadata reconciler places completed split groups into cooldown" {
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6892,7 +6878,7 @@ test "metadata reconciler ignores unhealthy store stats for automatic transition
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6961,7 +6947,7 @@ test "metadata reconciler ignores stale store stats for automatic transitions" {
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stale_ms = now_ms - 5 * std.time.ms_per_s;
     const stores = [_]table_manager.StoreRecord{
         .{
@@ -7032,7 +7018,7 @@ test "metadata reconciler ignores in-flight transition groups for automatic tran
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -7103,7 +7089,7 @@ test "metadata reconciler ignores transition-marked store status for automatic t
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -7159,7 +7145,7 @@ test "metadata reconciler uses live median key lookup for split planning" {
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -7233,7 +7219,7 @@ test "metadata reconciler requires leader-known group status for automatic plann
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -7286,7 +7272,7 @@ test "metadata reconciler does not plan automatic split while restore is pending
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const statuses = [_]MergedGroupStatus{
         .{
             .group_id = 4821,
@@ -7384,7 +7370,7 @@ test "metadata reconciler prefers live median key lookup for automatic split" {
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -7458,7 +7444,7 @@ test "metadata reconciler skips automatic split when live median key lookup fail
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
 
-    const now_ms = monotonicMillis();
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,

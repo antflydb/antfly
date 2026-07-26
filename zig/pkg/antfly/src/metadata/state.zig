@@ -561,8 +561,7 @@ const GroupStatusMergeCandidate = struct {
 const GroupStatusMergeState = struct {
     group_id: u64,
     latest: ?GroupStatusMergeCandidate = null,
-    latest_leader: ?GroupStatusMergeCandidate = null,
-    ambiguous_leader: bool = false,
+    leader_evidence: metadata_table_manager.GroupLeaderEvidence = .{},
     voter_set_evidence: metadata_table_manager.VoterSetEvidence = .{},
     healthy_voter_reports: u16 = 0,
     joint_consensus: bool = false,
@@ -643,6 +642,7 @@ pub fn mergeHealthyGroupStatuses(
                 state.healthy_voter_reports +|= 1;
                 state.last_voter_store_id = store.store_id;
             }
+            state.leader_evidence.observe(store.store_id, group_status);
             state.voter_set_evidence.observe(group_status);
             state.joint_consensus = state.joint_consensus or group_status.joint_consensus;
             state.transition_pending = state.transition_pending or group_status.transition_pending;
@@ -650,19 +650,6 @@ pub fn mergeHealthyGroupStatuses(
             state.replay_caught_up = state.replay_caught_up or group_status.replay_caught_up;
             state.cutover_ready = state.cutover_ready or group_status.cutover_ready;
             state.reads_ready_after_cutover = state.reads_ready_after_cutover or group_status.reads_ready_after_cutover;
-            if (group_status.local_leader) {
-                if (state.latest_leader) |existing| {
-                    if (group_status.updated_at_millis > existing.report.updated_at_millis) {
-                        state.latest_leader = candidate;
-                        state.ambiguous_leader = false;
-                    } else if (group_status.updated_at_millis == existing.report.updated_at_millis and existing.store_id != store.store_id) {
-                        state.ambiguous_leader = true;
-                    }
-                } else {
-                    state.latest_leader = candidate;
-                    state.ambiguous_leader = false;
-                }
-            }
         }
 
         for (store.runtime_statuses) |runtime_status| {
@@ -709,11 +696,10 @@ pub fn mergeHealthyGroupStatuses(
     for (states.items, 0..) |state, i| {
         const latest = state.latest orelse unreachable;
         const base = latest.report;
-        const authoritative_leader = if (!state.ambiguous_leader)
-            if (state.latest_leader) |candidate| candidate.report else null
-        else
-            null;
-        const voter_set = state.voter_set_evidence.resolve(authoritative_leader);
+        const authoritative_leader = state.leader_evidence.resolve();
+        const voter_set = state.voter_set_evidence.resolve(
+            if (authoritative_leader) |candidate| candidate.report else null,
+        );
         merged[i] = .{
             .group_id = base.group_id,
             .doc_count = base.doc_count,
@@ -739,20 +725,18 @@ pub fn mergeHealthyGroupStatuses(
             .doc_identity = state.doc_identity,
             .doc_identity_namespace_conflict = state.doc_identity_namespace_conflict,
         };
-        if (!state.ambiguous_leader) {
-            if (state.latest_leader) |leader| {
-                merged[i].leader_known = true;
-                merged[i].leader_store_id = leader.store_id;
-                merged[i].readiness_from_leader = true;
-                if (voter_set.from_leader) {
-                    merged[i].joint_consensus = leader.report.joint_consensus;
-                }
-                merged[i].transition_pending = leader.report.transition_pending;
-                merged[i].replay_required = leader.report.replay_required;
-                merged[i].replay_caught_up = leader.report.replay_caught_up;
-                merged[i].cutover_ready = leader.report.cutover_ready;
-                merged[i].reads_ready_after_cutover = leader.report.reads_ready_after_cutover;
+        if (authoritative_leader) |leader| {
+            merged[i].leader_known = true;
+            merged[i].leader_store_id = leader.store_id;
+            merged[i].readiness_from_leader = true;
+            if (voter_set.from_leader) {
+                merged[i].joint_consensus = leader.report.joint_consensus;
             }
+            merged[i].transition_pending = leader.report.transition_pending;
+            merged[i].replay_required = leader.report.replay_required;
+            merged[i].replay_caught_up = leader.report.replay_caught_up;
+            merged[i].cutover_ready = leader.report.cutover_ready;
+            merged[i].reads_ready_after_cutover = leader.report.reads_ready_after_cutover;
         }
     }
     overlayDocIdentityNamespaceExpectations(merged, ranges);
@@ -2315,7 +2299,7 @@ test "metadata state marks restore-pending groups as not yet ready" {
     try std.testing.expect(merged[0].restore_pending);
 }
 
-test "metadata state prefers freshest leader report over stale conflicting leader report" {
+test "metadata state prefers higher-term leader despite a larger stale producer clock" {
     const stores = [_]metadata_table_manager.StoreRecord{
         .{
             .store_id = 31,
@@ -2329,8 +2313,10 @@ test "metadata state prefers freshest leader report over stale conflicting leade
                     .doc_count = 40,
                     .disk_bytes = 400,
                     .empty = false,
-                    .updated_at_millis = 100,
+                    .updated_at_millis = 10_000,
                     .local_leader = true,
+                    .raft_term = 7,
+                    .raft_membership_index = 70,
                     .transition_pending = true,
                     .replay_required = true,
                 },
@@ -2348,8 +2334,10 @@ test "metadata state prefers freshest leader report over stale conflicting leade
                     .doc_count = 41,
                     .disk_bytes = 410,
                     .empty = false,
-                    .updated_at_millis = 200,
+                    .updated_at_millis = 100,
                     .local_leader = true,
+                    .raft_term = 8,
+                    .raft_membership_index = 80,
                     .transition_pending = false,
                     .replay_required = false,
                     .replay_caught_up = false,
@@ -2366,12 +2354,12 @@ test "metadata state prefers freshest leader report over stale conflicting leade
     try std.testing.expectEqual(@as(usize, 1), merged.len);
     try std.testing.expect(merged[0].leader_known);
     try std.testing.expectEqual(@as(u64, 32), merged[0].leader_store_id);
-    try std.testing.expectEqual(@as(u64, 200), merged[0].updated_at_millis);
+    try std.testing.expectEqual(@as(u64, 100), merged[0].updated_at_millis);
     try std.testing.expect(!merged[0].transition_pending);
     try std.testing.expect(!merged[0].replay_required);
 }
 
-test "metadata state keeps leader unknown when freshest leader reports conflict" {
+test "metadata state keeps leader unknown for same-term claims with different clocks" {
     const stores = [_]metadata_table_manager.StoreRecord{
         .{
             .store_id = 41,
@@ -2385,8 +2373,10 @@ test "metadata state keeps leader unknown when freshest leader reports conflict"
                     .doc_count = 50,
                     .disk_bytes = 500,
                     .empty = false,
-                    .updated_at_millis = 300,
+                    .updated_at_millis = 30_000,
                     .local_leader = true,
+                    .raft_term = 9,
+                    .raft_membership_index = 90,
                 },
             })[0..]),
         },
@@ -2404,6 +2394,8 @@ test "metadata state keeps leader unknown when freshest leader reports conflict"
                     .empty = false,
                     .updated_at_millis = 300,
                     .local_leader = true,
+                    .raft_term = 9,
+                    .raft_membership_index = 90,
                 },
             })[0..]),
         },
@@ -2416,4 +2408,56 @@ test "metadata state keeps leader unknown when freshest leader reports conflict"
     try std.testing.expect(!merged[0].leader_known);
     try std.testing.expectEqual(@as(u64, 0), merged[0].leader_store_id);
     try std.testing.expect(!merged[0].readiness_from_leader);
+}
+
+test "metadata state waits for leader membership catch-up before accepting readiness" {
+    var leader_statuses = [_]metadata_table_manager.GroupStatusReport{.{
+        .group_id = 7401,
+        .updated_at_millis = 500,
+        .local_leader = true,
+        .raft_term = 10,
+        .raft_membership_index = 100,
+        .transition_pending = false,
+    }};
+    const follower_statuses = [_]metadata_table_manager.GroupStatusReport{.{
+        .group_id = 7401,
+        .updated_at_millis = 400,
+        .raft_term = 10,
+        .raft_membership_index = 110,
+        .transition_pending = true,
+    }};
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 51,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = leader_statuses[0..],
+        },
+        .{
+            .store_id = 52,
+            .node_id = 2,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast(follower_statuses[0..]),
+        },
+    };
+
+    {
+        const merged = try mergeHealthyGroupStatuses(std.testing.allocator, &.{}, &.{}, &.{}, &.{}, &stores, &.{}, &.{}, &.{}, &.{});
+        defer freeMergedGroupStatuses(std.testing.allocator, merged);
+        try std.testing.expect(!merged[0].leader_known);
+        try std.testing.expect(merged[0].transition_pending);
+    }
+
+    leader_statuses[0].raft_membership_index = 110;
+    {
+        const merged = try mergeHealthyGroupStatuses(std.testing.allocator, &.{}, &.{}, &.{}, &.{}, &stores, &.{}, &.{}, &.{}, &.{});
+        defer freeMergedGroupStatuses(std.testing.allocator, merged);
+        try std.testing.expect(merged[0].leader_known);
+        try std.testing.expectEqual(@as(u64, 51), merged[0].leader_store_id);
+        try std.testing.expect(!merged[0].transition_pending);
+    }
 }

@@ -1972,6 +1972,8 @@ fn publishSimulatedRaftGroupStatus(
             }
             report.relocation_generation = local_intent.?.relocation_generation;
             report.raft_applied_index = status.applied_index;
+            report.raft_term = status.hard.current_term;
+            report.raft_membership_index = status.applied_index;
             report.updated_at_millis = cluster.manual_clock.clock().nowRealtimeMs();
             report.local_leader = status.soft.role == .leader;
             report.local_voter = local_voter;
@@ -4241,7 +4243,7 @@ fn bootstrapDesiredLoop(
 }
 
 fn currentGroupStatusTimestampMs() u64 {
-    return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    return platform_clock.Clock.real().nowRealtimeMs();
 }
 
 fn metadataBlackholeEndpoints() []const peer_resolver.PeerEndpoint {

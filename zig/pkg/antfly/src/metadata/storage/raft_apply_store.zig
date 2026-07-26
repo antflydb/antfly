@@ -3047,7 +3047,7 @@ pub const RaftApplyStore = struct {
 
 const transition_magic = "afmd1";
 const runtime_status_record_version: u16 = 10;
-const group_status_record_version: u16 = 3;
+const group_status_record_version: u16 = 4;
 
 const TransitionTag = enum(u8) {
     initialize_metadata_incarnation = 45,
@@ -4351,6 +4351,8 @@ fn appendGroupStatusRecord(
     try appendInt(alloc, out, u64, record.group_id);
     try appendInt(alloc, out, u64, record.relocation_generation);
     try appendInt(alloc, out, u64, record.raft_applied_index);
+    try appendInt(alloc, out, u64, record.raft_term);
+    try appendInt(alloc, out, u64, record.raft_membership_index);
     try appendInt(alloc, out, u64, record.doc_count);
     try appendInt(alloc, out, u64, record.disk_bytes);
     try out.append(alloc, if (record.disk_bytes_known) 1 else 0);
@@ -4382,6 +4384,8 @@ fn readGroupStatusRecord(
     const group_id = try readInt(encoded, pos, u64);
     const relocation_generation = if (version >= 2) try readInt(encoded, pos, u64) else 0;
     const raft_applied_index = if (version >= 2) try readInt(encoded, pos, u64) else 0;
+    const raft_term = if (version >= 4) try readInt(encoded, pos, u64) else 0;
+    const raft_membership_index = if (version >= 4) try readInt(encoded, pos, u64) else 0;
     const doc_count = try readInt(encoded, pos, u64);
     const disk_bytes = try readInt(encoded, pos, u64);
     const disk_bytes_known = if (version >= 3) blk: {
@@ -4455,6 +4459,8 @@ fn readGroupStatusRecord(
         .group_id = group_id,
         .relocation_generation = relocation_generation,
         .raft_applied_index = raft_applied_index,
+        .raft_term = raft_term,
+        .raft_membership_index = raft_membership_index,
         .doc_count = doc_count,
         .disk_bytes = disk_bytes,
         .disk_bytes_known = disk_bytes_known,
@@ -7730,6 +7736,9 @@ test "metadata raft apply store transition codec preserves exact raft voter iden
     const fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 101, 102, 104 }, null);
     var group_statuses = [_]metadata.GroupStatusReport{.{
         .group_id = 5101,
+        .raft_applied_index = 91,
+        .raft_term = 12,
+        .raft_membership_index = 87,
         .disk_bytes = 4096,
         .disk_bytes_known = true,
         .local_leader = true,
@@ -7757,6 +7766,9 @@ test "metadata raft apply store transition codec preserves exact raft voter iden
     try std.testing.expect(statuses[0].voter_set_known);
     try std.testing.expect(statuses[0].disk_bytes_known);
     try std.testing.expectEqual(@as(u64, 4096), statuses[0].disk_bytes);
+    try std.testing.expectEqual(@as(u64, 91), statuses[0].raft_applied_index);
+    try std.testing.expectEqual(@as(u64, 12), statuses[0].raft_term);
+    try std.testing.expectEqual(@as(u64, 87), statuses[0].raft_membership_index);
     try std.testing.expectEqual(@as(u16, 3), statuses[0].voter_count);
     try std.testing.expectEqualSlices(u8, &fingerprint, &statuses[0].voter_set_fingerprint);
 }

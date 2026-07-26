@@ -242,8 +242,6 @@ pub const StdHttpListener = struct {
 
     fn serve(self: *StdHttpListener) void {
         const io = self.io_impl.io();
-        var connection_group = std.Io.Group.init;
-        defer connection_group.await(io) catch {};
         defer if (self.stopping.load(.acquire)) self.shutdownActiveStreams(io);
         var slot_held = false;
         defer if (slot_held) self.releaseConnectionThreadSlot();
@@ -281,14 +279,25 @@ pub const StdHttpListener = struct {
                 return;
             }
             if (self.cfg.serve_in_connection_threads) {
-                connection_group.concurrent(io, serveStreamFiber, .{ self, stream }) catch |err| {
-                    slot_held = false;
-                    self.releaseConnectionThreadSlot();
-                    std.log.warn("std http listener connection fiber handoff failed err={s}", .{@errorName(err)});
+                const connection_thread = std.Thread.spawn(
+                    .{ .stack_size = self.cfg.connection_thread_stack_size },
+                    serveStreamThread,
+                    .{ self, stream },
+                ) catch |err| {
+                    // Resource exhaustion must degrade to bounded inline
+                    // service, not drop an already accepted request. The
+                    // listener thread remains joinable by stop(), and retains
+                    // this connection's admission slot while serving it.
+                    std.log.warn("std http listener connection thread handoff failed err={s}", .{@errorName(err)});
                     self.serveStream(stream);
+                    self.releaseConnectionThreadSlot();
+                    slot_held = false;
                     continue;
                 };
-                // The fiber owns the slot now and releases it on completion.
+                connection_thread.detach();
+                // The detached thread owns the slot now. stop() shuts down
+                // registered streams and drains this counter before the
+                // listener or shared I/O runtime can be destroyed.
                 slot_held = false;
                 continue;
             }
@@ -309,7 +318,7 @@ pub const StdHttpListener = struct {
         }
     }
 
-    fn serveStreamFiber(self: *StdHttpListener, stream: std.Io.net.Stream) void {
+    fn serveStreamThread(self: *StdHttpListener, stream: std.Io.net.Stream) void {
         defer self.releaseConnectionThreadSlot();
         self.serveStream(stream);
     }

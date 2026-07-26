@@ -936,6 +936,55 @@ pub const Store = struct {
         alloc.free(encoded);
     }
 
+    /// Return one exact running attempt to the durable FIFO after a
+    /// pre-publication retryable failure. Progress checkpoints remain intact,
+    /// so the next attempt resumes rather than replaying completed tables.
+    /// Capacity is reserved before persistence: once the durable phase becomes
+    /// queued, its in-memory runnable index cannot be lost to allocation
+    /// failure. A concurrent cancellation is made terminal instead.
+    pub fn retryRunning(
+        self: *Store,
+        alloc: std.mem.Allocator,
+        expected: JobState,
+        err_name: []const u8,
+    ) ![]u8 {
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(expected.job_id) orelse
+            return error.NotFound;
+        var parsed = try std.json.parseFromSlice(
+            JobState,
+            alloc,
+            current,
+            .{ .ignore_unknown_fields = true },
+        );
+        defer parsed.deinit();
+        if (parsed.value.attempt_id != expected.attempt_id or
+            parsed.value.phase != .running)
+        {
+            return try alloc.dupe(u8, current);
+        }
+        if (parsed.value.cancel_requested) {
+            return try self.updateLocked(alloc, parsed.value, .{
+                .phase = .cancelled,
+                .last_error = "cancel_requested",
+            });
+        }
+
+        self.compactPendingFullyLocked();
+        try self.pending.ensureUnusedCapacity(self.alloc, 1);
+        const encoded = try self.updateLocked(alloc, parsed.value, .{
+            .phase = .queued,
+            .last_error = err_name,
+        });
+        errdefer alloc.free(encoded);
+        try self.insertPendingSortedLocked(.{
+            .job_id = parsed.value.job_id,
+            .enqueue_sequence = parsed.value.enqueue_sequence,
+        });
+        return encoded;
+    }
+
     fn finishAs(self: *Store, alloc: std.mem.Allocator, expected: JobState, phase: Phase, result_json: ?[]const u8, last_error: ?[]const u8) ![]u8 {
         self.lock();
         defer self.mutex.unlock();
@@ -1795,6 +1844,120 @@ test "successful restore completion wins a racing cancellation" {
     try std.testing.expect(parsed_completed.value.cancel_requested);
     try std.testing.expectEqualStrings("{\"restored\":true}", parsed_completed.value.result_json.?);
     try std.testing.expect(parsed_completed.value.last_error == null);
+}
+
+test "retryable restore contention durably requeues progress and honors cancellation" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+
+    const started = try store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "daily",
+        .location = "s3://archive/daily",
+        .connection = "archive-reader",
+        .table_names = &.{ "docs", "events" },
+        .idempotency_namespace = "principal:admin:cluster",
+    });
+    defer std.testing.allocator.free(started);
+    var parsed_started = try std.json.parseFromSlice(
+        JobState,
+        std.testing.allocator,
+        started,
+        .{},
+    );
+    defer parsed_started.deinit();
+
+    const running = (try store.begin(
+        std.testing.allocator,
+        parsed_started.value.job_id,
+    )).?;
+    defer std.testing.allocator.free(running);
+    var parsed_running = try std.json.parseFromSlice(
+        JobState,
+        std.testing.allocator,
+        running,
+        .{},
+    );
+    defer parsed_running.deinit();
+    const checkpoint = try store.recordTableStarted(
+        std.testing.allocator,
+        parsed_running.value.job_id,
+        parsed_running.value.attempt_id,
+        0,
+    );
+    std.testing.allocator.free(checkpoint);
+
+    const retried = try store.retryRunning(
+        std.testing.allocator,
+        parsed_running.value,
+        "BackupRepositoryBusy",
+    );
+    defer std.testing.allocator.free(retried);
+    var parsed_retried = try std.json.parseFromSlice(
+        JobState,
+        std.testing.allocator,
+        retried,
+        .{},
+    );
+    defer parsed_retried.deinit();
+    try std.testing.expectEqual(Phase.queued, parsed_retried.value.phase);
+    try std.testing.expectEqual(@as(?u16, 0), parsed_retried.value.active_table_index);
+    try std.testing.expectEqualStrings(
+        "BackupRepositoryBusy",
+        parsed_retried.value.last_error.?,
+    );
+
+    const pending = try store.takePendingIds(std.testing.allocator, 1);
+    defer std.testing.allocator.free(pending);
+    try std.testing.expectEqualSlices(
+        u64,
+        &.{parsed_running.value.job_id},
+        pending,
+    );
+    const resumed = (try store.begin(
+        std.testing.allocator,
+        parsed_running.value.job_id,
+    )).?;
+    defer std.testing.allocator.free(resumed);
+    var parsed_resumed = try std.json.parseFromSlice(
+        JobState,
+        std.testing.allocator,
+        resumed,
+        .{},
+    );
+    defer parsed_resumed.deinit();
+    try std.testing.expectEqual(
+        parsed_running.value.attempt_id + 1,
+        parsed_resumed.value.attempt_id,
+    );
+    try std.testing.expectEqual(@as(?u16, 0), parsed_resumed.value.active_table_index);
+
+    const cancelling = (try store.cancel(
+        std.testing.allocator,
+        parsed_resumed.value.job_id,
+    )).?;
+    std.testing.allocator.free(cancelling);
+    const cancelled = try store.retryRunning(
+        std.testing.allocator,
+        parsed_resumed.value,
+        "BackupRepositoryBusy",
+    );
+    defer std.testing.allocator.free(cancelled);
+    var parsed_cancelled = try std.json.parseFromSlice(
+        JobState,
+        std.testing.allocator,
+        cancelled,
+        .{},
+    );
+    defer parsed_cancelled.deinit();
+    try std.testing.expectEqual(Phase.cancelled, parsed_cancelled.value.phase);
+    try std.testing.expectEqualStrings(
+        "cancel_requested",
+        parsed_cancelled.value.last_error.?,
+    );
 }
 
 test "restore job runnable queue drains incrementally and preserves insertion order" {

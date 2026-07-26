@@ -140,6 +140,8 @@ fn groupStatusEqual(
     return lhs.group_id == rhs.group_id and
         lhs.relocation_generation == rhs.relocation_generation and
         lhs.raft_applied_index == rhs.raft_applied_index and
+        lhs.raft_term == rhs.raft_term and
+        lhs.raft_membership_index == rhs.raft_membership_index and
         lhs.doc_count == rhs.doc_count and
         lhs.disk_bytes == rhs.disk_bytes and
         lhs.disk_bytes_known == rhs.disk_bytes_known and

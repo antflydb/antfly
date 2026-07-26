@@ -3005,11 +3005,15 @@ const IndexRepairYieldFence = struct {
 };
 
 pub const GroupMembership = struct {
+    local_leader: bool = false,
+    leadership_known: bool = false,
     local_voter: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
     voter_set_fingerprint: antfly.metadata.table_manager.VoterSetFingerprint = [_]u8{0} ** antfly.metadata.table_manager.voter_set_fingerprint_len,
     joint_consensus: bool = false,
+    raft_term: u64 = 0,
+    raft_membership_index: u64 = 0,
 };
 
 pub const GroupMembershipSource = struct {
@@ -3040,11 +3044,16 @@ pub const GroupMembershipSource = struct {
                             }
                         }
                         return .{
+                            .local_leader = raft_status.soft.role == .leader and
+                                raft_status.soft.leader_id == raft_status.id,
+                            .leadership_known = true,
                             .local_voter = local_voter,
                             .voter_count = @intCast(raft_status.conf_state.voters.len),
                             .voter_set_known = true,
                             .voter_set_fingerprint = antfly.metadata.table_manager.voterSetFingerprint(raft_status.conf_state.voters, null),
                             .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
+                            .raft_term = raft_status.hard.current_term,
+                            .raft_membership_index = raft_status.applied_index,
                         };
                     }
                 }.membership,
@@ -3068,11 +3077,16 @@ pub const GroupMembershipSource = struct {
                             }
                         }
                         return .{
+                            .local_leader = raft_status.soft.role == .leader and
+                                raft_status.soft.leader_id == raft_status.id,
+                            .leadership_known = true,
                             .local_voter = local_voter,
                             .voter_count = @intCast(raft_status.conf_state.voters.len),
                             .voter_set_known = true,
                             .voter_set_fingerprint = antfly.metadata.table_manager.voterSetFingerprint(raft_status.conf_state.voters, null),
                             .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
+                            .raft_term = raft_status.hard.current_term,
+                            .raft_membership_index = raft_status.applied_index,
                         };
                     }
                 }.membership,
@@ -3080,6 +3094,49 @@ pub const GroupMembershipSource = struct {
         };
     }
 };
+
+fn observedLocalGroupLeader(
+    membership: GroupMembership,
+    leadership_source: ?GroupLeadershipSource,
+    group_id: u64,
+    fallback: bool,
+) bool {
+    // Managed membership sources bind role, term, membership, and apply index
+    // to one Raft status snapshot. Custom sources can retain the legacy
+    // leadership callback by leaving `leadership_known` false.
+    if (membership.leadership_known) return membership.local_leader;
+    if (leadership_source) |source| return source.isLocalLeader(group_id);
+    return fallback;
+}
+
+test "group status binds leadership to the membership Raft snapshot" {
+    const Leadership = struct {
+        fn source() GroupLeadershipSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .is_local_leader = struct {
+                        fn call(_: *anyopaque, _: u64) bool {
+                            return true;
+                        }
+                    }.call,
+                },
+            };
+        }
+    };
+    try std.testing.expect(!observedLocalGroupLeader(
+        .{ .leadership_known = true, .local_leader = false },
+        Leadership.source(),
+        1,
+        false,
+    ));
+    try std.testing.expect(observedLocalGroupLeader(
+        .{},
+        Leadership.source(),
+        1,
+        false,
+    ));
+}
 
 test "index repair queue removes only authoritative non-local ownership" {
     const Ownership = struct {
@@ -12111,6 +12168,8 @@ fn hashGroupStatus(hasher: *std.hash.Wyhash, status: antfly.metadata.table_manag
     hasher.update(std.mem.asBytes(&status.group_id));
     hasher.update(std.mem.asBytes(&status.relocation_generation));
     hasher.update(std.mem.asBytes(&status.raft_applied_index));
+    hasher.update(std.mem.asBytes(&status.raft_term));
+    hasher.update(std.mem.asBytes(&status.raft_membership_index));
     hasher.update(std.mem.asBytes(&status.doc_count));
     hasher.update(std.mem.asBytes(&status.disk_bytes));
     hasher.update(std.mem.asBytes(&status.disk_bytes_known));
@@ -12159,7 +12218,10 @@ fn runtimeStatusReportFromLocalStatus(
         .group_id = group_id,
         .store_id = registration.store_id,
         .node_id = registration.node_id,
-        .updated_at_ns = platform_time.monotonicNs(),
+        // Runtime reports cross process boundaries. Publish Unix time here;
+        // process-local monotonic timestamps are only meaningful inside the
+        // local runtime-status cache.
+        .updated_at_ns = platform_clock.Clock.real().nowRealtimeMs() * std.time.ns_per_ms,
         .source = source,
         .freshness = freshness,
         .topology_generation = status.metadata.topology_generation,
@@ -12659,13 +12721,20 @@ fn collectLocalGroupStatusFromDb(
         .disk_bytes_known = true,
         .empty = source_doc_count == 0,
         .created_at_millis = created_at_millis,
-        .updated_at_millis = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)),
-        .local_leader = if (group_leadership_source) |source| source.isLocalLeader(group_id) else false,
+        .updated_at_millis = now_realtime_ms,
+        .local_leader = observedLocalGroupLeader(
+            membership,
+            group_leadership_source,
+            group_id,
+            false,
+        ),
         .local_voter = membership.local_voter,
         .voter_count = membership.voter_count,
         .voter_set_known = membership.voter_set_known,
         .voter_set_fingerprint = membership.voter_set_fingerprint,
         .joint_consensus = membership.joint_consensus,
+        .raft_term = membership.raft_term,
+        .raft_membership_index = membership.raft_membership_index,
         .transition_pending = readiness.transition_pending,
         .replay_required = readiness.replay_required,
         .replay_caught_up = readiness.replay_caught_up,
@@ -12681,7 +12750,7 @@ fn collectRaftOnlyLocalGroupStatus(
 ) ?antfly.metadata.table_manager.GroupStatusReport {
     const membership = if (group_membership_source) |source| source.membership(group_id) else GroupMembership{};
     if (!membership.local_voter and membership.voter_count == 0) return null;
-    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const now_ms = platform_clock.Clock.real().nowRealtimeMs();
     return .{
         .group_id = group_id,
         .doc_count = 0,
@@ -12689,12 +12758,19 @@ fn collectRaftOnlyLocalGroupStatus(
         .empty = true,
         .created_at_millis = platform_clock.Clock.real().nowRealtimeMs(),
         .updated_at_millis = now_ms,
-        .local_leader = if (group_leadership_source) |source| source.isLocalLeader(group_id) else false,
+        .local_leader = observedLocalGroupLeader(
+            membership,
+            group_leadership_source,
+            group_id,
+            false,
+        ),
         .local_voter = membership.local_voter,
         .voter_count = membership.voter_count,
         .voter_set_known = membership.voter_set_known,
         .voter_set_fingerprint = membership.voter_set_fingerprint,
         .joint_consensus = membership.joint_consensus,
+        .raft_term = membership.raft_term,
+        .raft_membership_index = membership.raft_membership_index,
     };
 }
 
@@ -12749,14 +12825,21 @@ fn overlayLiveRaftGroupStatus(
     group_leadership_source: ?GroupLeadershipSource,
     group_membership_source: ?GroupMembershipSource,
 ) void {
-    if (group_leadership_source) |source| report.local_leader = source.isLocalLeader(report.group_id);
     if (group_membership_source) |source| {
         const membership = source.membership(report.group_id);
+        report.local_leader = observedLocalGroupLeader(
+            membership,
+            group_leadership_source,
+            report.group_id,
+            report.local_leader,
+        );
         report.local_voter = membership.local_voter;
         report.voter_count = membership.voter_count;
         report.voter_set_known = membership.voter_set_known;
         report.voter_set_fingerprint = membership.voter_set_fingerprint;
         report.joint_consensus = membership.joint_consensus;
+        report.raft_term = membership.raft_term;
+        report.raft_membership_index = membership.raft_membership_index;
     }
 }
 
@@ -12824,13 +12907,20 @@ fn collectLocalGroupStatusFromRuntimeStatus(
             fallback.created_at_millis
         else
             now_realtime_ms,
-        .updated_at_millis = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)),
-        .local_leader = if (group_leadership_source) |source| source.isLocalLeader(group_id) else fallback.local_leader,
+        .updated_at_millis = now_realtime_ms,
+        .local_leader = observedLocalGroupLeader(
+            membership,
+            group_leadership_source,
+            group_id,
+            fallback.local_leader,
+        ),
         .local_voter = membership.local_voter,
         .voter_count = membership.voter_count,
         .voter_set_known = membership.voter_set_known,
         .voter_set_fingerprint = membership.voter_set_fingerprint,
         .joint_consensus = membership.joint_consensus,
+        .raft_term = membership.raft_term,
+        .raft_membership_index = membership.raft_membership_index,
         .transition_pending = readiness.transition_pending,
         .replay_required = readiness.replay_required,
         .replay_caught_up = readiness.replay_caught_up,
@@ -12896,7 +12986,7 @@ fn collectLocalGroupStatusWithoutDb(
     if (report.created_at_millis == 0) {
         report.created_at_millis = platform_clock.Clock.real().nowRealtimeMs();
     }
-    report.updated_at_millis = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    report.updated_at_millis = platform_clock.Clock.real().nowRealtimeMs();
 
     const readiness = derivePublishedGroupReadiness(
         group_id,
