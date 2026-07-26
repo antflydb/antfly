@@ -8072,7 +8072,12 @@ pub const ApiHttpServer = struct {
                 request_deadline_ns,
                 queryEmbeddingSecurityScope(authenticated_identity),
             ) catch |err| switch (err) {
-                error.InvalidQueryRequest => return error.InvalidQueryRequest,
+                error.InvalidQueryRequest,
+                error.InvalidFilterQueryRequest,
+                error.InvalidExclusionQueryRequest,
+                error.UnsupportedFilterQueryRequest,
+                error.UnsupportedExclusionQueryRequest,
+                => return err,
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.TableNotFound, error.NotFound => return error.NotFound,
@@ -8153,7 +8158,12 @@ pub const ApiHttpServer = struct {
             request_deadline_ns,
             queryEmbeddingSecurityScope(authenticated_identity),
         ) catch |err| switch (err) {
-            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.InvalidQueryRequest,
+            error.InvalidFilterQueryRequest,
+            error.InvalidExclusionQueryRequest,
+            error.UnsupportedFilterQueryRequest,
+            error.UnsupportedExclusionQueryRequest,
+            => return err,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.TableNotFound => return error.NotFound,
@@ -8518,7 +8528,12 @@ pub const ApiHttpServer = struct {
         semantic_resolver.query_embedding_deadline_ns = request_deadline_ns;
         var query_req = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, body) catch |err| {
             const normalized = normalizePublicQueryParseError(err);
-            if (normalized == error.InvalidQueryRequest) {
+            if (normalized == error.InvalidQueryRequest or
+                normalized == error.InvalidFilterQueryRequest or
+                normalized == error.InvalidExclusionQueryRequest or
+                normalized == error.UnsupportedFilterQueryRequest or
+                normalized == error.UnsupportedExclusionQueryRequest)
+            {
                 std.log.warn("public table query parse failed table={s} err={}", .{ table_name, err });
             } else {
                 std.log.debug("public table query embedding failed table={s} err={}", .{ table_name, normalized });
@@ -8543,7 +8558,27 @@ pub const ApiHttpServer = struct {
         if (row_filter_json) |value| {
             injectRowFilterIntoSearchRequest(alloc, &query_req.req, value) catch return error.InvalidQueryRequest;
         }
-        return (try queryWithTransientReadRetry(alloc, source, table_name, query_req.req, .read_index)) orelse error.TableNotFound;
+        return (queryWithTransientReadRetry(
+            alloc,
+            source,
+            table_name,
+            query_req.req,
+            .read_index,
+        ) catch |err| switch (err) {
+            // Query syntax must never escape the public boundary as an
+            // operational 500, even if a backend rejects a shape that passed
+            // contract normalization.
+            error.InvalidArgument => {
+                if (query_req.req.filter_query_json.len > 0) {
+                    return error.InvalidFilterQueryRequest;
+                }
+                if (query_req.req.exclusion_query_json.len > 0) {
+                    return error.InvalidExclusionQueryRequest;
+                }
+                return error.InvalidQueryRequest;
+            },
+            else => return err,
+        }) orelse error.TableNotFound;
     }
 
     fn queryWithTransientReadRetry(
@@ -9945,6 +9980,30 @@ pub const ApiHttpServer = struct {
     ) !http_common.HttpResponse {
         return switch (err) {
             error.InvalidQueryRequest => try invalidPublicQueryRequestResponse(self.alloc),
+            error.InvalidFilterQueryRequest => try publicFilterQueryErrorResponseForBody(
+                self.alloc,
+                body,
+                "filter_query",
+                .invalid,
+            ),
+            error.InvalidExclusionQueryRequest => try publicFilterQueryErrorResponseForBody(
+                self.alloc,
+                body,
+                "exclusion_query",
+                .invalid,
+            ),
+            error.UnsupportedFilterQueryRequest => try publicFilterQueryErrorResponseForBody(
+                self.alloc,
+                body,
+                "filter_query",
+                .unsupported,
+            ),
+            error.UnsupportedExclusionQueryRequest => try publicFilterQueryErrorResponseForBody(
+                self.alloc,
+                body,
+                "exclusion_query",
+                .unsupported,
+            ),
             error.UnsupportedExactSort => try unsupportedExactSortResponse(self.alloc),
             error.UnsupportedQueryRequest => try unsupportedPublicQueryResponse(self.alloc, body),
             error.IdentityReadGenerationChanged => try retryableTextResponse(self.alloc, 409, "identity read generation changed"),
@@ -13697,6 +13756,103 @@ fn invalidPublicQueryRequestResponse(alloc: std.mem.Allocator) !http_common.Http
     return try textResponse(alloc, 400, "invalid query request");
 }
 
+const PublicFilterQueryErrorKind = enum {
+    invalid,
+    unsupported,
+};
+
+fn publicFilterQueryErrorResponseForBody(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    field: []const u8,
+    kind: PublicFilterQueryErrorKind,
+) !http_common.HttpResponse {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
+        return try publicFilterQueryErrorResponse(alloc, kind, field, "unknown");
+    defer parsed.deinit();
+    const request = switch (parsed.value) {
+        .object => |object| object,
+        else => return try publicFilterQueryErrorResponse(alloc, kind, field, "unknown"),
+    };
+    const value = request.get(field) orelse
+        return try publicFilterQueryErrorResponse(alloc, kind, field, "unknown");
+    const object = switch (value) {
+        .object => |object| object,
+        else => return try publicFilterQueryErrorResponse(
+            alloc,
+            kind,
+            field,
+            "non_object",
+        ),
+    };
+    return try publicFilterQueryErrorResponse(
+        alloc,
+        kind,
+        field,
+        publicFilterQueryNodeName(object),
+    );
+}
+
+fn publicFilterQueryErrorResponse(
+    alloc: std.mem.Allocator,
+    kind: PublicFilterQueryErrorKind,
+    field: []const u8,
+    offending_node: []const u8,
+) !http_common.HttpResponse {
+    const status: u16 = if (kind == .invalid) 400 else 422;
+    return try jsonResponseWithStatus(alloc, status, .{
+        .status = status,
+        .@"error" = if (kind == .invalid) "invalid_query_request" else "unsupported_query_request",
+        .message = if (kind == .invalid) "invalid query filter" else "unsupported query filter",
+        .field = field,
+        .offending_node = offending_node,
+        .retryable = false,
+    });
+}
+
+fn publicFilterQueryNodeName(object: std.json.ObjectMap) []const u8 {
+    inline for ([_][]const u8{
+        "match_all",
+        "match_none",
+        "term",
+        "terms",
+        "exists",
+        "match",
+        "prefix",
+        "wildcard",
+        "regexp",
+        "fuzzy",
+        "range",
+        "numeric_range",
+        "term_range",
+        "date_range",
+        "bool_field",
+        "ip_range",
+        "geo_distance",
+        "geo_bbox",
+        "geo_shape",
+        "ids",
+        "doc_id",
+        "conjuncts",
+        "disjuncts",
+        "bool",
+    }) |candidate| {
+        if (object.get(candidate) != null) return candidate;
+    }
+    if (object.get("must") != null or
+        object.get("should") != null or
+        object.get("must_not") != null or
+        object.get("filter") != null)
+    {
+        return "boolean";
+    }
+    if (object.count() == 1) {
+        var iterator = object.iterator();
+        if (iterator.next()) |entry| return entry.key_ptr.*;
+    }
+    return "unknown";
+}
+
 pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
     return switch (err) {
         error.QueryEmbeddingInputTooLarge,
@@ -13725,7 +13881,15 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
 }
 
 fn normalizePublicQueryParseError(err: anyerror) anyerror {
-    if (err == error.ModelNotFound or err == error.OutOfMemory) return err;
+    if (err == error.ModelNotFound or
+        err == error.OutOfMemory or
+        err == error.InvalidFilterQueryRequest or
+        err == error.InvalidExclusionQueryRequest or
+        err == error.UnsupportedFilterQueryRequest or
+        err == error.UnsupportedExclusionQueryRequest)
+    {
+        return err;
+    }
     return normalizeQueryEmbeddingOperationalError(err) orelse error.InvalidQueryRequest;
 }
 
@@ -15458,6 +15622,71 @@ test "api http invalid query with sort diagnostic returns exact sort response" {
     try std.testing.expectEqualStrings("_score", parsed.value.sort_rejection_field);
 }
 
+test "api http invalid filter query response names the offending node" {
+    const alloc = std.testing.allocator;
+    db_mod.resetLastSortRejectionDiagnostic();
+    var resp = try publicFilterQueryErrorResponseForBody(
+        alloc,
+        \\{"filter_query":{"prefix":17,"field":"path"}}
+    ,
+        "filter_query",
+        .invalid,
+    );
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        field: []const u8,
+        offending_node: []const u8,
+        retryable: bool,
+    }, alloc, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 400), parsed.value.status);
+    try std.testing.expectEqualStrings(
+        "invalid_query_request",
+        parsed.value.@"error",
+    );
+    try std.testing.expectEqualStrings("invalid query filter", parsed.value.message);
+    try std.testing.expectEqualStrings("filter_query", parsed.value.field);
+    try std.testing.expectEqualStrings("prefix", parsed.value.offending_node);
+    try std.testing.expect(!parsed.value.retryable);
+}
+
+test "api http unsupported filter query response names the offending node" {
+    const alloc = std.testing.allocator;
+    var resp = try publicFilterQueryErrorResponseForBody(
+        alloc,
+        \\{"filter_query":{"query_string":"path:tenant/*"}}
+    ,
+        "filter_query",
+        .unsupported,
+    );
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        field: []const u8,
+        offending_node: []const u8,
+        retryable: bool,
+    }, alloc, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "unsupported_query_request",
+        parsed.value.@"error",
+    );
+    try std.testing.expectEqualStrings("filter_query", parsed.value.field);
+    try std.testing.expectEqualStrings("query_string", parsed.value.offending_node);
+    try std.testing.expect(!parsed.value.retryable);
+}
+
 test "api http unsupported unsorted query response remains generic" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
@@ -15751,6 +15980,8 @@ test "api http query parsing preserves operational embedding failures" {
     try std.testing.expectEqual(error.EmbedRateLimited, normalizePublicQueryParseError(error.EmbedRateLimited));
     try std.testing.expectEqual(error.EmbedTransientFailure, normalizePublicQueryParseError(error.ConnectionRefused));
     try std.testing.expectEqual(error.EmbedUpstreamFailure, normalizePublicQueryParseError(error.InvalidEmbeddingResponse));
+    try std.testing.expectEqual(error.InvalidFilterQueryRequest, normalizePublicQueryParseError(error.InvalidFilterQueryRequest));
+    try std.testing.expectEqual(error.UnsupportedExclusionQueryRequest, normalizePublicQueryParseError(error.UnsupportedExclusionQueryRequest));
     try std.testing.expectEqual(error.InvalidQueryRequest, normalizePublicQueryParseError(error.InvalidCharacter));
 }
 
@@ -20631,6 +20862,131 @@ test "api http server serves table query response envelope" {
     defer internal_field_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), internal_field_resp.status);
     try std.testing.expectEqualStrings("invalid query request", internal_field_resp.body);
+}
+
+test "api http server executes every SDK filter query root shape" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-http-sdk-filter-roots";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+    try db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"path\":\"tenant/invoice.pdf\",\"status\":\"active\",\"content\":\"receipt\",\"field\":\"active\",\"prefix\":\"prefixed\",\"value\":\"gold\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    var table_source = table_reads.BoundTableReadSource.init(
+        "files",
+        77,
+        &db,
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+    );
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 1,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(
+        alloc,
+        .{},
+        source.iface(),
+        table_source.source(),
+        null,
+    );
+    const filters = [_][]const u8{
+        "{\"term\":\"active\",\"field\":\"status\"}",
+        "{\"prefix\":\"tenant/\",\"field\":\"path\"}",
+        "{\"disjuncts\":[{\"term\":\"active\",\"field\":\"status\"}],\"min\":1}",
+        "{\"disjuncts\":[{\"prefix\":\"tenant/\",\"field\":\"path\"}],\"min\":1}",
+        "{\"conjuncts\":[{\"term\":\"active\",\"field\":\"status\"}]}",
+        "{\"must\":{\"conjuncts\":[{\"disjuncts\":[{\"term\":\"active\",\"field\":\"status\"}],\"min\":1},{\"disjuncts\":[{\"prefix\":\"tenant/\",\"field\":\"path\"}],\"min\":1}]},\"must_not\":{\"disjuncts\":[{\"term\":\"inactive\",\"field\":\"status\"}],\"min\":1}}",
+        "{\"must_not\":{\"disjuncts\":[{\"prefix\":\"private/\",\"field\":\"path\"}],\"min\":1}}",
+        "{\"must\":{\"conjuncts\":[{\"disjuncts\":[{\"prefix\":\"tenant/\",\"field\":\"path\"}],\"min\":1}]}}",
+        "{\"term\":\"active\",\"field\":\"field\"}",
+        "{\"prefix\":\"pre\",\"field\":\"prefix\"}",
+        "{\"term\":\"gold\",\"field\":\"value\"}",
+    };
+    for (filters) |filter| {
+        const body = try std.fmt.allocPrint(
+            alloc,
+            "{{\"fields\":[\"path\"],\"filter_query\":{s},\"full_text_search\":{{\"field\":\"content\",\"match\":\"receipt\"}},\"limit\":5}}",
+            .{filter},
+        );
+        defer alloc.free(body);
+        var resp = try server.handle(.{
+            .method = .POST,
+            .uri = "/tables/files/query",
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        var parsed = try std.json.parseFromSlice(
+            metadata_openapi.QueryResponses,
+            alloc,
+            resp.body,
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.responses.?.len);
+        try std.testing.expectEqualStrings(
+            "doc:a",
+            parsed.value.responses.?[0].hits.?.hits.?[0]._id,
+        );
+    }
+
+    var unsupported_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/files/query",
+        .content_type = "application/json",
+        .body = "{\"filter_query\":{\"query_string\":\"path:tenant/*\"}}",
+    });
+    defer unsupported_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), unsupported_resp.status);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        unsupported_resp.body,
+        "\"offending_node\":\"query_string\"",
+    ) != null);
+
+    var invalid_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/files/query",
+        .content_type = "application/json",
+        .body = "{\"filter_query\":{\"prefix\":17,\"field\":\"path\"}}",
+    });
+    defer invalid_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        invalid_resp.body,
+        "\"offending_node\":\"prefix\"",
+    ) != null);
 }
 
 test "api http server serves table query with SearchAF-shaped terms aggregations" {

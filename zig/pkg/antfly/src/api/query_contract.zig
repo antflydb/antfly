@@ -2162,7 +2162,12 @@ pub fn parseQueryRequest(
     defer if (contract_body) |owned| alloc.free(owned);
     const body_for_contract = contract_body orelse body;
 
-    var parsed = ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc, body_for_contract, .{}) catch return error.InvalidQueryRequest;
+    var parsed = ant_json.parseFromSlice(
+        metadata_openapi.QueryRequest,
+        alloc,
+        body_for_contract,
+        .{},
+    ) catch return classifyPublicFilterContractErrorAlloc(alloc, body);
     defer parsed.deinit();
     const request = parsed.value;
 
@@ -2228,6 +2233,52 @@ pub fn parsePublicQueryRequest(
 ) !OwnedQueryRequest {
     if (try queryBodyHasForbiddenPublicDocIdentityControlFields(alloc, body)) return error.InvalidQueryRequest;
     return try parseQueryRequest(alloc, semantic_resolver, table_name, body);
+}
+
+fn classifyPublicFilterContractErrorAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) anyerror {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
+        return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    const request = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidQueryRequest,
+    };
+    const fields = [_]struct {
+        name: []const u8,
+        invalid: anyerror,
+        unsupported: anyerror,
+    }{
+        .{
+            .name = "filter_query",
+            .invalid = error.InvalidFilterQueryRequest,
+            .unsupported = error.UnsupportedFilterQueryRequest,
+        },
+        .{
+            .name = "exclusion_query",
+            .invalid = error.InvalidExclusionQueryRequest,
+            .unsupported = error.UnsupportedExclusionQueryRequest,
+        },
+    };
+    for (fields) |field| {
+        const value = request.get(field.name) orelse continue;
+        const normalized = normalizePublicFilterQueryJsonAlloc(
+            alloc,
+            value,
+            10,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.UnsupportedQueryRequest => field.unsupported,
+            else => if (isStructuredFilterValue(value))
+                field.invalid
+            else
+                field.unsupported,
+        };
+        alloc.free(normalized);
+    }
+    return error.InvalidQueryRequest;
 }
 
 pub fn preflightGraphSearchesAlloc(
@@ -4740,10 +4791,18 @@ fn normalizePublicQueryBucketsAlloc(
         try appendScoringQueryClausesAlloc(alloc, &scoring_must, full_text_search, limit);
     }
     if (request.filter_query) |filter_query| {
-        try appendPublicFilterClausesAlloc(alloc, &filter_clauses, filter_query, limit);
+        appendPublicFilterClausesAlloc(alloc, &filter_clauses, filter_query, limit) catch |err| switch (err) {
+            error.InvalidQueryRequest => return error.InvalidFilterQueryRequest,
+            error.UnsupportedQueryRequest => return error.UnsupportedFilterQueryRequest,
+            else => return err,
+        };
     }
     if (request.exclusion_query) |exclusion_query| {
-        try appendPublicFilterClausesAlloc(alloc, &exclusion_clauses, exclusion_query, limit);
+        appendPublicFilterClausesAlloc(alloc, &exclusion_clauses, exclusion_query, limit) catch |err| switch (err) {
+            error.InvalidQueryRequest => return error.InvalidExclusionQueryRequest,
+            error.UnsupportedQueryRequest => return error.UnsupportedExclusionQueryRequest,
+            else => return err,
+        };
     }
 
     var full_text = try buildScoringTextQueryAlloc(alloc, &scoring_must, &scoring_should);
@@ -4842,15 +4901,36 @@ fn appendPublicFilterClausesAlloc(
         }
         return;
     }
-    if (isStructuredFilterValue(query_or_queries) and
-        !isQueryStringValue(query_or_queries) and
-        !isPublicScalarOperatorFilterValue(query_or_queries))
-    {
+    if (isExplicitStructuredScalarFilterValue(query_or_queries)) {
         try appendRawStructuredFilterClausesAlloc(alloc, list, query_or_queries);
         return;
     }
 
-    const parsed = try parseSupportedFullTextQuery(alloc, query_or_queries, limit);
+    // SDK Query unions and the internal structured-filter DSL deliberately
+    // overlap at their roots. Prefer parsing the public query tree so
+    // conjunction/disjunction children and scalar leaves are canonicalized
+    // recursively before they cross the storage boundary. Only fall back to
+    // the raw DSL for nodes that cannot be represented as a text query (for
+    // example typed boolean/numeric terms).
+    const parsed = parseSupportedFullTextQuery(
+        alloc,
+        query_or_queries,
+        limit,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        if (isCanonicalStructuredFilterValue(query_or_queries)) {
+            try appendRawStructuredFilterClausesAlloc(
+                alloc,
+                list,
+                query_or_queries,
+            );
+            return;
+        }
+        if (isStructuredFilterValue(query_or_queries)) {
+            return error.InvalidQueryRequest;
+        }
+        return error.UnsupportedQueryRequest;
+    };
     defer freeTextQuery(alloc, parsed);
     const encoded = try encodePatternFilterQuery(alloc, parsed);
     errdefer alloc.free(encoded);
@@ -4926,6 +5006,22 @@ fn isStructuredFilterValue(value: std.json.Value) bool {
     return false;
 }
 
+fn isExplicitStructuredScalarFilterValue(value: std.json.Value) bool {
+    if (value != .object) return false;
+    inline for ([_][]const u8{ "term", "match", "prefix", "wildcard", "regexp", "fuzzy" }) |key| {
+        if (value.object.get(key)) |operator_value| {
+            if (operator_value == .object and
+                (operator_value.object.get("path") != null or
+                    operator_value.object.get("value") != null or
+                    operator_value.object.get("values") != null))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn isCanonicalStructuredFilterValue(value: std.json.Value) bool {
     if (value != .object) return false;
     inline for ([_][]const u8{
@@ -4996,21 +5092,6 @@ fn isUnambiguousStructuredFilterValue(value: std.json.Value) bool {
             if (operator_value != .object) return false;
             if (operator_value.object.get("path") != null) return true;
             if (operator_value.object.get("values") != null) return true;
-        }
-    }
-    return false;
-}
-
-fn isQueryStringValue(value: std.json.Value) bool {
-    if (value != .object) return false;
-    return value.object.get("query") != null;
-}
-
-fn isPublicScalarOperatorFilterValue(value: std.json.Value) bool {
-    if (value != .object or directDslFieldValue(value.object) == null) return false;
-    inline for ([_][]const u8{ "term", "match", "prefix", "wildcard", "regexp", "fuzzy" }) |key| {
-        if (value.object.get(key)) |operator_value| {
-            return operator_value == .string;
         }
     }
     return false;
@@ -7381,6 +7462,88 @@ test "api query contract normalizes public scalar filters before forwarding" {
 
     try std.testing.expectEqualStrings("{\"term\":{\"status\":\"published\"}}", parsed.req.filter_query_json);
     try std.testing.expectEqualStrings("{\"term\":{\"title\":\"gamma\"}}", parsed.req.exclusion_query_json);
+}
+
+test "api query contract canonicalizes every SDK filter query root shape" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        body: []const u8,
+        required_fragments: []const []const u8,
+        forbidden_fragments: []const []const u8 = &.{},
+    }{
+        .{
+            .body =
+            \\{"filter_query":{"prefix":"tenant/","field":"path"}}
+            ,
+            .required_fragments = &.{"\"prefix\":{\"path\":\"tenant/\"}"},
+            .forbidden_fragments = &.{"\"field\""},
+        },
+        .{
+            .body =
+            \\{"filter_query":{"disjuncts":[{"term":"active","field":"status"}],"min":1}}
+            ,
+            .required_fragments = &.{
+                "\"bool\"",
+                "\"should\"",
+                "\"term\":{\"status\":\"active\"}",
+            },
+            .forbidden_fragments = &.{"\"field\""},
+        },
+        .{
+            .body =
+            \\{"filter_query":{"conjuncts":[{"term":"active","field":"status"}]}}
+            ,
+            .required_fragments = &.{
+                "\"bool\"",
+                "\"must\"",
+                "\"term\":{\"status\":\"active\"}",
+            },
+            .forbidden_fragments = &.{"\"field\""},
+        },
+        .{
+            .body =
+            \\{"filter_query":{"must_not":{"disjuncts":[{"prefix":"private/","field":"path"}]}}}
+            ,
+            .required_fragments = &.{
+                "\"bool\"",
+                "\"must_not\"",
+                "\"prefix\":{\"path\":\"private/\"}",
+            },
+            .forbidden_fragments = &.{"\"field\""},
+        },
+        .{
+            .body =
+            \\{"filter_query":{"must":{"conjuncts":[{"disjuncts":[{"prefix":"tenant/","field":"path"}],"min":1}]}}}
+            ,
+            .required_fragments = &.{
+                "\"bool\"",
+                "\"must\"",
+                "\"should\"",
+                "\"prefix\":{\"path\":\"tenant/\"}",
+            },
+            .forbidden_fragments = &.{"\"field\""},
+        },
+    };
+
+    for (cases) |case| {
+        var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
+        defer parsed.deinit(alloc);
+        try std.testing.expect(parsed.req.full_text.? == .match_all);
+        for (case.required_fragments) |fragment| {
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                parsed.req.filter_query_json,
+                fragment,
+            ) != null);
+        }
+        for (case.forbidden_fragments) |fragment| {
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                parsed.req.filter_query_json,
+                fragment,
+            ) == null);
+        }
+    }
 }
 
 test "api query contract preflight summarizes query lanes and result refs" {

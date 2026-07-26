@@ -1800,80 +1800,77 @@ fn patternFieldOrPathValue(object: std.json.ObjectMap) ?std.json.Value {
 
 fn extractPatternFieldFromStringShape(value: std.json.Value, value_key: []const u8) ![]const u8 {
     if (value != .object) return error.InvalidArgument;
-    if (patternFieldOrPathValue(value.object)) |field_value| {
-        if (field_value != .string) return error.InvalidArgument;
-        _ = value.object.get(value_key) orelse value.object.get("value") orelse return error.InvalidArgument;
-        return field_value.string;
+    if (value.object.count() == 1) {
+        var it = value.object.iterator();
+        return (it.next() orelse return error.InvalidArgument).key_ptr.*;
     }
-    if (value.object.count() != 1) return error.InvalidArgument;
-    var it = value.object.iterator();
-    const entry = it.next() orelse return error.InvalidArgument;
-    return entry.key_ptr.*;
+    _ = value.object.get(value_key) orelse value.object.get("value") orelse return error.InvalidArgument;
+    const field_value = patternFieldOrPathValue(value.object) orelse return error.InvalidArgument;
+    if (field_value != .string) return error.InvalidArgument;
+    return field_value.string;
 }
 
 fn extractPatternFieldString(alloc: Allocator, value: std.json.Value, value_key: []const u8) !PatternFieldString {
     if (value != .object) return error.InvalidArgument;
-    if (patternFieldOrPathValue(value.object)) |field_value| {
-        if (field_value != .string) return error.InvalidArgument;
-        const raw_value = value.object.get(value_key) orelse value.object.get("value") orelse return error.InvalidArgument;
-        return .{ .field = field_value.string, .value = try jsonScalarTermAlloc(alloc, raw_value) };
+    if (value.object.count() == 1) {
+        var it = value.object.iterator();
+        const entry = it.next() orelse return error.InvalidArgument;
+        return .{ .field = entry.key_ptr.*, .value = try jsonScalarTermAlloc(alloc, entry.value_ptr.*) };
     }
-    if (value.object.count() != 1) return error.InvalidArgument;
-    var it = value.object.iterator();
-    const entry = it.next() orelse return error.InvalidArgument;
-    return .{ .field = entry.key_ptr.*, .value = try jsonScalarTermAlloc(alloc, entry.value_ptr.*) };
+    const raw_value = value.object.get(value_key) orelse value.object.get("value") orelse return error.InvalidArgument;
+    const field_value = patternFieldOrPathValue(value.object) orelse return error.InvalidArgument;
+    if (field_value != .string) return error.InvalidArgument;
+    return .{ .field = field_value.string, .value = try jsonScalarTermAlloc(alloc, raw_value) };
 }
 
 fn extractPatternFieldTerms(alloc: Allocator, value: std.json.Value) !PatternFieldTerms {
     if (value != .object) return error.InvalidArgument;
-    if (patternFieldOrPathValue(value.object)) |field_value| {
-        if (field_value != .string) return error.InvalidArgument;
-        const raw_values = value.object.get("values") orelse value.object.get("terms") orelse return error.InvalidArgument;
-        return .{ .field = field_value.string, .terms = try compilePatternTerms(alloc, raw_values) };
+    if (value.object.count() == 1) {
+        var it = value.object.iterator();
+        const entry = it.next() orelse return error.InvalidArgument;
+        return .{ .field = entry.key_ptr.*, .terms = try compilePatternTerms(alloc, entry.value_ptr.*) };
     }
-    if (value.object.count() != 1) return error.InvalidArgument;
-    var it = value.object.iterator();
-    const entry = it.next() orelse return error.InvalidArgument;
-    return .{ .field = entry.key_ptr.*, .terms = try compilePatternTerms(alloc, entry.value_ptr.*) };
+    const raw_values = value.object.get("values") orelse value.object.get("terms") orelse return error.InvalidArgument;
+    const field_value = patternFieldOrPathValue(value.object) orelse return error.InvalidArgument;
+    if (field_value != .string) return error.InvalidArgument;
+    return .{ .field = field_value.string, .terms = try compilePatternTerms(alloc, raw_values) };
 }
 
 fn extractPatternTermsField(value: std.json.Value) ![]const u8 {
     if (value != .object) return error.InvalidArgument;
-    if (patternFieldOrPathValue(value.object)) |field_value| {
-        if (field_value != .string) return error.InvalidArgument;
-        _ = value.object.get("values") orelse value.object.get("terms") orelse return error.InvalidArgument;
-        return field_value.string;
+    if (value.object.count() == 1) {
+        var it = value.object.iterator();
+        const entry = it.next() orelse return error.InvalidArgument;
+        if (entry.value_ptr.* != .array) return error.InvalidArgument;
+        return entry.key_ptr.*;
     }
-    if (value.object.count() != 1) return error.InvalidArgument;
-    var it = value.object.iterator();
-    const entry = it.next() orelse return error.InvalidArgument;
-    if (entry.value_ptr.* != .array) return error.InvalidArgument;
-    return entry.key_ptr.*;
+    _ = value.object.get("values") orelse value.object.get("terms") orelse return error.InvalidArgument;
+    const field_value = patternFieldOrPathValue(value.object) orelse return error.InvalidArgument;
+    if (field_value != .string) return error.InvalidArgument;
+    return field_value.string;
 }
 
 fn extractPatternFuzzyField(value: std.json.Value) ![]const u8 {
     if (value != .object) return error.InvalidArgument;
-    if (patternFieldOrPathValue(value.object)) |field_value| {
-        if (field_value != .string) return error.InvalidArgument;
-        _ = value.object.get("query") orelse value.object.get("value") orelse return error.InvalidArgument;
-        return field_value.string;
+    if (value.object.count() == 1) {
+        var it = value.object.iterator();
+        return (it.next() orelse return error.InvalidArgument).key_ptr.*;
     }
-    if (value.object.count() != 1) return error.InvalidArgument;
-    var it = value.object.iterator();
-    const entry = it.next() orelse return error.InvalidArgument;
-    return entry.key_ptr.*;
+    _ = value.object.get("query") orelse value.object.get("value") orelse return error.InvalidArgument;
+    const field_value = patternFieldOrPathValue(value.object) orelse return error.InvalidArgument;
+    if (field_value != .string) return error.InvalidArgument;
+    return field_value.string;
 }
 
 fn extractPatternFuzzyPredicate(value: std.json.Value) !std.json.Value {
     if (value != .object) return error.InvalidArgument;
-    if (patternFieldOrPathValue(value.object) != null) {
-        _ = value.object.get("query") orelse value.object.get("value") orelse return error.InvalidArgument;
-        return value;
+    if (value.object.count() == 1) {
+        var it = value.object.iterator();
+        return (it.next() orelse return error.InvalidArgument).value_ptr.*;
     }
-    if (value.object.count() != 1) return error.InvalidArgument;
-    var it = value.object.iterator();
-    const entry = it.next() orelse return error.InvalidArgument;
-    return entry.value_ptr.*;
+    _ = value.object.get("query") orelse value.object.get("value") orelse return error.InvalidArgument;
+    _ = patternFieldOrPathValue(value.object) orelse return error.InvalidArgument;
+    return value;
 }
 
 fn compilePatternTerms(alloc: Allocator, value: std.json.Value) ![]const []const u8 {
@@ -2987,6 +2984,48 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     try std.testing.expect(compiled == .bool_query);
     try std.testing.expectEqual(@as(usize, 2), compiled.bool_query.must.len);
     try std.testing.expect(try compiled.matches(alloc, "doc:b", parsed_geo_doc.value));
+}
+
+test "stored structured filters preserve one-key field name collisions" {
+    const alloc = std.testing.allocator;
+    var parsed_doc = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"path":"tenant/file","field":"active","prefix":"prefixed","value":"gold","terms":"listed","query":"near"}
+    ,
+        .{},
+    );
+    defer parsed_doc.deinit();
+
+    const filters = [_][]const u8{
+        \\{"prefix":{"path":"tenant/"}}
+        ,
+        \\{"term":{"field":"active"}}
+        ,
+        \\{"prefix":{"prefix":"pre"}}
+        ,
+        \\{"term":{"value":"gold"}}
+        ,
+        \\{"terms":{"terms":["listed"]}}
+        ,
+        \\{"fuzzy":{"query":{"query":"near","max_edits":0}}}
+        ,
+    };
+    for (filters) |filter_json| {
+        var parsed_filter = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            filter_json,
+            .{},
+        );
+        defer parsed_filter.deinit();
+        try std.testing.expect(try jsonDocMatchesPatternFilter(
+            alloc,
+            "doc:collision",
+            parsed_doc.value,
+            parsed_filter.value,
+        ));
+    }
 }
 
 test "executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents" {
