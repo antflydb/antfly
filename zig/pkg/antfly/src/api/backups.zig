@@ -4954,11 +4954,17 @@ fn ensureClusterBackupAttemptHeadRestorable(
                 return error.IncompleteClusterBackup;
         }
     }
-    // The immutable aggregate manifest is the commit record. Artifact
-    // existence and cryptographic identity are verified for each requested
-    // table immediately before publication; walking every artifact in an
-    // unrelated newest backup here would make historical restore admission
-    // proportional to repository payload cardinality.
+    // Repository health includes the immutable bytes referenced by the newest
+    // Zig aggregate, not only its metadata shape. Verification is streaming
+    // and memory-bounded; it detects missing, truncated, same-size corrupt, or
+    // concurrently replaced artifacts before historical selection can mask a
+    // damaged authoritative attempt.
+    try verifyClusterBackupArtifactsIntegrityAtLocation(
+        alloc,
+        io,
+        location,
+        &manifest,
+    );
 }
 
 pub fn ensureNewestClusterBackupAttemptRestorable(
@@ -8179,7 +8185,7 @@ test "attempt head generation detects publication and retirement ABA" {
     try std.testing.expectEqual(ClusterBackupAttemptState.committed, committed.value.state);
 }
 
-test "newest attempt admission is metadata bounded and exact integrity detects corruption" {
+test "newest attempt admission verifies exact artifact integrity" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -8221,18 +8227,12 @@ test "newest attempt admission is metadata bounded and exact integrity detects c
     defer alloc.free(artifact_path);
     try writeFileAbsolute(artifact_path, "PAYLOAD");
 
-    try ensureNewestClusterBackupAttemptRestorable(
-        alloc,
-        io,
-        &location,
-    );
     try std.testing.expectError(
         error.BackupArtifactIntegrityMismatch,
-        verifyClusterBackupArtifactsIntegrityAtLocation(
+        ensureNewestClusterBackupAttemptRestorable(
             alloc,
             io,
             &location,
-            &committed,
         ),
     );
 
