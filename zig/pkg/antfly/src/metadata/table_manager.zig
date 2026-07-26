@@ -413,9 +413,10 @@ pub const GroupLeaderCandidate = struct {
 
 /// Selects a leader report using Raft evidence that is comparable across
 /// replicas. Reporter timestamps are deliberately excluded: they are useful
-/// for freshness, but cannot establish authority across hosts.
+/// for freshness, but cannot establish authority across hosts. Callers must
+/// first fence each report against its own placement's relocation generation;
+/// those generations are member-local and cannot order reports across stores.
 pub const GroupLeaderEvidence = struct {
-    relocation_generation: u64 = 0,
     max_raft_term: u64 = 0,
     max_membership_index: u64 = 0,
     candidate: ?GroupLeaderCandidate = null,
@@ -426,12 +427,6 @@ pub const GroupLeaderEvidence = struct {
         store_id: u64,
         report: GroupStatusReport,
     ) void {
-        if (report.relocation_generation > self.relocation_generation) {
-            self.* = .{ .relocation_generation = report.relocation_generation };
-        } else if (report.relocation_generation < self.relocation_generation) {
-            return;
-        }
-
         self.max_membership_index = @max(
             self.max_membership_index,
             report.raft_membership_index,
@@ -452,9 +447,9 @@ pub const GroupLeaderEvidence = struct {
                 return;
             }
             if (current.store_id != store_id) {
-                // Two stores claiming leadership in the same generation and
-                // term is contradictory Raft evidence. Fail closed until a
-                // higher term resolves it.
+                // Two stores claiming leadership in the same Raft term is
+                // contradictory evidence. Fail closed until a higher term
+                // resolves it.
                 self.ambiguous = true;
                 return;
             }
@@ -475,8 +470,7 @@ pub const GroupLeaderEvidence = struct {
     pub fn resolve(self: @This()) ?GroupLeaderCandidate {
         if (self.ambiguous) return null;
         const candidate = self.candidate orelse return null;
-        if (candidate.report.relocation_generation != self.relocation_generation or
-            candidate.report.raft_term != self.max_raft_term or
+        if (candidate.report.raft_term != self.max_raft_term or
             candidate.report.raft_membership_index < self.max_membership_index)
         {
             return null;
@@ -489,9 +483,8 @@ pub const GroupLeaderEvidence = struct {
 /// lacks Raft voter-set knowledge to poison authoritative evidence. A count
 /// from such a reporter remains useful as a conservative fallback; once any
 /// fingerprint-qualified evidence exists, only qualified reports can conflict
-/// with it.
+/// with it. As with leader evidence, callers own per-member relocation fences.
 pub const VoterSetEvidence = struct {
-    relocation_generation: u64 = 0,
     fallback_voter_count: ?u16 = null,
     fallback_membership_index: u64 = 0,
     ambiguous_fallback_voter_count: bool = false,
@@ -502,11 +495,6 @@ pub const VoterSetEvidence = struct {
     ambiguous_known_voter_set: bool = false,
 
     pub fn observe(self: *@This(), report: GroupStatusReport) void {
-        if (report.relocation_generation > self.relocation_generation) {
-            self.* = .{ .relocation_generation = report.relocation_generation };
-        } else if (report.relocation_generation < self.relocation_generation) {
-            return;
-        }
         if (report.voter_count == 0) return;
         if (self.fallback_voter_count == null or
             report.raft_membership_index > self.fallback_membership_index)
@@ -576,6 +564,28 @@ pub const VoterSetEvidence = struct {
         };
     }
 };
+
+test "table manager leader evidence does not compare member-local relocation generations" {
+    var evidence: GroupLeaderEvidence = .{};
+    evidence.observe(102, .{
+        .group_id = 77,
+        .relocation_generation = 4,
+        .local_leader = true,
+        .local_voter = true,
+        .raft_term = 9,
+        .raft_membership_index = 80,
+    });
+    evidence.observe(105, .{
+        .group_id = 77,
+        .relocation_generation = 5,
+        .local_voter = true,
+        .raft_term = 9,
+        .raft_membership_index = 80,
+    });
+
+    const leader = evidence.resolve() orelse return error.MissingLeader;
+    try std.testing.expectEqual(@as(u64, 102), leader.store_id);
+}
 
 test "table manager voter set evidence is order independent when newer reports lack fingerprints" {
     const older_known: GroupStatusReport = .{

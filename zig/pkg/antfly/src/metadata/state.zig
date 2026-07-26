@@ -581,6 +581,12 @@ const PlacementNodeKey = struct {
     node_id: u64,
 };
 
+const PlacementMemberEvidence = struct {
+    store_id: u64,
+    relocation_generation: u64,
+    ambiguous: bool = false,
+};
+
 pub fn mergeHealthyGroupStatuses(
     alloc: std.mem.Allocator,
     tables: []const metadata_table_manager.TableRecord,
@@ -597,17 +603,28 @@ pub fn mergeHealthyGroupStatuses(
     defer states.deinit(alloc);
     var indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
     defer indexes.deinit(alloc);
-    var placement_generations = std.AutoHashMapUnmanaged(PlacementNodeKey, u64).empty;
-    defer placement_generations.deinit(alloc);
+    var placement_members = std.AutoHashMapUnmanaged(
+        PlacementNodeKey,
+        PlacementMemberEvidence,
+    ).empty;
+    defer placement_members.deinit(alloc);
     var placement_counts = std.AutoHashMapUnmanaged(u64, u16).empty;
     defer placement_counts.deinit(alloc);
-    try placement_generations.ensureTotalCapacity(alloc, @intCast(placement_intents.len));
+    try placement_members.ensureTotalCapacity(alloc, @intCast(placement_intents.len));
     try placement_counts.ensureTotalCapacity(alloc, @intCast(placement_intents.len));
     for (placement_intents) |intent| {
-        placement_generations.putAssumeCapacity(.{
+        const member = placement_members.getOrPutAssumeCapacity(.{
             .group_id = intent.record.group_id,
             .node_id = intent.record.local_node_id,
-        }, intent.relocation_generation);
+        });
+        if (member.found_existing) {
+            member.value_ptr.ambiguous = true;
+        } else {
+            member.value_ptr.* = .{
+                .store_id = intent.store_id,
+                .relocation_generation = intent.relocation_generation,
+            };
+        }
         const count = placement_counts.getOrPutAssumeCapacity(intent.record.group_id);
         if (!count.found_existing) count.value_ptr.* = 0;
         count.value_ptr.* +|= 1;
@@ -619,11 +636,18 @@ pub fn mergeHealthyGroupStatuses(
 
         for (store.group_statuses) |group_status| {
             if (placement_intents.len > 0) {
-                const generation = placement_generations.get(.{
+                const placement = placement_members.get(.{
                     .group_id = group_status.group_id,
                     .node_id = store.node_id,
                 }) orelse continue;
-                if (generation != group_status.relocation_generation) continue;
+                if (placement.ambiguous or
+                    (placement.store_id != 0 and
+                        placement.store_id != store.store_id) or
+                    placement.relocation_generation !=
+                        group_status.relocation_generation)
+                {
+                    continue;
+                }
             }
             const entry = try indexes.getOrPut(alloc, group_status.group_id);
             if (!entry.found_existing) {
@@ -653,10 +677,16 @@ pub fn mergeHealthyGroupStatuses(
         }
 
         for (store.runtime_statuses) |runtime_status| {
-            if (!placement_generations.contains(.{
+            const placement = placement_members.get(.{
                 .group_id = runtime_status.group_id,
                 .node_id = store.node_id,
-            })) continue;
+            }) orelse continue;
+            if (placement.ambiguous or
+                (placement.store_id != 0 and
+                    placement.store_id != store.store_id))
+            {
+                continue;
+            }
             if (runtime_status.doc_count == 0 and !runtime_status.disk_bytes_known and !runtimeDocIdentityHasFacts(runtime_status.doc_identity)) continue;
             const entry = try indexes.getOrPut(alloc, runtime_status.group_id);
             if (!entry.found_existing) {

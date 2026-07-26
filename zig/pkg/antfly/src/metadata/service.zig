@@ -6532,7 +6532,7 @@ test "metadata service transition readiness requires stable healthy placement" {
     );
 }
 
-test "metadata service transition readiness map rejects stale placement generations" {
+test "metadata service transition readiness fences each member relocation generation independently" {
     const voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 1, 2, 3 }, null);
     const placements = [_]raft_reconciler.PlacementIntent{
         .{ .store_id = 1, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 }, .relocation_generation = 4 },
@@ -6571,6 +6571,24 @@ test "metadata service transition readiness map rejects stale placement generati
     try std.testing.expectEqual(
         transition_state.StablePlacementReadiness.ready,
         ready.get(77) orelse .status_unavailable,
+    );
+
+    var relocating_placements = placements;
+    relocating_placements[2].relocation_generation = 5;
+    relocating_placements[2].serving_state = .draining;
+    var relocating_follower_statuses = follower_statuses;
+    relocating_follower_statuses[0].relocation_generation = 5;
+    var relocating_stores = stores;
+    relocating_stores[2].group_statuses = &relocating_follower_statuses;
+    var relocating = try buildTransitionReadinessMap(
+        std.testing.allocator,
+        &relocating_stores,
+        &relocating_placements,
+    );
+    defer relocating.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.ready,
+        relocating.get(77) orelse .status_unavailable,
     );
 
     var stale_leader_statuses = leader_statuses;

@@ -1917,7 +1917,11 @@ fn mergedGroupStatus(current: CurrentMetadataState, group_id: u64) ?MergedGroupS
         }
         return null;
     }
-    const fallback = mergeHealthyGroupStatusFallback(current.stores, group_id) orelse return null;
+    const fallback = mergeHealthyGroupStatusFallback(
+        current.stores,
+        current.placement_intents,
+        group_id,
+    ) orelse return null;
     return mergeRuntimeGroupFacts(fallback, current.stores, current.placement_intents, current.ranges, group_id);
 }
 
@@ -1933,11 +1937,21 @@ fn mergeRuntimeGroupFacts(
     for (stores) |store| {
         if (!store.live) continue;
         if (!std.mem.eql(u8, store.health_class, "healthy")) continue;
+        const placement = currentPlacementForStore(
+            placements,
+            group_id,
+            store,
+        );
+        if (placements.len > 0 and placement == null) continue;
         var store_reports_group = false;
         var store_reports_voter = false;
         var store_reports_runtime_facts = false;
         for (store.group_statuses) |status| {
             if (status.group_id != group_id) continue;
+            if (placement) |intent| {
+                if (status.relocation_generation != intent.relocation_generation)
+                    continue;
+            }
             store_reports_group = true;
             store_reports_voter = store_reports_voter or status.local_voter;
         }
@@ -1957,7 +1971,7 @@ fn mergeRuntimeGroupFacts(
             if (updated_at_millis > merged.updated_at_millis) merged.updated_at_millis = updated_at_millis;
             mergeRuntimeDocIdentity(&merged, status.doc_identity);
         }
-        if (store_reports_voter or (!store_reports_group and store_reports_runtime_facts and storeHasPlacement(placements, group_id, store.node_id))) {
+        if (store_reports_voter or (!store_reports_group and store_reports_runtime_facts)) {
             healthy_voter_reports +|= 1;
         }
     }
@@ -2214,14 +2228,31 @@ fn runtimeDocIdentitySameNamespace(
         left.namespace_range_id == right.namespace_range_id;
 }
 
-fn storeHasPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
+fn currentPlacementForStore(
+    placements: []const raft_reconciler.PlacementIntent,
+    group_id: u64,
+    store: table_manager.StoreRecord,
+) ?raft_reconciler.PlacementIntent {
+    var found: ?raft_reconciler.PlacementIntent = null;
     for (placements) |intent| {
-        if (intent.record.group_id == group_id and intent.record.local_node_id == node_id) return true;
+        if (intent.record.group_id != group_id or
+            intent.record.local_node_id != store.node_id)
+        {
+            continue;
+        }
+        if (found != null) return null;
+        found = intent;
     }
-    return false;
+    const intent = found orelse return null;
+    if (intent.store_id != 0 and intent.store_id != store.store_id) return null;
+    return intent;
 }
 
-fn mergeHealthyGroupStatusFallback(stores: []const table_manager.StoreRecord, group_id: u64) ?MergedGroupStatus {
+fn mergeHealthyGroupStatusFallback(
+    stores: []const table_manager.StoreRecord,
+    placements: []const raft_reconciler.PlacementIntent,
+    group_id: u64,
+) ?MergedGroupStatus {
     var latest: ?table_manager.GroupStatusReport = null;
     var leader_evidence: table_manager.GroupLeaderEvidence = .{};
     var voter_set_evidence: table_manager.VoterSetEvidence = .{};
@@ -2236,10 +2267,20 @@ fn mergeHealthyGroupStatusFallback(stores: []const table_manager.StoreRecord, gr
     for (stores) |store| {
         if (!store.live) continue;
         if (!std.mem.eql(u8, store.health_class, "healthy")) continue;
+        const placement = currentPlacementForStore(
+            placements,
+            group_id,
+            store,
+        );
+        if (placements.len > 0 and placement == null) continue;
 
         var counted_voter_for_store = false;
         for (store.group_statuses) |status| {
             if (status.group_id != group_id) continue;
+            if (placement) |intent| {
+                if (status.relocation_generation != intent.relocation_generation)
+                    continue;
+            }
             if (latest == null or status.updated_at_millis >= latest.?.updated_at_millis) {
                 latest = status;
             }
