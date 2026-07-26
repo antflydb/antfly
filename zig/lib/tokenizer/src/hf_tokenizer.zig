@@ -2820,17 +2820,29 @@ pub const HfTokenizer = struct {
                 for (workers) |*worker| {
                     const required_words =
                         (worker.text.len + 63) / 64;
-                    try worker.pretoken_boundary_words
+                    worker.pretoken_boundary_words
                         .ensureTotalCapacityPrecise(
                         self.allocator,
                         required_words,
-                    );
+                    ) catch {
+                        // The stable index is an optional replay
+                        // acceleration. Retain and account any capacity
+                        // already acquired, but run the exact scanner rather
+                        // than failing tokenization under memory pressure.
+                        build_stable_boundaries = false;
+                        break;
+                    };
                     worker.pretoken_boundary_words.items.len =
                         required_words;
                     @memset(
                         worker.pretoken_boundary_words.items,
                         0,
                     );
+                }
+                if (!build_stable_boundaries) {
+                    for (workers) |*worker| {
+                        worker.pretoken_boundary_words.items.len = 0;
+                    }
                 }
             }
         }
@@ -3597,32 +3609,6 @@ pub const HfTokenizer = struct {
         break :blk table;
     };
 
-    fn fillWorkerPretokenBatch(
-        iterator: anytype,
-        input_end: usize,
-        probe_view: WorkerBpeProbeView,
-        prepared: []PreparedWorkerPretoken,
-    ) WorkerPretokenBatchFill {
-        var count: usize = 0;
-        var input_bytes: usize = 0;
-        while (count < worker_bpe_batch_size) : (count += 1) {
-            const word = iterator.next() orelse break;
-            const key = workerBpeKeyPadded(word, input_end) orelse 0;
-            const meta: u64 = if (key != 0)
-                workerBpeHash(key)
-            else
-                @intCast(word.len);
-            prepared[count] = .{
-                .key = key,
-                .ptr = word.ptr,
-                .meta = meta,
-            };
-            input_bytes += word.len;
-            prefetchWorkerBpe(probe_view, meta, 2);
-        }
-        return .{ .count = count, .input_bytes = input_bytes };
-    }
-
     inline fn appendGpt2BoundaryBits(
         bits_in: u64,
         block_base: usize,
@@ -3693,6 +3679,122 @@ pub const HfTokenizer = struct {
             count.* += 1;
             bits &= bits - 1;
         }
+    }
+
+    /// Replay a retained one-bit-per-byte boundary index in the same
+    /// cache-friendly batches as the fixed-grid scanner. Decoding one token
+    /// at a time made the index slower than recomputing boundaries: every
+    /// pretoken paid a mask, branch, and ctz. Here each u64 is loaded once and
+    /// flattened through the shared octet table into compact relative ends.
+    fn fillWorkerPretokenBatchIndexed(
+        iterator: *IndexedPretokenIterator,
+        input_end: usize,
+        probe_view: WorkerBpeProbeView,
+        prepared: []PreparedWorkerPretoken,
+    ) WorkerPretokenBatchFill {
+        const call_start = iterator.pos;
+        const relative_limit = std.math.maxInt(u16) - 64;
+        var output_count: usize = 0;
+        while (output_count < worker_bpe_batch_size and
+            iterator.pos < iterator.end)
+        {
+            const fill_base = iterator.pos;
+            const needed = worker_bpe_batch_size - output_count;
+            var ends: [worker_bpe_batch_size + 208]u16 = undefined;
+            var boundary_count: usize = 0;
+            const first_word = (fill_base + 1) / 64;
+            var word_index = first_word;
+            const word_limit = (iterator.end + 63) / 64;
+
+            while (word_index < word_limit and
+                boundary_count < needed)
+            {
+                const block_base = word_index * 64;
+                if (block_base > fill_base +| relative_limit) break;
+
+                var bits = iterator.boundary_words[word_index];
+                if (word_index == first_word) {
+                    const first_live = (fill_base + 1) % 64;
+                    bits &= @as(u64, std.math.maxInt(u64)) <<
+                        @as(u6, @intCast(first_live));
+                }
+                if (word_index + 1 == word_limit and
+                    iterator.end % 64 != 0)
+                {
+                    bits &= (@as(u64, 1) <<
+                        @as(u6, @intCast(iterator.end % 64))) - 1;
+                }
+                appendGpt2BoundaryBits(
+                    bits,
+                    block_base,
+                    fill_base,
+                    &ends,
+                    &boundary_count,
+                );
+                word_index += 1;
+            }
+
+            // A segment's end is an implicit endpoint rather than a
+            // pretoken-start bit. Add it only when it fits in this relative
+            // batch; a very long final token takes the exact scalar iterator
+            // below.
+            if (word_index == word_limit and
+                boundary_count < needed and
+                iterator.end - fill_base <= std.math.maxInt(u16))
+            {
+                ends[boundary_count] =
+                    @intCast(iterator.end - fill_base);
+                boundary_count += 1;
+            }
+
+            if (boundary_count == 0) {
+                const word = iterator.next() orelse break;
+                const key =
+                    workerBpeKeyPadded(word, input_end) orelse 0;
+                const meta: u64 = if (key != 0)
+                    workerBpeHash(key)
+                else
+                    @intCast(word.len);
+                prepared[output_count] = .{
+                    .key = key,
+                    .ptr = word.ptr,
+                    .meta = meta,
+                };
+                prefetchWorkerBpe(probe_view, meta, 2);
+                output_count += 1;
+                continue;
+            }
+
+            const emit_count = @min(boundary_count, needed);
+            var previous: usize = 0;
+            for (
+                ends[0..emit_count],
+                prepared[output_count .. output_count + emit_count],
+            ) |end16, *item| {
+                const end: usize = end16;
+                const word = iterator.text[fill_base + previous .. fill_base + end];
+                previous = end;
+                const key =
+                    workerBpeKeyPadded(word, input_end) orelse 0;
+                const meta: u64 = if (key != 0)
+                    workerBpeHash(key)
+                else
+                    @intCast(word.len);
+                item.* = .{
+                    .key = key,
+                    .ptr = word.ptr,
+                    .meta = meta,
+                };
+                prefetchWorkerBpe(probe_view, meta, 2);
+            }
+            output_count += emit_count;
+            iterator.pos = fill_base + previous;
+        }
+
+        return .{
+            .count = output_count,
+            .input_bytes = iterator.pos - call_start,
+        };
     }
 
     /// Harvest exact fixed-grid boundaries into compact u16 offsets, then
@@ -4215,7 +4317,7 @@ pub const HfTokenizer = struct {
         }
         while (true) {
             const fill = if (indexed_pretokens)
-                @call(.never_inline, fillWorkerPretokenBatch, .{
+                @call(.never_inline, fillWorkerPretokenBatchIndexed, .{
                     &iterator,
                     input_end,
                     probe_view,
@@ -8563,6 +8665,7 @@ test "worker BPE caches honor external resource-budget denial" {
     try tok.configureParallelBpe(.{
         .worker_cache_count = 4,
         .worker_cache_slots = 1024,
+        .retain_stable_pretoken_boundaries = true,
     });
 
     var text = std.ArrayListUnmanaged(u8).empty;
@@ -8618,6 +8721,8 @@ test "worker BPE caches honor external resource-budget denial" {
     const denied_stats = tok.bpeCacheStats();
     try std.testing.expectEqual(@as(usize, 0), denied_stats.workspace_total_count);
     try std.testing.expectEqual(@as(usize, 0), denied_stats.workspace_cached_count);
+    try std.testing.expectEqual(@as(usize, 0), denied_stats.stable_boundary_words);
+    try std.testing.expectEqual(@as(usize, 0), denied_stats.stable_boundary_bytes);
     try std.testing.expect(budget.denials.load(.acquire) > 0);
     try std.testing.expectEqual(base_bytes, budget.used.load(.acquire));
 
@@ -8897,6 +9002,67 @@ test "byte-level BPE parallel encoding preserves document delimiters" {
     try std.testing.expect(stats.stable_boundary_words > 0);
     try std.testing.expect(stats.stable_boundary_bytes >=
         stats.stable_boundary_words * @sizeOf(u64));
+}
+
+test "stable boundary replay refills across an oversized Unicode pretoken" {
+    const allocator = std.testing.allocator;
+    var text = std.ArrayListUnmanaged(u8).empty;
+    defer text.deinit(allocator);
+    for (0..64) |_| try text.appendSlice(allocator, "word ");
+    // U+00C3 and U+00C2 are both Unicode letters. GPT-2 therefore treats
+    // this entire 126 KiB run as one pretoken, matching the rare malformed
+    // text pattern found in the complete OpenWebText qualification corpus.
+    for (0..31_608) |_| {
+        try text.appendSlice(allocator, "\xc3\x83\xc3\x82");
+    }
+
+    const word_count = (text.items.len + 63) / 64;
+    const boundary_words = try allocator.alloc(u64, word_count);
+    defer allocator.free(boundary_words);
+    @memset(boundary_words, 0);
+
+    var expected = HfTokenizer.ByteLevelPretokenIterator{
+        .text = text.items,
+    };
+    var expected_count: usize = 0;
+    var longest: usize = 0;
+    while (expected.next()) |word| {
+        const offset =
+            @intFromPtr(word.ptr) - @intFromPtr(text.items.ptr);
+        boundary_words[offset / 64] |=
+            @as(u64, 1) << @intCast(offset % 64);
+        expected_count += 1;
+        longest = @max(longest, word.len);
+    }
+    try std.testing.expect(longest > std.math.maxInt(u16));
+    try std.testing.expect(
+        expected_count < HfTokenizer.worker_bpe_batch_size,
+    );
+
+    var cache_entries: [1024]HfTokenizer.WorkerBpeCacheEntry align(64) =
+        undefined;
+    @memset(&cache_entries, .{});
+    const probe_view = HfTokenizer.WorkerBpeProbeView{
+        .base = &cache_entries,
+        .pair_mask = (cache_entries.len - 1) & ~@as(usize, 1),
+    };
+    var indexed = HfTokenizer.IndexedPretokenIterator{
+        .text = text.items,
+        .boundary_words = boundary_words,
+        .pos = 0,
+        .end = text.items.len,
+    };
+    var prepared: [HfTokenizer.worker_bpe_batch_size]HfTokenizer.PreparedWorkerPretoken =
+        undefined;
+    const fill = HfTokenizer.fillWorkerPretokenBatchIndexed(
+        &indexed,
+        @intFromPtr(text.items.ptr) + text.items.len,
+        probe_view,
+        &prepared,
+    );
+    try std.testing.expectEqual(expected_count, fill.count);
+    try std.testing.expectEqual(text.items.len, fill.input_bytes);
+    try std.testing.expectEqual(text.items.len, indexed.pos);
 }
 
 test "parallel BPE rejects added tokens containing internal whitespace" {
