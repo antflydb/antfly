@@ -1913,7 +1913,7 @@ fn activeRangeTransitionCountForTable(current: CurrentMetadataState, table_id: u
 fn mergedGroupStatus(current: CurrentMetadataState, group_id: u64) ?MergedGroupStatus {
     if (current.merged_group_statuses.len > 0) {
         for (current.merged_group_statuses) |status| {
-            if (status.group_id == group_id) return mergeRuntimeGroupFacts(status, current.stores, current.placement_intents, current.ranges, group_id);
+            if (status.group_id == group_id) return status;
         }
         return null;
     }
@@ -1923,6 +1923,37 @@ fn mergedGroupStatus(current: CurrentMetadataState, group_id: u64) ?MergedGroupS
         group_id,
     ) orelse return null;
     return mergeRuntimeGroupFacts(fallback, current.stores, current.placement_intents, current.ranges, group_id);
+}
+
+test "metadata reconciler trusts captured merged group status" {
+    const captured = MergedGroupStatus{
+        .group_id = 701,
+        .doc_count = 17,
+        .disk_bytes = 170,
+        .disk_bytes_known = true,
+        .updated_at_millis = 100,
+    };
+    const stores = [_]table_manager.StoreRecord{.{
+        .store_id = 1,
+        .node_id = 1,
+        .live = true,
+        .health_class = "healthy",
+        .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{.{
+            .group_id = 701,
+            .doc_count = 99,
+            .disk_bytes = 990,
+            .disk_bytes_known = true,
+            .updated_at_ns = 200 * std.time.ns_per_ms,
+        }})[0..]),
+    }};
+
+    const resolved = mergedGroupStatus(.{
+        .stores = &stores,
+        .merged_group_statuses = &.{captured},
+    }, captured.group_id).?;
+    try std.testing.expectEqual(captured.doc_count, resolved.doc_count);
+    try std.testing.expectEqual(captured.disk_bytes, resolved.disk_bytes);
+    try std.testing.expectEqual(captured.updated_at_millis, resolved.updated_at_millis);
 }
 
 fn mergeRuntimeGroupFacts(
