@@ -1734,7 +1734,19 @@ pub const IndexManager = struct {
     }
 
     fn freeTextIndexEntry(self: *IndexManager, entry: *TextIndex) void {
-        entry.persistent.close();
+        self.deinitTextIndexEntry(entry, false);
+    }
+
+    fn abandonTextIndexEntryAfterCrash(self: *IndexManager, entry: *TextIndex) void {
+        self.deinitTextIndexEntry(entry, true);
+    }
+
+    fn deinitTextIndexEntry(self: *IndexManager, entry: *TextIndex, abandon_after_crash: bool) void {
+        if (abandon_after_crash) {
+            entry.persistent.abandonAfterCrash();
+        } else {
+            entry.persistent.close();
+        }
         self.destroyIndexApplyMutex(entry.apply_mutex);
         if (entry.chunk_name) |chunk_name| self.alloc.free(chunk_name);
         introducer_mod.freeTextAnalysisConfig(self.alloc, entry.text_analysis);
@@ -1756,7 +1768,19 @@ pub const IndexManager = struct {
     }
 
     fn freeDenseIndexEntry(self: *IndexManager, entry: *DenseIndex) void {
-        entry.index.close();
+        self.deinitDenseIndexEntry(entry, false);
+    }
+
+    fn abandonDenseIndexEntryAfterCrash(self: *IndexManager, entry: *DenseIndex) void {
+        self.deinitDenseIndexEntry(entry, true);
+    }
+
+    fn deinitDenseIndexEntry(self: *IndexManager, entry: *DenseIndex, abandon_after_crash: bool) void {
+        if (abandon_after_crash) {
+            entry.index.abandonAfterCrash();
+        } else {
+            entry.index.close();
+        }
         self.destroyIndexApplyMutex(entry.apply_mutex);
         if (entry.vector_loader_context) |ctx| ctx.deinit(self.alloc);
         entry.ordinal_vector_ids.deinit(self.alloc);
@@ -1967,7 +1991,19 @@ pub const IndexManager = struct {
     }
 
     fn freeSparseIndexEntry(self: *IndexManager, entry: *SparseIndex) void {
-        entry.index.close();
+        self.deinitSparseIndexEntry(entry, false);
+    }
+
+    fn abandonSparseIndexEntryAfterCrash(self: *IndexManager, entry: *SparseIndex) void {
+        self.deinitSparseIndexEntry(entry, true);
+    }
+
+    fn deinitSparseIndexEntry(self: *IndexManager, entry: *SparseIndex, abandon_after_crash: bool) void {
+        if (abandon_after_crash) {
+            entry.index.abandonAfterCrash();
+        } else {
+            entry.index.close();
+        }
         self.destroyIndexApplyMutex(entry.apply_mutex);
         self.alloc.free(entry.field_name);
         if (entry.chunk_name) |chunk_name| self.alloc.free(chunk_name);
@@ -1977,7 +2013,19 @@ pub const IndexManager = struct {
     }
 
     fn freeGraphIndexEntry(self: *IndexManager, entry: *GraphIndex) void {
-        entry.index.close();
+        self.deinitGraphIndexEntry(entry, false);
+    }
+
+    fn abandonGraphIndexEntryAfterCrash(self: *IndexManager, entry: *GraphIndex) void {
+        self.deinitGraphIndexEntry(entry, true);
+    }
+
+    fn deinitGraphIndexEntry(self: *IndexManager, entry: *GraphIndex, abandon_after_crash: bool) void {
+        if (abandon_after_crash) {
+            entry.index.abandonAfterCrash();
+        } else {
+            entry.index.close();
+        }
         self.destroyIndexApplyMutex(entry.apply_mutex);
         for (entry.edge_type_configs) |cfg| {
             self.alloc.free(cfg.name);
@@ -1990,19 +2038,30 @@ pub const IndexManager = struct {
     }
 
     pub fn deinit(self: *IndexManager) void {
+        self.deinitWithBackendDisposition(false);
+    }
+
+    /// Releases a pre-crash generation without executing backend finalizers.
+    /// This is for storage simulators and fault injection after the modeled
+    /// device has already rolled back volatile state.
+    pub fn abandonAfterCrash(self: *IndexManager) void {
+        self.deinitWithBackendDisposition(true);
+    }
+
+    fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
         self.releaseFullTextPendingBytes();
         self.text_merge_scheduler.deinit(self.alloc);
         for (self.text_indexes.items) |*entry| {
-            self.freeTextIndexEntry(entry);
+            if (abandon_after_crash) self.abandonTextIndexEntryAfterCrash(entry) else self.freeTextIndexEntry(entry);
         }
         for (self.dense_indexes.items) |*entry| {
-            self.freeDenseIndexEntry(entry);
+            if (abandon_after_crash) self.abandonDenseIndexEntryAfterCrash(entry) else self.freeDenseIndexEntry(entry);
         }
         for (self.sparse_indexes.items) |*entry| {
-            self.freeSparseIndexEntry(entry);
+            if (abandon_after_crash) self.abandonSparseIndexEntryAfterCrash(entry) else self.freeSparseIndexEntry(entry);
         }
         for (self.graph_indexes.items) |*entry| {
-            self.freeGraphIndexEntry(entry);
+            if (abandon_after_crash) self.abandonGraphIndexEntryAfterCrash(entry) else self.freeGraphIndexEntry(entry);
         }
         for (self.algebraic_indexes.items) |*entry| {
             self.freeAlgebraicIndexEntry(entry);
@@ -3543,6 +3602,7 @@ pub const IndexManager = struct {
         // crash-surviving artifact cleanup before the new config can bind the
         // same public artifact names, then discard name-scoped index state.
         try self.prepareStorageForFreshCatalogEntry(store, stored_cfg);
+        try self.provisionConfiguredIndexDirDurable(stored_cfg);
 
         const enrichment_checkpoint = self.enrichments.items.len;
         var enrichment_catalog_committed = false;
@@ -3614,6 +3674,7 @@ pub const IndexManager = struct {
             false;
 
         for (stored_configs) |cfg| {
+            try self.provisionConfiguredIndexDirDurable(cfg);
             try self.openConfiguredIndex(store, cfg, false, false);
             try opened.append(self.alloc, cfg.name);
         }
@@ -8285,6 +8346,36 @@ pub const IndexManager = struct {
 
     fn indexPath(self: *const IndexManager, name: []const u8) ![]u8 {
         return std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}", .{ self.base_path, name });
+    }
+
+    fn provisionConfiguredIndexDirDurable(self: *IndexManager, cfg: types.IndexConfig) !void {
+        const storage = switch (cfg.kind) {
+            .full_text => self.text_lsm_storage,
+            .dense_vector => self.dense_lsm_storage,
+            .sparse_vector => self.sparse_lsm_storage,
+            .graph => self.graph_lsm_storage,
+            .algebraic => return,
+        };
+        const path = try self.indexPath(cfg.name);
+        defer self.alloc.free(path);
+
+        if (storage) |lsm_storage| {
+            const parent_path = try std.fmt.allocPrint(self.alloc, "{s}/indexes", .{self.base_path});
+            defer self.alloc.free(parent_path);
+
+            // A catalog row must not become durable before the namespace that
+            // will hold its generation. Descendant file syncs cannot make an
+            // unsynced ancestor durable, so publish each structural boundary.
+            try lsm_storage.createDirPath(self.base_path);
+            try lsm_storage.syncParentAbsolute(self.base_path);
+            try lsm_storage.createDirPath(parent_path);
+            try lsm_storage.syncParentAbsolute(parent_path);
+            try lsm_storage.createDirPath(path);
+            try lsm_storage.syncParentAbsolute(path);
+            return;
+        }
+
+        try ensureIndexDirDurable(self.alloc, self.io, self.base_path, path);
     }
 
     fn prepareStorageForFreshCatalogEntry(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
@@ -16619,6 +16710,39 @@ fn ensureIndexDir(alloc: Allocator, base_path: []const u8, path: []const u8) !vo
     }
 }
 
+fn ensureIndexDirDurable(
+    alloc: Allocator,
+    shared_io: ?std.Io,
+    base_path: []const u8,
+    path: []const u8,
+) !void {
+    if (builtin.os.tag == .freestanding) return;
+
+    if (shared_io) |io| {
+        return ensureIndexDirDurableWithIo(alloc, io, base_path, path);
+    }
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    try ensureIndexDirDurableWithIo(alloc, io_impl.io(), base_path, path);
+}
+
+fn ensureIndexDirDurableWithIo(
+    alloc: Allocator,
+    io: std.Io,
+    base_path: []const u8,
+    path: []const u8,
+) !void {
+    const parent_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{base_path});
+    defer alloc.free(parent_path);
+
+    try fs_paths.createDirPathPortable(io, base_path);
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(base_path) orelse ".");
+    try fs_paths.createDirPathPortable(io, parent_path);
+    try fs_paths.syncDirPortable(io, base_path);
+    try fs_paths.createDirPathPortable(io, path);
+    try fs_paths.syncDirPortable(io, parent_path);
+}
+
 fn deleteIndexDirIfPresent(path: []const u8) void {
     if (builtin.os.tag == .freestanding) return;
 
@@ -17310,12 +17434,20 @@ const IndexManagerSimRuntime = struct {
     }
 
     fn reopen(self: *IndexManagerSimRuntime) !void {
+        try self.reopenWithBackendDisposition(false);
+    }
+
+    fn reopenAfterModeledCrash(self: *IndexManagerSimRuntime) !void {
+        try self.reopenWithBackendDisposition(true);
+    }
+
+    fn reopenWithBackendDisposition(self: *IndexManagerSimRuntime, abandon_after_crash: bool) !void {
         if (self.source_manager_open) {
-            self.source_manager.deinit();
+            if (abandon_after_crash) self.source_manager.abandonAfterCrash() else self.source_manager.deinit();
             self.source_manager_open = false;
         }
         if (self.dest_manager_open) {
-            self.dest_manager.deinit();
+            if (abandon_after_crash) self.dest_manager.abandonAfterCrash() else self.dest_manager.deinit();
             self.dest_manager_open = false;
         }
         if (self.source_store_open) {
@@ -17505,15 +17637,17 @@ const IndexManagerSimRuntime = struct {
     }
 
     fn summary(self: *IndexManagerSimRuntime, alloc: Allocator) !IndexManagerSimSummary {
+        const source = self.source_manager.textIndex(index_manager_sim_index_name) orelse return error.IndexNotFound;
+        const dest = self.dest_manager.textIndex(index_manager_sim_index_name) orelse return error.IndexNotFound;
         return .{
-            .source_doc_count = self.source_manager.textIndex(index_manager_sim_index_name).?.snapshot().global_doc_count,
-            .dest_doc_count = self.dest_manager.textIndex(index_manager_sim_index_name).?.snapshot().global_doc_count,
-            .source_alpha_hits = try self.source_manager.textIndex(index_manager_sim_index_name).?.snapshot().termDocFreq(alloc, "title", "alpha"),
-            .source_beta_hits = try self.source_manager.textIndex(index_manager_sim_index_name).?.snapshot().termDocFreq(alloc, "title", "beta"),
-            .source_gamma_hits = try self.source_manager.textIndex(index_manager_sim_index_name).?.snapshot().termDocFreq(alloc, "title", "gamma"),
-            .dest_alpha_hits = try self.dest_manager.textIndex(index_manager_sim_index_name).?.snapshot().termDocFreq(alloc, "title", "alpha"),
-            .dest_beta_hits = try self.dest_manager.textIndex(index_manager_sim_index_name).?.snapshot().termDocFreq(alloc, "title", "beta"),
-            .dest_gamma_hits = try self.dest_manager.textIndex(index_manager_sim_index_name).?.snapshot().termDocFreq(alloc, "title", "gamma"),
+            .source_doc_count = source.snapshot().global_doc_count,
+            .dest_doc_count = dest.snapshot().global_doc_count,
+            .source_alpha_hits = try source.snapshot().termDocFreq(alloc, "title", "alpha"),
+            .source_beta_hits = try source.snapshot().termDocFreq(alloc, "title", "beta"),
+            .source_gamma_hits = try source.snapshot().termDocFreq(alloc, "title", "gamma"),
+            .dest_alpha_hits = try dest.snapshot().termDocFreq(alloc, "title", "alpha"),
+            .dest_beta_hits = try dest.snapshot().termDocFreq(alloc, "title", "beta"),
+            .dest_gamma_hits = try dest.snapshot().termDocFreq(alloc, "title", "gamma"),
         };
     }
 };
@@ -18214,7 +18348,7 @@ fn replayModeledIndexManagerCrashFixture(
     }
     try runtime.applyReplayAction(crash_action, prelude_actions.len);
     try modeled_device.device().crash();
-    try runtime.reopen();
+    try runtime.reopenAfterModeledCrash();
 
     const full_actions = try alloc.alloc(IndexManagerSimAction, prelude_actions.len + 1);
     defer alloc.free(full_actions);
@@ -18355,7 +18489,7 @@ test "index manager split handoff preserves interleaved write and query summarie
     }
 
     try modeled_device.device().crash();
-    try runtime.reopen();
+    try runtime.reopenAfterModeledCrash();
     try expectIndexManagerSummaryEqual("deterministic-split-reopen", try expectedIndexManagerSummary(&actions), try runtime.summary(alloc));
 }
 

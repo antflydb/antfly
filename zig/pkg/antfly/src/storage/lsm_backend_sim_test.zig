@@ -207,9 +207,34 @@ fn crashReopenLsm(
     options: lsm_backend_mod.Options,
 ) !void {
     try modeled_device.device().crash();
-    lsm_backend.options.backend.read_only = true;
-    lsm_backend.close();
+    lsm_backend.abandonAfterCrash();
     lsm_backend.* = try lsm_backend_mod.Backend.open(std.testing.allocator, root_dir, options);
+}
+
+test "lsm backend simulation full durability publishes a newly created root before acknowledged writes" {
+    var modeled_device = storage_sim.ModeledDevice.init(std.testing.allocator);
+    defer modeled_device.deinit();
+
+    const root_dir = "/lsm-modeled-root-owner/index";
+    const open_options = lsm_backend_mod.Options{
+        .flush_threshold = 1,
+        .storage = modeled_device.storage(),
+    };
+    var lsm_backend = try lsm_backend_mod.Backend.open(std.testing.allocator, root_dir, open_options);
+    defer lsm_backend.close();
+
+    var txn = try lsm_backend.beginWrite();
+    defer txn.abort();
+    try txn.put(.{}, "durable-key", "durable-value");
+    try txn.commit();
+
+    try crashReopenLsm(&lsm_backend, &modeled_device, root_dir, open_options);
+
+    var store = try lsm_backend.runtimeStore(std.testing.allocator, .{});
+    defer store.deinit();
+    var read_txn = try store.beginRead();
+    defer read_txn.abort();
+    try std.testing.expectEqualStrings("durable-value", try read_txn.get("durable-key"));
 }
 
 fn runCompactionChaosCampaign(seed: u64, steps: usize) !void {

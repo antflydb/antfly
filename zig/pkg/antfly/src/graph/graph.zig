@@ -351,6 +351,22 @@ pub const GraphIndex = struct {
             self.* = .none;
         }
 
+        fn abandonAfterCrash(self: *ReverseStoreOwner, alloc: Allocator) void {
+            switch (self.*) {
+                .none => {},
+                .lmdb => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
+                .mem => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
+                .lsm => |*handle| handle.abandonAfterCrash(),
+            }
+            self.* = .none;
+        }
+
         fn sync(self: *ReverseStoreOwner, force: bool) !void {
             switch (self.*) {
                 .none, .mem => {},
@@ -698,6 +714,15 @@ pub const GraphIndex = struct {
         self.outgoing_owner.close(self.alloc);
         self.reverse_store.deinit();
         self.reverse_owner.close(self.alloc);
+        if (self.rebuild_root_path) |path| self.alloc.free(path);
+        self.* = undefined;
+    }
+
+    pub fn abandonAfterCrash(self: *GraphIndex) void {
+        self.outgoing_store.deinit();
+        self.outgoing_owner.abandonAfterCrash(self.alloc);
+        self.reverse_store.deinit();
+        self.reverse_owner.abandonAfterCrash(self.alloc);
         if (self.rebuild_root_path) |path| self.alloc.free(path);
         self.* = undefined;
     }

@@ -449,7 +449,11 @@ pub const WAL = struct {
         self.* = undefined;
     }
 
-    fn abandonAfterModeledCrash(self: *WAL) void {
+    /// Releases in-memory ownership without flushing or finalizing storage.
+    /// Crash simulators must use this after rolling storage back to its last
+    /// durable state; a normal close would let the stale pre-crash owner write
+    /// into the recovered generation.
+    pub fn abandonAfterCrash(self: *WAL) void {
         self.store.deinit();
         self.store_owner.abandonAfterCrash(std.heap.page_allocator);
         self.* = undefined;
@@ -1423,7 +1427,7 @@ fn reopenWalSim(wal: *WAL, wal_open: *bool, path: [*:0]const u8, opts: WalOption
 
 fn abandonWalSimAfterModeledCrash(wal: *WAL, wal_open: *bool) void {
     if (!wal_open.*) return;
-    wal.abandonAfterModeledCrash();
+    wal.abandonAfterCrash();
     wal_open.* = false;
 }
 
@@ -2803,7 +2807,7 @@ test "wal modeled storage survives crash before close after acknowledged append"
     var crashed_wal = try WAL.open(path, opts);
     try std.testing.expectEqual(@as(u64, 1), try crashed_wal.append("committed-before-crash"));
     try device_model.device().crash();
-    crashed_wal.abandonAfterModeledCrash();
+    crashed_wal.abandonAfterCrash();
 
     var reopened = try WAL.open(path, opts);
     defer reopened.close();
@@ -2842,7 +2846,7 @@ test "wal modeled storage preserves acknowledged append across segment rotation 
     try std.testing.expect((try device_model.fileSize("/wal-modeled-rotation-crash/wal/00000000000000000002.log")) > 0);
 
     try device_model.device().crash();
-    crashed_wal.abandonAfterModeledCrash();
+    crashed_wal.abandonAfterCrash();
 
     var reopened = try WAL.open(path, opts);
     defer reopened.close();
@@ -2895,7 +2899,7 @@ test "wal lsm sync boundary failures recover a valid acknowledged prefix" {
         try device_model.injectSyncFailureForPathContains(needle);
         try std.testing.expectError(error.InjectedSyncFault, crashed_wal.append("uncertain"));
         try device_model.device().crash();
-        crashed_wal.abandonAfterModeledCrash();
+        crashed_wal.abandonAfterCrash();
 
         var reopened = try WAL.open(path, opts);
         defer reopened.close();

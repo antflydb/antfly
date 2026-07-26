@@ -616,6 +616,21 @@ const MainStoreOwner = union(enum) {
         self.* = undefined;
     }
 
+    fn abandonAfterCrash(self: *MainStoreOwner, alloc: Allocator) void {
+        switch (self.*) {
+            .lmdb => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
+            .mem => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
+            .lsm => |*handle| handle.abandonAfterCrash(),
+        }
+        self.* = undefined;
+    }
+
     fn sync(self: *MainStoreOwner, force: bool) !void {
         switch (self.*) {
             .lmdb => |backend| try backend.sync(force),
@@ -1122,6 +1137,20 @@ pub const PersistentIndex = struct {
         self.wal.close();
         self.main_store.deinit();
         self.main_store_owner.close(self.alloc);
+        if (self.retired_segment_file_deleter) |deleter| deleter.deinit();
+        if (self.segment_files) |*store| store.close();
+        self.unlockStorage();
+        self.* = undefined;
+    }
+
+    /// Tears down a pre-crash owner without allowing it to flush, compact, or
+    /// reclaim files after storage has been rolled back to a durable snapshot.
+    pub fn abandonAfterCrash(self: *PersistentIndex) void {
+        self.lockStorage();
+        self.writer.deinit();
+        self.wal.abandonAfterCrash();
+        self.main_store.deinit();
+        self.main_store_owner.abandonAfterCrash(self.alloc);
         if (self.retired_segment_file_deleter) |deleter| deleter.deinit();
         if (self.segment_files) |*store| store.close();
         self.unlockStorage();
