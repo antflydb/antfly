@@ -54,19 +54,25 @@ pub const max_backup_manifest_bytes: usize = 16 * 1024 * 1024;
 pub const max_backup_attempt_marker_bytes: usize = 2 * 1024 * 1024;
 pub const max_cluster_backup_attempt_tables: usize = 4096;
 pub const backup_attempt_marker_version: u32 = 1;
+pub const backup_attempt_head_version: u32 = 1;
 pub const backup_attempt_reclaim_age_ns: u64 = 24 * std.time.ns_per_hour;
 pub const backup_attempt_reclaim_batch_size: usize = 2;
 pub const backup_attempt_reclaim_scan_budget: usize = 64;
 pub const backup_attempt_health_scan_budget: usize = 10_000;
 pub const backup_attempt_reclaim_object_budget: usize = 10_000;
 pub const backup_attempt_cleanup_object_budget: usize = 1_000_000;
+pub const backup_integrity_read_chunk_bytes: u64 = 8 * 1024 * 1024;
+pub const backup_integrity_max_native_files: usize = 1_000_000;
 const incomplete_backup_prefix = ".antfly-incomplete";
+const backup_attempt_head_name = ".antfly-backup-attempt-head.json";
 pub const manifest_too_large_message = "backup manifest exceeds 16 MiB limit";
 pub const integrity_failure_message = "backup artifact failed integrity verification";
 
 pub fn isArtifactIntegrityError(err: anyerror) bool {
     return switch (err) {
         error.BackupIntegrityMissing,
+        error.BackupArtifactMissing,
+        error.BackupArtifactFormatMismatch,
         error.BackupArtifactIntegrityMismatch,
         error.RestoreArtifactIdentityMissing,
         error.RestoreArtifactIdentityMismatch,
@@ -720,6 +726,60 @@ const RemoteBackupStore = struct {
         };
     }
 
+    /// Delete a small mutable object only when its current contents still name
+    /// the expected owner. The ETag condition closes the GET/delete race.
+    fn deleteSuffixIfOwned(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        suffix: []const u8,
+        expected_owner: []const u8,
+    ) !bool {
+        const key = try self.keyAlloc(alloc, suffix);
+        defer alloc.free(key);
+        var result = self.client.getObject(self.bucket, key, .{
+            .range = .{ .offset = 0, .length = @intCast(expected_owner.len + 3) },
+            .skip_metadata_probe = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer result.deinit(alloc);
+        const actual_owner = std.mem.trimEnd(u8, result.body, "\r\n");
+        if (!std.mem.eql(u8, actual_owner, expected_owner)) return false;
+        const etag = result.metadata.etag orelse
+            return error.BackupReservationIdentityUnavailable;
+        self.client.deleteObject(self.bucket, key, .{
+            .if_match_etag = etag,
+        }) catch |err| switch (err) {
+            error.FileNotFound, error.PreconditionFailed => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    fn suffixOwnerMatches(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        suffix: []const u8,
+        expected_owner: []const u8,
+    ) !?bool {
+        const key = try self.keyAlloc(alloc, suffix);
+        defer alloc.free(key);
+        var result = self.client.getObject(self.bucket, key, .{
+            .range = .{ .offset = 0, .length = @intCast(expected_owner.len + 3) },
+            .skip_metadata_probe = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer result.deinit(alloc);
+        return std.mem.eql(
+            u8,
+            std.mem.trimEnd(u8, result.body, "\r\n"),
+            expected_owner,
+        );
+    }
+
     fn deletePrefix(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
@@ -823,6 +883,192 @@ const RemoteBackupStore = struct {
                 }
             },
         }
+    }
+
+    fn hashObjectVersion(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        key: []const u8,
+        size: u64,
+        etag: []const u8,
+        hasher: *std.crypto.hash.sha2.Sha256,
+    ) !void {
+        var offset: u64 = 0;
+        while (offset < size) {
+            const wanted = @min(size - offset, backup_integrity_read_chunk_bytes);
+            var result = self.client.getObject(self.bucket, key, .{
+                .range = .{ .offset = offset, .length = wanted },
+                .if_match_etag = etag,
+                .skip_metadata_probe = true,
+            }) catch |err| switch (err) {
+                error.PreconditionFailed => return error.SourceFileChanged,
+                else => return err,
+            };
+            defer result.deinit(alloc);
+            if (result.body.len != wanted) return error.SourceFileChanged;
+            hasher.update(result.body);
+            offset += wanted;
+        }
+    }
+
+    fn verifyPortableArtifactIntegrity(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        shard: *const ShardSnapshot,
+    ) !void {
+        const key = try self.keyAlloc(alloc, shard.snapshot_path);
+        defer alloc.free(key);
+        var metadata = try self.client.statObject(self.bucket, key);
+        defer metadata.deinit(alloc);
+        if (metadata.content_length != shard.artifact_size_bytes)
+            return error.BackupArtifactIntegrityMismatch;
+        const etag = metadata.etag orelse return error.RestoreArtifactIdentityMissing;
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        try self.hashObjectVersion(
+            alloc,
+            key,
+            metadata.content_length,
+            etag,
+            &hasher,
+        );
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        if (!std.mem.eql(u8, &hex, shard.artifact_sha256))
+            return error.BackupArtifactIntegrityMismatch;
+    }
+
+    const RemoteNativeArtifactFile = struct {
+        key: []u8,
+        path: []u8,
+        etag: []u8,
+        size: u64,
+
+        fn deinit(self: RemoteNativeArtifactFile, alloc: std.mem.Allocator) void {
+            alloc.free(self.key);
+            alloc.free(self.path);
+            alloc.free(self.etag);
+        }
+    };
+
+    fn remoteNativeArtifactFileLessThan(
+        _: void,
+        lhs: RemoteNativeArtifactFile,
+        rhs: RemoteNativeArtifactFile,
+    ) bool {
+        return std.mem.order(u8, lhs.path, rhs.path) == .lt;
+    }
+
+    fn verifyNativeArtifactIntegrity(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        shard: *const ShardSnapshot,
+    ) !void {
+        const key_prefix = try self.keyPrefixAlloc(alloc, shard.snapshot_path);
+        defer alloc.free(key_prefix);
+        var files = std.ArrayListUnmanaged(RemoteNativeArtifactFile).empty;
+        defer {
+            for (files.items) |entry| entry.deinit(alloc);
+            files.deinit(alloc);
+        }
+        var continuation_token: ?[]u8 = null;
+        defer if (continuation_token) |value| alloc.free(value);
+        while (true) {
+            var listed = try self.client.listObjects(self.bucket, .{
+                .prefix = key_prefix,
+                .recursive = true,
+                .max_keys = 1000,
+                .continuation_token = continuation_token,
+            });
+            defer listed.deinit(alloc);
+            for (listed.entries) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, key_prefix))
+                    return error.InvalidBackupArtifactPath;
+                const relative_path = entry.key[key_prefix.len..];
+                if (relative_path.len == 0) continue;
+                try validateArtifactRelativePath(relative_path);
+                if (files.items.len == backup_integrity_max_native_files)
+                    return error.BackupArtifactTooLarge;
+                const etag = if (entry.etag) |value|
+                    try alloc.dupe(u8, value)
+                else blk: {
+                    var metadata = try self.client.statObject(self.bucket, entry.key);
+                    defer metadata.deinit(alloc);
+                    if (metadata.content_length != entry.size)
+                        return error.SourceFileChanged;
+                    break :blk try alloc.dupe(
+                        u8,
+                        metadata.etag orelse return error.RestoreArtifactIdentityMissing,
+                    );
+                };
+                errdefer alloc.free(etag);
+                const owned_key = try alloc.dupe(u8, entry.key);
+                errdefer alloc.free(owned_key);
+                const owned_path = try alloc.dupe(u8, relative_path);
+                errdefer alloc.free(owned_path);
+                try files.append(alloc, .{
+                    .key = owned_key,
+                    .path = owned_path,
+                    .etag = etag,
+                    .size = entry.size,
+                });
+            }
+            const next = if (listed.next_continuation_token) |value|
+                try alloc.dupe(u8, value)
+            else
+                null;
+            if (continuation_token) |value| alloc.free(value);
+            continuation_token = next;
+            if (continuation_token == null) break;
+        }
+        if (files.items.len == 0) return error.BackupArtifactMissing;
+        std.mem.sort(
+            RemoteNativeArtifactFile,
+            files.items,
+            {},
+            remoteNativeArtifactFileLessThan,
+        );
+
+        var total_size: u64 = 0;
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("antfly-native-backup-tree-v1");
+        hashArtifactU64(&hasher, @intCast(files.items.len));
+        for (files.items) |entry| {
+            total_size = std.math.add(u64, total_size, entry.size) catch
+                return error.BackupArtifactTooLarge;
+            hashArtifactBytes(&hasher, entry.path);
+            hashArtifactU64(&hasher, entry.size);
+            try self.hashObjectVersion(
+                alloc,
+                entry.key,
+                entry.size,
+                entry.etag,
+                &hasher,
+            );
+        }
+        hashArtifactU64(&hasher, total_size);
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        if (total_size != shard.artifact_size_bytes or
+            !std.mem.eql(u8, &hex, shard.artifact_sha256))
+        {
+            return error.BackupArtifactIntegrityMismatch;
+        }
+    }
+
+    fn verifyArtifactIntegrity(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        format: BackupFormat,
+        shard: *const ShardSnapshot,
+    ) !void {
+        if (!isLowerSha256Hex(shard.artifact_sha256))
+            return error.BackupIntegrityMissing;
+        return switch (format) {
+            .portable => self.verifyPortableArtifactIntegrity(alloc, shard),
+            .native => self.verifyNativeArtifactIntegrity(alloc, shard),
+        };
     }
 
     fn readFile(self: *RemoteBackupStore, alloc: std.mem.Allocator, suffix: []const u8, dest_path: []const u8) !void {
@@ -1074,6 +1320,11 @@ pub const ClusterBackupAttemptMarker = struct {
     created_at_unix_ns: u64,
     format: BackupFormat,
     tables: []const ClusterBackupAttemptTable,
+};
+
+pub const ClusterBackupAttemptHead = struct {
+    format_version: u32 = backup_attempt_head_version,
+    attempt_id: []const u8,
 };
 
 pub const ClusterBackupManifest = struct {
@@ -2027,6 +2278,36 @@ pub fn reserveBackupAtLocation(
     }
 }
 
+/// Cluster reservations are leases owned by an immutable attempt ID. Cleanup
+/// must present the same owner, so a stale process cannot release a retry's
+/// live admission fence.
+pub fn reserveClusterBackupAttemptAtLocation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    attempt_id: []const u8,
+) !void {
+    try validateBackupId(attempt_id);
+    const owner = try std.fmt.allocPrint(alloc, "{s}\n", .{attempt_id});
+    defer alloc.free(owner);
+    const suffix = try reservationPath(alloc, "", backup_id, true);
+    defer alloc.free(suffix);
+    switch (location.*) {
+        .file => |backup_root| {
+            const path = try reservationPath(alloc, backup_root, backup_id, true);
+            defer alloc.free(path);
+            try writeFileAbsoluteIfAbsentWithIo(alloc, io, path, owner);
+        },
+        .remote => |*store| try store.writeBytesIfAbsent(
+            alloc,
+            trimLeftSlash(suffix),
+            owner,
+            "text/plain",
+        ),
+    }
+}
+
 fn incompleteBackupMarkerPath(
     alloc: std.mem.Allocator,
     backup_root: []const u8,
@@ -2038,6 +2319,82 @@ fn incompleteBackupMarkerPath(
         incomplete_backup_prefix,
         attempt_id,
     });
+}
+
+fn backupAttemptHeadPath(alloc: std.mem.Allocator, backup_root: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, backup_attempt_head_name });
+}
+
+fn validateClusterBackupAttemptHead(head: *const ClusterBackupAttemptHead) !void {
+    if (head.format_version != backup_attempt_head_version)
+        return error.UnsupportedBackupFormat;
+    try validateBackupId(head.attempt_id);
+}
+
+pub fn writeClusterBackupAttemptHead(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    attempt_id: []const u8,
+) !void {
+    const head: ClusterBackupAttemptHead = .{ .attempt_id = attempt_id };
+    try validateClusterBackupAttemptHead(&head);
+    const encoded = try stringifyJsonAlloc(alloc, head);
+    defer alloc.free(encoded);
+    try ensureManifestSize(encoded, max_backup_attempt_marker_bytes);
+    switch (location.*) {
+        .file => |backup_root| {
+            const path = try backupAttemptHeadPath(alloc, backup_root);
+            defer alloc.free(path);
+            try writeFileAbsoluteAtomicallyWithIo(alloc, io, path, encoded);
+        },
+        .remote => |*store| try store.writeBytes(
+            alloc,
+            backup_attempt_head_name,
+            encoded,
+            "application/json",
+        ),
+    }
+}
+
+fn readClusterBackupAttemptHead(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+) !?std.json.Parsed(ClusterBackupAttemptHead) {
+    const body = switch (location.*) {
+        .file => |backup_root| blk: {
+            const path = try backupAttemptHeadPath(alloc, backup_root);
+            defer alloc.free(path);
+            break :blk readFileAbsoluteAllocWithIo(
+                alloc,
+                io,
+                path,
+                max_backup_attempt_marker_bytes,
+            ) catch |err| switch (err) {
+                error.FileNotFound => return null,
+                else => return err,
+            };
+        },
+        .remote => |*store| store.readBytesAllocLimited(
+            alloc,
+            backup_attempt_head_name,
+            max_backup_attempt_marker_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        },
+    };
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(
+        ClusterBackupAttemptHead,
+        alloc,
+        body,
+        .{ .allocate = .alloc_always },
+    );
+    errdefer parsed.deinit();
+    try validateClusterBackupAttemptHead(&parsed.value);
+    return parsed;
 }
 
 fn validateClusterBackupAttemptMarker(
@@ -2175,6 +2532,20 @@ fn latestClusterBackupAttemptForHealth(
     io: std.Io,
     location: *BackupLocation,
 ) !?LatestClusterBackupAttempt {
+    if (try readClusterBackupAttemptHead(alloc, io, location)) |parsed_value| {
+        var parsed = parsed_value;
+        defer parsed.deinit();
+        return .{
+            .attempt_id = try alloc.dupe(u8, parsed.value.attempt_id),
+            // Ordering is established by atomic publication of the head, not
+            // by a process-local wall clock.
+            .created_at_unix_ns = 0,
+        };
+    }
+
+    // Upgrade fallback for repositories created before the authoritative head
+    // existed. New writes always publish the head, making the steady-state
+    // health lookup O(1).
     var latest: ?LatestClusterBackupAttempt = null;
     errdefer if (latest) |*value| value.deinit(alloc);
     var scanned: usize = 0;
@@ -2382,6 +2753,90 @@ pub fn cleanupClusterReservationAtLocation(
     }
 }
 
+pub fn cleanupClusterReservationIfOwnedAtLocation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    attempt_id: []const u8,
+) !bool {
+    try validateBackupId(attempt_id);
+    const reservation_suffix = try reservationPath(alloc, "", backup_id, true);
+    defer alloc.free(reservation_suffix);
+    return switch (location.*) {
+        .file => |backup_root| blk: {
+            const path = try reservationPath(alloc, backup_root, backup_id, true);
+            defer alloc.free(path);
+            const lock_path = try std.fmt.allocPrint(alloc, "{s}.publish.lock", .{path});
+            defer alloc.free(lock_path);
+            var lock_file = if (std.fs.path.isAbsolute(lock_path))
+                try std.Io.Dir.createFileAbsolute(io, lock_path, .{ .truncate = false })
+            else
+                try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
+            defer lock_file.close(io);
+            try lock_file.lock(io, .exclusive);
+            defer lock_file.unlock(io);
+
+            const body = readFileAbsoluteAllocWithIo(alloc, io, path, 131) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => return err,
+            };
+            defer alloc.free(body);
+            if (!std.mem.eql(u8, std.mem.trimEnd(u8, body, "\r\n"), attempt_id))
+                break :blk false;
+            try deletePathDurably(io, path);
+            break :blk true;
+        },
+        .remote => |*store| try store.deleteSuffixIfOwned(
+            alloc,
+            trimLeftSlash(reservation_suffix),
+            attempt_id,
+        ),
+    };
+}
+
+fn clusterReservationOwnerMatchesAtLocation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    attempt_id: []const u8,
+) !?bool {
+    try validateBackupId(attempt_id);
+    const reservation_suffix = try reservationPath(alloc, "", backup_id, true);
+    defer alloc.free(reservation_suffix);
+    return switch (location.*) {
+        .file => |backup_root| blk: {
+            const path = try reservationPath(alloc, backup_root, backup_id, true);
+            defer alloc.free(path);
+            const lock_path = try std.fmt.allocPrint(alloc, "{s}.publish.lock", .{path});
+            defer alloc.free(lock_path);
+            var lock_file = if (std.fs.path.isAbsolute(lock_path))
+                try std.Io.Dir.createFileAbsolute(io, lock_path, .{ .truncate = false })
+            else
+                try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
+            defer lock_file.close(io);
+            try lock_file.lock(io, .exclusive);
+            defer lock_file.unlock(io);
+            const body = readFileAbsoluteAllocWithIo(alloc, io, path, 131) catch |err| switch (err) {
+                error.FileNotFound => break :blk null,
+                else => return err,
+            };
+            defer alloc.free(body);
+            break :blk std.mem.eql(
+                u8,
+                std.mem.trimEnd(u8, body, "\r\n"),
+                attempt_id,
+            );
+        },
+        .remote => |*store| try store.suffixOwnerMatches(
+            alloc,
+            trimLeftSlash(reservation_suffix),
+            attempt_id,
+        ),
+    };
+}
+
 pub fn cleanupClusterBackupAttemptAtLocation(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -2408,7 +2863,13 @@ pub fn cleanupClusterBackupAttemptAtLocation(
     if (cleanup_error) |err| return err;
     // Release the reservation for retry, but retain the lightweight marker as
     // bounded health history.
-    try cleanupClusterReservationAtLocation(alloc, io, location, marker.cluster_backup_id);
+    _ = try cleanupClusterReservationIfOwnedAtLocation(
+        alloc,
+        io,
+        location,
+        marker.cluster_backup_id,
+        marker.attempt_id,
+    );
 }
 
 fn reclaimClusterBackupAttemptMarker(
@@ -2416,6 +2877,7 @@ fn reclaimClusterBackupAttemptMarker(
     io: std.Io,
     location: *BackupLocation,
     marker: *const ClusterBackupAttemptMarker,
+    authoritative_attempt_id: ?[]const u8,
     object_budget: *usize,
 ) !bool {
     var committed = readClusterManifestFromLocation(
@@ -2423,9 +2885,17 @@ fn reclaimClusterBackupAttemptMarker(
         location,
         marker.cluster_backup_id,
     ) catch |err| switch (err) {
-        // The marker is an explicit 24-hour lease for a request that did not
-        // reach the aggregate commit point.
+        // Age alone is not proof of abandonment. The immutable reservation
+        // owner is the authority: retain live work, and reclaim only after the
+        // owner has released the fence or a retry has replaced it.
         error.FileNotFound => {
+            if ((try clusterReservationOwnerMatchesAtLocation(
+                alloc,
+                io,
+                location,
+                marker.cluster_backup_id,
+                marker.attempt_id,
+            )) == true) return false;
             var cleanup_error: ?anyerror = null;
             for (marker.tables) |table| {
                 cleanupTableBackupAttemptAtLocationWithBudget(
@@ -2442,19 +2912,21 @@ fn reclaimClusterBackupAttemptMarker(
                 };
             }
             if (cleanup_error) |cleanup_err| return cleanup_err;
-            try cleanupClusterReservationAtLocation(alloc, io, location, marker.cluster_backup_id);
-            try deleteClusterBackupAttemptMarker(alloc, io, location, marker.attempt_id);
+            if (authoritative_attempt_id) |attempt_id| {
+                if (!std.mem.eql(u8, marker.attempt_id, attempt_id))
+                    try deleteClusterBackupAttemptMarker(alloc, io, location, marker.attempt_id);
+            }
             return true;
         },
         else => return err,
     };
     defer committed.deinit(alloc);
 
-    // A committed marker is durable attempt-ordering authority. Retaining this
-    // small record prevents a corrupt newest aggregate from being masked by an
-    // older healthy backup after maintenance. Failed attempts still have a
-    // bounded payload cleanup path above.
-    return false;
+    const attempt_id = authoritative_attempt_id orelse return false;
+    if (std.mem.eql(u8, marker.attempt_id, attempt_id)) return false;
+    // The head, not every historical journal, is ordering authority.
+    try deleteClusterBackupAttemptMarker(alloc, io, location, marker.attempt_id);
+    return true;
 }
 
 fn markerIsStale(marker: *const ClusterBackupAttemptMarker, now_unix_ns: u64) bool {
@@ -2468,12 +2940,20 @@ fn reclaimClusterBackupAttemptById(
     location: *BackupLocation,
     attempt_id: []const u8,
     now_unix_ns: u64,
+    authoritative_attempt_id: ?[]const u8,
     object_budget: *usize,
 ) !bool {
     var parsed = try readClusterBackupAttemptMarker(alloc, io, location, attempt_id);
     defer parsed.deinit();
     if (!markerIsStale(&parsed.value, now_unix_ns)) return false;
-    return try reclaimClusterBackupAttemptMarker(alloc, io, location, &parsed.value, object_budget);
+    return try reclaimClusterBackupAttemptMarker(
+        alloc,
+        io,
+        location,
+        &parsed.value,
+        authoritative_attempt_id,
+        object_budget,
+    );
 }
 
 pub fn reclaimStaleClusterBackupAttempts(
@@ -2484,6 +2964,12 @@ pub fn reclaimStaleClusterBackupAttempts(
 ) !usize {
     var reclaimed: usize = 0;
     var object_budget: usize = backup_attempt_reclaim_object_budget;
+    var parsed_head = try readClusterBackupAttemptHead(alloc, io, location);
+    defer if (parsed_head) |*head| head.deinit();
+    const authoritative_attempt_id: ?[]const u8 = if (parsed_head) |*head|
+        head.value.attempt_id
+    else
+        null;
     switch (location.*) {
         .file => |backup_root| {
             const marker_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
@@ -2512,12 +2998,10 @@ pub fn reclaimStaleClusterBackupAttempts(
                     location,
                     attempt_id,
                     now_unix_ns,
+                    authoritative_attempt_id,
                     &object_budget,
                 ) catch |err| {
-                    std.log.warn("stale backup attempt reclamation deferred attempt_id={s} err={s}", .{
-                        attempt_id,
-                        @errorName(err),
-                    });
+                    std.log.warn("stale backup attempt reclamation deferred phase=local class={s}", .{@errorName(err)});
                     continue;
                 }) {
                     reclaimed += 1;
@@ -2550,12 +3034,10 @@ pub fn reclaimStaleClusterBackupAttempts(
                     location,
                     attempt_id,
                     now_unix_ns,
+                    authoritative_attempt_id,
                     &object_budget,
                 ) catch |err| {
-                    std.log.warn("stale remote backup attempt reclamation deferred attempt_id={s} err={s}", .{
-                        attempt_id,
-                        @errorName(err),
-                    });
+                    std.log.warn("stale backup attempt reclamation deferred phase=remote class={s}", .{@errorName(err)});
                     continue;
                 }) {
                     reclaimed += 1;
@@ -3065,6 +3547,58 @@ pub fn validateClusterBackupArtifactsAtLocation(
     }
 }
 
+/// Cryptographically verifies a complete cluster backup with bounded memory.
+/// This is reserved for health/restore admission; ordinary pagination keeps
+/// using metadata-only checks to avoid repeatedly downloading payloads.
+pub fn verifyClusterBackupArtifactsIntegrityAtLocation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    manifest: *const ClusterBackupManifest,
+) !void {
+    try validateClusterManifest(alloc, manifest, manifest.backup_id);
+    for (manifest.tables) |table| {
+        var table_manifest = try readManifestFromLocationWithArtifactBackupId(
+            alloc,
+            location,
+            table.table_backup_id,
+            table.artifact_backup_id orelse table.table_backup_id,
+        );
+        defer table_manifest.deinit(alloc);
+        if (!std.mem.eql(u8, table_manifest.table_name, table.name))
+            return error.InvalidBackupRequest;
+        if (table_manifest.artifact_integrity_mode != .declared)
+            return error.BackupIntegrityMissing;
+        for (table_manifest.shards) |*shard| switch (location.*) {
+            .file => |backup_root| {
+                const artifact_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+                    backup_root,
+                    shard.snapshot_path,
+                });
+                defer alloc.free(artifact_path);
+                verifyShardArtifactIntegrity(
+                    alloc,
+                    io,
+                    table_manifest.format,
+                    artifact_path,
+                    shard,
+                ) catch |err| switch (err) {
+                    error.FileNotFound => return error.BackupArtifactMissing,
+                    else => return err,
+                };
+            },
+            .remote => |*store| store.verifyArtifactIntegrity(
+                alloc,
+                table_manifest.format,
+                shard,
+            ) catch |err| switch (err) {
+                error.FileNotFound => return error.BackupArtifactMissing,
+                else => return err,
+            },
+        };
+    }
+}
+
 pub fn ensureNewestClusterBackupAttemptRestorable(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -3097,7 +3631,7 @@ pub fn ensureNewestClusterBackupAttemptRestorable(
                 return error.IncompleteClusterBackup;
         }
     }
-    try validateClusterBackupArtifactsAtLocation(alloc, io, location, &manifest);
+    try verifyClusterBackupArtifactsIntegrityAtLocation(alloc, io, location, &manifest);
 }
 
 pub fn encodeClusterBackupResponse(
@@ -4337,6 +4871,55 @@ fn writeFileAbsoluteIfAbsentWithIo(
     try syncPathAncestorsWithIo(io, std.fs.path.dirname(path) orelse ".");
 }
 
+/// Replace a small mutable control record with an fsync + atomic rename. The
+/// sibling lock serializes writers that share a filesystem.
+fn writeFileAbsoluteAtomicallyWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    data: []const u8,
+) !void {
+    if (std.fs.path.dirname(path)) |dir_name| try ensureDirPathWithIo(io, dir_name);
+    const lock_path = try std.fmt.allocPrint(alloc, "{s}.publish.lock", .{path});
+    defer alloc.free(lock_path);
+    var lock_file = if (std.fs.path.isAbsolute(lock_path))
+        try std.Io.Dir.createFileAbsolute(io, lock_path, .{ .truncate = false })
+    else
+        try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
+    defer lock_file.close(io);
+    try lock_file.lock(io, .exclusive);
+    defer lock_file.unlock(io);
+
+    var entropy: [8]u8 = undefined;
+    try io.randomSecure(&entropy);
+    const nonce = std.fmt.bytesToHex(entropy, .lower);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{s}", .{ path, &nonce });
+    defer alloc.free(tmp_path);
+    errdefer if (std.fs.path.isAbsolute(tmp_path))
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var file = if (std.fs.path.isAbsolute(tmp_path))
+        try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true })
+    else
+        try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+    var file_open = true;
+    defer if (file_open) file.close(io);
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll(data);
+    try writer.end();
+    try file.sync(io);
+    file.close(io);
+    file_open = false;
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    try syncPathAncestorsWithIo(io, std.fs.path.dirname(path) orelse ".");
+}
+
 fn readFileAbsoluteAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -5438,6 +6021,12 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
             try std.testing.expect(std.mem.startsWith(u8, path, object_path_prefix));
             const key = path[object_path_prefix.len..];
             try std.testing.expect(std.mem.indexOf(u8, key, "backups/prod//") == null);
+            if (std.mem.eql(u8, key, "backups/prod/.antfly-backup-attempt-head.json")) {
+                return .{
+                    .status = 404,
+                    .body = try request_alloc.alloc(u8, 0),
+                };
+            }
             const manifest_body = self.manifestForKey(key) orelse if (std.mem.eql(
                 u8,
                 key,
@@ -5846,6 +6435,213 @@ test "remote backup reservations fence duplicate execution and can be released a
     try reserveBackupAtLocation(std.testing.allocator, io, &location, "cluster-snap", true);
 }
 
+test "cluster reservation cleanup cannot release another attempt owner" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+
+    try reserveClusterBackupAttemptAtLocation(
+        alloc,
+        io,
+        &location,
+        "cluster-snap",
+        "attempt-old",
+    );
+    try std.testing.expect(!try cleanupClusterReservationIfOwnedAtLocation(
+        alloc,
+        io,
+        &location,
+        "cluster-snap",
+        "attempt-new",
+    ));
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        reserveClusterBackupAttemptAtLocation(
+            alloc,
+            io,
+            &location,
+            "cluster-snap",
+            "attempt-new",
+        ),
+    );
+    try std.testing.expect(try cleanupClusterReservationIfOwnedAtLocation(
+        alloc,
+        io,
+        &location,
+        "cluster-snap",
+        "attempt-old",
+    ));
+    try reserveClusterBackupAttemptAtLocation(
+        alloc,
+        io,
+        &location,
+        "cluster-snap",
+        "attempt-new",
+    );
+}
+
+test "attempt head ordering ignores producer wall clocks and journal scans" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+
+    try writePortableListValidationFixture(alloc, &location, "old-table", "docs");
+    const committed_tables = [_]ClusterTableBackupEntry{.{
+        .name = "docs",
+        .table_backup_id = "old-table",
+    }};
+    var committed = try createClusterManifest(
+        alloc,
+        "old-cluster",
+        "s3://bucket/backups",
+        &committed_tables,
+    );
+    defer committed.deinit(alloc);
+    try writeClusterManifestToLocationWithIo(alloc, io, &location, &committed);
+
+    const old_attempt_tables = [_]ClusterBackupAttemptTable{.{
+        .name = "docs",
+        .table_backup_id = "old-table",
+        .artifact_backup_id = "old-artifact",
+    }};
+    const old_marker: ClusterBackupAttemptMarker = .{
+        .attempt_id = "attempt-old",
+        .cluster_backup_id = "old-cluster",
+        .created_at_unix_ns = std.math.maxInt(u64),
+        .format = .portable,
+        .tables = &old_attempt_tables,
+    };
+    try writeClusterBackupAttemptMarker(alloc, io, &location, &old_marker);
+
+    const new_attempt_tables = [_]ClusterBackupAttemptTable{.{
+        .name = "docs",
+        .table_backup_id = "new-table",
+        .artifact_backup_id = "new-artifact",
+    }};
+    const new_marker: ClusterBackupAttemptMarker = .{
+        .attempt_id = "attempt-new",
+        .cluster_backup_id = "new-cluster",
+        .created_at_unix_ns = 1,
+        .format = .portable,
+        .tables = &new_attempt_tables,
+    };
+    try writeClusterBackupAttemptMarker(alloc, io, &location, &new_marker);
+    try location.remote.writeBytes(
+        alloc,
+        ".antfly-incomplete/poison.json",
+        "{not-json",
+        "application/json",
+    );
+    try writeClusterBackupAttemptHead(alloc, io, &location, new_marker.attempt_id);
+
+    try std.testing.expectError(
+        error.IncompleteClusterBackup,
+        ensureNewestClusterBackupAttemptRestorable(alloc, io, &location),
+    );
+}
+
+test "newest attempt health rejects same-size artifact corruption" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/integrity", .{tmp.sub_path});
+    defer alloc.free(root);
+    var location: BackupLocation = .{ .file = root };
+
+    try writePortableListValidationFixture(alloc, &location, "table-snap", "docs");
+    const committed_tables = [_]ClusterTableBackupEntry{.{
+        .name = "docs",
+        .table_backup_id = "table-snap",
+    }};
+    var committed = try createClusterManifest(
+        alloc,
+        "cluster-snap",
+        "file:///backup",
+        &committed_tables,
+    );
+    defer committed.deinit(alloc);
+    try writeClusterManifestToLocationWithIo(alloc, io, &location, &committed);
+    const attempt_tables = [_]ClusterBackupAttemptTable{.{
+        .name = "docs",
+        .table_backup_id = "table-snap",
+        .artifact_backup_id = "artifact-snap",
+    }};
+    const marker: ClusterBackupAttemptMarker = .{
+        .attempt_id = "attempt-snap",
+        .cluster_backup_id = "cluster-snap",
+        .created_at_unix_ns = 1,
+        .format = .portable,
+        .tables = &attempt_tables,
+    };
+    try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
+    try writeClusterBackupAttemptHead(alloc, io, &location, marker.attempt_id);
+    const artifact_path = try std.fmt.allocPrint(alloc, "{s}/table-snap.afb", .{root});
+    defer alloc.free(artifact_path);
+    try writeFileAbsolute(artifact_path, "PAYLOAD");
+
+    try std.testing.expectError(
+        error.BackupArtifactIntegrityMismatch,
+        ensureNewestClusterBackupAttemptRestorable(alloc, io, &location),
+    );
+
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var remote: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer remote.deinit(alloc);
+    try writePortableListValidationFixture(alloc, &remote, "remote-table", "docs");
+    const remote_tables = [_]ClusterTableBackupEntry{.{
+        .name = "docs",
+        .table_backup_id = "remote-table",
+    }};
+    var remote_manifest = try createClusterManifest(
+        alloc,
+        "remote-cluster",
+        "s3://bucket/backups",
+        &remote_tables,
+    );
+    defer remote_manifest.deinit(alloc);
+    try verifyClusterBackupArtifactsIntegrityAtLocation(
+        alloc,
+        io,
+        &remote,
+        &remote_manifest,
+    );
+    try remote.remote.writeBytes(
+        alloc,
+        "remote-table.afb",
+        "PAYLOAD",
+        "application/vnd.antfly.backup",
+    );
+    try std.testing.expectError(
+        error.BackupArtifactIntegrityMismatch,
+        verifyClusterBackupArtifactsIntegrityAtLocation(
+            alloc,
+            io,
+            &remote,
+            &remote_manifest,
+        ),
+    );
+}
+
 test "unpublished remote cleanup preserves a conflicting manifest" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -5916,7 +6712,7 @@ test "cluster backup attempt markers reject overlapping cleanup identities" {
     );
 }
 
-test "stale uncommitted cluster backup attempt is reclaimed" {
+test "stale uncommitted cluster backup attempt is retained without lease authority" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -5928,7 +6724,13 @@ test "stale uncommitted cluster backup attempt is reclaimed" {
     };
     defer location.deinit(alloc);
 
-    try reserveBackupAtLocation(alloc, io, &location, "cluster-snap", true);
+    try reserveClusterBackupAttemptAtLocation(
+        alloc,
+        io,
+        &location,
+        "cluster-snap",
+        "attempt-snap",
+    );
     try reserveBackupAtLocation(alloc, io, &location, "table-snap", false);
     try location.remote.writeBytes(
         alloc,
@@ -5951,6 +6753,43 @@ test "stale uncommitted cluster backup attempt is reclaimed" {
     try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
 
     try std.testing.expectEqual(
+        @as(usize, 0),
+        try reclaimStaleClusterBackupAttempts(
+            alloc,
+            io,
+            &location,
+            backup_attempt_reclaim_age_ns + 1,
+        ),
+    );
+    const retained_artifact = try location.remote.readBytesAllocLimited(alloc, "artifact-snap.afb", 16);
+    defer alloc.free(retained_artifact);
+    try std.testing.expectEqualStrings("payload", retained_artifact);
+    var retained_marker = try readClusterBackupAttemptMarker(alloc, io, &location, "attempt-snap");
+    defer retained_marker.deinit();
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        reserveBackupAtLocation(alloc, io, &location, "cluster-snap", true),
+    );
+    try std.testing.expectError(
+        error.BackupAlreadyExists,
+        reserveBackupAtLocation(alloc, io, &location, "table-snap", false),
+    );
+
+    try std.testing.expect(try cleanupClusterReservationIfOwnedAtLocation(
+        alloc,
+        io,
+        &location,
+        "cluster-snap",
+        "attempt-snap",
+    ));
+    try reserveClusterBackupAttemptAtLocation(
+        alloc,
+        io,
+        &location,
+        "cluster-snap",
+        "attempt-retry",
+    );
+    try std.testing.expectEqual(
         @as(usize, 1),
         try reclaimStaleClusterBackupAttempts(
             alloc,
@@ -5964,11 +6803,15 @@ test "stale uncommitted cluster backup attempt is reclaimed" {
         location.remote.readBytesAllocLimited(alloc, "artifact-snap.afb", 16),
     );
     try std.testing.expectError(
-        error.FileNotFound,
-        readClusterBackupAttemptMarker(alloc, io, &location, "attempt-snap"),
+        error.BackupAlreadyExists,
+        reserveClusterBackupAttemptAtLocation(
+            alloc,
+            io,
+            &location,
+            "cluster-snap",
+            "attempt-third",
+        ),
     );
-    try reserveBackupAtLocation(alloc, io, &location, "cluster-snap", true);
-    try reserveBackupAtLocation(alloc, io, &location, "table-snap", false);
 }
 
 test "stale cluster backup attempt preserves aggregate referenced artifacts" {

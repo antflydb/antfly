@@ -6455,21 +6455,14 @@ pub const ApiHttpServer = struct {
                     // A retained reservation fences retries when cleanup
                     // cannot be confirmed, preventing new work from colliding
                     // with orphans.
-                    std.log.err("table backup cleanup failed backup_id={s} artifact_id={s} err={s}", .{
-                        backup_id,
-                        artifact_backup_id,
-                        @errorName(cleanup_err),
-                    });
+                    std.log.err("table backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
                 };
             } else {
                 // A transport error after starting conditional publication is
                 // ambiguous: the manifest may be visible. Keep both the data
                 // and reservation so no retry can destroy or overwrite a
                 // potentially committed backup.
-                std.log.err("table backup publication outcome ambiguous; retaining fenced attempt backup_id={s} artifact_id={s}", .{
-                    backup_id,
-                    artifact_backup_id,
-                });
+                std.log.err("table backup publication outcome ambiguous phase=commit; retaining fenced attempt", .{});
             }
         };
         const table = (try self.loadOwnedTableRecord(self.alloc, table_name)) orelse return error.TableNotFound;
@@ -6745,7 +6738,7 @@ pub const ApiHttpServer = struct {
                     },
                     error.RestoreIdentityMismatch => return error.TableAlreadyExists,
                     else => {
-                        std.log.err("restoreOwnedTable restoreTable failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
+                        std.log.err("table restore failed phase=execution class={s}", .{@errorName(err)});
                         return err;
                     },
                 }) != null) break;
@@ -7895,7 +7888,7 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         self.source.ensureLinearizableRead() catch |err| {
-            std.log.warn("table backup metadata read barrier failed table={s} err={s}", .{ table_name, @errorName(err) });
+            std.log.warn("table backup metadata read barrier failed phase=admission class={s}", .{@errorName(err)});
             return metadataAccessFailure(err);
         };
         var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
@@ -7919,7 +7912,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedMultiRangeTable => return error.UnsupportedMultiRangeTable,
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-                std.log.err("table backup failed table={s} backup_id={s} err={s}", .{ table_name, backup_id, @errorName(err) });
+                std.log.err("table backup failed phase=execution class={s}", .{@errorName(err)});
                 return error.InternalFailure;
             },
         };
@@ -8507,7 +8500,13 @@ pub const ApiHttpServer = struct {
         // conflict check for both filesystem and write-only object-store
         // connections. It prevents duplicate requests from performing any
         // table side effects.
-        backups_api.reserveBackupAtLocation(op_alloc, backup_io, location, req.backup_id, true) catch |err| switch (err) {
+        backups_api.reserveClusterBackupAttemptAtLocation(
+            op_alloc,
+            backup_io,
+            location,
+            req.backup_id,
+            attempt_id,
+        ) catch |err| switch (err) {
             error.BackupAlreadyExists => return error.BackupAlreadyExists,
             else => return error.InternalFailure,
         };
@@ -8515,25 +8514,20 @@ pub const ApiHttpServer = struct {
         var marker_cleanup_safe = true;
         errdefer if (!marker_published) {
             if (marker_cleanup_safe) {
-                backups_api.cleanupClusterReservationAtLocation(
+                _ = backups_api.cleanupClusterReservationIfOwnedAtLocation(
                     op_alloc,
                     backup_io,
                     location,
                     req.backup_id,
+                    attempt_id,
                 ) catch |cleanup_err| {
-                    std.log.err("cluster backup reservation cleanup failed backup_id={s} err={s}", .{
-                        req.backup_id,
-                        @errorName(cleanup_err),
-                    });
+                    std.log.err("cluster backup reservation cleanup failed phase=admission class={s}", .{@errorName(cleanup_err)});
                 };
             } else {
                 // Conditional publication may have committed despite a lost
                 // response. Retain the reservation so a retry cannot race the
                 // stale-attempt reclaimer.
-                std.log.err("cluster backup attempt marker outcome ambiguous; retaining reservation backup_id={s} attempt_id={s}", .{
-                    req.backup_id,
-                    attempt_id,
-                });
+                std.log.err("cluster backup attempt marker outcome ambiguous phase=journal; retaining reservation", .{});
             }
         };
         marker_cleanup_safe = false;
@@ -8559,17 +8553,18 @@ pub const ApiHttpServer = struct {
                     location,
                     &attempt_marker,
                 ) catch |cleanup_err| {
-                    std.log.err("cluster backup cleanup failed backup_id={s} err={s}", .{
-                        req.backup_id,
-                        @errorName(cleanup_err),
-                    });
+                    std.log.err("cluster backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
                 };
             } else {
-                std.log.err("cluster backup publication outcome ambiguous; retaining fenced attempt backup_id={s}", .{
-                    req.backup_id,
-                });
+                std.log.err("cluster backup publication outcome ambiguous phase=commit; retaining fenced attempt", .{});
             }
         };
+        backups_api.writeClusterBackupAttemptHead(
+            op_alloc,
+            backup_io,
+            location,
+            attempt_id,
+        ) catch return error.InternalFailure;
         var extension_snapshot_opt = self.source.adminSnapshot() catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             else => if (metadata_authority.isRetryableError(err)) return error.NotLeader else null,
@@ -8701,6 +8696,17 @@ pub const ApiHttpServer = struct {
 
         try self.ensureRestoreActive(cancellation);
 
+        backups_api.ensureNewestClusterBackupAttemptRestorable(
+            op_alloc,
+            self.sharedApiIo() orelse return error.InternalFailure,
+            location,
+        ) catch |err| switch (err) {
+            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+            else => if (backups_api.isArtifactIntegrityError(err))
+                return error.BackupIntegrityFailure
+            else
+                return error.InvalidRequest,
+        };
         var manifest = backups_api.readClusterManifestFromLocation(op_alloc, location, req.backup_id) catch |err| switch (err) {
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             else => if (backups_api.isArtifactIntegrityError(err))
@@ -8789,7 +8795,7 @@ pub const ApiHttpServer = struct {
                         error.NotLeader => return error.NotLeader,
                         error.Cancelled => return error.Cancelled,
                         else => {
-                            std.log.err("cluster restore completion wait failed table={s} backup_id={s} err={s}", .{ table_name, table_backup_id, @errorName(err) });
+                            std.log.err("cluster restore completion wait failed phase=distributed class={s}", .{@errorName(err)});
                             return error.InternalFailure;
                         },
                     };
@@ -8878,7 +8884,7 @@ pub const ApiHttpServer = struct {
                         error.NotLeader => return error.NotLeader,
                         error.Cancelled => return error.Cancelled,
                         else => {
-                            std.log.err("cluster restore completion wait failed table={s} backup_id={s} err={s}", .{ table_name, table_backup_id, @errorName(err) });
+                            std.log.err("cluster restore completion wait failed phase=distributed class={s}", .{@errorName(err)});
                             return error.InternalFailure;
                         },
                     };
