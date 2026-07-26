@@ -4502,7 +4502,6 @@ pub fn build(b: *std.Build) void {
             "current Go attempt parser is strict in one pass",
             "current Go filesystem attempt snapshots detect repository changes",
             "current Go attempt snapshot marker-count budget fails closed",
-            "current Go attempt snapshot parsed-byte budget fails closed",
             "portable artifact availability rejects empty and non-regular local payloads",
             "remote uri canonicalizes object prefix separators",
             "remote backup metadata reads are size bounded",
