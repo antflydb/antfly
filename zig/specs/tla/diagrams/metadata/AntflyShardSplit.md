@@ -25,12 +25,13 @@ stateDiagram-v2
 ```mermaid
 stateDiagram-v2
     direction LR
+    state "default" as s_default
     [*] --> none
     none --> splittingOff : StartNewShard
     preSnap --> preSnap : NewShardReceivesSnapshot
     splittingOff --> preSnap : NewShardReceivesSnapshot
-    preSnap --> default : TablemgrTransitionsChild
-    splittingOff --> default : TablemgrTransitionsChild
+    preSnap --> s_default : TablemgrTransitionsChild
+    splittingOff --> s_default : TablemgrTransitionsChild
 ```
 
 Writes whose source state is not statically determined:

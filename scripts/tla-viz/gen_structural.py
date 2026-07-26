@@ -57,7 +57,8 @@ GENERATED_NOTE = (
 # animation views) are not protocol specs and produce no useful structure.
 SKIP_MODULE_RE = re.compile(r"^(MC|Trace)|MC$|_anim$")
 
-MERMAID_STATE_RESERVED = {"state", "end", "fork", "join", "choice", "note", "direction"}
+MERMAID_STATE_RESERVED = {"state", "end", "fork", "join", "choice", "note",
+                          "direction", "default", "as", "class", "classdef"}
 
 
 def parse_module(path: Path) -> Node:
