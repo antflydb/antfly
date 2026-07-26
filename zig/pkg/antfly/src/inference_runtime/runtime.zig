@@ -64,7 +64,7 @@ pub const SpawnedServer = struct {
 const EmbeddedServerConfig = struct {
     api_url: []const u8,
     models_dir: ?[]const u8 = null,
-    allow_experimental_models: bool = false,
+    allow_unknown_models: bool = false,
     ml_dir: ?[]const u8 = null,
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
@@ -208,7 +208,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var ml_dir: []const u8 = defaultMlDir(alloc);
     var budget_overrides_mb = BudgetOverridesMb{};
-    var allow_experimental_models = false;
+    var allow_unknown_models = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
     defer preload_models.deinit(alloc);
 
@@ -233,8 +233,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             budget_overrides_mb.scratch_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--preload-model")) {
             try preload_models.append(alloc, try parsePreloadModelFlag(args.next() orelse return error.InvalidArguments));
-        } else if (std.mem.eql(u8, arg, "--allow-experimental-models")) {
-            allow_experimental_models = true;
+        } else if (std.mem.eql(u8, arg, "--allow-unknown-models")) {
+            allow_unknown_models = true;
         }
     }
 
@@ -247,7 +247,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .ml_dir = ml_dir,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
         .preload = preload_models.items,
-        .allow_experimental_models = allow_experimental_models,
+        .allow_unknown_models = allow_unknown_models,
     });
     defer node.deinit();
 
@@ -270,7 +270,7 @@ pub fn spawnServerProcess(
         .ml_dir = config.ml_dir orelse defaultMlDir(alloc),
         .generation_budget_overrides = config.generation_budget_overrides,
         .preload = config.preload,
-        .allow_experimental_models = config.allow_experimental_models,
+        .allow_unknown_models = config.allow_unknown_models,
     };
     if (config.content_security) |sec| node_cfg.content_security = sec;
     if (config.s3_credentials) |creds| node_cfg.s3_credentials = creds;
@@ -583,7 +583,7 @@ fn printUsage() void {
         \\  --kv-budget-mb <n>        Native generation KV cache budget override
         \\  --scratch-budget-mb <n>   Native generation scratch budget override
         \\  --preload-model <kind:name|kind:backend:name>  Preload and warm a configured model before serving
-        \\  --allow-experimental-models  Permit unrecognized architectures; known unsafe models remain blocked
+        \\  --allow-unknown-models  Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked
         \\
         \\Pull options:
         \\  --token <token>  HuggingFace API token (or set HF_TOKEN env var)

@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const manifest_mod = @import("manifest.zig");
-const support_mod = @import("support.zig");
+const compatibility_mod = @import("compatibility.zig");
 
 pub fn hasCapability(capabilities: []const []const u8, capability: []const u8) bool {
     for (capabilities) |cap| {
@@ -102,17 +102,16 @@ test "modelKindAcceptsInput infers text and image modalities" {
     try std.testing.expect(!modelKindAcceptsInput("recognizer", "", &.{"image"}, false, false, "text"));
 }
 
-/// Release serving level for a non-decoder model class.
+/// Artifact compatibility for a non-decoder model class.
 ///
-/// Decoder families are tiered by `ModelFamily` in models/gpt.zig. Everything else --
-/// embedders, rerankers, readers, rewriters -- is identified by architecture instead, so
-/// it needs its own lookup over what the listing manifest already carries.
-pub const SupportLevel = support_mod.Level;
+/// Decoder and encoder paths use the manifest contract here; deeper artifact checks
+/// (tensor encodings, required names, and bundle sidecars) run before loading.
+pub const CompatibilityLevel = compatibility_mod.Level;
 
-/// Tier for a model class other than generation.
+/// Compatibility for a model class other than generation.
 ///
-/// `unsupported` here is not merely "unverified". Each entry below was measured, and the
-/// ones that are blocked crash the process rather than returning an error, so they must
+/// `incompatible` is not merely "unverified". The known safety blocks below were
+/// measured, and can crash the process rather than returning an error, so they must
 /// not be reachable from a request:
 ///
 ///   standalone CLIP  image embedding allocates without bound (~31 GB for one 64x64 PNG)
@@ -122,40 +121,46 @@ pub const SupportLevel = support_mod.Level;
 ///                    correctly and is the supported reader.
 ///   ONNX seq2seq     the rewrite path panics on a rank assertion while importing the
 ///                    graph (lib/ml/src/graph/shape.zig `axis < self.rank_`).
-pub fn modelClassSupportLevel(man: *const manifest_mod.ModelManifest) SupportLevel {
-    return support_mod.assess(man, man.config_model_arch).level;
+pub fn modelClassCompatibility(man: *const manifest_mod.ModelManifest) CompatibilityLevel {
+    return compatibility_mod.assess(man, man.config_model_arch).level;
 }
 
-test "clipclap stays supported while standalone clip and clap do not" {
+test "clipclap stays compatible while standalone clip and clap do not" {
     var bundle = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     bundle.model_type = .embedder;
     bundle.native_arch_hint = .clip;
     bundle.inference_bundle_family = "clipclap_gguf_bundle/v1";
-    try std.testing.expectEqual(SupportLevel.supported, modelClassSupportLevel(&bundle));
+    bundle.gguf_path = "clip.gguf";
+    bundle.audio_model_path = "audio.onnx";
+    bundle.model_manifest_path = "model_manifest.json";
+    bundle.tokenizer_json_path = "tokenizer.json";
+    bundle.tokenizer_config_path = "tokenizer_config.json";
+    bundle.processor_config_path = "processor_config.json";
+    try std.testing.expectEqual(CompatibilityLevel.compatible, modelClassCompatibility(&bundle));
 
     var standalone = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     standalone.model_type = .embedder;
     standalone.native_arch_hint = .clip;
-    try std.testing.expectEqual(SupportLevel.unsupported, modelClassSupportLevel(&standalone));
+    try std.testing.expectEqual(CompatibilityLevel.incompatible, modelClassCompatibility(&standalone));
 
     var plain = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     plain.model_type = .embedder;
-    try std.testing.expectEqual(SupportLevel.experimental, modelClassSupportLevel(&plain));
+    try std.testing.expectEqual(CompatibilityLevel.unknown, modelClassCompatibility(&plain));
 }
 
 test "florence reads but other encoder-decoder readers are blocked" {
     var florence = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     florence.model_type = .reader;
     florence.native_arch_hint = .florence;
-    try std.testing.expectEqual(SupportLevel.supported, modelClassSupportLevel(&florence));
+    try std.testing.expectEqual(CompatibilityLevel.compatible, modelClassCompatibility(&florence));
 
     var trocr = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     trocr.model_type = .reader;
-    try std.testing.expectEqual(SupportLevel.unsupported, modelClassSupportLevel(&trocr));
+    try std.testing.expectEqual(CompatibilityLevel.incompatible, modelClassCompatibility(&trocr));
 }
 
 test "rewriters are blocked because the onnx seq2seq import panics" {
     var rewriter = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     rewriter.model_type = .rewriter;
-    try std.testing.expectEqual(SupportLevel.unsupported, modelClassSupportLevel(&rewriter));
+    try std.testing.expectEqual(CompatibilityLevel.incompatible, modelClassCompatibility(&rewriter));
 }

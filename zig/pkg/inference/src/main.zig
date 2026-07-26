@@ -242,7 +242,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var ml_dir: []const u8 = defaultMlDir(allocator);
     var config_path: ?[]const u8 = null;
     var max_concurrent_requests_override: ?usize = null;
-    var allow_experimental_models = false;
+    var allow_unknown_models = false;
     var models_overridden = false;
     var ml_overridden = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
@@ -273,8 +273,8 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         } else if (std.mem.eql(u8, args[i], "--preload-model") and i + 1 < args.len) {
             try preload_models.append(allocator, try parsePreloadModelFlag(args[i + 1]));
             i += 1;
-        } else if (std.mem.eql(u8, args[i], "--allow-experimental-models")) {
-            allow_experimental_models = true;
+        } else if (std.mem.eql(u8, args[i], "--allow-unknown-models")) {
+            allow_unknown_models = true;
         }
     }
 
@@ -310,7 +310,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .preload = preload_models.items,
-        .allow_experimental_models = allow_experimental_models,
+        .allow_unknown_models = allow_unknown_models,
     };
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
@@ -475,7 +475,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --max-concurrent-requests <n> Bound weighted in-flight request capacity before returning 503
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
-        \\  --allow-experimental-models Permit unrecognized architectures; known unsafe models remain blocked
+        \\  --allow-unknown-models Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)

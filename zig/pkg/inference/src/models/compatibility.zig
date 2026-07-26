@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Release serving policy for local inference models.
+//! Artifact compatibility policy for local inference models.
 //!
-//! This is intentionally not an artifact certification system. `supported` means that
-//! Antfly enables the architecture/runtime path by default in this release. Unknown
-//! architectures are experimental and require an explicit server opt-in. Models with a
-//! known unsafe or unusable runtime path remain blocked even when that opt-in is set.
+//! This is intentionally not an artifact certification system. Compatibility is derived
+//! from the artifact contract and the runtime paths compiled into this build. Unknown
+//! contracts require an explicit server opt-in. Known unsafe or invalid contracts remain
+//! blocked even when that opt-in is set.
 
 const std = @import("std");
 const manifest_mod = @import("manifest.zig");
@@ -25,27 +25,40 @@ const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
 
 pub const Level = enum {
-    supported,
-    experimental,
-    unsupported,
+    compatible,
+    unknown,
+    incompatible,
+};
+
+pub const Code = enum {
+    compatible,
+    artifact_unreadable,
+    unknown_architecture,
+    unsafe_runtime,
+    incomplete_bundle,
+    unsupported_tensor_type,
+    missing_required_tensor,
+    invalid_graph,
+    unsupported_backend,
 };
 
 pub const Assessment = struct {
     level: Level,
-    reason: []const u8,
+    code: Code,
+    message: []const u8,
     architecture: []const u8,
 
-    pub fn allowed(self: Assessment, allow_experimental: bool) bool {
+    pub fn allowed(self: Assessment, allow_unknown: bool) bool {
         return switch (self.level) {
-            .supported => true,
-            .experimental => allow_experimental,
-            .unsupported => false,
+            .compatible => true,
+            .unknown => allow_unknown,
+            .incompatible => false,
         };
     }
 };
 
 pub const Policy = struct {
-    allow_experimental: bool = false,
+    allow_unknown: bool = false,
 };
 
 pub const Inspection = struct {
@@ -99,9 +112,10 @@ pub fn assessInspection(
     inspection: Inspection,
 ) Assessment {
     if (!inspection.artifact_inspected) {
-        return experimental(
+        return makeUnknown(
             inspection.architecture,
-            "GGUF compatibility metadata could not be inspected; start the server with --allow-experimental-models to opt in",
+            .artifact_unreadable,
+            "GGUF compatibility metadata could not be inspected; start the server with --allow-unknown-models to opt in",
         );
     }
     return assessWithFacts(man, inspection.architecture, inspection.expert_count);
@@ -112,46 +126,63 @@ fn assessWithFacts(
     architecture: []const u8,
     expert_count: u32,
 ) Assessment {
+    if (man.hasIncompleteGlinerBundle() or
+        man.hasIncompleteColqwenBundle() or
+        man.hasIncompleteClipclapGgufBundle() or
+        man.hasIncompleteFlorence2GgufBundle())
+    {
+        return makeIncompatible(
+            architecture,
+            .incomplete_bundle,
+            "the model bundle is missing required artifacts or sidecars",
+        );
+    }
+
     if (man.model_type == .generator) return assessGenerator(architecture, expert_count);
 
     // Canonical Antfly bundles are known runtime contracts, even when their encoder
     // architecture names overlap with blocked standalone exports.
     if (man.isClipclapGgufBundle()) {
-        return supported(architecture, "canonical ClipClap bundle");
+        return makeCompatible(architecture, "canonical ClipClap bundle");
     }
     if (std.mem.eql(u8, man.gliner_model_type, "gliner2")) {
-        return supported(architecture, "GLiNER2 extraction runtime is enabled");
+        return makeCompatible(architecture, "GLiNER2 extraction runtime is enabled");
     }
 
     switch (man.model_type) {
-        .rewriter => return unsupported(
+        .rewriter => return makeIncompatible(
             architecture,
+            .unsafe_runtime,
             "the ONNX encoder-decoder rewrite runtime can panic while importing graphs",
         ),
         .reader => {
             if (man.native_arch_hint == .florence) {
-                return supported(architecture, "Florence reader runtime is enabled");
+                return makeCompatible(architecture, "Florence reader runtime is enabled");
             }
-            return unsupported(
+            return makeIncompatible(
                 architecture,
+                .unsafe_runtime,
                 "no safe reader runtime is available for this architecture",
             );
         },
         .embedder => switch (man.native_arch_hint) {
-            .clip => return unsupported(
+            .clip => return makeIncompatible(
                 architecture,
+                .unsafe_runtime,
                 "standalone CLIP image inference can exhaust process memory; use ClipClap",
             ),
-            .clap => return unsupported(
+            .clap => return makeIncompatible(
                 architecture,
-                "standalone CLAP graph conversion is not supported; use ClipClap",
+                .unsupported_backend,
+                "standalone CLAP graph conversion is not compatible; use ClipClap",
             ),
             else => {},
         },
         .classifier => {
             if (man.native_arch_hint == .layoutlmv3) {
-                return unsupported(
+                return makeIncompatible(
                     architecture,
+                    .unsafe_runtime,
                     "LayoutLMv3 tokenizer assets are accepted by discovery but not by the loader",
                 );
             }
@@ -161,25 +192,35 @@ fn assessWithFacts(
     }
 
     if (std.mem.eql(u8, architecture, "nomic-bert")) {
-        return unsupported(
+        return makeIncompatible(
             architecture,
+            .unsupported_backend,
             "the published GGUF tokenizer is not supported by the current loader",
+        );
+    }
+    if (std.mem.eql(u8, architecture, "bart")) {
+        return makeIncompatible(
+            architecture,
+            .unsafe_runtime,
+            "the BART encoder-decoder runtime can panic while importing ONNX graphs; REBEL is not release-safe",
         );
     }
 
     if (knownEncoderArchitecture(architecture)) {
-        return supported(architecture, "recognized local inference runtime");
+        return makeCompatible(architecture, "recognized local inference runtime");
     }
-    return experimental(
+    return makeUnknown(
         architecture,
-        "unrecognized model architecture; start the server with --allow-experimental-models to opt in",
+        .unknown_architecture,
+        "unrecognized model architecture; start the server with --allow-unknown-models to opt in",
     );
 }
 
 fn assessGenerator(architecture: []const u8, expert_count: u32) Assessment {
     if (std.mem.startsWith(u8, architecture, "gemma4") and expert_count > 0) {
-        return unsupported(
+        return makeIncompatible(
             architecture,
+            .unsupported_backend,
             "Gemma 4 mixture-of-experts layouts are not enabled for this release",
         );
     }
@@ -197,15 +238,16 @@ fn assessGenerator(architecture: []const u8, expert_count: u32) Assessment {
         "gemma4_unified_assistant",
         "gemma4-assistant",
     })) {
-        return supported(architecture, "decoder runtime is enabled for this release");
+        return makeCompatible(architecture, "decoder runtime is enabled for this release");
     }
 
     if (stringIn(architecture, &.{
         "gemma4_unified",
         "gemma4_unified_text",
     })) {
-        return unsupported(
+        return makeIncompatible(
             architecture,
+            .missing_required_tensor,
             "this Gemma 4 unified layout has unresolved required weights",
         );
     }
@@ -248,15 +290,17 @@ fn assessGenerator(architecture: []const u8, expert_count: u32) Assessment {
         "bloom",
         "t5",
     })) {
-        return unsupported(
+        return makeIncompatible(
             architecture,
+            .unsafe_runtime,
             "the current decoder path is known to be missing, unsafe, or to produce unusable output",
         );
     }
 
-    return experimental(
+    return makeUnknown(
         architecture,
-        "unrecognized generator architecture; start the server with --allow-experimental-models to opt in",
+        .unknown_architecture,
+        "unrecognized generator architecture; start the server with --allow-unknown-models to opt in",
     );
 }
 
@@ -290,42 +334,42 @@ fn stringIn(value: []const u8, candidates: []const []const u8) bool {
     return false;
 }
 
-fn supported(architecture: []const u8, reason: []const u8) Assessment {
-    return .{ .level = .supported, .reason = reason, .architecture = architecture };
+pub fn makeCompatible(architecture: []const u8, message: []const u8) Assessment {
+    return .{ .level = .compatible, .code = .compatible, .message = message, .architecture = architecture };
 }
 
-fn experimental(architecture: []const u8, reason: []const u8) Assessment {
-    return .{ .level = .experimental, .reason = reason, .architecture = architecture };
+pub fn makeUnknown(architecture: []const u8, code: Code, message: []const u8) Assessment {
+    return .{ .level = .unknown, .code = code, .message = message, .architecture = architecture };
 }
 
-fn unsupported(architecture: []const u8, reason: []const u8) Assessment {
-    return .{ .level = .unsupported, .reason = reason, .architecture = architecture };
+pub fn makeIncompatible(architecture: []const u8, code: Code, message: []const u8) Assessment {
+    return .{ .level = .incompatible, .code = code, .message = message, .architecture = architecture };
 }
 
-test "unknown generators are experimental and require opt in" {
+test "unknown generators are unknown and require opt in" {
     var man = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     man.model_type = .generator;
     const result = assess(&man, "brand_new_decoder");
-    try std.testing.expectEqual(Level.experimental, result.level);
+    try std.testing.expectEqual(Level.unknown, result.level);
     try std.testing.expect(!result.allowed(false));
     try std.testing.expect(result.allowed(true));
 }
 
-test "known unsafe generators cannot be enabled by experimental opt in" {
+test "known unsafe generators cannot be enabled by unknown opt in" {
     var man = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     man.model_type = .generator;
     const result = assess(&man, "deepseek4");
-    try std.testing.expectEqual(Level.unsupported, result.level);
+    try std.testing.expectEqual(Level.incompatible, result.level);
     try std.testing.expect(!result.allowed(true));
 }
 
 test "gemma 4 E4B architecture is enabled while unified layout is blocked" {
     var man = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     man.model_type = .generator;
-    try std.testing.expectEqual(Level.supported, assess(&man, "gemma4").level);
-    try std.testing.expectEqual(Level.unsupported, assess(&man, "gemma4_unified").level);
+    try std.testing.expectEqual(Level.compatible, assess(&man, "gemma4").level);
+    try std.testing.expectEqual(Level.incompatible, assess(&man, "gemma4_unified").level);
     try std.testing.expectEqual(
-        Level.unsupported,
+        Level.incompatible,
         assessWithFacts(&man, "gemma4", 128).level,
     );
 }
@@ -333,21 +377,43 @@ test "gemma 4 E4B architecture is enabled while unified layout is blocked" {
 test "release encoder contracts cover DeBERTa reranking and GLiNER2" {
     var reranker = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     reranker.model_type = .reranker;
-    try std.testing.expectEqual(Level.supported, assess(&reranker, "deberta-v2").level);
+    try std.testing.expectEqual(Level.compatible, assess(&reranker, "deberta-v2").level);
 
     var gliner = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     gliner.model_type = .recognizer;
     gliner.gliner_model_type = "gliner2";
-    try std.testing.expectEqual(Level.supported, assess(&gliner, "extractor").level);
+    try std.testing.expectEqual(Level.compatible, assess(&gliner, "extractor").level);
 }
 
-test "known Qwen hybrid variants and unsupported Nomic GGUF stay blocked" {
+test "known Qwen hybrid variants and incompatible Nomic GGUF stay blocked" {
     var generator = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     generator.model_type = .generator;
-    try std.testing.expectEqual(Level.unsupported, assess(&generator, "qwen3_5_moe").level);
-    try std.testing.expectEqual(Level.unsupported, assess(&generator, "qwen3_next").level);
+    try std.testing.expectEqual(Level.incompatible, assess(&generator, "qwen3_5_moe").level);
+    try std.testing.expectEqual(Level.incompatible, assess(&generator, "qwen3_next").level);
 
     var embedder = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     embedder.model_type = .embedder;
-    try std.testing.expectEqual(Level.unsupported, assess(&embedder, "nomic-bert").level);
+    try std.testing.expectEqual(Level.incompatible, assess(&embedder, "nomic-bert").level);
+}
+
+test "known unsafe local site models stay blocked even with unknown opt in" {
+    var clip = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    clip.model_type = .embedder;
+    clip.native_arch_hint = .clip;
+    const clip_result = assess(&clip, "clip");
+    try std.testing.expectEqual(Level.incompatible, clip_result.level);
+    try std.testing.expect(!clip_result.allowed(true));
+
+    var clap = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    clap.model_type = .embedder;
+    clap.native_arch_hint = .clap;
+    const clap_result = assess(&clap, "clap");
+    try std.testing.expectEqual(Level.incompatible, clap_result.level);
+    try std.testing.expect(!clap_result.allowed(true));
+
+    var rebel = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    rebel.model_type = .recognizer;
+    const rebel_result = assess(&rebel, "bart");
+    try std.testing.expectEqual(Level.incompatible, rebel_result.level);
+    try std.testing.expect(!rebel_result.allowed(true));
 }

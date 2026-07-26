@@ -236,7 +236,7 @@ fn estimateGpuHostedResidentTensorBytes(tensor: *const Tensor, force_f32: bool) 
     return tensor.data.len;
 }
 
-fn estimateNativeWeightBytes(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest) !u64 {
+pub fn estimateNativeWeightBytes(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest) !u64 {
     if (mf.gguf_path) |path| {
         var total = try c_file.fileSize(allocator, path);
         if (mf.gliner_head_gguf_path) |head_path| {
@@ -1153,6 +1153,9 @@ fn createGpuHostedSessionWithTaskOverride(
         defer if (report_opt) |*report| report.deinit();
         if (report_opt) |report| {
             try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
+            if (backend_type == .metal) {
+                try ensureMetalGgufInspectionCompatible(report, mf.gguf_path.?);
+            }
         }
     }
 
@@ -1548,7 +1551,12 @@ fn overlayGptStructuralConfig(target: *gpt_mod.Config, source: gpt_mod.Config) v
     if (source.num_kv_shared_layers > 0) target.num_kv_shared_layers = source.num_kv_shared_layers;
     if (source.global_head_dim > 0) target.global_head_dim = source.global_head_dim;
     if (source.num_global_key_value_heads > 0) target.num_global_key_value_heads = source.num_global_key_value_heads;
-    if (source.shared_layer_intermediate_size > 0) target.shared_layer_intermediate_size = source.shared_layer_intermediate_size;
+    // A scalar GGUF feed_forward_length means every layer uses the same size.
+    // Keep zero authoritative here: HF Gemma 4 config.json derives a doubled
+    // shared-tail size, but some valid GGUF conversions store uniform 10240-wide
+    // FFNs. Retaining the sidecar's 20480 makes quant kernels read past the
+    // 10240-wide weight and can crash the Metal backend.
+    target.shared_layer_intermediate_size = source.shared_layer_intermediate_size;
     if (source.sliding_window_pattern != 6) target.sliding_window_pattern = source.sliding_window_pattern;
     if (source.rope_local_theta != 10000.0 or target.rope_local_theta == 10000.0) {
         target.rope_local_theta = source.rope_local_theta;
@@ -2170,6 +2178,35 @@ fn ensureGgufInspectionCompatible(report: GgufInspectionReport, gguf_path: []con
         }
         return error.MissingRequiredWeights;
     }
+}
+
+fn ensureMetalGgufInspectionCompatible(report: GgufInspectionReport, gguf_path: []const u8) !void {
+    if (comptime !build_options.enable_metal) return;
+    if (metalGgufIncompatibleTensorType(report)) |entry| {
+        std.log.err(
+            "GGUF {s} uses {d} {s} tensors that are not release-safe on Metal; rejecting Metal backend",
+            .{ gguf_path, entry.count, entry.tensor_type.name() },
+        );
+        return error.UnsupportedQuantFormatForMetalOnly;
+    }
+}
+
+fn metalGgufIncompatibleTensorType(report: GgufInspectionReport) ?UnsupportedTensorTypeCount {
+    if (comptime !build_options.enable_metal) return null;
+    for (report.all_tensor_types) |entry| {
+        if (!metal_runtime.isMetalNativeSupported(entry.tensor_type)) return entry;
+    }
+    return null;
+}
+
+pub fn ggufInspectionSupportsBackend(report: GgufInspectionReport, backend: BackendType) bool {
+    if (report.unsupported_tensor_types.len > 0 or report.missing_required_tensors.len > 0)
+        return false;
+    return switch (backend) {
+        .metal => metalGgufIncompatibleTensorType(report) == null,
+        .native, .cuda, .onnx, .wasm => true,
+        .pjrt => false,
+    };
 }
 
 fn normalizeWeightKey(store_kind: tensor_store_mod.StoreKind, arch_config: ArchConfig, key: []const u8, buf: *[256]u8) ![]const u8 {
@@ -5687,6 +5724,43 @@ test "overlay gpt structural config takes rope partial factor from gguf" {
     overlayGptStructuralConfig(&target, source);
 
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), target.rope_partial_factor, 1e-6);
+}
+
+test "overlay gpt structural config clears sidecar-only shared tail ffn size" {
+    var target: gpt_mod.Config = .{
+        .family = .gemma,
+        .intermediate_size = 10240,
+        .shared_layer_intermediate_size = 20480,
+    };
+    const source: gpt_mod.Config = .{
+        .family = .gemma,
+        .intermediate_size = 10240,
+        .shared_layer_intermediate_size = 0,
+    };
+
+    overlayGptStructuralConfig(&target, source);
+
+    try std.testing.expectEqual(@as(u32, 0), target.shared_layer_intermediate_size);
+    try std.testing.expectEqual(@as(u32, 10240), target.intermediateSize(41));
+}
+
+test "metal gguf preflight rejects release-unsafe iq4 xs tensors" {
+    var tensor_types = [_]UnsupportedTensorTypeCount{
+        .{ .tensor_type = .{ .known = .IQ4_XS }, .count = 15 },
+    };
+    const report = GgufInspectionReport{
+        .allocator = std.testing.allocator,
+        .architecture = "gemma4",
+        .tensor_count = 15,
+        .metadata_count = 0,
+        .all_tensor_types = tensor_types[0..],
+    };
+
+    if (comptime build_options.enable_metal) {
+        const incompatible = metalGgufIncompatibleTensorType(report) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(gguf_mod.tensor_types.KnownTensorType.IQ4_XS, incompatible.tensor_type.known);
+        try std.testing.expectEqual(@as(usize, 15), incompatible.count);
+    } else try std.testing.expect(metalGgufIncompatibleTensorType(report) == null);
 }
 
 test "overlay gpt structural config keeps config softcapping when gguf omits it" {

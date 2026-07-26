@@ -37,8 +37,9 @@ const cache_mod = @import("../cache/cache.zig");
 const model_manager_mod = @import("model_manager.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
+const safetensors_mod = @import("../models/safetensors.zig");
 const gpt_model_mod = @import("../models/gpt.zig");
-const model_support = @import("../models/support.zig");
+const model_compatibility = @import("../models/compatibility.zig");
 const chunking_mod = @import("../pipelines/chunking.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
@@ -76,6 +77,10 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 };
 pub const metrics_mod = @import("metrics.zig");
 const request_queue_mod = @import("request_queue.zig");
+
+fn spinLock(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
 
 fn shouldSkipAutoMtpDraftLoad(config: generation.GenerationConfig, draft_cfg: gpt_model_mod.Config) bool {
     if (config.speculation_policy != .auto) return false;
@@ -193,9 +198,9 @@ pub const NodeConfig = struct {
     prompt_cache: PromptCacheConfig = .{},
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
     tokenizer_cache: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig = .{},
-    /// Permit unrecognized/experimental model architectures in the serving process.
-    /// Known unsafe or unusable models remain blocked.
-    allow_experimental_models: bool = false,
+    /// Permit artifacts whose compatibility cannot be proven by this build.
+    /// Known incompatible or unsafe artifacts remain blocked.
+    allow_unknown_models: bool = false,
 };
 
 pub const WarmModelKind = enum {
@@ -567,28 +572,111 @@ fn isOpenAiListTask(task: []const u8) bool {
     return std.mem.eql(u8, task, "generators") or std.mem.eql(u8, task, "embedders");
 }
 
-const SupportSummary = struct {
-    level: model_support.Level,
-    reason: []const u8,
+const CompatibilitySummary = struct {
+    level: model_compatibility.Level,
+    code: model_compatibility.Code,
+    message: []const u8,
 };
 
-fn supportSummaryForManifest(
+const CachedCompatibility = struct {
+    signature: u64,
+    summary: CompatibilitySummary,
+};
+
+fn compatibilitySummaryForManifest(
     allocator: std.mem.Allocator,
     man: *const manifest_mod.ModelManifest,
-) !SupportSummary {
-    var inspection = try model_support.inspectAlloc(allocator, man);
+) !CompatibilitySummary {
+    var inspection = try model_compatibility.inspectAlloc(allocator, man);
     defer inspection.deinit(allocator);
-    const assessment = model_support.assessInspection(man, inspection);
-    return .{ .level = assessment.level, .reason = assessment.reason };
+    const assessment = model_compatibility.assessInspection(man, inspection);
+    return .{ .level = assessment.level, .code = assessment.code, .message = assessment.message };
 }
 
-fn supportSummaryForDir(
+fn refineGgufCompatibility(
     allocator: std.mem.Allocator,
     model_path: []const u8,
-) !SupportSummary {
-    var man = try manifest_mod.loadListingFromDir(allocator, model_path);
-    defer man.deinit();
-    return supportSummaryForManifest(allocator, &man);
+    man: *const manifest_mod.ModelManifest,
+    base: CompatibilitySummary,
+) !CompatibilitySummary {
+    if (man.gguf_path == null or base.level == .incompatible) return base;
+    var maybe_report = try session_factory.inspectGgufModel(allocator, model_path);
+    if (maybe_report) |*report| {
+        defer report.deinit();
+        if (report.unsupported_tensor_types.len > 0) {
+            return .{
+                .level = .incompatible,
+                .code = .unsupported_tensor_type,
+                .message = "GGUF contains tensor types that no available runtime can materialize",
+            };
+        }
+        if (report.missing_required_tensors.len > 0) {
+            return .{
+                .level = .incompatible,
+                .code = .missing_required_tensor,
+                .message = "GGUF is missing required normalized tensors",
+            };
+        }
+    }
+    return base;
+}
+
+fn refineOnnxCompatibility(
+    allocator: std.mem.Allocator,
+    man: *const manifest_mod.ModelManifest,
+    base: CompatibilitySummary,
+) !CompatibilitySummary {
+    const onnx_path = man.onnx_path orelse return base;
+    if (base.level == .incompatible or build_options.enable_onnx) return base;
+    backends_mod.imported_onnx_session.inspectGraphCompatibility(allocator, onnx_path) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .level = .incompatible,
+            .code = .invalid_graph,
+            .message = "ONNX graph cannot be converted and validated by any backend in this build",
+        };
+    };
+    return base;
+}
+
+fn addArtifactStatToSignature(
+    io: std.Io,
+    signature: *std.hash.Wyhash,
+    path: ?[]const u8,
+) void {
+    const artifact_path = path orelse return;
+    signature.update(artifact_path);
+    const stat = std.Io.Dir.cwd().statFile(io, artifact_path, .{}) catch {
+        signature.update("missing");
+        return;
+    };
+    signature.update(std.mem.asBytes(&stat.size));
+    signature.update(std.mem.asBytes(&stat.mtime));
+}
+
+fn addShardedArtifactStatsToSignature(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    signature: *std.hash.Wyhash,
+    index_path: ?[]const u8,
+) !void {
+    const path = index_path orelse return;
+    const bytes = try c_file.readFile(allocator, path);
+    defer allocator.free(bytes);
+    var index = try safetensors_mod.ShardedIndex.load(allocator, bytes);
+    defer index.deinit();
+    const model_dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(allocator);
+    var it = index.weight_map.iterator();
+    while (it.next()) |entry| {
+        const shard = entry.value_ptr.*;
+        if (seen.contains(shard)) continue;
+        try seen.put(allocator, shard, {});
+        const shard_path = try std.fs.path.join(allocator, &.{ model_dir, shard });
+        defer allocator.free(shard_path);
+        addArtifactStatToSignature(io, signature, shard_path);
+    }
 }
 
 /// Apply the serving policy before model loading. `ModelManager` repeats this check as a
@@ -598,44 +686,93 @@ fn rejectDisallowedModel(
     ctx: *httpx.Context,
     model_path: []const u8,
 ) !?httpx.Response {
-    const summary = supportSummaryForDir(ctx.allocator, model_path) catch {
-        if (self.config.allow_experimental_models) return null;
+    const summary = self.compatibilitySummaryForDir(ctx.allocator, model_path) catch {
+        if (self.config.allow_unknown_models) return null;
         return try ctx.status(400).json(.{
-            .@"error" = "EXPERIMENTAL_MODEL_DISABLED",
-            .message = "model compatibility could not be determined; restart with --allow-experimental-models to opt in",
+            .@"error" = "UNKNOWN_MODEL_COMPATIBILITY",
+            .message = "model compatibility could not be determined; restart with --allow-unknown-models to opt in",
         });
     };
     switch (summary.level) {
-        .supported => return null,
-        .experimental => {
-            if (self.config.allow_experimental_models) return null;
+        .compatible => return null,
+        .unknown => {
+            if (self.config.allow_unknown_models) return null;
             return try ctx.status(400).json(.{
-                .@"error" = "EXPERIMENTAL_MODEL_DISABLED",
-                .message = summary.reason,
+                .@"error" = "UNKNOWN_MODEL_COMPATIBILITY",
+                .message = summary.message,
             });
         },
-        .unsupported => return try ctx.status(400).json(.{
-            .@"error" = "UNSUPPORTED_MODEL",
-            .message = summary.reason,
+        .incompatible => return try ctx.status(400).json(.{
+            .@"error" = "INCOMPATIBLE_MODEL",
+            .message = summary.message,
         }),
     }
 }
 
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     return switch (err) {
-        error.ExperimentalModelDisabled => ctx.status(400).json(.{
-            .@"error" = "EXPERIMENTAL_MODEL_DISABLED",
-            .message = "model architecture is experimental; restart with --allow-experimental-models to opt in",
+        error.UnknownModelCompatibility => ctx.status(400).json(.{
+            .@"error" = "UNKNOWN_MODEL_COMPATIBILITY",
+            .message = "model compatibility is unknown; restart with --allow-unknown-models to opt in",
         }),
-        error.UnsupportedModel => ctx.status(400).json(.{
-            .@"error" = "UNSUPPORTED_MODEL",
-            .message = "model architecture is known to be unsafe or unusable in this release",
+        error.IncompatibleModel => ctx.status(400).json(.{
+            .@"error" = "INCOMPATIBLE_MODEL",
+            .message = "model artifact is incompatible with the available runtime",
+        }),
+        error.ResourceLimitExceeded => ctx.status(400).json(.{
+            .@"error" = "MODEL_RESOURCE_LIMIT",
+            .message = "model resource plan exceeds the configured inference budget",
+        }),
+        error.ResourceTemporarilyUnavailable => ctx.status(503).json(.{
+            .@"error" = "MODEL_RESOURCE_BUSY",
+            .message = "insufficient inference capacity is currently available",
         }),
         else => ctx.status(500).json(.{
             .@"error" = "MODEL_LOAD_FAILED",
             .message = @errorName(err),
         }),
     };
+}
+
+fn rejectExplicitBackendIncompatibility(
+    ctx: *httpx.Context,
+    model_path: []const u8,
+    choice: native_backend_choice.Choice,
+) !?httpx.Response {
+    const backend: backends_mod.BackendType = switch (choice) {
+        .auto => return null,
+        .onnx => .onnx,
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .xla, .webgpu => return null,
+    };
+    var man = try manifest_mod.loadListingFromDir(ctx.allocator, model_path);
+    defer man.deinit();
+    const has_candidate = switch (backend) {
+        .onnx => man.onnx_path != null,
+        .native, .metal, .cuda, .wasm => model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(man),
+        .pjrt => false,
+    };
+    if (!has_candidate) {
+        return try ctx.status(400).json(.{
+            .@"error" = "INCOMPATIBLE_MODEL",
+            .message = "the selected backend has no compatible artifact in this model bundle",
+        });
+    }
+    if (man.gguf_path) |_| {
+        var maybe_report = try session_factory.inspectGgufModel(ctx.allocator, model_path);
+        if (maybe_report) |*report| {
+            defer report.deinit();
+            if (!session_factory.ggufInspectionSupportsBackend(report.*, backend)) {
+                return try ctx.status(400).json(.{
+                    .@"error" = "INCOMPATIBLE_MODEL",
+                    .message = "the selected backend cannot materialize this GGUF tensor contract",
+                });
+            }
+        }
+    }
+    return null;
 }
 
 /// A discovered model resolved once, so the ten task passes in `listModelsJsonAlloc` can
@@ -646,9 +783,8 @@ const DiscoveredModelListing = struct {
     /// `@tagName(manifest.model_type)`, not the path-derived `entry.kind`.
     kind: []const u8,
     readers_supported: bool,
-    /// `@tagName` of the decoder support level, or empty for non-decoders.
-    support_level: []const u8,
-    support_reason: []const u8,
+    /// Compatibility derived from the artifact and available runtime paths.
+    compatibility_level: []const u8,
 };
 
 fn appendOpenAiModelEntry(
@@ -656,25 +792,22 @@ fn appendOpenAiModelEntry(
     allocator: std.mem.Allocator,
     model_id: []const u8,
     created: i64,
-    support_level: []const u8,
-    support_reason: []const u8,
+    compatibility_level: []const u8,
 ) !void {
     try buf.appendSlice(allocator, "{\"id\":");
     try jsonEncodeString(buf, allocator, model_id);
     const metadata = try std.fmt.allocPrint(
         allocator,
-        ",\"object\":\"model\",\"created\":{d},\"owned_by\":\"antfly\",\"support\":",
+        ",\"object\":\"model\",\"created\":{d},\"owned_by\":\"antfly\",\"compatibility\":",
         .{created},
     );
     defer allocator.free(metadata);
     try buf.appendSlice(allocator, metadata);
-    try jsonEncodeString(buf, allocator, support_level);
-    try buf.appendSlice(allocator, ",\"support_reason\":");
-    try jsonEncodeString(buf, allocator, support_reason);
+    try jsonEncodeString(buf, allocator, compatibility_level);
     try buf.append(allocator, '}');
 }
 
-test "OpenAI model entries expose serving support metadata" {
+test "OpenAI model entries expose artifact compatibility" {
     const allocator = std.testing.allocator;
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(allocator);
@@ -684,11 +817,10 @@ test "OpenAI model entries expose serving support metadata" {
         allocator,
         "owner/model",
         42,
-        "experimental",
-        "unknown architecture",
+        "unknown",
     );
     try std.testing.expectEqualStrings(
-        "{\"id\":\"owner/model\",\"object\":\"model\",\"created\":42,\"owned_by\":\"antfly\",\"support\":\"experimental\",\"support_reason\":\"unknown architecture\"}",
+        "{\"id\":\"owner/model\",\"object\":\"model\",\"created\":42,\"owned_by\":\"antfly\",\"compatibility\":\"unknown\"}",
         buf.items,
     );
 }
@@ -839,6 +971,8 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
     request_queue: request_queue_mod.RequestQueue,
+    compatibility_cache: std.StringHashMapUnmanaged(CachedCompatibility) = .empty,
+    compatibility_cache_lock: std.atomic.Mutex = .unlocked,
 
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
 
@@ -853,9 +987,17 @@ pub const Node = struct {
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
             .request_queue = request_queue_mod.RequestQueue.init(config.max_concurrent_requests),
+            .compatibility_cache = .empty,
         };
         node.model_manager.configureServingPolicy(.{
-            .allow_experimental = config.allow_experimental_models,
+            .allow_unknown = config.allow_unknown_models,
+        });
+        node.model_manager.configureAdmissionLimits(.{
+            .host_limit_bytes = config.generation_budget_overrides.host_limit_bytes,
+            .backend_limit_bytes = config.generation_budget_overrides.backend_limit_bytes,
+            .combined_limit_bytes = config.generation_budget_overrides.combined_limit_bytes,
+            .kv_limit_bytes = config.generation_budget_overrides.kv_limit_bytes,
+            .scratch_limit_bytes = config.generation_budget_overrides.scratch_limit_bytes,
         });
         node.model_manager.tokenizer_cache_config = config.tokenizer_cache;
         node.updateQueueMetrics();
@@ -876,6 +1018,83 @@ pub const Node = struct {
         self.registry.deinit();
         self.tabular_registry.deinit();
         self.embed_cache.deinit();
+        var compatibility_it = self.compatibility_cache.iterator();
+        while (compatibility_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.compatibility_cache.deinit(self.allocator);
+    }
+
+    /// Derive artifact compatibility once per immutable artifact signature. Discovery
+    /// calls this repeatedly, so caching prevents GGUF/ONNX metadata inspection from
+    /// becoming request-path work while still invalidating when a sidecar is replaced.
+    fn compatibilitySummaryForDir(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+    ) !CompatibilitySummary {
+        var man = try manifest_mod.loadListingFromDir(allocator, model_path);
+        defer man.deinit();
+
+        var io_impl: ?std.Io.Threaded = null;
+        defer if (io_impl) |*threaded| threaded.deinit();
+        const io = self.session_manager.io orelse blk: {
+            io_impl = std.Io.Threaded.init(allocator, .{});
+            break :blk io_impl.?.io();
+        };
+        var signature = std.hash.Wyhash.init(0);
+        addArtifactStatToSignature(io, &signature, man.model_manifest_path);
+        addArtifactStatToSignature(io, &signature, man.config_path);
+        addArtifactStatToSignature(io, &signature, man.gguf_path);
+        addArtifactStatToSignature(io, &signature, man.gguf_projector_path);
+        addArtifactStatToSignature(io, &signature, man.safetensors_path);
+        addArtifactStatToSignature(io, &signature, man.safetensors_index_path);
+        try addShardedArtifactStatsToSignature(allocator, io, &signature, man.safetensors_index_path);
+        addArtifactStatToSignature(io, &signature, man.onnx_path);
+        addArtifactStatToSignature(io, &signature, man.gliner_head_gguf_path);
+        addArtifactStatToSignature(io, &signature, man.gliner_head_safetensors_path);
+        addArtifactStatToSignature(io, &signature, man.visual_model_path);
+        addArtifactStatToSignature(io, &signature, man.audio_model_path);
+        addArtifactStatToSignature(io, &signature, man.text_projection_path);
+        addArtifactStatToSignature(io, &signature, man.visual_projection_path);
+        addArtifactStatToSignature(io, &signature, man.audio_projection_path);
+        addArtifactStatToSignature(io, &signature, man.tokenizer_json_path);
+        addArtifactStatToSignature(io, &signature, man.tokenizer_config_path);
+        addArtifactStatToSignature(io, &signature, man.preprocessor_config_path);
+        addArtifactStatToSignature(io, &signature, man.processor_config_path);
+        const artifact_signature = signature.final();
+
+        spinLock(&self.compatibility_cache_lock);
+        if (self.compatibility_cache.get(model_path)) |cached| {
+            if (cached.signature == artifact_signature) {
+                self.compatibility_cache_lock.unlock();
+                return cached.summary;
+            }
+        }
+        self.compatibility_cache_lock.unlock();
+
+        const base = if (model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(man))
+            try compatibilitySummaryForManifest(allocator, &man)
+        else
+            CompatibilitySummary{
+                .level = .incompatible,
+                .code = .unsupported_backend,
+                .message = "no backend in this build accepts the model bundle's artifact format",
+            };
+        const gguf_summary = try refineGgufCompatibility(allocator, model_path, &man, base);
+        const summary = try refineOnnxCompatibility(allocator, &man, gguf_summary);
+
+        spinLock(&self.compatibility_cache_lock);
+        defer self.compatibility_cache_lock.unlock();
+        if (self.compatibility_cache.getPtr(model_path)) |cached| {
+            cached.* = .{ .signature = artifact_signature, .summary = summary };
+        } else {
+            const owned_path = try self.allocator.dupe(u8, model_path);
+            errdefer self.allocator.free(owned_path);
+            try self.compatibility_cache.put(self.allocator, owned_path, .{
+                .signature = artifact_signature,
+                .summary = summary,
+            });
+        }
+        return summary;
     }
 
     pub fn attachIo(self: *Node, io: std.Io) void {
@@ -1092,14 +1311,15 @@ pub const Node = struct {
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const prompt_tokens = try countPromptTokens(allocator, model, messages);
-        run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+        const resource_estimate = runtime.tier.memory.estimateGptGeneration(
             backend_kind,
             kv_dtype,
             gpt_config,
             prompt_tokens,
             @intCast(@max(max_tokens, 1)),
             256,
-        )) catch |err| {
+        );
+        run_budget.reserveEstimate(resource_estimate) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
                 var buf: [512]u8 = undefined;
                 std.log.warn("{s}", .{
@@ -1109,6 +1329,8 @@ pub const Node = struct {
             }
             return err;
         };
+        var admission_lease = try self.model_manager.acquireRunResources(budget_limits, resource_estimate);
+        defer admission_lease.release();
 
         var kv_manager = runtime.kv.manager.KvManager.init(allocator);
         defer kv_manager.deinit();
@@ -2556,6 +2778,8 @@ pub const Node = struct {
                 },
             });
         };
+        if (try rejectExplicitBackendIncompatibility(ctx, model_path, backend_selection.native_choice)) |response|
+            return response;
         const allow_onnx = effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
             (body.backend == null or backend_selection.native_choice == .onnx);
@@ -2823,12 +3047,12 @@ pub const Node = struct {
             // architecture was never recognized and the model fell through to the
             // default encoder path. Name it, so the caller can tell "unsupported model"
             // apart from "Antfly is broken".
-            var inspection: model_support.Inspection = model_support.inspectAlloc(ctx.allocator, &model.manifest) catch .{
+            var inspection: model_compatibility.Inspection = model_compatibility.inspectAlloc(ctx.allocator, &model.manifest) catch .{
                 .architecture = try ctx.allocator.dupe(u8, "unknown"),
             };
             defer inspection.deinit(ctx.allocator);
             return ctx.status(400).json(.{
-                .@"error" = "UNSUPPORTED_MODEL",
+                .@"error" = "INCOMPATIBLE_MODEL",
                 .message = try std.fmt.allocPrint(
                     ctx.allocator,
                     "model architecture \"{s}\" does not provide a generation runtime",
@@ -2859,22 +3083,34 @@ pub const Node = struct {
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const admission_prefill_chunk = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else 256;
-        run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+        const resource_estimate = runtime.tier.memory.estimateGptGeneration(
             backend_kind,
             kv_dtype,
             gpt_config,
             prompt_tokens,
             @intCast(@max(config.max_tokens, 1)),
             admission_prefill_chunk,
-        )) catch |err| {
+        );
+        run_budget.reserveEstimate(resource_estimate) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
-                return ctx.status(507).json(.{
-                    .@"error" = "MEMORY_BUDGET_EXCEEDED",
+                return ctx.status(400).json(.{
+                    .@"error" = "MODEL_RESOURCE_LIMIT",
                     .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
                 });
             }
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         };
+        var admission_lease = self.model_manager.acquireRunResources(budget_limits, resource_estimate) catch |err| switch (err) {
+            error.ResourceLimitExceeded => return ctx.status(400).json(.{
+                .@"error" = "MODEL_RESOURCE_LIMIT",
+                .message = "request exceeds the configured inference resource budget",
+            }),
+            error.ResourceTemporarilyUnavailable => return ctx.status(503).json(.{
+                .@"error" = "MODEL_RESOURCE_BUSY",
+                .message = "insufficient inference capacity is currently available",
+            }),
+        };
+        defer admission_lease.release();
 
         const tok = model.getTokenizer();
         var draft_cb: ?ops.ComputeBackend = null;
@@ -2943,8 +3179,8 @@ pub const Node = struct {
 
                     draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
                         if (err == error.MemoryBudgetExceeded) {
-                            return ctx.status(507).json(.{
-                                .@"error" = "MEMORY_BUDGET_EXCEEDED",
+                            return ctx.status(400).json(.{
+                                .@"error" = "MODEL_RESOURCE_LIMIT",
                                 .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
                             });
                         }
@@ -2962,8 +3198,8 @@ pub const Node = struct {
 
         var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
-                return ctx.status(507).json(.{
-                    .@"error" = "MEMORY_BUDGET_EXCEEDED",
+                return ctx.status(400).json(.{
+                    .@"error" = "MODEL_RESOURCE_LIMIT",
                     .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
                 });
             }
@@ -3447,6 +3683,36 @@ pub const Node = struct {
         @"error": ?api.GenerateBatchError = null,
     };
 
+    fn batchModelLoadError(err: anyerror) api.GenerateBatchError {
+        return switch (err) {
+            error.UnknownModelCompatibility => .{
+                .code = "UNKNOWN_MODEL_COMPATIBILITY",
+                .message = "model compatibility is unknown",
+                .retryable = false,
+            },
+            error.IncompatibleModel => .{
+                .code = "INCOMPATIBLE_MODEL",
+                .message = "model artifact is incompatible with the selected runtime",
+                .retryable = false,
+            },
+            error.ResourceLimitExceeded => .{
+                .code = "MODEL_RESOURCE_LIMIT",
+                .message = "model resource plan exceeds the configured inference budget",
+                .retryable = false,
+            },
+            error.ResourceTemporarilyUnavailable => .{
+                .code = "MODEL_RESOURCE_BUSY",
+                .message = "insufficient inference capacity is currently available",
+                .retryable = true,
+            },
+            else => .{
+                .code = "MODEL_LOAD_FAILED",
+                .message = @errorName(err),
+                .retryable = true,
+            },
+        };
+    }
+
     const BatchGenerateTask = struct {
         allocator: std.mem.Allocator,
         pipeline: generation.NativeGenerationPipeline,
@@ -3569,21 +3835,22 @@ pub const Node = struct {
                 try group_indices.append(ctx.allocator, idx);
             }
 
-            const support_summary = supportSummaryForDir(ctx.allocator, model_path) catch SupportSummary{
-                .level = .experimental,
-                .reason = "model compatibility could not be determined",
+            const compatibility_summary = self.compatibilitySummaryForDir(ctx.allocator, model_path) catch CompatibilitySummary{
+                .level = .unknown,
+                .code = .artifact_unreadable,
+                .message = "model compatibility could not be determined",
             };
-            const support_blocked = support_summary.level == .unsupported or
-                (support_summary.level == .experimental and !self.config.allow_experimental_models);
-            if (support_blocked) {
-                const code = if (support_summary.level == .unsupported)
-                    "UNSUPPORTED_MODEL"
+            const compatibility_blocked = compatibility_summary.level == .incompatible or
+                (compatibility_summary.level == .unknown and !self.config.allow_unknown_models);
+            if (compatibility_blocked) {
+                const code = if (compatibility_summary.level == .incompatible)
+                    "INCOMPATIBLE_MODEL"
                 else
-                    "EXPERIMENTAL_MODEL_DISABLED";
+                    "UNKNOWN_MODEL_COMPATIBILITY";
                 for (group_indices.items) |idx| {
                     results[idx].@"error" = .{
                         .code = code,
-                        .message = support_summary.reason,
+                        .message = compatibility_summary.message,
                         .retryable = false,
                     };
                     pending[idx] = false;
@@ -3596,14 +3863,14 @@ pub const Node = struct {
                 configureGenerateBackendPreference(&request_session_manager, selection);
                 break :blk self.model_manager.loadFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err| {
                     for (group_indices.items) |idx| {
-                        results[idx].@"error" = .{ .code = "MODEL_LOAD_FAILED", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = batchModelLoadError(err);
                         pending[idx] = false;
                     }
                     continue;
                 };
             } else self.model_manager.loadFromDir(model_path) catch |err| {
                 for (group_indices.items) |idx| {
-                    results[idx].@"error" = .{ .code = "MODEL_LOAD_FAILED", .message = @errorName(err), .retryable = true };
+                    results[idx].@"error" = batchModelLoadError(err);
                     pending[idx] = false;
                 }
                 continue;
@@ -3675,20 +3942,37 @@ pub const Node = struct {
                     runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
                 ));
                 var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+                var admission_leases = std.ArrayListUnmanaged(runtime.tier.memory.AdmissionLease).empty;
+                defer {
+                    for (admission_leases.items) |*lease| lease.release();
+                    admission_leases.deinit(ctx.allocator);
+                }
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
                     const admission_prefill_chunk = if (configs[pos].prefill_chunk_size > 0) configs[pos].prefill_chunk_size else 256;
-                    run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+                    const resource_estimate = runtime.tier.memory.estimateGptGeneration(
                         backend_kind,
                         kv_dtype,
                         gpt_config,
                         prompt_tokens[pos],
                         @intCast(@max(configs[pos].max_tokens, 1)),
                         admission_prefill_chunk,
-                    )) catch |err| {
-                        results[idx].@"error" = .{ .code = "MEMORY_BUDGET_EXCEEDED", .message = @errorName(err), .retryable = true };
+                    );
+                    run_budget.reserveEstimate(resource_estimate) catch |err| {
+                        results[idx].@"error" = .{ .code = "MODEL_RESOURCE_LIMIT", .message = @errorName(err), .retryable = false };
                         pending[idx] = false;
+                        continue;
                     };
+                    const lease = self.model_manager.acquireRunResources(budget_limits, resource_estimate) catch |err| {
+                        results[idx].@"error" = .{
+                            .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
+                            .message = @errorName(err),
+                            .retryable = err == error.ResourceTemporarilyUnavailable,
+                        };
+                        pending[idx] = false;
+                        continue;
+                    };
+                    try admission_leases.append(ctx.allocator, lease);
                 }
 
                 var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
@@ -5728,9 +6012,10 @@ pub const Node = struct {
                 man.deinit();
                 continue;
             }
-            const support_summary = supportSummaryForManifest(a, &man) catch SupportSummary{
-                .level = .experimental,
-                .reason = "model compatibility could not be determined",
+            const compatibility_summary = self.compatibilitySummaryForDir(a, entry.path) catch CompatibilitySummary{
+                .level = .unknown,
+                .code = .artifact_unreadable,
+                .message = "model compatibility could not be determined",
             };
             listings.appendAssumeCapacity(.{
                 .entry = entry,
@@ -5741,8 +6026,7 @@ pub const Node = struct {
                 // when its own model_manifest.json says otherwise.
                 .kind = @tagName(man.model_type),
                 .readers_supported = readers_mod.isSupportedManifest(a, entry.path, man),
-                .support_level = @tagName(support_summary.level),
-                .support_reason = support_summary.reason,
+                .compatibility_level = @tagName(compatibility_summary.level),
             });
         }
 
@@ -5778,14 +6062,14 @@ pub const Node = struct {
                     loaded.chat_template_failed
                 else
                     false;
-                try appendModelInfo(&body, a, listing.kind, man.gliner_model_type, man.capabilities, man.inputs, has_visual, has_audio, chat_template_failed, listing.support_level, listing.support_reason);
+                try appendModelInfo(&body, a, listing.kind, man.gliner_model_type, man.capabilities, man.inputs, has_visual, has_audio, chat_template_failed, listing.compatibility_level);
                 if (isOpenAiListTask(task)) {
-                    const enabled = listing.support_level.len > 0 and
-                        (!std.mem.eql(u8, listing.support_level, "experimental") or self.config.allow_experimental_models) and
-                        !std.mem.eql(u8, listing.support_level, "unsupported");
+                    const enabled = listing.compatibility_level.len > 0 and
+                        (!std.mem.eql(u8, listing.compatibility_level, "unknown") or self.config.allow_unknown_models) and
+                        !std.mem.eql(u8, listing.compatibility_level, "incompatible");
                     if (enabled) {
                         if (openai_data_count > 0) try openai_data.append(a, ',');
-                        try appendOpenAiModelEntry(&openai_data, a, listing.entry.name, list_created, listing.support_level, listing.support_reason);
+                        try appendOpenAiModelEntry(&openai_data, a, listing.entry.name, list_created, listing.compatibility_level);
                         openai_data_count += 1;
                     }
                 }
@@ -5825,9 +6109,10 @@ pub const Node = struct {
                         if (model_count > 0) try body.append(a, ',');
                         try jsonEncodeString(&body, a, model.model_dir);
                         try body.append(a, ':');
-                        const loaded_support = supportSummaryForManifest(a, &model.manifest) catch SupportSummary{
-                            .level = .experimental,
-                            .reason = "model compatibility could not be determined",
+                        const loaded_compatibility = self.compatibilitySummaryForDir(a, model.model_dir) catch CompatibilitySummary{
+                            .level = .unknown,
+                            .code = .artifact_unreadable,
+                            .message = "model compatibility could not be determined",
                         };
                         try appendModelInfo(
                             &body,
@@ -5839,12 +6124,11 @@ pub const Node = struct {
                             model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
                             model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
                             model.chat_template_failed,
-                            @tagName(loaded_support.level),
-                            loaded_support.reason,
+                            @tagName(loaded_compatibility.level),
                         );
                         if (isOpenAiListTask(task)) {
-                            const enabled = loaded_support.level == .supported or
-                                (loaded_support.level == .experimental and self.config.allow_experimental_models);
+                            const enabled = loaded_compatibility.level == .compatible or
+                                (loaded_compatibility.level == .unknown and self.config.allow_unknown_models);
                             if (enabled) {
                                 if (openai_data_count > 0) try openai_data.append(a, ',');
                                 try appendOpenAiModelEntry(
@@ -5852,8 +6136,7 @@ pub const Node = struct {
                                     a,
                                     model.model_dir,
                                     list_created,
-                                    @tagName(loaded_support.level),
-                                    loaded_support.reason,
+                                    @tagName(loaded_compatibility.level),
                                 );
                                 openai_data_count += 1;
                             }
@@ -6865,9 +7148,8 @@ fn appendModelInfo(
     /// Set when the model shipped a chat template we could not parse. Without this the
     /// degradation to raw prompting is invisible to API clients.
     chat_template_failed: bool,
-    /// Release serving policy and its concise explanation.
-    support_level: []const u8,
-    support_reason: []const u8,
+    /// Artifact compatibility derived for the current build.
+    compatibility_level: []const u8,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
     const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
@@ -6877,18 +7159,16 @@ fn appendModelInfo(
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
 
     if (capabilities.len == 0 and !inferred_classification and !inferred_relations and !inferred_extraction and !has_known_inputs) {
-        if (!chat_template_failed and support_level.len == 0) {
+        if (!chat_template_failed and compatibility_level.len == 0) {
             try buf.appendSlice(allocator, "{}");
             return;
         }
         try buf.append(allocator, '{');
         if (chat_template_failed) try buf.appendSlice(allocator, "\"chat_template\":false");
-        if (support_level.len > 0) {
+        if (compatibility_level.len > 0) {
             if (chat_template_failed) try buf.append(allocator, ',');
-            try buf.appendSlice(allocator, "\"support\":");
-            try jsonEncodeString(buf, allocator, support_level);
-            try buf.appendSlice(allocator, ",\"support_reason\":");
-            try jsonEncodeString(buf, allocator, support_reason);
+            try buf.appendSlice(allocator, "\"compatibility\":");
+            try jsonEncodeString(buf, allocator, compatibility_level);
         }
         try buf.append(allocator, '}');
         return;
@@ -6926,11 +7206,9 @@ fn appendModelInfo(
     }
     try buf.append(allocator, ']');
     if (chat_template_failed) try buf.appendSlice(allocator, ",\"chat_template\":false");
-    if (support_level.len > 0) {
-        try buf.appendSlice(allocator, ",\"support\":");
-        try jsonEncodeString(buf, allocator, support_level);
-        try buf.appendSlice(allocator, ",\"support_reason\":");
-        try jsonEncodeString(buf, allocator, support_reason);
+    if (compatibility_level.len > 0) {
+        try buf.appendSlice(allocator, ",\"compatibility\":");
+        try jsonEncodeString(buf, allocator, compatibility_level);
     }
     try buf.append(allocator, '}');
 }
