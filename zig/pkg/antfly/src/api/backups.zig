@@ -4437,6 +4437,47 @@ pub fn readClusterManifestFromLocation(
     }
 }
 
+const ClusterManifestEncoding = enum {
+    zig_v2,
+    go_portable_v2,
+};
+
+const DecodedClusterManifest = struct {
+    manifest: ClusterBackupManifest,
+    encoding: ClusterManifestEncoding,
+};
+
+fn readClusterManifestFromLocationDecoded(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+) !DecodedClusterManifest {
+    const body = switch (location.*) {
+        .file => |backup_root| blk: {
+            const path = try clusterMetadataPath(alloc, backup_root, backup_id);
+            defer alloc.free(path);
+            break :blk try readFileAbsoluteAllocWithIo(
+                alloc,
+                io,
+                path,
+                max_backup_manifest_bytes,
+            );
+        },
+        .remote => |*store| blk: {
+            const suffix = try clusterMetadataPath(alloc, "", backup_id);
+            defer alloc.free(suffix);
+            break :blk try store.readBytesAllocLimited(
+                alloc,
+                trimLeftSlash(suffix),
+                max_backup_manifest_bytes,
+            );
+        },
+    };
+    defer alloc.free(body);
+    return try parseClusterManifestBytesDecoded(alloc, body, backup_id);
+}
+
 fn readClusterManifestFromRemoteKey(
     alloc: std.mem.Allocator,
     store: *RemoteBackupStore,
@@ -4462,6 +4503,15 @@ fn parseClusterManifestBytes(
     body: []const u8,
     backup_id: []const u8,
 ) !ClusterBackupManifest {
+    const decoded = try parseClusterManifestBytesDecoded(alloc, body, backup_id);
+    return decoded.manifest;
+}
+
+fn parseClusterManifestBytesDecoded(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    backup_id: []const u8,
+) !DecodedClusterManifest {
     var value = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer value.deinit();
     const root = switch (value.value) {
@@ -4472,9 +4522,15 @@ fn parseClusterManifestBytes(
         var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
         defer parsed.deinit();
         try validateClusterManifest(alloc, &parsed.value, backup_id);
-        return try cloneClusterBackupManifest(alloc, parsed.value);
+        return .{
+            .manifest = try cloneClusterBackupManifest(alloc, parsed.value),
+            .encoding = .zig_v2,
+        };
     }
-    return try parseGoPortableClusterManifest(alloc, root, backup_id);
+    return .{
+        .manifest = try parseGoPortableClusterManifest(alloc, root, backup_id),
+        .encoding = .go_portable_v2,
+    };
 }
 
 fn parseGoPortableClusterManifest(
@@ -4885,18 +4941,39 @@ pub fn readClusterManifestForRestoreAdmission(
     location: *BackupLocation,
     backup_id: []const u8,
 ) !ClusterBackupManifest {
-    // The head generation supplies an optimistic read transaction across
-    // repository health verification and requested-manifest selection.
+    // The Zig head generation supplies an optimistic read transaction across
+    // repository health verification and requested-manifest selection. The
+    // exact current Go portable envelope predates that head, so a headless Go
+    // repository is admitted only when the head remains absent across the
+    // bounded manifest read. Current Zig manifests without a head remain
+    // rejected; this is a narrow cross-runtime bridge, not legacy fallback.
     var attempt: usize = 0;
     while (attempt < 4) : (attempt += 1) {
-        var before = (try readClusterBackupAttemptHead(alloc, io, location)) orelse
-            return error.IncompleteClusterBackup;
-        defer before.deinit();
+        const before = try readClusterBackupAttemptHead(alloc, io, location);
+        if (before == null) {
+            var decoded = try readClusterManifestFromLocationDecoded(
+                alloc,
+                io,
+                location,
+                backup_id,
+            );
+            errdefer decoded.manifest.deinit(alloc);
+            if (decoded.encoding != .go_portable_v2)
+                return error.IncompleteClusterBackup;
+
+            var after = try readClusterBackupAttemptHead(alloc, io, location);
+            defer if (after) |*head| head.deinit();
+            if (after == null) return decoded.manifest;
+            decoded.manifest.deinit(alloc);
+            continue;
+        }
+        var stable_before = before.?;
+        defer stable_before.deinit();
         try ensureClusterBackupAttemptHeadRestorable(
             alloc,
             io,
             location,
-            &before.value,
+            &stable_before.value,
         );
 
         var manifest = try readClusterManifestFromLocation(alloc, location, backup_id);
@@ -4907,7 +4984,7 @@ pub fn readClusterManifestForRestoreAdmission(
         };
         defer after.deinit();
         if (clusterBackupAttemptHeadsEqual(
-            &before.value,
+            &stable_before.value,
             &after.value,
         )) {
             return manifest;
@@ -9219,5 +9296,66 @@ test "restore manifest preserves trusted coverage incarnation metadata" {
     try std.testing.expectError(
         error.InvalidCreateTableRequest,
         createTableRequestFromManifest(std.testing.allocator, &invalid),
+    );
+}
+
+test "restore admission accepts headless current Go portable cluster manifests only" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(
+            alloc,
+            memory.client(),
+            "bucket",
+            "backups",
+        ),
+    };
+    defer location.deinit(alloc);
+
+    const go_backup_id = "go-cluster";
+    const go_manifest_path = try clusterMetadataPath(alloc, "", go_backup_id);
+    defer alloc.free(go_manifest_path);
+    try location.remote.writeBytes(
+        alloc,
+        go_manifest_path,
+        "{\"version\":2,\"state\":\"complete\",\"backup_id\":\"go-cluster\",\"timestamp\":\"2026-07-25T12:00:00Z\",\"antfly_version\":\"go-current\",\"format\":\"portable\",\"expected_table_count\":1,\"completed_table_count\":1,\"tables\":[{\"name\":\"docs\",\"backup_location\":\"s3://archive/prod/table-a-metadata.json\",\"shard_count\":1,\"status\":\"completed\"}]}",
+        "application/json",
+    );
+
+    var admitted = try readClusterManifestForRestoreAdmission(
+        alloc,
+        io,
+        &location,
+        go_backup_id,
+    );
+    defer admitted.deinit(alloc);
+    try std.testing.expectEqualStrings(go_backup_id, admitted.backup_id);
+    try std.testing.expectEqualStrings("table-a", admitted.tables[0].table_backup_id);
+
+    const zig_backup_id = "zig-cluster";
+    const zig_tables = [_]ClusterTableBackupEntry{.{
+        .name = "docs",
+        .table_backup_id = "zig-table",
+    }};
+    var zig_manifest = try createClusterManifest(
+        alloc,
+        zig_backup_id,
+        "s3://bucket/backups",
+        &zig_tables,
+    );
+    defer zig_manifest.deinit(alloc);
+    try writeClusterManifestToLocationWithIo(alloc, io, &location, &zig_manifest);
+    try std.testing.expectError(
+        error.IncompleteClusterBackup,
+        readClusterManifestForRestoreAdmission(
+            alloc,
+            io,
+            &location,
+            zig_backup_id,
+        ),
     );
 }

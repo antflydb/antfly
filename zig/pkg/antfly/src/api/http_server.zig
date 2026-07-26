@@ -7046,7 +7046,10 @@ pub const ApiHttpServer = struct {
         );
     }
 
-    fn acquireClusterRepositoryLease(
+    /// Serialize repository mutations performed by cluster backup writers.
+    /// Restore deliberately never calls this: committed artifacts are immutable
+    /// input and restore.read credentials must remain sufficient.
+    fn acquireClusterBackupMutationLease(
         alloc: std.mem.Allocator,
         io: std.Io,
         location: *backups_api.BackupLocation,
@@ -7088,7 +7091,7 @@ pub const ApiHttpServer = struct {
         }
     }
 
-    const ClusterRepositoryLeaseHeartbeat = struct {
+    const ClusterBackupMutationLeaseHeartbeat = struct {
         alloc: std.mem.Allocator,
         io: std.Io,
         location: *backups_api.BackupLocation,
@@ -7122,13 +7125,6 @@ pub const ApiHttpServer = struct {
                 self.lost.store(true, .release);
                 return error.BackupAttemptLeaseLost;
             }
-        }
-
-        fn remainsWithinReclaimFence(self: *const @This()) bool {
-            if (self.lost.load(.acquire)) return false;
-            const now: u64 = @intCast(std.Io.Timestamp.now(self.io, .real).toNanoseconds());
-            return now < self.expires_at_unix_ns.load(.acquire) +|
-                backups_api.backup_attempt_lease_clock_skew_allowance_ns;
         }
 
         fn run(self: *@This()) void {
@@ -9260,7 +9256,7 @@ pub const ApiHttpServer = struct {
         // The repository lease is the authoritative pre-execution conflict
         // check. One exact expired-owner recovery is bounded independently of
         // repository size; a live operation reports contention explicitly.
-        acquireClusterRepositoryLease(
+        acquireClusterBackupMutationLease(
             op_alloc,
             backup_io,
             location,
@@ -9311,7 +9307,7 @@ pub const ApiHttpServer = struct {
         const initial_lease_expiration =
             @as(u64, @intCast(std.Io.Timestamp.now(backup_io, .real).toNanoseconds())) +|
             backups_api.backup_attempt_lease_duration_ns;
-        var lease_heartbeat: ClusterRepositoryLeaseHeartbeat = .{
+        var lease_heartbeat: ClusterBackupMutationLeaseHeartbeat = .{
             .alloc = op_alloc,
             .io = backup_io,
             .location = location,
@@ -9324,7 +9320,7 @@ pub const ApiHttpServer = struct {
         lease_heartbeat.ensureOwned() catch return error.InternalFailure;
         var lease_future = std.Io.async(
             backup_io,
-            ClusterRepositoryLeaseHeartbeat.run,
+            ClusterBackupMutationLeaseHeartbeat.run,
             .{&lease_heartbeat},
         );
         var lease_future_running = true;
@@ -9507,78 +9503,12 @@ pub const ApiHttpServer = struct {
 
         try self.ensureRestoreActive(cancellation);
 
-        const lease_owner_id = if (cancellation) |token|
-            std.fmt.allocPrint(op_alloc, "restore-{d}-{d}", .{
-                token.job_id,
-                token.attempt_id,
-            }) catch return error.InternalFailure
-        else
-            self.backupGenerationIdAlloc() catch return error.InternalFailure;
-        defer op_alloc.free(lease_owner_id);
-        acquireClusterRepositoryLease(
-            op_alloc,
-            restore_io,
-            location,
-            req.backup_id,
-            lease_owner_id,
-        ) catch |err| {
-            const mapped = mapClusterRestoreRepositoryError(err);
-            if (mapped == error.InternalFailure) {
-                std.log.err(
-                    "cluster restore repository lease failed class={s}",
-                    .{@errorName(err)},
-                );
-            }
-            return mapped;
-        };
-        defer {
-            if (!(backups_api.cleanupClusterReservationIfOwnedAtLocation(
-                op_alloc,
-                restore_io,
-                location,
-                req.backup_id,
-                lease_owner_id,
-            ) catch |err| blk: {
-                std.log.warn(
-                    "cluster restore repository lease release deferred class={s}",
-                    .{@errorName(err)},
-                );
-                break :blk false;
-            })) {
-                std.log.warn("cluster restore repository lease already fenced", .{});
-            }
-        }
-        const initial_lease_expiration =
-            @as(u64, @intCast(std.Io.Timestamp.now(restore_io, .real).toNanoseconds())) +|
-            backups_api.backup_attempt_lease_duration_ns;
-        var lease_heartbeat: ClusterRepositoryLeaseHeartbeat = .{
-            .alloc = op_alloc,
-            .io = restore_io,
-            .location = location,
-            .backup_id = req.backup_id,
-            .attempt_id = lease_owner_id,
-            .expires_at_unix_ns = .init(initial_lease_expiration),
-        };
-        lease_heartbeat.ensureOwned() catch |err| {
-            if (err == error.BackupAttemptLeaseLost)
-                return error.BackupRepositoryBusy;
-            const mapped = mapClusterRestoreRepositoryError(err);
-            std.log.err(
-                "cluster restore repository lease confirmation failed class={s}",
-                .{@errorName(err)},
-            );
-            return mapped;
-        };
-        var lease_future = std.Io.async(
-            restore_io,
-            ClusterRepositoryLeaseHeartbeat.run,
-            .{&lease_heartbeat},
-        );
-        defer {
-            lease_heartbeat.stop_event.set(restore_io);
-            lease_future.await(restore_io);
-        }
-
+        // Restore treats the backup repository as immutable input. Every
+        // selected manifest and artifact is size-bounded and integrity-checked
+        // before publication, so unrelated backup writers cannot invalidate
+        // the read. Keeping coordination in Antfly's durable restore job state
+        // preserves restore.read least privilege and supports read-only/WORM
+        // archives instead of writing lease sidecars into the source.
         var manifest = backups_api.readClusterManifestForRestoreAdmission(
             op_alloc,
             restore_io,
@@ -9659,8 +9589,6 @@ pub const ApiHttpServer = struct {
         const is_overwrite = std.mem.eql(u8, restore_mode, "overwrite");
         for (table_names, 0..) |table_name, i| {
             try self.ensureRestoreActive(cancellation);
-            if (!lease_heartbeat.remainsWithinReclaimFence())
-                return error.BackupRepositoryBusy;
             if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped")) continue;
 
             const cluster_table = backups_api.findClusterTable(&manifest, table_name).?;
@@ -9845,8 +9773,6 @@ pub const ApiHttpServer = struct {
                 }
                 continue;
             };
-            if (!lease_heartbeat.remainsWithinReclaimFence())
-                return error.BackupRepositoryBusy;
             statuses[i].status = switch (outcome) {
                 .committed_durable => "committed",
             };
@@ -28718,7 +28644,7 @@ test "api restore rollback preserves a concurrently replaced table definition" {
     try std.testing.expectEqualStrings("concurrent", state.current.description);
 }
 
-test "api http server cluster overwrite stages before replacing metadata without dropping live table" {
+test "api http server cluster overwrite restores from read-only repository without dropping live table" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28802,6 +28728,19 @@ test "api http server cluster overwrite stages before replacing metadata without
         table_backup_id,
         .native,
     );
+
+    var backup_dir = try std.Io.Dir.openDirAbsolute(
+        std.testing.io,
+        backup_root_abs,
+        .{ .iterate = true },
+    );
+    defer backup_dir.close(std.testing.io);
+    const backup_dir_permissions = (try backup_dir.stat(std.testing.io)).permissions;
+    try backup_dir.setPermissions(
+        std.testing.io,
+        backup_dir_permissions.setReadOnly(true),
+    );
+    defer backup_dir.setPermissions(std.testing.io, backup_dir_permissions) catch {};
 
     const State = struct {
         present: bool = true,
