@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -243,8 +244,15 @@ func (sc *StoreClient) Backup(
 		if err := file.Chmod(0o600); err != nil {
 			return nil, fmt.Errorf("setting backup file permissions: %w", err)
 		}
-		streamHasher := sha256.New()
-		written, err := io.Copy(io.MultiWriter(file, streamHasher), resp.Body)
+		var (
+			streamHasher hash.Hash
+			destination  io.Writer = file
+		)
+		if integrity != nil {
+			streamHasher = sha256.New()
+			destination = io.MultiWriter(file, streamHasher)
+		}
+		written, err := io.Copy(destination, resp.Body)
 		if err != nil {
 			return nil, fmt.Errorf("streaming backup response: %w", err)
 		}

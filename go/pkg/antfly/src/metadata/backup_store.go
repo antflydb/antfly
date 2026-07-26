@@ -114,14 +114,16 @@ func newBackupMetadata(
 	}
 	format = common.NormalizeBackupFormat(format)
 	switch format {
-	case common.BackupFormatNative, common.BackupFormatPortable:
-	default:
-		return nil, fmt.Errorf("unsupported backup format %q", format)
-	}
-	if format == common.BackupFormatPortable {
+	case common.BackupFormatNative:
+		if len(artifacts) != 0 {
+			return nil, errors.New("native backup metadata must not declare portable artifacts")
+		}
+	case common.BackupFormatPortable:
 		if err := validatePortableArtifactIntegrities(table, artifacts); err != nil {
 			return nil, err
 		}
+	default:
+		return nil, fmt.Errorf("unsupported backup format %q", format)
 	}
 	return &backupMetadata{
 		Version:   backupMetadataVersion,
@@ -144,7 +146,9 @@ func validatePortableArtifactIntegrities(
 		if err != nil || len(decoded) != sha256.Size ||
 			hex.EncodeToString(decoded) != artifact.SHA256 ||
 			artifact.SizeBytes == 0 ||
-			path.Base(artifact.Name) != artifact.Name {
+			artifact.Name == "" ||
+			path.Base(artifact.Name) != artifact.Name ||
+			strings.ContainsAny(artifact.Name, `/\`) {
 			return fmt.Errorf("invalid portable backup artifact identity %q", artifact.Name)
 		}
 		if _, duplicate := seen[artifact.Name]; duplicate {
@@ -167,14 +171,16 @@ func decodeBackupMetadata(data []byte) (*store.Table, common.BackupFormat, error
 		return nil, "", fmt.Errorf("backup metadata is missing table")
 	}
 	switch metadata.Format {
-	case common.BackupFormatNative, common.BackupFormatPortable:
-	default:
-		return nil, "", fmt.Errorf("unsupported backup format %q", metadata.Format)
-	}
-	if metadata.Format == common.BackupFormatPortable {
+	case common.BackupFormatNative:
+		if len(metadata.Artifacts) != 0 {
+			return nil, "", errors.New("native backup metadata declares portable artifacts")
+		}
+	case common.BackupFormatPortable:
 		if err := validatePortableArtifactIntegrities(metadata.Table, metadata.Artifacts); err != nil {
 			return nil, "", err
 		}
+	default:
+		return nil, "", fmt.Errorf("unsupported backup format %q", metadata.Format)
 	}
 	return metadata.Table, metadata.Format, nil
 }
