@@ -257,6 +257,228 @@ fn parseSseEventsAlloc(alloc: std.mem.Allocator, body: []const u8) ![]TestSseEve
 
 pub const public_api_max_request_body_bytes: usize = public_limits.max_request_body_bytes;
 const max_concurrent_restore_jobs: usize = 2;
+const max_pending_backup_maintenance_targets: usize = 128;
+
+fn trimBackupMaintenanceLocationTrailingSlash(value: []const u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and value[end - 1] == '/') end -= 1;
+    return value[0..end];
+}
+
+const ClusterBackupMaintenanceTarget = struct {
+    location_uri: []u8,
+    connection: []u8,
+    next_run_monotonic_ns: u64 = 0,
+
+    fn create(
+        alloc: std.mem.Allocator,
+        location_uri: []const u8,
+        connection: []const u8,
+    ) !*@This() {
+        const target = try alloc.create(@This());
+        errdefer alloc.destroy(target);
+        const owned_location = try alloc.dupe(u8, location_uri);
+        errdefer alloc.free(owned_location);
+        const owned_connection = try alloc.dupe(u8, connection);
+        target.* = .{
+            .location_uri = owned_location,
+            .connection = owned_connection,
+        };
+        return target;
+    }
+
+    fn destroy(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.connection);
+        alloc.free(self.location_uri);
+        alloc.destroy(self);
+    }
+
+    fn matches(
+        self: *const @This(),
+        location_uri: []const u8,
+        connection: []const u8,
+    ) bool {
+        // Remote URI parsing canonicalizes a terminal slash. Apply the same
+        // equivalence before queueing so issue-399's two accepted spellings do
+        // not consume separate maintenance slots.
+        return std.mem.eql(
+            u8,
+            trimBackupMaintenanceLocationTrailingSlash(self.location_uri),
+            trimBackupMaintenanceLocationTrailingSlash(location_uri),
+        ) and std.mem.eql(u8, self.connection, connection);
+    }
+};
+
+/// Bounded FIFO of distinct backup repositories. The queue owns every target
+/// from admission through worker completion. A head index avoids shifting the
+/// tail on every dequeue while retaining strict FIFO fairness.
+const ClusterBackupMaintenanceQueue = struct {
+    pending: std.ArrayListUnmanaged(*ClusterBackupMaintenanceTarget) = .empty,
+    pending_head: usize = 0,
+    active: ?*ClusterBackupMaintenanceTarget = null,
+
+    fn pendingCount(self: *const @This()) usize {
+        return self.pending.items.len - self.pending_head;
+    }
+
+    fn contains(
+        self: *const @This(),
+        location_uri: []const u8,
+        connection: []const u8,
+    ) bool {
+        if (self.active) |target| {
+            if (target.matches(location_uri, connection)) return true;
+        }
+        for (self.pending.items[self.pending_head..]) |target| {
+            if (target.matches(location_uri, connection)) return true;
+        }
+        return false;
+    }
+
+    /// Returns false when the target was already active or queued.
+    fn enqueue(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        location_uri: []const u8,
+        connection: []const u8,
+    ) !bool {
+        if (self.contains(location_uri, connection)) return false;
+        if (self.pendingCount() == max_pending_backup_maintenance_targets)
+            return error.BackupMaintenanceQueueFull;
+        if (self.pending_head == self.pending.items.len) {
+            self.pending.clearRetainingCapacity();
+            self.pending_head = 0;
+        } else if (self.pending_head >= self.pending.items.len / 2) {
+            const live = self.pending.items[self.pending_head..];
+            std.mem.copyForwards(
+                *ClusterBackupMaintenanceTarget,
+                self.pending.items[0..live.len],
+                live,
+            );
+            self.pending.items.len = live.len;
+            self.pending_head = 0;
+        }
+        const target = try ClusterBackupMaintenanceTarget.create(
+            alloc,
+            location_uri,
+            connection,
+        );
+        errdefer target.destroy(alloc);
+        try self.pending.append(alloc, target);
+        return true;
+    }
+
+    fn activateNext(self: *@This()) ?*ClusterBackupMaintenanceTarget {
+        if (self.active != null or self.pendingCount() == 0) return null;
+        const target = self.pending.items[self.pending_head];
+        self.pending_head += 1;
+        self.active = target;
+        return target;
+    }
+
+    fn requeueActive(self: *@This(), target: *ClusterBackupMaintenanceTarget) void {
+        std.debug.assert(self.active == target);
+        std.debug.assert(self.pending_head > 0);
+        self.active = null;
+        self.pending_head -= 1;
+        self.pending.items[self.pending_head] = target;
+    }
+
+    fn completeActive(self: *@This(), target: *ClusterBackupMaintenanceTarget) void {
+        std.debug.assert(self.active == target);
+        self.active = null;
+    }
+
+    /// Rotate the completed target behind every repository currently waiting.
+    /// The active slot already supplies enough storage, so steady-state
+    /// maintenance performs no allocation.
+    fn rotateActive(self: *@This(), target: *ClusterBackupMaintenanceTarget) void {
+        std.debug.assert(self.active == target);
+        std.debug.assert(self.pending_head > 0);
+        const live = self.pending.items[self.pending_head..];
+        std.mem.copyForwards(
+            *ClusterBackupMaintenanceTarget,
+            self.pending.items[0..live.len],
+            live,
+        );
+        self.pending.items[live.len] = target;
+        self.pending.items.len = live.len + 1;
+        self.pending_head = 0;
+        self.active = null;
+    }
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        std.debug.assert(self.active == null);
+        for (self.pending.items[self.pending_head..]) |target| target.destroy(alloc);
+        self.pending.deinit(alloc);
+        self.* = .{};
+    }
+};
+
+test "cluster backup maintenance queue retains distinct locations with bounded deduplication" {
+    const alloc = std.testing.allocator;
+    var queue: ClusterBackupMaintenanceQueue = .{};
+    defer queue.deinit(alloc);
+
+    try std.testing.expect(try queue.enqueue(
+        alloc,
+        "s3://bucket/backups/a",
+        "external",
+    ));
+    try std.testing.expect(!(try queue.enqueue(
+        alloc,
+        "s3://bucket/backups/a/",
+        "external",
+    )));
+    try std.testing.expect(try queue.enqueue(
+        alloc,
+        "s3://bucket/backups/b",
+        "external",
+    ));
+
+    const first = queue.activateNext() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("s3://bucket/backups/a", first.location_uri);
+    try std.testing.expect(!(try queue.enqueue(
+        alloc,
+        "s3://bucket/backups/a",
+        "external",
+    )));
+    try std.testing.expect(try queue.enqueue(
+        alloc,
+        "s3://bucket/backups/c",
+        "external",
+    ));
+    queue.completeActive(first);
+    first.destroy(alloc);
+
+    const second = queue.activateNext() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("s3://bucket/backups/b", second.location_uri);
+    queue.completeActive(second);
+    second.destroy(alloc);
+    const third = queue.activateNext() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("s3://bucket/backups/c", third.location_uri);
+    queue.completeActive(third);
+    third.destroy(alloc);
+    try std.testing.expectEqual(@as(usize, 0), queue.pendingCount());
+}
+
+test "cluster backup maintenance queue rotates repositories without allocation" {
+    const alloc = std.testing.allocator;
+    var queue: ClusterBackupMaintenanceQueue = .{};
+    defer queue.deinit(alloc);
+    _ = try queue.enqueue(alloc, "file:///a", "local");
+    _ = try queue.enqueue(alloc, "file:///b", "local");
+
+    const first = queue.activateNext() orelse return error.TestUnexpectedResult;
+    queue.rotateActive(first);
+    const second = queue.activateNext() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("file:///b", second.location_uri);
+    queue.rotateActive(second);
+    const first_again = queue.activateNext() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first_again == first);
+    queue.completeActive(first_again);
+    first_again.destroy(alloc);
+}
 
 pub const RestoreExecutionGuard = struct {
     ptr: *anyopaque,
@@ -1335,8 +1557,9 @@ pub const ApiHttpServer = struct {
     session_maintenance_owner_id: u64 = 0,
     session_maintenance_in_flight: std.atomic.Value(bool) = .init(false),
     backup_maintenance_owner_id: u64 = 0,
-    backup_maintenance_in_flight: std.atomic.Value(bool) = .init(false),
-    last_backup_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
+    backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
+    backup_maintenance_mutex: std.atomic.Mutex = .unlocked,
+    backup_maintenance_queue: ClusterBackupMaintenanceQueue = .{},
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -1606,12 +1829,16 @@ pub const ApiHttpServer = struct {
 
     pub fn deinit(self: *ApiHttpServer) void {
         self.restore_jobs_closing.store(true, .release);
+        self.backup_maintenance_closing.store(true, .release);
         if (self.cfg.backend_runtime) |runtime| {
             if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
             if (self.restore_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.restore_job_owner_id);
             if (self.session_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
             if (self.backup_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.backup_maintenance_owner_id);
         }
+        platform_sync.lockYielding(&self.backup_maintenance_mutex);
+        self.backup_maintenance_queue.deinit(self.owner_alloc);
+        self.backup_maintenance_mutex.unlock();
         self.mcp_sessions.deinit(self.owner_alloc);
         self.a2a_tasks.deinit(self.owner_alloc);
         self.txn_sessions.deinit(self.alloc);
@@ -1981,103 +2208,154 @@ pub const ApiHttpServer = struct {
 
     const ClusterBackupMaintenanceWork = struct {
         server: *ApiHttpServer,
-        location_uri: []u8,
-        connection: []u8,
+        target: *ClusterBackupMaintenanceTarget,
+
+        fn waitUntilDue(self: *@This(), io: std.Io) bool {
+            while (!self.server.backup_maintenance_closing.load(.acquire)) {
+                const now_ns = platform_time.monotonicNs();
+                if (now_ns >= self.target.next_run_monotonic_ns) return true;
+                const remaining_ns = self.target.next_run_monotonic_ns - now_ns;
+                io.sleep(
+                    std.Io.Duration.fromNanoseconds(
+                        @min(remaining_ns, std.time.ns_per_s),
+                    ),
+                    .awake,
+                ) catch return false;
+            }
+            return false;
+        }
 
         fn run(ptr: *anyopaque) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const io = self.server.sharedApiIo() orelse
                 return error.BackgroundRuntimeUnavailable;
-            var location = try backups_api.openBackupLocationWithOptions(
-                self.server.owner_alloc,
-                self.location_uri,
-                .{
-                    .secret_store = self.server.cfg.secret_store,
-                    .node_config = self.server.cfg.node_config,
-                    .connection = self.connection,
-                    .required_capability = "backup.write",
-                    .io = io,
-                },
-            );
-            defer location.deinit(self.server.owner_alloc);
-            const now_unix_ns: u64 = @intCast(
-                std.Io.Timestamp.now(io, .real).toNanoseconds(),
-            );
-            _ = try backups_api.reclaimStaleClusterBackupAttempts(
-                self.server.owner_alloc,
-                io,
-                &location,
-                now_unix_ns,
-            );
+            while (self.waitUntilDue(io)) {
+                var location = backups_api.openBackupLocationWithOptions(
+                    self.server.owner_alloc,
+                    self.target.location_uri,
+                    .{
+                        .secret_store = self.server.cfg.secret_store,
+                        .node_config = self.server.cfg.node_config,
+                        .connection = self.target.connection,
+                        .required_capability = "backup.write",
+                        .io = io,
+                    },
+                ) catch |err| {
+                    std.log.warn("cluster backup maintenance location open deferred class={s}", .{@errorName(err)});
+                    self.rotateToNextTarget();
+                    continue;
+                };
+                const now_unix_ns: u64 = @intCast(
+                    std.Io.Timestamp.now(io, .real).toNanoseconds(),
+                );
+                _ = backups_api.reclaimStaleClusterBackupAttempts(
+                    self.server.owner_alloc,
+                    io,
+                    &location,
+                    now_unix_ns,
+                ) catch |err| {
+                    std.log.warn("cluster backup stale-attempt maintenance deferred class={s}", .{@errorName(err)});
+                };
+                location.deinit(self.server.owner_alloc);
+                self.rotateToNextTarget();
+            }
+        }
+
+        fn rotateToNextTarget(self: *@This()) void {
+            self.target.next_run_monotonic_ns =
+                platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+            platform_sync.lockYielding(&self.server.backup_maintenance_mutex);
+            self.server.backup_maintenance_queue.rotateActive(self.target);
+            self.target = self.server.backup_maintenance_queue.activateNext().?;
+            self.server.backup_maintenance_mutex.unlock();
         }
 
         fn deinit(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const server = self.server;
-            server.owner_alloc.free(self.connection);
-            server.owner_alloc.free(self.location_uri);
+            const target = self.target;
+            platform_sync.lockYielding(&server.backup_maintenance_mutex);
+            server.backup_maintenance_queue.completeActive(target);
+            server.backup_maintenance_mutex.unlock();
+            target.destroy(server.owner_alloc);
             server.owner_alloc.destroy(self);
-            server.backup_maintenance_in_flight.store(false, .release);
         }
     };
 
-    /// Queue one best-effort stale-attempt reclamation quantum. Directory
-    /// enumeration and remote deletes must never run on backup admission's
-    /// latency-sensitive request path.
-    fn scheduleClusterBackupMaintenance(
-        self: *ApiHttpServer,
-        location_uri: []const u8,
-        connection: []const u8,
-    ) !void {
-        const runtime = self.cfg.backend_runtime orelse return;
+    fn submitNextClusterBackupMaintenance(self: *ApiHttpServer) !void {
+        if (self.backup_maintenance_closing.load(.acquire))
+            return error.BackupMaintenanceUnavailable;
+        const runtime = self.cfg.backend_runtime orelse
+            return error.BackupMaintenanceUnavailable;
         if (runtime.threaded_jobs == null or self.backup_maintenance_owner_id == 0)
-            return;
-        if (self.backup_maintenance_in_flight.cmpxchgStrong(
-            false,
-            true,
-            .acq_rel,
-            .acquire,
-        ) != null) return;
-        errdefer self.backup_maintenance_in_flight.store(false, .release);
+            return error.BackupMaintenanceUnavailable;
 
-        const now_ns = platform_time.monotonicNs();
-        const min_schedule_interval_ns = 30 * std.time.ns_per_s;
-        const previous_ns =
-            self.last_backup_maintenance_schedule_ns.load(.acquire);
-        if (previous_ns != 0 and
-            now_ns -| previous_ns < min_schedule_interval_ns)
-        {
-            self.backup_maintenance_in_flight.store(false, .release);
-            return;
+        platform_sync.lockYielding(&self.backup_maintenance_mutex);
+        if (self.backup_maintenance_closing.load(.acquire)) {
+            self.backup_maintenance_mutex.unlock();
+            return error.BackupMaintenanceUnavailable;
         }
-        if (self.last_backup_maintenance_schedule_ns.cmpxchgStrong(
-            previous_ns,
-            now_ns,
-            .acq_rel,
-            .acquire,
-        ) != null) {
-            self.backup_maintenance_in_flight.store(false, .release);
+        const target = self.backup_maintenance_queue.activateNext() orelse {
+            self.backup_maintenance_mutex.unlock();
             return;
-        }
-
-        const work = try self.owner_alloc.create(ClusterBackupMaintenanceWork);
-        errdefer self.owner_alloc.destroy(work);
-        const owned_location = try self.owner_alloc.dupe(u8, location_uri);
-        errdefer self.owner_alloc.free(owned_location);
-        const owned_connection = try self.owner_alloc.dupe(u8, connection);
-        errdefer self.owner_alloc.free(owned_connection);
-        work.* = .{
-            .server = self,
-            .location_uri = owned_location,
-            .connection = owned_connection,
         };
+        const work = self.owner_alloc.create(ClusterBackupMaintenanceWork) catch |err| {
+            self.backup_maintenance_queue.requeueActive(target);
+            self.backup_maintenance_mutex.unlock();
+            return err;
+        };
+        work.* = .{ .server = self, .target = target };
+        // Keep the scheduler mutex through durable-lane admission. Server
+        // shutdown sets `closing` and closes this owner before draining the
+        // queue; serializing submission here guarantees closeOwner either sees
+        // the job or causes submit to fail and requeue it before queue teardown.
         runtime.durable_jobs.submit(.{
             .owner_id = self.backup_maintenance_owner_id,
             .class = .cleanup,
             .ptr = work,
             .run = ClusterBackupMaintenanceWork.run,
             .deinit = ClusterBackupMaintenanceWork.deinit,
-        }) catch |err| return err;
+        }) catch |err| {
+            self.backup_maintenance_queue.requeueActive(target);
+            self.backup_maintenance_mutex.unlock();
+            self.owner_alloc.destroy(work);
+            return err;
+        };
+        self.backup_maintenance_mutex.unlock();
+    }
+
+    /// Register a repository with the periodic bounded maintenance supervisor.
+    /// The FIFO retains distinct locations and rotates them without steady-state
+    /// allocation; stale work therefore progresses even without later requests.
+    fn scheduleClusterBackupMaintenance(
+        self: *ApiHttpServer,
+        location_uri: []const u8,
+        connection: []const u8,
+    ) !void {
+        if (self.backup_maintenance_closing.load(.acquire))
+            return error.BackupMaintenanceUnavailable;
+        const runtime = self.cfg.backend_runtime orelse return;
+        if (runtime.threaded_jobs == null or self.backup_maintenance_owner_id == 0)
+            return;
+
+        platform_sync.lockYielding(&self.backup_maintenance_mutex);
+        if (self.backup_maintenance_closing.load(.acquire)) {
+            self.backup_maintenance_mutex.unlock();
+            return error.BackupMaintenanceUnavailable;
+        }
+        const enqueue_result = self.backup_maintenance_queue.enqueue(
+            self.owner_alloc,
+            location_uri,
+            connection,
+        );
+        self.backup_maintenance_mutex.unlock();
+        _ = enqueue_result catch |err| {
+            // Preserve progress for already queued repositories even when this
+            // caller receives explicit bounded-queue backpressure.
+            self.submitNextClusterBackupMaintenance() catch {};
+            return err;
+        };
+        try self.submitNextClusterBackupMaintenance();
     }
 
     pub fn storageMaintenanceExclusiveActive(self: *const ApiHttpServer) bool {
@@ -6847,6 +7125,56 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    /// Bind the bytes that the owned restore will actually publish. Declared
+    /// identities are always verified; they must never be silently accepted by
+    /// the derivation helper. For remote materialization, verify the staged
+    /// copy to cover transfer corruption and source mutation. Only the
+    /// checksum-less portable envelope is allowed to derive a new identity.
+    fn prepareOwnedRestoreArtifactIntegrity(
+        self: *ApiHttpServer,
+        io: std.Io,
+        backup_location: *backups_api.BackupLocation,
+        local_backup_root: []const u8,
+        materialize_snapshot: bool,
+        manifest: *backups_api.TableBackupManifest,
+    ) !void {
+        if (manifest.artifact_integrity_mode == .declared) {
+            if (materialize_snapshot) {
+                var materialized_location: backups_api.BackupLocation = .{
+                    // Borrowed for verification only; this tagged view is not
+                    // deinitialized and therefore does not assume ownership.
+                    .file = @constCast(local_backup_root),
+                };
+                return backups_api.verifyTableBackupArtifactsIntegrityAtLocation(
+                    self.alloc,
+                    io,
+                    &materialized_location,
+                    manifest,
+                );
+            }
+            return backups_api.verifyTableBackupArtifactsIntegrityAtLocation(
+                self.alloc,
+                io,
+                backup_location,
+                manifest,
+            );
+        }
+        if (manifest.format != .portable) return error.UnsupportedBackupFormat;
+        if (!materialize_snapshot) {
+            return self.admitExternalRestoreArtifactIntegrity(
+                io,
+                backup_location,
+                manifest,
+            );
+        }
+        try backups_api.deriveManifestArtifactIntegrity(
+            self.alloc,
+            io,
+            local_backup_root,
+            manifest,
+        );
+    }
+
     fn restoreOwnedTableWithLifecycle(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -6864,7 +7192,11 @@ pub const ApiHttpServer = struct {
             artifact_backup_id,
         ) catch |err| switch (err) {
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
-            else => return error.InvalidBackupRequest,
+            else => if (err == error.FileNotFound or
+                backups_api.isInvalidBackupManifestError(err))
+                return error.InvalidBackupRequest
+            else
+                return err,
         };
         defer manifest.deinit(self.alloc);
 
@@ -6897,14 +7229,18 @@ pub const ApiHttpServer = struct {
                 }
             }
         }
-        if (materialize_snapshot) {
-            try backups_api.deriveManifestArtifactIntegrity(
-                self.alloc,
-                self.sharedApiIo(),
-                local_backup_root,
-                &manifest,
-            );
-        }
+        var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
+            std.Io.Threaded.init(std.heap.page_allocator, .{})
+        else
+            null;
+        defer if (fallback_io) |*owned| owned.deinit();
+        try self.prepareOwnedRestoreArtifactIntegrity(
+            self.sharedApiIo() orelse fallback_io.?.io(),
+            backup_location,
+            local_backup_root,
+            materialize_snapshot,
+            &manifest,
+        );
 
         // Remote transfer and validation do not require exclusive table
         // admission. Fence only the publication window so unrelated tables and
@@ -8192,8 +8528,11 @@ pub const ApiHttpServer = struct {
                 error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
                 else => if (backups_api.isArtifactIntegrityError(err))
                     return error.BackupIntegrityFailure
+                else if (err == error.FileNotFound or
+                    backups_api.isInvalidBackupManifestError(err))
+                    return error.InvalidBackupRequest
                 else
-                    return error.InvalidBackupRequest,
+                    return error.InternalFailure,
             };
             defer manifest.deinit(self.alloc);
             backups_api.validateRestoreManifest(self.alloc, &manifest, backup_id) catch |err| {
@@ -8206,7 +8545,9 @@ pub const ApiHttpServer = struct {
                 &manifest,
             ) catch |err| {
                 if (backups_api.isArtifactIntegrityError(err)) return error.BackupIntegrityFailure;
-                return error.InvalidBackupRequest;
+                if (backups_api.isInvalidBackupManifestError(err))
+                    return error.InvalidBackupRequest;
+                return error.InternalFailure;
             };
             if (!std.mem.eql(u8, manifest.table_name, table_name))
                 return error.InvalidBackupRequest;
@@ -8947,6 +9288,25 @@ pub const ApiHttpServer = struct {
                     else => error.InternalFailure,
                 };
             };
+            // The immutable aggregate is now the commit record. Stop renewal
+            // before conditionally releasing the repository-global mutation
+            // lease; a cleanup failure is safe because the lease expires and
+            // exact recovery recognizes the committed marker.
+            lease_heartbeat.stop_event.set(backup_io);
+            lease_future.await(backup_io);
+            lease_future_running = false;
+            if (!(backups_api.cleanupClusterReservationIfOwnedAtLocation(
+                op_alloc,
+                backup_io,
+                location,
+                req.backup_id,
+                attempt_id,
+            ) catch |err| blk: {
+                std.log.warn("cluster backup committed lease release deferred class={s}", .{@errorName(err)});
+                break :blk false;
+            })) {
+                std.log.warn("cluster backup committed with lease already fenced", .{});
+            }
             cluster_committed = true;
         } else {
             // A partial aggregate is not a restore candidate. Reclaim every
@@ -8978,6 +9338,22 @@ pub const ApiHttpServer = struct {
 
     const RestoreCancellation = struct { job_id: u64, attempt_id: u64 };
 
+    fn mapClusterRestoreRepositoryError(
+        err: anyerror,
+    ) cluster_api_http.ClusterApi.ExecuteRestoreError {
+        if (err == error.BackupManifestTooLarge)
+            return error.BackupManifestTooLarge;
+        if (backups_api.isArtifactIntegrityError(err))
+            return error.BackupIntegrityFailure;
+        if (err == error.FileNotFound or
+            backups_api.isInvalidBackupManifestError(err))
+            return error.InvalidRequest;
+        // Repository contention, allocation failures, credential refresh, and
+        // storage transport errors are server-side availability failures. A
+        // 400 would incorrectly make them permanent and suppress safe retries.
+        return error.InternalFailure;
+    }
+
     fn executePublicClusterRestoreWithCancellation(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -9001,12 +9377,15 @@ pub const ApiHttpServer = struct {
             self.sharedApiIo() orelse return error.InternalFailure,
             location,
             req.backup_id,
-        ) catch |err| switch (err) {
-            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
-            else => if (backups_api.isArtifactIntegrityError(err))
-                return error.BackupIntegrityFailure
-            else
-                return error.InvalidRequest,
+        ) catch |err| {
+            const mapped = mapClusterRestoreRepositoryError(err);
+            if (mapped == error.InternalFailure) {
+                std.log.err(
+                    "cluster restore admission failed phase=repository class={s}",
+                    .{@errorName(err)},
+                );
+            }
+            return mapped;
         };
         defer manifest.deinit(op_alloc);
 
@@ -9117,15 +9496,26 @@ pub const ApiHttpServer = struct {
                     location,
                     table_backup_id,
                     artifact_backup_id,
-                ) catch |err| switch (err) {
-                    error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
-                    else => {
-                        statuses[i].@"error" = if (backups_api.isArtifactIntegrityError(err))
-                            backups_api.integrity_failure_message
-                        else
-                            "invalid table backup manifest";
-                        continue;
-                    },
+                ) catch |err| {
+                    switch (mapClusterRestoreRepositoryError(err)) {
+                        error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+                        error.InternalFailure => {
+                            std.log.err(
+                                "cluster restore manifest read failed phase=table class={s}",
+                                .{@errorName(err)},
+                            );
+                            return error.InternalFailure;
+                        },
+                        error.BackupIntegrityFailure => {
+                            statuses[i].@"error" = backups_api.integrity_failure_message;
+                            continue;
+                        },
+                        error.InvalidRequest => {
+                            statuses[i].@"error" = "invalid table backup manifest";
+                            continue;
+                        },
+                        else => unreachable,
+                    }
                 };
                 defer table_manifest.deinit(op_alloc);
                 if (!std.mem.eql(u8, table_manifest.table_name, table_name)) {
@@ -9137,11 +9527,25 @@ pub const ApiHttpServer = struct {
                     location,
                     &table_manifest,
                 ) catch |err| {
-                    statuses[i].@"error" = if (backups_api.isArtifactIntegrityError(err))
-                        backups_api.integrity_failure_message
-                    else
-                        "unable to bind portable backup artifact integrity";
-                    continue;
+                    switch (mapClusterRestoreRepositoryError(err)) {
+                        error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
+                        error.InternalFailure => {
+                            std.log.err(
+                                "cluster restore integrity admission failed phase=table class={s}",
+                                .{@errorName(err)},
+                            );
+                            return error.InternalFailure;
+                        },
+                        error.BackupIntegrityFailure => {
+                            statuses[i].@"error" = backups_api.integrity_failure_message;
+                            continue;
+                        },
+                        error.InvalidRequest => {
+                            statuses[i].@"error" = "unable to bind portable backup artifact integrity";
+                            continue;
+                        },
+                        else => unreachable,
+                    }
                 };
 
                 const restored_via_metadata = self.restoreMetadataTableWithRetry(
@@ -9172,7 +9576,7 @@ pub const ApiHttpServer = struct {
                             else => if (backups_api.isArtifactIntegrityError(err))
                                 backups_api.integrity_failure_message
                             else
-                                "restore failed",
+                                return error.InternalFailure,
                         };
                         continue;
                     },
@@ -9216,7 +9620,7 @@ pub const ApiHttpServer = struct {
                     else => if (backups_api.isArtifactIntegrityError(err))
                         backups_api.integrity_failure_message
                     else
-                        "restore failed",
+                        return error.InternalFailure,
                 };
                 if (err == error.RestoreDurabilityPending or err == error.GenerationDurabilityUncertain) {
                     self.checkpointRestoreTableDurabilityPending(cancellation, @intCast(i)) catch |checkpoint_err| {
@@ -29013,6 +29417,95 @@ test "distributed restore binds Go portable artifact bytes before metadata publi
     try std.testing.expectEqual(backups_api.ArtifactIntegrityMode.declared, manifest.artifact_integrity_mode);
     try std.testing.expectEqual(@as(u64, "portable-artifact".len), manifest.shards[0].artifact_size_bytes);
     try std.testing.expectEqual(@as(usize, 64), manifest.shards[0].artifact_sha256.len);
+}
+
+test "owned restore verifies declared artifact identity instead of accepting staged bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const artifact_path = try std.fmt.allocPrint(alloc, "{s}/snap1.afb", .{root});
+    defer alloc.free(artifact_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = artifact_path,
+        .data = "corrupted-after-manifest-publication",
+    });
+
+    const shards = [_]backups_api.ShardSnapshot{.{
+        .group_id = 7,
+        .start_key = "",
+        .end_key = null,
+        .snapshot_path = "snap1.afb",
+        .artifact_size_bytes = 5,
+        .artifact_sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+    }};
+    var manifest = try backups_api.createManifest(
+        alloc,
+        "snap1",
+        .portable,
+        &.{
+            .table_id = 7,
+            .name = "docs",
+            .description = "",
+            .schema_json = "{}",
+            .read_schema_json = "",
+            .indexes_json = "{}",
+            .replication_sources_json = "[]",
+        },
+        &shards,
+    );
+    defer manifest.deinit(alloc);
+    var location: backups_api.BackupLocation = .{ .file = root };
+
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(alloc, .{}, .{
+        .ptr = undefined,
+        .vtable = &.{ .status = Fake.status },
+    }, null, null);
+    defer server.deinit();
+
+    try std.testing.expectError(
+        error.BackupArtifactIntegrityMismatch,
+        server.prepareOwnedRestoreArtifactIntegrity(
+            std.testing.io,
+            &location,
+            root,
+            true,
+            &manifest,
+        ),
+    );
+}
+
+test "cluster restore repository errors preserve operational failure semantics" {
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.InvalidRequest),
+        ApiHttpServer.mapClusterRestoreRepositoryError(error.SyntaxError),
+    );
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.BackupIntegrityFailure),
+        ApiHttpServer.mapClusterRestoreRepositoryError(
+            error.BackupArtifactIntegrityMismatch,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.BackupManifestTooLarge),
+        ApiHttpServer.mapClusterRestoreRepositoryError(
+            error.BackupManifestTooLarge,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.InternalFailure),
+        ApiHttpServer.mapClusterRestoreRepositoryError(error.ConnectionTimeout),
+    );
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.InternalFailure),
+        ApiHttpServer.mapClusterRestoreRepositoryError(error.BackupRepositoryBusy),
+    );
 }
 
 test "api http server join planner uses snapshot stats for low-selectivity lookup joins" {
