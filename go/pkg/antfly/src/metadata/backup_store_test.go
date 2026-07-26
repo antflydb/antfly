@@ -18,6 +18,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -28,6 +29,42 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type cleanupOrderBackupStore struct {
+	expectedMetadata  int32
+	expectedArtifacts int32
+	metadataDeleted   atomic.Int32
+	artifactsDeleted  atomic.Int32
+	phaseViolation    atomic.Bool
+}
+
+func (*cleanupOrderBackupStore) EnsureMetadataAbsent(context.Context, string) error { return nil }
+func (*cleanupOrderBackupStore) ReserveBackupID(context.Context, string) error      { return nil }
+func (s *cleanupOrderBackupStore) DeleteMetadata(context.Context, string) error {
+	s.metadataDeleted.Add(1)
+	return nil
+}
+func (s *cleanupOrderBackupStore) DeleteArtifact(context.Context, string) error {
+	if s.metadataDeleted.Load() != s.expectedMetadata {
+		s.phaseViolation.Store(true)
+	}
+	s.artifactsDeleted.Add(1)
+	return nil
+}
+func (*cleanupOrderBackupStore) ValidateArtifact(context.Context, string) error { return nil }
+func (s *cleanupOrderBackupStore) ReleaseBackupID(context.Context, string) error {
+	if s.artifactsDeleted.Load() != s.expectedArtifacts {
+		s.phaseViolation.Store(true)
+	}
+	return nil
+}
+func (*cleanupOrderBackupStore) WriteMetadata(context.Context, string, *store.Table, common.BackupFormat) error {
+	return nil
+}
+func (*cleanupOrderBackupStore) ReadMetadata(context.Context, string) (*store.Table, common.BackupFormat, error) {
+	return nil, "", errors.New("not implemented")
+}
+func (*cleanupOrderBackupStore) ResolvedLocation() string { return "" }
 
 func TestFileBackupStorePersistsFormatInVersionedEnvelope(t *testing.T) {
 	root := t.TempDir()
@@ -96,6 +133,47 @@ func TestFileBackupStoreCleanupReleasesReservationAfterArtifactsAreRemoved(t *te
 	require.NoError(t, backupStore.DeleteMetadata(context.Background(), "backup-1"))
 	require.NoError(t, backupStore.ReleaseBackupID(context.Background(), "backup-1"))
 	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+}
+
+func TestBackupAttemptCleanupRemovesCommitRecordsBeforeArtifacts(t *testing.T) {
+	backupStore := &cleanupOrderBackupStore{
+		expectedMetadata:  2,
+		expectedArtifacts: 2,
+	}
+	require.NoError(t, cleanupBackupAttempt(
+		backupStore,
+		"backup-1",
+		[]string{"table-a", "table-b"},
+		[]string{"artifact-a", "artifact-b"},
+	))
+	require.False(t, backupStore.phaseViolation.Load())
+	require.Equal(t, int32(2), backupStore.metadataDeleted.Load())
+	require.Equal(t, int32(2), backupStore.artifactsDeleted.Load())
+}
+
+func TestBackupAttemptContentCleanupRetainsReservationFence(t *testing.T) {
+	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "backup-1-1.afb"),
+		[]byte("artifact"),
+		0o600,
+	))
+
+	require.NoError(t, cleanupBackupAttemptContents(
+		context.Background(),
+		backupStore,
+		nil,
+		[]string{"backup-1-1.afb"},
+	))
+	require.NoFileExists(t, filepath.Join(root, "backup-1-1.afb"))
+	require.ErrorIs(
+		t,
+		backupStore.ReserveBackupID(context.Background(), "backup-1"),
+		ErrBackupAlreadyExists,
+	)
+	require.NoError(t, backupStore.ReleaseBackupID(context.Background(), "backup-1"))
 }
 
 func TestFileBackupStoreDoesNotPublishAfterCancellation(t *testing.T) {
@@ -176,13 +254,41 @@ func TestTableBackupMetadataIDIsStableAndPathSafe(t *testing.T) {
 }
 
 func TestValidateBackupTableNamesRejectsAmbiguousSelections(t *testing.T) {
-	require.NoError(t, validateBackupTableNames([]string{"documents", "events"}))
+	require.NoError(t, validateBackupTableNames([]string{"documents", "events"}, clusterBackupExplicitTableLimit))
 	require.ErrorContains(
 		t,
-		validateBackupTableNames([]string{"documents", "documents"}),
+		validateBackupTableNames([]string{"documents", "documents"}, clusterBackupExplicitTableLimit),
 		"selected more than once",
 	)
-	require.ErrorContains(t, validateBackupTableNames([]string{"documents", " "}), "cannot be empty")
+	require.ErrorContains(
+		t,
+		validateBackupTableNames([]string{"documents", " "}, clusterBackupExplicitTableLimit),
+		"1 to 4096 bytes",
+	)
+	require.ErrorContains(
+		t,
+		validateBackupTableNames(
+			[]string{strings.Repeat("x", clusterBackupAttemptMaxNameBytes+1)},
+			clusterBackupExplicitTableLimit,
+		),
+		"1 to 4096 bytes",
+	)
+	require.ErrorContains(
+		t,
+		validateBackupTableNames(
+			make([]string, clusterBackupExplicitTableLimit+1),
+			clusterBackupExplicitTableLimit,
+		),
+		"at most 256 tables",
+	)
+	require.ErrorContains(
+		t,
+		validateBackupTableNames(
+			make([]string, clusterBackupAttemptMaxTables+1),
+			clusterBackupAttemptMaxTables,
+		),
+		"at most 4096 tables",
+	)
 }
 
 func TestFileBackupStoreRejectsUnversionedMetadata(t *testing.T) {
@@ -226,25 +332,8 @@ func TestClusterBackupMetadataRequiresVersionIDAndFormat(t *testing.T) {
 	}
 	require.NoError(t, validateClusterBackupMetadata("backup-1", valid))
 
-	legacy := *valid
-	legacy.Version = clusterBackupMetadataLegacyVersion
-	legacy.State = ""
-	legacy.ExpectedTableCount = 0
-	legacy.CompletedTableCount = 0
-	require.NoError(t, validateClusterBackupMetadata("backup-1", &legacy))
-
-	legacyFailed := legacy
-	legacyFailed.Tables = append([]ClusterBackupTableInfo(nil), legacy.Tables...)
-	legacyFailed.Tables[0].Status = "failed"
-	legacyFailed.Tables[0].Error = "interrupted"
-	require.ErrorContains(
-		t,
-		validateClusterBackupMetadata("backup-1", &legacyFailed),
-		"incomplete table entry",
-	)
-
 	invalidVersion := *valid
-	invalidVersion.Version = 0
+	invalidVersion.Version = 1
 	require.ErrorContains(
 		t,
 		validateClusterBackupMetadata("backup-1", &invalidVersion),
@@ -321,6 +410,7 @@ func TestClusterBackupAttemptMarkersSelectNewestAttempt(t *testing.T) {
 		"file://"+root,
 		nil,
 		backupStore,
+		clusterBackupAttemptScanLimit,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, latest)
@@ -328,7 +418,34 @@ func TestClusterBackupAttemptMarkersSelectNewestAttempt(t *testing.T) {
 	assert.Equal(t, newer.BackupID, latest.BackupID)
 }
 
-func TestStaleClusterBackupAttemptReclaimsArtifactsAndReservation(t *testing.T) {
+func TestClusterBackupAttemptRejectsOverlappingIdentifiers(t *testing.T) {
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-attempt",
+		BackupID:           "backup-1",
+		CreatedAt:          time.Now().UTC(),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"shared-id"},
+		ArtifactNames:      []string{"shared-id"},
+	}
+	require.ErrorContains(
+		t,
+		validateClusterBackupAttempt(attempt, attempt.AttemptID),
+		"duplicate identifier",
+	)
+
+	attempt.ArtifactNames = []string{"artifact.afb"}
+	attempt.CreatedAt = time.Time{}
+	require.ErrorContains(
+		t,
+		validateClusterBackupAttempt(attempt, attempt.AttemptID),
+		"invalid cluster backup attempt marker",
+	)
+}
+
+func TestStaleUncommittedClusterBackupAttemptRemainsFenced(t *testing.T) {
 	root := t.TempDir()
 	backupStore := &fileBackupStore{location: root}
 	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
@@ -360,16 +477,21 @@ func TestStaleClusterBackupAttemptReclaimsArtifactsAndReservation(t *testing.T) 
 		"file://"+root,
 		nil,
 		backupStore,
+		clusterBackupAttemptScanLimit,
 	)
 	require.NoError(t, err)
 	require.Nil(t, latest)
-	require.NoFileExists(t, filepath.Join(root, "backup-1-1.afb"))
-	require.NoFileExists(t, filepath.Join(
+	require.FileExists(t, filepath.Join(root, "backup-1-1.afb"))
+	require.FileExists(t, filepath.Join(
 		root,
 		clusterBackupAttemptDir,
 		attempt.AttemptID+".json",
 	))
-	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+	require.ErrorIs(
+		t,
+		backupStore.ReserveBackupID(context.Background(), "backup-1"),
+		ErrBackupAlreadyExists,
+	)
 }
 
 func TestFileBackupStoreValidatesArtifactPresence(t *testing.T) {

@@ -309,7 +309,9 @@ test "wal replica provider wires host through WAL-backed local state" {
         try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.wal_commit_elapsed_ns > 0);
         try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.wal_physical_commits > 0);
         try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.wal_inner_segment_syncs > 0);
-        try std.testing.expect(persisted_round.slowest_ready_group.persist_ready_detail.wal_inner_index_syncs > 0);
+        // The WAL index is synced only when its segment metadata changes.
+        // Campaign/bootstrap may initialize it in an earlier Ready; a
+        // steady-state proposal correctly persists with only a segment sync.
         try std.testing.expectEqual(@as(u64, 0), persisted_round.slowest_ready_group.persist_ready_detail.wal_post_commit_segment_syncs);
         try std.testing.expectEqual(@as(u64, 0), persisted_round.slowest_ready_group.persist_ready_detail.wal_post_commit_index_syncs);
 

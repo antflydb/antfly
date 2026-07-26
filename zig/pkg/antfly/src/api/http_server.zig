@@ -6444,7 +6444,7 @@ pub const ApiHttpServer = struct {
         var cleanup_safe = true;
         errdefer if (!committed) {
             if (cleanup_safe) {
-                backups_api.cleanupTableBackupAttemptAtLocation(
+                backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
                     self.alloc,
                     io,
                     backup_location,
@@ -6605,7 +6605,7 @@ pub const ApiHttpServer = struct {
     };
 
     fn restoreOwnedTable(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, source_location: []const u8, backup_id: []const u8) !OwnedRestoreOutcome {
-        return try self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, false, false);
+        return try self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, backup_id, false, false);
     }
 
     fn restoreOwnedTableWithLifecycle(
@@ -6614,10 +6614,16 @@ pub const ApiHttpServer = struct {
         backup_location: *backups_api.BackupLocation,
         source_location: []const u8,
         backup_id: []const u8,
+        artifact_backup_id: []const u8,
         restore_lifecycle_already_active: bool,
         replace_existing: bool,
     ) !OwnedRestoreOutcome {
-        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch |err| switch (err) {
+        var manifest = backups_api.readManifestFromLocationWithArtifactBackupId(
+            self.alloc,
+            backup_location,
+            backup_id,
+            artifact_backup_id,
+        ) catch |err| switch (err) {
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             else => return error.InvalidBackupRequest,
         };
@@ -6651,6 +6657,14 @@ pub const ApiHttpServer = struct {
                     .native => try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root),
                 }
             }
+        }
+        if (materialize_snapshot) {
+            try backups_api.deriveManifestArtifactIntegrity(
+                self.alloc,
+                self.sharedApiIo(),
+                local_backup_root,
+                &manifest,
+            );
         }
 
         // Remote transfer and validation do not require exclusive table
@@ -6868,7 +6882,7 @@ pub const ApiHttpServer = struct {
         source_location: []const u8,
         backup_id: []const u8,
     ) !OwnedRestoreOutcome {
-        return try self.restoreOwnedTableWithRetryAndLifecycle(table_name, backup_location, source_location, backup_id, false, false);
+        return try self.restoreOwnedTableWithRetryAndLifecycle(table_name, backup_location, source_location, backup_id, backup_id, false, false);
     }
 
     fn restoreOwnedTableWithRetryAndLifecycle(
@@ -6877,12 +6891,13 @@ pub const ApiHttpServer = struct {
         backup_location: *backups_api.BackupLocation,
         source_location: []const u8,
         backup_id: []const u8,
+        artifact_backup_id: []const u8,
         restore_lifecycle_already_active: bool,
         replace_existing: bool,
     ) !OwnedRestoreOutcome {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
-            const outcome = self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, restore_lifecycle_already_active, replace_existing) catch |err| switch (err) {
+            const outcome = self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, artifact_backup_id, restore_lifecycle_already_active, replace_existing) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
                     if (attempt + 1 >= 3) return err;
                     if (!replace_existing and (self.tableExists(table_name) catch false)) {
@@ -7881,7 +7896,7 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         self.source.ensureLinearizableRead() catch |err| {
             std.log.warn("table backup metadata read barrier failed table={s} err={s}", .{ table_name, @errorName(err) });
-            return error.InternalFailure;
+            return metadataAccessFailure(err);
         };
         var fallback_io: ?std.Io.Threaded = if (self.sharedApiIo() == null)
             std.Io.Threaded.init(std.heap.page_allocator, .{})
@@ -7890,6 +7905,12 @@ pub const ApiHttpServer = struct {
         defer if (fallback_io) |*owned| owned.deinit();
         const io = self.sharedApiIo() orelse fallback_io.?.io();
         self.backupOwnedTable(io, table_name, location, location_uri, backup_id, format, connection) catch |err| switch (err) {
+            error.NotLeader,
+            error.ProposalDropped,
+            error.LeaderTransferInProgress,
+            error.MetadataLinearizableReadTimeout,
+            error.ReconcileLeaseNotHeld,
+            => return error.NotLeader,
             error.BackupAlreadyExists => return error.BackupAlreadyExists,
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             error.TableNotFound => return error.NotFound,
@@ -7897,6 +7918,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => return error.UnsupportedMultiRangeTable,
             else => {
+                if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 std.log.err("table backup failed table={s} backup_id={s} err={s}", .{ table_name, backup_id, @errorName(err) });
                 return error.InternalFailure;
             },
@@ -8577,8 +8599,8 @@ pub const ApiHttpServer = struct {
                     // the retry-marked 503 from this phase: replaying the POST
                     // would duplicate side effects. Return a sanitized
                     // per-table outcome without publishing an incomplete
-                    // aggregate manifest; the caller can choose a new backup
-                    // id for a retry.
+                    // aggregate manifest. After cleanup completes, the caller
+                    // can safely retry the same backup id.
                     error.NotLeader,
                     error.ProposalDropped,
                     error.LeaderTransferInProgress,
@@ -8632,21 +8654,36 @@ pub const ApiHttpServer = struct {
                 };
             };
             cluster_committed = true;
-            backups_api.deleteClusterBackupAttemptMarker(
+            var reservation_cleaned = true;
+            backups_api.cleanupClusterReservationAtLocation(
                 op_alloc,
                 backup_io,
                 location,
-                attempt_marker.attempt_id,
+                attempt_marker.cluster_backup_id,
             ) catch |err| {
-                // The aggregate manifest is authoritative. The bounded
-                // reclaimer preserves referenced table attempts before
-                // removing a stale marker.
-                std.log.warn("committed cluster backup marker cleanup deferred backup_id={s} attempt_id={s} err={s}", .{
+                std.log.warn("committed cluster backup reservation cleanup deferred backup_id={s} err={s}", .{
                     req.backup_id,
-                    attempt_marker.attempt_id,
                     @errorName(err),
                 });
+                reservation_cleaned = false;
             };
+            if (reservation_cleaned) {
+                backups_api.deleteClusterBackupAttemptMarker(
+                    op_alloc,
+                    backup_io,
+                    location,
+                    attempt_marker.attempt_id,
+                ) catch |err| {
+                    // The aggregate manifest is authoritative. The bounded
+                    // reclaimer preserves referenced table attempts before
+                    // removing a stale marker.
+                    std.log.warn("committed cluster backup marker cleanup deferred backup_id={s} attempt_id={s} err={s}", .{
+                        req.backup_id,
+                        attempt_marker.attempt_id,
+                        @errorName(err),
+                    });
+                };
+            }
         } else {
             // A partial aggregate is not a restore candidate. Reclaim every
             // completed table attempt before releasing the cluster reservation
@@ -8766,7 +8803,9 @@ pub const ApiHttpServer = struct {
             try self.ensureRestoreActive(cancellation);
             if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped")) continue;
 
-            const table_backup_id = backups_api.findClusterTable(&manifest, table_name).?.table_backup_id;
+            const cluster_table = backups_api.findClusterTable(&manifest, table_name).?;
+            const table_backup_id = cluster_table.table_backup_id;
+            const artifact_backup_id = cluster_table.artifact_backup_id orelse table_backup_id;
 
             // published_table_ranges is a durable publication checkpoint. On a
             // resumed attempt, do not republish or reject the table merely
@@ -8801,7 +8840,12 @@ pub const ApiHttpServer = struct {
             // Overwrite publication is local and generation-aware. New-table
             // restores may delegate to metadata in distributed deployments.
             if (!is_overwrite and !self.cfg.deployment_mode.isStandalone()) {
-                var table_manifest = backups_api.readManifestFromLocation(op_alloc, location, table_backup_id) catch |err| switch (err) {
+                var table_manifest = backups_api.readManifestFromLocationWithArtifactBackupId(
+                    op_alloc,
+                    location,
+                    table_backup_id,
+                    artifact_backup_id,
+                ) catch |err| switch (err) {
                     error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
                     else => {
                         statuses[i].@"error" = if (backups_api.isArtifactIntegrityError(err))
@@ -8876,7 +8920,7 @@ pub const ApiHttpServer = struct {
             }
 
             const replace_existing = is_overwrite and (self.tableExists(table_name) catch |err| return metadataAccessFailure(err));
-            const outcome = self.restoreOwnedTableWithRetryAndLifecycle(table_name, location, req.location, table_backup_id, false, replace_existing) catch |err| {
+            const outcome = self.restoreOwnedTableWithRetryAndLifecycle(table_name, location, req.location, table_backup_id, artifact_backup_id, false, replace_existing) catch |err| {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 std.log.err("cluster restore failed table={s} backup_id={s} err={}", .{
                     table_name,
@@ -26432,6 +26476,36 @@ test "api http server lists cluster backups through public route" {
             .table_backup_id = "docs-snap1",
         },
     };
+    const artifact_rel_path = "docs-snap1.afb";
+    const shards = [_]backups_api.ShardSnapshot{.{
+        .group_id = 1,
+        .start_key = "",
+        .snapshot_path = artifact_rel_path,
+    }};
+    const table_record: metadata_table_manager.TableRecord = .{
+        .table_id = 1,
+        .name = "docs",
+        .schema_json = "{}",
+    };
+    var table_manifest = try backups_api.createManifest(
+        alloc,
+        table_entries[0].table_backup_id,
+        .portable,
+        &table_record,
+        &shards,
+    );
+    defer table_manifest.deinit(alloc);
+    table_manifest.artifact_integrity_mode = .derive_after_materialization;
+    try backups_api.writeManifest(alloc, backup_root, &table_manifest);
+    const artifact_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+        backup_root,
+        artifact_rel_path,
+    });
+    defer alloc.free(artifact_path);
+    var artifact_file = try std.Io.Dir.cwd().createFile(std.testing.io, artifact_path, .{ .truncate = true });
+    try artifact_file.writePositionalAll(std.testing.io, "payload", 0);
+    try artifact_file.sync(std.testing.io);
+    artifact_file.close(std.testing.io);
     var manifest = try backups_api.createClusterManifest(alloc, "snap1", location_uri, &table_entries);
     defer manifest.deinit(alloc);
     try backups_api.writeClusterManifest(alloc, backup_root, &manifest);

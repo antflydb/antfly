@@ -2162,6 +2162,7 @@ const NativeAtomicWriteSink = struct {
     }
 
     fn deinit(self: *NativeAtomicWriteSink) void {
+        if (self.fd >= 0) closeFd(self.fd);
         self.state.release();
         self.allocator.free(self.final_path);
         self.allocator.free(self.tmp_path);
@@ -2205,7 +2206,13 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
 
-        try fs_paths.syncFileFdPortable(self.fd);
+        fs_paths.syncFileFdPortable(self.fd) catch |err| {
+            closeFd(self.fd);
+            self.fd = -1;
+            self.state.invalidatePath(self.tmp_path);
+            deleteFilePathPosix(self.tmp_path) catch {};
+            return err;
+        };
         closeFd(self.fd);
         self.fd = -1;
 
@@ -2219,7 +2226,10 @@ const NativeAtomicWriteSink = struct {
 
     fn abort(ptr: *anyopaque) void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (self.fd >= 0) closeFd(self.fd);
+        if (self.fd >= 0) {
+            closeFd(self.fd);
+            self.fd = -1;
+        }
         self.state.invalidatePath(self.tmp_path);
         deleteFilePathPosix(self.tmp_path) catch {};
         self.deinit();
@@ -2672,6 +2682,37 @@ test "native atomic write sink supports patching and crc before finish" {
     const written = try native.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("hello world", written);
+}
+
+test "native atomic write sink cleans temporary file when content sync fails" {
+    if (!supports_native_storage) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-atomic-sync-failure-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
+    defer native.storage().deleteFileAbsolute(path) catch {};
+
+    var writer = try native.storage().beginAtomicWrite(std.testing.allocator, path);
+    const impl: *NativeAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
+    const tmp_path = try std.testing.allocator.dupe(u8, impl.tmp_path);
+    defer std.testing.allocator.free(tmp_path);
+    try writer.appendSlice("uncommitted");
+
+    closeFd(impl.fd);
+    impl.fd = -1;
+    try std.testing.expectError(error.InvalidFileDescriptor, writer.finish());
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        native.storage().fileSize(tmp_path),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        native.storage().fileSize(path),
+    );
 }
 
 test "buffered atomic write sink supports overlapping writes and appends" {

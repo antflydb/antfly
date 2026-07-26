@@ -99,6 +99,7 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteBackupError = error{
+        NotLeader,
         NotFound,
         BackupAlreadyExists,
         MethodNotAllowed,
@@ -760,6 +761,7 @@ pub fn handleTableBackup(
     defer location.deinit(alloc);
 
     api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, parsed_req.value.location, parsed_req.value.connection, &location) catch |err| switch (err) {
+        error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, "backup id already exists") },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },

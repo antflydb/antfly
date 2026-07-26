@@ -89,7 +89,11 @@ pub const ContainerStorage = struct {
         .rename_absolute = renameAbsolute,
         .delete_file_absolute = deleteFileAbsolute,
         .delete_tree = deleteTree,
+        .sync_contents_absolute = syncContentsAbsolute,
+        .sync_parent_absolute = syncParentAbsolute,
         .now_ns = nowNs,
+        .root_identity_alloc = rootIdentityAlloc,
+        .rename_is_atomic = true,
     };
 
     pub fn open(allocator: Allocator, path: []const u8) !ContainerStorage {
@@ -698,12 +702,41 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     try self.deleteTreeDurable(path);
 }
 
+fn syncContentsAbsolute(ptr: *anyopaque, _: []const u8) !void {
+    const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
+    const locked = lockAtomic(&self.mutex);
+    defer if (locked) self.mutex.unlock();
+    const file = self.lock_file orelse return error.FileNotFound;
+    if (!self.read_only) try file.sync(self.io_impl.io());
+}
+
+fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+    // Logical files and their namespace are one checksummed container record,
+    // so the physical container sync provides both durability barriers.
+    return try syncContentsAbsolute(ptr, path);
+}
+
 fn nowNs(ptr: *anyopaque) u64 {
     const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
     const now = std.Io.Timestamp.now(self.io_impl.io(), .awake);
     return @intCast(now.toNanoseconds());
+}
+
+fn rootIdentityAlloc(
+    ptr: *anyopaque,
+    allocator: Allocator,
+    root_dir: []const u8,
+) ![]u8 {
+    const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
+    const canonical = try storage_io.nativeRealPathAlloc(allocator, self.path);
+    defer allocator.free(canonical);
+    return try std.fmt.allocPrint(
+        allocator,
+        "aflite-bridge:{s}\x00{s}",
+        .{ canonical, root_dir },
+    );
 }
 
 const ContainerAtomicWriteSink = struct {

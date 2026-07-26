@@ -315,6 +315,10 @@ pub const OpenOptions = struct {
     start_optional_runtimes: bool = true,
     start_optional_runtime_workers: bool = true,
     external_derived_checkpoints: bool = true,
+    /// Optional durable namespace for replica-local index repair state.
+    /// Externally owned roots use this to keep crash-resume intent and replay
+    /// pins inside the same atomic storage generation as their indexes.
+    index_repair_checkpoint_storage: ?lsm_backend_mod.Storage = null,
     physical_root_mode: PhysicalRootMode = .filesystem_managed,
     /// Optional enrichment providers. `DB.open` takes ownership of every
     /// non-null provider when called, including when the open subsequently
@@ -661,7 +665,7 @@ const AsyncContext = struct {
     store: *docstore_mod.DocStore,
     snapshot_read_txn: ?*docstore_mod.DocStore.Txn = null,
     applied_sequence_checkpoint_path: ?[]const u8 = null,
-    index_repair_checkpoint_path: ?[]const u8 = null,
+    index_repair_checkpoint: ?index_repair_state.Location = null,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     repair_replay_mutex: ?*std.atomic.Mutex = null,
@@ -1194,7 +1198,7 @@ const EnrichmentAppendContext = struct {
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
-    index_repair_checkpoint_path: ?[]const u8 = null,
+    index_repair_checkpoint: ?index_repair_state.Location = null,
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
@@ -1216,7 +1220,7 @@ const EnrichmentAppendContext = struct {
             .alloc = self.alloc,
             .store = self.store,
             .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
-            .index_repair_checkpoint_path = self.index_repair_checkpoint_path,
+            .index_repair_checkpoint = self.index_repair_checkpoint,
             .shard_manager = self.shard_manager,
             .change_journal = self.change_journal,
             .replay_source = self.replay_source,
@@ -1256,7 +1260,7 @@ const BatchExecutionContext = struct {
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
-    index_repair_checkpoint_path: ?[]const u8 = null,
+    index_repair_checkpoint: ?index_repair_state.Location = null,
     shard_manager: *shard_mod.ShardManager,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
@@ -3022,7 +3026,7 @@ pub const DB = struct {
             .alloc = self.alloc,
             .store = resources.store,
             .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
-            .index_repair_checkpoint_path = resources.index_repair_checkpoint_path,
+            .index_repair_checkpoint = resources.index_repair_checkpoint,
             .shard_manager = resources.shard_manager,
             .change_journal = resources.change_journal,
             .replay_source = resources.replay_source,
@@ -3233,6 +3237,7 @@ pub const DB = struct {
                 false,
                 if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
                 opts.external_derived_checkpoints,
+                opts.index_repair_checkpoint_storage,
                 opts.lsm_root_generation,
                 openModeRequiresReadOnlyBackends(opts.open_mode),
             );
@@ -3391,7 +3396,7 @@ pub const DB = struct {
                 }
             }
             // The primary-store marker is the admission authority. Install its
-            // gate in every mode before consulting the materialized sidecar so
+            // gate in every mode before consulting the materialized checkpoint so
             // a crash between those two writes cannot expose an empty index.
             try db.core.index_manager.markManagedAdmissionsUnavailable();
             try db.refreshIndexRepairAvailabilityGate(alloc);
@@ -3509,7 +3514,7 @@ pub const DB = struct {
             .alloc = self.runtime_alloc,
             .store = async_resources.store,
             .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
-            .index_repair_checkpoint_path = async_resources.index_repair_checkpoint_path,
+            .index_repair_checkpoint = async_resources.index_repair_checkpoint,
             .index_manager = async_resources.index_manager,
             .apply_mutex = async_resources.apply_mutex,
             .repair_replay_mutex = async_resources.repair_replay_mutex,
@@ -3659,7 +3664,7 @@ pub const DB = struct {
             .alloc = self.runtime_alloc,
             .store = resources.store,
             .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
-            .index_repair_checkpoint_path = resources.index_repair_checkpoint_path,
+            .index_repair_checkpoint = resources.index_repair_checkpoint,
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
@@ -3792,7 +3797,7 @@ pub const DB = struct {
             .alloc = self.runtime_alloc,
             .store = resources.store,
             .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
-            .index_repair_checkpoint_path = resources.index_repair_checkpoint_path,
+            .index_repair_checkpoint = resources.index_repair_checkpoint,
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
@@ -8391,13 +8396,12 @@ pub const DB = struct {
         existing_terminal: usize = 0,
     };
 
-    fn indexRepairStatePathAlloc(self: *const DB, alloc: Allocator) ![]u8 {
-        return try indexRepairStatePathAllocContext(self.async_context, alloc);
+    fn indexRepairStateLocation(self: *const DB) !index_repair_state.Location {
+        return try indexRepairStateLocationContext(self.async_context);
     }
 
-    fn indexRepairStatePathAllocContext(ctx: *const AsyncContext, alloc: Allocator) ![]u8 {
-        const path = ctx.index_repair_checkpoint_path orelse return error.DurableIndexRepairStateUnavailable;
-        return try alloc.dupe(u8, path);
+    fn indexRepairStateLocationContext(ctx: *const AsyncContext) !index_repair_state.Location {
+        return ctx.index_repair_checkpoint orelse error.DurableIndexRepairStateUnavailable;
     }
 
     fn localRepairGroupId(self: *const DB) u64 {
@@ -8407,9 +8411,8 @@ pub const DB = struct {
     }
 
     pub fn hasPendingIndexRepairIntents(self: *const DB, alloc: Allocator) !bool {
-        const path = try self.indexRepairStatePathAlloc(alloc);
-        defer alloc.free(path);
-        var state = index_repair_state.load(alloc, path) catch |err| switch (err) {
+        const location = try self.indexRepairStateLocation();
+        var state = index_repair_state.loadAt(alloc, location) catch |err| switch (err) {
             error.FileNotFound => return self.hasManagedIndexAdmissionMarker(alloc),
             else => return err,
         };
@@ -8459,9 +8462,7 @@ pub const DB = struct {
     }
 
     pub fn loadIndexRepairState(self: *const DB, alloc: Allocator) !index_repair_state.State {
-        const path = try self.indexRepairStatePathAlloc(alloc);
-        defer alloc.free(path);
-        return try index_repair_state.load(alloc, path);
+        return try index_repair_state.loadAt(alloc, try self.indexRepairStateLocation());
     }
 
     fn refreshIndexRepairAvailabilityGate(self: *DB, alloc: Allocator) !void {
@@ -8499,7 +8500,7 @@ pub const DB = struct {
 
     /// A writable generation may clear its gate after activating the repaired
     /// root. A query-only DB is pinned to the root it opened, so it must retain
-    /// every startup gate until retirement; durable sidecar completion can
+    /// every startup gate until retirement; durable checkpoint completion can
     /// describe a newer root and is not authority to expose the pinned one.
     /// Writable DBs recheck only rejected indexes, keeping healthy queries free
     /// of checkpoint I/O.
@@ -8568,9 +8569,8 @@ pub const DB = struct {
     }
 
     fn loadOrCreateCurrentIndexRepairState(self: *DB, alloc: Allocator) !index_repair_state.State {
-        const path = try self.indexRepairStatePathAlloc(alloc);
-        defer alloc.free(path);
-        var state = try index_repair_state.loadOrCreate(alloc, path, self.core.root_generation);
+        const location = try self.indexRepairStateLocation();
+        var state = try index_repair_state.loadOrCreateAt(alloc, location, self.core.root_generation);
         var state_owned = true;
         defer if (state_owned) state.deinit(alloc);
         if (state.identity.root_generation == self.core.root_generation) {
@@ -8631,9 +8631,9 @@ pub const DB = struct {
         const old_identity = state.identity;
         state.deinit(alloc);
         state_owned = false;
-        return try index_repair_state.resetForRootGenerationWithIntents(
+        return try index_repair_state.resetForRootGenerationWithIntentsAt(
             alloc,
-            path,
+            location,
             old_identity,
             self.core.root_generation,
             replacement_intents.items,
@@ -8675,9 +8675,8 @@ pub const DB = struct {
     ) !PinnedIndexRepairSnapshot {
         lockAtomic(self.core.repair_replay_mutex);
         defer self.core.repair_replay_mutex.unlock();
-        const path = try self.indexRepairStatePathAlloc(alloc);
-        defer alloc.free(path);
-        var state = try index_repair_state.load(alloc, path);
+        const location = try self.indexRepairStateLocation();
+        var state = try index_repair_state.loadAt(alloc, location);
         defer state.deinit(alloc);
         const entry_index = blk: {
             for (state.entries.items, 0..) |entry, i| {
@@ -8705,12 +8704,12 @@ pub const DB = struct {
                 .index_name = try alloc.dupe(u8, entry.intent.index_name),
                 .retain_after_sequence = 0,
             };
-            try index_repair_state.putEntry(alloc, path, state.identity, expected, entry);
+            try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
         } else {
             // Re-entering snapshot acquisition must become conservative before
             // replacing a previously finalized build floor.
             entry.pin.?.retain_after_sequence = 0;
-            try index_repair_state.putEntry(alloc, path, state.identity, expected, entry);
+            try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
         }
         expected.revision +|= 1;
         self.async_context.index_repair_replay_pinned.store(true, .release);
@@ -8721,7 +8720,7 @@ pub const DB = struct {
         entry.intent.build_floor_sequence = build_floor;
         entry.intent.updated_at_ms = currentTimeNs() / std.time.ns_per_ms;
         entry.pin.?.retain_after_sequence = build_floor;
-        try index_repair_state.putEntry(alloc, path, state.identity, expected, entry);
+        try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
         return .{
             .txn = txn,
             .repair_id = repair_id,
@@ -8776,16 +8775,13 @@ pub const DB = struct {
     }
 
     fn indexRepairIdForIndexContext(ctx: *const AsyncContext, alloc: Allocator, index_name: []const u8) !?u128 {
-        const path = indexRepairStatePathAllocContext(ctx, alloc) catch |err| switch (err) {
-            // Embedded/Lite databases intentionally omit the durable managed
-            // repair checkpoint. No intent can exist in that configuration,
-            // so read-side discovery is equivalent to an empty state. Actual
-            // repair creation still fails closed through indexRepairStatePathAlloc.
-            error.DurableIndexRepairStateUnavailable => return null,
-            else => return err,
+        const location = indexRepairStateLocationContext(ctx) catch {
+            // Backends without a replica-local durable checkpoint cannot own
+            // repair intents, so read-side discovery is equivalent to empty.
+            // Intent creation remains fail-closed through the same capability.
+            return null;
         };
-        defer alloc.free(path);
-        var state = index_repair_state.load(alloc, path) catch |err| switch (err) {
+        var state = index_repair_state.loadAt(alloc, location) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -8818,9 +8814,8 @@ pub const DB = struct {
         repair_id: u128,
         update: IndexRepairIntentUpdate,
     ) !void {
-        const path = try self.indexRepairStatePathAlloc(alloc);
-        defer alloc.free(path);
-        var state = try index_repair_state.load(alloc, path);
+        const location = try self.indexRepairStateLocation();
+        var state = try index_repair_state.loadAt(alloc, location);
         defer state.deinit(alloc);
         const i = blk: {
             for (state.entries.items, 0..) |entry, entry_i| {
@@ -8870,7 +8865,7 @@ pub const DB = struct {
             entry.intent.last_error = if (update.last_error) |value| try alloc.dupe(u8, value) else null;
         }
         entry.intent.updated_at_ms = currentTimeNs() / std.time.ns_per_ms;
-        try index_repair_state.putEntry(alloc, path, state.identity, expected, entry);
+        try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
         if (indexRepairIntentBlocksService(entry.intent)) {
             try self.core.index_manager.markRepairUnavailable(entry.intent.index_name);
         } else {
@@ -9096,8 +9091,7 @@ pub const DB = struct {
         var state = try self.loadOrCreateCurrentIndexRepairState(alloc);
         defer state.deinit(alloc);
         if (state.findIndex(cfg.name)) |i| return state.entries.items[i].intent.repair_id;
-        const path = try self.indexRepairStatePathAlloc(alloc);
-        defer alloc.free(path);
+        const location = try self.indexRepairStateLocation();
         const now_ms = currentTimeNs() / std.time.ns_per_ms;
         const target_sequence = @max(
             self.core.nextDerivedSequence(),
@@ -9130,7 +9124,7 @@ pub const DB = struct {
         };
         intent_allocations_transferred = true;
         defer intent.deinit(alloc);
-        index_repair_state.putEntry(alloc, path, state.identity, null, .{ .intent = intent }) catch |err| switch (err) {
+        index_repair_state.putEntryAt(alloc, location, state.identity, null, .{ .intent = intent }) catch |err| switch (err) {
             // Another operator/maintenance caller may win creation between the
             // optimistic state read and the checkpoint CAS. Adopt that durable
             // intent; callers subsequently attach their job identity or
@@ -9180,7 +9174,7 @@ pub const DB = struct {
     ) !?u128 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         // Catalog entries are owned by the apply lifecycle. Hold its exclusive
-        // lock through marker validation and sidecar publication so deletion or
+        // lock through marker validation and checkpoint publication so deletion or
         // replacement cannot free the config or commit absence in between.
         lockApply(self);
         defer self.core.unlockApply();
@@ -9265,7 +9259,7 @@ pub const DB = struct {
     fn materializeManagedIndexAdmissionsOnce(self: *DB, alloc: Allocator) !void {
         // This is intentionally a structural lock, not a general repair lock:
         // the primary marker, catalog membership, and borrowed config must
-        // remain one lifecycle observation through sidecar publication.
+        // remain one lifecycle observation through checkpoint publication.
         lockApply(self);
         defer self.core.unlockApply();
         const prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
@@ -9614,7 +9608,7 @@ pub const DB = struct {
     }
 
     /// Quiesce repair for deletion while retaining its durable gate. The caller
-    /// owns the returned lease and removes the sidecar only after catalog
+    /// owns the returned lease and removes the checkpoint only after catalog
     /// absence and marker deletion commit atomically.
     fn prepareIndexRepairForDeletion(self: *DB, alloc: Allocator, index_name: []const u8) !?u128 {
         const repair_id = (try self.indexRepairIdForIndex(alloc, index_name)) orelse return null;
@@ -9704,9 +9698,8 @@ pub const DB = struct {
         const repair_replay_mutex = ctx.repair_replay_mutex orelse return error.DurableIndexRepairStateUnavailable;
         lockAtomic(repair_replay_mutex);
         defer repair_replay_mutex.unlock();
-        const path = try indexRepairStatePathAllocContext(ctx, alloc);
-        defer alloc.free(path);
-        var state = try index_repair_state.load(alloc, path);
+        const location = try indexRepairStateLocationContext(ctx);
+        var state = try index_repair_state.loadAt(alloc, location);
         defer state.deinit(alloc);
         const entry = blk: {
             for (state.entries.items) |candidate| {
@@ -9724,15 +9717,16 @@ pub const DB = struct {
         }
         // For managed admission, clear the primary-store lifecycle marker only
         // after activation published a clean generation. Do this before
-        // removing the sidecar intent: a crash between the two leaves harmless
-        // resumable sidecar debt, never an admitted generation with no proof.
+        // removing the checkpoint intent: a crash between the two leaves
+        // harmless resumable checkpoint debt, never an admitted generation
+        // with no proof.
         const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, entry.intent.index_name);
         defer alloc.free(admission_key);
         ctx.store.delete(admission_key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
         };
-        try index_repair_state.removeEntryAndPin(alloc, path, state.identity, .{
+        try index_repair_state.removeEntryAndPinAt(alloc, location, state.identity, .{
             .repair_id = repair_id,
             .revision = entry.intent.revision,
             .phase = entry.intent.phase,
@@ -9872,8 +9866,7 @@ pub const DB = struct {
         var result: StartupIndexRepairDiscovery = .{};
         var state = try self.loadOrCreateCurrentIndexRepairState(alloc);
         defer state.deinit(alloc);
-        const path = try self.indexRepairStatePathAlloc(alloc);
-        defer alloc.free(path);
+        const location = try self.indexRepairStateLocation();
 
         const configs = try self.core.index_manager.listIndexesPublic(alloc);
         defer {
@@ -9929,7 +9922,7 @@ pub const DB = struct {
                 .owner_epoch = 0,
             };
             defer intent.deinit(alloc);
-            try index_repair_state.putEntry(alloc, path, state.identity, null, .{ .intent = intent });
+            try index_repair_state.putEntryAt(alloc, location, state.identity, null, .{ .intent = intent });
             try self.core.index_manager.markRepairUnavailable(cfg.name);
             notifyQueryVisibilityHook(self.async_context, .index_repair_pending);
             result.discovered += 1;
@@ -13752,7 +13745,7 @@ pub const DB = struct {
     ) !?u128 {
         const repair_id = if (installed.managed_admission_pending) repair_blk: {
             // Drain the complete outbox, not only this index. A prior admission
-            // may have committed before a transient sidecar failure.
+            // may have committed before a transient checkpoint failure.
             try self.drainManagedIndexAdmissions(self.alloc);
             break :repair_blk try self.indexRepairIdForIndex(self.alloc, cfg.name);
         } else null;
@@ -34264,11 +34257,11 @@ fn clampReplayTruncationForReplayStage(
 
 fn clampReplayTruncationForRepairPins(
     alloc: Allocator,
-    checkpoint_path: ?[]const u8,
+    checkpoint: ?index_repair_state.Location,
     effective: u64,
 ) !u64 {
-    const path = checkpoint_path orelse return effective;
-    var state = index_repair_state.load(alloc, path) catch |err| switch (err) {
+    const location = checkpoint orelse return effective;
+    var state = index_repair_state.loadAt(alloc, location) catch |err| switch (err) {
         error.FileNotFound => return effective,
         // A malformed local repair checkpoint may have contained a zero or
         // finalized replay pin. Retain everything until an operator repairs
@@ -34298,7 +34291,7 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     if (ctx.promotion_runtime) |runtime| {
         effective = clampReplayTruncationForReplayStage(effective, ctx.index_manager, runtime.stats());
     }
-    effective = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint_path, effective);
+    effective = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, effective);
     try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
 }
 
@@ -34344,7 +34337,7 @@ fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
             min_applied = @min(min_applied, stats.applied_sequence);
         }
     }
-    min_applied = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint_path, min_applied);
+    min_applied = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, min_applied);
     if (min_applied == 0 or min_applied == std.math.maxInt(u64)) return;
     try truncateReplayLogs(ctx, min_applied);
 }
@@ -60917,7 +60910,7 @@ test "db corrupt repair checkpoint preserves primary availability and fails inde
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
             .sync_level = .full_index,
         });
-        repair_checkpoint_path = try alloc.dupe(u8, db.core.index_repair_checkpoint_path.?);
+        repair_checkpoint_path = try alloc.dupe(u8, db.core.index_repair_checkpoint.?.path);
     }
     defer alloc.free(repair_checkpoint_path);
     try writeRawProjectionCheckpointSidecarForTest(repair_checkpoint_path, "corrupt-index-repair-state");
@@ -61837,7 +61830,7 @@ test "db managed full text admission survives restart without in-place backfill"
         const repair_id = (try db.admitManagedFullTextIndex(cfg)) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(repair_id, (try db.materializeManagedIndexAdmission(alloc, cfg.name)).?);
         try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
-        repair_checkpoint_path = try alloc.dupe(u8, db.core.index_repair_checkpoint_path.?);
+        repair_checkpoint_path = try alloc.dupe(u8, db.core.index_repair_checkpoint.?.path);
 
         const stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, stats);
@@ -61848,13 +61841,13 @@ test "db managed full text admission survives restart without in-place backfill"
     }
 
     // Model a crash after the atomic catalog/outbox commit but before the
-    // sidecar projection becomes durable. Reopen must reconstruct the intent
+    // repair checkpoint becomes durable. Reopen must reconstruct the intent
     // from the primary-store marker without running an in-place backfill.
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try std.Io.Dir.cwd().deleteFile(io_impl.io(), repair_checkpoint_path.?);
 
-    // A read-only/status process cannot materialize the sidecar, but the
+    // A read-only/status process cannot materialize the checkpoint, but the
     // primary marker must still close service during this crash window.
     var readonly = try DB.open(alloc, std.mem.span(path), .{
         .open_mode = .query_readonly,
@@ -62081,7 +62074,7 @@ test "db managed index deletion commits catalog absence with marker removal" {
         DB.test_fail_managed_index_delete_after_catalog_commit = false;
     }
 
-    // The simulated crash precedes sidecar cleanup. Catalog and marker must
+    // The simulated crash precedes checkpoint cleanup. Catalog and marker must
     // nevertheless agree, and writable startup reclaims the orphaned intent.
     var reopened = try DB.open(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,

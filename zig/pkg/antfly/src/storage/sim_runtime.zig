@@ -840,6 +840,8 @@ fn modeledDeleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     self.mutex.lock();
     defer self.mutex.unlock();
     if (self.consumeFaultNeedle(&self.fail_next_delete_path_contains, path)) return error.InjectedDeleteFault;
+    if (!self.files.contains(path)) return error.FileNotFound;
+    try self.markNamespaceDirtyLocked(path);
     const removed = self.files.fetchRemove(path) orelse return error.FileNotFound;
     self.alloc.free(removed.key);
     var file = removed.value;
@@ -853,13 +855,15 @@ fn modeledDeleteTree(ptr: *anyopaque, path: []const u8) !void {
     var doomed = std.ArrayListUnmanaged([]const u8).empty;
     defer doomed.deinit(self.alloc);
 
+    // Directory-tree durability is represented by the root namespace entry.
+    // Journaling every descendant would require syncing every removed child
+    // directory and turns a tree deletion into quadratic simulator work.
+    try self.markNamespaceDirtyLocked(path);
     var it = self.files.keyIterator();
     while (it.next()) |file_path| {
         if (!pathContains(path, file_path.*)) continue;
         try doomed.append(self.alloc, file_path.*);
     }
-    for (doomed.items) |file_path| try self.markNamespaceDirtyLocked(file_path);
-
     for (doomed.items) |file_path| {
         const removed = self.files.fetchRemove(file_path) orelse continue;
         self.alloc.free(removed.key);
@@ -873,7 +877,6 @@ fn modeledDeleteTree(ptr: *anyopaque, path: []const u8) !void {
         if (!pathContains(path, dir_path.*)) continue;
         try doomed.append(self.alloc, dir_path.*);
     }
-    for (doomed.items) |dir_path| try self.markNamespaceDirtyLocked(dir_path);
     for (doomed.items) |dir_path| {
         const removed = self.directories.fetchRemove(dir_path) orelse continue;
         self.alloc.free(removed.key);
@@ -1120,6 +1123,52 @@ test "modeled storage rolls back an unsynced rename namespace" {
     try std.testing.expectError(
         error.FileNotFound,
         storage.readFileAlloc(std.testing.allocator, "/root/new", 16),
+    );
+}
+
+test "modeled storage requires a parent sync for durable deletion" {
+    var device_model = ModeledDevice.init(std.testing.allocator);
+    defer device_model.deinit();
+    const storage = device_model.storage();
+
+    try storage.createDirPath("/root");
+    try storage.writeFileAbsolute("/root/stable", "value");
+    try storage.syncFileContentsAbsolute("/root/stable");
+    try storage.syncParentAbsolute("/root/stable");
+
+    try storage.deleteFileAbsolute("/root/stable");
+    try device_model.device().crash();
+    const resurrected = try storage.readFileAlloc(std.testing.allocator, "/root/stable", 16);
+    defer std.testing.allocator.free(resurrected);
+    try std.testing.expectEqualStrings("value", resurrected);
+
+    try storage.deleteFileAbsolute("/root/stable");
+    try storage.syncParentAbsolute("/root/stable");
+    try device_model.device().crash();
+    try std.testing.expectError(
+        error.FileNotFound,
+        storage.readFileAlloc(std.testing.allocator, "/root/stable", 16),
+    );
+}
+
+test "modeled storage publishes tree deletion at the removed root" {
+    var device_model = ModeledDevice.init(std.testing.allocator);
+    defer device_model.deinit();
+    const storage = device_model.storage();
+
+    try storage.createDirPath("/root/tree/nested");
+    try storage.syncParentAbsolute("/root/tree");
+    try storage.syncParentAbsolute("/root/tree/nested");
+    try storage.writeFileAbsolute("/root/tree/nested/value", "durable");
+    try storage.syncFileContentsAbsolute("/root/tree/nested/value");
+    try storage.syncParentAbsolute("/root/tree/nested/value");
+
+    try storage.deleteTree("/root/tree");
+    try storage.syncParentAbsolute("/root/tree");
+    try device_model.device().crash();
+    try std.testing.expectError(
+        error.FileNotFound,
+        storage.readFileAlloc(std.testing.allocator, "/root/tree/nested/value", 16),
     );
 }
 

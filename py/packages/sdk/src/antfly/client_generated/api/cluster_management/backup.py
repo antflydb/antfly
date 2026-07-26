@@ -81,8 +81,12 @@ def sync_detailed(
     - Table metadata (schema, indexes, shard configuration)
     - All shard data (compressed with zstd)
 
-    The backup creates a cluster-level manifest that tracks all included tables
-    and their individual backup locations.
+    A non-empty backup publishes a cluster-level manifest only after every
+    requested table backup is durable. The manifest is the final commit
+    point and records complete expected/completed table counts. A `partial`
+    or `failed` attempt returns per-table diagnostics but does not publish a
+    restorable aggregate manifest. A cluster with no selected tables returns
+    `400` without writing a backup artifact.
 
     Backup IDs are immutable. Reusing an ID that already has a published
     cluster manifest returns `409` and leaves the existing backup unchanged.
@@ -131,8 +135,12 @@ def sync(
     - Table metadata (schema, indexes, shard configuration)
     - All shard data (compressed with zstd)
 
-    The backup creates a cluster-level manifest that tracks all included tables
-    and their individual backup locations.
+    A non-empty backup publishes a cluster-level manifest only after every
+    requested table backup is durable. The manifest is the final commit
+    point and records complete expected/completed table counts. A `partial`
+    or `failed` attempt returns per-table diagnostics but does not publish a
+    restorable aggregate manifest. A cluster with no selected tables returns
+    `400` without writing a backup artifact.
 
     Backup IDs are immutable. Reusing an ID that already has a published
     cluster manifest returns `409` and leaves the existing backup unchanged.
@@ -176,8 +184,12 @@ async def asyncio_detailed(
     - Table metadata (schema, indexes, shard configuration)
     - All shard data (compressed with zstd)
 
-    The backup creates a cluster-level manifest that tracks all included tables
-    and their individual backup locations.
+    A non-empty backup publishes a cluster-level manifest only after every
+    requested table backup is durable. The manifest is the final commit
+    point and records complete expected/completed table counts. A `partial`
+    or `failed` attempt returns per-table diagnostics but does not publish a
+    restorable aggregate manifest. A cluster with no selected tables returns
+    `400` without writing a backup artifact.
 
     Backup IDs are immutable. Reusing an ID that already has a published
     cluster manifest returns `409` and leaves the existing backup unchanged.
@@ -224,8 +236,12 @@ async def asyncio(
     - Table metadata (schema, indexes, shard configuration)
     - All shard data (compressed with zstd)
 
-    The backup creates a cluster-level manifest that tracks all included tables
-    and their individual backup locations.
+    A non-empty backup publishes a cluster-level manifest only after every
+    requested table backup is durable. The manifest is the final commit
+    point and records complete expected/completed table counts. A `partial`
+    or `failed` attempt returns per-table diagnostics but does not publish a
+    restorable aggregate manifest. A cluster with no selected tables returns
+    `400` without writing a backup artifact.
 
     Backup IDs are immutable. Reusing an ID that already has a published
     cluster manifest returns `409` and leaves the existing backup unchanged.

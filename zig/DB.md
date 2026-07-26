@@ -1063,11 +1063,19 @@ primary document store:
    The owner repair scheduler performs the bounded shadow rebuild and replay.
 4. Keep the marker while repair is pending. Every DB open captures the marker
    prefix once before catalog open. Writable open uses the O(1) name set to
-   suppress in-place backfill and recreate missing sidecar state; read-only and
-   status opens use the same snapshot to keep the generation unavailable.
+   suppress in-place backfill and recreate missing checkpoint state; read-only
+   and status opens use the same snapshot to keep the generation unavailable.
 5. After clean shadow activation, delete the primary-store marker before
-   removing the sidecar intent. A crash between those writes leaves redundant,
-   resumable repair state rather than an admitted generation without debt.
+   removing the checkpoint intent. A crash between those writes leaves
+   redundant, resumable repair state rather than an admitted generation
+   without debt.
+
+Filesystem DBs publish the replica-local repair checkpoint beside the physical
+root with fsync and atomic rename. Externally owned roots such as `.aflite`
+publish the same checksummed checkpoint through the backend's atomic storage
+namespace. The physical lock key, not the logical container path, identifies
+the replica, and generation-owned asynchronous work borrows that stable
+location instead of retaining transient open options.
 
 Desired-state reconciliation that observes pending repair must enqueue the
 table-group route with the owner repair scheduler, even when admission occurred
@@ -1095,10 +1103,10 @@ cardinality or replay lag during every reconciliation pass.
 Index deletion uses catalog absence as its commit point. The catalog image
 without the index and deletion of its admission marker commit in one primary
 store transaction while repair remains quiesced and gated. Runtime roots,
-coverage metadata, and repair sidecars are post-commit cleanup. A crash can
-therefore leave reclaimable files or an orphaned sidecar, but cannot leave a
+coverage metadata, and repair checkpoints are post-commit cleanup. A crash can
+therefore leave reclaimable files or an orphaned checkpoint, but cannot leave a
 query-visible catalog entry without admission proof. Writable startup removes
-sidecar intents whose catalog entry is absent before workers start.
+checkpoint intents whose catalog entry is absent before workers start.
 
 Generated-artifact reclamation separates page arbitration from terminal
 filesystem ownership. Cleanup workers try to claim the short page mutex and

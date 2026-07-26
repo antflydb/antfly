@@ -47,7 +47,6 @@ pub const ClusterRestoreRequest = struct {
 
 pub const format_version: u32 = 2;
 pub const cluster_format_version: u32 = 2;
-pub const legacy_cluster_format_version: u32 = 1;
 pub const table_backup_id = "table";
 pub const antfly_version = "zig-dev";
 pub const max_portable_backup_file_bytes: usize = 1024 * 1024 * 1024;
@@ -99,9 +98,15 @@ pub const BackupFormat = enum {
     portable,
 };
 
+pub const ArtifactIntegrityMode = enum {
+    declared,
+    derive_after_materialization,
+};
+
 pub const TableBackupManifest = struct {
     format_version: u32 = format_version,
     format: BackupFormat,
+    artifact_integrity_mode: ArtifactIntegrityMode = .declared,
     backup_id: []const u8,
     table_name: []const u8,
     description: []const u8,
@@ -772,6 +777,7 @@ const RemoteBackupStore = struct {
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
         format: BackupFormat,
+        integrity_mode: ArtifactIntegrityMode,
         shard: *const ShardSnapshot,
     ) !void {
         switch (format) {
@@ -780,8 +786,11 @@ const RemoteBackupStore = struct {
                 defer alloc.free(key);
                 var metadata = try self.client.statObject(self.bucket, key);
                 defer metadata.deinit(alloc);
-                if (metadata.content_length != shard.artifact_size_bytes)
+                if (integrity_mode == .declared and
+                    metadata.content_length != shard.artifact_size_bytes)
+                {
                     return error.BackupArtifactIntegrityMismatch;
+                }
             },
             .native => {
                 const key_prefix = try self.keyPrefixAlloc(alloc, shard.snapshot_path);
@@ -1023,10 +1032,16 @@ fn firstStoredSecretOwned(
 pub const ClusterTableBackupEntry = struct {
     name: []const u8,
     table_backup_id: []const u8,
+    /// Current Go cluster backups publish table metadata under a derived ID
+    /// while naming portable shard artifacts with the cluster backup ID.
+    /// Native Zig manifests leave this null because their table manifest
+    /// already declares every artifact path.
+    artifact_backup_id: ?[]const u8 = null,
 
     pub fn deinit(self: *ClusterTableBackupEntry, alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.name));
         alloc.free(@constCast(self.table_backup_id));
+        if (self.artifact_backup_id) |value| alloc.free(@constCast(value));
         self.* = undefined;
     }
 };
@@ -1405,7 +1420,7 @@ pub fn writeManifest(
     backup_root: []const u8,
     manifest: *const TableBackupManifest,
 ) !void {
-    try validateTableManifest(alloc, manifest, manifest.backup_id);
+    try validatePublishedTableManifest(alloc, manifest, manifest.backup_id);
     const path = try metadataPath(alloc, backup_root, manifest.backup_id);
     defer alloc.free(path);
     try ensureDirPath(backup_root);
@@ -1447,7 +1462,7 @@ pub fn writeManifestToLocationWithIo(
 ) !void {
     switch (location.*) {
         .file => |backup_root| {
-            try validateTableManifest(alloc, manifest, manifest.backup_id);
+            try validatePublishedTableManifest(alloc, manifest, manifest.backup_id);
             const path = try metadataPath(alloc, backup_root, manifest.backup_id);
             defer alloc.free(path);
             const encoded = try stringifyJsonAlloc(alloc, manifest.*);
@@ -1456,7 +1471,7 @@ pub fn writeManifestToLocationWithIo(
             try writeFileAbsoluteIfAbsentWithIo(alloc, io, path, encoded);
         },
         .remote => |*store| {
-            try validateTableManifest(alloc, manifest, manifest.backup_id);
+            try validatePublishedTableManifest(alloc, manifest, manifest.backup_id);
             const encoded = try stringifyJsonAlloc(alloc, manifest.*);
             defer alloc.free(encoded);
             try ensureManifestSize(encoded, max_backup_manifest_bytes);
@@ -1472,14 +1487,45 @@ pub fn readManifestFromLocation(
     location: *BackupLocation,
     backup_id: []const u8,
 ) !TableBackupManifest {
+    return try readManifestFromLocationWithArtifactBackupId(
+        alloc,
+        location,
+        backup_id,
+        backup_id,
+    );
+}
+
+pub fn readManifestFromLocationWithArtifactBackupId(
+    alloc: std.mem.Allocator,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    artifact_backup_id: []const u8,
+) !TableBackupManifest {
+    try validateBackupId(artifact_backup_id);
     switch (location.*) {
-        .file => |backup_root| return try readManifest(alloc, backup_root, backup_id),
+        .file => |backup_root| {
+            const path = try metadataPath(alloc, backup_root, backup_id);
+            defer alloc.free(path);
+            const body = try readFileAbsoluteAlloc(alloc, path, max_backup_manifest_bytes);
+            defer alloc.free(body);
+            return try parseTableBackupManifestWithArtifactBackupId(
+                alloc,
+                body,
+                backup_id,
+                artifact_backup_id,
+            );
+        },
         .remote => |*store| {
             const suffix = try metadataPath(alloc, "", backup_id);
             defer alloc.free(suffix);
             const body = try store.readBytesAllocLimited(alloc, trimLeftSlash(suffix), max_backup_manifest_bytes);
             defer alloc.free(body);
-            return parseTableBackupManifest(alloc, body, backup_id);
+            return parseTableBackupManifestWithArtifactBackupId(
+                alloc,
+                body,
+                backup_id,
+                artifact_backup_id,
+            );
         },
     }
 }
@@ -1514,10 +1560,33 @@ fn parseTableBackupManifest(
     body: []const u8,
     backup_id: []const u8,
 ) !TableBackupManifest {
-    var parsed = try std.json.parseFromSlice(TableBackupManifest, alloc, body, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-    try validateTableManifest(alloc, &parsed.value, backup_id);
-    return try cloneTableBackupManifest(alloc, parsed.value);
+    return try parseTableBackupManifestWithArtifactBackupId(
+        alloc,
+        body,
+        backup_id,
+        backup_id,
+    );
+}
+
+fn parseTableBackupManifestWithArtifactBackupId(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    backup_id: []const u8,
+    artifact_backup_id: []const u8,
+) !TableBackupManifest {
+    var value = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer value.deinit();
+    const root = switch (value.value) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+    if (root.get("format_version") != null) {
+        var parsed = try std.json.parseFromSlice(TableBackupManifest, alloc, body, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        try validatePublishedTableManifest(alloc, &parsed.value, backup_id);
+        return try cloneTableBackupManifest(alloc, parsed.value);
+    }
+    return try parseGoPortableTableManifest(alloc, root, backup_id, artifact_backup_id);
 }
 
 pub fn validateTableManifest(
@@ -1528,6 +1597,20 @@ pub fn validateTableManifest(
     if (manifest.format_version != format_version) return error.UnsupportedBackupFormat;
     if (!std.mem.eql(u8, manifest.backup_id, requested_backup_id)) return error.InvalidBackupRequest;
     try validateManifestShards(alloc, manifest);
+}
+
+fn validatePublishedTableManifest(
+    alloc: std.mem.Allocator,
+    manifest: *const TableBackupManifest,
+    requested_backup_id: []const u8,
+) !void {
+    try validateTableManifest(alloc, manifest, requested_backup_id);
+    // Derivation is an in-memory bridge for the exact Go envelope, whose
+    // format cannot carry integrity metadata. Never accept it as authority in
+    // the current Zig manifest or a writer could publish a checksum-free
+    // backup that merely hashes whatever bytes happen to be downloaded.
+    if (manifest.artifact_integrity_mode != .declared)
+        return error.BackupIntegrityMissing;
 }
 
 fn validateManifestShards(
@@ -1554,8 +1637,18 @@ fn validateManifestShards(
         const is_portable_path = std.mem.endsWith(u8, shard.snapshot_path, ".afb");
         if ((manifest.format == .portable) != is_portable_path)
             return error.BackupArtifactFormatMismatch;
-        if (!isLowerSha256Hex(shard.artifact_sha256))
+        if (manifest.artifact_integrity_mode == .declared and
+            !isLowerSha256Hex(shard.artifact_sha256))
+        {
             return error.BackupIntegrityMissing;
+        }
+        if (manifest.artifact_integrity_mode == .derive_after_materialization and
+            (manifest.format != .portable or
+                shard.artifact_size_bytes != 0 or
+                shard.artifact_sha256.len != 0))
+        {
+            return error.InvalidBackupRequest;
+        }
     }
 
     const ordered = try alloc.dupe(ShardSnapshot, manifest.shards);
@@ -1588,6 +1681,288 @@ fn isLowerSha256Hex(value: []const u8) bool {
         if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
     }
     return true;
+}
+
+const PortableShard = struct {
+    group_id: u64,
+    shard_id: []u8,
+    start_key: []u8,
+    end_key: ?[]u8,
+    snapshot_path: []u8,
+
+    fn deinit(self: PortableShard, alloc: std.mem.Allocator) void {
+        alloc.free(self.shard_id);
+        alloc.free(self.start_key);
+        if (self.end_key) |end| alloc.free(end);
+        alloc.free(self.snapshot_path);
+    }
+};
+
+fn parseGoPortableTableManifest(
+    alloc: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    backup_id: []const u8,
+    artifact_backup_id: []const u8,
+) !TableBackupManifest {
+    if (root.count() != 3) return error.InvalidBackupRequest;
+    const version = switch (root.get("version") orelse return error.InvalidBackupRequest) {
+        .integer => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    if (version != 1) return error.UnsupportedBackupFormat;
+    const format = switch (root.get("format") orelse return error.InvalidBackupRequest) {
+        .string => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    if (!std.mem.eql(u8, format, "portable")) return error.UnsupportedBackupFormat;
+    const table = switch (root.get("table") orelse return error.InvalidBackupRequest) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+    const table_name = switch (table.get("name") orelse return error.InvalidBackupRequest) {
+        .string => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    if (table_name.len == 0 or table_name.len > 4096) return error.InvalidBackupRequest;
+
+    const schema_json = try stringifyOptionalGoTableField(alloc, table.get("schema"), "{}");
+    errdefer alloc.free(schema_json);
+    const read_schema_json = try stringifyOptionalGoTableField(alloc, table.get("read_schema"), "");
+    errdefer alloc.free(read_schema_json);
+    const indexes_json = try normalizeGoPortableIndexesJson(alloc, table.get("indexes"));
+    errdefer alloc.free(indexes_json);
+    const replication_sources_json = try stringifyOptionalGoTableField(
+        alloc,
+        table.get("replication_sources"),
+        "[]",
+    );
+    errdefer alloc.free(replication_sources_json);
+    const description = if (table.get("description")) |value|
+        switch (value) {
+            .null => "",
+            .string => |text| text,
+            else => return error.InvalidBackupRequest,
+        }
+    else
+        "";
+    const shards_value = switch (table.get("shards") orelse return error.InvalidBackupRequest) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+
+    var shards_list = std.ArrayListUnmanaged(PortableShard).empty;
+    defer {
+        for (shards_list.items) |shard| shard.deinit(alloc);
+        shards_list.deinit(alloc);
+    }
+    var it = shards_value.iterator();
+    while (it.next()) |entry| {
+        const shard_object = switch (entry.value_ptr.*) {
+            .object => |object| object,
+            else => return error.InvalidBackupRequest,
+        };
+        const raw_group_id = try std.fmt.parseInt(u64, entry.key_ptr.*, 16);
+        const byte_range = switch (shard_object.get("byte_range") orelse return error.InvalidBackupRequest) {
+            .array => |array| array,
+            else => return error.InvalidBackupRequest,
+        };
+        if (byte_range.items.len != 2) return error.InvalidBackupRequest;
+        const start_encoded = switch (byte_range.items[0]) {
+            .string => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        const end_encoded = switch (byte_range.items[1]) {
+            .string => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        const start_key = try decodePortableByteRangeBoundary(alloc, start_encoded);
+        errdefer alloc.free(start_key);
+        const end_key = if (end_encoded.len > 0)
+            try decodePortableByteRangeBoundary(alloc, end_encoded)
+        else
+            null;
+        errdefer if (end_key) |value| alloc.free(value);
+        const snapshot_path = try std.fmt.allocPrint(alloc, "{s}-{s}.afb", .{
+            artifact_backup_id,
+            entry.key_ptr.*,
+        });
+        errdefer alloc.free(snapshot_path);
+        try shards_list.append(alloc, .{
+            .group_id = group_ids.dataGroupIdFromHash(raw_group_id),
+            .shard_id = try alloc.dupe(u8, entry.key_ptr.*),
+            .start_key = start_key,
+            .end_key = end_key,
+            .snapshot_path = snapshot_path,
+        });
+    }
+    std.mem.sort(PortableShard, shards_list.items, {}, portableShardLessThan);
+
+    const shards = try alloc.alloc(ShardSnapshot, shards_list.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (shards[0..initialized]) |shard| shard.deinit(alloc);
+        alloc.free(shards);
+    }
+    for (shards_list.items, 0..) |portable_shard, i| {
+        shards[i] = .{
+            .group_id = portable_shard.group_id,
+            .start_key = try alloc.dupe(u8, portable_shard.start_key),
+            .end_key = if (portable_shard.end_key) |value| try alloc.dupe(u8, value) else null,
+            .snapshot_path = try alloc.dupe(u8, portable_shard.snapshot_path),
+        };
+        initialized += 1;
+    }
+
+    var manifest: TableBackupManifest = .{
+        .format = .portable,
+        .artifact_integrity_mode = .derive_after_materialization,
+        .backup_id = try alloc.dupe(u8, backup_id),
+        .table_name = try alloc.dupe(u8, table_name),
+        .description = try alloc.dupe(u8, description),
+        .schema_json = schema_json,
+        .read_schema_json = read_schema_json,
+        .indexes_json = indexes_json,
+        .replication_sources_json = replication_sources_json,
+        .shards = shards,
+    };
+    errdefer manifest.deinit(alloc);
+    try validateTableManifest(alloc, &manifest, backup_id);
+    return manifest;
+}
+
+fn stringifyOptionalGoTableField(
+    alloc: std.mem.Allocator,
+    maybe_value: ?std.json.Value,
+    absent: []const u8,
+) ![]u8 {
+    const value = maybe_value orelse return try alloc.dupe(u8, absent);
+    if (value == .null) return try alloc.dupe(u8, absent);
+    return try stringifyJsonAlloc(alloc, value);
+}
+
+fn normalizeGoPortableIndexesJson(alloc: std.mem.Allocator, maybe_indexes: ?std.json.Value) ![]u8 {
+    const indexes = maybe_indexes orelse return try alloc.dupe(u8, "{}");
+    if (indexes == .null) return try alloc.dupe(u8, "{}");
+    const object = switch (indexes) {
+        .object => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) return error.InvalidBackupRequest;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonString(alloc, &out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        try appendGoPortableIndexConfigJson(alloc, &out, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendGoPortableIndexConfigJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    index_name: []const u8,
+    value: std.json.Value,
+) !void {
+    const object = switch (value) {
+        .object => |item| item,
+        else => return error.InvalidBackupRequest,
+    };
+    var has_non_empty_name = false;
+    if (object.get("name")) |name_value| {
+        has_non_empty_name = switch (name_value) {
+            .string => |name| name.len > 0,
+            else => false,
+        };
+    }
+    try out.append(alloc, '{');
+    var first = true;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "name") and !has_non_empty_name) continue;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonString(alloc, out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        try appendGoPortableJsonValue(alloc, out, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    if (!has_non_empty_name) {
+        if (!first) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, "name");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, index_name);
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendGoPortableJsonValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    field_name: []const u8,
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .object => |object| {
+            try out.append(alloc, '{');
+            var first = true;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (!first) try out.append(alloc, ',');
+                first = false;
+                try appendJsonString(alloc, out, entry.key_ptr.*);
+                try out.append(alloc, ':');
+                try appendGoPortableJsonValue(alloc, out, entry.key_ptr.*, entry.value_ptr.*);
+            }
+            try out.append(alloc, '}');
+        },
+        .array => |array| {
+            try out.append(alloc, '[');
+            for (array.items, 0..) |item, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try appendGoPortableJsonValue(alloc, out, field_name, item);
+            }
+            try out.append(alloc, ']');
+        },
+        .string => |text| {
+            if (std.mem.eql(u8, field_name, "provider") and std.mem.eql(u8, text, "termite")) {
+                try appendJsonString(alloc, out, "antfly");
+            } else {
+                try appendJsonString(alloc, out, text);
+            }
+        },
+        else => {
+            const encoded = try stringifyJsonAlloc(alloc, value);
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        },
+    }
+}
+
+fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const encoded = try stringifyJsonAlloc(alloc, value);
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
+fn portableShardLessThan(_: void, a: PortableShard, b: PortableShard) bool {
+    const start_order = std.mem.order(u8, a.start_key, b.start_key);
+    if (start_order != .eq) return start_order == .lt;
+    return a.group_id < b.group_id;
+}
+
+fn decodePortableByteRangeBoundary(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    if (encoded.len == 0) return try alloc.dupe(u8, "");
+    const size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+    const out = try alloc.alloc(u8, size);
+    errdefer alloc.free(out);
+    try std.base64.standard.Decoder.decode(out, encoded);
+    return out;
 }
 
 pub fn metadataPath(alloc: std.mem.Allocator, backup_root: []const u8, backup_id: []const u8) ![]u8 {
@@ -1661,6 +2036,11 @@ fn validateClusterBackupAttemptMarker(
     try validateBackupId(marker.cluster_backup_id);
     if (!std.mem.eql(u8, marker.attempt_id, expected_attempt_id))
         return error.InvalidBackupRequest;
+    if (std.mem.eql(u8, marker.attempt_id, marker.cluster_backup_id) or
+        marker.created_at_unix_ns == 0)
+    {
+        return error.InvalidBackupRequest;
+    }
     if (marker.tables.len == 0 or marker.tables.len > max_cluster_backup_attempt_tables)
         return error.InvalidBackupRequest;
 
@@ -1669,12 +2049,15 @@ fn validateClusterBackupAttemptMarker(
     var ids = std.StringHashMapUnmanaged(void).empty;
     defer ids.deinit(alloc);
     try table_names.ensureTotalCapacity(alloc, @intCast(marker.tables.len));
-    try ids.ensureTotalCapacity(alloc, @intCast(marker.tables.len * 2));
+    try ids.ensureTotalCapacity(alloc, @intCast(marker.tables.len * 2 + 2));
+    ids.putAssumeCapacity(marker.attempt_id, {});
+    ids.putAssumeCapacity(marker.cluster_backup_id, {});
     for (marker.tables) |table| {
-        if (table.name.len == 0) return error.InvalidBackupRequest;
+        if (table.name.len == 0 or table.name.len > 4096) return error.InvalidBackupRequest;
         try validateBackupId(table.table_backup_id);
         try validateBackupId(table.artifact_backup_id);
-        if (table_names.contains(table.name) or
+        if (std.mem.eql(u8, table.table_backup_id, table.artifact_backup_id) or
+            table_names.contains(table.name) or
             ids.contains(table.table_backup_id) or
             ids.contains(table.artifact_backup_id))
         {
@@ -1757,7 +2140,10 @@ fn deleteFileOrTreeAbsolute(io: std.Io, path: []const u8) !bool {
 }
 
 fn deletePathDurably(io: std.Io, path: []const u8) !void {
-    if (!try deleteFileOrTreeAbsolute(io, path)) return;
+    _ = try deleteFileOrTreeAbsolute(io, path);
+    // A retry can observe an already-absent path after a previous unlink
+    // succeeded but its directory sync failed. Re-sync the parent in both
+    // cases so successful cleanup always establishes a durable absence.
     try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse "/");
 }
 
@@ -1778,6 +2164,28 @@ pub fn cleanupTableBackupAttemptAtLocation(
         artifact_backup_id,
         format,
         &object_budget,
+        true,
+    );
+}
+
+pub fn cleanupUnpublishedTableBackupAttemptAtLocation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    artifact_backup_id: []const u8,
+    format: BackupFormat,
+) !void {
+    var object_budget: usize = backup_attempt_cleanup_object_budget;
+    return cleanupTableBackupAttemptAtLocationWithBudget(
+        alloc,
+        io,
+        location,
+        backup_id,
+        artifact_backup_id,
+        format,
+        &object_budget,
+        false,
     );
 }
 
@@ -1789,17 +2197,20 @@ fn cleanupTableBackupAttemptAtLocationWithBudget(
     artifact_backup_id: []const u8,
     format: BackupFormat,
     object_budget: *usize,
+    manifest_owned: bool,
 ) !void {
     try validateBackupId(backup_id);
     try validateBackupId(artifact_backup_id);
     switch (location.*) {
         .file => |backup_root| {
-            const manifest_path = try metadataPath(alloc, backup_root, backup_id);
-            defer alloc.free(manifest_path);
-            // Remove and durably fence the table commit record before its
-            // payload. A crash must never resurrect a manifest whose artifact
-            // cleanup had already started.
-            try deletePathDurably(io, manifest_path);
+            if (manifest_owned) {
+                const manifest_path = try metadataPath(alloc, backup_root, backup_id);
+                defer alloc.free(manifest_path);
+                // Remove and durably fence the table commit record before its
+                // payload. A crash must never resurrect a manifest whose
+                // artifact cleanup had already started.
+                try deletePathDurably(io, manifest_path);
+            }
             const artifact_path = switch (format) {
                 .native => try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, artifact_backup_id }),
                 .portable => try std.fmt.allocPrint(alloc, "{s}/{s}.afb", .{ backup_root, artifact_backup_id }),
@@ -1811,9 +2222,11 @@ fn cleanupTableBackupAttemptAtLocationWithBudget(
             try deletePathDurably(io, reservation_path);
         },
         .remote => |*store| {
-            const manifest_suffix = try metadataPath(alloc, "", backup_id);
-            defer alloc.free(manifest_suffix);
-            try store.deleteSuffix(alloc, trimLeftSlash(manifest_suffix));
+            if (manifest_owned) {
+                const manifest_suffix = try metadataPath(alloc, "", backup_id);
+                defer alloc.free(manifest_suffix);
+                try store.deleteSuffix(alloc, trimLeftSlash(manifest_suffix));
+            }
             switch (format) {
                 .native => try store.deletePrefix(alloc, artifact_backup_id, object_budget),
                 .portable => {
@@ -1883,11 +2296,16 @@ pub fn cleanupClusterBackupAttemptAtLocation(
             table.artifact_backup_id,
             marker.format,
             &object_budget,
+            true,
         ) catch |err| {
             if (cleanup_error == null) cleanup_error = err;
         };
     }
     if (cleanup_error) |err| return err;
+    // The owning request has established a terminal failure and all of its
+    // artifacts are durably absent. Remove the reservation while the marker
+    // still makes an interrupted cleanup discoverable, then retire the marker
+    // as the final step.
     try cleanupClusterReservationAtLocation(alloc, io, location, marker.cluster_backup_id);
     try deleteClusterBackupAttemptMarker(alloc, io, location, marker.attempt_id);
 }
@@ -1898,32 +2316,16 @@ fn reclaimClusterBackupAttemptMarker(
     location: *BackupLocation,
     marker: *const ClusterBackupAttemptMarker,
     object_budget: *usize,
-) !void {
+) !bool {
     var committed = readClusterManifestFromLocation(
         alloc,
         location,
         marker.cluster_backup_id,
     ) catch |err| switch (err) {
-        error.FileNotFound => {
-            var cleanup_error: ?anyerror = null;
-            for (marker.tables) |table| {
-                cleanupTableBackupAttemptAtLocationWithBudget(
-                    alloc,
-                    io,
-                    location,
-                    table.table_backup_id,
-                    table.artifact_backup_id,
-                    marker.format,
-                    object_budget,
-                ) catch |cleanup_err| {
-                    if (cleanup_error == null) cleanup_error = cleanup_err;
-                };
-            }
-            if (cleanup_error) |cleanup_err| return cleanup_err;
-            try cleanupClusterReservationAtLocation(alloc, io, location, marker.cluster_backup_id);
-            try deleteClusterBackupAttemptMarker(alloc, io, location, marker.attempt_id);
-            return;
-        },
+        // Age alone cannot distinguish an abandoned attempt from a valid,
+        // unusually long-running backup. Only the owning request may clean an
+        // uncommitted attempt; maintenance keeps it fenced.
+        error.FileNotFound => return false,
         else => return err,
     };
     defer committed.deinit(alloc);
@@ -1946,12 +2348,18 @@ fn reclaimClusterBackupAttemptMarker(
             table.artifact_backup_id,
             marker.format,
             object_budget,
+            true,
         ) catch |err| {
             if (cleanup_error == null) cleanup_error = err;
         };
     }
     if (cleanup_error) |err| return err;
+    // Keep the committed reservation as the pre-execution same-ID fence.
+    // Write-only object-store connections cannot inspect the aggregate
+    // manifest, so deleting this reservation would permit a duplicate request
+    // to repeat every table backup before its final conditional publish fails.
     try deleteClusterBackupAttemptMarker(alloc, io, location, marker.attempt_id);
+    return true;
 }
 
 fn markerIsStale(marker: *const ClusterBackupAttemptMarker, now_unix_ns: u64) bool {
@@ -1970,8 +2378,7 @@ fn reclaimClusterBackupAttemptById(
     var parsed = try readClusterBackupAttemptMarker(alloc, io, location, attempt_id);
     defer parsed.deinit();
     if (!markerIsStale(&parsed.value, now_unix_ns)) return false;
-    try reclaimClusterBackupAttemptMarker(alloc, io, location, &parsed.value, object_budget);
-    return true;
+    return try reclaimClusterBackupAttemptMarker(alloc, io, location, &parsed.value, object_budget);
 }
 
 pub fn reclaimStaleClusterBackupAttempts(
@@ -2118,9 +2525,18 @@ pub fn createClusterManifestWithExtensions(
         alloc.free(owned_entries);
     }
     for (table_entries, 0..) |entry, i| {
+        const name = try alloc.dupe(u8, entry.name);
+        errdefer alloc.free(name);
+        const owned_table_backup_id = try alloc.dupe(u8, entry.table_backup_id);
+        errdefer alloc.free(owned_table_backup_id);
+        const owned_artifact_backup_id = if (entry.artifact_backup_id) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
         owned_entries[i] = .{
-            .name = try alloc.dupe(u8, entry.name),
-            .table_backup_id = try alloc.dupe(u8, entry.table_backup_id),
+            .name = name,
+            .table_backup_id = owned_table_backup_id,
+            .artifact_backup_id = owned_artifact_backup_id,
         };
         initialized += 1;
     }
@@ -2150,6 +2566,9 @@ pub fn writeClusterManifest(
     backup_root: []const u8,
     manifest: *const ClusterBackupManifest,
 ) !void {
+    if (manifest.format_version != cluster_format_version)
+        return error.UnsupportedBackupFormat;
+    try validateClusterManifest(alloc, manifest, manifest.backup_id);
     const path = try clusterMetadataPath(alloc, backup_root, manifest.backup_id);
     defer alloc.free(path);
     try ensureDirPath(backup_root);
@@ -2169,11 +2588,7 @@ pub fn readClusterManifest(
     defer alloc.free(path);
     const body = try readFileAbsoluteAlloc(alloc, path, max_backup_manifest_bytes);
     defer alloc.free(body);
-
-    var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-    try validateClusterManifest(alloc, &parsed.value, backup_id);
-    return try cloneClusterBackupManifest(alloc, parsed.value);
+    return try parseClusterManifestBytes(alloc, body, backup_id);
 }
 
 pub fn writeClusterManifestToLocation(
@@ -2192,6 +2607,9 @@ pub fn writeClusterManifestToLocationWithIo(
     location: *BackupLocation,
     manifest: *const ClusterBackupManifest,
 ) !void {
+    if (manifest.format_version != cluster_format_version)
+        return error.UnsupportedBackupFormat;
+    try validateClusterManifest(alloc, manifest, manifest.backup_id);
     switch (location.*) {
         .file => |backup_root| {
             const path = try clusterMetadataPath(alloc, backup_root, manifest.backup_id);
@@ -2245,10 +2663,167 @@ fn parseClusterManifestBytes(
     body: []const u8,
     backup_id: []const u8,
 ) !ClusterBackupManifest {
-    var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-    try validateClusterManifest(alloc, &parsed.value, backup_id);
-    return try cloneClusterBackupManifest(alloc, parsed.value);
+    var value = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer value.deinit();
+    const root = switch (value.value) {
+        .object => |object| object,
+        else => return error.InvalidBackupRequest,
+    };
+    if (root.get("format_version") != null) {
+        var parsed = try std.json.parseFromSlice(ClusterBackupManifest, alloc, body, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        try validateClusterManifest(alloc, &parsed.value, backup_id);
+        return try cloneClusterBackupManifest(alloc, parsed.value);
+    }
+    return try parseGoPortableClusterManifest(alloc, root, backup_id);
+}
+
+fn parseGoPortableClusterManifest(
+    alloc: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    backup_id: []const u8,
+) !ClusterBackupManifest {
+    // This is the exact current Go aggregate envelope, not a permissive
+    // compatibility path. Keeping the root shape closed prevents an unrelated
+    // or future version from being silently interpreted as restorable.
+    if (root.count() != 9) return error.InvalidBackupRequest;
+    const version = switch (root.get("version") orelse return error.InvalidBackupRequest) {
+        .integer => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    if (version != 2) return error.UnsupportedBackupFormat;
+    const state = switch (root.get("state") orelse return error.InvalidBackupRequest) {
+        .string => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    if (!std.mem.eql(u8, state, "complete")) return error.IncompleteClusterBackup;
+    const encoded_backup_id = switch (root.get("backup_id") orelse return error.InvalidBackupRequest) {
+        .string => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    if (!std.mem.eql(u8, encoded_backup_id, backup_id)) return error.InvalidBackupRequest;
+    const format = switch (root.get("format") orelse return error.InvalidBackupRequest) {
+        .string => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    if (!std.mem.eql(u8, format, "portable")) return error.UnsupportedBackupFormat;
+    const timestamp = switch (root.get("timestamp") orelse return error.InvalidBackupRequest) {
+        .string => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    const source_version = switch (root.get("antfly_version") orelse return error.InvalidBackupRequest) {
+        .string => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    const expected = try nonNegativeJsonIntegerAsUsize(
+        root.get("expected_table_count") orelse return error.InvalidBackupRequest,
+    );
+    const completed = try nonNegativeJsonIntegerAsUsize(
+        root.get("completed_table_count") orelse return error.InvalidBackupRequest,
+    );
+    const table_values = switch (root.get("tables") orelse return error.InvalidBackupRequest) {
+        .array => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    if (expected == 0 or expected > max_cluster_backup_attempt_tables or
+        completed != expected or table_values.items.len != expected)
+    {
+        return error.IncompleteClusterBackup;
+    }
+
+    const tables = try alloc.alloc(ClusterTableBackupEntry, table_values.items.len);
+    var initialized: usize = 0;
+    var common_location: ?[]u8 = null;
+    errdefer {
+        for (tables[0..initialized]) |*table| table.deinit(alloc);
+        alloc.free(tables);
+        if (common_location) |location| alloc.free(location);
+    }
+    for (table_values.items, 0..) |table_value, i| {
+        const table = switch (table_value) {
+            .object => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        if (table.count() != 4) return error.InvalidBackupRequest;
+        const name = switch (table.get("name") orelse return error.InvalidBackupRequest) {
+            .string => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        const status = switch (table.get("status") orelse return error.InvalidBackupRequest) {
+            .string => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        if (!std.mem.eql(u8, status, "completed")) return error.IncompleteClusterBackup;
+        _ = try nonNegativeJsonIntegerAsUsize(
+            table.get("shard_count") orelse return error.InvalidBackupRequest,
+        );
+        const backup_location = switch (table.get("backup_location") orelse return error.InvalidBackupRequest) {
+            .string => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        const split = try goTableMetadataLocationParts(backup_location);
+        if (common_location) |location| {
+            if (!std.mem.eql(u8, location, split.root)) return error.InvalidBackupRequest;
+        } else {
+            common_location = try alloc.dupe(u8, split.root);
+        }
+        const owned_name = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned_name);
+        const owned_table_backup_id = try alloc.dupe(u8, split.backup_id);
+        errdefer alloc.free(owned_table_backup_id);
+        const owned_artifact_backup_id = try alloc.dupe(u8, backup_id);
+        tables[i] = .{
+            .name = owned_name,
+            .table_backup_id = owned_table_backup_id,
+            .artifact_backup_id = owned_artifact_backup_id,
+        };
+        initialized += 1;
+    }
+
+    const owned_backup_id = try alloc.dupe(u8, backup_id);
+    errdefer alloc.free(owned_backup_id);
+    const owned_timestamp = try alloc.dupe(u8, timestamp);
+    errdefer alloc.free(owned_timestamp);
+    const owned_source_version = try alloc.dupe(u8, source_version);
+    errdefer alloc.free(owned_source_version);
+    var manifest: ClusterBackupManifest = .{
+        .backup_id = owned_backup_id,
+        .timestamp = owned_timestamp,
+        .location = common_location.?,
+        .antfly_version = owned_source_version,
+        .expected_table_count = expected,
+        .completed_table_count = completed,
+        .tables = tables,
+    };
+    try validateClusterManifest(alloc, &manifest, backup_id);
+    common_location = null;
+    return manifest;
+}
+
+fn nonNegativeJsonIntegerAsUsize(value: std.json.Value) !usize {
+    const integer = switch (value) {
+        .integer => |item| item,
+        else => return error.InvalidBackupRequest,
+    };
+    if (integer < 0) return error.InvalidBackupRequest;
+    return std.math.cast(usize, integer) orelse error.InvalidBackupRequest;
+}
+
+const GoTableMetadataLocationParts = struct {
+    root: []const u8,
+    backup_id: []const u8,
+};
+
+fn goTableMetadataLocationParts(location: []const u8) !GoTableMetadataLocationParts {
+    const slash = std.mem.lastIndexOfScalar(u8, location, '/') orelse
+        return error.InvalidBackupRequest;
+    const leaf = location[slash + 1 ..];
+    const suffix = "-metadata.json";
+    if (leaf.len <= suffix.len or !std.mem.endsWith(u8, leaf, suffix))
+        return error.InvalidBackupRequest;
+    const id = leaf[0 .. leaf.len - suffix.len];
+    try validateBackupId(id);
+    return .{ .root = location[0..slash], .backup_id = id };
 }
 
 pub fn clusterManifestExistsAtLocation(alloc: std.mem.Allocator, location: *BackupLocation, backup_id: []const u8) !bool {
@@ -2278,24 +2853,16 @@ fn validateClusterManifest(
     manifest: *const ClusterBackupManifest,
     requested_backup_id: []const u8,
 ) !void {
-    if (manifest.format_version != cluster_format_version and
-        manifest.format_version != legacy_cluster_format_version)
-    {
+    if (manifest.format_version != cluster_format_version)
         return error.UnsupportedBackupFormat;
-    }
+    try validateBackupId(manifest.backup_id);
     if (!std.mem.eql(u8, manifest.backup_id, requested_backup_id)) return error.InvalidBackupRequest;
-    if (manifest.format_version == cluster_format_version) {
-        if (manifest.state != .complete or
-            manifest.expected_table_count == 0 or
-            manifest.expected_table_count != manifest.tables.len or
-            manifest.completed_table_count != manifest.expected_table_count)
-        {
-            return error.IncompleteClusterBackup;
-        }
-    } else if (manifest.tables.len == 0) {
-        // Version 1 predates the explicit state/count commit fields. Its
-        // non-empty manifest was the commit record; duplicate IDs and invalid
-        // entries are still rejected below.
+    if (manifest.state != .complete or
+        manifest.expected_table_count == 0 or
+        manifest.expected_table_count > max_cluster_backup_attempt_tables or
+        manifest.expected_table_count != manifest.tables.len or
+        manifest.completed_table_count != manifest.expected_table_count)
+    {
         return error.IncompleteClusterBackup;
     }
     var table_names = std.StringHashMapUnmanaged(void).empty;
@@ -2306,10 +2873,16 @@ fn validateClusterManifest(
     try table_backup_ids.ensureTotalCapacity(alloc, @intCast(manifest.tables.len));
 
     for (manifest.tables) |table| {
-        if (table.name.len == 0) return error.InvalidBackupRequest;
+        if (table.name.len == 0 or table.name.len > 4096) return error.InvalidBackupRequest;
         try validateBackupId(table.table_backup_id);
-        if (table_names.contains(table.name) or table_backup_ids.contains(table.table_backup_id))
+        if (table.artifact_backup_id) |artifact_backup_id|
+            try validateBackupId(artifact_backup_id);
+        if (std.mem.eql(u8, table.table_backup_id, manifest.backup_id) or
+            table_names.contains(table.name) or
+            table_backup_ids.contains(table.table_backup_id))
+        {
             return error.InvalidBackupRequest;
+        }
         table_names.putAssumeCapacity(table.name, {});
         table_backup_ids.putAssumeCapacity(table.table_backup_id, {});
     }
@@ -2320,6 +2893,7 @@ fn validateLocalArtifactAvailable(
     io: std.Io,
     backup_root: []const u8,
     format: BackupFormat,
+    integrity_mode: ArtifactIntegrityMode,
     shard: *const ShardSnapshot,
 ) !void {
     const artifact_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
@@ -2330,7 +2904,7 @@ fn validateLocalArtifactAvailable(
     switch (format) {
         .portable => {
             const stat = try std.Io.Dir.cwd().statFile(io, artifact_path, .{});
-            if (stat.size != shard.artifact_size_bytes)
+            if (integrity_mode == .declared and stat.size != shard.artifact_size_bytes)
                 return error.BackupArtifactIntegrityMismatch;
         },
         .native => {
@@ -2359,7 +2933,12 @@ pub fn validateClusterBackupArtifactsAtLocation(
 ) !void {
     try validateClusterManifest(alloc, manifest, manifest.backup_id);
     for (manifest.tables) |table| {
-        var table_manifest = try readManifestFromLocation(alloc, location, table.table_backup_id);
+        var table_manifest = try readManifestFromLocationWithArtifactBackupId(
+            alloc,
+            location,
+            table.table_backup_id,
+            table.artifact_backup_id orelse table.table_backup_id,
+        );
         defer table_manifest.deinit(alloc);
         if (!std.mem.eql(u8, table_manifest.table_name, table.name))
             return error.InvalidBackupRequest;
@@ -2369,11 +2948,13 @@ pub fn validateClusterBackupArtifactsAtLocation(
                 io,
                 backup_root,
                 table_manifest.format,
+                table_manifest.artifact_integrity_mode,
                 shard,
             ),
             .remote => |*store| try store.validateArtifactAvailable(
                 alloc,
                 table_manifest.format,
+                table_manifest.artifact_integrity_mode,
                 shard,
             ),
         };
@@ -2492,6 +3073,7 @@ pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, loc
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
+    var opened_location: BackupLocation = .{ .file = @constCast(backup_root) };
     var dir = std.Io.Dir.cwd().openDir(io, backup_root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return .{ .backups = try alloc.alloc(BackupInfo, 0) },
         else => return err,
@@ -2558,6 +3140,7 @@ pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, loc
         };
         defer manifest.deinit(alloc);
         if (manifest.format_version != cluster_format_version) continue;
+        try validateClusterBackupArtifactsAtLocation(alloc, io, &opened_location, &manifest);
         infos.appendAssumeCapacity(try backupInfoFromManifest(alloc, &manifest, location));
     }
     const next_cursor = if (has_more and infos.items.len > 0) try alloc.dupe(u8, infos.items[infos.items.len - 1].backup_id) else null;
@@ -2620,7 +3203,8 @@ pub fn backupListErrorClass(err: anyerror) []const u8 {
 
 fn backupListManifestErrorClass(err: anyerror) []const u8 {
     if (isInvalidBackupListManifestError(err)) return "invalid_manifest";
-    return backupListErrorClass(err);
+    const storage_class = backupListErrorClass(err);
+    return storage_class;
 }
 
 fn isSkippableBackupListManifestError(err: anyerror) bool {
@@ -2742,6 +3326,12 @@ pub fn listClusterBackupsFromOpenedLocation(
                 has_more = true;
                 break;
             }
+            try validateClusterBackupArtifactsAtLocation(
+                alloc,
+                location.remote.io,
+                location,
+                &manifest,
+            );
             infos.appendAssumeCapacity(try backupInfoFromManifest(alloc, &manifest, location_uri));
         }
 
@@ -2999,6 +3589,26 @@ pub fn populateShardArtifactIntegrity(
     integrity = undefined;
 }
 
+pub fn deriveManifestArtifactIntegrity(
+    alloc: std.mem.Allocator,
+    shared_io: ?std.Io,
+    backup_root: []const u8,
+    manifest: *TableBackupManifest,
+) !void {
+    if (manifest.artifact_integrity_mode == .declared) return;
+    if (manifest.format != .portable) return error.UnsupportedBackupFormat;
+    for (@constCast(manifest.shards)) |*shard| {
+        const artifact_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+            backup_root,
+            shard.snapshot_path,
+        });
+        defer alloc.free(artifact_path);
+        try populateShardArtifactIntegrity(alloc, shared_io, .portable, artifact_path, shard);
+    }
+    manifest.artifact_integrity_mode = .declared;
+    try validateTableManifest(alloc, manifest, manifest.backup_id);
+}
+
 pub fn verifyShardArtifactIntegrity(
     alloc: std.mem.Allocator,
     shared_io: ?std.Io,
@@ -3225,6 +3835,7 @@ fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupManif
     return .{
         .format_version = manifest.format_version,
         .format = manifest.format,
+        .artifact_integrity_mode = manifest.artifact_integrity_mode,
         .backup_id = try alloc.dupe(u8, manifest.backup_id),
         .table_name = try alloc.dupe(u8, manifest.table_name),
         .description = try alloc.dupe(u8, manifest.description),
@@ -3244,9 +3855,18 @@ fn cloneClusterBackupManifest(alloc: std.mem.Allocator, manifest: ClusterBackupM
         alloc.free(tables);
     }
     for (manifest.tables, 0..) |table, i| {
+        const name = try alloc.dupe(u8, table.name);
+        errdefer alloc.free(name);
+        const owned_table_backup_id = try alloc.dupe(u8, table.table_backup_id);
+        errdefer alloc.free(owned_table_backup_id);
+        const artifact_backup_id = if (table.artifact_backup_id) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
         tables[i] = .{
-            .name = try alloc.dupe(u8, table.name),
-            .table_backup_id = try alloc.dupe(u8, table.table_backup_id),
+            .name = name,
+            .table_backup_id = owned_table_backup_id,
+            .artifact_backup_id = artifact_backup_id,
         };
         initialized_tables += 1;
     }
@@ -3982,10 +4602,13 @@ test "cluster backup manifest rejects incomplete coverage" {
         validateClusterManifest(std.testing.allocator, &manifest, "snap"),
     );
     manifest.expected_table_count = 1;
-    manifest.format_version = legacy_cluster_format_version;
+    manifest.format_version = 1;
     manifest.expected_table_count = 0;
     manifest.completed_table_count = 0;
-    try validateClusterManifest(std.testing.allocator, &manifest, "snap");
+    try std.testing.expectError(
+        error.UnsupportedBackupFormat,
+        validateClusterManifest(std.testing.allocator, &manifest, "snap"),
+    );
 
     var empty = try createClusterManifest(
         std.testing.allocator,
@@ -4118,6 +4741,89 @@ test "backup manifest round trips through remote objectstore location" {
     try std.testing.expectEqual(@as(u64, 7), loaded.shards[0].group_id);
 }
 
+test "current Go portable metadata envelope materializes into a verified Zig manifest" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"version":1,"format":"portable","table":{"name":"docs","description":"documents","schema":{"version":0},"indexes":{"embedding":{"provider":"termite"}},"shards":{"1":{"byte_range":["",""]}}}}
+    ;
+    var manifest = try parseTableBackupManifest(alloc, body, "go-snap");
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqual(ArtifactIntegrityMode.derive_after_materialization, manifest.artifact_integrity_mode);
+    try std.testing.expectEqual(BackupFormat.portable, manifest.format);
+    try std.testing.expectEqualStrings("docs", manifest.table_name);
+    try std.testing.expectEqualStrings("go-snap-1.afb", manifest.shards[0].snapshot_path);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"provider\":\"antfly\"") != null);
+    try std.testing.expectError(
+        error.BackupIntegrityMissing,
+        validatePublishedTableManifest(alloc, &manifest, manifest.backup_id),
+    );
+    const unverified_current = try stringifyJsonAlloc(alloc, manifest);
+    defer alloc.free(unverified_current);
+    try std.testing.expectError(
+        error.BackupIntegrityMissing,
+        parseTableBackupManifest(alloc, unverified_current, manifest.backup_id),
+    );
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const artifact_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+        root,
+        manifest.shards[0].snapshot_path,
+    });
+    defer alloc.free(artifact_path);
+    try writeFileAbsolute(artifact_path, "portable-afb");
+    try deriveManifestArtifactIntegrity(alloc, null, root, &manifest);
+    try std.testing.expectEqual(ArtifactIntegrityMode.declared, manifest.artifact_integrity_mode);
+    try std.testing.expectEqual(@as(u64, "portable-afb".len), manifest.shards[0].artifact_size_bytes);
+    try verifyShardArtifactIntegrity(alloc, null, .portable, artifact_path, &manifest.shards[0]);
+
+    try std.testing.expectError(
+        error.UnsupportedBackupFormat,
+        parseTableBackupManifest(
+            alloc,
+            "{\"version\":2,\"format\":\"portable\",\"table\":{}}",
+            "go-snap",
+        ),
+    );
+}
+
+test "current Go portable cluster envelope resolves table metadata ids" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"version":2,"state":"complete","backup_id":"go-cluster","timestamp":"2026-07-25T12:00:00Z","antfly_version":"go-current","format":"portable","expected_table_count":2,"completed_table_count":2,"tables":[{"name":"docs","backup_location":"s3://archive/prod/table-a-metadata.json","shard_count":1,"status":"completed"},{"name":"events","backup_location":"s3://archive/prod/table-b-metadata.json","shard_count":2,"status":"completed"}]}
+    ;
+    var manifest = try parseClusterManifestBytes(alloc, body, "go-cluster");
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqual(cluster_format_version, manifest.format_version);
+    try std.testing.expectEqualStrings("s3://archive/prod", manifest.location);
+    try std.testing.expectEqual(@as(usize, 2), manifest.tables.len);
+    try std.testing.expectEqualStrings("docs", manifest.tables[0].name);
+    try std.testing.expectEqualStrings("table-a", manifest.tables[0].table_backup_id);
+    try std.testing.expectEqualStrings("go-cluster", manifest.tables[0].artifact_backup_id.?);
+    try std.testing.expectEqualStrings("table-b", manifest.tables[1].table_backup_id);
+
+    var table_manifest = try parseTableBackupManifestWithArtifactBackupId(
+        alloc,
+        "{\"version\":1,\"format\":\"portable\",\"table\":{\"name\":\"docs\",\"shards\":{\"1\":{\"byte_range\":[\"\",\"\"]}}}}",
+        manifest.tables[0].table_backup_id,
+        manifest.tables[0].artifact_backup_id.?,
+    );
+    defer table_manifest.deinit(alloc);
+    try std.testing.expectEqualStrings("table-a", table_manifest.backup_id);
+    try std.testing.expectEqualStrings("go-cluster-1.afb", table_manifest.shards[0].snapshot_path);
+
+    try std.testing.expectError(
+        error.UnsupportedBackupFormat,
+        parseClusterManifestBytes(
+            alloc,
+            "{\"version\":1,\"state\":\"complete\",\"backup_id\":\"go-cluster\",\"timestamp\":\"2026-07-25T12:00:00Z\",\"antfly_version\":\"go-old\",\"format\":\"portable\",\"expected_table_count\":1,\"completed_table_count\":1,\"tables\":[{\"name\":\"docs\",\"backup_location\":\"s3://archive/prod/table-a-metadata.json\",\"shard_count\":1,\"status\":\"completed\"}]}",
+            "go-cluster",
+        ),
+    );
+}
+
 test "remote backup metadata reads are size bounded" {
     const alloc = std.testing.allocator;
     try ensureManifestSize("0123456789abcdef", 16);
@@ -4200,9 +4906,14 @@ test "remote backup key joins canonicalize only the prefix boundary" {
 
 test "remote portable file transfer uses objectstore file paths" {
     const alloc = std.testing.allocator;
-    const root = ".zig-cache/test-backup-file-transfer-store";
-    const source_path = ".zig-cache/test-backup-file-transfer-source.afb";
-    const restored_path = ".zig-cache/test-backup-file-transfer-restored.afb";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/object-store", .{tmp.sub_path});
+    defer alloc.free(root);
+    const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source.afb", .{tmp.sub_path});
+    defer alloc.free(source_path);
+    const restored_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restored.afb", .{tmp.sub_path});
+    defer alloc.free(restored_path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
@@ -4274,6 +4985,51 @@ test "remote backup directory download paginates and enforces segment prefix" {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(io, escaped_path, alloc, .limited(16)));
 }
 
+fn writePortableListValidationFixture(
+    alloc: std.mem.Allocator,
+    location: *BackupLocation,
+    fixture_backup_id: []const u8,
+    table_name: []const u8,
+) !void {
+    const artifact_path = try std.fmt.allocPrint(alloc, "{s}.afb", .{fixture_backup_id});
+    defer alloc.free(artifact_path);
+    const shards = [_]ShardSnapshot{.{
+        .group_id = 1,
+        .start_key = "",
+        .snapshot_path = artifact_path,
+    }};
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 1,
+        .name = table_name,
+        .schema_json = "{}",
+    };
+    var manifest = try createManifest(alloc, fixture_backup_id, .portable, &table, &shards);
+    defer manifest.deinit(alloc);
+    const payload = "payload";
+    var integrity = try portableBytesIntegrityAlloc(alloc, payload);
+    const mutable_shard = &@constCast(manifest.shards)[0];
+    mutable_shard.artifact_size_bytes = integrity.size_bytes;
+    mutable_shard.artifact_sha256 = integrity.sha256;
+    integrity = undefined;
+    switch (location.*) {
+        .file => |backup_root| {
+            const absolute_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+                backup_root,
+                artifact_path,
+            });
+            defer alloc.free(absolute_path);
+            try writeFileAbsolute(absolute_path, payload);
+        },
+        .remote => |*store| try store.writeBytes(
+            alloc,
+            artifact_path,
+            payload,
+            "application/vnd.antfly.backup",
+        ),
+    }
+    try writeManifestToLocation(alloc, location, &manifest);
+}
+
 test "cluster backup list uses top-level remote manifests without recursing into payloads" {
     var memory = object_storage.MemoryObjectStorage.init(std.testing.allocator);
     defer memory.deinit();
@@ -4286,6 +5042,12 @@ test "cluster backup list uses top-level remote manifests without recursing into
     const entries = [_]ClusterTableBackupEntry{
         .{ .name = "docs", .table_backup_id = "docs-prod-snap" },
     };
+    try writePortableListValidationFixture(
+        std.testing.allocator,
+        &location,
+        entries[0].table_backup_id,
+        entries[0].name,
+    );
     var manifest = try createClusterManifest(std.testing.allocator, "prod-snap", "s3://bucket/backups/prod", &entries);
     defer manifest.deinit(std.testing.allocator);
     try writeClusterManifestToLocation(std.testing.allocator, &location, &manifest);
@@ -4340,6 +5102,93 @@ test "cluster backup list uses top-level remote manifests without recursing into
     try std.testing.expect(std.mem.indexOf(u8, second_json, "next_cursor") == null);
 }
 
+test "incomplete cluster backup attempt does not hide committed backups" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+
+    try writePortableListValidationFixture(alloc, &location, "old-table", "docs");
+    const old_entries = [_]ClusterTableBackupEntry{.{
+        .name = "docs",
+        .table_backup_id = "old-table",
+    }};
+    var old_manifest = try createClusterManifest(
+        alloc,
+        "old-cluster",
+        "s3://bucket/backups",
+        &old_entries,
+    );
+    defer old_manifest.deinit(alloc);
+    try writeClusterManifestToLocation(alloc, &location, &old_manifest);
+
+    const attempt_tables = [_]ClusterBackupAttemptTable{.{
+        .name = "docs",
+        .table_backup_id = "new-table",
+        .artifact_backup_id = "new-artifact",
+    }};
+    const now_ns: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+    const marker: ClusterBackupAttemptMarker = .{
+        .attempt_id = "new-attempt",
+        .cluster_backup_id = "new-cluster",
+        .created_at_unix_ns = now_ns,
+        .format = .portable,
+        .tables = &attempt_tables,
+    };
+    try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
+
+    var listed = try listClusterBackupsFromOpenedLocation(
+        alloc,
+        &location,
+        "s3://bucket/backups",
+        .{ .limit = 10 },
+    );
+    defer listed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), listed.backups.len);
+    try std.testing.expectEqualStrings("old-cluster", listed.backups[0].backup_id);
+}
+
+test "cluster backup list rejects a committed manifest with a missing artifact" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+
+    try writePortableListValidationFixture(alloc, &location, "missing-table", "docs");
+    try location.remote.deleteSuffix(alloc, "missing-table.afb");
+    const entries = [_]ClusterTableBackupEntry{.{
+        .name = "docs",
+        .table_backup_id = "missing-table",
+    }};
+    var manifest = try createClusterManifest(
+        alloc,
+        "missing-cluster",
+        "s3://bucket/backups",
+        &entries,
+    );
+    defer manifest.deinit(alloc);
+    try writeClusterManifestToLocation(alloc, &location, &manifest);
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        listClusterBackupsFromOpenedLocation(
+            alloc,
+            &location,
+            "s3://bucket/backups",
+            .{ .limit = 10 },
+        ),
+    );
+}
+
 test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
     const alloc = std.testing.allocator;
     const backup_ids = [_][]const u8{ "snap-a", "snap-b", "snap-c" };
@@ -4362,6 +5211,9 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
     }
 
     const FakeS3 = struct {
+        const table_manifest =
+            \\{"format_version":2,"format":"portable","artifact_integrity_mode":"declared","backup_id":"docs-snap","table_name":"docs","description":"","schema_json":"{}","read_schema_json":"","indexes_json":"{}","replication_sources_json":"[]","shards":[{"group_id":1,"start_key":"","end_key":null,"snapshot_path":"docs-snap.afb","artifact_size_bytes":1,"artifact_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
+        ;
         manifests: *const [backup_ids.len][]u8,
         list_requests: usize = 0,
         manifest_head_requests: usize = 0,
@@ -4407,7 +5259,9 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
                 try std.testing.expect(std.mem.indexOf(u8, query, "backups/prod//") == null);
                 self.list_requests += 1;
 
-                const page = if (std.mem.indexOf(u8, query, "continuation-token=page-2") != null or
+                const page = if (std.mem.indexOf(u8, query, ".antfly-incomplete/") != null)
+                    "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>"
+                else if (std.mem.indexOf(u8, query, "continuation-token=page-2") != null or
                     std.mem.indexOf(u8, query, "start-after=backups/prod/snap-b-cluster-metadata.json") != null)
                     "<ListBucketResult><Contents><Key>backups/prod/snap-c-cluster-metadata.json</Key><ETag>\"c\"</ETag><Size>1</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"
                 else
@@ -4422,7 +5276,16 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
             try std.testing.expect(std.mem.startsWith(u8, path, object_path_prefix));
             const key = path[object_path_prefix.len..];
             try std.testing.expect(std.mem.indexOf(u8, key, "backups/prod//") == null);
-            const manifest_body = self.manifestForKey(key) orelse return error.UnexpectedS3ObjectKey;
+            const manifest_body = self.manifestForKey(key) orelse if (std.mem.eql(
+                u8,
+                key,
+                "backups/prod/docs-snap-metadata.json",
+            ))
+                table_manifest
+            else if (std.mem.eql(u8, key, "backups/prod/docs-snap.afb"))
+                "x"
+            else
+                return error.UnexpectedS3ObjectKey;
             return switch (method) {
                 .HEAD => blk: {
                     self.manifest_head_requests += 1;
@@ -4542,9 +5405,13 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
     );
     try std.testing.expectEqual(@as(?[]u8, null), canonical_second.next_cursor);
     try std.testing.expectEqual(@as(?[]u8, null), trailing_second.next_cursor);
+    // Listing reads only committed manifests; in-flight attempt journals are
+    // admission/recovery state and do not add object-store requests here.
     try std.testing.expectEqual(@as(usize, 6), fake.list_requests);
-    try std.testing.expectEqual(@as(usize, 8), fake.manifest_head_requests);
-    try std.testing.expectEqual(@as(usize, 8), fake.manifest_get_requests);
+    // Eight aggregate reads, six table-manifest reads, and six artifact
+    // metadata checks across the two equivalent paginated traversals.
+    try std.testing.expectEqual(@as(usize, 20), fake.manifest_head_requests);
+    try std.testing.expectEqual(@as(usize, 14), fake.manifest_get_requests);
 }
 
 test "cluster backup list canonicalizes trailing remote prefix slash" {
@@ -4563,6 +5430,12 @@ test "cluster backup list canonicalizes trailing remote prefix slash" {
     const entries = [_]ClusterTableBackupEntry{
         .{ .name = "docs", .table_backup_id = "docs-snap" },
     };
+    try writePortableListValidationFixture(
+        alloc,
+        &canonical,
+        entries[0].table_backup_id,
+        entries[0].name,
+    );
     inline for (&.{ "snap-a", "snap-b", "snap-c" }, 0..) |backup_id, index| {
         var manifest = try createClusterManifest(
             alloc,
@@ -4581,7 +5454,9 @@ test "cluster backup list canonicalizes trailing remote prefix slash" {
         .recursive = true,
     });
     defer listed.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), listed.entries.len);
+    // Three aggregate manifests plus the table manifest and portable payload
+    // used by list-time restorable-artifact admission.
+    try std.testing.expectEqual(@as(usize, 5), listed.entries.len);
     for (listed.entries) |entry| {
         try std.testing.expect(std.mem.indexOf(u8, entry.key, "backups/prod//") == null);
     }
@@ -4648,7 +5523,77 @@ test "remote backup reservations fence duplicate execution and can be released a
     try reserveBackupAtLocation(std.testing.allocator, io, &location, "cluster-snap", true);
 }
 
-test "stale cluster backup attempt reclamation is bounded and releases fenced artifacts" {
+test "unpublished remote cleanup preserves a conflicting manifest" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+
+    try location.remote.writeBytes(alloc, "shared-metadata.json", "existing-commit", "application/json");
+    try reserveBackupAtLocation(alloc, io, &location, "shared", false);
+    try location.remote.writeBytes(
+        alloc,
+        "attempt-artifact.afb",
+        "new-attempt",
+        "application/vnd.antfly.backup",
+    );
+    try cleanupUnpublishedTableBackupAttemptAtLocation(
+        alloc,
+        io,
+        &location,
+        "shared",
+        "attempt-artifact",
+        .portable,
+    );
+
+    const committed = try location.remote.readBytesAllocLimited(alloc, "shared-metadata.json", 64);
+    defer alloc.free(committed);
+    try std.testing.expectEqualStrings("existing-commit", committed);
+    try std.testing.expectError(
+        error.FileNotFound,
+        location.remote.readBytesAllocLimited(alloc, "attempt-artifact.afb", 64),
+    );
+    try reserveBackupAtLocation(alloc, io, &location, "shared", false);
+}
+
+test "cluster backup attempt markers reject overlapping cleanup identities" {
+    const tables = [_]ClusterBackupAttemptTable{.{
+        .name = "docs",
+        .table_backup_id = "shared-id",
+        .artifact_backup_id = "shared-id",
+    }};
+    var marker: ClusterBackupAttemptMarker = .{
+        .attempt_id = "attempt-snap",
+        .cluster_backup_id = "cluster-snap",
+        .created_at_unix_ns = 1,
+        .format = .portable,
+        .tables = &tables,
+    };
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        validateClusterBackupAttemptMarker(std.testing.allocator, &marker, marker.attempt_id),
+    );
+
+    const valid_tables = [_]ClusterBackupAttemptTable{.{
+        .name = "docs",
+        .table_backup_id = "table-snap",
+        .artifact_backup_id = "artifact-snap",
+    }};
+    marker.tables = &valid_tables;
+    marker.created_at_unix_ns = 0;
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        validateClusterBackupAttemptMarker(std.testing.allocator, &marker, marker.attempt_id),
+    );
+}
+
+test "stale uncommitted cluster backup attempt remains fenced" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -4683,7 +5628,7 @@ test "stale cluster backup attempt reclamation is bounded and releases fenced ar
     try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
 
     try std.testing.expectEqual(
-        @as(usize, 1),
+        @as(usize, 0),
         try reclaimStaleClusterBackupAttempts(
             alloc,
             io,
@@ -4691,16 +5636,20 @@ test "stale cluster backup attempt reclamation is bounded and releases fenced ar
             backup_attempt_reclaim_age_ns + 1,
         ),
     );
+    const artifact = try location.remote.readBytesAllocLimited(alloc, "artifact-snap.afb", 16);
+    defer alloc.free(artifact);
+    try std.testing.expectEqualStrings("payload", artifact);
+    var retained = try readClusterBackupAttemptMarker(alloc, io, &location, "attempt-snap");
+    defer retained.deinit();
+    try std.testing.expectEqualStrings(marker.attempt_id, retained.value.attempt_id);
     try std.testing.expectError(
-        error.FileNotFound,
-        location.remote.readBytesAllocLimited(alloc, "artifact-snap.afb", 16),
+        error.BackupAlreadyExists,
+        reserveBackupAtLocation(alloc, io, &location, "cluster-snap", true),
     );
     try std.testing.expectError(
-        error.FileNotFound,
-        readClusterBackupAttemptMarker(alloc, io, &location, "attempt-snap"),
+        error.BackupAlreadyExists,
+        reserveBackupAtLocation(alloc, io, &location, "table-snap", false),
     );
-    try reserveBackupAtLocation(alloc, io, &location, "cluster-snap", true);
-    try reserveBackupAtLocation(alloc, io, &location, "table-snap", false);
 }
 
 test "stale cluster backup attempt preserves aggregate referenced artifacts" {
@@ -4771,6 +5720,10 @@ test "stale cluster backup attempt preserves aggregate referenced artifacts" {
         location.remote.readBytesAllocLimited(alloc, loser_suffix, 64),
     );
     try std.testing.expectError(
+        error.FileNotFound,
+        readClusterBackupAttemptMarker(alloc, io, &location, marker.attempt_id),
+    );
+    try std.testing.expectError(
         error.BackupAlreadyExists,
         reserveBackupAtLocation(alloc, io, &location, marker.cluster_backup_id, true),
     );
@@ -4783,6 +5736,13 @@ test "filesystem backup listing is bounded and cursor stable" {
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/backup-list", .{tmp.sub_path});
     defer alloc.free(root);
     const entries = [_]ClusterTableBackupEntry{.{ .name = "docs", .table_backup_id = "docs-snapshot" }};
+    var location: BackupLocation = .{ .file = root };
+    try writePortableListValidationFixture(
+        alloc,
+        &location,
+        entries[0].table_backup_id,
+        entries[0].name,
+    );
     inline for (&.{ "prod-snap", "prod-snap-3", "prod-snap-2" }) |backup_id| {
         var manifest = try createClusterManifest(alloc, backup_id, "file:///backups", &entries);
         defer manifest.deinit(alloc);
