@@ -24,6 +24,7 @@ const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
+const model_support = @import("../models/support.zig");
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
@@ -90,9 +91,7 @@ fn shouldUseMetalWholeModelExecutor(session: backends.Session) bool {
 }
 
 fn spinLock(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) {
-        std.atomic.spinLoopHint();
-    }
+    platform.sync.lockYielding(m);
 }
 
 pub fn shouldPreferSentencePieceOverride(man: manifest_mod.ModelManifest, model_dir: []const u8, allocator: std.mem.Allocator) bool {
@@ -1022,8 +1021,15 @@ fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) b
 pub const ModelManager = struct {
     allocator: std.mem.Allocator,
     session_manager: backends.SessionManager,
+    /// Null for diagnostic/offline CLIs. Serving Nodes set this before any model load.
+    serving_policy: ?model_support.Policy = null,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
+    /// Model construction mutates the caches below and initializes shared backend state.
+    /// Cold requests can arrive concurrently, so cache lookup through insertion must be
+    /// one critical section. Model loads are rare enough that a single manager-wide lock
+    /// is safer than introducing a per-key in-flight registry for 0.2.0.
+    load_lock: std.atomic.Mutex = .unlocked,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe_config: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
 
@@ -1034,6 +1040,25 @@ pub const ModelManager = struct {
             .loaded = std.StringHashMapUnmanaged(*LoadedModel){},
             .loaded_aliases = std.StringHashMapUnmanaged(*LoadedModel){},
         };
+    }
+
+    pub fn configureServingPolicy(self: *ModelManager, policy: model_support.Policy) void {
+        std.debug.assert(self.loaded.count() == 0);
+        self.serving_policy = policy;
+    }
+
+    pub fn lockLoadedModels(self: *ModelManager) void {
+        spinLock(&self.load_lock);
+    }
+
+    pub fn unlockLoadedModels(self: *ModelManager) void {
+        self.load_lock.unlock();
+    }
+
+    pub fn getLoadedModel(self: *ModelManager, model_dir: []const u8) ?*LoadedModel {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        return self.loaded.get(model_dir) orelse self.loaded_aliases.get(model_dir);
     }
 
     /// Configure tokenizer-cache admission before any model is loaded. The
@@ -1103,6 +1128,8 @@ pub const ModelManager = struct {
         include: *LoadedModel,
         node_config: runtime.kv.prompt_cache.Config,
     ) void {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
         var per_cache = node_config;
         per_cache.max_bytes /= self.activePromptCacheCount(include);
         include.prompt_prefix_cache.configure(per_cache);
@@ -1118,12 +1145,25 @@ pub const ModelManager = struct {
 
     /// Load a model from a directory path. Returns a cached model if already loaded.
     pub fn loadFromDir(self: *ModelManager, model_dir: []const u8) !*LoadedModel {
+        spinLock(&self.load_lock);
+        defer self.load_lock.unlock();
         if (self.loaded.get(model_dir)) |model| return model;
         if (self.loaded_aliases.get(model_dir)) |model| return model;
-        return self.loadFromDirWithPreferredBackends(model_dir, self.session_manager.preferred_backends, true);
+        return self.loadFromDirWithPreferredBackendsLocked(model_dir, self.session_manager.preferred_backends, true);
     }
 
     pub fn loadFromDirWithPreferredBackends(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+    ) !*LoadedModel {
+        spinLock(&self.load_lock);
+        defer self.load_lock.unlock();
+        return self.loadFromDirWithPreferredBackendsLocked(model_dir, preferred_backends, cache_default_alias);
+    }
+
+    fn loadFromDirWithPreferredBackendsLocked(
         self: *ModelManager,
         model_dir: []const u8,
         preferred_backends: []const backends.BackendType,
@@ -1151,6 +1191,17 @@ pub const ModelManager = struct {
         // Load manifest
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         errdefer man.deinit();
+        if (self.serving_policy) |policy| {
+            var inspection = try model_support.inspectAlloc(self.allocator, &man);
+            defer inspection.deinit(self.allocator);
+            const assessment = model_support.assessInspection(&man, inspection);
+            switch (assessment.level) {
+                .supported => {},
+                .experimental => if (!policy.allow_experimental)
+                    return error.ExperimentalModelDisabled,
+                .unsupported => return error.UnsupportedModel,
+            }
+        }
         if (man.hasIncompleteGlinerBundle()) return error.IncompleteGlinerBundle;
         if (man.hasIncompleteColqwenBundle()) return error.IncompleteColqwenBundle;
         if (man.hasIncompleteClipclapGgufBundle()) return error.IncompleteClipclapGgufBundle;
@@ -1635,7 +1686,36 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     });
     defer manager.deinit();
 
-    const model = try manager.loadFromDir(dir_path);
+    const ColdLoadWorker = struct {
+        manager: *ModelManager,
+        path: []const u8,
+        model: ?*LoadedModel = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.model = self.manager.loadFromDir(self.path) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var workers = [_]ColdLoadWorker{
+        .{ .manager = &manager, .path = dir_path },
+        .{ .manager = &manager, .path = dir_path },
+        .{ .manager = &manager, .path = dir_path },
+        .{ .manager = &manager, .path = dir_path },
+    };
+    var threads: [workers.len]std.Thread = undefined;
+    for (&workers, 0..) |*worker, i| {
+        threads[i] = try std.Thread.spawn(.{}, ColdLoadWorker.run, .{worker});
+    }
+    for (&threads) |*thread| thread.join();
+    for (workers) |worker| {
+        try std.testing.expect(worker.err == null);
+        try std.testing.expect(worker.model == workers[0].model);
+    }
+
+    const model = workers[0].model.?;
     try std.testing.expect(model.isGlinerModel());
     try std.testing.expect(model.supportsExtraction());
     try std.testing.expectEqualStrings("gliner2_split_bundle/v1", model.manifest.inference_bundle_family);
@@ -1643,6 +1723,60 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     var pipeline = model.glinerPipeline(allocator);
     try std.testing.expectEqualStrings("gliner2", pipeline.config.model_type);
     try std.testing.expectError(error.MissingSpecialTokenIds, pipeline.recognizeBatch(&.{"hello"}, &.{"person"}));
+}
+
+test "ModelManager serving policy fails closed before loading generator weights" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "model_manifest.json",
+        .data = "{\"type\":\"generator\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"brand_new_decoder\"}",
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(dir_path);
+
+    var manager = ModelManager.init(allocator, .{
+        .allocator = allocator,
+        .preferred_backends = &.{.native},
+    });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{});
+
+    try std.testing.expectError(error.ExperimentalModelDisabled, manager.loadFromDir(dir_path));
+}
+
+test "experimental opt in does not enable a known unsupported generator" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "model_manifest.json",
+        .data = "{\"type\":\"generator\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"deepseek4\"}",
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(dir_path);
+
+    var manager = ModelManager.init(allocator, .{
+        .allocator = allocator,
+        .preferred_backends = &.{.native},
+    });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_experimental = true });
+
+    try std.testing.expectError(error.UnsupportedModel, manager.loadFromDir(dir_path));
 }
 
 test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipeline" {

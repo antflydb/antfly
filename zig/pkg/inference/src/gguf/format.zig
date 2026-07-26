@@ -156,17 +156,23 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !File {
     };
 }
 
-/// Read only `general.architecture` from a GGUF file, skipping every other metadata value
-/// without allocating it.
+pub const SupportMetadata = struct {
+    architecture: ?[]const u8 = null,
+    expert_count: u32 = 0,
+};
+
+/// Read the small set of GGUF metadata used to choose a safe serving path, skipping every
+/// other metadata value without allocating it.
 ///
 /// `parse` materializes the whole KV table, which for a modern tokenizer means allocating
 /// hundreds of thousands of token strings. Model listing only needs the architecture, and
 /// doing a full parse per listed model is what made `/ai/v1/models` take seconds per call.
 ///
-/// Returns a slice borrowed from `bytes`, or null if the key is absent.
-pub fn readArchitecture(bytes: []const u8) !?[]const u8 {
+/// Any returned architecture slice is borrowed from `bytes`.
+pub fn readSupportMetadata(bytes: []const u8) !SupportMetadata {
     var cursor = Cursor{ .bytes = bytes };
     const header = try parseHeader(&cursor);
+    var result = SupportMetadata{};
 
     for (0..@as(usize, @intCast(header.metadata_count))) |_| {
         const key = try cursor.readBorrowedString();
@@ -174,12 +180,19 @@ pub fn readArchitecture(bytes: []const u8) !?[]const u8 {
         const value_type = metadataValueTypeFromRaw(raw_type) orelse return error.UnsupportedMetadataType;
 
         if (value_type == .string and std.mem.eql(u8, key, "general.architecture")) {
-            return try cursor.readBorrowedString();
+            result.architecture = try cursor.readBorrowedString();
+        } else if (value_type == .u32 and std.mem.endsWith(u8, key, ".expert_count")) {
+            result.expert_count = try cursor.readInt(u32);
+        } else {
+            try cursor.skipMetadataValue(value_type);
         }
-        try cursor.skipMetadataValue(value_type);
     }
 
-    return null;
+    return result;
+}
+
+pub fn readArchitecture(bytes: []const u8) !?[]const u8 {
+    return (try readSupportMetadata(bytes)).architecture;
 }
 
 fn parseHeader(cursor: *Cursor) !Header {
@@ -385,7 +398,7 @@ test "readArchitecture skips past preceding metadata including token arrays" {
     try data.appendSlice(allocator, magic);
     try appendLe(u32, allocator, &data, 3);
     try appendLe(u64, allocator, &data, 0);
-    try appendLe(u64, allocator, &data, 4);
+    try appendLe(u64, allocator, &data, 5);
 
     // A string array, like tokenizer.ggml.tokens: the entry that makes a full parse
     // expensive, and the one readArchitecture must walk without allocating.
@@ -414,8 +427,15 @@ test "readArchitecture skips past preceding metadata including token arrays" {
     try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
     try appendString(allocator, &data, "gemma4");
 
-    const arch = try readArchitecture(data.items);
-    try std.testing.expectEqualStrings("gemma4", arch.?);
+    // Structural serving facts can appear after the architecture key, so the lightweight
+    // reader must keep scanning rather than returning on the first match.
+    try appendString(allocator, &data, "gemma4.expert_count");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, 128);
+
+    const metadata = try readSupportMetadata(data.items);
+    try std.testing.expectEqualStrings("gemma4", metadata.architecture.?);
+    try std.testing.expectEqual(@as(u32, 128), metadata.expert_count);
 }
 
 test "readArchitecture returns null when the key is absent" {

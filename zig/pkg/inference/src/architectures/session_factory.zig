@@ -6287,35 +6287,7 @@ test "Gemma resident embeddings retain CUDA-supported quantized formats" {
     try std.testing.expect(!shouldKeepResidentGptEmbeddingQuantizedOnly(llama_cfg, .{ .known = .Q6_K }));
 }
 
-test "support level separates verified and unsupported families" {
-    // Verified against real GGUF artifacts.
-    try std.testing.expectEqual(gpt_mod.SupportLevel.supported, gpt_mod.supportLevel(.llama));
-    try std.testing.expectEqual(gpt_mod.SupportLevel.supported, gpt_mod.supportLevel(.qwen3));
-    try std.testing.expectEqual(gpt_mod.SupportLevel.supported, gpt_mod.supportLevel(.gemma));
-
-    // Measured against real artifacts and unusable: qwen2 answers the wrong question,
-    // bitnet degenerates, mistral emits only <unk>, Phi-3 cannot load. None of these are
-    // "early", so none belong in experimental.
-    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.qwen2));
-    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.bitnet));
-    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.mistral));
-    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.phi));
-
-    // Loads and resolves every tensor, but execution panics in the grouped output
-    // projection, so it must not be reachable from a server.
-    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.deepseek_v4));
-
-    // falcon/opt/bloom are enum entries with no weight mapping or runtime at all, so
-    // they must not present as generators that merely happen to be missing tensors.
-    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.falcon));
-    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.opt));
-    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.bloom));
-    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.qwen3_5));
-}
-
-test "experimental families keep their gguf weight mapping" {
-    // `unsupported` gates the normalizer; `experimental` must not, or a family we are
-    // merely unsure about would fail as though it had no mapping.
+test "serving policy does not disable existing gguf weight mappings" {
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(
         "model.layers.3.self_attn.q_proj.weight",
@@ -6326,26 +6298,6 @@ test "experimental families keep their gguf weight mapping" {
         "blk.3.attn_q.weight",
         &buf,
     ) == null);
-}
-
-test "architecture strings named in errors resolve to their advertised level" {
-    // The error message lists these by name, so a typo or a rename would silently
-    // advertise something the gate rejects.
-    for ([_][]const u8{ "llama", "qwen3", "gemma", "gemma2", "gemma3", "gemma4" }) |arch| {
-        try std.testing.expectEqual(
-            gpt_mod.SupportLevel.supported,
-            gpt_mod.supportLevel(gpt_mod.detectFamily(arch)),
-        );
-    }
-    // Nothing is experimental for 0.2.0: every family that fell short of supported did
-    // so by producing unusable output, and that belongs in unsupported.
-    try std.testing.expectEqual(@as(usize, 0), gpt_mod.gguf_experimental_architectures.len);
-    for ([_][]const u8{ "mistral", "mixtral", "qwen2", "phi", "phi3", "bitnet" }) |arch| {
-        try std.testing.expectEqual(
-            gpt_mod.SupportLevel.unsupported,
-            gpt_mod.supportLevel(gpt_mod.detectFamily(arch)),
-        );
-    }
 }
 
 test "deepseek v4 gguf architecture name is recognized" {
@@ -6361,14 +6313,12 @@ test "i32 index tables pass gguf tensor type inspection" {
     try std.testing.expect(tensorTypeSupported(.{ .known = .I32 }));
 }
 
-
 test "unsupported families keep their gguf weight mapping" {
     // The mapping predicate is independent of the support tier. deepseek_v4 is blocked
     // for generation but its tensor names must still resolve, both because its mapping
     // tests depend on them and because blocking a family should not silently change what
     // the loader can parse.
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqual(gpt_mod.SupportLevel.unsupported, gpt_mod.supportLevel(.deepseek_v4));
     try std.testing.expect(gpt_mod.ggufWeightMappingSupported(.deepseek_v4));
     try std.testing.expectEqualStrings(
         "model.layers.0.self_attn.q_a_proj.weight",
