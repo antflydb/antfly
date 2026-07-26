@@ -1140,6 +1140,7 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
             .bootstrap_mode = .fetch_snapshot,
             .backup_restore_bootstrap = .{
                 .backup_id = "snap1",
+                .artifact_backup_id = "snap1",
                 .location = restore_location,
                 .snapshot_path = "snap1/groups/903",
                 .connection = "test-backups",
@@ -1993,6 +1994,7 @@ test "managed http host exposes backup bootstrap status from underlying host" {
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-1205",
+            .artifact_backup_id = "snap-1205",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-1205/groups/1205",
             .connection = "backup-store",

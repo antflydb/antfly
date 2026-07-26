@@ -97,6 +97,7 @@ const TableProgressStatus = struct {
 
 const RestoreIntentSource = struct {
     backup_id: []const u8,
+    artifact_backup_id: []const u8,
     location: []const u8,
     snapshot_path: []const u8 = "",
     connection: []const u8 = "",
@@ -161,6 +162,7 @@ pub fn provisioningFingerprint(
             hasher.update(&[_]u8{0});
         }
         hashBytes(&hasher, range.restore_backup_id);
+        hashBytes(&hasher, range.restore_artifact_backup_id);
         hashBytes(&hasher, range.restore_location);
         hashBytes(&hasher, range.restore_snapshot_path);
         hashBytes(&hasher, range.restore_connection);
@@ -718,6 +720,7 @@ pub fn applyRestoreIntentIfNeededWithOptions(
     const restore = resolveRestoreIntent(range, table) orelse return;
     try backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
         .backup_id = restore.backup_id,
+        .artifact_backup_id = restore.artifact_backup_id,
         .location = restore.location,
         .snapshot_path = restore.snapshot_path,
         .authority = .{ .external = restore.connection },
@@ -747,6 +750,7 @@ fn resolveRestoreIntent(
     if (range.restore_backup_id.len > 0 and range.restore_location.len > 0) {
         return .{
             .backup_id = range.restore_backup_id,
+            .artifact_backup_id = range.restore_artifact_backup_id,
             .location = range.restore_location,
             .snapshot_path = range.restore_snapshot_path,
             .connection = range.restore_connection,
@@ -2960,6 +2964,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
             .end_key = null,
             .range_id = 2001,
             .restore_backup_id = "snap1",
+            .restore_artifact_backup_id = "snap1",
             .restore_location = restore_location,
             .restore_snapshot_path = "snap1/groups/2001",
             .restore_connection = "test-backups",

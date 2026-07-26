@@ -5445,10 +5445,25 @@ pub const DataServer = struct {
     ) void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         switch (action) {
-            .enqueue => self.enqueueProvisionedIndexRepairForTable(table_name, group_id) catch |err| {
-                _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
-                self.provisioned_index_repair_dirty.store(true, .release);
-                std.log.warn("provisioned index repair debt enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
+            .enqueue, .enqueue_runnable => {
+                self.enqueueProvisionedIndexRepairForTable(table_name, group_id) catch |err| {
+                    _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
+                    self.provisioned_index_repair_dirty.store(true, .release);
+                    std.log.warn("provisioned index repair debt enqueue failed group={} err={s}", .{ group_id, @errorName(err) });
+                    return;
+                };
+                if (action == .enqueue_runnable) {
+                    self.maybeRequestProvisionedIndexRepair() catch |err| {
+                        // The exact durable queue remains dirty, and the
+                        // control loop is a lost-wakeup fallback. Admission
+                        // pressure must not turn a successful catalog mutation
+                        // into a failed API request.
+                        std.log.warn("provisioned index repair immediate admission deferred group={} err={s}", .{
+                            group_id,
+                            @errorName(err),
+                        });
+                    };
+                }
             },
             .remove => {
                 self.removeProvisionedIndexRepair(group_id);
@@ -9699,7 +9714,6 @@ pub const DataServer = struct {
         if (self.provisioned_index_repair_shutdown.load(.acquire)) return;
         const dirty = self.provisioned_index_repair_dirty.load(.acquire);
         if (self.provisioned_index_repair_active.load(.acquire)) return;
-        if (self.provisioned_startup_catch_up_active.load(.acquire)) return;
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         const scheduler_not_before_ms = self.provisioned_index_repair_scheduler_not_before_ms.load(.acquire);
         const fallback_not_before_ms = self.provisioned_index_repair_fallback_not_before_ms.load(.acquire);
@@ -11581,11 +11595,13 @@ const RemoteMetadataSource = struct {
         table_name: []const u8,
         location_uri: []const u8,
         connection: []const u8,
+        artifact_backup_id: []const u8,
         manifest: *const antfly.public_api.backups.TableBackupManifest,
     ) !void {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         const body = try std.json.Stringify.valueAlloc(alloc, .{
             .backup_id = manifest.backup_id,
+            .artifact_backup_id = artifact_backup_id,
             .location = location_uri,
             .connection = connection,
             .manifest = manifest.*,
@@ -19073,6 +19089,8 @@ test "data runtime reconciled changes invalidate status without scheduling root 
 
 test "data runtime repair debt hook targets the affected group queue" {
     const alloc = std.testing.allocator;
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
     var server: DataServer = .{
         .alloc = alloc,
         .provisioned_storage = undefined,
@@ -19081,6 +19099,7 @@ test "data runtime repair debt hook targets the affected group queue" {
         .status_source = undefined,
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
+        .backend_runtime = runtime.ptr(),
         .listener_cfg = undefined,
     };
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
@@ -19098,6 +19117,16 @@ test "data runtime repair debt hook targets the affected group queue" {
     try std.testing.expectEqualStrings("docs", server.provisioned_index_repair_group_ages.get(7001).?.table_name.?);
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_queue_depth.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_started.load(.monotonic));
+
+    // Broad startup discovery must not starve exact, post-reservation debt.
+    // Same-group exclusion is enforced by the write source and returns a
+    // retained busy result if the discovery worker actually owns this shard.
+    server.provisioned_startup_catch_up_active.store(true, .release);
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue_runnable);
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_started.load(.monotonic));
+    try std.testing.expect(!server.provisioned_index_repair_active.load(.acquire));
+    server.provisioned_startup_catch_up_active.store(false, .release);
 
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .cancel);
     try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));

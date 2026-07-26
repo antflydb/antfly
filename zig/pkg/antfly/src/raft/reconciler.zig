@@ -903,6 +903,7 @@ test "prepared reconcile failure never publishes an unprepared replica" {
             .bootstrap_mode = .fetch_snapshot,
             .backup_restore_bootstrap = .{
                 .backup_id = "backup-503",
+                .artifact_backup_id = "backup-503",
                 .location = "file:///unused",
                 .snapshot_path = "backup-503/groups/503",
                 .connection = "backup-store",
@@ -987,6 +988,7 @@ test "blocked reconcile preparation does not block existing raft progress" {
             .bootstrap_mode = .fetch_snapshot,
             .backup_restore_bootstrap = .{
                 .backup_id = "backup-505",
+                .artifact_backup_id = "backup-505",
                 .location = "file:///unused",
                 .snapshot_path = "backup-505/groups/505",
                 .connection = "backup-store",
@@ -1445,6 +1447,7 @@ test "cloneIntentOwned deep clones backup restore metadata" {
             .metadata_version = 11,
             .backup_restore_bootstrap = .{
                 .backup_id = try std.testing.allocator.dupe(u8, "snap-52"),
+                .artifact_backup_id = try std.testing.allocator.dupe(u8, "snap-52"),
                 .location = try std.testing.allocator.dupe(u8, "file:///tmp/backups"),
                 .snapshot_path = try std.testing.allocator.dupe(u8, "snap-52/groups/52"),
                 .connection = try std.testing.allocator.dupe(u8, "backup-store"),

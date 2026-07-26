@@ -784,7 +784,8 @@ const CatalogValidationSnapshot = struct {
         }
         for (self.ranges) |record| {
             out.estimated_bytes += record.start_key.len + optionalLen(record.end_key) +
-                record.restore_backup_id.len + record.restore_location.len + record.restore_snapshot_path.len +
+                record.restore_backup_id.len + record.restore_artifact_backup_id.len +
+                record.restore_location.len + record.restore_snapshot_path.len +
                 record.restore_connection.len + record.restore_artifact_sha256.len;
         }
     }
@@ -815,7 +816,7 @@ const ProjectedCoreSnapshotCache = struct {
 const TransitionReadinessCache = struct {
     initialized: bool = false,
     epoch: u64 = 0,
-    ready_by_group: std.AutoHashMapUnmanaged(u64, bool) = .empty,
+    ready_by_group: std.AutoHashMapUnmanaged(u64, transition_state.StablePlacementReadiness) = .empty,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.ready_by_group.deinit(alloc);
@@ -3901,7 +3902,10 @@ pub const MetadataHttpService = struct {
         return snapshot;
     }
 
-    pub fn groupTransitionReady(self: *MetadataHttpService, group_id: u64) !bool {
+    pub fn groupTransitionReadiness(
+        self: *MetadataHttpService,
+        group_id: u64,
+    ) !transition_state.StablePlacementReadiness {
         self.transition_readiness_mutex.lockUncancelable(std.Options.debug_io);
         defer self.transition_readiness_mutex.unlock(std.Options.debug_io);
 
@@ -3909,7 +3913,7 @@ pub const MetadataHttpService = struct {
         for (0..4) |_| {
             const epoch = self.transition_readiness_epoch.load(.acquire);
             if (cache.initialized and cache.epoch == epoch) {
-                return cache.ready_by_group.get(group_id) orelse false;
+                return cache.ready_by_group.get(group_id) orelse .status_unavailable;
             }
 
             var inputs = try self.captureTransitionReadinessInputs();
@@ -3928,7 +3932,7 @@ pub const MetadataHttpService = struct {
             cache.ready_by_group = next;
             cache.epoch = epoch;
             cache.initialized = true;
-            return cache.ready_by_group.get(group_id) orelse false;
+            return cache.ready_by_group.get(group_id) orelse .status_unavailable;
         }
         return error.MetadataProjectionAdvanced;
     }
@@ -6409,27 +6413,29 @@ fn findMergedGroupStatus(
     return null;
 }
 
-fn transitionStatusHasStablePlacement(
+fn transitionStatusStablePlacementReadiness(
     status: metadata_reconciler.MergedGroupStatus,
     expected_voters: u32,
     leader_placed: bool,
-) bool {
-    if (expected_voters == 0 or expected_voters > std.math.maxInt(u16)) return false;
+) transition_state.StablePlacementReadiness {
+    if (expected_voters == 0 or expected_voters > std.math.maxInt(u16))
+        return .invalid_expected_voter_count;
     const expected_voter_count: u16 = @intCast(expected_voters);
-    return status.leader_known and
-        status.leader_store_id != 0 and
-        leader_placed and
-        status.voter_count_known and
-        status.voter_count == expected_voter_count and
-        status.healthy_voter_reports >= status.voter_count and
-        !status.joint_consensus;
+    if (!status.leader_known) return .leader_unknown;
+    if (status.leader_store_id == 0) return .leader_store_unknown;
+    if (!leader_placed) return .leader_not_placed;
+    if (!status.voter_count_known) return .voter_count_unknown;
+    if (status.voter_count != expected_voter_count) return .voter_count_mismatch;
+    if (status.healthy_voter_reports < status.voter_count) return .insufficient_healthy_voters;
+    if (status.joint_consensus) return .joint_consensus;
+    return .ready;
 }
 
 fn buildTransitionReadinessMap(
     alloc: std.mem.Allocator,
     stores: []const metadata_table_manager.StoreRecord,
     placements: []const raft_reconciler.PlacementIntent,
-) !std.AutoHashMapUnmanaged(u64, bool) {
+) !std.AutoHashMapUnmanaged(u64, transition_state.StablePlacementReadiness) {
     const merged = try metadata_state.mergeHealthyGroupStatuses(
         alloc,
         &.{},
@@ -6460,13 +6466,13 @@ fn buildTransitionReadinessMap(
         }, {});
     }
 
-    var ready_by_group = std.AutoHashMapUnmanaged(u64, bool).empty;
+    var ready_by_group = std.AutoHashMapUnmanaged(u64, transition_state.StablePlacementReadiness).empty;
     errdefer ready_by_group.deinit(alloc);
     try ready_by_group.ensureTotalCapacity(alloc, @intCast(merged.len));
     for (merged) |status| {
         ready_by_group.putAssumeCapacity(
             status.group_id,
-            transitionStatusHasStablePlacement(
+            transitionStatusStablePlacementReadiness(
                 status,
                 placement_counts.get(status.group_id) orelse 0,
                 placement_stores.contains(.{
@@ -6493,18 +6499,31 @@ test "metadata service transition readiness requires stable healthy placement" {
         .voter_count = 3,
         .healthy_voter_reports = 3,
     };
-    try std.testing.expect(transitionStatusHasStablePlacement(status, placements.len, true));
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.ready,
+        transitionStatusStablePlacementReadiness(status, placements.len, true),
+    );
     status.healthy_voter_reports = 2;
-    try std.testing.expect(!transitionStatusHasStablePlacement(status, placements.len, true));
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.insufficient_healthy_voters,
+        transitionStatusStablePlacementReadiness(status, placements.len, true),
+    );
     status.healthy_voter_reports = 3;
     status.joint_consensus = true;
-    try std.testing.expect(!transitionStatusHasStablePlacement(status, placements.len, true));
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.joint_consensus,
+        transitionStatusStablePlacementReadiness(status, placements.len, true),
+    );
     status.joint_consensus = false;
     status.leader_store_id = 99;
-    try std.testing.expect(!transitionStatusHasStablePlacement(status, placements.len, false));
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.leader_not_placed,
+        transitionStatusStablePlacementReadiness(status, placements.len, false),
+    );
 }
 
 test "metadata service transition readiness map rejects stale placement generations" {
+    const voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 1, 2, 3 }, null);
     const placements = [_]raft_reconciler.PlacementIntent{
         .{ .store_id = 1, .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 }, .relocation_generation = 4 },
         .{ .store_id = 2, .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 }, .relocation_generation = 4 },
@@ -6516,6 +6535,7 @@ test "metadata service transition readiness map rejects stale placement generati
             .local_leader = true,
             .local_voter = true,
             .voter_set_known = true,
+            .voter_set_fingerprint = voter_set_fingerprint,
             .voter_count = 3,
             .relocation_generation = 4,
         },
@@ -6525,6 +6545,7 @@ test "metadata service transition readiness map rejects stale placement generati
             .group_id = 77,
             .local_voter = true,
             .voter_set_known = true,
+            .voter_set_fingerprint = voter_set_fingerprint,
             .voter_count = 3,
             .relocation_generation = 4,
         },
@@ -6537,7 +6558,10 @@ test "metadata service transition readiness map rejects stale placement generati
 
     var ready = try buildTransitionReadinessMap(std.testing.allocator, &stores, &placements);
     defer ready.deinit(std.testing.allocator);
-    try std.testing.expect(ready.get(77) orelse false);
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.ready,
+        ready.get(77) orelse .status_unavailable,
+    );
 
     var stale_leader_statuses = leader_statuses;
     stale_leader_statuses[0].relocation_generation = 3;
@@ -6549,7 +6573,10 @@ test "metadata service transition readiness map rejects stale placement generati
     stale_stores[2].group_statuses = &stale_follower_statuses;
     var stale = try buildTransitionReadinessMap(std.testing.allocator, &stale_stores, &placements);
     defer stale.deinit(std.testing.allocator);
-    try std.testing.expect(!(stale.get(77) orelse false));
+    try std.testing.expectEqual(
+        transition_state.StablePlacementReadiness.status_unavailable,
+        stale.get(77) orelse .status_unavailable,
+    );
 }
 
 fn groupHasExpectedHealthyPlacement(
@@ -6713,6 +6740,7 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
             hasher.update(&.{0});
         }
         hashProjectedProvisioningBytes(&hasher, range.restore_backup_id);
+        hashProjectedProvisioningBytes(&hasher, range.restore_artifact_backup_id);
         hashProjectedProvisioningBytes(&hasher, range.restore_location);
         hashProjectedProvisioningBytes(&hasher, range.restore_snapshot_path);
         hashProjectedProvisioningBytes(&hasher, range.restore_connection);
@@ -9919,6 +9947,7 @@ test "metadata service status reports repair and rebalance counts" {
             .bootstrap_mode = .fetch_snapshot,
             .backup_restore_bootstrap = .{
                 .backup_id = "backup-8801",
+                .artifact_backup_id = "backup-8801",
                 .location = "file:///tmp/backups",
                 .snapshot_path = "backup-8801/groups/8801",
                 .connection = "backup-store",

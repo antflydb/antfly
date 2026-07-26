@@ -3459,7 +3459,7 @@ pub fn build(b: *std.Build) void {
         "http host simulation updates split transition to rollback mid-flight",
         "cluster simulation drives queued split transitions through service-owned metadata updates",
         "cluster simulation resumes queued split transitions after node restart",
-        "cluster simulation removes queued split transition mid-flight across node restart",
+        "cluster simulation ignores active split removal and rolls back explicitly across restart",
         "cluster simulation rolls back queued split transition mid-flight across node restart",
         "cluster simulation survives repeated same-id split overwrites across restart",
         "cluster simulation drives queued merge transitions through service-owned metadata updates",
@@ -3473,10 +3473,10 @@ pub fn build(b: *std.Build) void {
         "cluster simulation isolates concurrent",
         "cluster simulation drives multiple concurrent real transition ids through multiplexed runtime",
         "cluster simulation isolates overlapping same-id split overwrites while other transitions complete",
-        "cluster simulation removes queued merge transition mid-flight across node restart",
+        "cluster simulation ignores active merge removal and rolls back explicitly across restart",
     };
     const lib_raft_chaos_tests = b.addTest(.{
-        .root_module = lib_test_mod,
+        .root_module = raft_sim_test_mod,
         .filters = &lib_raft_chaos_default_filters,
     });
     const run_lib_raft_chaos_tests = addFilteredTestRunArtifact(b, lib_raft_chaos_tests);
@@ -4496,8 +4496,8 @@ pub fn build(b: *std.Build) void {
             "remote backup metadata reads are size bounded",
             "remote backup key joins canonicalize only the prefix boundary",
             "cluster backup list uses top-level remote manifests without recursing into payloads",
-            "newest incomplete cluster backup attempt fails backup health",
-            "cluster backup list rejects a committed manifest with a missing artifact",
+            "incomplete cluster backup attempts do not hide committed backups",
+            "cluster backup list defers artifact validation to restore admission",
             "cluster backup list canonicalizes trailing prefix through s3 protocol",
             "cluster backup list canonicalizes trailing remote prefix slash",
             "remote backup reservations fence duplicate execution and can be released after cleanup",

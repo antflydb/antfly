@@ -681,6 +681,7 @@ const LocalStandaloneMetadata = struct {
         table_name: []const u8,
         location_uri: []const u8,
         connection: []const u8,
+        artifact_backup_id: []const u8,
         manifest: *const antfly.public_api.backups.TableBackupManifest,
     ) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
@@ -688,7 +689,14 @@ const LocalStandaloneMetadata = struct {
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
         var table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest);
         defer antfly.metadata.table_manager.freeTable(alloc, table);
-        const ranges = try antfly.public_api.backups.deriveRestoreRanges(alloc, table.table_id, location_uri, connection, manifest);
+        const ranges = try antfly.public_api.backups.deriveRestoreRanges(
+            alloc,
+            table.table_id,
+            location_uri,
+            connection,
+            artifact_backup_id,
+            manifest,
+        );
         defer {
             for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
             alloc.free(ranges);
@@ -2264,7 +2272,7 @@ fn serveUnifiedInner(
     lifecycle.publishReady();
 
     if (server.boundAddress()) |addr| {
-        std.debug.print("standalone public api listening on http://{}\n", .{addr});
+        std.debug.print("standalone public api listening on http://{f}\n", .{addr});
     }
 
     try server.listen();

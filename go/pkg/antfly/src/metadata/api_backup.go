@@ -820,23 +820,14 @@ func reclaimStaleClusterBackupAttempt(
 		// permit an older backup to mask current health.
 		return false, nil
 	case availabilityErr == nil:
-		if err := cleanupBackupAttemptContents(
-			ctx, metadataStore, attempt.MetadataIDs, attempt.ArtifactNames,
-		); err != nil {
-			return false, err
-		}
-		if err := metadataStore.ReleaseBackupID(ctx, attempt.BackupID); err != nil {
-			return false, err
-		}
+		// Age is not proof that an attempt is abandoned: a large backup may
+		// legitimately outlive this process or the previous scan window. Keep
+		// its reservation, journal, and artifacts until a renewable lease or
+		// an explicitly authorized cleanup operation can prove ownership.
+		return false, nil
 	default:
 		return false, availabilityErr
 	}
-	// The failed/interrupted attempt's exact contents and reservation are now
-	// absent. Retire its journal as the final cleanup step.
-	if err := deleteClusterBackupAttempt(ctx, resolvedLocation, s3Info, attempt.AttemptID); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 func latestClusterBackupAttempt(
@@ -1192,18 +1183,6 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
 		return
 	}
-	reclaimCtx, reclaimCancel := context.WithTimeout(ctx, 5*time.Second)
-	if _, reclaimErr := latestClusterBackupAttempt(
-		reclaimCtx,
-		resolvedLocation,
-		s3Info,
-		metadataStore,
-		clusterBackupAttemptScanLimit,
-		false,
-	); reclaimErr != nil {
-		t.logger.Warn("Stale cluster backup reclamation deferred", zap.Error(reclaimErr))
-	}
-	reclaimCancel()
 	backupConfig := common.BackupConfig{
 		BackupID:         req.BackupId,
 		Connection:       req.Connection,
@@ -1838,29 +1817,6 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
 		return
 	}
-	metadataStore, err := newBackupStore(
-		t.ln.config, params.Connection, "restore.read", location,
-	)
-	if err != nil {
-		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
-		return
-	}
-	latestAttempt, err := latestClusterBackupAttempt(
-		ctx, resolvedLocation, s3Info, metadataStore, clusterBackupHealthScanLimit, true,
-	)
-	if err == nil {
-		err = validateNewestClusterBackupAttempt(
-			ctx, resolvedLocation, s3Info, metadataStore, latestAttempt,
-		)
-	}
-	if err != nil {
-		t.logger.Error(
-			"Newest cluster backup attempt is unhealthy",
-			zap.String("class", sanitizedBackupFailure(err)),
-		)
-		errorResponse(w, "Newest cluster backup attempt is incomplete or not restorable", http.StatusInternalServerError)
-		return
-	}
 	var backups []BackupInfo
 	if strings.HasPrefix(location, "s3://") {
 		// e.g. "s3://my-bucket-name/optional/prefix"
@@ -1902,11 +1858,6 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 					t.logger.Warn("Skipping invalid cluster backup metadata", zap.String("class", sanitizedBackupFailure(err)))
 					continue
 				}
-				if err := validateClusterBackupArtifacts(ctx, metadataStore, meta); err != nil {
-					t.logger.Error("Cluster backup is not restorable", zap.String("class", sanitizedBackupFailure(err)))
-					errorResponse(w, "Backup metadata references an unavailable artifact", http.StatusInternalServerError)
-					return
-				}
 				tableNames := make([]string, 0, len(meta.Tables))
 				for _, tableInfo := range meta.Tables {
 					if tableInfo.Status == "completed" {
@@ -1946,11 +1897,6 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 				if err != nil {
 					t.logger.Warn("Skipping invalid cluster backup metadata", zap.String("class", sanitizedBackupFailure(err)))
 					continue
-				}
-				if err := validateClusterBackupArtifacts(ctx, metadataStore, meta); err != nil {
-					t.logger.Error("Cluster backup is not restorable", zap.String("class", sanitizedBackupFailure(err)))
-					errorResponse(w, "Backup metadata references an unavailable artifact", http.StatusInternalServerError)
-					return
 				}
 				tableNames := make([]string, 0, len(meta.Tables))
 				for _, tableInfo := range meta.Tables {

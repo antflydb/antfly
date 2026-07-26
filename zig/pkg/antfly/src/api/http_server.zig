@@ -421,6 +421,7 @@ pub const StatusSource = struct {
             table_name: []const u8,
             location_uri: []const u8,
             connection: []const u8,
+            artifact_backup_id: []const u8,
             manifest: *const backups_api.TableBackupManifest,
         ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
@@ -484,10 +485,11 @@ pub const StatusSource = struct {
         table_name: []const u8,
         location_uri: []const u8,
         connection: []const u8,
+        artifact_backup_id: []const u8,
         manifest: *const backups_api.TableBackupManifest,
     ) !bool {
         const fn_ptr = self.vtable.restore_table orelse return false;
-        try fn_ptr(self.ptr, alloc, table_name, location_uri, connection, manifest);
+        try fn_ptr(self.ptr, alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
         return true;
     }
 
@@ -637,9 +639,10 @@ pub const StatusSource = struct {
                 table_name: []const u8,
                 location_uri: []const u8,
                 connection: []const u8,
+                artifact_backup_id: []const u8,
                 manifest: *const backups_api.TableBackupManifest,
             ) anyerror!void {
-                return try persistRestoreTableIntent(cast(ptr), alloc, table_name, location_uri, connection, manifest);
+                return try persistRestoreTableIntent(cast(ptr), alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
             }
 
             fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
@@ -792,16 +795,19 @@ fn deriveRestoreMetadataSpec(
     table_name: []const u8,
     location_uri: []const u8,
     connection: []const u8,
+    artifact_backup_id: []const u8,
     manifest: *const backups_api.TableBackupManifest,
 ) !RestoreMetadataSpec {
     try backups_api.validateRestoreManifest(alloc, manifest, manifest.backup_id);
+    if (manifest.artifact_integrity_mode != .declared)
+        return error.BackupIntegrityMissing;
     if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
     const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest) catch |err| switch (err) {
         error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
         else => return err,
     };
     errdefer metadata_table_manager.freeTable(alloc, table);
-    const ranges = try backups_api.deriveRestoreRanges(alloc, table.table_id, location_uri, connection, manifest);
+    const ranges = try backups_api.deriveRestoreRanges(alloc, table.table_id, location_uri, connection, artifact_backup_id, manifest);
     errdefer {
         for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
         alloc.free(ranges);
@@ -934,9 +940,10 @@ fn persistRestoreTableIntent(
     table_name: []const u8,
     location_uri: []const u8,
     connection: []const u8,
+    artifact_backup_id: []const u8,
     manifest: *const backups_api.TableBackupManifest,
 ) !void {
-    var spec = try deriveRestoreMetadataSpec(alloc, table_name, location_uri, connection, manifest);
+    var spec = try deriveRestoreMetadataSpec(alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
     defer spec.deinit(alloc);
 
     var snapshot = try service.adminSnapshot();
@@ -6601,6 +6608,60 @@ pub const ApiHttpServer = struct {
         return try self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, backup_id, false, false);
     }
 
+    /// The Go portable envelope predates declared artifact checksums. Bind its
+    /// bytes to the restore intent before metadata publication so every Raft
+    /// replica independently verifies the exact artifact admitted here.
+    fn bindExternalRestoreArtifactIntegrity(
+        self: *ApiHttpServer,
+        backup_location: *backups_api.BackupLocation,
+        manifest: *backups_api.TableBackupManifest,
+    ) !void {
+        if (manifest.artifact_integrity_mode == .declared) return;
+        if (manifest.format != .portable) return error.UnsupportedBackupFormat;
+
+        switch (backup_location.*) {
+            .file => |backup_root| backups_api.deriveManifestArtifactIntegrity(
+                self.alloc,
+                self.sharedApiIo(),
+                backup_root,
+                manifest,
+            ) catch |err| switch (err) {
+                error.FileNotFound => return error.BackupArtifactMissing,
+                else => return err,
+            },
+            .remote => {
+                const staging_id = try self.backupGenerationIdAlloc();
+                defer self.alloc.free(staging_id);
+                const staging_root = try self.createBackupStagingRoot(staging_id);
+                defer self.destroyBackupStagingRoot(staging_root);
+
+                for (manifest.shards) |shard| {
+                    const destination = try std.fs.path.join(self.alloc, &.{
+                        staging_root,
+                        shard.snapshot_path,
+                    });
+                    defer self.alloc.free(destination);
+                    backups_api.copyFileFromLocationUsingIo(
+                        self.alloc,
+                        self.sharedApiIo(),
+                        backup_location,
+                        shard.snapshot_path,
+                        destination,
+                    ) catch |err| switch (err) {
+                        error.FileNotFound => return error.BackupArtifactMissing,
+                        else => return err,
+                    };
+                }
+                try backups_api.deriveManifestArtifactIntegrity(
+                    self.alloc,
+                    self.sharedApiIo(),
+                    staging_root,
+                    manifest,
+                );
+            },
+        }
+    }
+
     fn restoreOwnedTableWithLifecycle(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -6724,6 +6785,7 @@ pub const ApiHttpServer = struct {
                 if ((table_writes_source.restoreTableReserved(self.alloc, table_name, .{
                     .backup_root = local_backup_root,
                     .manifest = &manifest,
+                    .artifact_backup_id = artifact_backup_id,
                     .source_location = source_location,
                     .reconcile_only = target_exists and !replace_existing,
                     .replace_existing = replace_existing,
@@ -6758,12 +6820,14 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         location_uri: []const u8,
         connection: []const u8,
+        artifact_backup_id: []const u8,
         manifest: *const backups_api.TableBackupManifest,
     ) !bool {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
-            return self.source.restoreTable(alloc, table_name, location_uri, connection, manifest) catch |err| {
+            return self.source.restoreTable(alloc, table_name, location_uri, connection, artifact_backup_id, manifest) catch |err| {
                 if (metadata_authority.isRetryableError(err)) return err;
+                if (backups_api.isArtifactIntegrityError(err)) return err;
                 return switch (err) {
                     error.InvalidBackupRequest,
                     error.BackupManifestTooLarge,
@@ -6778,7 +6842,12 @@ pub const ApiHttpServer = struct {
                         // A reconciliation plan publishes the table and ranges as
                         // separate proposals. Any error after one proposal may be
                         // an interrupted exact restore intent, not a clean abort.
-                        const intent_state = self.distributedRestoreIntentState(table_name, location_uri, manifest.backup_id) catch |state_err| blk: {
+                        const intent_state = self.distributedRestoreIntentState(
+                            table_name,
+                            location_uri,
+                            manifest.backup_id,
+                            artifact_backup_id,
+                        ) catch |state_err| blk: {
                             if (metadata_authority.isRetryableError(state_err)) return state_err;
                             break :blk .missing;
                         };
@@ -6803,6 +6872,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         location_uri: []const u8,
         backup_id: []const u8,
+        artifact_backup_id: []const u8,
     ) !DistributedRestoreIntentState {
         var snapshot = (try self.source.adminSnapshot()) orelse return .missing;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -6816,6 +6886,7 @@ pub const ApiHttpServer = struct {
             if (range.restore_backup_id.len == 0 or range.restore_location.len == 0)
                 return .conflicting;
             if (!std.mem.eql(u8, range.restore_backup_id, backup_id) or
+                !std.mem.eql(u8, range.restore_artifact_backup_id, artifact_backup_id) or
                 !std.mem.eql(u8, range.restore_location, location_uri)) return .conflicting;
             found_pending = true;
         }
@@ -6851,13 +6922,14 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         location_uri: []const u8,
         backup_id: []const u8,
+        artifact_backup_id: []const u8,
         cancellation: ?RestoreCancellation,
     ) !void {
         const io = self.sharedApiIo() orelse return error.AsyncRestoreUnavailable;
         var poll_ms: u64 = 250;
         while (true) {
             try self.ensureRestoreActive(cancellation);
-            switch (try self.distributedRestoreIntentState(table_name, location_uri, backup_id)) {
+            switch (try self.distributedRestoreIntentState(table_name, location_uri, backup_id, artifact_backup_id)) {
                 .completed => return,
                 .pending => {},
                 .missing => return error.TableNotFound,
@@ -7941,10 +8013,14 @@ pub const ApiHttpServer = struct {
                 if (backups_api.isArtifactIntegrityError(err)) return error.BackupIntegrityFailure;
                 return error.InvalidBackupRequest;
             };
+            self.bindExternalRestoreArtifactIntegrity(location, &manifest) catch |err| {
+                if (backups_api.isArtifactIntegrityError(err)) return error.BackupIntegrityFailure;
+                return error.InvalidBackupRequest;
+            };
             if (!std.mem.eql(u8, manifest.table_name, table_name))
                 return error.InvalidBackupRequest;
 
-            if (self.restoreMetadataTableWithRetry(self.alloc, table_name, location_uri, connection, &manifest) catch |err| switch (err) {
+            if (self.restoreMetadataTableWithRetry(self.alloc, table_name, location_uri, connection, backup_id, &manifest) catch |err| switch (err) {
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                 error.UnsupportedOperation => false,
                 error.InvalidBackupRequest => {
@@ -8430,19 +8506,6 @@ pub const ApiHttpServer = struct {
         // selection has no commit to publish and is rejected before creating
         // any table artifact.
         if (table_names.len == 0) return error.NoTables;
-        const now_unix_ns: u64 = @intCast(std.Io.Timestamp.now(backup_io, .real).toNanoseconds());
-        _ = backups_api.reclaimStaleClusterBackupAttempts(
-            op_alloc,
-            backup_io,
-            location,
-            now_unix_ns,
-        ) catch |err| {
-            // Write-only object-store connections intentionally may not have
-            // list/read/delete authority. Reclamation is bounded maintenance,
-            // not a prerequisite for a new backup.
-            std.log.debug("backup attempt reclamation unavailable err={s}", .{@errorName(err)});
-        };
-
         const statuses = op_alloc.alloc(backups_api.ClusterTableBackupStatus, table_names.len) catch return error.InternalFailure;
         const status_names = op_alloc.alloc([]u8, table_names.len) catch {
             op_alloc.free(statuses);
@@ -8489,6 +8552,7 @@ pub const ApiHttpServer = struct {
             };
             initialized_attempt_tables += 1;
         }
+        const now_unix_ns: u64 = @intCast(std.Io.Timestamp.now(backup_io, .real).toNanoseconds());
         const attempt_marker: backups_api.ClusterBackupAttemptMarker = .{
             .attempt_id = attempt_id,
             .cluster_backup_id = req.backup_id,
@@ -8791,7 +8855,7 @@ pub const ApiHttpServer = struct {
             // restore intent to drain instead.
             if (restore_jobs.containsTableIndex(published_table_ranges, @intCast(i))) {
                 if (!self.cfg.deployment_mode.isStandalone()) {
-                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, cancellation) catch |err| switch (err) {
+                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, artifact_backup_id, cancellation) catch |err| switch (err) {
                         error.NotLeader => return error.NotLeader,
                         error.Cancelled => return error.Cancelled,
                         else => {
@@ -8838,12 +8902,20 @@ pub const ApiHttpServer = struct {
                     statuses[i].@"error" = "table backup manifest does not match table";
                     continue;
                 }
+                self.bindExternalRestoreArtifactIntegrity(location, &table_manifest) catch |err| {
+                    statuses[i].@"error" = if (backups_api.isArtifactIntegrityError(err))
+                        backups_api.integrity_failure_message
+                    else
+                        "unable to bind portable backup artifact integrity";
+                    continue;
+                };
 
                 const restored_via_metadata = self.restoreMetadataTableWithRetry(
                     alloc,
                     table_name,
                     req.location,
                     restore_connection,
+                    artifact_backup_id,
                     &table_manifest,
                 ) catch |err| switch (err) {
                     error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
@@ -8880,7 +8952,7 @@ pub const ApiHttpServer = struct {
                         if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.NotLeader;
                         return error.InternalFailure;
                     };
-                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, cancellation) catch |err| switch (err) {
+                    self.waitForDistributedRestoreCompletion(table_name, req.location, table_backup_id, artifact_backup_id, cancellation) catch |err| switch (err) {
                         error.NotLeader => return error.NotLeader,
                         error.Cancelled => return error.Cancelled,
                         else => {
@@ -10287,7 +10359,7 @@ pub const ApiHttpServer = struct {
                     // A resumed job may already have crossed publication. Infer
                     // which completion protocol owns it from durable metadata;
                     // local fallback restores intentionally have no such intent.
-                    restored_via_metadata = switch (try self.distributedRestoreIntentState(table_name, state.location, state.backup_id)) {
+                    restored_via_metadata = switch (try self.distributedRestoreIntentState(table_name, state.location, state.backup_id, state.backup_id)) {
                         .pending, .completed => true,
                         .missing => false,
                         .conflicting => {
@@ -10298,7 +10370,7 @@ pub const ApiHttpServer = struct {
                     };
                 }
                 if (restored_via_metadata and !self.cfg.deployment_mode.isStandalone()) {
-                    self.waitForDistributedRestoreCompletion(table_name, state.location, state.backup_id, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }) catch |err| {
+                    self.waitForDistributedRestoreCompletion(table_name, state.location, state.backup_id, state.backup_id, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }) catch |err| {
                         if (metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
@@ -28253,12 +28325,14 @@ test "api http server cluster restore rehydrates extension metadata" {
             table_name: []const u8,
             location_uri_arg: []const u8,
             connection: []const u8,
+            artifact_backup_id: []const u8,
             manifest: *const backups_api.TableBackupManifest,
         ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expect(location_uri_arg.len > 0);
             try std.testing.expectEqualStrings("test-backups", connection);
+            try std.testing.expectEqualStrings("docs-snap-cluster", artifact_backup_id);
             try std.testing.expectEqualStrings("docs-snap-cluster", manifest.backup_id);
             try std.testing.expectEqualStrings("docs", manifest.table_name);
             self.state.table_restored = true;
@@ -28355,12 +28429,14 @@ test "api http server prefers metadata-owned restore over inline write-source re
             table_name: []const u8,
             location_uri_arg: []const u8,
             connection: []const u8,
+            artifact_backup_id: []const u8,
             manifest: *const backups_api.TableBackupManifest,
         ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings(self.expected_location, location_uri_arg);
             try std.testing.expectEqualStrings("test-backups", connection);
+            try std.testing.expectEqualStrings("snap1", artifact_backup_id);
             try std.testing.expectEqualStrings("snap1", manifest.backup_id);
             try std.testing.expectEqualStrings("docs", manifest.table_name);
             self.restored = true;
@@ -28491,12 +28567,14 @@ test "api http server retries stale metadata table-exists restore race" {
             table_name: []const u8,
             location_uri_arg: []const u8,
             connection: []const u8,
+            artifact_backup_id: []const u8,
             manifest: *const backups_api.TableBackupManifest,
         ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings(self.expected_location, location_uri_arg);
             try std.testing.expectEqualStrings("test-backups", connection);
+            try std.testing.expectEqualStrings("snap1", artifact_backup_id);
             try std.testing.expectEqualStrings("snap1", manifest.backup_id);
             try std.testing.expectEqualStrings("docs", manifest.table_name);
             self.attempts += 1;
@@ -28558,12 +28636,14 @@ test "api http server retries interrupted metadata restore publication" {
             table_name: []const u8,
             location_uri: []const u8,
             connection: []const u8,
+            artifact_backup_id: []const u8,
             manifest: *const backups_api.TableBackupManifest,
         ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("file:///backup", location_uri);
             try std.testing.expectEqualStrings("test-backups", connection);
+            try std.testing.expectEqualStrings("daily", artifact_backup_id);
             try std.testing.expectEqualStrings("daily", manifest.backup_id);
             self.attempts += 1;
             if (self.attempts == 1) return error.TestPublicationInterrupted;
@@ -28580,6 +28660,7 @@ test "api http server retries interrupted metadata restore publication" {
         "docs",
         "file:///backup",
         "test-backups",
+        "daily",
         &manifest,
     ));
     try std.testing.expectEqual(@as(usize, 2), source.attempts);
@@ -28615,17 +28696,66 @@ test "api http server restore metadata spec uses range-scoped restore intent" {
         &shards,
     );
     defer manifest.deinit(alloc);
-    var spec = try deriveRestoreMetadataSpec(alloc, "docs", location_uri, "production-backups", &manifest);
+    var spec = try deriveRestoreMetadataSpec(alloc, "docs", location_uri, "production-backups", "snap1", &manifest);
     defer spec.deinit(alloc);
 
     try std.testing.expectEqualStrings("", spec.table.restore_backup_id);
     try std.testing.expectEqualStrings("", spec.table.restore_location);
     try std.testing.expectEqual(@as(usize, 1), spec.ranges.len);
     try std.testing.expectEqualStrings("snap1", spec.ranges[0].restore_backup_id);
+    try std.testing.expectEqualStrings("snap1", spec.ranges[0].restore_artifact_backup_id);
     try std.testing.expectEqualStrings(location_uri, spec.ranges[0].restore_location);
     try std.testing.expectEqualStrings("snap/groups/7001", spec.ranges[0].restore_snapshot_path);
     try std.testing.expectEqualStrings("production-backups", spec.ranges[0].restore_connection);
     try std.testing.expectEqualStrings(shards[0].artifact_sha256, spec.ranges[0].restore_artifact_sha256);
+}
+
+test "distributed restore binds Go portable artifact bytes before metadata publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const metadata_path = try backups_api.metadataPath(alloc, root, "table-a");
+    defer alloc.free(metadata_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = metadata_path,
+        .data =
+        \\{"version":1,"format":"portable","table":{"name":"docs","shards":{"1":{"byte_range":["",""]}}}}
+        ,
+    });
+    const artifact_path = try std.fmt.allocPrint(alloc, "{s}/go-cluster-1.afb", .{root});
+    defer alloc.free(artifact_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = artifact_path,
+        .data = "portable-artifact",
+    });
+
+    var location: backups_api.BackupLocation = .{ .file = root };
+    var manifest = try backups_api.readManifestFromLocationWithArtifactBackupId(
+        alloc,
+        &location,
+        "table-a",
+        "go-cluster",
+    );
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqual(backups_api.ArtifactIntegrityMode.derive_after_materialization, manifest.artifact_integrity_mode);
+
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(alloc, .{}, .{
+        .ptr = undefined,
+        .vtable = &.{ .status = Fake.status },
+    }, null, null);
+    defer server.deinit();
+    try server.bindExternalRestoreArtifactIntegrity(&location, &manifest);
+
+    try std.testing.expectEqual(backups_api.ArtifactIntegrityMode.declared, manifest.artifact_integrity_mode);
+    try std.testing.expectEqual(@as(u64, "portable-artifact".len), manifest.shards[0].artifact_size_bytes);
+    try std.testing.expectEqual(@as(usize, 64), manifest.shards[0].artifact_sha256.len);
 }
 
 test "api http server join planner uses snapshot stats for low-selectivity lookup joins" {

@@ -394,6 +394,7 @@ fn catalogRangeTopologyDigest(range: table_manager.RangeRecord) [std.crypto.hash
     hashCatalogTopologyU64(&hasher, range.doc_identity_range_id);
     hashCatalogTopologyU64(&hasher, range.split_attempt_epoch);
     hashCatalogTopologyBytes(&hasher, range.restore_backup_id);
+    hashCatalogTopologyBytes(&hasher, range.restore_artifact_backup_id);
     hashCatalogTopologyBytes(&hasher, range.restore_location);
     hashCatalogTopologyBytes(&hasher, range.restore_snapshot_path);
     hashCatalogTopologyBytes(&hasher, range.restore_connection);

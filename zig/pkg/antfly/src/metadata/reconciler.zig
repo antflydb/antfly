@@ -869,6 +869,7 @@ fn backupRestoreBootstrapEqual(
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?.backup_id, b.?.backup_id) and
+        std.mem.eql(u8, a.?.artifact_backup_id, b.?.artifact_backup_id) and
         std.mem.eql(u8, a.?.location, b.?.location) and
         std.mem.eql(u8, a.?.snapshot_path, b.?.snapshot_path) and
         std.mem.eql(u8, a.?.connection, b.?.connection) and
@@ -912,6 +913,7 @@ fn normalizeRestoreBootstrapIntent(
         effective.record.snapshot_bootstrap = null;
         effective.record.backup_restore_bootstrap = .{
             .backup_id = range.restore_backup_id,
+            .artifact_backup_id = range.restore_artifact_backup_id,
             .location = range.restore_location,
             .snapshot_path = range.restore_snapshot_path,
             .connection = range.restore_connection,
@@ -2244,8 +2246,7 @@ fn mergeHealthyGroupStatusFallback(stores: []const table_manager.StoreRecord, gr
     var latest_leader: ?table_manager.GroupStatusReport = null;
     var latest_leader_store_id: u64 = 0;
     var ambiguous_leader = false;
-    var observed_voter_count: ?u16 = null;
-    var ambiguous_voter_count = false;
+    var voter_set_evidence: table_manager.VoterSetEvidence = .{};
     var healthy_voter_reports: u16 = 0;
     var transition_pending = false;
     var replay_required = false;
@@ -2268,13 +2269,7 @@ fn mergeHealthyGroupStatusFallback(stores: []const table_manager.StoreRecord, gr
                 healthy_voter_reports +|= 1;
                 counted_voter_for_store = true;
             }
-            if (status.voter_count > 0) {
-                if (observed_voter_count) |existing| {
-                    if (existing != status.voter_count) ambiguous_voter_count = true;
-                } else {
-                    observed_voter_count = status.voter_count;
-                }
-            }
+            voter_set_evidence.observe(status);
             transition_pending = transition_pending or status.transition_pending;
             replay_required = replay_required or status.replay_required;
             replay_caught_up = replay_caught_up or status.replay_caught_up;
@@ -2300,6 +2295,8 @@ fn mergeHealthyGroupStatusFallback(stores: []const table_manager.StoreRecord, gr
     }
 
     const base = latest orelse return null;
+    const authoritative_leader = if (!ambiguous_leader) latest_leader else null;
+    const voter_set = voter_set_evidence.resolve(authoritative_leader);
     var merged: MergedGroupStatus = .{
         .group_id = base.group_id,
         .doc_count = base.doc_count,
@@ -2310,8 +2307,8 @@ fn mergeHealthyGroupStatusFallback(stores: []const table_manager.StoreRecord, gr
         .updated_at_millis = base.updated_at_millis,
         .leader_known = false,
         .leader_store_id = 0,
-        .voter_count_known = observed_voter_count != null and !ambiguous_voter_count,
-        .voter_count = observed_voter_count orelse 0,
+        .voter_count_known = voter_set.voter_count_known,
+        .voter_count = voter_set.voter_count,
         .healthy_voter_reports = healthy_voter_reports,
         .joint_consensus = joint_consensus,
         .readiness_from_leader = false,
@@ -2326,6 +2323,9 @@ fn mergeHealthyGroupStatusFallback(stores: []const table_manager.StoreRecord, gr
             merged.leader_known = true;
             merged.leader_store_id = latest_leader_store_id;
             merged.readiness_from_leader = true;
+            if (voter_set.from_leader) {
+                merged.joint_consensus = leader.joint_consensus;
+            }
             merged.transition_pending = leader.transition_pending;
             merged.replay_required = leader.replay_required;
             merged.replay_caught_up = leader.replay_caught_up;
@@ -2663,6 +2663,7 @@ fn rangeRecordsEqual(a: table_manager.RangeRecord, b: table_manager.RangeRecord)
         std.mem.eql(u8, a.start_key, b.start_key) and
         optionalBytesEqual(a.end_key, b.end_key) and
         std.mem.eql(u8, a.restore_backup_id, b.restore_backup_id) and
+        std.mem.eql(u8, a.restore_artifact_backup_id, b.restore_artifact_backup_id) and
         std.mem.eql(u8, a.restore_location, b.restore_location) and
         std.mem.eql(u8, a.restore_snapshot_path, b.restore_snapshot_path) and
         std.mem.eql(u8, a.restore_connection, b.restore_connection) and

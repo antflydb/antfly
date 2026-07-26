@@ -1604,6 +1604,7 @@ test "host invokes backup restore bootstrapper exactly once before creating a re
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-91",
+            .artifact_backup_id = "snap-91",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-91/groups/91",
             .connection = "backup-store",
@@ -1643,6 +1644,7 @@ test "host invokes backup restore bootstrapper exactly once before creating a re
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-91",
+            .artifact_backup_id = "snap-91",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-91/groups/91",
             .connection = "backup-store",
@@ -1711,6 +1713,7 @@ test "host records backup restore bootstrap failure when no handler is available
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-92",
+            .artifact_backup_id = "snap-92",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-92/groups/92",
             .connection = "backup-store",
@@ -1746,6 +1749,7 @@ test "host records committed bootstrap durability as pending instead of failed" 
     defer host.deinit();
     const restore: catalog.BackupRestoreBootstrapRecord = .{
         .backup_id = "snap-pending",
+        .artifact_backup_id = "snap-pending",
         .location = "file:///tmp/backups",
         .snapshot_path = "snap-pending/groups/94",
         .connection = "backup-store",
@@ -1833,6 +1837,7 @@ test "host does not perform path restore without a bootstrap authority owner" {
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-93",
+            .artifact_backup_id = "snap-93",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-93/groups/93",
             .connection = "backup-store",
@@ -2043,6 +2048,7 @@ test "host restores through an explicitly authorized bootstrap owner" {
         .bootstrap_mode = .fetch_snapshot,
         .backup_restore_bootstrap = .{
             .backup_id = "snap1",
+            .artifact_backup_id = "snap1",
             .location = restore_location,
             .snapshot_path = "snap1/groups/91",
             .connection = "test-backups",
@@ -2218,6 +2224,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
             .bootstrap_mode = .fetch_snapshot,
             .backup_restore_bootstrap = .{
                 .backup_id = "snap1",
+                .artifact_backup_id = "snap1",
                 .location = restore_location,
                 .snapshot_path = "snap1/groups/92",
                 .connection = "test-backups",

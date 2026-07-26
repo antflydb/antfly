@@ -35,10 +35,13 @@ const RollbackMerge = @FieldType(metadata_mod.TransitionAction, "rollback_merge"
 
 pub const GroupTransitionReadinessSource = struct {
     ptr: *anyopaque,
-    is_ready: *const fn (ptr: *anyopaque, group_id: u64) anyerror!bool,
+    readiness: *const fn (
+        ptr: *anyopaque,
+        group_id: u64,
+    ) anyerror!metadata_transition_state.StablePlacementReadiness,
 
-    pub fn isReady(self: @This(), group_id: u64) !bool {
-        return try self.is_ready(self.ptr, group_id);
+    pub fn get(self: @This(), group_id: u64) !metadata_transition_state.StablePlacementReadiness {
+        return try self.readiness(self.ptr, group_id);
     }
 };
 
@@ -376,7 +379,13 @@ pub const HostedShardOperationAdapter = struct {
     }
 
     fn requireGroupReadyForTransition(self: *HostedShardOperationAdapter, group_id: u64) !void {
-        if (!try self.readiness.isReady(group_id)) return error.GroupLeaderUnavailable;
+        const readiness = try self.readiness.get(group_id);
+        if (readiness == .ready) return;
+        std.log.warn("group transition destination not ready group={} reason={s}", .{
+            group_id,
+            @tagName(readiness),
+        });
+        return error.GroupLeaderUnavailable;
     }
 };
 
@@ -389,22 +398,25 @@ fn isLeaderRediscoveryError(err: anyerror) bool {
 
 test "transition destination requires a stable healthy voter set" {
     const Readiness = struct {
-        ready: bool,
+        readiness: metadata_transition_state.StablePlacementReadiness,
         calls: usize = 0,
 
         fn source(self: *@This()) GroupTransitionReadinessSource {
-            return .{ .ptr = self, .is_ready = isReady };
+            return .{ .ptr = self, .readiness = get };
         }
 
-        fn isReady(ptr: *anyopaque, group_id: u64) !bool {
+        fn get(
+            ptr: *anyopaque,
+            group_id: u64,
+        ) !metadata_transition_state.StablePlacementReadiness {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(u64, 77), group_id);
             self.calls += 1;
-            return self.ready;
+            return self.readiness;
         }
     };
 
-    var readiness = Readiness{ .ready = true };
+    var readiness = Readiness{ .readiness = .ready };
     var adapter = HostedShardOperationAdapter{
         .alloc = std.testing.allocator,
         .catalog = undefined,
@@ -414,7 +426,7 @@ test "transition destination requires a stable healthy voter set" {
         .readiness = readiness.source(),
     };
     try adapter.requireGroupReadyForTransition(77);
-    readiness.ready = false;
+    readiness.readiness = .voter_count_unknown;
     try std.testing.expectError(error.GroupLeaderUnavailable, adapter.requireGroupReadyForTransition(77));
     try std.testing.expectEqual(@as(usize, 2), readiness.calls);
 }

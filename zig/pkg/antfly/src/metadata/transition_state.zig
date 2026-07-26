@@ -94,6 +94,19 @@ pub const GroupTransitionReadinessResult = struct {
     source: GroupTransitionReadinessSource,
 };
 
+pub const StablePlacementReadiness = enum {
+    ready,
+    status_unavailable,
+    invalid_expected_voter_count,
+    leader_unknown,
+    leader_store_unknown,
+    leader_not_placed,
+    voter_count_unknown,
+    voter_count_mismatch,
+    insufficient_healthy_voters,
+    joint_consensus,
+};
+
 pub const TransitionRecord = union(TransitionKind) {
     split: SplitTransitionRecord,
     merge: MergeTransitionRecord,
@@ -383,6 +396,7 @@ test "transition state module compiles" {
     _ = GroupTransitionReadiness;
     _ = GroupTransitionReadinessSource;
     _ = GroupTransitionReadinessResult;
+    _ = StablePlacementReadiness;
     _ = readinessForGroup;
     _ = readinessForLocalGroup;
     _ = readinessResultForLocalSplitTransition;

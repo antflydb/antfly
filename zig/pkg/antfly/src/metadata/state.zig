@@ -563,8 +563,7 @@ const GroupStatusMergeState = struct {
     latest: ?GroupStatusMergeCandidate = null,
     latest_leader: ?GroupStatusMergeCandidate = null,
     ambiguous_leader: bool = false,
-    observed_voter_count: ?u16 = null,
-    ambiguous_voter_count: bool = false,
+    voter_set_evidence: metadata_table_manager.VoterSetEvidence = .{},
     healthy_voter_reports: u16 = 0,
     joint_consensus: bool = false,
     transition_pending: bool = false,
@@ -644,13 +643,7 @@ pub fn mergeHealthyGroupStatuses(
                 state.healthy_voter_reports +|= 1;
                 state.last_voter_store_id = store.store_id;
             }
-            if (group_status.voter_count > 0) {
-                if (state.observed_voter_count) |existing| {
-                    if (existing != group_status.voter_count) state.ambiguous_voter_count = true;
-                } else {
-                    state.observed_voter_count = group_status.voter_count;
-                }
-            }
+            state.voter_set_evidence.observe(group_status);
             state.joint_consensus = state.joint_consensus or group_status.joint_consensus;
             state.transition_pending = state.transition_pending or group_status.transition_pending;
             state.replay_required = state.replay_required or group_status.replay_required;
@@ -706,14 +699,7 @@ pub fn mergeHealthyGroupStatuses(
                 state.healthy_voter_reports +|= 1;
                 state.last_voter_store_id = store.store_id;
             }
-            const voter_count = placement_counts.get(runtime_status.group_id) orelse 0;
-            if (voter_count > 0) {
-                if (state.observed_voter_count) |existing| {
-                    if (existing != voter_count) state.ambiguous_voter_count = true;
-                } else {
-                    state.observed_voter_count = voter_count;
-                }
-            }
+            state.voter_set_evidence.observe(candidate.report);
             mergeRuntimeDocIdentity(state, runtime_status.doc_identity);
         }
     }
@@ -723,6 +709,11 @@ pub fn mergeHealthyGroupStatuses(
     for (states.items, 0..) |state, i| {
         const latest = state.latest orelse unreachable;
         const base = latest.report;
+        const authoritative_leader = if (!state.ambiguous_leader)
+            if (state.latest_leader) |candidate| candidate.report else null
+        else
+            null;
+        const voter_set = state.voter_set_evidence.resolve(authoritative_leader);
         merged[i] = .{
             .group_id = base.group_id,
             .doc_count = base.doc_count,
@@ -733,8 +724,8 @@ pub fn mergeHealthyGroupStatuses(
             .updated_at_millis = base.updated_at_millis,
             .leader_known = false,
             .leader_store_id = 0,
-            .voter_count_known = state.observed_voter_count != null and !state.ambiguous_voter_count,
-            .voter_count = if (state.observed_voter_count) |count| count else 0,
+            .voter_count_known = voter_set.voter_count_known,
+            .voter_count = voter_set.voter_count,
             .healthy_voter_reports = state.healthy_voter_reports,
             .joint_consensus = state.joint_consensus,
             .readiness_from_leader = false,
@@ -753,6 +744,9 @@ pub fn mergeHealthyGroupStatuses(
                 merged[i].leader_known = true;
                 merged[i].leader_store_id = leader.store_id;
                 merged[i].readiness_from_leader = true;
+                if (voter_set.from_leader) {
+                    merged[i].joint_consensus = leader.report.joint_consensus;
+                }
                 merged[i].transition_pending = leader.report.transition_pending;
                 merged[i].replay_required = leader.report.replay_required;
                 merged[i].replay_caught_up = leader.report.replay_caught_up;
@@ -1985,6 +1979,7 @@ test "metadata state conservatively aggregates readiness across healthy peers wi
 }
 
 test "metadata state tracks authoritative voter count when healthy peers agree" {
+    const voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 2, 3 }, null);
     const stores = [_]metadata_table_manager.StoreRecord{
         .{
             .store_id = 26,
@@ -1998,6 +1993,8 @@ test "metadata state tracks authoritative voter count when healthy peers agree" 
                     .updated_at_millis = 100,
                     .local_voter = true,
                     .voter_count = 2,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -2013,6 +2010,8 @@ test "metadata state tracks authoritative voter count when healthy peers agree" 
                     .updated_at_millis = 101,
                     .local_voter = true,
                     .voter_count = 2,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -2027,7 +2026,129 @@ test "metadata state tracks authoritative voter count when healthy peers agree" 
     try std.testing.expectEqual(@as(u16, 2), merged[0].healthy_voter_reports);
 }
 
+test "metadata state prefers authoritative leader membership over stale peer evidence" {
+    const leader_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 1, 2, 3, 4 }, null);
+    const stale_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 1, 2, 3 }, null);
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 101,
+            .node_id = 1,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7105,
+                .updated_at_millis = 300,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 4,
+                .voter_set_known = true,
+                .voter_set_fingerprint = leader_fingerprint,
+            }})[0..]),
+        },
+        .{
+            .store_id = 102,
+            .node_id = 2,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7105,
+                .updated_at_millis = 200,
+                .local_voter = true,
+                .voter_count = 3,
+                .voter_set_known = false,
+                .joint_consensus = true,
+            }})[0..]),
+        },
+        .{
+            .store_id = 103,
+            .node_id = 3,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7105,
+                .updated_at_millis = 100,
+                .local_voter = true,
+                .voter_count = 3,
+                .voter_set_known = true,
+                .voter_set_fingerprint = stale_fingerprint,
+                .joint_consensus = true,
+            }})[0..]),
+        },
+    };
+
+    const merged = try mergeHealthyGroupStatuses(
+        std.testing.allocator,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &stores,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+    );
+    defer freeMergedGroupStatuses(std.testing.allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expect(merged[0].leader_known);
+    try std.testing.expect(merged[0].voter_count_known);
+    try std.testing.expectEqual(@as(u16, 4), merged[0].voter_count);
+    try std.testing.expect(!merged[0].joint_consensus);
+}
+
+test "metadata state rejects conflicting known voter sets without leader truth" {
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 104,
+            .node_id = 4,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7106,
+                .local_voter = true,
+                .voter_count = 3,
+                .voter_set_known = true,
+                .voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 1, 2, 3 }, null),
+            }})[0..]),
+        },
+        .{
+            .store_id = 105,
+            .node_id = 5,
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7106,
+                .local_voter = true,
+                .voter_count = 3,
+                .voter_set_known = true,
+                .voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 1, 2, 4 }, null),
+            }})[0..]),
+        },
+    };
+
+    const merged = try mergeHealthyGroupStatuses(
+        std.testing.allocator,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &stores,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+    );
+    defer freeMergedGroupStatuses(std.testing.allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expect(!merged[0].leader_known);
+    try std.testing.expect(!merged[0].voter_count_known);
+    try std.testing.expectEqual(@as(u16, 3), merged[0].voter_count);
+}
+
 test "metadata state ignores group status from stores without current placement" {
+    const current_fingerprint = metadata_table_manager.voterSetFingerprint(&.{ 2, 3 }, null);
     const placement_intents = [_]raft_reconciler.PlacementIntent{
         .{ .record = .{ .group_id = 7204, .replica_id = 1, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 22, .peer_node_ids = &.{ 2, 3 } },
         .{ .record = .{ .group_id = 7204, .replica_id = 2, .local_node_id = 3, .bootstrap_mode = .persisted }, .store_id = 33, .peer_node_ids = &.{ 2, 3 }, .relocation_generation = 7 },
@@ -2069,6 +2190,8 @@ test "metadata state ignores group status from stores without current placement"
                     .local_leader = true,
                     .local_voter = true,
                     .voter_count = 2,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = current_fingerprint,
                 },
             })[0..]),
         },

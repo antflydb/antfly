@@ -88,7 +88,7 @@ pub const MetadataServer = struct {
                 svc.raft.host.http_host.request_executor,
                 .{
                     .ptr = svc,
-                    .is_ready = metadataGroupTransitionReady,
+                    .readiness = metadataGroupTransitionReadiness,
                 },
                 local_ops,
             );
@@ -222,9 +222,12 @@ pub const MetadataServer = struct {
         };
     }
 
-    fn metadataGroupTransitionReady(ptr: *anyopaque, group_id: u64) !bool {
+    fn metadataGroupTransitionReadiness(
+        ptr: *anyopaque,
+        group_id: u64,
+    ) !transition_state.StablePlacementReadiness {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        return try svc.groupTransitionReady(group_id);
+        return try svc.groupTransitionReadiness(group_id);
     }
 
     pub fn deinit(self: *MetadataServer) void {

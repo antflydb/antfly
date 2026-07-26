@@ -173,6 +173,9 @@ pub const TableBackupPlan = struct {
 pub const TableRestorePlan = struct {
     backup_root: []const u8,
     manifest: *const TableBackupManifest,
+    /// Immutable storage identity of this table artifact. This can differ
+    /// from the logical backup ID for a table inside a cluster backup.
+    artifact_backup_id: []const u8,
     /// Stable location of the admitted backup source. The storage boundary
     /// canonicalizes this into the durable restore idempotency identity after
     /// a remote artifact is copied into a private local staging root.
@@ -3750,8 +3753,6 @@ pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, loc
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var opened_location: BackupLocation = .{ .file = @constCast(backup_root) };
-    try ensureNewestClusterBackupAttemptRestorable(alloc, io, &opened_location);
     var dir = std.Io.Dir.cwd().openDir(io, backup_root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return .{ .backups = try alloc.alloc(BackupInfo, 0) },
         else => return err,
@@ -3818,7 +3819,6 @@ pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, loc
         };
         defer manifest.deinit(alloc);
         if (manifest.format_version != cluster_format_version) continue;
-        try validateClusterBackupArtifactsAtLocation(alloc, io, &opened_location, &manifest);
         infos.appendAssumeCapacity(try backupInfoFromManifest(alloc, &manifest, location));
     }
     const next_cursor = if (has_more and infos.items.len > 0) try alloc.dupe(u8, infos.items[infos.items.len - 1].backup_id) else null;
@@ -3994,7 +3994,6 @@ pub fn listClusterBackupsFromOpenedLocation(
         .file => |path| return try listClusterBackups(alloc, path, location_uri, options),
         .remote => {},
     }
-    try ensureNewestClusterBackupAttemptRestorable(alloc, location.remote.io, location);
     var infos = std.ArrayListUnmanaged(BackupInfo).empty;
     errdefer {
         for (infos.items) |info| freeBackupInfo(alloc, info);
@@ -4054,12 +4053,6 @@ pub fn listClusterBackupsFromOpenedLocation(
                 has_more = true;
                 break;
             }
-            try validateClusterBackupArtifactsAtLocation(
-                alloc,
-                location.remote.io,
-                location,
-                &manifest,
-            );
             infos.appendAssumeCapacity(try backupInfoFromManifest(alloc, &manifest, location_uri));
         }
 
@@ -4119,10 +4112,12 @@ pub fn deriveRestoreRanges(
     table_id: u64,
     location_uri: []const u8,
     connection: []const u8,
+    artifact_backup_id: []const u8,
     manifest: *const TableBackupManifest,
 ) ![]metadata_table_manager.RangeRecord {
     if (manifest.shards.len == 0) return error.UnsupportedBackupFormat;
     if (connection.len == 0 or connection.len > 256) return error.InvalidBackupRequest;
+    try validateBackupId(artifact_backup_id);
     const ranges = try alloc.alloc(metadata_table_manager.RangeRecord, manifest.shards.len);
     var initialized: usize = 0;
     errdefer {
@@ -4137,6 +4132,7 @@ pub fn deriveRestoreRanges(
             location_uri,
             connection,
             manifest.backup_id,
+            artifact_backup_id,
             shard,
         );
         initialized += 1;
@@ -4150,6 +4146,7 @@ fn deriveRestoreRange(
     location_uri: []const u8,
     connection: []const u8,
     backup_id: []const u8,
+    artifact_backup_id: []const u8,
     shard: ShardSnapshot,
 ) !metadata_table_manager.RangeRecord {
     const start_key = try alloc.dupe(u8, shard.start_key);
@@ -4158,6 +4155,8 @@ fn deriveRestoreRange(
     errdefer if (end_key) |end| alloc.free(end);
     const owned_backup_id = try alloc.dupe(u8, backup_id);
     errdefer alloc.free(owned_backup_id);
+    const owned_artifact_backup_id = try alloc.dupe(u8, artifact_backup_id);
+    errdefer alloc.free(owned_artifact_backup_id);
     const restore_location = try alloc.dupe(u8, location_uri);
     errdefer alloc.free(restore_location);
     const restore_snapshot_path = try alloc.dupe(u8, shard.snapshot_path);
@@ -4172,6 +4171,7 @@ fn deriveRestoreRange(
         .start_key = start_key,
         .end_key = end_key,
         .restore_backup_id = owned_backup_id,
+        .restore_artifact_backup_id = owned_artifact_backup_id,
         .restore_location = restore_location,
         .restore_snapshot_path = restore_snapshot_path,
         .restore_connection = restore_connection,
@@ -5591,6 +5591,37 @@ test "current Go portable cluster envelope resolves table metadata ids" {
     try std.testing.expectEqualStrings("table-a", table_manifest.backup_id);
     try std.testing.expectEqualStrings("go-cluster-1.afb", table_manifest.shards[0].snapshot_path);
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const artifact_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+        root,
+        table_manifest.shards[0].snapshot_path,
+    });
+    defer alloc.free(artifact_path);
+    try writeFileAbsolute(artifact_path, "go-portable-artifact");
+    try deriveManifestArtifactIntegrity(alloc, null, root, &table_manifest);
+
+    const table = try deriveRestoreTableRecord(alloc, "docs", "file:///backup", &table_manifest);
+    defer metadata_table_manager.freeTable(alloc, table);
+    const ranges = try deriveRestoreRanges(
+        alloc,
+        table.table_id,
+        "file:///backup",
+        "production-backups",
+        manifest.tables[0].artifact_backup_id.?,
+        &table_manifest,
+    );
+    defer {
+        for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
+        alloc.free(ranges);
+    }
+    try std.testing.expectEqualStrings("table-a", ranges[0].restore_backup_id);
+    try std.testing.expectEqualStrings("go-cluster", ranges[0].restore_artifact_backup_id);
+    try std.testing.expectEqual(@as(u64, "go-portable-artifact".len), ranges[0].restore_artifact_size_bytes);
+    try std.testing.expectEqual(@as(usize, 64), ranges[0].restore_artifact_sha256.len);
+
     try std.testing.expectError(
         error.UnsupportedBackupFormat,
         parseClusterManifestBytes(
@@ -5899,7 +5930,7 @@ test "cluster backup list uses top-level remote manifests without recursing into
     try std.testing.expect(std.mem.indexOf(u8, second_json, "next_cursor") == null);
 }
 
-test "newest incomplete cluster backup attempt fails backup health" {
+test "incomplete cluster backup attempts do not hide committed backups" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -5940,33 +5971,33 @@ test "newest incomplete cluster backup attempt fails backup health" {
     };
     try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
 
-    try std.testing.expectError(
-        error.IncompleteClusterBackup,
-        listClusterBackupsFromOpenedLocation(
-            alloc,
-            &location,
-            "s3://bucket/backups",
-            .{ .limit = 10 },
-        ),
+    var before_corrupt = try listClusterBackupsFromOpenedLocation(
+        alloc,
+        &location,
+        "s3://bucket/backups",
+        .{ .limit = 10 },
     );
+    defer before_corrupt.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), before_corrupt.backups.len);
+    try std.testing.expectEqualStrings("old-cluster", before_corrupt.backups[0].backup_id);
     try location.remote.writeBytes(
         alloc,
         "new-cluster-cluster-metadata.json",
         "{not-json",
         "application/json",
     );
-    try std.testing.expectError(
-        error.SyntaxError,
-        listClusterBackupsFromOpenedLocation(
-            alloc,
-            &location,
-            "s3://bucket/backups",
-            .{ .limit = 10 },
-        ),
+    var after_corrupt = try listClusterBackupsFromOpenedLocation(
+        alloc,
+        &location,
+        "s3://bucket/backups",
+        .{ .limit = 10 },
     );
+    defer after_corrupt.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), after_corrupt.backups.len);
+    try std.testing.expectEqualStrings("old-cluster", after_corrupt.backups[0].backup_id);
 }
 
-test "cluster backup list rejects a committed manifest with a missing artifact" {
+test "cluster backup list defers artifact validation to restore admission" {
     const alloc = std.testing.allocator;
     var memory = object_storage.MemoryObjectStorage.init(alloc);
     defer memory.deinit();
@@ -5990,13 +6021,22 @@ test "cluster backup list rejects a committed manifest with a missing artifact" 
     defer manifest.deinit(alloc);
     try writeClusterManifestToLocation(alloc, &location, &manifest);
 
+    var listed = try listClusterBackupsFromOpenedLocation(
+        alloc,
+        &location,
+        "s3://bucket/backups",
+        .{ .limit = 10 },
+    );
+    defer listed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), listed.backups.len);
+    try std.testing.expectEqualStrings("missing-cluster", listed.backups[0].backup_id);
     try std.testing.expectError(
         error.FileNotFound,
-        listClusterBackupsFromOpenedLocation(
+        validateClusterBackupArtifactsAtLocation(
             alloc,
+            location.remote.io,
             &location,
-            "s3://bucket/backups",
-            .{ .limit = 10 },
+            &manifest,
         ),
     );
 }
@@ -6235,12 +6275,12 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
     );
     try std.testing.expectEqual(@as(?[]u8, null), canonical_second.next_cursor);
     try std.testing.expectEqual(@as(?[]u8, null), trailing_second.next_cursor);
-    // Each traversal performs one bounded attempt-health scan.
-    try std.testing.expectEqual(@as(usize, 10), fake.list_requests);
-    // Aggregate reads reuse LIST metadata and go straight to bounded GETs.
-    // Only six table-manifest reads and six artifact checks require metadata.
-    try std.testing.expectEqual(@as(usize, 12), fake.manifest_head_requests);
-    try std.testing.expectEqual(@as(usize, 14), fake.manifest_get_requests);
+    // Discovery is one paginated top-level LIST traversal per request. It
+    // never scans attempt journals or probes table artifacts.
+    try std.testing.expectEqual(@as(usize, 6), fake.list_requests);
+    // Aggregate reads reuse LIST sizes and go straight to bounded GETs.
+    try std.testing.expectEqual(@as(usize, 0), fake.manifest_head_requests);
+    try std.testing.expectEqual(@as(usize, 8), fake.manifest_get_requests);
 }
 
 test "cluster backup list canonicalizes trailing remote prefix slash" {

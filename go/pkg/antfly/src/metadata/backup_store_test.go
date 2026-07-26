@@ -502,7 +502,7 @@ func TestClusterBackupAttemptRejectsOverlappingIdentifiers(t *testing.T) {
 	)
 }
 
-func TestStaleUncommittedClusterBackupAttemptIsReclaimed(t *testing.T) {
+func TestStaleUncommittedClusterBackupAttemptIsRetainedWithoutLeaseAuthority(t *testing.T) {
 	root := t.TempDir()
 	backupStore := &fileBackupStore{location: root}
 	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
@@ -539,13 +539,17 @@ func TestStaleUncommittedClusterBackupAttemptIsReclaimed(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Nil(t, latest)
-	require.NoFileExists(t, filepath.Join(root, "backup-1-1.afb"))
-	require.NoFileExists(t, filepath.Join(
+	require.FileExists(t, filepath.Join(root, "backup-1-1.afb"))
+	require.FileExists(t, filepath.Join(
 		root,
 		clusterBackupAttemptDir,
 		attempt.AttemptID+".json",
 	))
-	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
+	require.ErrorIs(
+		t,
+		backupStore.ReserveBackupID(context.Background(), "backup-1"),
+		ErrBackupAlreadyExists,
+	)
 }
 
 func TestStaleCommittedClusterBackupAttemptRetainsPermanentReservation(t *testing.T) {

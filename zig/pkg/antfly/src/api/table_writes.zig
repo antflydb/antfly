@@ -4641,6 +4641,10 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub const LocalIndexRepairDebtAction = enum {
         enqueue,
+        /// The caller has released every structural and DB lease that could
+        /// conflict with repair, so the runtime may admit the queued work
+        /// immediately instead of waiting for its control-loop poll.
+        enqueue_runnable,
         remove,
         cancel,
         clear_cancel,
@@ -4684,7 +4688,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         fn publishDeferredRepairDebt(self: *@This(), owner: *ProvisionedTableWriteSource) void {
             for (self.deferred_repair_group_ids.items) |group_id| {
-                owner.notifyLocalIndexRepairDebt(self.table_name, group_id, .enqueue);
+                owner.notifyLocalIndexRepairDebt(self.table_name, group_id, .enqueue_runnable);
             }
             self.deferred_repair_group_ids.clearRetainingCapacity();
         }
@@ -11981,6 +11985,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(path);
         const restore_source: backup_restore.RestoreSource = .{
             .backup_id = plan.manifest.backup_id,
+            .artifact_backup_id = plan.artifact_backup_id,
             .location = local_location,
             .identity_location = source_identity,
             .snapshot_path = source_shard.snapshot_path,
@@ -21772,6 +21777,7 @@ test "provisioned native backup restore repeats through shared read and write ow
         _ = try source.source().restoreTable(alloc, "docs", .{
             .backup_root = backup_root,
             .manifest = &manifest,
+            .artifact_backup_id = backup_id,
             .source_location = "file:///provisioned-native-restore-repeat",
         });
         try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
@@ -27602,6 +27608,7 @@ test "table write source restore acquires lifecycle unless caller reserves it" {
     const plan = backups_api.TableRestorePlan{
         .backup_root = "/tmp/unused-antfly-automatic-restore-lifecycle",
         .manifest = &manifest,
+        .artifact_backup_id = manifest.backup_id,
         .source_location = "file:///tmp/unused-antfly-automatic-restore-lifecycle",
     };
 
@@ -28198,6 +28205,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
     };
     const DebtCapture = struct {
         enqueue_calls: usize = 0,
+        runnable_enqueue_calls: usize = 0,
         remove_calls: usize = 0,
 
         fn onDebt(ptr: *anyopaque, table_name: []const u8, group_id: u64, action: ProvisionedTableWriteSource.LocalIndexRepairDebtAction) void {
@@ -28206,6 +28214,10 @@ test "structural reconcile publishes durable index repair debt once per group" {
             std.debug.assert(group_id == 7001);
             switch (action) {
                 .enqueue => self.enqueue_calls += 1,
+                .enqueue_runnable => {
+                    self.enqueue_calls += 1;
+                    self.runnable_enqueue_calls += 1;
+                },
                 .remove => self.remove_calls += 1,
                 .cancel, .clear_cancel => unreachable,
             }
@@ -28269,6 +28281,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
     reconcile_active = false;
     request.publishDeferredRepairDebt(&source);
     try std.testing.expect(capture.enqueue_calls >= 1);
+    try std.testing.expectEqual(@as(usize, 1), capture.runnable_enqueue_calls);
     const first_pass_enqueue_calls = capture.enqueue_calls;
 
     var attempted_repair = false;

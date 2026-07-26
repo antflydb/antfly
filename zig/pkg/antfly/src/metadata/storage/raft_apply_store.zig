@@ -248,6 +248,7 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             if (identity.table_id == 0) return error.InvalidRestoreIntentIdentity;
             const bootstrap = raft_catalog.BackupRestoreBootstrapRecord{
                 .backup_id = identity.backup_id,
+                .artifact_backup_id = identity.artifact_backup_id,
                 .location = identity.location,
                 .snapshot_path = identity.snapshot_path,
                 .connection = identity.connection,
@@ -312,7 +313,8 @@ test "metadata raft apply store decodes range values before split attempt epochs
         @sizeOf(u64) + // split_attempt_epoch
         @sizeOf(u32) + // empty restore_connection
         @sizeOf(u64) + // restore_artifact_size_bytes
-        @sizeOf(u32); // empty restore_artifact_sha256
+        @sizeOf(u32) + // empty restore_artifact_sha256
+        @sizeOf(u32); // empty restore_artifact_backup_id
     const legacy = encoded[0 .. encoded.len - appended_fields_size];
     const decoded = try decodeRangeRecord(std.testing.allocator, legacy);
     defer metadata_table_manager.freeRange(std.testing.allocator, decoded);
@@ -4502,6 +4504,8 @@ fn appendPlacementIntent(
             try backup.validate();
             try appendInt(alloc, out, u32, @intCast(backup.backup_id.len));
             try out.appendSlice(alloc, backup.backup_id);
+            try appendInt(alloc, out, u32, @intCast(backup.artifact_backup_id.len));
+            try out.appendSlice(alloc, backup.artifact_backup_id);
             try appendInt(alloc, out, u32, @intCast(backup.location.len));
             try out.appendSlice(alloc, backup.location);
             try appendInt(alloc, out, u32, @intCast(backup.snapshot_path.len));
@@ -4658,6 +4662,8 @@ fn appendRangeRecord(
     try appendInt(alloc, out, u64, record.restore_artifact_size_bytes);
     try appendInt(alloc, out, u32, @intCast(record.restore_artifact_sha256.len));
     try out.appendSlice(alloc, record.restore_artifact_sha256);
+    try appendInt(alloc, out, u32, @intCast(record.restore_artifact_backup_id.len));
+    try out.appendSlice(alloc, record.restore_artifact_backup_id);
 }
 
 fn appendSplitTransitionRecord(
@@ -4949,6 +4955,7 @@ fn appendRestoreIntentIdentity(
     try appendInt(alloc, out, u64, identity.group_id);
     try appendInt(alloc, out, u64, identity.table_id);
     try appendRequiredString(alloc, out, identity.backup_id);
+    try appendRequiredString(alloc, out, identity.artifact_backup_id);
     try appendRequiredString(alloc, out, identity.location);
     try appendRequiredString(alloc, out, identity.snapshot_path);
     try appendRequiredString(alloc, out, identity.connection);
@@ -4965,6 +4972,8 @@ fn readRestoreIntentIdentity(
     const table_id = try readInt(encoded, pos, u64);
     const backup_id = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(backup_id);
+    const artifact_backup_id = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(artifact_backup_id);
     const location = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(location);
     const snapshot_path = try readRequiredString(alloc, encoded, pos);
@@ -4977,6 +4986,7 @@ fn readRestoreIntentIdentity(
         .group_id = group_id,
         .table_id = table_id,
         .backup_id = backup_id,
+        .artifact_backup_id = artifact_backup_id,
         .location = location,
         .snapshot_path = snapshot_path,
         .connection = connection,
@@ -5040,8 +5050,10 @@ fn readRangeRecord(
     const start_len = try readInt(encoded, pos, u32);
     if (pos.* + start_len > encoded.len) return error.InvalidMetadataTransitionEncoding;
     const start_key = try alloc.dupe(u8, encoded[pos.* .. pos.* + start_len]);
+    errdefer alloc.free(start_key);
     pos.* += start_len;
     const end_key = try readOptionalString(alloc, encoded, pos);
+    errdefer if (end_key) |value| alloc.free(value);
     const restore_backup_id = if (pos.* < encoded.len)
         try readRequiredString(alloc, encoded, pos)
     else
@@ -5090,6 +5102,11 @@ fn readRangeRecord(
     else
         try alloc.dupe(u8, "");
     errdefer alloc.free(restore_artifact_sha256);
+    const restore_artifact_backup_id = if (pos.* < encoded.len)
+        try readRequiredString(alloc, encoded, pos)
+    else
+        try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_artifact_backup_id);
     return .{
         .group_id = group_id,
         .range_id = if (range_id == 0) group_id else range_id,
@@ -5100,6 +5117,7 @@ fn readRangeRecord(
         .doc_identity_range_id = doc_identity_range_id,
         .split_attempt_epoch = split_attempt_epoch,
         .restore_backup_id = restore_backup_id,
+        .restore_artifact_backup_id = restore_artifact_backup_id,
         .restore_location = restore_location,
         .restore_snapshot_path = restore_snapshot_path,
         .restore_connection = restore_connection,
@@ -5280,6 +5298,8 @@ fn readPlacementIntent(
             2 => {
                 const backup_id = try readRequiredString(alloc, encoded, pos);
                 errdefer alloc.free(backup_id);
+                const artifact_backup_id = try readRequiredString(alloc, encoded, pos);
+                errdefer alloc.free(artifact_backup_id);
                 const location = try readRequiredString(alloc, encoded, pos);
                 errdefer alloc.free(location);
                 const snapshot_path = try readRequiredString(alloc, encoded, pos);
@@ -5291,6 +5311,7 @@ fn readPlacementIntent(
                 errdefer alloc.free(artifact_sha256);
                 backup_restore_bootstrap = .{
                     .backup_id = backup_id,
+                    .artifact_backup_id = artifact_backup_id,
                     .location = location,
                     .snapshot_path = snapshot_path,
                     .connection = connection,
@@ -6621,6 +6642,7 @@ test "metadata raft apply store projects table and range records from committed 
             .doc_identity_shard_id = 4001,
             .doc_identity_range_id = 9001,
             .restore_backup_id = "nightly",
+            .restore_artifact_backup_id = "nightly-artifacts",
             .restore_location = "s3://backups/tables/docs",
             .restore_snapshot_path = "nightly/groups/4101.afb",
             .restore_connection = "production-backups",
@@ -6662,6 +6684,7 @@ test "metadata raft apply store projects table and range records from committed 
     try std.testing.expectEqual(@as(u64, 9001), ranges[0].doc_identity_range_id);
     try std.testing.expectEqualStrings("doc:a", ranges[0].start_key);
     try std.testing.expectEqualStrings("nightly", ranges[0].restore_backup_id);
+    try std.testing.expectEqualStrings("nightly-artifacts", ranges[0].restore_artifact_backup_id);
     try std.testing.expectEqualStrings("s3://backups/tables/docs", ranges[0].restore_location);
     try std.testing.expectEqualStrings("nightly/groups/4101.afb", ranges[0].restore_snapshot_path);
     try std.testing.expectEqualStrings("production-backups", ranges[0].restore_connection);
@@ -6728,6 +6751,7 @@ test "metadata raft apply store completes only the matching restore intent and p
             .doc_identity_range_id = 88,
             .split_attempt_epoch = 9,
             .restore_backup_id = "new",
+            .restore_artifact_backup_id = "new-artifact-namespace",
             .restore_location = "s3://backups/new",
             .restore_snapshot_path = "new/groups/4101.afb",
             .restore_connection = "backup-store",
@@ -6741,6 +6765,7 @@ test "metadata raft apply store completes only the matching restore intent and p
             .group_id = data_group_id,
             .table_id = 41,
             .backup_id = "old",
+            .artifact_backup_id = "old",
             .location = "s3://backups/old",
             .snapshot_path = "old/groups/4101.afb",
             .connection = "backup-store",
@@ -6765,6 +6790,7 @@ test "metadata raft apply store completes only the matching restore intent and p
         defer store.freeRanges(std.testing.allocator, ranges);
         try std.testing.expectEqual(@as(usize, 1), ranges.len);
         try std.testing.expectEqualStrings("new", ranges[0].restore_backup_id);
+        try std.testing.expectEqualStrings("new-artifact-namespace", ranges[0].restore_artifact_backup_id);
         try std.testing.expectEqualStrings(new_hash, ranges[0].restore_artifact_sha256);
     }
 
@@ -6773,6 +6799,7 @@ test "metadata raft apply store completes only the matching restore intent and p
             .group_id = data_group_id,
             .table_id = 41,
             .backup_id = "new",
+            .artifact_backup_id = "new-artifact-namespace",
             .location = "s3://backups/new",
             .snapshot_path = "new/groups/4101.afb",
             .connection = "backup-store",
@@ -7771,6 +7798,7 @@ test "metadata raft apply store projects backup restore bootstrap source in plac
                 .metadata_version = 4,
                 .backup_restore_bootstrap = .{
                     .backup_id = "snap-5201",
+                    .artifact_backup_id = "snap-5201",
                     .location = "file:///tmp/backups",
                     .snapshot_path = "snap-5201/groups/5201",
                     .connection = "backup-store",

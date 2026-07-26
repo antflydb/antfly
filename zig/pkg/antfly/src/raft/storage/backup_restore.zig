@@ -28,6 +28,7 @@ pub const RestoreAuthority = union(enum) {
 
 pub const RestoreSource = struct {
     backup_id: []const u8,
+    artifact_backup_id: []const u8,
     location: []const u8,
     identity_location: ?[]const u8 = null,
     snapshot_path: []const u8,
@@ -337,6 +338,7 @@ pub fn applyBackupRestoreFromRecordWithOptions(
     try restore.validate();
     try applyRestoreSnapshotToReplicaRoot(alloc, replica_root_dir, group_id, .{
         .backup_id = restore.backup_id,
+        .artifact_backup_id = restore.artifact_backup_id,
         .location = restore.location,
         .snapshot_path = restore.snapshot_path,
         .authority = .{ .external = restore.connection },
@@ -393,7 +395,12 @@ fn prepareRestoreSnapshot(
     var owned_manifest: ?backups_api.TableBackupManifest = null;
     defer if (owned_manifest) |*manifest| manifest.deinit(alloc);
     const manifest = restore.manifest orelse blk: {
-        owned_manifest = try backups_api.readManifestFromLocation(alloc, &location, restore.backup_id);
+        owned_manifest = try backups_api.readManifestFromLocationWithArtifactBackupId(
+            alloc,
+            &location,
+            restore.backup_id,
+            restore.artifact_backup_id,
+        );
         break :blk &owned_manifest.?;
     };
     try backups_api.validateRestoreManifest(alloc, manifest, restore.backup_id);

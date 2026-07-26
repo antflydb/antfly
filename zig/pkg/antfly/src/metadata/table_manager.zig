@@ -97,6 +97,7 @@ pub const RangeRecord = struct {
     /// range update may commit before its transition record during recovery.
     split_attempt_epoch: u64 = 0,
     restore_backup_id: []const u8 = "",
+    restore_artifact_backup_id: []const u8 = "",
     restore_location: []const u8 = "",
     restore_snapshot_path: []const u8 = "",
     /// Cluster-local authority used to resolve `restore_location`. This is an
@@ -114,6 +115,7 @@ pub const RestoreIntentIdentity = struct {
     group_id: u64,
     table_id: u64,
     backup_id: []const u8,
+    artifact_backup_id: []const u8,
     location: []const u8,
     snapshot_path: []const u8,
     connection: []const u8,
@@ -126,6 +128,7 @@ pub fn restoreIntentIdentity(record: RangeRecord) RestoreIntentIdentity {
         .group_id = record.group_id,
         .table_id = record.table_id,
         .backup_id = record.restore_backup_id,
+        .artifact_backup_id = record.restore_artifact_backup_id,
         .location = record.restore_location,
         .snapshot_path = record.restore_snapshot_path,
         .connection = record.restore_connection,
@@ -138,6 +141,7 @@ pub fn restoreIntentMatchesRange(expected: RestoreIntentIdentity, record: RangeR
     return expected.group_id == record.group_id and
         expected.table_id == record.table_id and
         std.mem.eql(u8, expected.backup_id, record.restore_backup_id) and
+        std.mem.eql(u8, expected.artifact_backup_id, record.restore_artifact_backup_id) and
         std.mem.eql(u8, expected.location, record.restore_location) and
         std.mem.eql(u8, expected.snapshot_path, record.restore_snapshot_path) and
         std.mem.eql(u8, expected.connection, record.restore_connection) and
@@ -151,6 +155,8 @@ pub fn cloneRestoreIntentIdentity(
 ) !RestoreIntentIdentity {
     const backup_id = try alloc.dupe(u8, identity.backup_id);
     errdefer alloc.free(backup_id);
+    const artifact_backup_id = try alloc.dupe(u8, identity.artifact_backup_id);
+    errdefer alloc.free(artifact_backup_id);
     const location = try alloc.dupe(u8, identity.location);
     errdefer alloc.free(location);
     const snapshot_path = try alloc.dupe(u8, identity.snapshot_path);
@@ -163,6 +169,7 @@ pub fn cloneRestoreIntentIdentity(
         .group_id = identity.group_id,
         .table_id = identity.table_id,
         .backup_id = backup_id,
+        .artifact_backup_id = artifact_backup_id,
         .location = location,
         .snapshot_path = snapshot_path,
         .connection = connection,
@@ -176,6 +183,7 @@ pub fn freeRestoreIntentIdentity(
     identity: RestoreIntentIdentity,
 ) void {
     alloc.free(identity.backup_id);
+    alloc.free(identity.artifact_backup_id);
     alloc.free(identity.location);
     alloc.free(identity.snapshot_path);
     alloc.free(identity.connection);
@@ -185,6 +193,8 @@ pub fn freeRestoreIntentIdentity(
 pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeRecord) !void {
     const backup_id = try alloc.dupe(u8, "");
     errdefer alloc.free(backup_id);
+    const artifact_backup_id = try alloc.dupe(u8, "");
+    errdefer alloc.free(artifact_backup_id);
     const location = try alloc.dupe(u8, "");
     errdefer alloc.free(location);
     const snapshot_path = try alloc.dupe(u8, "");
@@ -195,11 +205,13 @@ pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeReco
     errdefer alloc.free(artifact_sha256);
 
     alloc.free(record.restore_backup_id);
+    alloc.free(record.restore_artifact_backup_id);
     alloc.free(record.restore_location);
     alloc.free(record.restore_snapshot_path);
     alloc.free(record.restore_connection);
     alloc.free(record.restore_artifact_sha256);
     record.restore_backup_id = backup_id;
+    record.restore_artifact_backup_id = artifact_backup_id;
     record.restore_location = location;
     record.restore_snapshot_path = snapshot_path;
     record.restore_connection = connection;
@@ -218,6 +230,7 @@ pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
         lhs.doc_identity_range_id == rhs.doc_identity_range_id and
         lhs.split_attempt_epoch == rhs.split_attempt_epoch and
         std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
+        std.mem.eql(u8, lhs.restore_artifact_backup_id, rhs.restore_artifact_backup_id) and
         std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
         std.mem.eql(u8, lhs.restore_snapshot_path, rhs.restore_snapshot_path) and
         std.mem.eql(u8, lhs.restore_connection, rhs.restore_connection) and
@@ -315,6 +328,80 @@ pub const GroupStatusReport = struct {
 
 pub const voter_set_fingerprint_len = std.crypto.hash.sha2.Sha256.digest_length;
 pub const VoterSetFingerprint = [voter_set_fingerprint_len]u8;
+
+pub const ResolvedVoterSetEvidence = struct {
+    voter_count_known: bool,
+    voter_count: u16,
+    from_leader: bool,
+};
+
+/// Merges membership observations without allowing a reporter that explicitly
+/// lacks Raft voter-set knowledge to poison authoritative evidence. A count
+/// from such a reporter remains useful as a conservative fallback; once any
+/// fingerprint-qualified evidence exists, only qualified reports can conflict
+/// with it.
+pub const VoterSetEvidence = struct {
+    fallback_voter_count: ?u16 = null,
+    ambiguous_fallback_voter_count: bool = false,
+    known_voter_count: ?u16 = null,
+    known_voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
+    has_known_voter_set: bool = false,
+    ambiguous_known_voter_set: bool = false,
+
+    pub fn observe(self: *@This(), report: GroupStatusReport) void {
+        if (report.voter_count == 0) return;
+        if (self.fallback_voter_count) |existing| {
+            if (existing != report.voter_count) self.ambiguous_fallback_voter_count = true;
+        } else {
+            self.fallback_voter_count = report.voter_count;
+        }
+        if (!report.voter_set_known) return;
+
+        if (!self.has_known_voter_set) {
+            self.known_voter_count = report.voter_count;
+            self.known_voter_set_fingerprint = report.voter_set_fingerprint;
+            self.has_known_voter_set = true;
+            return;
+        }
+        if (self.known_voter_count.? != report.voter_count or
+            !std.mem.eql(
+                u8,
+                &self.known_voter_set_fingerprint,
+                &report.voter_set_fingerprint,
+            ))
+        {
+            self.ambiguous_known_voter_set = true;
+        }
+    }
+
+    pub fn resolve(
+        self: @This(),
+        authoritative_leader: ?GroupStatusReport,
+    ) ResolvedVoterSetEvidence {
+        if (authoritative_leader) |leader| {
+            if (leader.voter_set_known and leader.voter_count > 0) {
+                return .{
+                    .voter_count_known = true,
+                    .voter_count = leader.voter_count,
+                    .from_leader = true,
+                };
+            }
+        }
+        if (self.has_known_voter_set) {
+            return .{
+                .voter_count_known = !self.ambiguous_known_voter_set,
+                .voter_count = self.known_voter_count.?,
+                .from_leader = false,
+            };
+        }
+        return .{
+            .voter_count_known = self.fallback_voter_count != null and
+                !self.ambiguous_fallback_voter_count,
+            .voter_count = self.fallback_voter_count orelse 0,
+            .from_leader = false,
+        };
+    }
+};
 
 pub fn normalizedVoterCount(node_ids: []const u64, required_node_id: ?u64) usize {
     var count: usize = 0;
@@ -1194,6 +1281,8 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
     errdefer freeOwnedOptional(alloc, end_key);
     const restore_backup_id = try alloc.dupe(u8, record.restore_backup_id);
     errdefer alloc.free(restore_backup_id);
+    const restore_artifact_backup_id = try alloc.dupe(u8, record.restore_artifact_backup_id);
+    errdefer alloc.free(restore_artifact_backup_id);
     const restore_location = try alloc.dupe(u8, record.restore_location);
     errdefer alloc.free(restore_location);
     const restore_snapshot_path = try alloc.dupe(u8, record.restore_snapshot_path);
@@ -1212,6 +1301,7 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
         .doc_identity_range_id = record.doc_identity_range_id,
         .split_attempt_epoch = record.split_attempt_epoch,
         .restore_backup_id = restore_backup_id,
+        .restore_artifact_backup_id = restore_artifact_backup_id,
         .restore_location = restore_location,
         .restore_snapshot_path = restore_snapshot_path,
         .restore_connection = restore_connection,
@@ -1233,6 +1323,7 @@ pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
     alloc.free(record.start_key);
     freeOwnedOptional(alloc, record.end_key);
     alloc.free(record.restore_backup_id);
+    alloc.free(record.restore_artifact_backup_id);
     alloc.free(record.restore_location);
     alloc.free(record.restore_snapshot_path);
     alloc.free(record.restore_connection);

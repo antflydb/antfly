@@ -580,6 +580,32 @@ fn appendOpenAiModelEntry(
     try buf.appendSlice(allocator, metadata);
 }
 
+fn appendUniqueOpenAiModelEntry(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    seen: *std.StringHashMapUnmanaged(void),
+    count: *usize,
+    model_id: []const u8,
+    created: i64,
+) !void {
+    const entry = try seen.getOrPut(allocator, model_id);
+    if (entry.found_existing) return;
+    if (count.* > 0) try buf.append(allocator, ',');
+    try appendOpenAiModelEntry(buf, allocator, model_id, created);
+    count.* += 1;
+}
+
+const DiscoveredModelListing = struct {
+    entry_index: usize,
+    manifest: ?manifest_mod.ModelManifest,
+    reader_supported: bool,
+
+    fn deinit(self: *@This()) void {
+        if (self.manifest) |*manifest| manifest.deinit();
+        self.* = undefined;
+    }
+};
+
 const ModelCounts = struct {
     embedders: usize = 0,
     rerankers: usize = 0,
@@ -5532,6 +5558,8 @@ pub const Node = struct {
         defer body.deinit(a);
         var openai_data = std.ArrayListUnmanaged(u8).empty;
         defer openai_data.deinit(a);
+        var openai_models = std.StringHashMapUnmanaged(void).empty;
+        defer openai_models.deinit(a);
         var openai_data_count: usize = 0;
         const list_created = completionCreatedTimestamp();
 
@@ -5544,6 +5572,21 @@ pub const Node = struct {
                 ra.free(entry.path);
             }
             if (discovered.len > 0) ra.free(discovered);
+        }
+
+        var discovered_listings = std.ArrayListUnmanaged(DiscoveredModelListing).empty;
+        defer {
+            for (discovered_listings.items) |*listing| listing.deinit();
+            discovered_listings.deinit(a);
+        }
+        try discovered_listings.ensureTotalCapacity(a, discovered.len);
+        for (discovered, 0..) |entry, entry_index| {
+            if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(a, entry.path)) continue;
+            discovered_listings.appendAssumeCapacity(.{
+                .entry_index = entry_index,
+                .manifest = manifest_mod.loadFromDir(a, entry.path) catch null,
+                .reader_supported = readers_mod.isSupportedModelDir(a, entry.path),
+            });
         }
 
         const task_names = [_][]const u8{
@@ -5568,19 +5611,16 @@ pub const Node = struct {
             }
 
             // Add discovered models matching this task
-            for (discovered) |entry| {
-                if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(a, entry.path)) continue;
-                if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(a, entry.path)) continue;
+            for (discovered_listings.items) |*listing| {
+                const entry = discovered[listing.entry_index];
+                if (std.mem.eql(u8, task, "readers") and !listing.reader_supported) continue;
 
-                var maybe_manifest: ?manifest_mod.ModelManifest = manifest_mod.loadFromDir(a, entry.path) catch null;
-                defer if (maybe_manifest) |*man| man.deinit();
-
-                const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
-                const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
-                const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
-                const inputs = if (maybe_manifest) |*man| man.inputs else &.{};
-                const has_visual = if (maybe_manifest) |*man| man.visual_model_path != null or man.visual_projection_path != null else false;
-                const has_audio = if (maybe_manifest) |*man| man.audio_model_path != null or man.audio_projection_path != null else false;
+                const tasks = if (listing.manifest) |*man| man.tasks else &.{};
+                const capabilities = if (listing.manifest) |*man| man.capabilities else &.{};
+                const gliner_model_type = if (listing.manifest) |*man| man.gliner_model_type else "";
+                const inputs = if (listing.manifest) |*man| man.inputs else &.{};
+                const has_visual = if (listing.manifest) |*man| man.visual_model_path != null or man.visual_projection_path != null else false;
+                const has_audio = if (listing.manifest) |*man| man.audio_model_path != null or man.audio_projection_path != null else false;
                 if (!taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) continue;
 
                 if (model_count > 0) try body.append(a, ',');
@@ -5588,9 +5628,14 @@ pub const Node = struct {
                 try body.append(a, ':');
                 try appendModelInfo(&body, a, @tagName(entry.kind), gliner_model_type, capabilities, inputs, has_visual, has_audio);
                 if (isOpenAiListTask(task)) {
-                    if (openai_data_count > 0) try openai_data.append(a, ',');
-                    try appendOpenAiModelEntry(&openai_data, a, entry.name, list_created);
-                    openai_data_count += 1;
+                    try appendUniqueOpenAiModelEntry(
+                        &openai_data,
+                        a,
+                        &openai_models,
+                        &openai_data_count,
+                        entry.name,
+                        list_created,
+                    );
                 }
                 model_count += 1;
             }
@@ -5625,9 +5670,14 @@ pub const Node = struct {
                         model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
                     );
                     if (isOpenAiListTask(task)) {
-                        if (openai_data_count > 0) try openai_data.append(a, ',');
-                        try appendOpenAiModelEntry(&openai_data, a, entry.key_ptr.*, list_created);
-                        openai_data_count += 1;
+                        try appendUniqueOpenAiModelEntry(
+                            &openai_data,
+                            a,
+                            &openai_models,
+                            &openai_data_count,
+                            entry.key_ptr.*,
+                            list_created,
+                        );
                     }
                     model_count += 1;
                 }
@@ -6582,6 +6632,37 @@ test "graph executor metrics render counters" {
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_graph_executor_partitions_total 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_graph_executor_interpreter_fallbacks_total 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_graph_executor_host_materialized_outputs_total 3\n") != null);
+}
+
+test "OpenAI model listing deduplicates multi-task models" {
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(std.testing.allocator);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(std.testing.allocator);
+    var count: usize = 0;
+
+    try appendUniqueOpenAiModelEntry(
+        &output,
+        std.testing.allocator,
+        &seen,
+        &count,
+        "antflydb/clipclap",
+        17,
+    );
+    try appendUniqueOpenAiModelEntry(
+        &output,
+        std.testing.allocator,
+        &seen,
+        &count,
+        "antflydb/clipclap",
+        17,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, output.items, "\"id\":\"antflydb/clipclap\""),
+    );
 }
 
 fn taskMatchesModelListing(task: []const u8, model_kind: []const u8, gliner_model_type: []const u8, tasks: []const []const u8, capabilities: []const []const u8) bool {

@@ -77,6 +77,7 @@ pub const SnapshotBootstrapRecord = struct {
 
 pub const BackupRestoreBootstrapRecord = struct {
     backup_id: []const u8,
+    artifact_backup_id: []const u8,
     location: []const u8,
     snapshot_path: []const u8,
     connection: []const u8,
@@ -86,6 +87,8 @@ pub const BackupRestoreBootstrapRecord = struct {
     pub fn validate(self: BackupRestoreBootstrapRecord) !void {
         if (self.backup_id.len == 0 or
             self.backup_id.len > 128 or
+            self.artifact_backup_id.len == 0 or
+            self.artifact_backup_id.len > 128 or
             self.location.len == 0 or
             self.location.len > 4096 or
             self.snapshot_path.len == 0 or
@@ -100,8 +103,14 @@ pub const BackupRestoreBootstrapRecord = struct {
             if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.')
                 return error.InvalidBackupRestoreBootstrap;
         }
+        for (self.artifact_backup_id) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.')
+                return error.InvalidBackupRestoreBootstrap;
+        }
         if (std.mem.eql(u8, self.backup_id, ".") or
             std.mem.eql(u8, self.backup_id, "..") or
+            std.mem.eql(u8, self.artifact_backup_id, ".") or
+            std.mem.eql(u8, self.artifact_backup_id, "..") or
             std.mem.indexOfScalar(u8, self.location, 0) != null or
             std.mem.indexOfScalar(u8, self.connection, 0) != null or
             std.fs.path.isAbsolute(self.snapshot_path) or
@@ -128,6 +137,7 @@ pub const BackupRestoreBootstrapRecord = struct {
     pub fn clone(self: BackupRestoreBootstrapRecord, alloc: std.mem.Allocator) !BackupRestoreBootstrapRecord {
         var cloned = BackupRestoreBootstrapRecord{
             .backup_id = "",
+            .artifact_backup_id = "",
             .location = "",
             .snapshot_path = "",
             .connection = "",
@@ -136,6 +146,8 @@ pub const BackupRestoreBootstrapRecord = struct {
         };
         cloned.backup_id = try alloc.dupe(u8, self.backup_id);
         errdefer alloc.free(cloned.backup_id);
+        cloned.artifact_backup_id = try alloc.dupe(u8, self.artifact_backup_id);
+        errdefer alloc.free(cloned.artifact_backup_id);
         cloned.location = try alloc.dupe(u8, self.location);
         errdefer alloc.free(cloned.location);
         cloned.snapshot_path = try alloc.dupe(u8, self.snapshot_path);
@@ -148,6 +160,7 @@ pub const BackupRestoreBootstrapRecord = struct {
 
     pub fn deinit(self: *BackupRestoreBootstrapRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.backup_id);
+        alloc.free(self.artifact_backup_id);
         alloc.free(self.location);
         alloc.free(self.snapshot_path);
         alloc.free(self.connection);
@@ -784,6 +797,7 @@ test "replica catalog rejects invalid backup restore authority and integrity bin
         .local_node_id = 3,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-11",
+            .artifact_backup_id = "snap-11",
             .location = "file:///tmp/backups",
             .snapshot_path = "../snap-11",
             .connection = "backup-store",
@@ -797,6 +811,7 @@ test "replica catalog rejects invalid backup restore authority and integrity bin
         .local_node_id = 3,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-11",
+            .artifact_backup_id = "snap-11",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-11/groups/11",
             .connection = "",
@@ -810,6 +825,7 @@ test "replica catalog rejects invalid backup restore authority and integrity bin
         .local_node_id = 3,
         .backup_restore_bootstrap = .{
             .backup_id = "snap-11",
+            .artifact_backup_id = "snap-11",
             .location = "file:///tmp/backups",
             .snapshot_path = "snap-11/groups/11",
             .connection = "backup-store",
@@ -1078,6 +1094,7 @@ test "file replica catalog persists backup restore bootstrap records across reop
             .metadata_version = 10,
             .backup_restore_bootstrap = .{
                 .backup_id = "snap-22",
+                .artifact_backup_id = "snap-22",
                 .location = "file:///tmp/backups",
                 .snapshot_path = "snap-22/groups/22",
                 .connection = "backup-store",
