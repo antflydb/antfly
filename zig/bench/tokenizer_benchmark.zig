@@ -619,10 +619,19 @@ fn runStageDiagnostics(
     corpus: []const u8,
     iterations: usize,
 ) !StageDiagnostics {
+    const total_bytes = std.math.mul(
+        usize,
+        corpus.len,
+        iterations,
+    ) catch return error.InvalidConfiguration;
     var scanner_pretokens: usize = 0;
     const scanner_started = std.Io.Timestamp.now(io, .awake);
     for (0..iterations) |_| {
-        scanner_pretokens +%= try hf.countByteLevelPretokens(corpus);
+        scanner_pretokens = std.math.add(
+            usize,
+            scanner_pretokens,
+            try hf.countByteLevelPretokens(corpus),
+        ) catch return error.InvalidConfiguration;
     }
     const scanner_finished = std.Io.Timestamp.now(io, .awake);
     const scanner_seconds = elapsedSeconds(scanner_started, scanner_finished);
@@ -640,7 +649,11 @@ fn runStageDiagnostics(
     for (0..iterations) |_| {
         no_cache_ids.clearRetainingCapacity();
         try no_cache_hf.tokenizer().encodeInto(allocator, corpus, &no_cache_ids);
-        serial_no_cache_tokens +%= no_cache_ids.items.len;
+        serial_no_cache_tokens = std.math.add(
+            usize,
+            serial_no_cache_tokens,
+            no_cache_ids.items.len,
+        ) catch return error.InvalidConfiguration;
     }
     const no_cache_finished = std.Io.Timestamp.now(io, .awake);
     const no_cache_seconds = elapsedSeconds(no_cache_started, no_cache_finished);
@@ -656,7 +669,11 @@ fn runStageDiagnostics(
     for (0..iterations) |_| {
         warm_ids.clearRetainingCapacity();
         try hf.tokenizer().encodeInto(allocator, corpus, &warm_ids);
-        serial_warm_tokens +%= warm_ids.items.len;
+        serial_warm_tokens = std.math.add(
+            usize,
+            serial_warm_tokens,
+            warm_ids.items.len,
+        ) catch return error.InvalidConfiguration;
     }
     const warm_finished = std.Io.Timestamp.now(io, .awake);
     const warm_seconds = elapsedSeconds(warm_started, warm_finished);
@@ -668,8 +685,6 @@ fn runStageDiagnostics(
     {
         return error.StageDiagnosticSequenceMismatch;
     }
-    const total_bytes = corpus.len * iterations;
-
     return .{
         .scanner_pretokens = scanner_pretokens / iterations,
         .scanner_seconds = scanner_seconds,
@@ -850,6 +865,11 @@ pub fn main(init: std.process.Init) !void {
         cfg.iterations,
         cfg.threads,
     ) catch return error.InvalidConfiguration;
+    const total_bytes = std.math.mul(
+        usize,
+        corpus.len,
+        timed_sample_count,
+    ) catch return error.InvalidConfiguration;
     const timed_digests = try allocator.alloc([32]u8, timed_sample_count);
     defer allocator.free(timed_digests);
     const timed_token_counts = try allocator.alloc(usize, timed_sample_count);
@@ -880,7 +900,11 @@ pub fn main(init: std.process.Init) !void {
             const sample_index = iteration * cfg.threads + worker_index;
             const token_count = worker.tokenCount();
             timed_token_counts[sample_index] = token_count;
-            token_total +%= token_count;
+            token_total = std.math.add(
+                usize,
+                token_total,
+                token_count,
+            ) catch return error.InvalidConfiguration;
             timed_digests[sample_index] =
                 if (worker.segments_u16) |*segments|
                     hashTokenSegmentsU16Blake3(segments)
@@ -1050,7 +1074,6 @@ pub fn main(init: std.process.Init) !void {
 
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) /
         @as(f64, @floatFromInt(std.time.ns_per_s));
-    const total_bytes = corpus.len * cfg.iterations * cfg.threads;
     const mb_per_second = @as(f64, @floatFromInt(total_bytes)) / seconds / 1_000_000.0;
     const mtok_per_second = @as(f64, @floatFromInt(token_total)) / seconds / 1_000_000.0;
     const cpu_seconds = @as(f64, @floatFromInt(cpu_elapsed_ns)) /

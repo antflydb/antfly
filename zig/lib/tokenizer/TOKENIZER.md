@@ -740,6 +740,22 @@ workspaces and reads cached workspaces directly while holding the workspace
 list mutex. This keeps metrics race-free without putting locks or atomics in
 the scanner, cache-probe, or BPE inner loops.
 
+Private-table observability follows the same production rule. A consumer owns
+its table lease for a complete encode, so `bpeCacheStats` never waits for that
+mutex. It reads an exact table snapshot when `tryLock` succeeds and otherwise
+uses the last atomically published entry, arena, byte, and storage counters.
+Metrics collection therefore cannot burn a core behind a multi-gigabyte
+request, and the cache probe/admission path still contains no statistics
+atomics.
+
+Stable-boundary admission gives private tables priority because the indexed
+scanner requires them. On the first stable encode, all required tables are
+initialized concurrently through `std.Io` before the corpus-sized index asks
+the shared budget for memory. If pressure admits the tables but rejects the
+index, normal private-cache BPE remains available; if any table is denied, the
+index is not allocated. This prevents retained, resource-accounted metadata
+that no admitted execution path can consume.
+
 Focused denial tests reject every optional reservation, verify that no private
 table is retained, compare packed segmented output with the serial i32 result,
 and confirm that all workspace and tokenizer bytes are released at teardown.
@@ -747,6 +763,16 @@ An additional transient-denial test verifies that private worker tables become
 available after pressure subsides and that their reservations are released at
 teardown. Denial therefore changes only speed and retention, never tokenization
 success or output.
+
+Packed private-cache values are decoded into `@Vector(4, u16)` lanes before
+either the u16 store or i32 widening store. Little-endian builds retain the
+zero-cost scalar bitcast; big-endian builds construct semantic lanes explicitly.
+Token order is therefore portable without a runtime branch in the hit path.
+Baseline AArch64, x86-64, and big-endian PowerPC64 cross-builds cover the
+implementation. The benchmark also uses checked multiplication and accumulation
+for sample bytes and token counts, rejecting configurations whose reported
+throughput would overflow `usize` instead of emitting wrapped, plausible-looking
+results.
 
 ### Accepted and rejected residual experiments
 

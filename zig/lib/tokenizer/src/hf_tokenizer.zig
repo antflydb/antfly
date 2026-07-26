@@ -201,6 +201,67 @@ pub const HfTokenizer = struct {
         allocation_failed: bool = false,
         reservation_denials: u8 = 0,
         reservation_retry_after: u8 = 0,
+        published_present: std.atomic.Value(bool) = .init(false),
+        published_entries: std.atomic.Value(usize) = .init(0),
+        published_slots: std.atomic.Value(usize) = .init(0),
+        published_bytes: std.atomic.Value(usize) = .init(0),
+        published_token_arena_ids: std.atomic.Value(usize) = .init(0),
+        published_superpage: std.atomic.Value(bool) = .init(false),
+
+        fn publishStats(self: *WorkerBpeCacheLease) void {
+            const cache = self.cache orelse {
+                self.published_present.store(false, .release);
+                return;
+            };
+            self.published_entries.store(cache.count, .monotonic);
+            self.published_slots.store(cache.entries.len, .monotonic);
+            self.published_bytes.store(cache.accounted_bytes, .monotonic);
+            self.published_token_arena_ids.store(
+                cache.token_arena.items.len,
+                .monotonic,
+            );
+            self.published_superpage.store(
+                cache.storage == .darwin_superpage,
+                .monotonic,
+            );
+            // Publish presence last so an observer that sees a table also sees
+            // the complete snapshot written above. Subsequent fields only grow.
+            self.published_present.store(true, .release);
+        }
+
+        fn loadPublishedStats(
+            self: *const WorkerBpeCacheLease,
+        ) WorkerBpeCachePublishedStats {
+            if (!self.published_present.load(.acquire)) return .{};
+            return .{
+                .present = true,
+                .entries = self.published_entries.load(.monotonic),
+                .slots = self.published_slots.load(.monotonic),
+                .bytes = self.published_bytes.load(.monotonic),
+                .token_arena_ids = self.published_token_arena_ids.load(.monotonic),
+                .superpage = self.published_superpage.load(.monotonic),
+            };
+        }
+    };
+
+    const WorkerBpeCachePublishedStats = struct {
+        present: bool = false,
+        entries: usize = 0,
+        slots: usize = 0,
+        bytes: usize = 0,
+        token_arena_ids: usize = 0,
+        superpage: bool = false,
+
+        fn fromCache(cache: *const WorkerBpeCache) @This() {
+            return .{
+                .present = true,
+                .entries = cache.count,
+                .slots = cache.entries.len,
+                .bytes = cache.accounted_bytes,
+                .token_arena_ids = cache.token_arena.items.len,
+                .superpage = cache.storage == .darwin_superpage,
+            };
+        }
     };
 
     const worker_bpe_superpage_bytes = 2 * 1024 * 1024;
@@ -1513,6 +1574,23 @@ pub const HfTokenizer = struct {
         ids.items.len = output_len;
     }
 
+    inline fn workerBpeValueLanes(
+        packed_value: PackedWorkerBpeValue,
+    ) @Vector(4, u16) {
+        // Preserve the zero-cost scalar bitcast on little-endian production
+        // targets. Scalar byte order differs on big-endian targets, where
+        // explicit semantic lanes keep token order without a runtime branch.
+        if (comptime builtin.cpu.arch.endian() == .little) {
+            return @bitCast(packed_value.value);
+        }
+        return .{
+            @truncate(packed_value.value),
+            @truncate(packed_value.value >> 16),
+            @truncate(packed_value.value >> 32),
+            @truncate(packed_value.value >> 48),
+        };
+    }
+
     inline fn writeWorkerBpeValueU16(
         output: [*]u16,
         output_len: *usize,
@@ -1520,8 +1598,9 @@ pub const HfTokenizer = struct {
     ) void {
         const count = workerBpeInlineCount(packed_value.value);
         const destination = output + output_len.*;
-        const packed_store: *align(1) u64 = @ptrCast(destination);
-        packed_store.* = packed_value.value;
+        const output_store: *align(1) @Vector(4, u16) =
+            @ptrCast(destination);
+        output_store.* = workerBpeValueLanes(packed_value);
         output_len.* += count;
     }
 
@@ -1532,8 +1611,7 @@ pub const HfTokenizer = struct {
     ) void {
         const count = workerBpeInlineCount(packed_value.value);
         const destination = output + output_len.*;
-        const packed_ids: @Vector(4, u16) =
-            @bitCast(packed_value.value);
+        const packed_ids = workerBpeValueLanes(packed_value);
         const widened: @Vector(4, i32) = packed_ids;
         const output_store: *align(1) @Vector(4, i32) =
             @ptrCast(destination);
@@ -1776,7 +1854,10 @@ pub const HfTokenizer = struct {
     }
 
     fn releaseWorkerBpeCache(lease: ?*WorkerBpeCacheLease) void {
-        if (lease) |held| held.mutex.unlock();
+        if (lease) |held| {
+            held.publishStats();
+            held.mutex.unlock();
+        }
     }
 
     const ParallelBpeWorker = struct {
@@ -2000,6 +2081,48 @@ pub const HfTokenizer = struct {
             }
         }
     };
+
+    const ParallelWorkerBpeCacheInitJob = struct {
+        tokenizer: *HfTokenizer,
+        cache_count: usize,
+        next_cache: std.atomic.Value(usize) = .init(0),
+        ready_count: std.atomic.Value(usize) = .init(0),
+
+        fn run(self: *ParallelWorkerBpeCacheInitJob) std.Io.Cancelable!void {
+            while (true) {
+                const idx = self.next_cache.fetchAdd(1, .monotonic);
+                if (idx >= self.cache_count) return;
+                const lease = self.tokenizer.acquireWorkerBpeCacheAt(idx);
+                if (lease != null) {
+                    _ = self.ready_count.fetchAdd(1, .monotonic);
+                }
+                releaseWorkerBpeCache(lease);
+            }
+        }
+    };
+
+    fn prepareWorkerBpeCachesForStableIndex(
+        self: *HfTokenizer,
+        io: std.Io,
+        cache_count: usize,
+    ) !bool {
+        std.debug.assert(cache_count != 0);
+        std.debug.assert(
+            cache_count <= self.parallel_bpe_config.worker_cache_count,
+        );
+        var job = ParallelWorkerBpeCacheInitJob{
+            .tokenizer = self,
+            .cache_count = cache_count,
+        };
+        var group: std.Io.Group = .init;
+        errdefer group.cancel(io);
+        for (1..cache_count) |_| {
+            group.async(io, ParallelWorkerBpeCacheInitJob.run, .{&job});
+        }
+        try job.run();
+        try group.await(io);
+        return job.ready_count.load(.acquire) == cache_count;
+    }
 
     const ParallelBpeJob = struct {
         tokenizer: *HfTokenizer,
@@ -2886,6 +3009,18 @@ pub const HfTokenizer = struct {
             stable_offsets_eligible and !reuse_stable_added_offsets;
         var build_stable_boundaries =
             stable_boundaries_eligible and !reuse_stable_boundaries;
+        if (build_stable_boundaries) {
+            // The index only accelerates the private-cache scanner. Establish
+            // every required table first, in parallel, so a constrained shared
+            // resource budget cannot admit a corpus-sized index and then deny
+            // the caches needed to consume it. Tables remain useful if index
+            // admission subsequently fails.
+            build_stable_boundaries =
+                try self.prepareWorkerBpeCachesForStableIndex(
+                    io,
+                    active_runners,
+                );
+        }
         if (build_stable_boundaries) {
             var additional_bytes: usize = 0;
             for (workers) |worker| {
@@ -5123,22 +5258,30 @@ pub const HfTokenizer = struct {
         var worker_token_arena_ids: usize = 0;
         var worker_superpage_tables: usize = 0;
         for (@constCast(&self.worker_bpe_caches)) |*lease| {
-            while (!lease.mutex.tryLock()) std.atomic.spinLoopHint();
-            if (lease.cache) |cache| {
-                worker_tables += 1;
-                worker_entries += cache.count;
-                worker_min_entries =
-                    @min(worker_min_entries, cache.count);
-                worker_max_entries =
-                    @max(worker_max_entries, cache.count);
-                worker_slots += cache.entries.len;
-                worker_bytes += cache.accounted_bytes;
-                worker_token_arena_ids += cache.token_arena.items.len;
-                if (cache.storage == .darwin_superpage) {
-                    worker_superpage_tables += 1;
-                }
-            }
-            lease.mutex.unlock();
+            // A consumer owns its lease for an entire encode. Metrics must
+            // never spin behind that potentially multi-second critical
+            // section: use an exact snapshot when immediately available and
+            // the last atomically published snapshot otherwise.
+            const snapshot = if (lease.mutex.tryLock()) blk: {
+                const exact = if (lease.cache) |*cache|
+                    WorkerBpeCachePublishedStats.fromCache(cache)
+                else
+                    WorkerBpeCachePublishedStats{};
+                lease.publishStats();
+                lease.mutex.unlock();
+                break :blk exact;
+            } else lease.loadPublishedStats();
+            if (!snapshot.present) continue;
+            worker_tables += 1;
+            worker_entries += snapshot.entries;
+            worker_min_entries =
+                @min(worker_min_entries, snapshot.entries);
+            worker_max_entries =
+                @max(worker_max_entries, snapshot.entries);
+            worker_slots += snapshot.slots;
+            worker_bytes += snapshot.bytes;
+            worker_token_arena_ids += snapshot.token_arena_ids;
+            if (snapshot.superpage) worker_superpage_tables += 1;
         }
         if (worker_tables == 0) worker_min_entries = 0;
         const workspace_mutex = @constCast(&self.parallel_workspace_mutex);
@@ -8935,6 +9078,166 @@ test "worker BPE caches retry transient resource-budget denial" {
     try std.testing.expectEqual(@as(usize, 4), tok.bpeCacheStats().worker_tables);
     tok.deinitSelf();
     try std.testing.expectEqual(@as(usize, 0), budget.used.load(.acquire));
+}
+
+test "stable boundary index yields resource priority to worker caches" {
+    const allocator = std.heap.c_allocator;
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 1, "b": 2, "c": 3, "ab": 4, "abc": 5, "Ġ": 6},
+        \\    "merges": ["a b", "ab c"]
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
+        \\}
+    ;
+    const table_slots = 1024;
+    const table_bytes =
+        table_slots * @sizeOf(HfTokenizer.WorkerBpeCacheEntry);
+    const table_count = 4;
+    const Budget = struct {
+        limit: usize,
+        used: std.atomic.Value(usize) = .init(0),
+        denials: std.atomic.Value(usize) = .init(0),
+
+        fn tryReserve(context: *anyopaque, bytes: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            var used = self.used.load(.acquire);
+            while (used <= self.limit and bytes <= self.limit - used) {
+                used = self.used.cmpxchgWeak(
+                    used,
+                    used + bytes,
+                    .acq_rel,
+                    .acquire,
+                ) orelse return true;
+            }
+            _ = self.denials.fetchAdd(1, .monotonic);
+            return false;
+        }
+
+        fn release(context: *anyopaque, bytes: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const previous = self.used.fetchSub(bytes, .acq_rel);
+            std.debug.assert(previous >= bytes);
+        }
+    };
+
+    var budget = Budget{ .limit = table_count * table_bytes };
+    const tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    errdefer tok.deinitSelf();
+    try tok.configureBpeCache(.{
+        .max_bytes = 0,
+        .resource_budget = .{
+            .context = &budget,
+            .try_reserve = Budget.tryReserve,
+            .release = Budget.release,
+        },
+    });
+    try tok.configureParallelBpe(.{
+        .worker_cache_count = table_count,
+        .worker_cache_slots = table_slots,
+        .retain_stable_pretoken_boundaries = true,
+        .max_retained_workspace_bytes = 0,
+    });
+
+    var text = std.ArrayListUnmanaged(u8).empty;
+    defer text.deinit(allocator);
+    for (0..70_000) |_| try text.appendSlice(allocator, "abc ");
+    var ids = std.ArrayListUnmanaged(i32).empty;
+    defer ids.deinit(allocator);
+    try tok.tokenizer().encodeIntoParallelStable(
+        std.testing.io,
+        allocator,
+        text.items,
+        &ids,
+        table_count,
+        17,
+    );
+
+    const stats = tok.bpeCacheStats();
+    try std.testing.expectEqual(@as(usize, table_count), stats.worker_tables);
+    try std.testing.expectEqual(@as(usize, 0), stats.stable_boundary_words);
+    try std.testing.expect(budget.denials.load(.acquire) > 0);
+    try std.testing.expectEqual(
+        @as(usize, table_count * table_bytes),
+        budget.used.load(.acquire),
+    );
+
+    tok.deinitSelf();
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.acquire));
+}
+
+test "worker cache statistics never wait for an active lease" {
+    const allocator = std.heap.c_allocator;
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 1},
+        \\    "merges": []
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel"}
+        \\}
+    ;
+    const tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer tok.deinitSelf();
+    try tok.configureParallelBpe(.{
+        .worker_cache_count = 1,
+        .worker_cache_slots = 1024,
+    });
+
+    const initialized = tok.acquireWorkerBpeCacheAt(0);
+    try std.testing.expect(initialized != null);
+    HfTokenizer.releaseWorkerBpeCache(initialized);
+
+    const lease = &tok.worker_bpe_caches[0];
+    try std.testing.expect(lease.mutex.tryLock());
+    defer lease.mutex.unlock();
+    const stats = tok.bpeCacheStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.worker_tables);
+    try std.testing.expectEqual(@as(usize, 1024), stats.worker_slots);
+}
+
+test "packed worker BPE values preserve token lane order" {
+    const token_ids = [_]i32{ 7, 513, 65_534 };
+    const packed_value = HfTokenizer.packWorkerBpeValue(&token_ids).?;
+    const lanes = HfTokenizer.workerBpeValueLanes(packed_value);
+    try std.testing.expectEqual(@as(u16, 7), lanes[0]);
+    try std.testing.expectEqual(@as(u16, 513), lanes[1]);
+    try std.testing.expectEqual(@as(u16, 65_534), lanes[2]);
+    try std.testing.expectEqual(
+        @as(u16, HfTokenizer.worker_bpe_inline_sentinel),
+        lanes[3],
+    );
+
+    var output_u16: [4]u16 = undefined;
+    var output_u16_len: usize = 0;
+    HfTokenizer.writeWorkerBpeValueU16(
+        &output_u16,
+        &output_u16_len,
+        packed_value,
+    );
+    try std.testing.expectEqual(@as(usize, token_ids.len), output_u16_len);
+    try std.testing.expectEqualSlices(
+        u16,
+        &[_]u16{ 7, 513, 65_534 },
+        output_u16[0..output_u16_len],
+    );
+
+    var output_i32: [4]i32 = undefined;
+    var output_i32_len: usize = 0;
+    HfTokenizer.writeWorkerBpeValue(
+        &output_i32,
+        &output_i32_len,
+        packed_value,
+    );
+    try std.testing.expectEqual(@as(usize, token_ids.len), output_i32_len);
+    try std.testing.expectEqualSlices(
+        i32,
+        &token_ids,
+        output_i32[0..output_i32_len],
+    );
 }
 
 test "worker BPE cache retains spilled token sequences" {
