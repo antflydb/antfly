@@ -601,7 +601,7 @@ fn refineGgufCompatibility(
     base: CompatibilitySummary,
 ) !CompatibilitySummary {
     if (man.gguf_path == null or base.level == .incompatible) return base;
-    var maybe_report = try session_factory.inspectGgufModel(allocator, model_path);
+    var maybe_report = try session_factory.inspectGgufModelForListing(allocator, model_path, man.*);
     if (maybe_report) |*report| {
         defer report.deinit();
         if (report.unsupported_tensor_types.len > 0) {
@@ -1325,7 +1325,7 @@ pub const Node = struct {
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const prompt_tokens = try countPromptTokens(allocator, model, messages);
-        const resource_estimate = runtime.tier.memory.estimateGptGeneration(
+        const resource_estimate = try runtime.tier.memory.estimateGptGeneration(
             backend_kind,
             kv_dtype,
             gpt_config,
@@ -3087,15 +3087,6 @@ pub const Node = struct {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
         else
             session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
-        const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
-            .native => .cpu,
-            .metal, .cuda => .gpu,
-        };
-        const budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
-            model.session,
-            runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
-        ));
-        var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const admission_prefill_chunk = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else 256;
         const resource_estimate = runtime.tier.memory.estimateGptGeneration(
             backend_kind,
@@ -3104,32 +3095,25 @@ pub const Node = struct {
             prompt_tokens,
             @intCast(@max(config.max_tokens, 1)),
             admission_prefill_chunk,
-        );
-        run_budget.reserveEstimate(resource_estimate) catch |err| {
-            if (err == error.MemoryBudgetExceeded) {
-                return ctx.status(400).json(.{
-                    .@"error" = "MODEL_RESOURCE_LIMIT",
-                    .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
-                });
-            }
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-        };
-        var admission_lease = self.model_manager.acquireRunResources(budget_limits, resource_estimate) catch |err| switch (err) {
+        ) catch |err| switch (err) {
+            error.InvalidModelConfig => return ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "model contains invalid generation dimensions",
+            }),
             error.ResourceLimitExceeded => return ctx.status(400).json(.{
                 .@"error" = "MODEL_RESOURCE_LIMIT",
-                .message = "request exceeds the configured inference resource budget",
-            }),
-            error.ResourceTemporarilyUnavailable => return ctx.status(503).json(.{
-                .@"error" = "MODEL_RESOURCE_BUSY",
-                .message = "insufficient inference capacity is currently available",
+                .message = "request resource estimate exceeds addressable memory",
             }),
         };
-        defer admission_lease.release();
 
         const tok = model.getTokenizer();
         var draft_cb: ?ops.ComputeBackend = null;
         defer if (draft_cb) |*cb_value| cb_value.deinit();
         var draft_gpt_config: ?@import("../models/gpt.zig").Config = null;
+        var draft_model_for_generation: ?*model_manager_mod.LoadedModel = null;
+        var draft_backend_kind: ?runtime.kv.pool.BackendKind = null;
+        var draft_kv_dtype: ?runtime.kv.pool.KvDType = null;
+        var draft_resource_estimate: ?runtime.tier.memory.Estimate = null;
         var pjrt_client: ?pjrt_lib.pjrt.Client = null;
         defer if (pjrt_client) |*client| client.deinit();
         var pjrt_plugin_path: ?[:0]u8 = null;
@@ -3191,18 +3175,110 @@ pub const Node = struct {
                         });
                     }
 
-                    draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
-                        if (err == error.MemoryBudgetExceeded) {
-                            return ctx.status(400).json(.{
-                                .@"error" = "MODEL_RESOURCE_LIMIT",
-                                .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
-                            });
-                        }
-                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                    const actual_draft_backend: runtime.kv.pool.BackendKind = switch (draft_model.session.backend()) {
+                        .native => .native,
+                        .metal => .metal,
+                        .cuda => .cuda,
+                        .pjrt, .onnx, .wasm => return ctx.status(400).json(.{
+                            .@"error" = "INVALID_MODEL",
+                            .message = "draft_model does not use a supported generation backend",
+                        }),
                     };
+                    const actual_draft_kv_dtype = session_factory.recommendedKvDTypeForSession(
+                        draft_model.session,
+                        actual_draft_backend,
+                    );
+                    draft_resource_estimate = runtime.tier.memory.estimateGptGeneration(
+                        actual_draft_backend,
+                        actual_draft_kv_dtype,
+                        draft_cfg,
+                        prompt_tokens,
+                        @intCast(@max(config.max_tokens, 1)),
+                        admission_prefill_chunk,
+                    ) catch |err| switch (err) {
+                        error.InvalidModelConfig => return ctx.status(400).json(.{
+                            .@"error" = "INVALID_MODEL",
+                            .message = "draft_model contains invalid generation dimensions",
+                        }),
+                        error.ResourceLimitExceeded => return ctx.status(400).json(.{
+                            .@"error" = "MODEL_RESOURCE_LIMIT",
+                            .message = "draft_model resource estimate exceeds addressable memory",
+                        }),
+                    };
+                    draft_model_for_generation = draft_model;
+                    draft_backend_kind = actual_draft_backend;
+                    draft_kv_dtype = actual_draft_kv_dtype;
                     draft_gpt_config = draft_cfg;
                 }
             }
+        }
+
+        const budget_backend_class: runtime.tier.memory.BackendClass =
+            if (backend_kind != .native or (draft_backend_kind != null and draft_backend_kind.? != .native))
+                .gpu
+            else
+                .cpu;
+        var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
+        budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
+        if (draft_model_for_generation) |draft_model| {
+            budget_limits = session_factory.widenBudgetLimitsForSession(draft_model.session, budget_limits);
+        }
+        budget_limits = self.config.generation_budget_overrides.apply(budget_limits);
+        var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+        run_budget.reserveEstimate(resource_estimate) catch |err| {
+            if (err == error.MemoryBudgetExceeded) {
+                return ctx.status(400).json(.{
+                    .@"error" = "MODEL_RESOURCE_LIMIT",
+                    .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
+                });
+            }
+            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+        };
+        if (draft_resource_estimate) |estimate| {
+            run_budget.reserveEstimate(estimate) catch |err| {
+                if (err == error.MemoryBudgetExceeded) {
+                    return ctx.status(400).json(.{
+                        .@"error" = "MODEL_RESOURCE_LIMIT",
+                        .message = memoryBudgetExceededMessage(
+                            ctx.allocator,
+                            draft_model_for_generation.?.session,
+                            &run_budget,
+                        ),
+                    });
+                }
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+            };
+        }
+        var estimates = [_]runtime.tier.memory.Estimate{ resource_estimate, undefined };
+        const estimate_count: usize = if (draft_resource_estimate) |estimate| blk: {
+            estimates[1] = estimate;
+            break :blk 2;
+        } else 1;
+        var admission_lease = self.model_manager.acquireRunResourceEstimates(
+            budget_limits,
+            estimates[0..estimate_count],
+        ) catch |err| switch (err) {
+            error.ResourceLimitExceeded => return ctx.status(400).json(.{
+                .@"error" = "MODEL_RESOURCE_LIMIT",
+                .message = "request exceeds the configured inference resource budget",
+            }),
+            error.ResourceTemporarilyUnavailable => return ctx.status(503).json(.{
+                .@"error" = "MODEL_RESOURCE_BUSY",
+                .message = "insufficient inference capacity is currently available",
+            }),
+        };
+        defer admission_lease.release();
+
+        if (draft_model_for_generation) |draft_model| {
+            draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
+                if (err == error.MemoryBudgetExceeded) {
+                    return ctx.status(400).json(.{
+                        .@"error" = "MODEL_RESOURCE_LIMIT",
+                        .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
+                    });
+                }
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+            };
         }
 
         var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
@@ -3306,10 +3382,6 @@ pub const Node = struct {
 
         if (draft_cb != null) {
             if (draft_gpt_config) |draft_cfg| {
-                // Draft model uses the same backend kind as the target — they run
-                // on the same machine so the available backends are identical.
-                const draft_backend_kind = backend_kind;
-                const draft_kv_dtype = session_factory.recommendedKvDTypeForGptConfig(draft_cfg, draft_backend_kind);
                 draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
                 const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
                     null
@@ -3318,12 +3390,12 @@ pub const Node = struct {
                 else
                     null;
                 const draft_pool_id = draft_kv_manager.?.addPool(.{
-                    .backend = draft_backend_kind,
-                    .dtype = draft_kv_dtype,
+                    .backend = draft_backend_kind.?,
+                    .dtype = draft_kv_dtype.?,
                     .page_size_tokens = 16,
                     .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
-                    .num_kv_heads = draft_cfg.num_key_value_heads,
-                    .head_dim = draft_cfg.hidden_size / draft_cfg.num_attention_heads,
+                    .num_kv_heads = draft_cfg.maxKvHeads(),
+                    .head_dim = draft_cfg.maxHeadDim(),
                     .sliding_window_size = draft_sliding_window_size,
                 }) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
@@ -3971,7 +4043,15 @@ pub const Node = struct {
                         prompt_tokens[pos],
                         @intCast(@max(configs[pos].max_tokens, 1)),
                         admission_prefill_chunk,
-                    );
+                    ) catch |err| {
+                        results[idx].@"error" = .{
+                            .code = if (err == error.InvalidModelConfig) "INVALID_MODEL" else "MODEL_RESOURCE_LIMIT",
+                            .message = @errorName(err),
+                            .retryable = false,
+                        };
+                        pending[idx] = false;
+                        continue;
+                    };
                     run_budget.reserveEstimate(resource_estimate) catch |err| {
                         results[idx].@"error" = .{ .code = "MODEL_RESOURCE_LIMIT", .message = @errorName(err), .retryable = false };
                         pending[idx] = false;

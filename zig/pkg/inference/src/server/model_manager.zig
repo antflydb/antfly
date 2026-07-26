@@ -1058,19 +1058,21 @@ pub const ModelManager = struct {
         limits: runtime.tier.memory.Limits,
         estimate: runtime.tier.memory.Estimate,
     ) !runtime.tier.memory.AdmissionLease {
-        const amounts: runtime.tier.memory.AdmissionAmounts = switch (estimate.kv_tier) {
-            .disk => .{},
-            .host => .{
-                .host_kv_bytes = estimate.kv_bytes,
-                .host_scratch_bytes = if (estimate.scratch_tier == .host) estimate.scratch_bytes else 0,
-                .backend_scratch_bytes = if (estimate.scratch_tier == .backend) estimate.scratch_bytes else 0,
-            },
-            .backend => .{
-                .backend_kv_bytes = estimate.kv_bytes,
-                .host_scratch_bytes = if (estimate.scratch_tier == .host) estimate.scratch_bytes else 0,
-                .backend_scratch_bytes = if (estimate.scratch_tier == .backend) estimate.scratch_bytes else 0,
-            },
-        };
+        return self.acquireRunResourceEstimates(limits, &.{estimate});
+    }
+
+    /// Atomically admits all transient resources for one execution. Speculative
+    /// generation must acquire target and draft KV/scratch together so concurrent
+    /// requests cannot each pass admission using only a partial estimate.
+    pub fn acquireRunResourceEstimates(
+        self: *ModelManager,
+        limits: runtime.tier.memory.Limits,
+        estimates: []const runtime.tier.memory.Estimate,
+    ) !runtime.tier.memory.AdmissionLease {
+        var amounts: runtime.tier.memory.AdmissionAmounts = .{};
+        for (estimates) |estimate| {
+            amounts = try amounts.merge(.fromEstimate(estimate));
+        }
         return self.admission.tryAcquire(limits, amounts, true);
     }
 
