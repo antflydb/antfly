@@ -2782,6 +2782,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
             .start_key = "doc:a",
             .end_key = null,
             .restore_backup_id = "snap1",
+            .restore_artifact_backup_id = "snap1",
             .restore_location = restore_location,
             .restore_snapshot_path = "snap1/groups/2001",
             .restore_connection = "test-backups",

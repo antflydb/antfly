@@ -17,7 +17,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_state = @import("state.zig");
 const metadata_table_manager = @import("table_manager.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_clock = @import("antfly_platform").clock;
 const transition_state = @import("transition_state.zig");
 
 pub const ReconcileSummary = struct {
@@ -502,8 +502,12 @@ test "metadata control loop installs service median key lookup for automatic spl
         }
     };
 
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(10 * std.time.ns_per_s);
+    const now_realtime_ms = manual_clock.clock().nowRealtimeMs();
     var loop = MetadataControlLoop.initWithConfig(std.testing.allocator, .{
         .max_shard_size_bytes = 100,
+        .clock = manual_clock.clock(),
     });
     defer loop.deinit();
 
@@ -527,7 +531,7 @@ test "metadata control loop installs service median key lookup for automatic spl
                     .doc_count = 200,
                     .disk_bytes = 200,
                     .empty = false,
-                    .updated_at_millis = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)),
+                    .updated_at_millis = now_realtime_ms,
                     .local_leader = true,
                 },
             })[0..]),

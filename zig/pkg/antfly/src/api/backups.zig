@@ -480,6 +480,7 @@ const RemoteBackupStore = struct {
     const BoundedReadOptions = struct {
         known_size: ?u64 = null,
         skip_metadata_probe: bool = false,
+        if_match_etag: ?[]const u8 = null,
     };
 
     alloc: std.mem.Allocator,
@@ -946,9 +947,11 @@ const RemoteBackupStore = struct {
             // authoritative for buffering even if provider metadata is stale.
             .range = .{ .offset = 0, .length = @intCast(max_bytes + 1) },
             .skip_metadata_probe = options.skip_metadata_probe,
+            .if_match_etag = options.if_match_etag,
             .max_response_bytes = max_bytes + 1,
         }) catch |err| switch (err) {
             error.ResponseTooLarge => return error.BackupManifestTooLarge,
+            error.PreconditionFailed => return error.SourceFileChanged,
             else => return err,
         };
         defer result.deinit(alloc);
@@ -3232,13 +3235,18 @@ const ParsedCurrentGoClusterBackupAttempt = struct {
 const CurrentGoAttemptRepositorySnapshot = struct {
     fingerprint: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @splat(0),
     marker_count: usize = 0,
-    total_bytes: usize = 0,
+    parsed_bytes: usize = 0,
     latest: ?ParsedCurrentGoClusterBackupAttempt = null,
 
     fn deinit(self: *@This()) void {
         if (self.latest) |*latest| latest.deinit();
         self.* = undefined;
     }
+};
+
+const CurrentGoAttemptScanMode = enum {
+    parse_markers,
+    identity_only,
 };
 
 fn parseFixedWidthDecimal(comptime T: type, text: []const u8) !T {
@@ -3478,27 +3486,15 @@ fn absorbCurrentGoAttemptMarker(
     attempt_id: []const u8,
     body: []const u8,
 ) !void {
-    if (snapshot.marker_count == current_go_backup_attempt_scan_limit)
+    const parsed_bytes = std.math.add(usize, snapshot.parsed_bytes, body.len) catch
         return error.BackupRepositoryHealthScanLimitExceeded;
-    const total_bytes = std.math.add(usize, snapshot.total_bytes, body.len) catch
-        return error.BackupRepositoryHealthScanLimitExceeded;
-    if (total_bytes > current_go_backup_attempt_total_bytes_limit)
+    if (parsed_bytes > current_go_backup_attempt_total_bytes_limit)
         return error.BackupRepositoryHealthScanLimitExceeded;
 
     var parsed = try parseCurrentGoClusterBackupAttempt(alloc, body, attempt_id);
     var parsed_owned = true;
     defer if (parsed_owned) parsed.deinit();
-
-    var leaf_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    leaf_hasher.update("antfly-current-go-attempt-snapshot-v1");
-    hashArtifactBytes(&leaf_hasher, attempt_id);
-    hashArtifactBytes(&leaf_hasher, body);
-    var leaf_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    leaf_hasher.final(&leaf_digest);
-    for (&snapshot.fingerprint, leaf_digest) |*aggregate, leaf|
-        aggregate.* ^= leaf;
-    snapshot.marker_count += 1;
-    snapshot.total_bytes = total_bytes;
+    snapshot.parsed_bytes = parsed_bytes;
 
     const replace_latest = if (snapshot.latest) |*latest| blk: {
         const timestamp_order = currentGoAttemptTimestampOrder(
@@ -3520,10 +3516,108 @@ fn absorbCurrentGoAttemptMarker(
     }
 }
 
+fn absorbCurrentGoAttemptIdentity(
+    snapshot: *CurrentGoAttemptRepositorySnapshot,
+    attempt_id: []const u8,
+    size: u64,
+    identity: []const u8,
+) !void {
+    if (snapshot.marker_count == current_go_backup_attempt_scan_limit)
+        return error.BackupRepositoryHealthScanLimitExceeded;
+    var leaf_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    leaf_hasher.update("antfly-current-go-attempt-identity-v1");
+    hashArtifactBytes(&leaf_hasher, attempt_id);
+    var encoded_size: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_size, size, .little);
+    leaf_hasher.update(&encoded_size);
+    hashArtifactBytes(&leaf_hasher, identity);
+    var leaf_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    leaf_hasher.final(&leaf_digest);
+    for (&snapshot.fingerprint, leaf_digest) |*aggregate, leaf|
+        aggregate.* ^= leaf;
+    snapshot.marker_count += 1;
+}
+
+const CurrentGoStableMarkerFile = struct {
+    body: ?[]u8,
+    stat: std.Io.File.Stat,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.body) |body| alloc.free(body);
+        self.* = undefined;
+    }
+};
+
+fn readCurrentGoStableMarkerFile(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    mode: CurrentGoAttemptScanMode,
+) !CurrentGoStableMarkerFile {
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const initial = try file.stat(io);
+    if (initial.kind != .file) return error.InvalidBackupRequest;
+    if (initial.size > max_backup_manifest_bytes)
+        return error.BackupManifestTooLarge;
+    const body = switch (mode) {
+        .identity_only => null,
+        .parse_markers => blk: {
+            var reader: std.Io.File.Reader = .initSize(file, io, &.{}, initial.size);
+            break :blk try reader.interface.allocRemaining(
+                alloc,
+                .limited(max_backup_manifest_bytes),
+            );
+        },
+    };
+    errdefer if (body) |bytes| alloc.free(bytes);
+    const final = try file.stat(io);
+    if (initial.inode != final.inode or
+        initial.size != final.size or
+        !std.meta.eql(initial.mtime, final.mtime) or
+        !std.meta.eql(initial.ctime, final.ctime))
+    {
+        return error.SourceFileChanged;
+    }
+    return .{ .body = body, .stat = final };
+}
+
+fn currentGoFileIdentity(
+    stat: std.Io.File.Stat,
+    buffer: *[@sizeOf(std.Io.File.INode) + 2 * @sizeOf(i128)]u8,
+) []const u8 {
+    var offset: usize = 0;
+    std.mem.writeInt(
+        std.Io.File.INode,
+        buffer[offset..][0..@sizeOf(std.Io.File.INode)],
+        stat.inode,
+        .little,
+    );
+    offset += @sizeOf(std.Io.File.INode);
+    std.mem.writeInt(
+        i128,
+        buffer[offset..][0..@sizeOf(i128)],
+        stat.mtime.toNanoseconds(),
+        .little,
+    );
+    offset += @sizeOf(i128);
+    std.mem.writeInt(
+        i128,
+        buffer[offset..][0..@sizeOf(i128)],
+        stat.ctime.toNanoseconds(),
+        .little,
+    );
+    return buffer;
+}
+
 fn scanCurrentGoAttemptRepository(
     alloc: std.mem.Allocator,
     io: std.Io,
     location: *BackupLocation,
+    mode: CurrentGoAttemptScanMode,
 ) !CurrentGoAttemptRepositorySnapshot {
     var snapshot: CurrentGoAttemptRepositorySnapshot = .{};
     errdefer snapshot.deinit();
@@ -3562,19 +3656,27 @@ fn scanCurrentGoAttemptRepository(
                     entry.name,
                 });
                 defer alloc.free(marker_path);
-                const body = try readFileAbsoluteAllocWithIo(
+                var marker = try readCurrentGoStableMarkerFile(
                     alloc,
                     io,
                     marker_path,
-                    max_backup_manifest_bytes,
+                    mode,
                 );
-                defer alloc.free(body);
-                try absorbCurrentGoAttemptMarker(
-                    alloc,
+                defer marker.deinit(alloc);
+                var identity_buffer: [@sizeOf(std.Io.File.INode) + 2 * @sizeOf(i128)]u8 = undefined;
+                try absorbCurrentGoAttemptIdentity(
                     &snapshot,
                     attempt_id,
-                    body,
+                    marker.stat.size,
+                    currentGoFileIdentity(marker.stat, &identity_buffer),
                 );
+                if (marker.body) |body|
+                    try absorbCurrentGoAttemptMarker(
+                        alloc,
+                        &snapshot,
+                        attempt_id,
+                        body,
+                    );
             }
         },
         .remote => |*store| {
@@ -3631,23 +3733,34 @@ fn scanCurrentGoAttemptRepository(
                     if (!std.mem.endsWith(u8, name, ".json")) continue;
                     const attempt_id = name[0 .. name.len - ".json".len];
                     try validateBackupId(attempt_id);
-                    const body = try store.readKeyBytesAllocLimited(
-                        alloc,
-                        entry.key,
-                        max_backup_manifest_bytes,
-                        .{
-                            .known_size = entry.size,
-                            .skip_metadata_probe = true,
-                        },
-                    );
-                    defer alloc.free(body);
-                    if (body.len != entry.size) return error.SourceFileChanged;
-                    try absorbCurrentGoAttemptMarker(
-                        alloc,
+                    const etag = entry.etag orelse
+                        return error.BackupReservationIdentityUnavailable;
+                    try absorbCurrentGoAttemptIdentity(
                         &snapshot,
                         attempt_id,
-                        body,
+                        entry.size,
+                        etag,
                     );
+                    if (mode == .parse_markers) {
+                        const body = try store.readKeyBytesAllocLimited(
+                            alloc,
+                            entry.key,
+                            max_backup_manifest_bytes,
+                            .{
+                                .known_size = entry.size,
+                                .skip_metadata_probe = true,
+                                .if_match_etag = etag,
+                            },
+                        );
+                        defer alloc.free(body);
+                        if (body.len != entry.size) return error.SourceFileChanged;
+                        try absorbCurrentGoAttemptMarker(
+                            alloc,
+                            &snapshot,
+                            attempt_id,
+                            body,
+                        );
+                    }
                 }
 
                 if (continuation_token != null and next_token != null and
@@ -3670,18 +3783,9 @@ fn currentGoAttemptSnapshotsEqual(
     rhs: *const CurrentGoAttemptRepositorySnapshot,
 ) bool {
     if (lhs.marker_count != rhs.marker_count or
-        lhs.total_bytes != rhs.total_bytes or
         !std.mem.eql(u8, &lhs.fingerprint, &rhs.fingerprint))
     {
         return false;
-    }
-    if ((lhs.latest == null) != (rhs.latest == null)) return false;
-    if (lhs.latest) |latest| {
-        return std.mem.eql(
-            u8,
-            latest.parsed.value.attempt_id,
-            rhs.latest.?.parsed.value.attempt_id,
-        );
     }
     return true;
 }
@@ -5451,12 +5555,10 @@ fn ensureClusterBackupAttemptHeadRestorable(
                 return error.IncompleteClusterBackup;
         }
     }
-    // Repository health includes the immutable bytes referenced by the newest
-    // Zig aggregate, not only its metadata shape. Verification is streaming
-    // and memory-bounded; it detects missing, truncated, same-size corrupt, or
-    // concurrently replaced artifacts before historical selection can mask a
-    // damaged authoritative attempt.
-    try verifyClusterBackupArtifactsIntegrityAtLocation(
+    // Prove that every newest-attempt artifact is present and has its declared
+    // size without downloading unrelated payloads. The exact selected backup
+    // is still cryptographically verified immediately before publication.
+    try validateClusterBackupArtifactsAtLocation(
         alloc,
         io,
         location,
@@ -5578,7 +5680,12 @@ fn readCurrentGoManifestForRestoreAdmission(
     location: *BackupLocation,
     backup_id: []const u8,
 ) !ClusterBackupManifest {
-    var before = try scanCurrentGoAttemptRepository(alloc, io, location);
+    var before = try scanCurrentGoAttemptRepository(
+        alloc,
+        io,
+        location,
+        .parse_markers,
+    );
     defer before.deinit();
     const newest = if (before.latest) |*latest|
         &latest.parsed.value
@@ -5617,7 +5724,15 @@ fn readCurrentGoManifestForRestoreAdmission(
     if (decoded.encoding != .go_portable_v2)
         return error.IncompleteClusterBackup;
 
-    var after = try scanCurrentGoAttemptRepository(alloc, io, location);
+    // Attempt markers are immutable. Re-listing their storage identities
+    // proves the parsed snapshot stayed stable without downloading every
+    // marker body a second time.
+    var after = try scanCurrentGoAttemptRepository(
+        alloc,
+        io,
+        location,
+        .identity_only,
+    );
     defer after.deinit();
     var final_head = try readClusterBackupAttemptHead(alloc, io, location);
     defer if (final_head) |*head| head.deinit();
@@ -8825,7 +8940,7 @@ test "attempt head generation detects publication and retirement ABA" {
     try std.testing.expectEqual(ClusterBackupAttemptState.committed, committed.value.state);
 }
 
-test "newest attempt admission verifies exact artifact integrity" {
+test "newest attempt admission is metadata bounded and exact integrity detects corruption" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -8867,12 +8982,18 @@ test "newest attempt admission verifies exact artifact integrity" {
     defer alloc.free(artifact_path);
     try writeFileAbsolute(artifact_path, "PAYLOAD");
 
+    try ensureNewestClusterBackupAttemptRestorable(
+        alloc,
+        io,
+        &location,
+    );
     try std.testing.expectError(
         error.BackupArtifactIntegrityMismatch,
-        ensureNewestClusterBackupAttemptRestorable(
+        verifyClusterBackupArtifactsIntegrityAtLocation(
             alloc,
             io,
             &location,
+            &committed,
         ),
     );
 
@@ -10325,13 +10446,26 @@ test "current Go filesystem attempt snapshots detect repository changes" {
         .file = try alloc.dupe(u8, backup_root),
     };
     defer location.deinit(alloc);
-    var before = try scanCurrentGoAttemptRepository(alloc, io, &location);
+    var before = try scanCurrentGoAttemptRepository(
+        alloc,
+        io,
+        &location,
+        .parse_markers,
+    );
     defer before.deinit();
     try std.testing.expectEqual(@as(usize, 1), before.marker_count);
     try std.testing.expectEqualStrings(
         "afba-first",
         before.latest.?.parsed.value.attempt_id,
     );
+    var stable = try scanCurrentGoAttemptRepository(
+        alloc,
+        io,
+        &location,
+        .identity_only,
+    );
+    defer stable.deinit();
+    try std.testing.expect(currentGoAttemptSnapshotsEqual(&before, &stable));
 
     const second_marker = try std.fmt.allocPrint(
         alloc,
@@ -10343,43 +10477,46 @@ test "current Go filesystem attempt snapshots detect repository changes" {
         second_marker,
         "{\"version\":1,\"attempt_id\":\"afba-second\",\"backup_id\":\"go-second\",\"created_at\":\"2026-07-25T12:00:01Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"events\"],\"metadata_ids\":[\"table-259f93136a109153d3193dca4409ca22ca1088f68c9821342eee129373b101c5\"],\"artifact_names\":[\"go-second-1.afb\"]}",
     );
-    var after = try scanCurrentGoAttemptRepository(alloc, io, &location);
+    var after = try scanCurrentGoAttemptRepository(
+        alloc,
+        io,
+        &location,
+        .identity_only,
+    );
     defer after.deinit();
     try std.testing.expect(!currentGoAttemptSnapshotsEqual(&before, &after));
-    try std.testing.expectEqualStrings(
-        "afba-second",
-        after.latest.?.parsed.value.attempt_id,
-    );
+    try std.testing.expectEqual(@as(usize, 2), after.marker_count);
 }
 
-test "current Go attempt snapshot budgets fail closed" {
-    const alloc = std.testing.allocator;
-    const marker =
-        "{\"version\":1,\"attempt_id\":\"afba-budget\",\"backup_id\":\"go-budget\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-85ebc63c34b2947dfb825fd107b98a347971125de92cb3893a95333d6ada7cbd\"],\"artifact_names\":[\"go-budget-1.afb\"]}";
-
+test "current Go attempt snapshot marker-count budget fails closed" {
     var count_exhausted: CurrentGoAttemptRepositorySnapshot = .{
         .marker_count = current_go_backup_attempt_scan_limit,
     };
     defer count_exhausted.deinit();
     try std.testing.expectError(
         error.BackupRepositoryHealthScanLimitExceeded,
-        absorbCurrentGoAttemptMarker(
-            alloc,
+        absorbCurrentGoAttemptIdentity(
             &count_exhausted,
             "afba-budget",
-            marker,
+            1024,
+            "\"etag\"",
         ),
     );
+}
 
-    var bytes_exhausted: CurrentGoAttemptRepositorySnapshot = .{
-        .total_bytes = current_go_backup_attempt_total_bytes_limit,
+test "current Go attempt snapshot parsed-byte budget fails closed" {
+    const alloc = std.testing.allocator;
+    const marker =
+        "{\"version\":1,\"attempt_id\":\"afba-budget\",\"backup_id\":\"go-budget\",\"created_at\":\"2026-07-25T12:00:00Z\",\"format\":\"portable\",\"expected_table_count\":1,\"table_names\":[\"docs\"],\"metadata_ids\":[\"table-85ebc63c34b2947dfb825fd107b98a347971125de92cb3893a95333d6ada7cbd\"],\"artifact_names\":[\"go-budget-1.afb\"]}";
+    var snapshot: CurrentGoAttemptRepositorySnapshot = .{
+        .parsed_bytes = current_go_backup_attempt_total_bytes_limit,
     };
-    defer bytes_exhausted.deinit();
+    defer snapshot.deinit();
     try std.testing.expectError(
         error.BackupRepositoryHealthScanLimitExceeded,
         absorbCurrentGoAttemptMarker(
             alloc,
-            &bytes_exhausted,
+            &snapshot,
             "afba-budget",
             marker,
         ),

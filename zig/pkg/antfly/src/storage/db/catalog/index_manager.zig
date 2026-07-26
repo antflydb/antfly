@@ -23076,6 +23076,11 @@ test "best effort force compact resumes after modeled reopen under relaxed press
 
     var modeled_device = storage_sim.ModeledDevice.init(alloc);
     defer modeled_device.deinit();
+    const modeled_storage = modeled_device.storage();
+    // The backing store's mount root predates the index lifecycle. Model that
+    // external durability boundary so this test isolates index-owned paths.
+    try modeled_storage.createDirPath(".zig-cache/tmp");
+    try modeled_storage.syncParentAbsolute(".zig-cache/tmp");
 
     var pressured_budgets = resource_manager_mod.Options.defaultBudgets();
     pressured_budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
@@ -23097,7 +23102,7 @@ test "best effort force compact resumes after modeled reopen under relaxed press
 
     const backend_options = db_config.IndexBackendOptions{
         .text_main_backend = .lsm,
-        .text_lsm_storage = modeled_device.storage(),
+        .text_lsm_storage = modeled_storage,
         .resource_manager = &pressured_manager,
     };
 
@@ -23154,7 +23159,7 @@ test "best effort force compact resumes after modeled reopen under relaxed press
     var relaxed_manager = resource_manager_mod.ResourceManager.init(.{});
     const reopen_backend_options = db_config.IndexBackendOptions{
         .text_main_backend = .lsm,
-        .text_lsm_storage = modeled_device.storage(),
+        .text_lsm_storage = modeled_storage,
         .resource_manager = &relaxed_manager,
     };
 

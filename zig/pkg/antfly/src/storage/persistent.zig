@@ -268,7 +268,14 @@ const SegmentFileStore = struct {
         errdefer allocator.free(owned_root);
 
         if (storage) |provided| {
-            if (create_if_missing) try provided.createDirPath(owned_root);
+            if (create_if_missing) {
+                try provided.createDirPath(owned_root);
+                // Segment publication fsyncs each immutable file and its
+                // containing directory. Publish the directory entry itself
+                // first so those acknowledged files remain reachable after a
+                // crash that follows initial index creation.
+                try provided.syncParentAbsolute(owned_root);
+            }
             return .{
                 .allocator = allocator,
                 .root_dir = owned_root,
@@ -280,7 +287,10 @@ const SegmentFileStore = struct {
         errdefer allocator.destroy(owner);
         owner.* = try storage_io.NativeStorage.init(allocator, io_runtime);
         errdefer owner.deinit();
-        if (create_if_missing) try owner.storage().createDirPath(owned_root);
+        if (create_if_missing) {
+            try owner.storage().createDirPath(owned_root);
+            try owner.storage().syncParentAbsolute(owned_root);
+        }
 
         return .{
             .allocator = allocator,
