@@ -50,24 +50,28 @@ zig build -Doptimize=ReleaseFast bench-tokenizer -- \
 
 Use `--warmup 0 --iterations 1` for a cold first pass. `--threads N` runs
 concurrent `std.Io` tasks against the same tokenizer and cache. The benchmark
-reports the token count, legacy FNV hash, and complete BLAKE3. After the timed
-interval, it builds
-an independent serial reference with a fresh, cache-disabled tokenizer and
-compares the final complete sequence retained by every timed worker
-byte-for-byte. It then releases those buffers, repeats the requested external
-and internal concurrency against the measured tokenizer, and compares every
-replay sequence byte-for-byte. This validation is outside the measured
-interval, so concurrency correctness cannot be hidden by a same-length
-corruption and does not reduce the reported throughput.
+reports the token count, legacy FNV hash, and complete BLAKE3. Each requested
+iteration is timed as a separate concurrent batch. Immediately after that
+batch, and outside its wall and CPU timers, the benchmark hashes the complete
+output of every worker before the buffers can be reused by the next iteration.
+After all timed batches, it builds an independent serial reference with a
+fresh, cache-disabled tokenizer and verifies every timed digest and token
+count. In the default exact mode it also compares the final complete sequence
+retained by every timed worker byte-for-byte, releases those buffers, repeats
+the requested external and internal concurrency against the measured
+tokenizer, and compares every replay sequence byte-for-byte. Concurrency
+correctness therefore cannot be hidden by a same-length corruption or by an
+incorrect earlier iteration, and validation does not reduce the reported
+throughput.
 
-For multi-gigabyte corpora, `--validation hash` computes BLAKE3 over the final
-complete output retained by every timed worker, releases those outputs, builds
-the independent serial cache-disabled reference, and compares both the digest
-and token count. This avoids retaining the reference and multiple
-multi-gigabyte outputs simultaneously. Normal regression fixtures retain the
-default `--validation exact`, including byte-for-byte final timed and replay
-comparisons. Warmup and diagnostic outputs are released before the timed run
-in both modes.
+For multi-gigabyte corpora, `--validation hash` retains only the current
+iteration's outputs, records their complete BLAKE3 digests and token counts,
+then releases the final outputs before building the independent serial
+cache-disabled reference. This avoids retaining the reference and multiple
+multi-gigabyte outputs simultaneously while still validating every measured
+encode. Normal regression fixtures retain the default `--validation exact`,
+including byte-for-byte final timed and replay comparisons. Warmup and
+diagnostic outputs are released before the timed run in both modes.
 
 `--mmap-corpus --prefault-corpus` avoids a second 11.9 GB input copy while
 touching every mapped page before the timer. Gigatoken reads the complete file
@@ -633,9 +637,12 @@ consume about 1 GiB. `ParallelBpeConfig` controls the number and size of
 persistent worker-local tables. Tables are acquired by a `std.Io` consumer for
 the duration of its pull loop, survive across encode calls, and are independent
 of OS-thread identity. Lazy table creation happens in parallel and every byte
-is reserved through the tokenizer's `BpeCacheResourceBudget`; denial or
-allocation failure falls back to the bounded shared cache without affecting
-correctness.
+is reserved through the tokenizer's `BpeCacheResourceBudget`. A transient
+resource-manager denial falls back to the bounded shared cache for that
+acquisition and retries with a bounded exponential backoff of up to 64
+acquisition opportunities. Arithmetic overflow or an admitted allocator
+failure is terminal for that lease, preventing repeated large allocations
+under genuine memory exhaustion. Neither path affects correctness.
 
 Short keys of 3--15 bytes use the private inline table. One- and two-byte
 vocabulary hits retain direct-address tables. The entry value is the final four
@@ -726,11 +733,20 @@ capacity. The standalone adapter maps it to the ResourceManager's
 rather than retained cache, so the benchmark reports both logical output bytes
 and reserved capacity explicitly.
 
+Workspace observability is safe during active encodes: each worker publishes
+atomic retained-memory, output, stable-index, timing, and cache-owner snapshots
+at chunk boundaries. `bpeCacheStats` reads those snapshots for active
+workspaces and reads cached workspaces directly while holding the workspace
+list mutex. This keeps metrics race-free without putting locks or atomics in
+the scanner, cache-probe, or BPE inner loops.
+
 Focused denial tests reject every optional reservation, verify that no private
 table is retained, compare packed segmented output with the serial i32 result,
 and confirm that all workspace and tokenizer bytes are released at teardown.
-Denial therefore changes only speed and retention, never tokenization success
-or output.
+An additional transient-denial test verifies that private worker tables become
+available after pressure subsides and that their reservations are released at
+teardown. Denial therefore changes only speed and retention, never tokenization
+success or output.
 
 ### Accepted and rejected residual experiments
 

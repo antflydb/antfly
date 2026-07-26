@@ -198,7 +198,9 @@ pub const HfTokenizer = struct {
     const WorkerBpeCacheLease = struct {
         mutex: std.atomic.Mutex = .unlocked,
         cache: ?WorkerBpeCache = null,
-        allocation_attempted: bool = false,
+        allocation_failed: bool = false,
+        reservation_denials: u8 = 0,
+        reservation_retry_after: u8 = 0,
     };
 
     const worker_bpe_superpage_bytes = 2 * 1024 * 1024;
@@ -1705,40 +1707,60 @@ pub const HfTokenizer = struct {
         self: *HfTokenizer,
         lease: *WorkerBpeCacheLease,
     ) bool {
-        if (lease.cache == null and !lease.allocation_attempted) {
-            lease.allocation_attempted = true;
-            const slot_count = self.parallel_bpe_config.worker_cache_slots;
-            const bytes = std.math.mul(
-                usize,
-                slot_count,
-                @sizeOf(WorkerBpeCacheEntry),
-            ) catch return false;
-            var reserved = false;
-            if (self.cache_resource_budget) |budget| {
-                if (!budget.try_reserve(budget.context, bytes)) {
-                    return false;
-                }
-                reserved = true;
-            }
-            const allocation = self.allocateWorkerBpeCacheEntries(
-                slot_count,
-                bytes,
-            ) catch {
-                if (reserved) {
-                    const budget = self.cache_resource_budget.?;
-                    budget.release(budget.context, bytes);
-                }
-                return false;
-            };
-            @memset(allocation.entries, .{});
-            lease.cache = .{
-                .entries = allocation.entries,
-                .accounted_bytes = bytes,
-                .storage = allocation.storage,
-            };
-            self.seedWorkerBpeCache(&lease.cache.?);
+        if (lease.cache != null) return true;
+        if (lease.allocation_failed) return false;
+        if (lease.reservation_retry_after != 0) {
+            lease.reservation_retry_after -= 1;
+            return false;
         }
-        return lease.cache != null;
+
+        const slot_count = self.parallel_bpe_config.worker_cache_slots;
+        const bytes = std.math.mul(
+            usize,
+            slot_count,
+            @sizeOf(WorkerBpeCacheEntry),
+        ) catch {
+            lease.allocation_failed = true;
+            return false;
+        };
+        var reserved = false;
+        if (self.cache_resource_budget) |budget| {
+            if (!budget.try_reserve(budget.context, bytes)) {
+                lease.reservation_denials +|= 1;
+                const shift: u3 = @intCast(@min(
+                    lease.reservation_denials - 1,
+                    6,
+                ));
+                lease.reservation_retry_after =
+                    @as(u8, 1) << shift;
+                return false;
+            }
+            reserved = true;
+        }
+        lease.reservation_denials = 0;
+        lease.reservation_retry_after = 0;
+        const allocation = self.allocateWorkerBpeCacheEntries(
+            slot_count,
+            bytes,
+        ) catch {
+            if (reserved) {
+                const budget = self.cache_resource_budget.?;
+                budget.release(budget.context, bytes);
+            }
+            // Repeated multi-megabyte allocator attempts under OOM can amplify
+            // pressure. Resource-budget denials above remain retryable, while
+            // an admitted allocation failure is terminal for this lease.
+            lease.allocation_failed = true;
+            return false;
+        };
+        @memset(allocation.entries, .{});
+        lease.cache = .{
+            .entries = allocation.entries,
+            .accounted_bytes = bytes,
+            .storage = allocation.storage,
+        };
+        self.seedWorkerBpeCache(&lease.cache.?);
+        return true;
     }
 
     fn acquireWorkerBpeCacheAt(
@@ -1774,6 +1796,70 @@ pub const HfTokenizer = struct {
         cache_owner: u8 = invalid_worker_cache_owner,
         reuse_added_token_offsets: bool = false,
         reuse_pretoken_boundaries: bool = false,
+        published_retained_bytes: std.atomic.Value(usize) = .init(0),
+        published_output_bytes: std.atomic.Value(usize) = .init(0),
+        published_output_capacity_bytes: std.atomic.Value(usize) = .init(0),
+        published_stable_offset_count: std.atomic.Value(usize) = .init(0),
+        published_stable_offset_bytes: std.atomic.Value(usize) = .init(0),
+        published_stable_boundary_words: std.atomic.Value(usize) = .init(0),
+        published_stable_boundary_bytes: std.atomic.Value(usize) = .init(0),
+        published_text_bytes: std.atomic.Value(usize) = .init(0),
+        published_elapsed_ns: std.atomic.Value(u64) = .init(0),
+        published_cache_owner: std.atomic.Value(usize) =
+            .init(invalid_worker_cache_owner),
+
+        fn retainedBytes(self: *const ParallelBpeWorker) usize {
+            var total: usize = 0;
+            total +|= self.ids.capacity *| @sizeOf(i32);
+            total +|= self.ids_u16.capacity *| @sizeOf(u16);
+            total +|= self.added_token_offsets.capacity *| @sizeOf(usize);
+            total +|= self.pretoken_boundary_words.capacity *| @sizeOf(u64);
+            total +|= self.bpe_scratch.symbols.capacity *| @sizeOf(BpeSymbol);
+            total +|= self.bpe_scratch.transcode_ids.capacity *| @sizeOf(i32);
+            if (self.bpe_scratch.candidates) |*candidates| {
+                total +|= candidates.items.capacity *| @sizeOf(BpeCandidate);
+            }
+            return total;
+        }
+
+        /// Publish an eventually consistent, race-free observability snapshot.
+        /// This runs only at chunk setup/completion, never in the pretoken or
+        /// BPE probe loops.
+        fn publishStats(self: *ParallelBpeWorker) void {
+            self.published_retained_bytes.store(
+                self.retainedBytes(),
+                .monotonic,
+            );
+            self.published_output_bytes.store(
+                self.ids.items.len *| @sizeOf(i32) +|
+                    self.ids_u16.items.len *| @sizeOf(u16),
+                .monotonic,
+            );
+            self.published_output_capacity_bytes.store(
+                self.ids.capacity *| @sizeOf(i32) +|
+                    self.ids_u16.capacity *| @sizeOf(u16),
+                .monotonic,
+            );
+            self.published_stable_offset_count.store(
+                self.added_token_offsets.items.len,
+                .monotonic,
+            );
+            self.published_stable_offset_bytes.store(
+                self.added_token_offsets.capacity *| @sizeOf(usize),
+                .monotonic,
+            );
+            self.published_stable_boundary_words.store(
+                self.pretoken_boundary_words.items.len,
+                .monotonic,
+            );
+            self.published_stable_boundary_bytes.store(
+                self.pretoken_boundary_words.capacity *| @sizeOf(u64),
+                .monotonic,
+            );
+            self.published_text_bytes.store(self.text.len, .monotonic);
+            self.published_elapsed_ns.store(self.last_elapsed_ns, .monotonic);
+            self.published_cache_owner.store(self.cache_owner, .release);
+        }
 
         fn run(
             self: *ParallelBpeWorker,
@@ -2005,6 +2091,7 @@ pub const HfTokenizer = struct {
             if (self.record_affinity) {
                 self.chunks[idx].cache_owner = @intCast(consumer_idx);
             }
+            self.chunks[idx].publishStats();
             self.chunks[idx].done.store(true, .release);
             self.commitReady();
         }
@@ -2058,15 +2145,15 @@ pub const HfTokenizer = struct {
         next_free: ?*ParallelBpeWorkspace = null,
         next_all: ?*ParallelBpeWorkspace = null,
         cached: bool = false,
-        resource_accounted_bytes: usize = 0,
+        resource_accounted_bytes: std.atomic.Value(usize) = .init(0),
         affinity_valid: bool = false,
         affinity_text_ptr: usize = 0,
         affinity_text_len: usize = 0,
         affinity_worker_count: usize = 0,
         affinity_consumer_count: usize = 0,
-        affinity_learns: usize = 0,
-        affinity_replays: usize = 0,
-        affinity_stolen_chunks: usize = 0,
+        affinity_learns: std.atomic.Value(usize) = .init(0),
+        affinity_replays: std.atomic.Value(usize) = .init(0),
+        affinity_stolen_chunks: std.atomic.Value(usize) = .init(0),
         stable_chunk_boundaries_valid: bool = false,
         stable_chunk_boundaries_id: u64 = 0,
         stable_chunk_boundaries_text_ptr: usize = 0,
@@ -2080,26 +2167,25 @@ pub const HfTokenizer = struct {
         stable_added_offsets_text_len: usize = 0,
         stable_added_offsets_worker_count: usize = 0,
         stable_pretoken_boundaries_valid: bool = false,
-        stable_offset_learns: usize = 0,
-        stable_offset_replays: usize = 0,
+        stable_offset_learns: std.atomic.Value(usize) = .init(0),
+        stable_offset_replays: std.atomic.Value(usize) = .init(0),
         workers: [max_parallel_bpe_chunks]ParallelBpeWorker =
             [_]ParallelBpeWorker{.{}} ** max_parallel_bpe_chunks,
 
         fn retainedBytes(self: *const ParallelBpeWorkspace) usize {
             var total: usize = @sizeOf(ParallelBpeWorkspace);
             for (&self.workers) |*worker| {
-                total +|= worker.ids.capacity *| @sizeOf(i32);
-                total +|= worker.ids_u16.capacity *| @sizeOf(u16);
-                total +|= worker.added_token_offsets.capacity *|
-                    @sizeOf(usize);
-                total +|= worker.pretoken_boundary_words.capacity *|
-                    @sizeOf(u64);
-                total +|= worker.bpe_scratch.symbols.capacity *| @sizeOf(BpeSymbol);
-                total +|= worker.bpe_scratch.transcode_ids.capacity *|
-                    @sizeOf(i32);
-                if (worker.bpe_scratch.candidates) |*candidates| {
-                    total +|= candidates.items.capacity *| @sizeOf(BpeCandidate);
-                }
+                total +|= worker.retainedBytes();
+            }
+            return total;
+        }
+
+        fn publishedRetainedBytes(
+            self: *const ParallelBpeWorkspace,
+        ) usize {
+            var total: usize = @sizeOf(ParallelBpeWorkspace);
+            for (&self.workers) |*worker| {
+                total +|= worker.published_retained_bytes.load(.acquire);
             }
             return total;
         }
@@ -2194,14 +2280,15 @@ pub const HfTokenizer = struct {
         if (self.parallel_bpe_config.recycle_segmented_output_pages) {
             adviseParallelOutputPages(workspace, false);
         }
-        if (workspace.resource_accounted_bytes != 0) {
+        const resource_accounted_bytes =
+            workspace.resource_accounted_bytes.swap(0, .acq_rel);
+        if (resource_accounted_bytes != 0) {
             if (self.cache_resource_budget) |budget| {
                 budget.release(
                     budget.context,
-                    workspace.resource_accounted_bytes,
+                    resource_accounted_bytes,
                 );
             }
-            workspace.resource_accounted_bytes = 0;
         }
         for (&workspace.workers) |*worker| {
             worker.ids.deinit(self.allocator);
@@ -2252,20 +2339,28 @@ pub const HfTokenizer = struct {
             self.parallel_bpe_config.max_retained_workspace_bytes;
         if (cacheable) {
             if (self.cache_resource_budget) |budget| {
-                if (retained_bytes > workspace.resource_accounted_bytes) {
+                const accounted_bytes =
+                    workspace.resource_accounted_bytes.load(.acquire);
+                if (retained_bytes > accounted_bytes) {
                     const additional =
-                        retained_bytes - workspace.resource_accounted_bytes;
+                        retained_bytes - accounted_bytes;
                     if (budget.try_reserve(budget.context, additional)) {
-                        workspace.resource_accounted_bytes = retained_bytes;
+                        workspace.resource_accounted_bytes.store(
+                            retained_bytes,
+                            .release,
+                        );
                     } else {
                         cacheable = false;
                     }
-                } else if (retained_bytes < workspace.resource_accounted_bytes) {
+                } else if (retained_bytes < accounted_bytes) {
                     budget.release(
                         budget.context,
-                        workspace.resource_accounted_bytes - retained_bytes,
+                        accounted_bytes - retained_bytes,
                     );
-                    workspace.resource_accounted_bytes = retained_bytes;
+                    workspace.resource_accounted_bytes.store(
+                        retained_bytes,
+                        .release,
+                    );
                 }
             }
         }
@@ -2784,6 +2879,7 @@ pub const HfTokenizer = struct {
             {
                 worker.added_token_offsets.clearRetainingCapacity();
             }
+            worker.publishStats();
         }
 
         const learned_stable_offsets =
@@ -2809,8 +2905,10 @@ pub const HfTokenizer = struct {
                         budget.context,
                         additional_bytes,
                     )) {
-                        workspace.resource_accounted_bytes +=
-                            additional_bytes;
+                        _ = workspace.resource_accounted_bytes.fetchAdd(
+                            additional_bytes,
+                            .acq_rel,
+                        );
                     } else {
                         build_stable_boundaries = false;
                     }
@@ -2884,6 +2982,7 @@ pub const HfTokenizer = struct {
             // pass now that the immutable-source index is available.
             workspace.affinity_valid = false;
         }
+        for (workers) |*worker| worker.publishStats();
 
         const affinity_eligible =
             text.len >= affinity_replay_min_input_bytes and
@@ -3016,9 +3115,9 @@ pub const HfTokenizer = struct {
         }
         if (stable_offsets_eligible) {
             if (learned_stable_offsets) {
-                workspace.stable_offset_learns += 1;
+                _ = workspace.stable_offset_learns.fetchAdd(1, .monotonic);
             } else {
-                workspace.stable_offset_replays += 1;
+                _ = workspace.stable_offset_replays.fetchAdd(1, .monotonic);
             }
         }
         if (affinity_eligible) {
@@ -3028,11 +3127,13 @@ pub const HfTokenizer = struct {
             workspace.affinity_worker_count = worker_count;
             workspace.affinity_consumer_count = active_runners;
             if (replay_affinity) {
-                workspace.affinity_replays += 1;
-                workspace.affinity_stolen_chunks +=
-                    job.stolen_chunks.load(.monotonic);
+                _ = workspace.affinity_replays.fetchAdd(1, .monotonic);
+                _ = workspace.affinity_stolen_chunks.fetchAdd(
+                    job.stolen_chunks.load(.monotonic),
+                    .monotonic,
+                );
             } else {
-                workspace.affinity_learns += 1;
+                _ = workspace.affinity_learns.fetchAdd(1, .monotonic);
             }
         } else {
             workspace.affinity_valid = false;
@@ -5069,54 +5170,84 @@ pub const HfTokenizer = struct {
         var parallel_min_owner_chunk_ns: u64 = std.math.maxInt(u64);
         var workspace = self.parallel_workspace_all;
         while (workspace) |current| : (workspace = current.next_all) {
-            const retained_bytes = current.retainedBytes();
+            // Cached workspaces cannot be acquired while the list mutex is
+            // held and are therefore safe to inspect directly. Active
+            // workspaces are mutated by std.Io consumers; read only their
+            // atomic, per-chunk published snapshots.
+            const retained_bytes = if (current.cached)
+                current.retainedBytes()
+            else
+                current.publishedRetainedBytes();
             workspace_total_count += 1;
             workspace_total_bytes +|= retained_bytes;
             workspace_accounted_bytes +|=
-                current.resource_accounted_bytes;
+                current.resource_accounted_bytes.load(.acquire);
             if (!current.cached) {
                 workspace_active_count += 1;
                 workspace_active_bytes +|= retained_bytes;
                 for (&current.workers) |*worker| {
                     workspace_active_output_bytes +|=
-                        worker.ids.items.len *| @sizeOf(i32);
-                    workspace_active_output_bytes +|=
-                        worker.ids_u16.items.len *| @sizeOf(u16);
+                        worker.published_output_bytes.load(.acquire);
                     workspace_active_output_capacity_bytes +|=
-                        worker.ids.capacity *| @sizeOf(i32);
-                    workspace_active_output_capacity_bytes +|=
-                        worker.ids_u16.capacity *| @sizeOf(u16);
+                        worker.published_output_capacity_bytes.load(.acquire);
                 }
             }
-            affinity_learns += current.affinity_learns;
-            affinity_replays += current.affinity_replays;
-            affinity_stolen_chunks += current.affinity_stolen_chunks;
-            stable_offset_learns += current.stable_offset_learns;
-            stable_offset_replays += current.stable_offset_replays;
+            affinity_learns += current.affinity_learns.load(.monotonic);
+            affinity_replays += current.affinity_replays.load(.monotonic);
+            affinity_stolen_chunks +=
+                current.affinity_stolen_chunks.load(.monotonic);
+            stable_offset_learns +=
+                current.stable_offset_learns.load(.monotonic);
+            stable_offset_replays +=
+                current.stable_offset_replays.load(.monotonic);
             var owner_elapsed_ns: [max_worker_bpe_caches]u64 =
                 @splat(0);
             var owner_has_chunks: [max_worker_bpe_caches]bool =
                 @splat(false);
             for (&current.workers) |*worker| {
-                stable_offset_count += worker.added_token_offsets.items.len;
-                stable_offset_bytes += worker.added_token_offsets.capacity *
-                    @sizeOf(usize);
-                stable_boundary_words +=
-                    worker.pretoken_boundary_words.items.len;
-                stable_boundary_bytes +=
-                    worker.pretoken_boundary_words.capacity *
-                    @sizeOf(u64);
+                const worker_stable_offset_count = if (current.cached)
+                    worker.added_token_offsets.items.len
+                else
+                    worker.published_stable_offset_count.load(.acquire);
+                const worker_stable_offset_bytes = if (current.cached)
+                    worker.added_token_offsets.capacity * @sizeOf(usize)
+                else
+                    worker.published_stable_offset_bytes.load(.acquire);
+                const worker_stable_boundary_words = if (current.cached)
+                    worker.pretoken_boundary_words.items.len
+                else
+                    worker.published_stable_boundary_words.load(.acquire);
+                const worker_stable_boundary_bytes = if (current.cached)
+                    worker.pretoken_boundary_words.capacity * @sizeOf(u64)
+                else
+                    worker.published_stable_boundary_bytes.load(.acquire);
+                const worker_text_bytes = if (current.cached)
+                    worker.text.len
+                else
+                    worker.published_text_bytes.load(.acquire);
+                const worker_elapsed_ns = if (current.cached)
+                    worker.last_elapsed_ns
+                else
+                    worker.published_elapsed_ns.load(.acquire);
+                const worker_cache_owner = if (current.cached)
+                    @as(usize, worker.cache_owner)
+                else
+                    worker.published_cache_owner.load(.acquire);
+
+                stable_offset_count += worker_stable_offset_count;
+                stable_offset_bytes += worker_stable_offset_bytes;
+                stable_boundary_words += worker_stable_boundary_words;
+                stable_boundary_bytes += worker_stable_boundary_bytes;
                 parallel_max_chunk_bytes =
-                    @max(parallel_max_chunk_bytes, worker.text.len);
-                if (worker.last_elapsed_ns > parallel_max_chunk_ns) {
-                    parallel_max_chunk_ns = worker.last_elapsed_ns;
-                    parallel_slowest_chunk_bytes = worker.text.len;
-                    parallel_slowest_chunk_owner = worker.cache_owner;
+                    @max(parallel_max_chunk_bytes, worker_text_bytes);
+                if (worker_elapsed_ns > parallel_max_chunk_ns) {
+                    parallel_max_chunk_ns = worker_elapsed_ns;
+                    parallel_slowest_chunk_bytes = worker_text_bytes;
+                    parallel_slowest_chunk_owner = worker_cache_owner;
                 }
-                if (worker.cache_owner != invalid_worker_cache_owner) {
-                    const owner: usize = worker.cache_owner;
-                    owner_elapsed_ns[owner] +|=
-                        worker.last_elapsed_ns;
+                if (worker_cache_owner != invalid_worker_cache_owner) {
+                    const owner = worker_cache_owner;
+                    owner_elapsed_ns[owner] +|= worker_elapsed_ns;
                     owner_has_chunks[owner] = true;
                 }
             }
@@ -8726,6 +8857,82 @@ test "worker BPE caches honor external resource-budget denial" {
     try std.testing.expect(budget.denials.load(.acquire) > 0);
     try std.testing.expectEqual(base_bytes, budget.used.load(.acquire));
 
+    tok.deinitSelf();
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.acquire));
+}
+
+test "worker BPE caches retry transient resource-budget denial" {
+    const allocator = std.heap.c_allocator;
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"a": 1},
+        \\    "merges": []
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel"}
+        \\}
+    ;
+    const table_slots = 1024;
+    const table_bytes =
+        table_slots * @sizeOf(HfTokenizer.WorkerBpeCacheEntry);
+    const Budget = struct {
+        table_bytes: usize,
+        transient_denials: std.atomic.Value(usize) = .init(4),
+        used: std.atomic.Value(usize) = .init(0),
+
+        fn tryReserve(context: *anyopaque, bytes: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (bytes == self.table_bytes) {
+                var remaining = self.transient_denials.load(.acquire);
+                while (remaining != 0) {
+                    remaining = self.transient_denials.cmpxchgWeak(
+                        remaining,
+                        remaining - 1,
+                        .acq_rel,
+                        .acquire,
+                    ) orelse return false;
+                }
+            }
+            _ = self.used.fetchAdd(bytes, .acq_rel);
+            return true;
+        }
+
+        fn release(context: *anyopaque, bytes: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const previous = self.used.fetchSub(bytes, .acq_rel);
+            std.debug.assert(previous >= bytes);
+        }
+    };
+
+    var budget = Budget{ .table_bytes = table_bytes };
+    const tok = try HfTokenizer.loadFromBytes(allocator, json_str);
+    errdefer tok.deinitSelf();
+    try tok.configureBpeCache(.{
+        .resource_budget = .{
+            .context = &budget,
+            .try_reserve = Budget.tryReserve,
+            .release = Budget.release,
+        },
+    });
+    try tok.configureParallelBpe(.{
+        .worker_cache_count = 4,
+        .worker_cache_slots = table_slots,
+    });
+
+    // The first call for every lease is denied, the second observes its
+    // one-acquisition cooldown, and the third retries successfully.
+    for (0..3) |_| {
+        for (0..4) |idx| {
+            const lease = tok.acquireWorkerBpeCacheAt(idx);
+            HfTokenizer.releaseWorkerBpeCache(lease);
+        }
+    }
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        budget.transient_denials.load(.acquire),
+    );
+    try std.testing.expectEqual(@as(usize, 4), tok.bpeCacheStats().worker_tables);
     tok.deinitSelf();
     try std.testing.expectEqual(@as(usize, 0), budget.used.load(.acquire));
 }

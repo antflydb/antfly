@@ -263,7 +263,6 @@ const Worker = struct {
     hf: *tokenizer_mod.hf.HfTokenizer,
     io: std.Io,
     corpus: []const u8,
-    iterations: usize,
     internal_threads: usize,
     stable_input_id: ?u64,
     segmented_output: bool,
@@ -271,7 +270,6 @@ const Worker = struct {
     ids: std.ArrayListUnmanaged(i32) = .empty,
     segments: ?tokenizer_mod.hf.HfTokenizer.ParallelTokenSegments = null,
     segments_u16: ?tokenizer_mod.hf.HfTokenizer.ParallelTokenSegmentsU16 = null,
-    token_total: usize = 0,
     failure: ?anyerror = null,
 
     fn deinit(self: *Worker) void {
@@ -283,85 +281,96 @@ const Worker = struct {
         self.ids = .empty;
     }
 
-    fn run(self: *Worker) std.Io.Cancelable!void {
+    fn tokenCount(self: *const Worker) usize {
+        if (self.segments_u16) |*segments| return segments.tokenCount();
+        if (self.segments) |*segments| return segments.tokenCount();
+        return self.ids.items.len;
+    }
+
+    fn runOnce(self: *Worker) std.Io.Cancelable!void {
         const allocator = std.heap.c_allocator;
 
-        for (0..self.iterations) |_| {
-            if (self.segments) |*segments| segments.deinit();
-            self.segments = null;
-            if (self.segments_u16) |*segments| segments.deinit();
-            self.segments_u16 = null;
-            self.ids.clearRetainingCapacity();
-            if (self.segmented_output) {
-                if (self.packed_u16_output) {
-                    self.segments_u16 =
-                        self.hf.encodeParallelSegmentsU16Stable(
-                            self.io,
-                            self.corpus,
-                            self.internal_threads,
-                            self.stable_input_id.?,
-                        ) catch |err| {
-                            self.failure = err;
-                            if (err == error.Canceled)
-                                return error.Canceled;
-                            return;
-                        };
-                    self.token_total +%=
-                        self.segments_u16.?.tokenCount();
-                    if (self.segments_u16.?.segmentCount() != 0) {
-                        std.mem.doNotOptimizeAway(
-                            self.segments_u16.?.segment(0).ptr,
-                        );
-                    }
-                } else {
-                    self.segments =
-                        self.hf.encodeParallelSegmentsStable(
-                            self.io,
-                            self.corpus,
-                            self.internal_threads,
-                            self.stable_input_id.?,
-                        ) catch |err| {
-                            self.failure = err;
-                            if (err == error.Canceled)
-                                return error.Canceled;
-                            return;
-                        };
-                    self.token_total +%= self.segments.?.tokenCount();
-                    if (self.segments.?.segmentCount() != 0) {
-                        std.mem.doNotOptimizeAway(
-                            self.segments.?.segment(0).ptr,
-                        );
-                    }
+        if (self.segments) |*segments| segments.deinit();
+        self.segments = null;
+        if (self.segments_u16) |*segments| segments.deinit();
+        self.segments_u16 = null;
+        self.ids.clearRetainingCapacity();
+        self.failure = null;
+        if (self.segmented_output) {
+            if (self.packed_u16_output) {
+                self.segments_u16 =
+                    self.hf.encodeParallelSegmentsU16Stable(
+                        self.io,
+                        self.corpus,
+                        self.internal_threads,
+                        self.stable_input_id.?,
+                    ) catch |err| {
+                        self.failure = err;
+                        if (err == error.Canceled)
+                            return error.Canceled;
+                        return;
+                    };
+                if (self.segments_u16.?.segmentCount() != 0) {
+                    std.mem.doNotOptimizeAway(
+                        self.segments_u16.?.segment(0).ptr,
+                    );
                 }
-                continue;
+            } else {
+                self.segments =
+                    self.hf.encodeParallelSegmentsStable(
+                        self.io,
+                        self.corpus,
+                        self.internal_threads,
+                        self.stable_input_id.?,
+                    ) catch |err| {
+                        self.failure = err;
+                        if (err == error.Canceled)
+                            return error.Canceled;
+                        return;
+                    };
+                if (self.segments.?.segmentCount() != 0) {
+                    std.mem.doNotOptimizeAway(
+                        self.segments.?.segment(0).ptr,
+                    );
+                }
             }
-            const result = if (self.stable_input_id) |stable_input_id|
-                self.tokenizer.encodeIntoParallelStable(
-                    self.io,
-                    allocator,
-                    self.corpus,
-                    &self.ids,
-                    self.internal_threads,
-                    stable_input_id,
-                )
-            else
-                self.tokenizer.encodeIntoParallel(
-                    self.io,
-                    allocator,
-                    self.corpus,
-                    &self.ids,
-                    self.internal_threads,
-                );
-            result catch |err| {
-                self.failure = err;
-                if (err == error.Canceled) return error.Canceled;
-                return;
-            };
-            self.token_total +%= self.ids.items.len;
-            std.mem.doNotOptimizeAway(self.ids.items.ptr);
+            return;
         }
+        const result = if (self.stable_input_id) |stable_input_id|
+            self.tokenizer.encodeIntoParallelStable(
+                self.io,
+                allocator,
+                self.corpus,
+                &self.ids,
+                self.internal_threads,
+                stable_input_id,
+            )
+        else
+            self.tokenizer.encodeIntoParallel(
+                self.io,
+                allocator,
+                self.corpus,
+                &self.ids,
+                self.internal_threads,
+            );
+        result catch |err| {
+            self.failure = err;
+            if (err == error.Canceled) return error.Canceled;
+            return;
+        };
+        std.mem.doNotOptimizeAway(self.ids.items.ptr);
     }
 };
+
+fn runWorkerBatch(io: std.Io, workers: []Worker) !void {
+    var group: std.Io.Group = .init;
+    errdefer group.cancel(io);
+    for (workers[0 .. workers.len - 1]) |*worker| {
+        group.async(io, Worker.runOnce, .{worker});
+    }
+    try workers[workers.len - 1].runOnce();
+    try group.await(io);
+}
 
 const SequenceMismatch = struct {
     index: usize,
@@ -824,7 +833,6 @@ pub fn main(init: std.process.Init) !void {
             .hf = hf,
             .io = init.io,
             .corpus = corpus,
-            .iterations = cfg.iterations,
             .internal_threads = cfg.internal_threads,
             .stable_input_id = if (cfg.stable_input) 1 else null,
             .segmented_output = cfg.segmented_output,
@@ -837,26 +845,53 @@ pub fn main(init: std.process.Init) !void {
     // optional segmented-page recycling above prevents stale anonymous
     // token pages from displacing this file-backed corpus.
     if (cfg.prefault_corpus) prefaultCorpus(corpus);
+    const timed_sample_count = std.math.mul(
+        usize,
+        cfg.iterations,
+        cfg.threads,
+    ) catch return error.InvalidConfiguration;
+    const timed_digests = try allocator.alloc([32]u8, timed_sample_count);
+    defer allocator.free(timed_digests);
+    const timed_token_counts = try allocator.alloc(usize, timed_sample_count);
+    defer allocator.free(timed_token_counts);
     const rss_before_timed = processPeakRssBytes();
-    const cpu_started_ns = processCpuNs();
-    const started_at = std.Io.Timestamp.now(init.io, .awake);
-    var group: std.Io.Group = .init;
-    errdefer group.cancel(init.io);
-    for (workers[0 .. workers.len - 1]) |*worker| {
-        group.async(init.io, Worker.run, .{worker});
+    var elapsed_ns: u64 = 0;
+    var cpu_elapsed_ns: u64 = 0;
+    var token_total: usize = 0;
+    for (0..cfg.iterations) |iteration| {
+        // Hashing the preceding complete outputs happens outside the measured
+        // interval. Restore the in-memory input contract before the next
+        // encode batch so validation reads cannot bias corpus residency.
+        if (iteration != 0 and cfg.prefault_corpus) prefaultCorpus(corpus);
+        const cpu_started_ns = processCpuNs();
+        const started_at = std.Io.Timestamp.now(init.io, .awake);
+        try runWorkerBatch(init.io, workers);
+        const finished_at = std.Io.Timestamp.now(init.io, .awake);
+        elapsed_ns +|= @intCast(
+            std.Io.Timestamp.durationTo(
+                started_at,
+                finished_at,
+            ).nanoseconds,
+        );
+        cpu_elapsed_ns +|= processCpuNs() -| cpu_started_ns;
+
+        for (workers, 0..) |*worker, worker_index| {
+            if (worker.failure) |err| return err;
+            const sample_index = iteration * cfg.threads + worker_index;
+            const token_count = worker.tokenCount();
+            timed_token_counts[sample_index] = token_count;
+            token_total +%= token_count;
+            timed_digests[sample_index] =
+                if (worker.segments_u16) |*segments|
+                    hashTokenSegmentsU16Blake3(segments)
+                else if (worker.segments) |*segments|
+                    hashTokenSegmentsBlake3(segments)
+                else
+                    hashTokenIdsBlake3(worker.ids.items);
+        }
     }
-    try workers[workers.len - 1].run();
-    try group.await(init.io);
-    const finished_at = std.Io.Timestamp.now(init.io, .awake);
-    const elapsed_ns = std.Io.Timestamp.durationTo(started_at, finished_at).nanoseconds;
-    const cpu_elapsed_ns = processCpuNs() -| cpu_started_ns;
     const rss_after_timed = processPeakRssBytes();
 
-    var token_total: usize = 0;
-    for (workers) |worker| {
-        if (worker.failure) |err| return err;
-        token_total +%= worker.token_total;
-    }
     // Snapshot attribution before correctness validation exercises the cache
     // again. Validation is intentionally outside the measured interval.
     const cache_stats = hf.bpeCacheStats();
@@ -865,18 +900,8 @@ pub fn main(init: std.process.Init) !void {
     // The memory-bounded mode digests and releases timed outputs before
     // constructing the independent serial reference. This keeps full-corpus
     // validation from retaining several multi-gigabyte token arrays at once.
-    const timed_digests = try allocator.alloc([32]u8, cfg.threads);
-    defer allocator.free(timed_digests);
     if (cfg.validation_mode == .complete_hash) {
-        for (workers, timed_digests) |*worker, *digest| {
-            digest.* = if (worker.segments_u16) |*segments|
-                hashTokenSegmentsU16Blake3(segments)
-            else if (worker.segments) |*segments|
-                hashTokenSegmentsBlake3(segments)
-            else
-                hashTokenIdsBlake3(worker.ids.items);
-            worker.deinit();
-        }
+        for (workers) |*worker| worker.deinit();
     }
 
     // Derive the reference from a fresh tokenizer with its optional cache
@@ -896,6 +921,41 @@ pub fn main(init: std.process.Init) !void {
     const token_blake3 = hashTokenIdsBlake3(ids.items);
     const token_blake3_hex = std.fmt.bytesToHex(token_blake3, .lower);
     const expected_token_count = ids.items.len;
+
+    // Validate every measured encode, not only the final retained output.
+    // Digests are produced after each separately timed concurrent batch, so
+    // complete validation does not contribute to wall or CPU throughput.
+    for (
+        timed_digests,
+        timed_token_counts,
+        0..,
+    ) |digest, actual_token_count, sample_index| {
+        if (actual_token_count != expected_token_count or
+            !std.mem.eql(u8, &digest, &token_blake3))
+        {
+            var stderr_buf: [512]u8 = undefined;
+            var stderr = std.Io.File.stderr().writerStreaming(
+                init.io,
+                &stderr_buf,
+            );
+            const actual_hex = std.fmt.bytesToHex(digest, .lower);
+            try stderr.interface.print(
+                "token validation failed phase=timed_hash iteration={d} " ++
+                    "worker={d} expected_tokens={d} actual_tokens={d} " ++
+                    "expected_blake3={s} actual_blake3={s}\n",
+                .{
+                    sample_index / cfg.threads,
+                    sample_index % cfg.threads,
+                    expected_token_count,
+                    actual_token_count,
+                    &token_blake3_hex,
+                    &actual_hex,
+                },
+            );
+            try stderr.interface.flush();
+            return error.TokenSequenceHashMismatch;
+        }
+    }
 
     if (cfg.validation_mode == .exact) {
         for (workers) |*worker| {
@@ -983,33 +1043,6 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     } else {
-        for (workers, timed_digests, 0..) |worker, digest, worker_index| {
-            const actual_token_count = worker.token_total / cfg.iterations;
-            if (actual_token_count != expected_token_count or
-                !std.mem.eql(u8, &digest, &token_blake3))
-            {
-                var stderr_buf: [512]u8 = undefined;
-                var stderr = std.Io.File.stderr().writerStreaming(
-                    init.io,
-                    &stderr_buf,
-                );
-                const actual_hex = std.fmt.bytesToHex(digest, .lower);
-                try stderr.interface.print(
-                    "token validation failed phase=timed_hash worker={d} " ++
-                        "expected_tokens={d} actual_tokens={d} " ++
-                        "expected_blake3={s} actual_blake3={s}\n",
-                    .{
-                        worker_index,
-                        expected_token_count,
-                        actual_token_count,
-                        &token_blake3_hex,
-                        &actual_hex,
-                    },
-                );
-                try stderr.interface.flush();
-                return error.TokenSequenceHashMismatch;
-            }
-        }
         ids.deinit(allocator);
         ids = .empty;
     }
