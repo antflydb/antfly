@@ -2592,6 +2592,7 @@ pub fn build(b: *std.Build) void {
         .root_module = portable_backup_test_mod,
         .filters = &.{
             "export and import documents round trip",
+            "file import restores Go cross-backend portable fixture",
             "file import rejects oversized portable blocks before allocation",
             "document batch round-trip",
         },
@@ -4516,7 +4517,7 @@ pub fn build(b: *std.Build) void {
             "cluster repository reservation serializes distinct backup ids and owners",
             "attempt head ordering ignores producer wall clocks and journal scans",
             "attempt head generation detects publication and retirement ABA",
-            "newest attempt admission is metadata bounded and exact integrity detects corruption",
+            "newest attempt admission rejects exact artifact corruption",
             "unpublished remote cleanup preserves a conflicting manifest",
             "cluster backup attempt markers reject overlapping cleanup identities",
             "stale owned cluster backup attempt releases fences and retires authoritative head",

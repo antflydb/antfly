@@ -5498,9 +5498,10 @@ pub fn verifyTableBackupArtifactsIntegrityAtLocation(
 }
 
 /// Cryptographically verifies a complete cluster backup with bounded memory.
-/// Callers use this for the exact backup being materialized; repository-wide
-/// admission intentionally remains metadata-only so a historical restore never
-/// downloads an unrelated newest backup.
+/// Callers use this for both the authoritative newest-attempt health gate and
+/// the exact backup being materialized. Reads are streamed in bounded chunks;
+/// repository integrity therefore remains fail-closed without buffering large
+/// artifacts in memory.
 pub fn verifyClusterBackupArtifactsIntegrityAtLocation(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -5555,10 +5556,11 @@ fn ensureClusterBackupAttemptHeadRestorable(
                 return error.IncompleteClusterBackup;
         }
     }
-    // Prove that every newest-attempt artifact is present and has its declared
-    // size without downloading unrelated payloads. The exact selected backup
-    // is still cryptographically verified immediately before publication.
-    try validateClusterBackupArtifactsAtLocation(
+    // Repository health is fail-closed: a historical restore must not mask
+    // same-size corruption in the authoritative newest attempt. Verification
+    // streams artifact bytes in bounded chunks, so exact integrity does not
+    // increase peak memory with backup size.
+    try verifyClusterBackupArtifactsIntegrityAtLocation(
         alloc,
         io,
         location,
@@ -8940,7 +8942,7 @@ test "attempt head generation detects publication and retirement ABA" {
     try std.testing.expectEqual(ClusterBackupAttemptState.committed, committed.value.state);
 }
 
-test "newest attempt admission is metadata bounded and exact integrity detects corruption" {
+test "newest attempt admission rejects exact artifact corruption" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -8982,18 +8984,12 @@ test "newest attempt admission is metadata bounded and exact integrity detects c
     defer alloc.free(artifact_path);
     try writeFileAbsolute(artifact_path, "PAYLOAD");
 
-    try ensureNewestClusterBackupAttemptRestorable(
-        alloc,
-        io,
-        &location,
-    );
     try std.testing.expectError(
         error.BackupArtifactIntegrityMismatch,
-        verifyClusterBackupArtifactsIntegrityAtLocation(
+        ensureNewestClusterBackupAttemptRestorable(
             alloc,
             io,
             &location,
-            &committed,
         ),
     );
 

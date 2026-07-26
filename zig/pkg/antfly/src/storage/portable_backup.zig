@@ -1727,6 +1727,61 @@ test "export and import documents round trip" {
     }
 }
 
+test "file import restores Go cross-backend portable fixture" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("testdata/cross_backend_v1.afb");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const archive_path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/go-cross-backend.afb",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(archive_path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = archive_path,
+        .data = fixture,
+    });
+    var archive = try std.Io.Dir.cwd().openFile(io, archive_path, .{});
+    defer archive.close(io);
+
+    var store = try openTestStore(alloc, &tmp);
+    defer store.close();
+    try importPortableFileWithOptions(
+        alloc,
+        &store,
+        io,
+        archive,
+        fixture.len,
+        .{ .import_derived_indexes = true },
+    );
+
+    const expected_docs = [_]struct {
+        key: []const u8,
+        title: []const u8,
+        born: []const u8,
+    }{
+        .{ .key = "albert-einstein", .title = "Albert Einstein", .born = "1879" },
+        .{ .key = "alan-turing", .title = "Alan Turing", .born = "1912" },
+        .{ .key = "ada-lovelace", .title = "Ada Lovelace", .born = "1815" },
+        .{ .key = "marie-curie", .title = "Marie Curie", .born = "1867" },
+        .{ .key = "nikola-tesla", .title = "Nikola Tesla", .born = "1856" },
+    };
+    for (expected_docs) |expected| {
+        const store_key = try internal_keys.documentKeyAlloc(alloc, expected.key);
+        defer alloc.free(store_key);
+        const value = try store.get(alloc, store_key);
+        defer alloc.free(value);
+        try std.testing.expect(std.mem.indexOf(u8, value, expected.title) != null);
+        try std.testing.expect(std.mem.indexOf(u8, value, expected.born) != null);
+    }
+}
+
 test "file import rejects oversized portable blocks before allocation" {
     const alloc = std.testing.allocator;
     var encoded: ArrayList(u8) = .empty;

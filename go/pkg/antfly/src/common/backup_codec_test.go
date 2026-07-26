@@ -873,10 +873,12 @@ func buildCrossBackendAFB() ([]byte, error) {
 		return nil, err
 	}
 
-	// Shard 1 footer: shardID(u32) + docCount(u32)
-	shard1Footer := make([]byte, 8)
-	binary.LittleEndian.PutUint32(shard1Footer[0:4], 1)
-	binary.LittleEndian.PutUint32(shard1Footer[4:8], 3) // 3 docs
+	shard1Footer := EncodeShardFooter(ShardFooterEntry{
+		ShardID:        1,
+		DocumentCount:  3,
+		EmbeddingCount: 3,
+		EdgeCount:      3,
+	})
 	if err := w.WriteBlock(BlockShardFooter, shard1Footer); err != nil {
 		return nil, err
 	}
@@ -928,17 +930,21 @@ func buildCrossBackendAFB() ([]byte, error) {
 		return nil, err
 	}
 
-	// Shard 2 footer
-	shard2Footer := make([]byte, 8)
-	binary.LittleEndian.PutUint32(shard2Footer[0:4], 2)
-	binary.LittleEndian.PutUint32(shard2Footer[4:8], 2) // 2 docs
+	shard2Footer := EncodeShardFooter(ShardFooterEntry{
+		ShardID:        2,
+		DocumentCount:  2,
+		EmbeddingCount: 2,
+		EdgeCount:      2,
+	})
 	if err := w.WriteBlock(BlockShardFooter, shard2Footer); err != nil {
 		return nil, err
 	}
 
-	// File footer: total doc count
-	fileFooter := make([]byte, 4)
-	binary.LittleEndian.PutUint32(fileFooter[0:4], 5) // 5 total docs
+	fileFooter := EncodeFileFooter(FileFooterEntry{
+		TableCount:     1,
+		ShardCount:     2,
+		TotalDocuments: 5,
+	})
 	if err := w.WriteBlock(BlockFileFooter, fileFooter); err != nil {
 		return nil, err
 	}
