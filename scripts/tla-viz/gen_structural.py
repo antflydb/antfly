@@ -53,9 +53,9 @@ GENERATED_NOTE = (
     "Regenerate with `make -C zig tla-viz` (scripts/tla-viz/gen_structural.py). -->"
 )
 
-# Harness modules (model-checking configs, trace validation, Spectacle
-# animation views) are not protocol specs and produce no useful structure.
-SKIP_MODULE_RE = re.compile(r"^(MC|Trace)|MC$|_anim$")
+# Harness modules (model-checking configs, trace validation) are not protocol
+# specs and produce no useful structure.
+SKIP_MODULE_RE = re.compile(r"^(MC|Trace)|MC$")
 
 MERMAID_STATE_RESERVED = {"state", "end", "fork", "join", "choice", "note",
                           "direction", "default", "as", "class", "classdef"}
