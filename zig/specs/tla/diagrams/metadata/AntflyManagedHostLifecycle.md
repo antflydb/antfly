@@ -16,6 +16,14 @@ stateDiagram-v2
     [*] --> none
     preparing --> succeeded : CompleteBackupRestore
     preparing --> failed : FailBackupRestore
+    classDef c_none fill:#2a78d630,stroke:#2a78d6
+    class none c_none
+    classDef c_preparing fill:#eb683430,stroke:#eb6834
+    class preparing c_preparing
+    classDef c_succeeded fill:#1baf7a30,stroke:#1baf7a
+    class succeeded c_succeeded
+    classDef c_failed fill:#eda10030,stroke:#eda100
+    class failed c_failed
 ```
 
 Writes whose source state is not statically determined:

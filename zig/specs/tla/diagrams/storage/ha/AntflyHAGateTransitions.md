@@ -17,6 +17,12 @@ stateDiagram-v2
     primary --> standby : BecomeStandby
     primary --> former_primary : BecomeFormerPrimary
     standby --> primary : PromoteStandby
+    classDef c_primary fill:#2a78d630,stroke:#2a78d6
+    class primary c_primary
+    classDef c_standby fill:#eb683430,stroke:#eb6834
+    class standby c_standby
+    classDef c_former_primary fill:#1baf7a30,stroke:#1baf7a
+    class former_primary c_former_primary
 ```
 
 ## Actions and the state they touch

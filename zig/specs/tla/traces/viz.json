@@ -1,0 +1,113 @@
+{
+  "_comment": "Trace-family -> visualization archetype bindings for scripts/tla-viz/render_trace.py. Archetypes: consensus (node lanes + role bands + message arrows), dialogue (lanes from event-name rules + declarative causal pairs), narrative (single actor, per-event state diffs). bandField values get tenure washes; model+phaseVar link band colors to the spec's phase domain so diagrams and timelines share hues. Unbound tags fall back to narrative.",
+
+  "trace": {
+    "label": "raft",
+    "archetype": "consensus",
+    "laneField": "nid",
+    "lanePrefix": "node ",
+    "segmented": true,
+    "msgArrows": true,
+    "bandField": "role",
+    "bandQuiet": ["StateFollower"],
+    "bandColors": {
+      "StateLeader": "#2a78d6",
+      "StateCandidate": "#eb6834",
+      "StatePreCandidate": "#eda100"
+    },
+    "categories": [
+      {"label": "Replication", "patterns": ["AppendEntries", "Snapshot", "Heartbeat"]},
+      {"label": "Election", "patterns": ["Vote", "Become", "Timeout", "Campaign"]},
+      {"label": "Commit / apply", "patterns": ["Commit", "Replicate", "Ready", "ConfChange", "ChangeConf", "Apply"]}
+    ],
+    "milestones": ["^Become", "^InitState"]
+  },
+
+  "antfly-trace": {
+    "label": "transaction",
+    "archetype": "narrative",
+    "laneField": "shardId",
+    "lanePrefix": "shard ",
+    "categories": [
+      {"label": "Writes / intents", "patterns": ["Write", "Intent"]},
+      {"label": "Commit / abort", "patterns": ["Commit", "Abort", "Resolve"]},
+      {"label": "Lifecycle", "patterns": ["Init", "Begin", "Recovery", "Cleanup", "Clock"]}
+    ]
+  },
+
+  "ha-trace": {
+    "label": "HA replication",
+    "archetype": "dialogue",
+    "laneRules": [
+      ["^Primary", "primary"],
+      ["^(Standby|StatusAck)", "standby"],
+      ["^(Assess|Execute)", "rejoining node"],
+      [".*", "cluster"]
+    ],
+    "laneOrder": ["primary", "standby", "rejoining node", "cluster"],
+    "bandField": "timelineState",
+    "model": "storage/ha/AntflyHARejoin",
+    "phaseVar": "timelineState",
+    "pairs": [
+      {"from": "PrimaryAppend", "to": "StandbyReceive", "keys": ["timeline", "lsn"]},
+      {"from": "StandbyReceive", "to": "StandbyApplySuccess", "keys": ["timeline", "lsn"]}
+    ],
+    "faultPatterns": ["Failure"],
+    "categories": [
+      {"label": "Append / apply", "patterns": ["Append", "Receive", "Apply", "StatusAck"]},
+      {"label": "Timeline / failover", "patterns": ["TimelineSwitch", "Freeze", "Reject", "Promote", "Fence"]},
+      {"label": "Rejoin", "patterns": ["Assess", "Rewind", "Reseed", "Rejoin"]}
+    ]
+  },
+
+  "split-bridge-trace": {
+    "label": "shard split bridge",
+    "archetype": "dialogue",
+    "laneRules": [
+      ["^Parent", "parent shard"],
+      ["^(Bootstrap|Replay|Build|PublishDb|ObserveDestination)", "child shard"],
+      [".*", "metadata"]
+    ],
+    "laneOrder": ["metadata", "parent shard", "child shard"],
+    "bandField": "phase",
+    "bandGlobal": true,
+    "bandQuiet": ["single"],
+    "model": "metadata/AntflySplitRefinementBridge",
+    "phaseVar": "phase",
+    "pairs": [
+      {"from": "ParentRightWrite", "to": "ReplayDelta",
+       "fromKeys": ["dbDeltaSeq"], "toKeys": ["dbReplaySeq"]}
+    ],
+    "categories": [
+      {"label": "Writes / replay", "patterns": ["Write", "Replay"]},
+      {"label": "Build / publish", "patterns": ["Build", "Publish", "Bootstrap", "Observe"]},
+      {"label": "Cutover / routing", "patterns": ["Cutover", "Route", "Fence", "BeginSplit", "Rollback"]}
+    ]
+  },
+
+  "txn-session-trace": {
+    "label": "transaction session",
+    "archetype": "narrative",
+    "lane": "session",
+    "bandField": "status",
+    "bandQuiet": ["idle"],
+    "model": "storage/db/AntflyTransactionSession",
+    "phaseVar": "status",
+    "categories": [
+      {"label": "Writes", "patterns": ["Stage"]},
+      {"label": "2PC", "patterns": ["Prepare", "Resolve", "Commit", "Abort", "Finalize"]},
+      {"label": "Lifecycle", "patterns": ["Begin", "Cleanup", "Savepoint", "Release", "Rollback"]}
+    ]
+  },
+
+  "doc-identity-range-repair-trace": {
+    "label": "doc identity range repair",
+    "archetype": "narrative",
+    "lane": "restore",
+    "categories": [
+      {"label": "Restore intent", "patterns": ["Intent"]},
+      {"label": "Repair / recovery", "patterns": ["Repair", "Recover"]},
+      {"label": "Restore", "patterns": ["Restore", "Import"]}
+    ]
+  }
+}

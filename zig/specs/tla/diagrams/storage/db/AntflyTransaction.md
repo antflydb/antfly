@@ -25,6 +25,20 @@ stateDiagram-v2
     predicatesChecked --> done : OrchestratorCrashPrepare
     preparing --> done : OrchestratorCrashPrepare
     predicatesChecked --> aborting : WriteIntentFails
+    classDef c_idle fill:#2a78d630,stroke:#2a78d6
+    class idle c_idle
+    classDef c_preparing fill:#eb683430,stroke:#eb6834
+    class preparing c_preparing
+    classDef c_predicatesChecked fill:#1baf7a30,stroke:#1baf7a
+    class predicatesChecked c_predicatesChecked
+    classDef c_committed fill:#eda10030,stroke:#eda100
+    class committed c_committed
+    classDef c_aborting fill:#e87ba430,stroke:#e87ba4
+    class aborting c_aborting
+    classDef c_aborted fill:#00830030,stroke:#008300
+    class aborted c_aborted
+    classDef c_done fill:#4a3aa730,stroke:#4a3aa7
+    class done c_done
 ```
 
 ### `txnRecords`
@@ -36,6 +50,16 @@ stateDiagram-v2
     pending --> aborted : RecoveryAutoAbort
     aborted --> deleted : CleanupTxnRecord
     committed --> deleted : CleanupTxnRecord
+    classDef c_none fill:#2a78d630,stroke:#2a78d6
+    class none c_none
+    classDef c_pending fill:#eb683430,stroke:#eb6834
+    class pending c_pending
+    classDef c_committed fill:#1baf7a30,stroke:#1baf7a
+    class committed c_committed
+    classDef c_aborted fill:#eda10030,stroke:#eda100
+    class aborted c_aborted
+    classDef c_deleted fill:#e87ba430,stroke:#e87ba4
+    class deleted c_deleted
 ```
 
 Writes whose source state is not statically determined:
@@ -55,6 +79,12 @@ stateDiagram-v2
     none --> resolved : ResolveIntentsOnShard, RecoveryResolve
     written --> resolved : ResolveIntentsOnShard, RecoveryResolve
     written --> written : ResolveIntentsOnShard, RecoveryResolve
+    classDef c_none fill:#2a78d630,stroke:#2a78d6
+    class none c_none
+    classDef c_written fill:#eb683430,stroke:#eb6834
+    class written c_written
+    classDef c_resolved fill:#1baf7a30,stroke:#1baf7a
+    class resolved c_resolved
 ```
 
 ## Actions and the state they touch

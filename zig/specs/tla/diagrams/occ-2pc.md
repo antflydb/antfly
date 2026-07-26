@@ -19,6 +19,18 @@ stateDiagram-v2
     inited --> aborted : AbortAfterIntentFailure
     intentsWritten --> committed : CommitTransaction
     committed --> resolved : ResolutionComplete
+    classDef c_none fill:#2a78d630,stroke:#2a78d6
+    class none c_none
+    classDef c_inited fill:#eb683430,stroke:#eb6834
+    class inited c_inited
+    classDef c_intentsWritten fill:#1baf7a30,stroke:#1baf7a
+    class intentsWritten c_intentsWritten
+    classDef c_committed fill:#eda10030,stroke:#eda100
+    class committed c_committed
+    classDef c_aborted fill:#e87ba430,stroke:#e87ba4
+    class aborted c_aborted
+    classDef c_resolved fill:#00830030,stroke:#008300
+    class resolved c_resolved
 ```
 
 ## Actions and the state they touch

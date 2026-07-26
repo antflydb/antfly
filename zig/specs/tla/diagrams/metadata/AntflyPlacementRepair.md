@@ -16,6 +16,14 @@ stateDiagram-v2
     planned --> expanded : ApplyExpansion
     expanded --> awaiting_proof : LatchFinalMembership
     awaiting_proof --> retired : RetireSource
+    classDef c_planned fill:#2a78d630,stroke:#2a78d6
+    class planned c_planned
+    classDef c_expanded fill:#eb683430,stroke:#eb6834
+    class expanded c_expanded
+    classDef c_awaiting_proof fill:#1baf7a30,stroke:#1baf7a
+    class awaiting_proof c_awaiting_proof
+    classDef c_retired fill:#eda10030,stroke:#eda100
+    class retired c_retired
 ```
 
 Writes whose source state is not statically determined:

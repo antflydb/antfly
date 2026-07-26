@@ -375,17 +375,45 @@ disciplined conjunct-list action style).
 ### Trace timelines
 
 `make tla-viz-trace JSON=<trace.ndjson> [OUT=<out.html>]` renders any of the
-suite's NDJSON trace families (`trace`, `antfly-trace`, `ha-trace`,
-`txn-session-trace`, `doc-identity-range-repair-trace`, ...) as one
-self-contained HTML swimlane timeline: a lane per node/shard where the events
-carry one, role tenure as lane tint and matched send→receive arrows for raft
-traces, event-category filters, hover detail, and a table view. No external
-assets — attachable to a PR or Zulip thread. Try the fixtures:
+suite's NDJSON trace families as one self-contained HTML swimlane timeline
+(no external assets — attachable to a PR or Zulip thread). Try the fixtures:
 
 ```bash
 make tla-viz-trace JSON=specs/tla/example.ndjson OUT=/tmp/raft.html
-make tla-viz-trace JSON=specs/tla/traces/ha_rejoin.ndjson OUT=/tmp/ha.html
+make tla-viz-trace JSON=specs/tla/traces/split_bridge_cutover.ndjson OUT=/tmp/split.html
 ```
+
+A timeline's useful encodings are domain knowledge (what is an actor, what
+deserves a tenure band, which events form causal pairs), so each trace family
+is **assigned a visualization archetype** in
+[`traces/viz.json`](traces/viz.json) (`scripts/tla-viz/archetypes.py`):
+
+- `consensus` — symmetric node actors: a lane per node id, role tenure as
+  lane tint, send→receive message arrows, multi-run segmentation (raft).
+- `dialogue` — a small named cast encoded in the event names: lanes from
+  name rules (`^Primary` → primary, `^Parent` → parent shard, ...) and
+  declarative causal pairs matched on event fields
+  (`PrimaryAppend → StandbyReceive` on timeline+lsn;
+  `ParentRightWrite → ReplayDelta` on delta/replay seq). Used by `ha-trace`
+  and `split-bridge-trace`.
+- `narrative` — a single progressing actor: taller rows where every event is
+  labeled with its name and the observable state fields it changed. Used by
+  `txn-session-trace`, `doc-identity-range-repair-trace`, `antfly-trace`,
+  and as the fallback for tags with no binding yet.
+
+Shared across archetypes: per-family category legends, and **fault emphasis**
+(crash/corruption events always render in the reserved status-critical red
+with a ⚠ label). Tenure-band colors can be linked to a model's phase variable
+(`model` + `phaseVar` in the binding, via `scripts/tla-viz/phasecolors.py`),
+which is the same assignment the diagrams layer uses for its state-machine
+coloring — a phase value like `"splitting"` gets the same hue in
+`diagrams/metadata/AntflySplitRefinementBridge.md` and in the timeline's
+phase strips.
+
+**To wire up a new trace family**: add its tag to `traces/viz.json`, pick an
+archetype, and declare lanes/band/pairs/categories (~15 lines; the raft and
+split-bridge entries are the reference examples). Until then it renders with
+the narrative fallback.
 
 Multi-run raft traces are split into segments with the same boundary rules as
 `../../scripts/tla-segment-raft-trace.py`.

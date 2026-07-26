@@ -18,6 +18,12 @@ stateDiagram-v2
     prepare --> splitting : SetSplittingPhase
     splitting --> none : FinalizeSplitComplete, TimeoutRollback
     prepare --> none : TimeoutRollback
+    classDef c_none fill:#2a78d630,stroke:#2a78d6
+    class none c_none
+    classDef c_prepare fill:#eb683430,stroke:#eb6834
+    class prepare c_prepare
+    classDef c_splitting fill:#1baf7a30,stroke:#1baf7a
+    class splitting c_splitting
 ```
 
 ### `newShardState`
@@ -32,6 +38,14 @@ stateDiagram-v2
     splittingOff --> preSnap : NewShardReceivesSnapshot
     preSnap --> s_default : TablemgrTransitionsChild
     splittingOff --> s_default : TablemgrTransitionsChild
+    classDef c_none fill:#2a78d630,stroke:#2a78d6
+    class none c_none
+    classDef c_splittingOff fill:#eb683430,stroke:#eb6834
+    class splittingOff c_splittingOff
+    classDef c_preSnap fill:#1baf7a30,stroke:#1baf7a
+    class preSnap c_preSnap
+    classDef c_s_default fill:#eda10030,stroke:#eda100
+    class s_default c_s_default
 ```
 
 Writes whose source state is not statically determined:

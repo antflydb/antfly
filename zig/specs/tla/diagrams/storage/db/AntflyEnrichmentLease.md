@@ -16,6 +16,12 @@ stateDiagram-v2
     [*] --> none
     nodeA --> none : LoseLease
     nodeB --> none : LoseLease
+    classDef c_none fill:#2a78d630,stroke:#2a78d6
+    class none c_none
+    classDef c_nodeA fill:#eb683430,stroke:#eb6834
+    class nodeA c_nodeA
+    classDef c_nodeB fill:#1baf7a30,stroke:#1baf7a
+    class nodeB c_nodeB
 ```
 
 ## Actions and the state they touch

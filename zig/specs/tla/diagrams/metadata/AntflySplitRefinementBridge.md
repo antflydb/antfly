@@ -18,6 +18,16 @@ stateDiagram-v2
     splitting --> cutover : CompleteShardCutover
     cutover --> children : PublishDbChildServing
     splitting --> rolledBack : Rollback
+    classDef c_single fill:#2a78d630,stroke:#2a78d6
+    class single c_single
+    classDef c_splitting fill:#eb683430,stroke:#eb6834
+    class splitting c_splitting
+    classDef c_cutover fill:#1baf7a30,stroke:#1baf7a
+    class cutover c_cutover
+    classDef c_children fill:#eda10030,stroke:#eda100
+    class children c_children
+    classDef c_rolledBack fill:#e87ba430,stroke:#e87ba4
+    class rolledBack c_rolledBack
 ```
 
 ### `routeRightOwner`

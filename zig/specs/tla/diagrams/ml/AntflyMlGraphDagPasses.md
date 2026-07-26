@@ -16,6 +16,12 @@ stateDiagram-v2
     [*] --> init
     init --> cse : RunCSE
     cse --> dce : RunDCE
+    classDef c_init fill:#2a78d630,stroke:#2a78d6
+    class init c_init
+    classDef c_cse fill:#eb683430,stroke:#eb6834
+    class cse c_cse
+    classDef c_dce fill:#1baf7a30,stroke:#1baf7a
+    class dce c_dce
 ```
 
 ### `kind`

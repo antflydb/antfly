@@ -19,6 +19,14 @@ stateDiagram-v2
     building --> fresh : Swap
     building --> failed : FailBuild
     fresh --> stale : RequestSecondSchema
+    classDef c_stale fill:#2a78d630,stroke:#2a78d6
+    class stale c_stale
+    classDef c_building fill:#eb683430,stroke:#eb6834
+    class building c_building
+    classDef c_fresh fill:#1baf7a30,stroke:#1baf7a
+    class fresh c_fresh
+    classDef c_failed fill:#eda10030,stroke:#eda100
+    class failed c_failed
 ```
 
 Writes whose source state is not statically determined:

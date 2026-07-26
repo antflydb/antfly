@@ -16,6 +16,12 @@ stateDiagram-v2
     [*] --> active
     active --> draining : RequestShutdown
     draining --> active : CancelShutdown, ReRegisterNode
+    classDef c_active fill:#2a78d630,stroke:#2a78d6
+    class active c_active
+    classDef c_draining fill:#eb683430,stroke:#eb6834
+    class draining c_draining
+    classDef c_removed fill:#1baf7a30,stroke:#1baf7a
+    class removed c_removed
 ```
 
 Writes whose source state is not statically determined:

@@ -21,6 +21,18 @@ stateDiagram-v2
     replaying --> children : FinalizeSplit
     single --> mergePrepared : StartMerge
     mergePrepared --> merged : FinalizeMerge
+    classDef c_single fill:#2a78d630,stroke:#2a78d6
+    class single c_single
+    classDef c_prepared fill:#eb683430,stroke:#eb6834
+    class prepared c_prepared
+    classDef c_replaying fill:#1baf7a30,stroke:#1baf7a
+    class replaying c_replaying
+    classDef c_children fill:#eda10030,stroke:#eda100
+    class children c_children
+    classDef c_mergePrepared fill:#e87ba430,stroke:#e87ba4
+    class mergePrepared c_mergePrepared
+    classDef c_merged fill:#00830030,stroke:#008300
+    class merged c_merged
 ```
 
 ### `childArtifactPlacement`

@@ -18,6 +18,14 @@ stateDiagram-v2
     Live --> Destroyed : CacheRetireInactive
     Live --> Retired : CacheRetireActive
     Retired --> Destroyed : CacheReleaseRetiredLease
+    classDef c_Absent fill:#2a78d630,stroke:#2a78d6
+    class Absent c_Absent
+    classDef c_Live fill:#eb683430,stroke:#eb6834
+    class Live c_Live
+    classDef c_Retired fill:#1baf7a30,stroke:#1baf7a
+    class Retired c_Retired
+    classDef c_Destroyed fill:#eda10030,stroke:#eda100
+    class Destroyed c_Destroyed
 ```
 
 ### `snapshotLoc`
@@ -30,6 +38,14 @@ stateDiagram-v2
     MutableOwner --> RetiredOwner : InvalidateMutableSnapshotWithActiveReader
     MutableOwner --> Destroyed : InvalidateMutableSnapshotWithoutReader
     RetiredOwner --> Destroyed : ReleaseReaderDrainsRetiredSnapshot
+    classDef c_NoSnapshot fill:#2a78d630,stroke:#2a78d6
+    class NoSnapshot c_NoSnapshot
+    classDef c_MutableOwner fill:#eb683430,stroke:#eb6834
+    class MutableOwner c_MutableOwner
+    classDef c_RetiredOwner fill:#1baf7a30,stroke:#1baf7a
+    class RetiredOwner c_RetiredOwner
+    classDef c_Destroyed fill:#eda10030,stroke:#eda100
+    class Destroyed c_Destroyed
 ```
 
 ### `indexTemp`
@@ -43,6 +59,18 @@ stateDiagram-v2
     NewOnly --> BothAllocated : IndexRetiredAllocationSucceeds
     BothAllocated --> Freed : IndexRebuildFails
     BothAllocated --> Published : IndexRebuildPublishes
+    classDef c_None fill:#2a78d630,stroke:#2a78d6
+    class None c_None
+    classDef c_NewOnly fill:#eb683430,stroke:#eb6834
+    class NewOnly c_NewOnly
+    classDef c_BothAllocated fill:#1baf7a30,stroke:#1baf7a
+    class BothAllocated c_BothAllocated
+    classDef c_Published fill:#eda10030,stroke:#eda100
+    class Published c_Published
+    classDef c_Freed fill:#e87ba430,stroke:#e87ba4
+    class Freed c_Freed
+    classDef c_Leaked fill:#00830030,stroke:#008300
+    class Leaked c_Leaked
 ```
 
 ## Actions and the state they touch

@@ -21,6 +21,16 @@ stateDiagram-v2
     aborted --> idle : Cleanup
     committed --> idle : Cleanup
     open --> prepared : PrepareParticipant
+    classDef c_idle fill:#2a78d630,stroke:#2a78d6
+    class idle c_idle
+    classDef c_open fill:#eb683430,stroke:#eb6834
+    class open c_open
+    classDef c_prepared fill:#1baf7a30,stroke:#1baf7a
+    class prepared c_prepared
+    classDef c_committed fill:#eda10030,stroke:#eda100
+    class committed c_committed
+    classDef c_aborted fill:#e87ba430,stroke:#e87ba4
+    class aborted c_aborted
 ```
 
 ## Actions and the state they touch

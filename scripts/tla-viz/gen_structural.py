@@ -48,6 +48,8 @@ from pathlib import Path
 import tree_sitter_tlaplus
 from tree_sitter import Language, Node, Parser
 
+import phasecolors
+
 GENERATED_NOTE = (
     "<!-- GENERATED FILE: do not edit. "
     "Regenerate with `make -C zig tla-viz` (scripts/tla-viz/gen_structural.py). -->"
@@ -442,6 +444,15 @@ def render_state_diagram(spec: Spec, var: str) -> list[str]:
         for (src, tgt), actions in merged.items():
             label = ", ".join(dict.fromkeys(actions))
             lines.append(f"    {state_id(src)} --> {state_id(tgt)} : {label}")
+        # Phase colors are shared with trace-timeline tenure bands
+        # (scripts/tla-viz/phasecolors.py): same value, same hue, both layers.
+        colors = phasecolors.assign(domain)
+        for value in domain:
+            if value in colors:
+                hex_color = colors[value]
+                lines.append(f"    classDef c_{state_id(value)} "
+                             f"fill:{hex_color}30,stroke:{hex_color}")
+                lines.append(f"    class {state_id(value)} c_{state_id(value)}")
         lines.append("```")
     else:
         lines.append(f"Domain: {', '.join(f'`{v}`' for v in domain)}. "

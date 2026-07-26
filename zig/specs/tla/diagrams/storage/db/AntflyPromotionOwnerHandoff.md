@@ -15,6 +15,10 @@ stateDiagram-v2
     direction LR
     [*] --> old
     old --> new : TransferRange
+    classDef c_old fill:#2a78d630,stroke:#2a78d6
+    class old c_old
+    classDef c_new fill:#eb683430,stroke:#eb6834
+    class new c_new
 ```
 
 ## Actions and the state they touch

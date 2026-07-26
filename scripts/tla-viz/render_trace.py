@@ -15,20 +15,26 @@
 
 """Render a TLA+ ndjson trace as a self-contained HTML swimlane timeline.
 
-Input is the trace format emitted by the Zig tracing writers (and the older Go
-harness): one JSON object per line with tag "trace" (raft events: nid, state,
-role, msg) or "antfly-trace" (transaction events: txnId, shardId, state).
-Non-JSON line prefixes (logger timestamps) are stripped, matching
+Input is the ndjson format emitted by the Zig tracing writers: one JSON object
+per line with a `*-trace` tag (or `trace` for raft) and an `event`. Non-JSON
+line prefixes (logger timestamps) are stripped, matching
 scripts/tla-validate-trace.sh.
 
-Output is one HTML file with no external dependencies: one swimlane per node
-(or shard), one row per event, role shown as lane background bands, matched
-Send/Receive message arrows, hover tooltips, category/node filters, and a
-table view. Multi-run raft traces are split into segments using the same
-boundary rules as scripts/tla-segment-raft-trace.py.
+Each trace family is assigned a visualization archetype in
+specs/tla/traces/viz.json (see archetypes.py): `consensus` (node lanes, role
+tenure bands, message arrows, multi-run segmentation), `dialogue` (lanes from
+event-name rules, declarative causal pairs), or `narrative` (single actor,
+per-event state diffs). Tenure-band colors can be linked to the model's phase
+domain (phasecolors.py) so the same phase value gets the same hue here and in
+the generated Mermaid state diagrams. Unbound tags render with the narrative
+fallback.
+
+Output is one HTML file with no external dependencies: category/lane filters,
+hover detail, a table view, light/dark support. Faults (crash/corruption
+events) always render in the reserved status-critical red.
 
 Usage:
-  render_trace.py trace.ndjson [-o out.html] [--max-events N]
+  render_trace.py trace.ndjson [-o out.html] [--bindings viz.json] [--max-events N]
 """
 
 from __future__ import annotations
@@ -39,29 +45,11 @@ import json
 import sys
 from pathlib import Path
 
+import archetypes
+import phasecolors
+from archetypes import Binding
+
 BOOTSTRAP_EVENTS = {"InitState", "BecomeFollower", "ApplyConfChange"}
-
-# Event categories. Slot colors come from the validated reference palette
-# (first three categorical slots are all-pairs safe; "other" is neutral ink)
-# and each category also carries a distinct mark shape as secondary encoding.
-CATEGORIES = [
-    ("replication", "Replication"),
-    ("election", "Election"),
-    ("apply", "Commit / apply"),
-    ("other", "Other"),
-]
-
-
-def categorize(name: str) -> str:
-    n = name.lower()
-    if "appendentries" in n or "snapshot" in n or "heartbeat" in n:
-        return "replication"
-    if "vote" in n or "become" in n or "timeout" in n or "campaign" in n:
-        return "election"
-    if any(k in n for k in ("commit", "replicate", "ready", "confchange",
-                            "changeconf", "apply", "abort", "intent", "resolve")):
-        return "apply"
-    return "other"
 
 
 def parse_lines(path: Path):
@@ -76,30 +64,15 @@ def parse_lines(path: Path):
             except json.JSONDecodeError:
                 continue
             tag = obj.get("tag", "")
-            # "trace" is the raft trace; the rest of the suite's writers use
-            # <subsystem>-trace tags (antfly-trace, ha-trace, ...).
             if (tag == "trace" or tag.endswith("-trace")) \
                     and isinstance(obj.get("event"), dict):
                 yield obj
 
 
-def is_state_reset(seg_events: list[dict], ev: dict) -> bool:
-    """Same rule as tla-segment-raft-trace.py: a node's commit/log dropping
-    back to zero marks a re-initialized engine (new test run)."""
-    if ev.get("state", {}).get("commit", 0) != 0 or ev.get("log", 0) != 0:
-        return False
-    for prev in reversed(seg_events):
-        if prev["lane"] == ev["nid"]:
-            if prev.get("commit", 0) > 0 or prev.get("log", 0) > 0:
-                return True
-            break
-    return False
-
-
 def flatten_event(ev: dict) -> dict:
-    """Scalar view of an event's state for per-lane diffing. Nested dicts get
-    dotted keys; lists are inlined when short. The message payload is excluded
-    (it changes every event and is shown in the tooltip/table instead)."""
+    """Scalar view of an event's state for lanes, bands, and diffing. Nested
+    dicts get dotted keys; lists are inlined when short. The message payload
+    is excluded (it changes every event and is shown in the tooltip/table)."""
     out: dict = {}
 
     def add(key, val):
@@ -125,55 +98,74 @@ def fmt(val) -> str:
     return json.dumps(val) if isinstance(val, (bool, str)) or val is None else str(val)
 
 
-def build_segments(objs) -> list[list[dict]]:
+def is_state_reset(seg_events: list[dict], ev: dict) -> bool:
+    """Same rule as tla-segment-raft-trace.py: a node's commit/log dropping
+    back to zero marks a re-initialized engine (new test run)."""
+    if ev.get("state", {}).get("commit", 0) != 0 or ev.get("log", 0) != 0:
+        return False
+    for prev in reversed(seg_events):
+        if prev["lane"] == str(ev.get("nid", "?")):
+            if prev.get("commit", 0) > 0 or prev.get("log", 0) > 0:
+                return True
+            break
+    return False
+
+
+def build_segments(objs, binding: Binding) -> list[list[dict]]:
     """Flatten trace objects into per-segment event records."""
     segments: list[list[dict]] = []
     current: list[dict] = []
     init_nodes: set[str] = set()
     lane_state: dict[str, dict] = {}
+    lane_band: dict[str, object] = {}
 
     for obj in objs:
         ev = obj["event"]
         name = ev.get("name", "?")
-        if obj["tag"] == "trace":
-            lane = str(ev.get("nid", "?"))
-        else:
-            lane = str(ev.get("nid") or ev.get("shardId") or ev.get("txnId")
-                       or ev.get("sessionId") or "events")
+        flat = flatten_event(ev)
+        lane = binding.lane_for(name, flat)
 
-        if obj["tag"] == "trace":
+        if binding.segmented:
             new_run = (name == "InitState" and lane in init_nodes) or (
                 name not in BOOTSTRAP_EVENTS and current and is_state_reset(current, ev)
             )
             if new_run:
                 segments.append(current)
-                current, init_nodes, lane_state = [], set(), {}
+                current, init_nodes = [], set()
+                lane_state, lane_band = {}, {}
             if name == "InitState":
                 init_nodes.add(lane)
 
         # What changed in this lane's observable state, for direct labels.
-        snap = flatten_event(ev)
         prev = lane_state.get(lane)
         if prev is None:
-            changes = [f"{k}={fmt(v)}" for k, v in snap.items()][:6]
+            changes = [f"{k}={fmt(v)}" for k, v in flat.items()][:6]
         else:
             changes = [f"{k}: {fmt(prev[k])}→{fmt(v)}"
-                       for k, v in snap.items() if k in prev and prev[k] != v]
-            changes += [f"{k}={fmt(v)}" for k, v in snap.items() if k not in prev]
-        lane_state[lane] = {**(prev or {}), **snap}
+                       for k, v in flat.items() if k in prev and prev[k] != v]
+            changes += [f"{k}={fmt(v)}" for k, v in flat.items() if k not in prev]
+        lane_state[lane] = {**(prev or {}), **flat}
+
+        # Tenure band value carries forward until a new one is reported —
+        # per lane for actor state, trace-wide for global protocol state.
+        band_key = "*" if binding.band_global else lane
+        if binding.band_field and flat.get(binding.band_field) is not None:
+            lane_band[band_key] = flat[binding.band_field]
+        band = lane_band.get(band_key)
 
         state = ev.get("state") or {}
         rec = {
             "lane": lane,
             "name": name,
-            "cat": categorize(name),
-            "role": ev.get("role"),
+            "cat": binding.categorize(name),
+            "band": band,
+            "ms": binding.is_milestone(name),
             "term": state.get("term"),
             "commit": state.get("commit"),
             "log": ev.get("log"),
             "msg": ev.get("msg"),
-            "txn": ev.get("txnId"),
             "changes": changes,
+            "flat": flat,
             "detail": json.dumps(ev, indent=1),
         }
         current.append(rec)
@@ -182,8 +174,9 @@ def build_segments(objs) -> list[list[dict]]:
     return segments
 
 
-def match_arrows(events: list[dict]) -> list[dict]:
-    """Pair SendX events with the ReceiveX that consumes the same message."""
+def match_msg_arrows(events: list[dict]) -> list[dict]:
+    """Consensus archetype: pair SendX events with the ReceiveX that consumes
+    the same message envelope."""
     pending: dict[tuple, list[int]] = {}
     arrows = []
     for i, ev in enumerate(events):
@@ -202,12 +195,34 @@ def match_arrows(events: list[dict]) -> list[dict]:
     return arrows
 
 
-def lane_order(events: list[dict]) -> list[str]:
+def lane_order(events: list[dict], binding: Binding) -> list[str]:
     lanes = list(dict.fromkeys(ev["lane"] for ev in events))
+    if binding.lane_order:
+        known = [l for l in binding.lane_order if l in lanes]
+        return known + sorted(l for l in lanes if l not in binding.lane_order)
     try:
         return sorted(lanes, key=int)
     except ValueError:
         return sorted(lanes)
+
+
+def resolve_band_colors(binding: Binding, segments: list[list[dict]],
+                        specs_dir: Path | None) -> dict[str, str]:
+    """Explicit binding colors win; then the model's phase domain (shared with
+    the diagrams layer); then first-appearance palette order."""
+    colors = dict(binding.band_colors)
+    if binding.model and binding.phase_var and specs_dir is not None:
+        for value, hex_color in phasecolors.model_phase_colors(
+                specs_dir, binding.model, binding.phase_var).items():
+            colors.setdefault(value, hex_color)
+    observed = list(dict.fromkeys(
+        ev["band"] for seg in segments for ev in seg if ev["band"] is not None))
+    unassigned = [v for v in observed if v not in colors]
+    taken = set(colors.values())
+    free = [s for s in phasecolors.SLOTS if s not in taken]
+    for value, hex_color in zip(unassigned, free):
+        colors[value] = hex_color
+    return {v: c for v, c in colors.items() if v in observed}
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -222,10 +237,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     --surface-1: #fcfcfb; --page: #f9f9f7;
     --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
     --grid: #e1e0d9; --baseline: #c3c2b7; --border: rgba(11,11,11,0.10);
-    --cat-replication: #2a78d6; --cat-election: #eb6834;
-    --cat-apply: #1baf7a; --cat-other: #898781;
-    --band-leader: rgba(42,120,214,0.12); --band-candidate: rgba(235,104,52,0.14);
-    --band-precandidate: rgba(235,104,52,0.07);
   }
   @media (prefers-color-scheme: dark) {
     :root:where(:not([data-theme="light"])) .viz-root {
@@ -233,10 +244,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       --surface-1: #1a1a19; --page: #0d0d0d;
       --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #898781;
       --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
-      --cat-replication: #3987e5; --cat-election: #d95926;
-      --cat-apply: #199e70; --cat-other: #898781;
-      --band-leader: rgba(57,135,229,0.18); --band-candidate: rgba(217,89,38,0.20);
-      --band-precandidate: rgba(217,89,38,0.10);
     }
   }
   :root[data-theme="dark"] .viz-root {
@@ -244,10 +251,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     --surface-1: #1a1a19; --page: #0d0d0d;
     --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #898781;
     --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
-    --cat-replication: #3987e5; --cat-election: #d95926;
-    --cat-apply: #199e70; --cat-other: #898781;
-    --band-leader: rgba(57,135,229,0.18); --band-candidate: rgba(217,89,38,0.20);
-    --band-precandidate: rgba(217,89,38,0.10);
   }
   body.viz-root {
     margin: 0; background: var(--page); color: var(--text-primary);
@@ -270,6 +273,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .chip input { display: none; }
   .chip.off { opacity: 0.38; }
   .swatch { width: 10px; height: 10px; display: inline-block; }
+  .bandlegend { font-size: 12px; color: var(--text-secondary);
+    display: inline-flex; gap: 10px; align-items: center; }
+  .bandlegend .swatch { border: 1px solid var(--border); }
   section { padding: 8px 16px 24px; }
   section h2 { font-size: 13px; color: var(--text-secondary); margin: 14px 0 4px; }
   .laneheads { display: flex; margin-left: 46px; position: sticky;
@@ -317,6 +323,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="controls">
     <div class="group" id="cat-filters"></div>
     <div class="group" id="lane-filters"></div>
+    <div class="group bandlegend" id="band-legend"></div>
     <div class="group"><button class="toggleview" id="viewbtn">Table view</button></div>
   </div>
 </header>
@@ -330,17 +337,8 @@ const DATA = __DATA__;
 const SPARSE = DATA.sparse;
 const ROW_H = SPARSE ? 24 : 12, LANE_W = SPARSE ? 240 : 130,
       GUTTER = 46, TOP_PAD = 10;
-const CAT_COLOR = {
-  replication: "var(--cat-replication)",
-  election: "var(--cat-election)",
-  apply: "var(--cat-apply)",
-  other: "var(--cat-other)",
-};
-const BAND = {
-  StateLeader: "var(--band-leader)",
-  StateCandidate: "var(--band-candidate)",
-  StatePreCandidate: "var(--band-precandidate)",
-};
+const CATS = DATA.categories;         // [{label, color, shape}] x5
+const FAULT = 4;
 const SVG = "http://www.w3.org/2000/svg";
 
 function el(tag, attrs, parent) {
@@ -352,17 +350,22 @@ function el(tag, attrs, parent) {
 
 // Mark shapes: shape is the secondary (color-independent) encoding.
 function drawMark(parent, cat, x, y) {
-  const c = CAT_COLOR[cat];
-  if (cat === "replication") {
+  const c = CATS[cat].color, shape = CATS[cat].shape;
+  if (shape === "circle") {
     return el("circle", {cx: x, cy: y, r: 3.5, fill: c, class: "mark"}, parent);
   }
-  if (cat === "election") {  // diamond
+  if (shape === "diamond") {
     const d = 4.6;
     return el("path", {d: `M ${x} ${y - d} L ${x + d} ${y} L ${x} ${y + d} L ${x - d} ${y} Z`,
                        fill: c, class: "mark"}, parent);
   }
-  if (cat === "apply") {  // square
+  if (shape === "square") {
     return el("rect", {x: x - 3.2, y: y - 3.2, width: 6.4, height: 6.4,
+                       fill: c, class: "mark"}, parent);
+  }
+  if (shape === "cross") {
+    const d = 4.4, w = 1.6;
+    return el("path", {d: `M ${x - d} ${y - d + w} L ${x - w} ${y} L ${x - d} ${y + d - w} L ${x - d + w} ${y + d} L ${x} ${y + w} L ${x + d - w} ${y + d} L ${x + d} ${y + d - w} L ${x + w} ${y} L ${x + d} ${y - d + w} L ${x + d - w} ${y - d} L ${x} ${y - w} L ${x - d + w} ${y - d} Z`,
                        fill: c, class: "mark"}, parent);
   }
   const d = 4.4;  // triangle
@@ -371,12 +374,13 @@ function drawMark(parent, cat, x, y) {
 }
 
 const state = {
-  cats: new Set(Object.keys(CAT_COLOR)),
+  cats: new Set(CATS.map((_, i) => i)),
   lanes: new Set(DATA.segments.flatMap(s => s.lanes)),
   table: false,
 };
 
 function laneX(seg, lane) { return GUTTER + seg.lanes.indexOf(lane) * LANE_W + LANE_W / 2; }
+function laneName(lane) { return DATA.lanePrefix + lane; }
 
 function renderSegment(seg, idx) {
   const wrap = document.createElement("section");
@@ -396,7 +400,7 @@ function renderSegment(seg, idx) {
   for (const lane of seg.lanes) {
     const d = document.createElement("div");
     d.style.width = LANE_W + "px";
-    d.textContent = DATA.kind === "trace" ? `node ${lane}` : lane;
+    d.textContent = laneName(lane);
     d.dataset.lane = lane;
     heads.appendChild(d);
   }
@@ -406,21 +410,27 @@ function renderSegment(seg, idx) {
                          viewBox: `0 0 ${w} ${h}`});
   wrap.appendChild(svg);
 
-  // Role bands: contiguous spans of each lane's role.
+  // Tenure bands: per-lane washes for actor state, or one full-width strip
+  // per span for global protocol state (bandGlobal).
   const bands = el("g", {}, svg);
-  for (const lane of seg.lanes) {
-    let start = null, role = null;
+  const bandLanes = DATA.bandGlobal ? [null] : seg.lanes;
+  for (const lane of bandLanes) {
+    let start = null, band = null;
+    const bx = lane === null ? GUTTER - 6 : laneX(seg, lane) - LANE_W / 2 + 4;
+    const bw = lane === null ? w - GUTTER - 8 : LANE_W - 8;
     const flush = (endIdx) => {
-      if (role && BAND[role]) {
-        el("rect", {x: laneX(seg, lane) - LANE_W / 2 + 4, y: TOP_PAD + start * ROW_H - 5,
-                    width: LANE_W - 8, height: (endIdx - start) * ROW_H,
-                    fill: BAND[role], "data-lane": lane}, bands);
+      if (band !== null && DATA.bands[band] && !DATA.bandQuiet.includes(band)) {
+        const attrs = {x: bx, y: TOP_PAD + start * ROW_H - 5,
+                       width: bw, height: (endIdx - start) * ROW_H,
+                       fill: DATA.bands[band] + "30"};
+        if (lane !== null) attrs["data-lane"] = lane;
+        el("rect", attrs, bands);
       }
     };
     events.forEach((ev, i) => {
-      if (ev.lane !== lane || ev.role === role) return;
+      if ((lane !== null && ev.lane !== lane) || ev.band === band) return;
       if (start !== null) flush(i);
-      start = i; role = ev.role;
+      start = i; band = ev.band;
     });
     if (start !== null) flush(events.length);
   }
@@ -435,47 +445,48 @@ function renderSegment(seg, idx) {
     el("text", {x: 4, y: TOP_PAD + i * ROW_H + 3}, svg).textContent = String(i);
   }
 
-  // Message arrows.
+  // Causal / message arrows.
   const defs = el("defs", {}, svg);
-  for (const [cat, color] of Object.entries(CAT_COLOR)) {
-    const m = el("marker", {id: `arr-${idx}-${cat}`, viewBox: "0 0 8 8",
+  CATS.forEach((cat, ci) => {
+    const m = el("marker", {id: `arr-${idx}-${ci}`, viewBox: "0 0 8 8",
                             refX: 7, refY: 4, markerWidth: 6, markerHeight: 6,
                             orient: "auto-start-reverse"}, defs);
-    el("path", {d: "M 0 0 L 8 4 L 0 8 Z", fill: color}, m);
-  }
+    el("path", {d: "M 0 0 L 8 4 L 0 8 Z", fill: cat.color}, m);
+  });
   const arrowsG = el("g", {}, svg);
   for (const a of seg.arrows) {
     const evA = events[a.from], evB = events[a.to];
     el("line", {x1: laneX(seg, evA.lane), y1: TOP_PAD + a.from * ROW_H,
                 x2: laneX(seg, evB.lane), y2: TOP_PAD + a.to * ROW_H,
-                stroke: CAT_COLOR[a.cat], class: "arrow",
+                stroke: CATS[a.cat].color, class: "arrow",
                 "marker-end": `url(#arr-${idx}-${a.cat})`,
                 "data-cat": a.cat,
                 "data-lanes": evA.lane + "," + evB.lane}, arrowsG);
   }
 
-  // Event marks + selective direct labels (role transitions only).
+  // Event marks + labels.
   const marksG = el("g", {}, svg);
   const tooltip = document.getElementById("tooltip");
   events.forEach((ev, i) => {
     const x = laneX(seg, ev.lane), y = TOP_PAD + i * ROW_H;
     const g = el("g", {"data-cat": ev.cat, "data-lane": ev.lane}, marksG);
     drawMark(g, ev.cat, x, y);
+    const warn = ev.cat === FAULT ? "⚠ " : "";
     if (SPARSE) {
-      el("text", {x: x + 10, y: y, class: "evlabel"}, g).textContent = ev.name;
+      el("text", {x: x + 10, y: y, class: "evlabel"}, g).textContent = warn + ev.name;
       if (ev.changes && ev.changes.length) {
         const maxCh = seg.lanes.length > 1 ? 42 : 120;
         const txt = ev.changes.join("   ");
         el("text", {x: x + 10, y: y + 11, class: "chlabel"}, g).textContent =
           txt.length > maxCh ? txt.slice(0, maxCh - 1) + "…" : txt;
       }
-    } else if (ev.name.startsWith("Become") || ev.name === "InitState") {
+    } else if (ev.ms || ev.cat === FAULT) {
       el("text", {x: x + 8, y: y + 3, class: "evlabel"}, g).textContent =
-        `${ev.name} (t${ev.term ?? "?"})`;
+        warn + ev.name + (ev.term != null ? ` (t${ev.term})` : "");
     }
     const hit = el("circle", {cx: x, cy: y, r: 8, class: "hit"}, g);
-    hit.addEventListener("mouseenter", (e) => {
-      tooltip.textContent = `#${i} ${ev.name} — ${DATA.kind === "trace" ? "node " : ""}${ev.lane}\n` + ev.detail;
+    hit.addEventListener("mouseenter", () => {
+      tooltip.textContent = `#${i} ${ev.name} — ${laneName(ev.lane)}\\n` + ev.detail;
       tooltip.style.display = "block";
     });
     hit.addEventListener("mousemove", (e) => {
@@ -487,18 +498,22 @@ function renderSegment(seg, idx) {
   });
 
   // Table view (accessibility / exact values).
+  const hasMsg = events.some(ev => ev.msg);
   const table = document.createElement("table");
   table.className = "events hidden";
-  table.innerHTML = "<thead><tr><th>#</th><th>" +
-    (DATA.kind === "trace" ? "Node" : "Lane") +
-    "</th><th>Event</th><th>Role</th><th>Term</th><th>Commit</th><th>Log</th><th>Message</th></tr></thead>";
+  table.innerHTML = "<thead><tr><th>#</th><th>Lane</th><th>Event</th>" +
+    (DATA.bandField ? `<th>${DATA.bandField}</th>` : "") +
+    (hasMsg ? "<th>Message</th>" : "") +
+    "<th>Changed</th></tr></thead>";
   const tbody = document.createElement("tbody");
   events.forEach((ev, i) => {
     const tr = document.createElement("tr");
     tr.dataset.cat = ev.cat; tr.dataset.lane = ev.lane;
-    const msg = ev.msg ? `${ev.msg.type} ${ev.msg.from}→${ev.msg.to}` : "";
-    for (const v of [i, ev.lane, ev.name, ev.role ?? "", ev.term ?? "",
-                     ev.commit ?? "", ev.log ?? "", msg]) {
+    const cells = [i, ev.lane, (ev.cat === FAULT ? "⚠ " : "") + ev.name];
+    if (DATA.bandField) cells.push(ev.band ?? "");
+    if (hasMsg) cells.push(ev.msg ? `${ev.msg.type} ${ev.msg.from}→${ev.msg.to}` : "");
+    cells.push((ev.changes || []).join("; "));
+    for (const v of cells) {
       const td = document.createElement("td");
       td.textContent = String(v);
       tr.appendChild(td);
@@ -513,7 +528,7 @@ function renderSegment(seg, idx) {
 
 function applyFilters() {
   for (const node of document.querySelectorAll("[data-cat],[data-lane]")) {
-    const catOK = !node.dataset.cat || state.cats.has(node.dataset.cat);
+    const catOK = !node.dataset.cat || state.cats.has(Number(node.dataset.cat));
     let laneOK = true;
     if (node.dataset.lane) laneOK = state.lanes.has(node.dataset.lane);
     if (node.dataset.lanes) {
@@ -523,9 +538,9 @@ function applyFilters() {
   }
 }
 
-function chip(parent, label, swatchColor, isOn, onToggle) {
+function chip(parent, label, swatchColor, onToggle) {
   const lab = document.createElement("label");
-  lab.className = "chip" + (isOn ? "" : " off");
+  lab.className = "chip";
   if (swatchColor) {
     const sw = document.createElement("span");
     sw.className = "swatch";
@@ -541,19 +556,40 @@ function chip(parent, label, swatchColor, isOn, onToggle) {
   parent.appendChild(lab);
 }
 
-const catNames = {replication: "Replication ●", election: "Election ◆",
-                  apply: "Commit/apply ■", other: "Other ▲"};
+const SHAPE_GLYPH = {circle: "●", diamond: "◆", square: "■", triangle: "▲", cross: "✕"};
+const usedCats = new Set(DATA.segments.flatMap(s => s.events.map(e => e.cat)));
 const catBox = document.getElementById("cat-filters");
-for (const cat of Object.keys(CAT_COLOR)) {
-  chip(catBox, catNames[cat], CAT_COLOR[cat], true,
-       on => on ? state.cats.add(cat) : state.cats.delete(cat));
-}
+CATS.forEach((cat, i) => {
+  if (!usedCats.has(i)) return;
+  chip(catBox, `${cat.label} ${SHAPE_GLYPH[cat.shape]}`, cat.color,
+       on => on ? state.cats.add(i) : state.cats.delete(i));
+});
 const laneBox = document.getElementById("lane-filters");
 const allLanes = [...state.lanes];
-if (allLanes.length <= 12) {
+if (allLanes.length > 1 && allLanes.length <= 12) {
   for (const lane of allLanes) {
-    chip(laneBox, (DATA.kind === "trace" ? "node " : "") + lane, null, true,
+    chip(laneBox, laneName(lane), null,
          on => on ? state.lanes.add(lane) : state.lanes.delete(lane));
+  }
+}
+
+// Band (phase) legend: colors shared with the model's state diagram.
+const bandBox = document.getElementById("band-legend");
+const bandEntries = Object.entries(DATA.bands);
+if (bandEntries.length) {
+  const label = document.createElement("span");
+  label.textContent = DATA.bandField + ":";
+  bandBox.appendChild(label);
+  for (const [value, color] of bandEntries) {
+    const item = document.createElement("span");
+    const quiet = DATA.bandQuiet.includes(value);
+    const sw = document.createElement("span");
+    sw.className = "swatch";
+    sw.style.background = quiet ? "transparent" : color + "60";
+    item.appendChild(sw);
+    item.appendChild(document.createTextNode(" " + value +
+      (quiet ? " (untinted)" : "")));
+    bandBox.appendChild(item);
   }
 }
 
@@ -586,6 +622,9 @@ def main() -> int:
     ap.add_argument("trace", type=Path, help="ndjson trace file")
     ap.add_argument("-o", "--output", type=Path,
                     help="output HTML path (default: <trace>.html)")
+    ap.add_argument("--bindings", type=Path,
+                    help="viz.json binding table (default: found next to the "
+                         "trace or under specs/tla/traces/)")
     ap.add_argument("--max-events", type=int, default=20000,
                     help="refuse to render more events than this (default 20000); "
                          "pre-split large traces with scripts/tla-segment-*.py")
@@ -602,28 +641,52 @@ def main() -> int:
         return 1
 
     kind = objs[0]["tag"]
-    segments = build_segments(objs)
+    bindings_path = archetypes.find_bindings_file(args.trace, args.bindings)
+    specs_dir = None
+    if bindings_path is not None:
+        bindings = archetypes.load_bindings(bindings_path)
+        binding = bindings.get(kind) or archetypes.fallback(kind)
+        specs_dir = bindings_path.parent.parent
+    else:
+        binding = archetypes.fallback(kind)
+
+    segments = build_segments(objs, binding)
+    band_colors = resolve_band_colors(binding, segments, specs_dir)
+
+    seg_data = []
+    for events in segments:
+        if binding.msg_arrows:
+            arrows = match_msg_arrows(events)
+        elif binding.pairs:
+            arrows = archetypes.match_pairs(events, binding.pairs)
+        else:
+            arrows = []
+        for ev in events:
+            del ev["flat"]
+        seg_data.append({"lanes": lane_order(events, binding),
+                         "events": events, "arrows": arrows})
+
     data = {
         "kind": kind,
         "sparse": len(objs) <= 200,
-        "segments": [
-            {
-                "lanes": lane_order(events),
-                "events": events,
-                "arrows": match_arrows(events),
-            }
-            for events in segments
-        ],
+        "lanePrefix": binding.lane_prefix,
+        "categories": binding.category_legend(),
+        "bandField": binding.band_field,
+        "bandGlobal": binding.band_global,
+        "bands": band_colors,
+        "bandQuiet": binding.band_quiet,
+        "segments": seg_data,
     }
 
     title = f"TLA+ trace — {args.trace.name}"
+    n_arrows = sum(len(s["arrows"]) for s in seg_data)
     subtitle = (
-        f"{sum(len(s) for s in segments)} events, {len(segments)} segment(s), "
-        f"{'raft' if kind == 'trace' else kind.removesuffix('-trace')} trace. "
-        "Rows are event order (top to bottom), lanes are "
-        + ("nodes; lane tint marks leader (blue) / candidate (orange) tenure; "
-           "arrows are matched send→receive messages."
-           if kind == "trace" else "shards / sessions.")
+        f"{len(objs)} events, {len(segments)} segment(s) — {binding.label} trace, "
+        f"{binding.archetype} archetype. Rows are event order (top to bottom)."
+        + (f" {n_arrows} matched causal arrows." if n_arrows else "")
+        + ("" if binding.bound else
+           " No viz binding for this tag — rendered with the generic narrative "
+           "preset; add one in specs/tla/traces/viz.json.")
     )
     out = args.output or args.trace.with_suffix(".html")
     page = (HTML_TEMPLATE

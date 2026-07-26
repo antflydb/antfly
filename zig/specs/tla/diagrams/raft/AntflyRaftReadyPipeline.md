@@ -14,6 +14,10 @@ Transitions are extracted from action guards and primed updates; edge labels are
 stateDiagram-v2
     direction LR
     continuation --> done : FinishContinuation
+    classDef c_continuation fill:#2a78d630,stroke:#2a78d6
+    class continuation c_continuation
+    classDef c_done fill:#eb683430,stroke:#eb6834
+    class done c_done
 ```
 
 Writes whose source state is not statically determined:

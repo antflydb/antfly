@@ -19,6 +19,14 @@ stateDiagram-v2
     manifest_written --> idle : AdvanceHead, CrashAfterManifestBeforeHead
     building --> failed : FailPublication
     failed --> idle : DiscardFailedPublication
+    classDef c_idle fill:#2a78d630,stroke:#2a78d6
+    class idle c_idle
+    classDef c_building fill:#eb683430,stroke:#eb6834
+    class building c_building
+    classDef c_manifest_written fill:#1baf7a30,stroke:#1baf7a
+    class manifest_written c_manifest_written
+    classDef c_failed fill:#eda10030,stroke:#eda100
+    class failed c_failed
 ```
 
 ## Actions and the state they touch

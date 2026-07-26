@@ -18,6 +18,14 @@ stateDiagram-v2
     fetching --> done : TransferSucceeds
     fetching --> failed : TransferPermanentFailure, TransferExhaustedRetries
     done --> idle : ApplySnapshot
+    classDef c_idle fill:#2a78d630,stroke:#2a78d6
+    class idle c_idle
+    classDef c_fetching fill:#eb683430,stroke:#eb6834
+    class fetching c_fetching
+    classDef c_done fill:#1baf7a30,stroke:#1baf7a
+    class done c_done
+    classDef c_failed fill:#eda10030,stroke:#eda100
+    class failed c_failed
 ```
 
 Writes whose source state is not statically determined:

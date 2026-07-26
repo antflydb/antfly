@@ -19,6 +19,12 @@ stateDiagram-v2
     stream --> crashed : Crash
     crashed --> snapshot : Resume
     crashed --> stream : Resume
+    classDef c_snapshot fill:#2a78d630,stroke:#2a78d6
+    class snapshot c_snapshot
+    classDef c_stream fill:#eb683430,stroke:#eb6834
+    class stream c_stream
+    classDef c_crashed fill:#1baf7a30,stroke:#1baf7a
+    class crashed c_crashed
 ```
 
 ## Actions and the state they touch
