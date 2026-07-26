@@ -443,7 +443,16 @@ pub const JsonApiClient = struct {
             if (part_number != 1) return error.InvalidPartNumber;
         }
 
-        var meta = try self.statObject(alloc, bucket, key);
+        var meta = if (opts.skip_metadata_probe) blk: {
+            const owned_bucket = try alloc.dupe(u8, bucket);
+            errdefer alloc.free(owned_bucket);
+            const owned_key = try alloc.dupe(u8, key);
+            break :blk types.ObjectMetadata{
+                .bucket = owned_bucket,
+                .key = owned_key,
+                .content_length = 0,
+            };
+        } else try self.statObject(alloc, bucket, key);
         errdefer meta.deinit(alloc);
 
         const url = try objectMediaUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, opts.version_id);
@@ -475,6 +484,9 @@ pub const JsonApiClient = struct {
         }
 
         meta.content_length = @intCast(response.body.len);
+        if (opts.skip_metadata_probe) {
+            if (response.etag) |value| meta.etag = try alloc.dupe(u8, value);
+        }
         if (response.content_type) |value| {
             if (meta.content_type) |current| alloc.free(current);
             meta.content_type = try alloc.dupe(u8, value);
@@ -1318,6 +1330,19 @@ test "json api client get object uses metadata then media with auth and range" {
                         .content_type = try request_alloc.dupe(u8, "text/plain"),
                     };
                 },
+                2 => {
+                    try std.testing.expectEqual(HttpMethod.GET, method);
+                    try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt?generation=42&alt=media", url);
+                    try expectHeader(headers, "Authorization", "Bearer token-123");
+                    try expectHeader(headers, "If-Match", "etag-1");
+                    try expectHeader(headers, "Range", "bytes=2-5");
+                    return .{
+                        .status = 206,
+                        .body = try request_alloc.dupe(u8, "cdef"),
+                        .etag = try request_alloc.dupe(u8, "etag-media"),
+                        .content_type = try request_alloc.dupe(u8, "text/plain"),
+                    };
+                },
                 else => return error.UnexpectedCall,
             }
         }
@@ -1343,6 +1368,20 @@ test "json api client get object uses metadata then media with auth and range" {
     try std.testing.expectEqualStrings("etag-1", result.metadata.etag.?);
     try std.testing.expectEqualStrings("42", result.metadata.version_id.?);
     try std.testing.expectEqualStrings("text/plain", result.metadata.content_type.?);
+
+    var direct = try client.getObject("bucket", "folder/doc.txt", .{
+        .version_id = "42",
+        .range = .{ .offset = 2, .length = 4 },
+        .if_match_etag = "etag-1",
+        .skip_metadata_probe = true,
+    });
+    defer direct.deinit(alloc);
+    try std.testing.expectEqualStrings("cdef", direct.body);
+    try std.testing.expectEqualStrings("bucket", direct.metadata.bucket);
+    try std.testing.expectEqualStrings("folder/doc.txt", direct.metadata.key);
+    try std.testing.expectEqualStrings("etag-media", direct.metadata.etag.?);
+    try std.testing.expectEqualStrings("text/plain", direct.metadata.content_type.?);
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
 }
 
 test "json api client put object encodes upload url and returns etag" {

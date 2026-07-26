@@ -47,6 +47,10 @@ pub const GetOptions = struct {
     /// `error.PreconditionFailed` rather than data from another object version.
     if_match_etag: ?[]const u8 = null,
     part_number: ?u32 = null,
+    /// Avoid a separate provider metadata request when the caller only needs
+    /// the response body and response-derived metadata. Defaults to false so
+    /// existing callers retain complete metadata semantics.
+    skip_metadata_probe: bool = false,
 };
 
 pub const DeleteOptions = struct {

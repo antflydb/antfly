@@ -492,7 +492,16 @@ pub const Client = struct {
         key: []const u8,
         opts: types.GetOptions,
     ) !types.GetResult {
-        var meta = try self.statObject(alloc, bucket, key);
+        var meta = if (opts.skip_metadata_probe) blk: {
+            const owned_bucket = try alloc.dupe(u8, bucket);
+            errdefer alloc.free(owned_bucket);
+            const owned_key = try alloc.dupe(u8, key);
+            break :blk types.ObjectMetadata{
+                .bucket = owned_bucket,
+                .key = owned_key,
+                .content_length = 0,
+            };
+        } else try self.statObject(alloc, bucket, key);
         errdefer meta.deinit(alloc);
 
         const query = try buildObjectQueryAlloc(alloc, opts.version_id, opts.part_number);
@@ -525,6 +534,9 @@ pub const Client = struct {
         }
 
         meta.content_length = @intCast(response.body.len);
+        if (opts.skip_metadata_probe) {
+            if (response.etag) |value| meta.etag = try alloc.dupe(u8, value);
+        }
         if (response.content_type) |value| {
             if (meta.content_type) |current| alloc.free(current);
             meta.content_type = try alloc.dupe(u8, value);
