@@ -11,9 +11,9 @@
     "bandField": "role",
     "bandQuiet": ["StateFollower"],
     "bandColors": {
-      "StateLeader": "#2a78d6",
-      "StateCandidate": "#eb6834",
-      "StatePreCandidate": "#eda100"
+      "StateLeader": ["#2a78d6", "#3987e5"],
+      "StateCandidate": ["#eb6834", "#d95926"],
+      "StatePreCandidate": ["#eda100", "#c98500"]
     },
     "categories": [
       {"label": "Replication", "patterns": ["AppendEntries", "Snapshot", "Heartbeat"]},

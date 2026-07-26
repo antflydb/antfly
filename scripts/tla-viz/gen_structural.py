@@ -449,7 +449,7 @@ def render_state_diagram(spec: Spec, var: str) -> list[str]:
         colors = phasecolors.assign(domain)
         for value in domain:
             if value in colors:
-                hex_color = colors[value]
+                hex_color = colors[value][0]  # light step; GitHub themes both
                 lines.append(f"    classDef c_{state_id(value)} "
                              f"fill:{hex_color}30,stroke:{hex_color}")
                 lines.append(f"    class {state_id(value)} c_{state_id(value)}")

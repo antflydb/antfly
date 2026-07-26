@@ -44,9 +44,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # Category slot presentation, fixed across families: three categorical slots,
-# a neutral "other", and the reserved fault slot. Shape is the secondary
+# a neutral "other", and the reserved fault slot, each as a
+# (light-surface, dark-surface) hex pair. Shape is the secondary
 # (color-independent) encoding.
-CATEGORY_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#898781", "#d03b3b"]
+CATEGORY_COLORS = [
+    ("#2a78d6", "#3987e5"),
+    ("#eb6834", "#d95926"),
+    ("#1baf7a", "#199e70"),
+    ("#898781", "#898781"),
+    ("#d03b3b", "#d03b3b"),
+]
 CATEGORY_SHAPES = ["circle", "diamond", "square", "triangle", "cross"]
 OTHER_INDEX, FAULT_INDEX = 3, 4
 

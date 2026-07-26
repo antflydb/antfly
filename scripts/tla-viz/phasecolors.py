@@ -27,32 +27,37 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# Categorical palette slots (light-surface hex), CVD-safe in this order.
+# Categorical palette slots as (light-surface, dark-surface) hex pairs,
+# CVD-safe in this order. The dark column is the same hues re-stepped for the
+# dark surface — a light-tuned hex washed over near-black reads as mud.
 SLOTS = [
-    "#2a78d6",  # blue
-    "#eb6834",  # orange
-    "#1baf7a",  # aqua
-    "#eda100",  # yellow
-    "#e87ba4",  # magenta
-    "#008300",  # green
-    "#4a3aa7",  # violet
-    "#e34948",  # red
+    ("#2a78d6", "#3987e5"),  # blue
+    ("#eb6834", "#d95926"),  # orange
+    ("#1baf7a", "#199e70"),  # aqua
+    ("#eda100", "#c98500"),  # yellow
+    ("#e87ba4", "#d55181"),  # magenta
+    ("#008300", "#008300"),  # green
+    ("#4a3aa7", "#9085e9"),  # violet
+    ("#e34948", "#e66767"),  # red
 ]
 
 # Reserved status color for fault/crash events; never used for phases.
-FAULT_COLOR = "#d03b3b"
+# Clears 3:1 on both surfaces.
+FAULT_COLOR = ("#d03b3b", "#d03b3b")
 
 
-def assign(values: list[str]) -> dict[str, str]:
-    """Map domain values (in declaration order) to palette hexes. Empty when
-    the domain exceeds the palette (no recycled or invented hues)."""
+def assign(values: list[str]) -> dict[str, tuple[str, str]]:
+    """Map domain values (in declaration order) to (light, dark) palette
+    pairs. Empty when the domain exceeds the palette (no recycled or invented
+    hues)."""
     values = list(dict.fromkeys(values))
     if not values or len(values) > len(SLOTS):
         return {}
     return {v: SLOTS[i] for i, v in enumerate(values)}
 
 
-def model_phase_colors(specs_dir: Path, model: str, phase_var: str) -> dict[str, str]:
+def model_phase_colors(specs_dir: Path, model: str,
+                       phase_var: str) -> dict[str, tuple[str, str]]:
     """Colors for a model's phase variable, e.g.
     model_phase_colors(specs, "metadata/AntflySplitRefinementBridge", "phase").
     Returns {} if the spec or variable cannot be resolved."""

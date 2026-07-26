@@ -208,21 +208,24 @@ def lane_order(events: list[dict], binding: Binding) -> list[str]:
 
 
 def resolve_band_colors(binding: Binding, segments: list[list[dict]],
-                        specs_dir: Path | None) -> dict[str, str]:
+                        specs_dir: Path | None) -> dict[str, tuple[str, str]]:
     """Explicit binding colors win; then the model's phase domain (shared with
-    the diagrams layer); then first-appearance palette order."""
-    colors = dict(binding.band_colors)
+    the diagrams layer); then first-appearance palette order. Values are
+    (light-surface, dark-surface) hex pairs."""
+    # viz.json bandColors entries may be a single hex or a [light, dark] pair.
+    colors = {v: tuple(c) if isinstance(c, list) else (c, c)
+              for v, c in binding.band_colors.items()}
     if binding.model and binding.phase_var and specs_dir is not None:
-        for value, hex_color in phasecolors.model_phase_colors(
+        for value, pair in phasecolors.model_phase_colors(
                 specs_dir, binding.model, binding.phase_var).items():
-            colors.setdefault(value, hex_color)
+            colors.setdefault(value, pair)
     observed = list(dict.fromkeys(
         ev["band"] for seg in segments for ev in seg if ev["band"] is not None))
     unassigned = [v for v in observed if v not in colors]
     taken = set(colors.values())
     free = [s for s in phasecolors.SLOTS if s not in taken]
-    for value, hex_color in zip(unassigned, free):
-        colors[value] = hex_color
+    for value, pair in zip(unassigned, free):
+        colors[value] = pair
     return {v: c for v, c in colors.items() if v in observed}
 
 
@@ -358,10 +361,18 @@ const TRACES = __DATA__;
 // Per-trace globals, set by buildUI(). Small traces get a "narrated" layout:
 // taller rows, every event labeled with its name and the state fields it
 // changed.
-let CUR, SPARSE, ROW_H, LANE_W, CATS, state;
+let CUR, CUR_IDX = 0, SPARSE, ROW_H, LANE_W, CATS, state;
 const GUTTER = 46, TOP_PAD = 10;
 const FAULT = 4;
 const SVG = "http://www.w3.org/2000/svg";
+
+// Colors ship as [light-surface, dark-surface] hex pairs; pick by the mode
+// actually rendering, and re-render if the OS theme flips. Band washes need
+// more alpha on the dark surface to keep their hue identity.
+const darkMq = window.matchMedia("(prefers-color-scheme: dark)");
+const pick = (c) => Array.isArray(c) ? c[darkMq.matches ? 1 : 0] : c;
+const WASH = () => darkMq.matches ? "4A" : "30";
+darkMq.addEventListener("change", () => buildUI(CUR_IDX));
 
 function el(tag, attrs, parent) {
   const node = document.createElementNS(SVG, tag);
@@ -372,7 +383,7 @@ function el(tag, attrs, parent) {
 
 // Mark shapes: shape is the secondary (color-independent) encoding.
 function drawMark(parent, cat, x, y) {
-  const c = CATS[cat].color, shape = CATS[cat].shape;
+  const c = pick(CATS[cat].color), shape = CATS[cat].shape;
   if (shape === "circle") {
     return el("circle", {cx: x, cy: y, r: 3.5, fill: c, class: "mark"}, parent);
   }
@@ -438,7 +449,7 @@ function renderSegment(seg, idx) {
       if (band !== null && CUR.bands[band] && !CUR.bandQuiet.includes(band)) {
         const attrs = {x: bx, y: TOP_PAD + start * ROW_H - 5,
                        width: bw, height: (endIdx - start) * ROW_H,
-                       fill: CUR.bands[band] + "30"};
+                       fill: pick(CUR.bands[band]) + WASH()};
         if (lane !== null) attrs["data-lane"] = lane;
         el("rect", attrs, bands);
       }
@@ -467,14 +478,14 @@ function renderSegment(seg, idx) {
     const m = el("marker", {id: `arr-${idx}-${ci}`, viewBox: "0 0 8 8",
                             refX: 7, refY: 4, markerWidth: 6, markerHeight: 6,
                             orient: "auto-start-reverse"}, defs);
-    el("path", {d: "M 0 0 L 8 4 L 0 8 Z", fill: cat.color}, m);
+    el("path", {d: "M 0 0 L 8 4 L 0 8 Z", fill: pick(cat.color)}, m);
   });
   const arrowsG = el("g", {}, svg);
   for (const a of seg.arrows) {
     const evA = events[a.from], evB = events[a.to];
     el("line", {x1: laneX(seg, evA.lane), y1: TOP_PAD + a.from * ROW_H,
                 x2: laneX(seg, evB.lane), y2: TOP_PAD + a.to * ROW_H,
-                stroke: CATS[a.cat].color, class: "arrow",
+                stroke: pick(CATS[a.cat].color), class: "arrow",
                 "marker-end": `url(#arr-${idx}-${a.cat})`,
                 "data-cat": a.cat,
                 "data-lanes": evA.lane + "," + evB.lane}, arrowsG);
@@ -605,6 +616,7 @@ function buildSidebar() {
 }
 
 function buildUI(idx) {
+  CUR_IDX = idx;
   CUR = TRACES[idx].data;
   SPARSE = CUR.sparse;
   ROW_H = SPARSE ? 24 : 12;
@@ -625,7 +637,7 @@ function buildUI(idx) {
   const catBox = document.getElementById("cat-filters");
   CATS.forEach((cat, i) => {
     if (!usedCats.has(i)) return;
-    chip(catBox, `${cat.label} ${SHAPE_GLYPH[cat.shape]}`, cat.color,
+    chip(catBox, `${cat.label} ${SHAPE_GLYPH[cat.shape]}`, pick(cat.color),
          on => on ? state.cats.add(i) : state.cats.delete(i));
   });
   const laneBox = document.getElementById("lane-filters");
@@ -649,7 +661,7 @@ function buildUI(idx) {
       const quiet = CUR.bandQuiet.includes(value);
       const sw = document.createElement("span");
       sw.className = "swatch";
-      sw.style.background = quiet ? "transparent" : color + "60";
+      sw.style.background = quiet ? "transparent" : pick(color) + "60";
       item.appendChild(sw);
       item.appendChild(document.createTextNode(" " + value +
         (quiet ? " (untinted)" : "")));
