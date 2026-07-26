@@ -768,6 +768,13 @@ Packed private-cache values are decoded into `@Vector(4, u16)` lanes before
 either the u16 store or i32 widening store. Little-endian builds retain the
 zero-cost scalar bitcast; big-endian builds construct semantic lanes explicitly.
 Token order is therefore portable without a runtime branch in the hit path.
+The generic 64-byte classifier likewise normalizes its vector predicate masks
+at compile time so lane N always becomes boundary bit N; little-endian builds
+retain the direct bitcast while big-endian builds use one bit reversal. The
+4 KiB boundary-position table stores `@Vector(8, u16)` values directly rather
+than packing lanes through a byte-order-sensitive scalar `u128`. Fixed-grid
+scanning and stable-boundary replay therefore preserve byte and endpoint order
+on both endian layouts without adding work to little-endian production paths.
 Baseline AArch64, x86-64, and big-endian PowerPC64 cross-builds cover the
 implementation. The benchmark also uses checked multiplication and accumulation
 for sample bytes and token counts, rejecting configurations whose reported

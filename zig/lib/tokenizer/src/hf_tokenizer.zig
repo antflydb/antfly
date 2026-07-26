@@ -3827,17 +3827,17 @@ pub const HfTokenizer = struct {
         scan: usize = 0,
     };
 
-    const gpt2_boundary_byte_positions: [256]u128 = blk: {
+    const Gpt2BoundaryPositions = @Vector(8, u16);
+
+    const gpt2_boundary_byte_positions: [256]Gpt2BoundaryPositions = blk: {
         @setEvalBranchQuota(5000);
-        var table: [256]u128 = undefined;
+        var table: [256]Gpt2BoundaryPositions = undefined;
         for (0..256) |value| {
-            var positions: u128 = 0;
+            var positions: Gpt2BoundaryPositions = @splat(0);
             var bits: u8 = @intCast(value);
             var lane: usize = 0;
             while (bits != 0) : (lane += 1) {
-                const bit: u16 = @intCast(@ctz(bits));
-                positions |=
-                    @as(u128, bit) << @intCast(lane * @bitSizeOf(u16));
+                positions[lane] = @intCast(@ctz(bits));
                 bits &= bits - 1;
             }
             table[value] = positions;
@@ -3875,7 +3875,6 @@ pub const HfTokenizer = struct {
             const exclusive = inclusive << 8;
             const relative_base: u16 =
                 @intCast(block_base - fill_base);
-            const BoundaryPositions = @Vector(8, u16);
             inline for (0..@sizeOf(u64)) |byte_index| {
                 const byte_bits: u8 = @truncate(
                     bits_in >> @intCast(byte_index * 8),
@@ -3886,19 +3885,18 @@ pub const HfTokenizer = struct {
                         exclusive >> @intCast(byte_index * 8),
                     ),
                 );
-                const positions: BoundaryPositions = @bitCast(
-                    gpt2_boundary_byte_positions[byte_bits],
-                );
+                const positions =
+                    gpt2_boundary_byte_positions[byte_bits];
                 const adjusted =
                     positions +
                     @as(
-                        BoundaryPositions,
+                        Gpt2BoundaryPositions,
                         @splat(
                             relative_base +
                                 @as(u16, byte_index * 8),
                         ),
                     );
-                const destination: *align(1) BoundaryPositions =
+                const destination: *align(1) Gpt2BoundaryPositions =
                     @ptrCast(ends.ptr + count.* + write_offset);
                 destination.* = adjusted;
             }
@@ -7346,6 +7344,62 @@ const Gpt2BoundaryMasks = struct {
     bad: u64,
 };
 
+const Gpt2BoolVector = @Vector(64, bool);
+const Gpt2ByteVector = @Vector(64, u8);
+
+inline fn normalizeGpt2PredicateMask(
+    comptime native_endian: std.builtin.Endian,
+    native_mask: u64,
+) u64 {
+    // A vector-to-scalar bitcast follows target byte order. The boundary
+    // scanner's semantic contract instead requires lane N to become bit N.
+    // This remains a no-op on little-endian targets and one bit-reverse on
+    // big-endian targets, selected entirely at compile time.
+    return if (comptime native_endian == .little)
+        native_mask
+    else
+        @bitReverse(native_mask);
+}
+
+inline fn gpt2PredicateMask(predicate: Gpt2BoolVector) u64 {
+    return normalizeGpt2PredicateMask(
+        builtin.cpu.arch.endian(),
+        @bitCast(predicate),
+    );
+}
+
+inline fn gpt2PortableClassMasks(
+    text: []const u8,
+    start: usize,
+) Gpt2AsciiClassMasks {
+    const bytes: Gpt2ByteVector = text[start..][0..64].*;
+    const lower = bytes | @as(Gpt2ByteVector, @splat(0x20));
+    const letters_vec: Gpt2BoolVector =
+        (lower >= @as(Gpt2ByteVector, @splat('a'))) &
+        (lower <= @as(Gpt2ByteVector, @splat('z')));
+    const digits_vec: Gpt2BoolVector =
+        (bytes >= @as(Gpt2ByteVector, @splat('0'))) &
+        (bytes <= @as(Gpt2ByteVector, @splat('9')));
+    const spaces_vec: Gpt2BoolVector =
+        bytes == @as(Gpt2ByteVector, @splat(' '));
+    const control_ws_vec: Gpt2BoolVector =
+        (bytes >= @as(Gpt2ByteVector, @splat(9))) &
+        (bytes <= @as(Gpt2ByteVector, @splat(13)));
+    const spaces = gpt2PredicateMask(spaces_vec);
+    return .{
+        .letters = gpt2PredicateMask(letters_vec),
+        .digits = gpt2PredicateMask(digits_vec),
+        .spaces = spaces,
+        .whitespace = spaces | gpt2PredicateMask(control_ws_vec),
+        .high_bytes = gpt2PredicateMask(
+            bytes >= @as(Gpt2ByteVector, @splat(0x80)),
+        ),
+        .apostrophes = gpt2PredicateMask(
+            bytes == @as(Gpt2ByteVector, @splat('\'')),
+        ),
+    };
+}
+
 const NeonBytes = @Vector(16, u8);
 
 inline fn neonPredicateMask(predicate: @Vector(16, bool)) NeonBytes {
@@ -7732,37 +7786,8 @@ fn gpt2GridBoundaryMasks(
     }
     const classes = if (comptime builtin.cpu.arch == .aarch64)
         gpt2Aarch64ClassMasks(text, start)
-    else blk: {
-        const ByteVector = @Vector(batch_len, u8);
-        const BoolVector = @Vector(batch_len, bool);
-        const block: [batch_len]u8 = text[start..][0..batch_len].*;
-        const bytes: ByteVector = block;
-        const lower = bytes | @as(ByteVector, @splat(0x20));
-        const letters_vec: BoolVector =
-            (lower >= @as(ByteVector, @splat('a'))) &
-            (lower <= @as(ByteVector, @splat('z')));
-        const digits_vec: BoolVector =
-            (bytes >= @as(ByteVector, @splat('0'))) &
-            (bytes <= @as(ByteVector, @splat('9')));
-        const spaces_vec: BoolVector =
-            bytes == @as(ByteVector, @splat(' '));
-        const control_ws_vec: BoolVector =
-            (bytes >= @as(ByteVector, @splat(9))) &
-            (bytes <= @as(ByteVector, @splat(13)));
-        break :blk Gpt2AsciiClassMasks{
-            .letters = @bitCast(letters_vec),
-            .digits = @bitCast(digits_vec),
-            .spaces = @bitCast(spaces_vec),
-            .whitespace = @as(u64, @bitCast(spaces_vec)) |
-                @as(u64, @bitCast(control_ws_vec)),
-            .high_bytes = @bitCast(
-                bytes >= @as(ByteVector, @splat(0x80)),
-            ),
-            .apostrophes = @bitCast(
-                bytes == @as(ByteVector, @splat('\'')),
-            ),
-        };
-    };
+    else
+        gpt2PortableClassMasks(text, start);
     if (classes.high_bytes != 0)
         return gpt2ExtendedGridBoundaryMasks(text, start, classes);
 
@@ -7843,37 +7868,8 @@ fn gpt2AsciiBoundaryMask(text: []const u8, start: usize) ?u64 {
 
     const classes = if (comptime builtin.cpu.arch == .aarch64)
         gpt2Aarch64ClassMasks(text, start)
-    else blk: {
-        const ByteVector = @Vector(batch_len, u8);
-        const BoolVector = @Vector(batch_len, bool);
-        const block: [batch_len]u8 = text[start..][0..batch_len].*;
-        const bytes: ByteVector = block;
-        const lower = bytes | @as(ByteVector, @splat(0x20));
-        const letters_vec: BoolVector =
-            (lower >= @as(ByteVector, @splat('a'))) &
-            (lower <= @as(ByteVector, @splat('z')));
-        const digits_vec: BoolVector =
-            (bytes >= @as(ByteVector, @splat('0'))) &
-            (bytes <= @as(ByteVector, @splat('9')));
-        const spaces_vec: BoolVector =
-            bytes == @as(ByteVector, @splat(' '));
-        const control_ws_vec: BoolVector =
-            (bytes >= @as(ByteVector, @splat(9))) &
-            (bytes <= @as(ByteVector, @splat(13)));
-        break :blk Gpt2AsciiClassMasks{
-            .letters = @bitCast(letters_vec),
-            .digits = @bitCast(digits_vec),
-            .spaces = @bitCast(spaces_vec),
-            .whitespace = @as(u64, @bitCast(spaces_vec)) |
-                @as(u64, @bitCast(control_ws_vec)),
-            .high_bytes = @bitCast(
-                bytes >= @as(ByteVector, @splat(0x80)),
-            ),
-            .apostrophes = @bitCast(
-                bytes == @as(ByteVector, @splat('\'')),
-            ),
-        };
-    };
+    else
+        gpt2PortableClassMasks(text, start);
     const letters = classes.letters;
     const digits = classes.digits;
     const spaces = classes.spaces;
@@ -8476,6 +8472,46 @@ test "gpt2 ASCII vector scanner matches scalar boundaries" {
     }
 
     try std.testing.expectEqualSlices(usize, scalar.items, vectorized.items);
+}
+
+test "gpt2 SIMD predicate masks preserve byte order" {
+    const expected =
+        (@as(u64, 1) << 0) |
+        (@as(u64, 1) << 7) |
+        (@as(u64, 1) << 32) |
+        (@as(u64, 1) << 63);
+
+    var predicate: Gpt2BoolVector = @splat(false);
+    predicate[0] = true;
+    predicate[7] = true;
+    predicate[32] = true;
+    predicate[63] = true;
+    try std.testing.expectEqual(expected, gpt2PredicateMask(predicate));
+
+    // Exercise both compile-time layouts even when the test host is
+    // little-endian. A big-endian vector bitcast presents the semantic mask
+    // in reversed scalar-bit order.
+    try std.testing.expectEqual(
+        expected,
+        normalizeGpt2PredicateMask(.little, expected),
+    );
+    try std.testing.expectEqual(
+        expected,
+        normalizeGpt2PredicateMask(.big, @bitReverse(expected)),
+    );
+}
+
+test "gpt2 boundary lookup preserves semantic lane order" {
+    const positions =
+        HfTokenizer.gpt2_boundary_byte_positions[0b1011_0101];
+    try std.testing.expectEqual(@as(u16, 0), positions[0]);
+    try std.testing.expectEqual(@as(u16, 2), positions[1]);
+    try std.testing.expectEqual(@as(u16, 4), positions[2]);
+    try std.testing.expectEqual(@as(u16, 5), positions[3]);
+    try std.testing.expectEqual(@as(u16, 7), positions[4]);
+    try std.testing.expectEqual(@as(u16, 0), positions[5]);
+    try std.testing.expectEqual(@as(u16, 0), positions[6]);
+    try std.testing.expectEqual(@as(u16, 0), positions[7]);
 }
 
 test "gpt2 two-phase fixed-grid fill matches scalar boundaries" {
