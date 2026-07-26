@@ -1462,7 +1462,10 @@ func reclaimStaleClusterBackupAttempt(
 	s3Info *common.S3Info,
 	attempt *ClusterBackupAttempt,
 ) (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		clusterBackupAttemptCleanupTimeout,
+	)
 	defer cancel()
 	availabilityErr := ensureClusterMetadataAbsent(
 		ctx,
@@ -2101,8 +2104,8 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 	var attemptLease *clusterBackupAttemptLeaseController
 	cleanupMetadataPublished := make([]bool, len(tableNames))
 	defer func() {
-		attemptLease.Stop()
 		if committed {
+			attemptLease.Stop()
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			if err := deleteClusterBackupAttemptLease(
 				cleanupCtx,
@@ -2120,9 +2123,22 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !cleanupSafe {
+			attemptLease.Stop()
 			t.logger.Error(
 				"Cluster backup publication outcome is ambiguous; retaining fenced attempt",
 				zap.String("backup_id", req.BackupId),
+			)
+			return
+		}
+		leaseCtx, leaseCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		leaseOwned, leaseErr := attemptLease.StopAndAcquireCleanupWindow(leaseCtx)
+		leaseCancel()
+		if leaseErr != nil || !leaseOwned {
+			t.logger.Error(
+				"Cluster backup attempt no longer owns cleanup; retaining fenced attempt",
+				zap.String("backup_id", req.BackupId),
+				zap.String("attempt_id", attemptID),
+				zap.Error(leaseErr),
 			)
 			return
 		}
@@ -2136,7 +2152,10 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		for _, names := range cleanupArtifactsByTable {
 			cleanupArtifacts = append(cleanupArtifacts, names...)
 		}
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			clusterBackupAttemptCleanupTimeout,
+		)
 		defer cleanupCancel()
 		if err := cleanupBackupAttemptContents(
 			cleanupCtx,
@@ -2241,6 +2260,9 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		attemptID,
 	)
 	if err != nil {
+		// The marker may have survived a crash-window recovery claim. Without
+		// an active lease this producer must not delete shared retry objects.
+		cleanupSafe = false
 		writeBackupError(w, "Failed to establish backup attempt lease", err)
 		return
 	}

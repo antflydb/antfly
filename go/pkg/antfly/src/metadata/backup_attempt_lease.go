@@ -37,6 +37,7 @@ const (
 	clusterBackupAttemptLeaseDuration      = 10 * time.Minute
 	clusterBackupAttemptLeaseRenewInterval = time.Minute
 	clusterBackupAttemptLeaseSafetyMargin  = time.Minute
+	clusterBackupAttemptCleanupTimeout     = 2 * time.Minute
 
 	clusterBackupAttemptLeaseStateActive     = "active"
 	clusterBackupAttemptLeaseStateReclaiming = "reclaiming"
@@ -357,21 +358,19 @@ func claimExpiredClusterBackupAttemptLease(
 		attemptID,
 		func(current *clusterBackupAttemptLeaseRecord) (*clusterBackupAttemptLeaseRecord, bool, error) {
 			if current == nil {
-				// A missing sidecar identifies an attempt written before the
-				// lease protocol. The deprecated Go producer has a documented
-				// quiescent-upgrade requirement; after the reclaim grace, a
-				// create-only claim migrates that legacy journal into the same
-				// fenced cleanup protocol as current attempts.
+				// The attempt marker is published before its lease. A crash in
+				// that window leaves no sidecar, so recovery creates the
+				// reclaiming record atomically before deleting shared objects.
 				return &clusterBackupAttemptLeaseRecord{
 					Version:    clusterBackupAttemptLeaseVersion,
 					AttemptID:  attemptID,
 					Generation: 1,
 					State:      clusterBackupAttemptLeaseStateReclaiming,
-					ExpiresAt:  now.UTC().Add(clusterBackupAttemptLeaseDuration),
+					ExpiresAt: now.UTC().Add(
+						clusterBackupAttemptCleanupTimeout +
+							clusterBackupAttemptLeaseSafetyMargin,
+					),
 				}, true, nil
-			}
-			if current.State == clusterBackupAttemptLeaseStateReclaiming {
-				return nil, true, nil
 			}
 			if current.ExpiresAt.After(now.UTC()) {
 				return nil, false, nil
@@ -382,6 +381,10 @@ func claimExpiredClusterBackupAttemptLease(
 			next := *current
 			next.Generation++
 			next.State = clusterBackupAttemptLeaseStateReclaiming
+			next.ExpiresAt = now.UTC().Add(
+				clusterBackupAttemptCleanupTimeout +
+					clusterBackupAttemptLeaseSafetyMargin,
+			)
 			return &next, true, nil
 		},
 	)
@@ -412,8 +415,11 @@ func deleteClusterBackupAttemptLease(
 }
 
 type clusterBackupAttemptLeaseController struct {
-	stop context.CancelFunc
-	done <-chan struct{}
+	stop             context.CancelFunc
+	done             <-chan struct{}
+	resolvedLocation string
+	s3Info           *common.S3Info
+	attemptID        string
 }
 
 func startClusterBackupAttemptLease(
@@ -433,7 +439,10 @@ func startClusterBackupAttemptLease(
 	); err != nil {
 		return nil, err
 	}
-	leaseCtx, stop := context.WithCancel(ctx)
+	// The operation context still cancels backup work, but lease ownership
+	// must survive long enough to perform bounded cleanup after a client
+	// disconnect. The handler stops this context explicitly on every exit.
+	leaseCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -469,7 +478,13 @@ func startClusterBackupAttemptLease(
 			}
 		}
 	}()
-	return &clusterBackupAttemptLeaseController{stop: stop, done: done}, nil
+	return &clusterBackupAttemptLeaseController{
+		stop:             stop,
+		done:             done,
+		resolvedLocation: resolvedLocation,
+		s3Info:           s3Info,
+		attemptID:        attemptID,
+	}, nil
 }
 
 func (controller *clusterBackupAttemptLeaseController) Stop() {
@@ -478,4 +493,25 @@ func (controller *clusterBackupAttemptLeaseController) Stop() {
 	}
 	controller.stop()
 	<-controller.done
+}
+
+// StopAndAcquireCleanupWindow stops background renewal, then atomically proves
+// that this producer still owns an active lease and extends it beyond the
+// bounded cleanup deadline. A fenced or ambiguous producer must leave cleanup
+// to the reclaiming owner.
+func (controller *clusterBackupAttemptLeaseController) StopAndAcquireCleanupWindow(
+	ctx context.Context,
+) (bool, error) {
+	if controller == nil {
+		return false, nil
+	}
+	controller.Stop()
+	_, owned, err := renewClusterBackupAttemptLease(
+		ctx,
+		controller.resolvedLocation,
+		controller.s3Info,
+		controller.attemptID,
+		time.Now().UTC(),
+	)
+	return owned, err
 }

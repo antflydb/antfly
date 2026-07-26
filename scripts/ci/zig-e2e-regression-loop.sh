@@ -12,6 +12,13 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # Elastic License 2.0 for the specific language governing permissions and
 # limitations.
+#
+# Serial regression loop:
+#   ANTFLY_E2E_REGRESSION_REPEATS=20 scripts/ci/zig-e2e-regression-loop.sh
+#
+# Mixed-load lifecycle race soak:
+#   ANTFLY_E2E_REGRESSION_WORKERS=3 ANTFLY_E2E_REGRESSION_REPEATS=20 \
+#     scripts/ci/zig-e2e-regression-loop.sh
 
 set -euo pipefail
 

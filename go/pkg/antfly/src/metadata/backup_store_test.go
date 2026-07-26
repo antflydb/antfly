@@ -1268,6 +1268,114 @@ func TestClusterBackupAttemptLeaseCannotRenewAfterReclamationClaim(t *testing.T)
 	require.False(t, owned)
 }
 
+func TestClusterBackupAttemptReclamationClaimIsExclusiveAndRecoverable(t *testing.T) {
+	root := t.TempDir()
+	location := "file://" + root
+	attemptID := "afba-exclusive-reclaim"
+	startedAt := time.Now().UTC()
+	require.NoError(t, createClusterBackupAttemptLease(
+		context.Background(),
+		location,
+		nil,
+		attemptID,
+		startedAt,
+	))
+
+	claimAt := startedAt.Add(clusterBackupAttemptLeaseDuration + time.Second)
+	claimed, err := claimExpiredClusterBackupAttemptLease(
+		context.Background(),
+		location,
+		nil,
+		attemptID,
+		claimAt,
+	)
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	leasePath := clusterBackupAttemptLeasePath(location, attemptID)
+	reclaiming, err := readClusterBackupAttemptLeaseFile(leasePath, attemptID)
+	require.NoError(t, err)
+	require.NotNil(t, reclaiming)
+	require.Equal(t, clusterBackupAttemptLeaseStateReclaiming, reclaiming.State)
+	require.Equal(t, uint64(2), reclaiming.Generation)
+
+	claimed, err = claimExpiredClusterBackupAttemptLease(
+		context.Background(),
+		location,
+		nil,
+		attemptID,
+		claimAt.Add(time.Second),
+	)
+	require.NoError(t, err)
+	require.False(t, claimed)
+
+	claimed, err = claimExpiredClusterBackupAttemptLease(
+		context.Background(),
+		location,
+		nil,
+		attemptID,
+		reclaiming.ExpiresAt.Add(time.Second),
+	)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	recovered, err := readClusterBackupAttemptLeaseFile(leasePath, attemptID)
+	require.NoError(t, err)
+	require.NotNil(t, recovered)
+	require.Equal(t, uint64(3), recovered.Generation)
+	require.True(t, recovered.ExpiresAt.After(reclaiming.ExpiresAt))
+}
+
+func TestClusterBackupAttemptProducerReprovesLeaseBeforeCleanup(t *testing.T) {
+	root := t.TempDir()
+	location := "file://" + root
+	activeController, err := startClusterBackupAttemptLease(
+		context.Background(),
+		func() {},
+		location,
+		nil,
+		"afba-active-cleanup-owner",
+	)
+	require.NoError(t, err)
+	owned, err := activeController.StopAndAcquireCleanupWindow(context.Background())
+	require.NoError(t, err)
+	require.True(t, owned)
+
+	attemptID := "afba-cleanup-owner"
+	controller, err := startClusterBackupAttemptLease(
+		context.Background(),
+		func() {},
+		location,
+		nil,
+		attemptID,
+	)
+	require.NoError(t, err)
+
+	_, err = mutateClusterBackupAttemptLease(
+		context.Background(),
+		location,
+		nil,
+		attemptID,
+		func(
+			current *clusterBackupAttemptLeaseRecord,
+		) (*clusterBackupAttemptLeaseRecord, bool, error) {
+			require.NotNil(t, current)
+			next := *current
+			next.Generation++
+			next.State = clusterBackupAttemptLeaseStateReclaiming
+			next.ExpiresAt = time.Now().UTC().Add(
+				clusterBackupAttemptCleanupTimeout +
+					clusterBackupAttemptLeaseSafetyMargin,
+			)
+			return &next, true, nil
+		},
+	)
+	require.NoError(t, err)
+
+	owned, err = controller.StopAndAcquireCleanupWindow(context.Background())
+	require.NoError(t, err)
+	require.False(t, owned)
+}
+
 func TestExpiredAuthoritativeAttemptRetiresHeadBeforeKeepingJournal(t *testing.T) {
 	root := t.TempDir()
 	location := "file://" + root

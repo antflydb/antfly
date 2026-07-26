@@ -1912,6 +1912,9 @@ fn activeRangeTransitionCountForTable(current: CurrentMetadataState, table_id: u
 
 fn mergedGroupStatus(current: CurrentMetadataState, group_id: u64) ?MergedGroupStatus {
     if (current.merged_group_statuses.len > 0) {
+        // Captured state already merges placement-fenced storage and runtime
+        // facts. Re-reading stores here would mix snapshots and rescan the
+        // entire topology once per planned shard.
         for (current.merged_group_statuses) |status| {
             if (status.group_id == group_id) return status;
         }
