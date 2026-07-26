@@ -491,7 +491,17 @@ pub const AdmissionController = struct {
         try checkAdmissionLimit(request_kv, next_kv, limits.kv_limit_bytes);
         try checkAdmissionLimit(request_scratch, next_scratch, limits.scratch_limit_bytes);
 
-        if (check_live_memory) try checkLiveHostMemory(request_combined);
+        if (check_live_memory) {
+            // Metal allocations consume unified system memory. CUDA allocations are
+            // accounted against the backend budget and must not also be charged to
+            // Linux MemAvailable, or a valid device-resident model is rejected merely
+            // because its VRAM footprint exceeds free host RAM.
+            const live_host_incremental = if (builtin.os.tag == .macos)
+                request_combined
+            else
+                request_host;
+            try checkLiveHostMemory(live_host_incremental);
+        }
         self.admitted = next;
         return .{ .controller = self, .amounts = amounts };
     }
@@ -582,6 +592,7 @@ fn staticLimitsForBackend(backend: BackendClass) Limits {
 pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
     return switch (builtin.os.tag) {
         .macos => probeSystemMemoryInfoMacos(),
+        .linux => probeSystemMemoryInfoLinux(),
         else => null,
     };
 }
@@ -646,6 +657,237 @@ fn probeSystemMemoryInfoMacos() ?SystemMemoryInfo {
         .total_bytes = @intCast(total_raw),
         .available_bytes = @intCast(@min(available_bytes_u64, total_raw)),
     };
+}
+
+const LinuxMemInfoFields = struct {
+    total_kib: u64 = 0,
+    available_kib: ?u64 = null,
+    free_kib: u64 = 0,
+    buffers_kib: u64 = 0,
+    cached_kib: u64 = 0,
+    reclaimable_kib: u64 = 0,
+    shmem_kib: u64 = 0,
+};
+
+const CgroupMemoryInfo = struct {
+    limit_bytes: ?usize = null,
+    current_bytes: ?usize = null,
+};
+
+const CgroupPaths = struct {
+    v2: ?[]const u8 = null,
+    v1_memory: ?[]const u8 = null,
+};
+
+fn readSmallLinuxFile(path: []const u8, buffer: []u8) ?[]const u8 {
+    if (builtin.os.tag != .linux or buffer.len == 0) return null;
+    const fd = std.posix.openat(
+        std.posix.AT.FDCWD,
+        path,
+        .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+        0,
+    ) catch return null;
+    defer _ = std.posix.system.close(fd);
+
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const count = std.posix.read(fd, buffer[used..]) catch return null;
+        if (count == 0) break;
+        used += count;
+    }
+    if (used == 0) return null;
+    return buffer[0..used];
+}
+
+fn parseLinuxMemInfo(bytes: []const u8) ?SystemMemoryInfo {
+    var fields = LinuxMemInfoFields{};
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = line[0..colon];
+        var values = std.mem.tokenizeAny(u8, line[colon + 1 ..], " \t");
+        const raw = values.next() orelse continue;
+        const value = std.fmt.parseUnsigned(u64, raw, 10) catch continue;
+        if (std.mem.eql(u8, key, "MemTotal")) {
+            fields.total_kib = value;
+        } else if (std.mem.eql(u8, key, "MemAvailable")) {
+            fields.available_kib = value;
+        } else if (std.mem.eql(u8, key, "MemFree")) {
+            fields.free_kib = value;
+        } else if (std.mem.eql(u8, key, "Buffers")) {
+            fields.buffers_kib = value;
+        } else if (std.mem.eql(u8, key, "Cached")) {
+            fields.cached_kib = value;
+        } else if (std.mem.eql(u8, key, "SReclaimable")) {
+            fields.reclaimable_kib = value;
+        } else if (std.mem.eql(u8, key, "Shmem")) {
+            fields.shmem_kib = value;
+        }
+    }
+    if (fields.total_kib == 0) return null;
+
+    const available_kib = fields.available_kib orelse blk: {
+        var fallback = std.math.add(u64, fields.free_kib, fields.buffers_kib) catch
+            std.math.maxInt(u64);
+        fallback = std.math.add(u64, fallback, fields.cached_kib) catch
+            std.math.maxInt(u64);
+        fallback = std.math.add(u64, fallback, fields.reclaimable_kib) catch
+            std.math.maxInt(u64);
+        break :blk fallback -| fields.shmem_kib;
+    };
+    const total_bytes_u64 = std.math.mul(u64, fields.total_kib, 1024) catch return null;
+    const available_bytes_u64 = std.math.mul(u64, available_kib, 1024) catch
+        std.math.maxInt(u64);
+    return .{
+        .total_bytes = std.math.cast(usize, total_bytes_u64) orelse return null,
+        .available_bytes = std.math.cast(
+            usize,
+            @min(available_bytes_u64, total_bytes_u64),
+        ),
+    };
+}
+
+fn controllerListContains(controllers: []const u8, expected: []const u8) bool {
+    var it = std.mem.splitScalar(u8, controllers, ',');
+    while (it.next()) |controller| {
+        if (std.mem.eql(u8, controller, expected)) return true;
+    }
+    return false;
+}
+
+fn parseCgroupPaths(bytes: []const u8) CgroupPaths {
+    var result = CgroupPaths{};
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        const first = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const second = std.mem.indexOfScalarPos(u8, line, first + 1, ':') orelse continue;
+        const hierarchy = line[0..first];
+        const controllers = line[first + 1 .. second];
+        const path = line[second + 1 ..];
+        if (path.len == 0 or path[0] != '/' or std.mem.indexOf(u8, path, "..") != null) continue;
+        if (std.mem.eql(u8, hierarchy, "0") and controllers.len == 0) {
+            result.v2 = path;
+        } else if (controllerListContains(controllers, "memory")) {
+            result.v1_memory = path;
+        }
+    }
+    return result;
+}
+
+fn cgroupFilePath(
+    buffer: []u8,
+    root: []const u8,
+    relative: []const u8,
+    filename: []const u8,
+) ?[]const u8 {
+    if (relative.len == 0 or relative[0] != '/') return null;
+    return if (std.mem.eql(u8, relative, "/"))
+        std.fmt.bufPrint(buffer, "{s}/{s}", .{ root, filename }) catch null
+    else
+        std.fmt.bufPrint(buffer, "{s}{s}/{s}", .{ root, relative, filename }) catch null;
+}
+
+fn readLinuxUnsignedFile(path: []const u8) ?usize {
+    var buffer: [128]u8 = undefined;
+    const bytes = readSmallLinuxFile(path, &buffer) orelse return null;
+    const raw = std.mem.trim(u8, bytes, " \t\r\n");
+    if (raw.len == 0 or std.mem.eql(u8, raw, "max")) return null;
+    return std.fmt.parseUnsigned(usize, raw, 10) catch null;
+}
+
+fn readCgroupPair(
+    root: []const u8,
+    relative: []const u8,
+    limit_filename: []const u8,
+    current_filename: []const u8,
+) CgroupMemoryInfo {
+    var limit_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var current_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const limit_path = cgroupFilePath(
+        &limit_path_buffer,
+        root,
+        relative,
+        limit_filename,
+    ) orelse return .{};
+    const current_path = cgroupFilePath(
+        &current_path_buffer,
+        root,
+        relative,
+        current_filename,
+    ) orelse return .{};
+    return .{
+        .limit_bytes = readLinuxUnsignedFile(limit_path),
+        .current_bytes = readLinuxUnsignedFile(current_path),
+    };
+}
+
+fn probeCgroupMemoryInfoLinux() CgroupMemoryInfo {
+    var cgroup_buffer: [4096]u8 = undefined;
+    const cgroup_bytes = readSmallLinuxFile("/proc/self/cgroup", &cgroup_buffer) orelse
+        return .{};
+    const paths = parseCgroupPaths(cgroup_bytes);
+    if (paths.v2) |path| {
+        const info = readCgroupPair(
+            "/sys/fs/cgroup",
+            path,
+            "memory.max",
+            "memory.current",
+        );
+        if (info.limit_bytes != null) return info;
+    }
+    if (paths.v1_memory) |path| {
+        const info = readCgroupPair(
+            "/sys/fs/cgroup/memory",
+            path,
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
+        );
+        if (info.limit_bytes != null) return info;
+    }
+
+    // Cgroup namespaces commonly expose the process cgroup as the mount root.
+    var fallback = CgroupMemoryInfo{
+        .limit_bytes = readLinuxUnsignedFile("/sys/fs/cgroup/memory.max"),
+        .current_bytes = readLinuxUnsignedFile("/sys/fs/cgroup/memory.current"),
+    };
+    if (fallback.limit_bytes != null) return fallback;
+    fallback = .{
+        .limit_bytes = readLinuxUnsignedFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+        .current_bytes = readLinuxUnsignedFile("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    };
+    return fallback;
+}
+
+fn applyCgroupMemoryInfo(
+    host: SystemMemoryInfo,
+    cgroup: CgroupMemoryInfo,
+) SystemMemoryInfo {
+    const raw_limit = cgroup.limit_bytes orelse return host;
+    // Cgroup v1 represents "unlimited" with a very large numeric sentinel.
+    // Ignore any limit above host RAM; applying memory.current to that sentinel
+    // would incorrectly subtract process usage from MemAvailable a second time.
+    if (raw_limit > host.total_bytes) return host;
+    const limit = raw_limit;
+    var available = host.available_bytes;
+    if (cgroup.current_bytes) |current| {
+        const cgroup_available = limit -| @min(current, limit);
+        available = if (available) |host_available|
+            @min(host_available, cgroup_available)
+        else
+            cgroup_available;
+    }
+    return .{
+        .total_bytes = limit,
+        .available_bytes = if (available) |value| @min(value, limit) else null,
+    };
+}
+
+fn probeSystemMemoryInfoLinux() ?SystemMemoryInfo {
+    if (builtin.os.tag != .linux) return null;
+    var meminfo_buffer: [8192]u8 = undefined;
+    const bytes = readSmallLinuxFile("/proc/meminfo", &meminfo_buffer) orelse return null;
+    const host = parseLinuxMemInfo(bytes) orelse return null;
+    return applyCgroupMemoryInfo(host, probeCgroupMemoryInfoLinux());
 }
 
 fn mib(value: usize) usize {
@@ -770,6 +1012,58 @@ fn checkedProduct(values: []const usize) !usize {
     var result: usize = 1;
     for (values) |value| result = try std.math.mul(usize, result, value);
     return result;
+}
+
+test "linux meminfo parser uses MemAvailable and converts KiB" {
+    const info = parseLinuxMemInfo(
+        \\MemTotal:       16777216 kB
+        \\MemFree:         1048576 kB
+        \\MemAvailable:    4194304 kB
+        \\Buffers:          131072 kB
+        \\Cached:          2097152 kB
+        \\
+    ) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(gib(16), info.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(4)), info.available_bytes);
+}
+
+test "linux meminfo parser has a conservative legacy availability fallback" {
+    const info = parseLinuxMemInfo(
+        \\MemTotal:        8388608 kB
+        \\MemFree:          524288 kB
+        \\Buffers:          131072 kB
+        \\Cached:          1048576 kB
+        \\SReclaimable:     262144 kB
+        \\Shmem:            131072 kB
+        \\
+    ) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(gib(8), info.total_bytes);
+    try std.testing.expectEqual(@as(?usize, 1792 * 1024 * 1024), info.available_bytes);
+}
+
+test "cgroup paths and limits constrain host memory" {
+    const paths = parseCgroupPaths(
+        \\0::/system.slice/antfly.service
+        \\7:cpu,cpuacct:/system.slice/antfly.service
+        \\6:memory:/production/antfly
+        \\
+    );
+    try std.testing.expectEqualStrings("/system.slice/antfly.service", paths.v2.?);
+    try std.testing.expectEqualStrings("/production/antfly", paths.v1_memory.?);
+
+    const effective = applyCgroupMemoryInfo(
+        .{ .total_bytes = gib(64), .available_bytes = gib(32) },
+        .{ .limit_bytes = gib(16), .current_bytes = gib(12) },
+    );
+    try std.testing.expectEqual(gib(16), effective.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(4)), effective.available_bytes);
+
+    const v1_unlimited = applyCgroupMemoryInfo(
+        .{ .total_bytes = gib(64), .available_bytes = gib(32) },
+        .{ .limit_bytes = std.math.maxInt(usize) - 4095, .current_bytes = gib(12) },
+    );
+    try std.testing.expectEqual(gib(64), v1_unlimited.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(32)), v1_unlimited.available_bytes);
 }
 
 test "shared admission accounts for concurrent leases and releases capacity" {

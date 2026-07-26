@@ -3191,11 +3191,10 @@ pub const NativeGenerationPipeline = struct {
             );
         }
 
-        // Decode only the generated tokens
+        // Decode only the generated tokens. Channel-aware models project both the
+        // public text and public token IDs from the same slice so callers cannot
+        // reconstruct a withheld reasoning channel from GenerationResult.token_ids.
         const gen_start = prompt_token_count;
-        const gen_ids = try allocator.alloc(i32, seq_len - gen_start);
-        for (0..gen_ids.len) |i| gen_ids[i] = @intCast(token_ids[gen_start + i]);
-
         const final_channel_end_token_id = if (stream_enabled)
             streaming_text.final_channel_end_token_id
         else
@@ -3211,7 +3210,7 @@ pub const NativeGenerationPipeline = struct {
             finish_reason,
         );
         const projected_gen_ids = try allocator.alloc(i32, projected_gen_token_ids.len);
-        defer allocator.free(projected_gen_ids);
+        errdefer allocator.free(projected_gen_ids);
         for (projected_gen_token_ids, 0..) |token_id, idx| projected_gen_ids[idx] = @intCast(token_id);
 
         const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
@@ -3281,7 +3280,7 @@ pub const NativeGenerationPipeline = struct {
         }
         return .{
             .text = text,
-            .token_ids = gen_ids,
+            .token_ids = projected_gen_ids,
             .prompt_tokens = prompt_token_count,
             .tokens_used = tokens_generated,
             .finish_reason = finish_reason,
