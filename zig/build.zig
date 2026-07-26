@@ -4509,7 +4509,6 @@ pub fn build(b: *std.Build) void {
             "stale owned cluster backup attempt releases fences and retires authoritative head",
             "expired recovery preserves an oversized remote commit record",
             "cluster backup reservation heartbeat fences premature and stale recovery",
-            "legacy cluster reservation is reclaimed only after marker staleness",
             "filesystem cluster backup lease supports the maximum owner identity",
             "filesystem stale attempt reclamation index prevents directory-order starvation",
             "filesystem stale attempt reclamation recovers an abandoned claim",

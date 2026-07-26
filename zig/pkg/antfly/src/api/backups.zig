@@ -845,7 +845,6 @@ const RemoteBackupStore = struct {
         suffix: []const u8,
         now_unix_ns: u64,
         expected_owner: ?[]const u8,
-        allow_legacy: bool,
     ) !?[]u8 {
         const key = try self.keyAlloc(alloc, suffix);
         defer alloc.free(key);
@@ -866,7 +865,6 @@ const RemoteBackupStore = struct {
         if (!clusterBackupLeaseReclaimable(
             lease.expires_at_unix_ns,
             now_unix_ns,
-            allow_legacy,
         ))
             return null;
         const etag = current.metadata.etag orelse
@@ -1466,10 +1464,7 @@ pub const ClusterBackupAttemptHead = struct {
 
 const ClusterBackupReservationLease = struct {
     attempt_id: []const u8,
-    // Reservations written before renewable leases contain only
-    // "<attempt-id>\n". They have no trustworthy expiration and are eligible
-    // for takeover only from the separately age-gated marker reclaimer.
-    expires_at_unix_ns: ?u64,
+    expires_at_unix_ns: u64,
 };
 
 fn reservationOwner(body: []const u8) []const u8 {
@@ -1487,10 +1482,7 @@ fn parseClusterBackupReservationLease(body: []const u8) !ClusterBackupReservatio
         body[newline + 1 ..],
         " \t\r\n",
     );
-    if (expiration_text.len == 0) return .{
-        .attempt_id = attempt_id,
-        .expires_at_unix_ns = null,
-    };
+    if (expiration_text.len == 0) return error.InvalidBackupRequest;
     const expires_at_unix_ns = try std.fmt.parseInt(u64, expiration_text, 10);
     if (expires_at_unix_ns == 0) return error.InvalidBackupRequest;
     return .{
@@ -1500,13 +1492,11 @@ fn parseClusterBackupReservationLease(body: []const u8) !ClusterBackupReservatio
 }
 
 fn clusterBackupLeaseReclaimable(
-    expires_at_unix_ns: ?u64,
+    expires_at_unix_ns: u64,
     now_unix_ns: u64,
-    allow_legacy: bool,
 ) bool {
-    const expiration = expires_at_unix_ns orelse return allow_legacy;
     const reclaim_after_unix_ns =
-        expiration +| backup_attempt_lease_clock_skew_allowance_ns;
+        expires_at_unix_ns +| backup_attempt_lease_clock_skew_allowance_ns;
     return now_unix_ns >= reclaim_after_unix_ns;
 }
 
@@ -3385,7 +3375,6 @@ fn takeExpiredClusterReservationAtLocation(
     backup_id: []const u8,
     now_unix_ns: u64,
     expected_owner: ?[]const u8,
-    allow_legacy: bool,
 ) !?[]u8 {
     const reservation_suffix = try reservationPath(alloc, "", backup_id, true);
     defer alloc.free(reservation_suffix);
@@ -3420,7 +3409,6 @@ fn takeExpiredClusterReservationAtLocation(
             if (!clusterBackupLeaseReclaimable(
                 lease.expires_at_unix_ns,
                 now_unix_ns,
-                allow_legacy,
             )) {
                 break :blk null;
             }
@@ -3434,7 +3422,6 @@ fn takeExpiredClusterReservationAtLocation(
             trimLeftSlash(reservation_suffix),
             now_unix_ns,
             expected_owner,
-            allow_legacy,
         ),
     };
 }
@@ -3472,7 +3459,6 @@ pub fn reclaimExpiredClusterBackupAttemptAtLocation(
         backup_id,
         now_unix_ns,
         null,
-        false,
     )) orelse return false;
     defer alloc.free(attempt_id);
     var parsed = readClusterBackupAttemptMarker(
@@ -3572,7 +3558,6 @@ fn reclaimClusterBackupAttemptMarker(
                 marker.cluster_backup_id,
                 now_unix_ns,
                 marker.attempt_id,
-                true,
             );
             if (expired_owner) |owner| {
                 alloc.free(owner);
@@ -8185,96 +8170,6 @@ test "cluster backup reservation heartbeat fences premature and stale recovery" 
     try std.testing.expectError(
         error.FileNotFound,
         readClusterBackupAttemptMarker(alloc, io, &location, marker.attempt_id),
-    );
-}
-
-test "legacy cluster reservation is reclaimed only after marker staleness" {
-    const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
-    var memory = object_storage.MemoryObjectStorage.init(alloc);
-    defer memory.deinit();
-    var location: BackupLocation = .{
-        .remote = try RemoteBackupStore.initWithClient(
-            alloc,
-            memory.client(),
-            "bucket",
-            "backups",
-        ),
-    };
-    defer location.deinit(alloc);
-
-    const tables = [_]ClusterBackupAttemptTable{.{
-        .name = "docs",
-        .table_backup_id = "legacy-table",
-        .artifact_backup_id = "legacy-artifact",
-    }};
-    const marker: ClusterBackupAttemptMarker = .{
-        .attempt_id = "legacy-attempt",
-        .cluster_backup_id = "legacy-cluster",
-        .created_at_unix_ns = 1,
-        .format = .portable,
-        .tables = &tables,
-    };
-    try writeClusterBackupAttemptMarker(alloc, io, &location, &marker);
-    try writeClusterBackupAttemptHead(alloc, io, &location, marker.attempt_id);
-    const reservation_suffix = try reservationPath(
-        alloc,
-        "",
-        marker.cluster_backup_id,
-        true,
-    );
-    defer alloc.free(reservation_suffix);
-    try location.remote.writeBytesIfAbsent(
-        alloc,
-        trimLeftSlash(reservation_suffix),
-        "legacy-attempt\n",
-        "text/plain",
-    );
-
-    // Exact same-ID recovery is not age-gated, so it must never infer expiry
-    // for a legacy record that carries no expiration timestamp.
-    try std.testing.expect(!try reclaimExpiredClusterBackupAttemptAtLocation(
-        alloc,
-        io,
-        &location,
-        marker.cluster_backup_id,
-        std.math.maxInt(u64),
-    ));
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        try reclaimStaleClusterBackupAttempts(
-            alloc,
-            io,
-            &location,
-            backup_attempt_reclaim_age_ns,
-        ),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        try reclaimStaleClusterBackupAttempts(
-            alloc,
-            io,
-            &location,
-            backup_attempt_reclaim_age_ns + 1,
-        ),
-    );
-    try std.testing.expectError(
-        error.FileNotFound,
-        readClusterBackupAttemptMarker(alloc, io, &location, marker.attempt_id),
-    );
-    var handled_head = (try readClusterBackupAttemptHead(alloc, io, &location)) orelse
-        return error.TestUnexpectedResult;
-    defer handled_head.deinit();
-    try std.testing.expectEqual(ClusterBackupAttemptState.handled, handled_head.value.state);
-    try reserveClusterBackupAttemptLeaseAtLocation(
-        alloc,
-        io,
-        &location,
-        marker.cluster_backup_id,
-        "retry-attempt",
-        std.math.maxInt(u64),
     );
 }
 
