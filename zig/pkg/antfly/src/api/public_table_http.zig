@@ -73,6 +73,10 @@ pub const TableApi = struct {
 
     pub const ExecuteQueryError = error{
         InvalidQueryRequest,
+        InvalidFilterQueryRequest,
+        InvalidExclusionQueryRequest,
+        UnsupportedFilterQueryRequest,
+        UnsupportedExclusionQueryRequest,
         NotFound,
         DocIdentityUnavailable,
         ReadRequiresPrimary,
@@ -615,6 +619,30 @@ pub fn handleTableQueryRequest(
                 std.log.err("public table query invalid table={s} err={}", .{ table_name, err });
                 return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
             },
+            error.InvalidFilterQueryRequest => return publicFilterQueryErrorResponse(
+                alloc,
+                body,
+                "filter_query",
+                .invalid,
+            ),
+            error.InvalidExclusionQueryRequest => return publicFilterQueryErrorResponse(
+                alloc,
+                body,
+                "exclusion_query",
+                .invalid,
+            ),
+            error.UnsupportedFilterQueryRequest => return publicFilterQueryErrorResponse(
+                alloc,
+                body,
+                "filter_query",
+                .unsupported,
+            ),
+            error.UnsupportedExclusionQueryRequest => return publicFilterQueryErrorResponse(
+                alloc,
+                body,
+                "exclusion_query",
+                .unsupported,
+            ),
             error.NotFound => {
                 std.log.err("public table query missing table={s} err={}", .{ table_name, err });
                 return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
@@ -677,6 +705,24 @@ pub fn handleTableQueryRequest(
     return .{
         .status = 200,
         .body = response_body,
+    };
+}
+
+fn publicFilterQueryErrorResponse(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    field: []const u8,
+    kind: query_contract.PublicFilterQueryErrorKind,
+) !OwnedResponse {
+    return .{
+        .status = query_contract.publicFilterQueryErrorStatus(kind),
+        .body = try query_contract.encodePublicFilterQueryErrorBodyAlloc(
+            alloc,
+            body,
+            field,
+            kind,
+        ),
+        .json = true,
     };
 }
 
@@ -1779,6 +1825,86 @@ test "public table query handler maps doc identity unavailable errors" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+}
+
+test "public table query handler preserves structured filter diagnostics" {
+    const Backend = struct {
+        err: TableApi.ExecuteQueryError,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
+        }
+    };
+    const Case = struct {
+        err: TableApi.ExecuteQueryError,
+        field: []const u8,
+        status: u16,
+    };
+    const cases = [_]Case{
+        .{ .err = error.InvalidFilterQueryRequest, .field = "filter_query", .status = 400 },
+        .{ .err = error.InvalidExclusionQueryRequest, .field = "exclusion_query", .status = 400 },
+        .{ .err = error.UnsupportedFilterQueryRequest, .field = "filter_query", .status = 422 },
+        .{ .err = error.UnsupportedExclusionQueryRequest, .field = "exclusion_query", .status = 422 },
+    };
+    const body =
+        \\{"filter_query":{"disjuncts":[{"query_string":"status:active"}]},"exclusion_query":{"disjuncts":[{"query_string":"status:deleted"}]}}
+    ;
+    const Parsed = struct {
+        status: u16,
+        field: []const u8,
+        offending_node: []const u8,
+        retryable: bool,
+    };
+
+    for (cases) |tc| {
+        var backend = Backend{ .err = tc.err };
+        var resp = try handleTableQueryRequest(
+            std.testing.allocator,
+            "docs",
+            body,
+            null,
+            backend.iface(),
+        );
+        defer resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(tc.status, resp.status);
+        try std.testing.expect(resp.json);
+
+        var parsed = try std.json.parseFromSlice(
+            Parsed,
+            std.testing.allocator,
+            resp.body,
+            .{ .ignore_unknown_fields = true },
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqual(tc.status, parsed.value.status);
+        try std.testing.expectEqualStrings(tc.field, parsed.value.field);
+        try std.testing.expectEqualStrings("query_string", parsed.value.offending_node);
+        try std.testing.expect(!parsed.value.retryable);
+    }
 }
 
 test "public table query handler preserves retryable failure status" {

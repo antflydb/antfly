@@ -9142,20 +9142,49 @@ fn patternFilterValueToSearchQuery(
     }
     if (value.object.get("prefix")) |prefix| {
         const field_value = try singleFieldString(prefix, "prefix");
-        return .{ .prefix = .{ .field = field_value.field, .prefix = field_value.value } };
+        return .{ .prefix = .{
+            .field = try exactTermFilterFieldAlloc(
+                alloc,
+                field_value.field,
+                text_analysis,
+                runtime_schema,
+            ),
+            .prefix = field_value.value,
+        } };
     }
     if (value.object.get("wildcard")) |wildcard| {
         const field_value = try singleFieldString(wildcard, "pattern");
-        return .{ .wildcard = .{ .field = field_value.field, .pattern = field_value.value } };
+        return .{ .wildcard = .{
+            .field = try exactTermFilterFieldAlloc(
+                alloc,
+                field_value.field,
+                text_analysis,
+                runtime_schema,
+            ),
+            .pattern = field_value.value,
+        } };
     }
     if (value.object.get("regexp")) |regexp| {
         const field_value = try singleFieldString(regexp, "pattern");
-        return .{ .regexp = .{ .field = field_value.field, .pattern = field_value.value } };
+        return .{ .regexp = .{
+            .field = try exactTermFilterFieldAlloc(
+                alloc,
+                field_value.field,
+                text_analysis,
+                runtime_schema,
+            ),
+            .pattern = field_value.value,
+        } };
     }
     if (value.object.get("fuzzy")) |fuzzy| {
         const field_fuzzy = try singleFieldFuzzy(fuzzy);
         return .{ .fuzzy = .{
-            .field = field_fuzzy.field,
+            .field = try exactTermFilterFieldAlloc(
+                alloc,
+                field_fuzzy.field,
+                text_analysis,
+                runtime_schema,
+            ),
             .term = field_fuzzy.term,
             .max_edits = field_fuzzy.max_edits,
             .prefix_len = field_fuzzy.prefix_len,
@@ -9171,6 +9200,21 @@ fn patternFilterValueToSearchQuery(
     if (value.object.get("geo_distance")) |geo_query| return .{ .geo_distance = try parseGeoDistanceQuery(geo_query) };
     if (value.object.get("geo_bbox")) |geo_query| return .{ .geo_bbox = try parseGeoBBoxQuery(geo_query) };
     return error.UnsupportedQueryRequest;
+}
+
+/// Validates the storage-level structured-filter grammar without retaining any
+/// parsed state. Public request normalization uses this at the raw DSL
+/// compatibility boundary so malformed filters are rejected before execution.
+///
+/// An arena keeps validation cleanup constant-time and avoids duplicating the
+/// production parser's recursive ownership rules.
+pub fn validateStructuredFilterValueAlloc(
+    alloc: Allocator,
+    value: std.json.Value,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    _ = try patternFilterValueToSearchQuery(arena.allocator(), value, .{}, null);
 }
 
 fn patternBoolFilterToSearchQuery(
@@ -9191,6 +9235,17 @@ fn patternBoolFilterToSearchQuery(
     const has_must = value.object.get("must") != null or value.object.get("filter") != null;
     const has_should = value.object.get("should") != null;
     const only_must_not = !has_must and !has_should and value.object.get("must_not") != null;
+    const should = if (value.object.get("should")) |should_value|
+        try patternFilterArrayToSearchQueries(alloc, should_value, text_analysis, runtime_schema)
+    else
+        &.{};
+    const default_min_should: u32 = if (!has_must and has_should) 1 else 0;
+    const min_should = if (value.object.get("minimum_should_match") orelse
+        value.object.get("min_should")) |minimum|
+        jsonU32(minimum) orelse return error.InvalidArgument
+    else
+        default_min_should;
+    if (@as(usize, min_should) > should.len) return error.InvalidArgument;
     return .{ .bool_query = .{
         .must = if (must_out.items.len > 0)
             try must_out.toOwnedSlice(alloc)
@@ -9198,15 +9253,12 @@ fn patternBoolFilterToSearchQuery(
             &.{.{ .match_all = {} }}
         else
             &.{},
-        .should = if (value.object.get("should")) |should|
-            try patternFilterArrayToSearchQueries(alloc, should, text_analysis, runtime_schema)
-        else
-            &.{},
+        .should = should,
         .must_not = if (value.object.get("must_not")) |must_not|
             try patternFilterArrayToSearchQueries(alloc, must_not, text_analysis, runtime_schema)
         else
             &.{},
-        .min_should = if (!has_must and has_should) 1 else 0,
+        .min_should = min_should,
     } };
 }
 
@@ -9411,6 +9463,20 @@ test "pattern bool filter clauses are merged into required search clauses" {
     try std.testing.expectEqualStrings("doc:filter", query.bool_query.must[0].doc_id.ids[0]);
     try std.testing.expect(query.bool_query.must[1] == .doc_id);
     try std.testing.expectEqualStrings("doc:must", query.bool_query.must[1].doc_id.ids[0]);
+}
+
+test "pattern bool filter preserves explicit minimum should match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool":{"should":[{"term":{"status":"active"}},{"term":{"tier":"gold"}}],"minimum_should_match":2}}
+    , .{});
+
+    const query = try patternFilterValueToSearchQuery(alloc, parsed.value, .{}, null);
+    try std.testing.expect(query == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), query.bool_query.should.len);
+    try std.testing.expectEqual(@as(u32, 2), query.bool_query.min_should);
 }
 
 test "pattern date range filter lowers public date and timestamp bounds" {
@@ -10058,6 +10124,20 @@ fn jsonU8(value: std.json.Value) ?u8 {
             if (!std.math.isFinite(number) or @round(number) != number) break :blk null;
             const parsed: i64 = @intFromFloat(number);
             break :blk std.math.cast(u8, parsed);
+        },
+        else => null,
+    };
+}
+
+fn jsonU32(value: std.json.Value) ?u32 {
+    return switch (value) {
+        .integer => |number| std.math.cast(u32, number),
+        .float => |number| blk: {
+            if (!std.math.isFinite(number) or @round(number) != number) break :blk null;
+            if (number < 0 or number > @as(f64, @floatFromInt(std.math.maxInt(u32)))) {
+                break :blk null;
+            }
+            break :blk @intFromFloat(number);
         },
         else => null,
     };

@@ -4350,6 +4350,10 @@ pub const HttpHandler = struct {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         return self.executePublicTableQueryJsonAlloc(table_name, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
+            error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
+            error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
+            error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
