@@ -181,7 +181,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     budget_limits = applyBudgetOverrides(budget_limits, opts);
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     const admission_prefill_chunk = if (opts.prefill_chunk_size > 0) opts.prefill_chunk_size else 256;
-    run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+    run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
         backend_kind,
         kv_dtype,
         gpt_config,

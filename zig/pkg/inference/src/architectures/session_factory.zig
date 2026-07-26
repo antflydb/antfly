@@ -402,6 +402,26 @@ pub fn inspectGgufModel(allocator: std.mem.Allocator, model_path: []const u8) !?
     return try buildGgufInspectionReport(allocator, arch_config, store);
 }
 
+/// Cold-listing inspection reads only GGUF metadata and tensor headers. In
+/// particular, tokenizer vocabulary arrays are skipped rather than allocated.
+pub fn inspectGgufModelForListing(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    mf: manifest_mod.ModelManifest,
+) !?GgufInspectionReport {
+    const gguf_path = mf.gguf_path orelse return null;
+    var mapped = try c_file.MmapRegion.init(allocator, gguf_path);
+    defer mapped.deinit();
+
+    var file = try gguf_mod.format.parseStructure(allocator, mapped.data);
+    defer file.deinit(allocator);
+    const parsed_prefix_len = std.math.cast(usize, file.data_region_offset) orelse mapped.data.len;
+    mapped.adviseSequentialPrefix(@min(parsed_prefix_len, mapped.data.len));
+
+    const arch_config = try detectArchitectureWithGgufFile(allocator, model_path, mf, &file);
+    return @as(?GgufInspectionReport, try buildGgufInspectionReportFromFile(allocator, arch_config, &file));
+}
+
 /// Create a native CPU session from a model directory.
 pub fn createNativeSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
     return createNativeSessionWithTaskOverride(allocator, model_path, null);
@@ -1326,6 +1346,15 @@ fn createGpuHostedSessionWithTaskOverride(
 
 /// Detect the model architecture from config.json.
 fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: manifest_mod.ModelManifest) !ArchConfig {
+    return detectArchitectureWithGgufFile(allocator, model_path, mf, null);
+}
+
+fn detectArchitectureWithGgufFile(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    mf: manifest_mod.ModelManifest,
+    parsed_gguf: ?*const gguf_mod.format.File,
+) !ArchConfig {
     // Try to read config.json for model_type
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_path});
     defer allocator.free(config_path);
@@ -1363,7 +1392,7 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
             {
                 var cfg = try gpt_mod.parseConfig(allocator, config_bytes);
                 if (mf.gguf_path) |gguf_path| {
-                    if (try detectArchitectureFromGguf(allocator, gguf_path)) |gguf_config| {
+                    if (try detectArchitectureFromOptionalGgufFile(allocator, gguf_path, parsed_gguf)) |gguf_config| {
                         switch (gguf_config) {
                             .gpt => |gguf_cfg| overlayGptStructuralConfig(&cfg, gguf_cfg),
                             else => {},
@@ -1391,13 +1420,22 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
     } else |_| {}
 
     if (mf.gguf_path) |gguf_path| {
-        if (try detectArchitectureFromGguf(allocator, gguf_path)) |gguf_config| {
+        if (try detectArchitectureFromOptionalGgufFile(allocator, gguf_path, parsed_gguf)) |gguf_config| {
             return gguf_config;
         }
     }
 
     // Default: BERT
     return .{ .bert = makeBertConfig(mf) };
+}
+
+fn detectArchitectureFromOptionalGgufFile(
+    allocator: std.mem.Allocator,
+    gguf_path: []const u8,
+    parsed_gguf: ?*const gguf_mod.format.File,
+) !?ArchConfig {
+    if (parsed_gguf) |file| return detectArchitectureFromGgufFile(file);
+    return detectArchitectureFromGguf(allocator, gguf_path);
 }
 
 fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8, mf: manifest_mod.ModelManifest, cfg: *deberta_mod.Config) !void {
@@ -1428,13 +1466,24 @@ fn detectArchitectureFromGguf(allocator: std.mem.Allocator, gguf_path: []const u
     defer store.tensorStore().deinit();
 
     const file = store.tensorStore().ggufFile() orelse return null;
+    const detected = (try detectArchitectureFromGgufFile(file)) orelse return null;
+    return switch (detected) {
+        .gpt => |cfg| blk: {
+            var refined = cfg;
+            if (store.mmap_region) |region| {
+                refineRopeDimFromFreqs(&refined, file, region.data);
+            }
+            break :blk .{ .gpt = refined };
+        },
+        else => detected,
+    };
+}
+
+fn detectArchitectureFromGgufFile(file: *const gguf_mod.format.File) !?ArchConfig {
     const meta = gguf_mod.metadata.View.init(file);
     if (gpt_mod.parseGgufMetadata(meta)) |cfg| {
         var refined = cfg;
         refineGptConfigFromGgufFile(&refined, file);
-        if (store.mmap_region) |region| {
-            refineRopeDimFromFreqs(&refined, file, region.data);
-        }
         return .{ .gpt = refined };
     }
     if (bert.parseGgufMetadata(meta)) |cfg| {
@@ -1681,6 +1730,14 @@ fn buildGgufInspectionReport(
 ) !?GgufInspectionReport {
     if (store.kind() != .gguf) return null;
     const file = store.ggufFile() orelse return null;
+    return @as(?GgufInspectionReport, try buildGgufInspectionReportFromFile(allocator, arch_config, file));
+}
+
+fn buildGgufInspectionReportFromFile(
+    allocator: std.mem.Allocator,
+    arch_config: ArchConfig,
+    file: *const gguf_mod.format.File,
+) !GgufInspectionReport {
     const meta = gguf_mod.metadata.View.init(file);
     const architecture = try allocator.dupe(u8, meta.getString("general.architecture") orelse "unknown");
 
@@ -1688,7 +1745,7 @@ fn buildGgufInspectionReport(
         .allocator = allocator,
         .architecture = architecture,
         .tensor_count = file.tensors.len,
-        .metadata_count = file.metadata.len,
+        .metadata_count = std.math.cast(usize, file.header.metadata_count) orelse file.metadata.len,
         .gpt_config = switch (arch_config) {
             .gpt => |cfg| cfg,
             else => null,

@@ -111,40 +111,87 @@ pub const File = struct {
 };
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !File {
+    return parseWithOptions(allocator, bytes, .{});
+}
+
+/// Parse compatibility-relevant metadata and tensor headers without materializing
+/// tokenizer vocabulary arrays. The returned file is sufficient for architecture,
+/// tensor-type, shape, and required-weight inspection.
+pub fn parseStructure(allocator: std.mem.Allocator, bytes: []const u8) !File {
+    return parseWithOptions(allocator, bytes, .{ .skip_tokenizer_metadata = true });
+}
+
+const ParseOptions = struct {
+    skip_tokenizer_metadata: bool = false,
+};
+
+fn parseWithOptions(allocator: std.mem.Allocator, bytes: []const u8, options: ParseOptions) !File {
     var cursor = Cursor{ .bytes = bytes };
     const header = try parseHeader(&cursor);
 
-    const metadata = try allocator.alloc(MetadataEntry, @intCast(header.metadata_count));
-    errdefer allocator.free(metadata);
-    var metadata_len: usize = 0;
+    const metadata_count = try countToUsize(header.metadata_count);
+    // Even the smallest metadata entry has an empty key, a type tag, and a
+    // one-byte value. Reject impossible counts before reserving allocator space.
+    if (metadata_count > cursor.remainingBytes() / 13) return error.InvalidMetadataCount;
+    var metadata = std.ArrayListUnmanaged(MetadataEntry).empty;
     errdefer {
-        for (metadata[0..metadata_len]) |*entry| entry.deinit(allocator);
+        for (metadata.items) |*entry| entry.deinit(allocator);
+        metadata.deinit(allocator);
+    }
+    try metadata.ensureTotalCapacityPrecise(
+        allocator,
+        if (options.skip_tokenizer_metadata) @min(metadata_count, 32) else metadata_count,
+    );
+
+    for (0..metadata_count) |_| {
+        if (options.skip_tokenizer_metadata) {
+            const key = try cursor.readBorrowedString();
+            const raw_type = try cursor.readInt(u32);
+            const value_type = metadataValueTypeFromRaw(raw_type) orelse return error.UnsupportedMetadataType;
+            if (std.mem.startsWith(u8, key, "tokenizer.")) {
+                try cursor.skipMetadataValue(value_type);
+                continue;
+            }
+
+            var value = try parseMetadataValue(allocator, &cursor, value_type);
+            errdefer value.deinit(allocator);
+            const owned_key = try allocator.dupe(u8, key);
+            errdefer allocator.free(owned_key);
+            try metadata.append(allocator, .{ .key = owned_key, .value = value });
+        } else {
+            var entry = try parseMetadataEntry(allocator, &cursor);
+            errdefer entry.deinit(allocator);
+            try metadata.append(allocator, entry);
+        }
     }
 
-    for (0..@as(usize, @intCast(header.metadata_count))) |_| {
-        metadata[metadata_len] = try parseMetadataEntry(allocator, &cursor);
-        metadata_len += 1;
+    const parsed_metadata = try metadata.toOwnedSlice(allocator);
+    errdefer {
+        for (parsed_metadata) |*entry| entry.deinit(allocator);
+        allocator.free(parsed_metadata);
     }
-
-    const parsed_metadata = metadata[0..metadata_len];
     const alignment = readAlignment(parsed_metadata) orelse default_alignment;
+    if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.InvalidAlignment;
     const tensor_dialect = tensorDialectFromMetadata(parsed_metadata);
 
-    const tensors = try allocator.alloc(TensorInfo, @intCast(header.tensor_count));
+    const tensor_count = try countToUsize(header.tensor_count);
+    // Empty tensor name + dimension count + type + offset is at least 24 bytes.
+    if (tensor_count > cursor.remainingBytes() / 24) return error.InvalidTensorCount;
+    const tensors = try allocator.alloc(TensorInfo, tensor_count);
     errdefer allocator.free(tensors);
     var tensor_len: usize = 0;
     errdefer {
         for (tensors[0..tensor_len]) |*tensor| tensor.deinit(allocator);
     }
 
-    for (0..@as(usize, @intCast(header.tensor_count))) |_| {
+    for (0..tensor_count) |_| {
         tensors[tensor_len] = try parseTensorInfo(allocator, &cursor, alignment, tensor_dialect);
         tensor_len += 1;
     }
 
-    const data_region_offset = alignForward(cursor.pos, alignment);
+    const data_region_offset = try alignForward(@intCast(cursor.pos), alignment);
     for (tensors[0..tensor_len]) |*tensor| {
-        tensor.data_offset = data_region_offset + tensor.offset;
+        tensor.data_offset = try std.math.add(u64, data_region_offset, tensor.offset);
     }
 
     return .{
@@ -174,7 +221,7 @@ pub fn readSupportMetadata(bytes: []const u8) !SupportMetadata {
     const header = try parseHeader(&cursor);
     var result = SupportMetadata{};
 
-    for (0..@as(usize, @intCast(header.metadata_count))) |_| {
+    for (0..try countToUsize(header.metadata_count)) |_| {
         const key = try cursor.readBorrowedString();
         const raw_type = try cursor.readInt(u32);
         const value_type = metadataValueTypeFromRaw(raw_type) orelse return error.UnsupportedMetadataType;
@@ -234,13 +281,15 @@ fn parseMetadataValue(allocator: std.mem.Allocator, cursor: *Cursor, value_type:
             if (elem_type == .array) return error.UnsupportedNestedMetadataArray;
 
             const count = try cursor.readInt(u64);
-            const values = try allocator.alloc(MetadataValue, @intCast(count));
+            const value_count = try countToUsize(count);
+            if (value_count > cursor.remainingBytes()) return error.InvalidMetadataCount;
+            const values = try allocator.alloc(MetadataValue, value_count);
             errdefer allocator.free(values);
             var len: usize = 0;
             errdefer {
                 for (values[0..len]) |*value| value.deinit(allocator);
             }
-            for (0..@as(usize, @intCast(count))) |_| {
+            for (0..value_count) |_| {
                 values[len] = try parseMetadataValue(allocator, cursor, elem_type);
                 len += 1;
             }
@@ -256,7 +305,8 @@ fn parseTensorInfo(allocator: std.mem.Allocator, cursor: *Cursor, alignment: u64
     const name = try cursor.readOwnedString(allocator);
     errdefer allocator.free(name);
 
-    const n_dimensions = try cursor.readInt(u32);
+    const n_dimensions: usize = try countToUsize(try cursor.readInt(u32));
+    if (n_dimensions > cursor.remainingBytes() / @sizeOf(u64)) return error.InvalidDimensionCount;
     const dimensions = try allocator.alloc(u64, n_dimensions);
     errdefer allocator.free(dimensions);
     for (dimensions) |*dim| dim.* = try cursor.readInt(u64);
@@ -269,7 +319,7 @@ fn parseTensorInfo(allocator: std.mem.Allocator, cursor: *Cursor, alignment: u64
         .dimensions = dimensions,
         .tensor_type = tensor_type,
         .offset = offset,
-        .data_offset = alignForward(cursor.pos, alignment) + offset,
+        .data_offset = try std.math.add(u64, try alignForward(@intCast(cursor.pos), alignment), offset),
     };
 }
 
@@ -315,22 +365,26 @@ fn metadataValueTypeFromRaw(raw: u32) ?MetadataValueType {
     };
 }
 
-fn alignForward(value: u64, alignment: u64) u64 {
+fn alignForward(value: u64, alignment: u64) !u64 {
     if (alignment == 0 or alignment == 1) return value;
     const rem = value % alignment;
     if (rem == 0) return value;
-    return value + (alignment - rem);
+    return std.math.add(u64, value, alignment - rem);
+}
+
+fn countToUsize(value: anytype) !usize {
+    return std.math.cast(usize, value) orelse error.CountTooLarge;
 }
 
 const Cursor = struct {
     bytes: []const u8,
-    pos: u64 = 0,
+    pos: usize = 0,
 
     fn readBytes(self: *Cursor, count: usize) ![]const u8 {
-        const start: usize = @intCast(self.pos);
-        const end = start + count;
+        const start = self.pos;
+        const end = std.math.add(usize, start, count) catch return error.UnexpectedEndOfFile;
         if (end > self.bytes.len) return error.UnexpectedEndOfFile;
-        self.pos += count;
+        self.pos = end;
         return self.bytes[start..end];
     }
 
@@ -341,19 +395,24 @@ const Cursor = struct {
 
     fn readOwnedString(self: *Cursor, allocator: std.mem.Allocator) ![]u8 {
         const len = try self.readInt(u64);
-        const bytes = try self.readBytes(@intCast(len));
+        const bytes = try self.readBytes(try countToUsize(len));
         return allocator.dupe(u8, bytes);
     }
 
     fn readBorrowedString(self: *Cursor) ![]const u8 {
         const len = try self.readInt(u64);
-        return self.readBytes(@intCast(len));
+        return self.readBytes(try countToUsize(len));
     }
 
     fn skipBytes(self: *Cursor, count: u64) !void {
-        const end = self.pos + count;
+        const count_usize = try countToUsize(count);
+        const end = std.math.add(usize, self.pos, count_usize) catch return error.UnexpectedEndOfFile;
         if (end > self.bytes.len) return error.UnexpectedEndOfFile;
         self.pos = end;
+    }
+
+    fn remainingBytes(self: *const Cursor) usize {
+        return self.bytes.len - self.pos;
     }
 
     /// Advance past one metadata value without allocating it.
@@ -375,13 +434,17 @@ const Cursor = struct {
                 switch (elem_type) {
                     // Fixed-width elements can be skipped in one jump.
                     .u8, .i8, .bool_ => try self.skipBytes(count),
-                    .u16, .i16 => try self.skipBytes(count * 2),
-                    .u32, .i32, .f32 => try self.skipBytes(count * 4),
-                    .u64, .i64, .f64 => try self.skipBytes(count * 8),
+                    .u16, .i16 => try self.skipBytes(try std.math.mul(u64, count, 2)),
+                    .u32, .i32, .f32 => try self.skipBytes(try std.math.mul(u64, count, 4)),
+                    .u64, .i64, .f64 => try self.skipBytes(try std.math.mul(u64, count, 8)),
                     // Strings are length-prefixed, so they must be walked individually.
-                    .string => for (0..@intCast(count)) |_| {
-                        const len = try self.readInt(u64);
-                        try self.skipBytes(len);
+                    .string => {
+                        const string_count = try countToUsize(count);
+                        if (string_count > self.remainingBytes() / @sizeOf(u64)) return error.InvalidMetadataCount;
+                        for (0..string_count) |_| {
+                            const len = try self.readInt(u64);
+                            try self.skipBytes(len);
+                        }
                     },
                     .array => unreachable,
                 }
@@ -405,10 +468,8 @@ test "readArchitecture skips past preceding metadata including token arrays" {
     try appendString(allocator, &data, "tokenizer.ggml.tokens");
     try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.array));
     try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
-    try appendLe(u64, allocator, &data, 3);
-    try appendString(allocator, &data, "<bos>");
-    try appendString(allocator, &data, "hello");
-    try appendString(allocator, &data, "world");
+    try appendLe(u64, allocator, &data, 1024);
+    for (0..1024) |_| try appendString(allocator, &data, "representative-token");
 
     // A fixed-width array, skipped in one jump.
     try appendString(allocator, &data, "tokenizer.ggml.token_type");
@@ -493,6 +554,69 @@ test "parse minimal gguf file" {
     try std.testing.expectEqualStrings("tok_embeddings.weight", parsed.tensors[0].name);
     try std.testing.expectEqual(@as(u64, 192), parsed.data_region_offset);
     try std.testing.expectEqual(@as(u64, 192), parsed.tensors[0].data_offset);
+}
+
+test "parseStructure skips tokenizer payloads and retains tensor headers" {
+    const allocator = std.testing.allocator;
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, magic);
+    try appendLe(u32, allocator, &data, 3);
+    try appendLe(u64, allocator, &data, 1);
+    try appendLe(u64, allocator, &data, 3);
+
+    try appendString(allocator, &data, "tokenizer.ggml.tokens");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.array));
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendLe(u64, allocator, &data, 3);
+    try appendString(allocator, &data, "<bos>");
+    try appendString(allocator, &data, "hello");
+    try appendString(allocator, &data, "world");
+
+    try appendString(allocator, &data, "general.architecture");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendString(allocator, &data, "llama");
+    try appendString(allocator, &data, "general.alignment");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, 32);
+
+    try appendString(allocator, &data, "token_embd.weight");
+    try appendLe(u32, allocator, &data, 2);
+    try appendLe(u64, allocator, &data, 8);
+    try appendLe(u64, allocator, &data, 4);
+    try appendLe(u32, allocator, &data, 1);
+    try appendLe(u64, allocator, &data, 0);
+
+    // The structural parser must not scale allocator use with vocabulary size.
+    // A full parse needs well over this buffer just for 1,024 MetadataValue slots.
+    var fixed_buffer: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&fixed_buffer);
+    const structural_allocator = fixed.allocator();
+    var parsed = try parseStructure(structural_allocator, data.items);
+    defer parsed.deinit(structural_allocator);
+
+    try std.testing.expectEqual(@as(u64, 3), parsed.header.metadata_count);
+    try std.testing.expectEqual(@as(usize, 2), parsed.metadata.len);
+    try std.testing.expectEqualStrings("general.architecture", parsed.metadata[0].key);
+    try std.testing.expectEqualStrings("token_embd.weight", parsed.tensors[0].name);
+}
+
+test "metadata skipping rejects overflowing array lengths" {
+    const allocator = std.testing.allocator;
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, magic);
+    try appendLe(u32, allocator, &data, 3);
+    try appendLe(u64, allocator, &data, 0);
+    try appendLe(u64, allocator, &data, 1);
+    try appendString(allocator, &data, "tokenizer.ggml.token_type");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.array));
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u64));
+    try appendLe(u64, allocator, &data, std.math.maxInt(u64));
+
+    try std.testing.expectError(error.Overflow, readSupportMetadata(data.items));
 }
 
 test "parse tensor type 39 by gguf architecture dialect" {

@@ -140,6 +140,11 @@ pub const Estimate = struct {
     scratch_tier: ResidencyTier,
 };
 
+pub const EstimateError = error{
+    InvalidModelConfig,
+    ResourceLimitExceeded,
+};
+
 pub const RunBudget = struct {
     limits: Limits,
     host_weight_bytes: usize = 0,
@@ -195,19 +200,19 @@ pub const RunBudget = struct {
     }
 
     pub fn hostTotalBytes(self: *const RunBudget) usize {
-        return self.host_weight_bytes + self.host_kv_bytes + self.host_scratch_bytes;
+        return addSaturating(addSaturating(self.host_weight_bytes, self.host_kv_bytes), self.host_scratch_bytes);
     }
 
     pub fn backendTotalBytes(self: *const RunBudget) usize {
-        return self.backend_weight_bytes + self.backend_kv_bytes + self.backend_scratch_bytes;
+        return addSaturating(addSaturating(self.backend_weight_bytes, self.backend_kv_bytes), self.backend_scratch_bytes);
     }
 
     pub fn kvTotalBytes(self: *const RunBudget) usize {
-        return self.host_kv_bytes + self.backend_kv_bytes;
+        return addSaturating(self.host_kv_bytes, self.backend_kv_bytes);
     }
 
     pub fn scratchTotalBytes(self: *const RunBudget) usize {
-        return self.host_scratch_bytes + self.backend_scratch_bytes;
+        return addSaturating(self.host_scratch_bytes, self.backend_scratch_bytes);
     }
 
     pub fn noteSharedCacheDenial(
@@ -226,7 +231,7 @@ pub const RunBudget = struct {
             },
             .{ .kind = .weight, .tier = tier, .bytes = bytes },
             current_bytes,
-            current_bytes + bytes,
+            addSaturating(current_bytes, bytes),
             limit_bytes,
         );
     }
@@ -261,23 +266,48 @@ pub const RunBudget = struct {
     fn tryReserve(self: *RunBudget, reservation: Reservation) !void {
         if (reservation.bytes == 0 or reservation.tier == .disk) return;
 
+        const current_host = self.hostTotalBytes();
+        const current_backend = self.backendTotalBytes();
+        const current_kv = self.kvTotalBytes();
+        const current_scratch = self.scratchTotalBytes();
         const next_host = switch (reservation.tier) {
-            .host => self.hostTotalBytes() + reservation.bytes,
-            else => self.hostTotalBytes(),
+            .host => std.math.add(usize, current_host, reservation.bytes) catch {
+                self.recordDenial(.host_total, reservation, current_host, std.math.maxInt(usize), self.limits.host_limit_bytes);
+                return error.MemoryBudgetExceeded;
+            },
+            else => current_host,
         };
         const next_backend = switch (reservation.tier) {
-            .backend => self.backendTotalBytes() + reservation.bytes,
-            else => self.backendTotalBytes(),
+            .backend => std.math.add(usize, current_backend, reservation.bytes) catch {
+                self.recordDenial(.backend_total, reservation, current_backend, std.math.maxInt(usize), self.limits.backend_limit_bytes);
+                return error.MemoryBudgetExceeded;
+            },
+            else => current_backend,
         };
         const next_kv = switch (reservation.kind) {
-            .kv => self.kvTotalBytes() + reservation.bytes,
-            else => self.kvTotalBytes(),
+            .kv => std.math.add(usize, current_kv, reservation.bytes) catch {
+                self.recordDenial(.kv_total, reservation, current_kv, std.math.maxInt(usize), self.limits.kv_limit_bytes);
+                return error.MemoryBudgetExceeded;
+            },
+            else => current_kv,
         };
         const next_scratch = switch (reservation.kind) {
-            .scratch => self.scratchTotalBytes() + reservation.bytes,
-            else => self.scratchTotalBytes(),
+            .scratch => std.math.add(usize, current_scratch, reservation.bytes) catch {
+                self.recordDenial(.scratch_total, reservation, current_scratch, std.math.maxInt(usize), self.limits.scratch_limit_bytes);
+                return error.MemoryBudgetExceeded;
+            },
+            else => current_scratch,
         };
-        const next_combined = next_host + next_backend;
+        const next_combined = std.math.add(usize, next_host, next_backend) catch {
+            self.recordDenial(
+                .combined_total,
+                reservation,
+                addSaturating(current_host, current_backend),
+                std.math.maxInt(usize),
+                self.limits.combined_limit_bytes,
+            );
+            return error.MemoryBudgetExceeded;
+        };
 
         if (self.limits.host_limit_bytes != 0 and next_host > self.limits.host_limit_bytes) {
             self.recordDenial(.host_total, reservation, self.hostTotalBytes(), next_host, self.limits.host_limit_bytes);
@@ -288,7 +318,7 @@ pub const RunBudget = struct {
             return error.MemoryBudgetExceeded;
         }
         if (self.limits.combined_limit_bytes != 0 and next_combined > self.limits.combined_limit_bytes) {
-            self.recordDenial(.combined_total, reservation, self.hostTotalBytes() + self.backendTotalBytes(), next_combined, self.limits.combined_limit_bytes);
+            self.recordDenial(.combined_total, reservation, addSaturating(self.hostTotalBytes(), self.backendTotalBytes()), next_combined, self.limits.combined_limit_bytes);
             return error.MemoryBudgetExceeded;
         }
         if (self.limits.kv_limit_bytes != 0 and next_kv > self.limits.kv_limit_bytes) {
@@ -330,7 +360,7 @@ pub const RunBudget = struct {
         requested_total_bytes: usize,
         limit_bytes: usize,
     ) void {
-        self.denials += 1;
+        self.denials +|= 1;
         self.last_denial = .{
             .reservation = reservation,
             .limit = limit,
@@ -356,19 +386,62 @@ pub const AdmissionAmounts = struct {
     backend_scratch_bytes: usize = 0,
 
     pub fn hostTotalBytes(self: @This()) usize {
-        return self.host_weight_bytes + self.host_kv_bytes + self.host_scratch_bytes;
+        return addSaturating(addSaturating(self.host_weight_bytes, self.host_kv_bytes), self.host_scratch_bytes);
     }
 
     pub fn backendTotalBytes(self: @This()) usize {
-        return self.backend_weight_bytes + self.backend_kv_bytes + self.backend_scratch_bytes;
+        return addSaturating(addSaturating(self.backend_weight_bytes, self.backend_kv_bytes), self.backend_scratch_bytes);
     }
 
     pub fn kvTotalBytes(self: @This()) usize {
-        return self.host_kv_bytes + self.backend_kv_bytes;
+        return addSaturating(self.host_kv_bytes, self.backend_kv_bytes);
     }
 
     pub fn scratchTotalBytes(self: @This()) usize {
-        return self.host_scratch_bytes + self.backend_scratch_bytes;
+        return addSaturating(self.host_scratch_bytes, self.backend_scratch_bytes);
+    }
+
+    pub fn fromEstimate(estimate: Estimate) @This() {
+        var amounts: @This() = .{};
+        switch (estimate.kv_tier) {
+            .disk => {},
+            .host => amounts.host_kv_bytes = estimate.kv_bytes,
+            .backend => amounts.backend_kv_bytes = estimate.kv_bytes,
+        }
+        switch (estimate.scratch_tier) {
+            .disk => {},
+            .host => amounts.host_scratch_bytes = estimate.scratch_bytes,
+            .backend => amounts.backend_scratch_bytes = estimate.scratch_bytes,
+        }
+        return amounts;
+    }
+
+    pub fn merge(self: @This(), other: @This()) !@This() {
+        return addAdmissionAmounts(self, other) orelse error.ResourceLimitExceeded;
+    }
+
+    fn hostTotalBytesChecked(self: @This()) !usize {
+        return std.math.add(
+            usize,
+            try std.math.add(usize, self.host_weight_bytes, self.host_kv_bytes),
+            self.host_scratch_bytes,
+        );
+    }
+
+    fn backendTotalBytesChecked(self: @This()) !usize {
+        return std.math.add(
+            usize,
+            try std.math.add(usize, self.backend_weight_bytes, self.backend_kv_bytes),
+            self.backend_scratch_bytes,
+        );
+    }
+
+    fn kvTotalBytesChecked(self: @This()) !usize {
+        return std.math.add(usize, self.host_kv_bytes, self.backend_kv_bytes);
+    }
+
+    fn scratchTotalBytesChecked(self: @This()) !usize {
+        return std.math.add(usize, self.host_scratch_bytes, self.backend_scratch_bytes);
     }
 };
 
@@ -399,18 +472,18 @@ pub const AdmissionController = struct {
 
         const next = addAdmissionAmounts(self.admitted, amounts) orelse
             return error.ResourceLimitExceeded;
-        const request_host = amounts.hostTotalBytes();
-        const request_backend = amounts.backendTotalBytes();
+        const request_host = amounts.hostTotalBytesChecked() catch return error.ResourceLimitExceeded;
+        const request_backend = amounts.backendTotalBytesChecked() catch return error.ResourceLimitExceeded;
         const request_combined = std.math.add(usize, request_host, request_backend) catch
             return error.ResourceLimitExceeded;
-        const request_kv = amounts.kvTotalBytes();
-        const request_scratch = amounts.scratchTotalBytes();
-        const next_host = next.hostTotalBytes();
-        const next_backend = next.backendTotalBytes();
+        const request_kv = amounts.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
+        const request_scratch = amounts.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
+        const next_host = next.hostTotalBytesChecked() catch return error.ResourceLimitExceeded;
+        const next_backend = next.backendTotalBytesChecked() catch return error.ResourceLimitExceeded;
         const next_combined = std.math.add(usize, next_host, next_backend) catch
             return error.ResourceLimitExceeded;
-        const next_kv = next.kvTotalBytes();
-        const next_scratch = next.scratchTotalBytes();
+        const next_kv = next.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
+        const next_scratch = next.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
 
         try checkAdmissionLimit(request_host, next_host, limits.host_limit_bytes);
         try checkAdmissionLimit(request_backend, next_backend, limits.backend_limit_bytes);
@@ -454,6 +527,10 @@ fn addAdmissionAmounts(a: AdmissionAmounts, b: AdmissionAmounts) ?AdmissionAmoun
         .host_scratch_bytes = std.math.add(usize, a.host_scratch_bytes, b.host_scratch_bytes) catch return null,
         .backend_scratch_bytes = std.math.add(usize, a.backend_scratch_bytes, b.backend_scratch_bytes) catch return null,
     };
+}
+
+fn addSaturating(a: usize, b: usize) usize {
+    return std.math.add(usize, a, b) catch std.math.maxInt(usize);
 }
 
 fn checkAdmissionLimit(request: usize, next: usize, limit: usize) !void {
@@ -590,8 +667,16 @@ pub fn estimateGptGeneration(
     prompt_tokens: usize,
     max_tokens: usize,
     prefill_chunk_size: usize,
-) Estimate {
-    const total_tokens = prompt_tokens + max_tokens;
+) EstimateError!Estimate {
+    if (config.num_hidden_layers == 0 or
+        config.hidden_size == 0 or
+        config.num_attention_heads == 0 or
+        config.vocab_size == 0)
+    {
+        return error.InvalidModelConfig;
+    }
+    const total_tokens = std.math.add(usize, prompt_tokens, max_tokens) catch
+        return error.ResourceLimitExceeded;
     const retained_tokens = blk: {
         if (config.position_encoding != .absolute and config.sliding_window > 0) {
             break :blk @min(total_tokens, @as(usize, @intCast(config.sliding_window)));
@@ -601,22 +686,38 @@ pub fn estimateGptGeneration(
         }
         break :blk total_tokens;
     };
-    const page_aligned_tokens = std.mem.alignForward(usize, @max(retained_tokens, 1), 16);
-    const kv_pair_bytes = kv_dtype.bytesForTokenPair(
-        @intCast(config.maxKvHeads()),
-        @intCast(config.maxHeadDim()),
-    );
-    const kv_bytes = page_aligned_tokens * @as(usize, @intCast(config.num_hidden_layers)) * kv_pair_bytes;
+    const page_aligned_tokens = alignForwardChecked(@max(retained_tokens, 1), 16) catch
+        return error.ResourceLimitExceeded;
+    const max_kv_heads = config.maxKvHeads();
+    const max_head_dim = try estimateMaxHeadDim(config);
+    if (max_kv_heads == 0 or max_head_dim == 0) return error.InvalidModelConfig;
+    const kv_pair_bytes = kv_dtype.bytesForTokenPairChecked(max_kv_heads, max_head_dim) catch
+        return error.ResourceLimitExceeded;
+    const token_layers = std.math.mul(
+        usize,
+        page_aligned_tokens,
+        @as(usize, config.num_hidden_layers),
+    ) catch return error.ResourceLimitExceeded;
+    const kv_bytes = std.math.mul(usize, token_layers, kv_pair_bytes) catch
+        return error.ResourceLimitExceeded;
 
     const scratch_rows = @max(prefill_chunk_size, 1);
     const hidden = @as(usize, @intCast(config.hidden_size));
     const heads = @as(usize, @intCast(config.num_attention_heads));
     const head_dim = @as(usize, @intCast(config.headDim()));
     const vocab = @as(usize, @intCast(config.vocab_size));
-    const hidden_scratch = scratch_rows * hidden * @as(usize, 8) * @sizeOf(f32);
-    const attn_scratch = scratch_rows * @max(heads * head_dim, hidden) * @as(usize, 4) * @sizeOf(f32);
-    const logits_scratch = vocab * @sizeOf(f32);
-    const scratch_bytes = hidden_scratch + attn_scratch + logits_scratch;
+    const attention_width = std.math.mul(usize, heads, head_dim) catch
+        return error.ResourceLimitExceeded;
+    const hidden_scratch = checkedProduct(&.{ scratch_rows, hidden, 8, @sizeOf(f32) }) catch
+        return error.ResourceLimitExceeded;
+    const attn_scratch = checkedProduct(&.{ scratch_rows, @max(attention_width, hidden), 4, @sizeOf(f32) }) catch
+        return error.ResourceLimitExceeded;
+    const logits_scratch = std.math.mul(usize, vocab, @sizeOf(f32)) catch
+        return error.ResourceLimitExceeded;
+    const activation_scratch = std.math.add(usize, hidden_scratch, attn_scratch) catch
+        return error.ResourceLimitExceeded;
+    const scratch_bytes = std.math.add(usize, activation_scratch, logits_scratch) catch
+        return error.ResourceLimitExceeded;
 
     return .{
         .prompt_tokens = prompt_tokens,
@@ -632,6 +733,43 @@ pub fn estimateGptGeneration(
             .metal, .cuda => .backend,
         },
     };
+}
+
+fn alignForwardChecked(value: usize, alignment: usize) !usize {
+    std.debug.assert(std.math.isPowerOfTwo(alignment));
+    return (try std.math.add(usize, value, alignment - 1)) & ~(alignment - 1);
+}
+
+fn estimateMaxHeadDim(config: gpt_mod.Config) EstimateError!u32 {
+    if (config.family != .deepseek_v4) return config.maxHeadDim();
+
+    const base_head_dim = if (config.attention_head_dim > 0)
+        config.attention_head_dim
+    else
+        config.hidden_size / config.num_attention_heads;
+    const kv_lora: usize = if (config.deepseek_v4_kv_lora_rank > 0)
+        config.deepseek_v4_kv_lora_rank
+    else if (base_head_dim > config.deepseek_v4_qk_rope_head_dim)
+        base_head_dim - config.deepseek_v4_qk_rope_head_dim
+    else
+        0;
+    const width = std.math.add(usize, kv_lora, config.deepseek_v4_qk_rope_head_dim) catch
+        return error.ResourceLimitExceeded;
+    if (width > 0) {
+        return std.math.cast(u32, width) orelse error.ResourceLimitExceeded;
+    }
+    const fallback = std.math.mul(
+        usize,
+        @as(usize, config.effectiveKVHeads()),
+        @as(usize, base_head_dim),
+    ) catch return error.ResourceLimitExceeded;
+    return std.math.cast(u32, fallback) orelse error.ResourceLimitExceeded;
+}
+
+fn checkedProduct(values: []const usize) !usize {
+    var result: usize = 1;
+    for (values) |value| result = try std.math.mul(usize, result, value);
+    return result;
 }
 
 test "shared admission accounts for concurrent leases and releases capacity" {
@@ -731,19 +869,98 @@ test "gpt generation estimate accounts for sliding window and page alignment" {
         .position_encoding = .rope,
     };
 
-    const estimate = estimateGptGeneration(.metal, .f16, cfg, 100, 10, 64);
+    const estimate = try estimateGptGeneration(.metal, .f16, cfg, 100, 10, 64);
     try std.testing.expectEqual(@as(usize, 110), estimate.retained_tokens);
     try std.testing.expectEqual(@as(usize, 112), estimate.kv_bytes / (32 * 8 * 128 * 2 * 2));
     try std.testing.expectEqual(ResidencyTier.backend, estimate.kv_tier);
     try std.testing.expect(estimate.scratch_bytes > 0);
 
     // int8: bytesForTokenRow(8, 128) = 1024 + 8*4 = 1056
-    const est_int8 = estimateGptGeneration(.metal, .int8, cfg, 100, 10, 64);
+    const est_int8 = try estimateGptGeneration(.metal, .int8, cfg, 100, 10, 64);
     try std.testing.expectEqual(@as(usize, 112 * 32 * 1056 * 2), est_int8.kv_bytes);
 
     // int4: bytesForTokenRow(8, 128) = ceil(1024/32)*18 = 32*18 = 576
-    const est_int4 = estimateGptGeneration(.metal, .int4, cfg, 100, 10, 64);
+    const est_int4 = try estimateGptGeneration(.metal, .int4, cfg, 100, 10, 64);
     try std.testing.expectEqual(@as(usize, 112 * 32 * 576 * 2), est_int4.kv_bytes);
+}
+
+test "gpt generation estimate rejects malformed and overflowing inputs" {
+    var cfg = gpt_mod.Config{
+        .hidden_size = 4096,
+        .num_hidden_layers = 32,
+        .num_attention_heads = 32,
+        .num_key_value_heads = 8,
+        .attention_head_dim = 128,
+        .vocab_size = 32000,
+    };
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        estimateGptGeneration(.native, .f16, cfg, std.math.maxInt(usize), 1, 256),
+    );
+
+    cfg.num_attention_heads = 0;
+    try std.testing.expectError(
+        error.InvalidModelConfig,
+        estimateGptGeneration(.native, .f16, cfg, 1, 1, 256),
+    );
+
+    cfg.num_attention_heads = 32;
+    cfg.family = .deepseek_v4;
+    cfg.deepseek_v4_kv_lora_rank = std.math.maxInt(u32);
+    cfg.deepseek_v4_qk_rope_head_dim = std.math.maxInt(u32);
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        estimateGptGeneration(.native, .f16, cfg, 1, 1, 256),
+    );
+}
+
+test "admission rejects aggregate total overflow" {
+    var controller = AdmissionController{};
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        controller.tryAcquire(
+            .{},
+            .{ .host_weight_bytes = std.math.maxInt(usize), .host_kv_bytes = 1 },
+            false,
+        ),
+    );
+}
+
+test "combined target and draft estimates are admitted atomically" {
+    const target = AdmissionAmounts.fromEstimate(.{
+        .prompt_tokens = 8,
+        .retained_tokens = 16,
+        .kv_bytes = 40,
+        .kv_tier = .host,
+        .scratch_bytes = 10,
+        .scratch_tier = .host,
+    });
+    const draft = AdmissionAmounts.fromEstimate(.{
+        .prompt_tokens = 8,
+        .retained_tokens = 16,
+        .kv_bytes = 30,
+        .kv_tier = .backend,
+        .scratch_bytes = 20,
+        .scratch_tier = .backend,
+    });
+    const combined = try target.merge(draft);
+    try std.testing.expectEqual(@as(usize, 50), combined.hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 50), combined.backendTotalBytes());
+
+    var controller = AdmissionController{};
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        controller.tryAcquire(.{ .combined_limit_bytes = 90 }, combined, false),
+    );
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+test "run budget rejects accounting overflow even without configured limits" {
+    var budget = RunBudget.init(.{});
+    _ = try budget.tryReserveWeight(.host, std.math.maxInt(usize));
+    try std.testing.expectError(error.MemoryBudgetExceeded, budget.tryReserveWeight(.host, 1));
+    try std.testing.expectEqual(DenialLimit.host_total, budget.last_denial.?.limit);
+    try std.testing.expectEqual(std.math.maxInt(usize), budget.hostTotalBytes());
 }
 
 test "derive gpu limits keeps combined cap sane" {
