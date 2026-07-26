@@ -4589,6 +4589,8 @@ fn appendRestoreProgressRecord(
     try appendInt(alloc, out, u64, record.updated_at_ms);
     try appendInt(alloc, out, u32, @intCast(record.artifact_sha256.len));
     try out.appendSlice(alloc, record.artifact_sha256);
+    try appendInt(alloc, out, u32, @intCast(record.artifact_backup_id.len));
+    try out.appendSlice(alloc, record.artifact_backup_id);
 }
 
 fn appendReplicationSourceStatusRecord(
@@ -5175,11 +5177,17 @@ fn readRestoreProgressRecord(
     else
         try alloc.dupe(u8, "");
     errdefer alloc.free(artifact_sha256);
+    const artifact_backup_id = if (pos.* < encoded.len)
+        try readRequiredString(alloc, encoded, pos)
+    else
+        try alloc.dupe(u8, "");
+    errdefer alloc.free(artifact_backup_id);
     return .{
         .table_id = table_id,
         .node_id = node_id,
         .group_id = group_id,
         .backup_id = backup_id,
+        .artifact_backup_id = artifact_backup_id,
         .location = location,
         .snapshot_path = snapshot_path,
         .artifact_sha256 = artifact_sha256,
@@ -7427,6 +7435,7 @@ test "metadata restore progress transition command round-trips" {
             .node_id = 7,
             .group_id = 4101,
             .backup_id = "snap1",
+            .artifact_backup_id = "snap1-artifacts",
             .location = "s3://archive/snap1",
             .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         },
@@ -7444,6 +7453,10 @@ test "metadata restore progress transition command round-trips" {
     try std.testing.expectEqual(@as(u64, 7), decoded.?.upsert_restore_progress.node_id);
     try std.testing.expectEqual(@as(u64, 4101), decoded.?.upsert_restore_progress.group_id);
     try std.testing.expectEqualStrings("snap1", decoded.?.upsert_restore_progress.backup_id);
+    try std.testing.expectEqualStrings(
+        "snap1-artifacts",
+        decoded.?.upsert_restore_progress.artifact_backup_id,
+    );
     try std.testing.expectEqualStrings("s3://archive/snap1", decoded.?.upsert_restore_progress.location);
     try std.testing.expectEqualStrings(
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -7576,6 +7589,7 @@ test "metadata raft apply store projects restore progress records from committed
             .node_id = 7,
             .group_id = 4101,
             .backup_id = "snap1",
+            .artifact_backup_id = "snap1-artifacts",
         },
     });
     defer std.testing.allocator.free(progress_cmd);
@@ -7605,6 +7619,7 @@ test "metadata raft apply store projects restore progress records from committed
         try std.testing.expectEqual(@as(u64, 7), progress[0].node_id);
         try std.testing.expectEqual(@as(u64, 4101), progress[0].group_id);
         try std.testing.expectEqualStrings("snap1", progress[0].backup_id);
+        try std.testing.expectEqualStrings("snap1-artifacts", progress[0].artifact_backup_id);
     }
 }
 

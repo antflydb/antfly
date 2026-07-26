@@ -901,12 +901,32 @@ pub const H2Connection = struct {
                     if (stream.completion_sem) |sem| sem.post(self.io);
                     return;
                 }
-                const stream_data_limit = stream.max_data_size orelse self.max_stream_data_size;
-                if (stream_data_limit > 0) {
+                const stream_data_limit: ?usize = stream.max_data_size orelse
+                    if (self.max_stream_data_size > 0) self.max_stream_data_size else null;
+                const incoming_size = std.math.cast(u64, data_payload.len) orelse {
+                    stream.stream_error = error.StreamDataOverflow;
+                    stream.completed = true;
+                    if (stream.data_event) |ev| ev.set(self.io);
+                    if (stream.completion_sem) |sem| sem.post(self.io);
+                    return;
+                };
+                const new_size = std.math.add(
+                    u64,
+                    stream.total_data_received,
+                    incoming_size,
+                ) catch {
+                    stream.stream_error = error.StreamDataOverflow;
+                    stream.completed = true;
+                    if (stream.data_event) |ev| ev.set(self.io);
+                    if (stream.completion_sem) |sem| sem.post(self.io);
+                    return;
+                };
+                if (stream_data_limit) |limit| {
                     // Use total_data_received, not data_buf.items.len — compactDataBuf()
                     // shrinks the buffer, so buffer length alone is bypassable.
-                    const new_size = stream.total_data_received + data_payload.len;
-                    if (new_size > stream_data_limit) {
+                    const limit_u64 = std.math.cast(u64, limit) orelse
+                        std.math.maxInt(u64);
+                    if (new_size > limit_u64) {
                         stream.stream_error = error.StreamDataOverflow;
                         stream.completed = true;
                         if (stream.data_event) |ev| ev.set(self.io);
@@ -914,7 +934,7 @@ pub const H2Connection = struct {
                         return;
                     }
                 }
-                stream.total_data_received += data_payload.len;
+                stream.total_data_received = new_size;
                 try stream.data_buf.appendSlice(self.allocator, data_payload);
                 if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
@@ -2220,6 +2240,44 @@ test "deliverToMailbox allows unlimited DATA when max_stream_data_size is 0" {
     try server.deliverToMailbox(&frame);
     try std.testing.expectEqual(@as(usize, 200), stream.data_buf.items.len);
     try std.testing.expect(!stream.completed);
+}
+
+test "deliverToMailbox treats an explicit per-stream zero limit as no body" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    stream.max_data_size = 0;
+
+    var frame = Frame{
+        .header = .{ .length = 1, .frame_type = .data, .flags = 0, .stream_id = 1 },
+        .payload = @constCast(&[_]u8{0x41}),
+    };
+    try server.deliverToMailbox(&frame);
+    try std.testing.expect(stream.completed);
+    try std.testing.expectEqual(error.StreamDataOverflow, stream.stream_error.?);
+    try std.testing.expectEqual(@as(usize, 0), stream.data_buf.items.len);
+}
+
+test "deliverToMailbox fails closed when cumulative DATA accounting overflows" {
+    const allocator = std.testing.allocator;
+    var server = H2Connection.initServer(allocator, std.testing.io);
+    defer server.deinit();
+
+    const stream = try server.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    stream.total_data_received = std.math.maxInt(u64);
+
+    var frame = Frame{
+        .header = .{ .length = 1, .frame_type = .data, .flags = 0, .stream_id = 1 },
+        .payload = @constCast(&[_]u8{0x41}),
+    };
+    try server.deliverToMailbox(&frame);
+    try std.testing.expect(stream.completed);
+    try std.testing.expectEqual(error.StreamDataOverflow, stream.stream_error.?);
+    try std.testing.expectEqual(@as(usize, 0), stream.data_buf.items.len);
 }
 
 test "CONTINUATION reassembly rejects oversized header block" {

@@ -6563,6 +6563,76 @@ pub const ApiHttpServer = struct {
         );
     }
 
+    const ClusterBackupLeaseHeartbeat = struct {
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        location: *backups_api.BackupLocation,
+        backup_id: []const u8,
+        attempt_id: []const u8,
+        stop_event: std.Io.Event = .unset,
+        lost: std.atomic.Value(bool) = .init(false),
+        expires_at_unix_ns: std.atomic.Value(u64),
+
+        fn renewedExpiration(self: *@This()) u64 {
+            const now: u64 = @intCast(std.Io.Timestamp.now(self.io, .real).toNanoseconds());
+            return now +| backups_api.backup_attempt_lease_duration_ns;
+        }
+
+        fn renew(self: *@This()) !bool {
+            const expiration = self.renewedExpiration();
+            const owned = try backups_api.renewClusterBackupAttemptLeaseAtLocation(
+                self.alloc,
+                self.io,
+                self.location,
+                self.backup_id,
+                self.attempt_id,
+                expiration,
+            );
+            if (owned) self.expires_at_unix_ns.store(expiration, .release);
+            return owned;
+        }
+
+        fn ensureOwned(self: *@This()) !void {
+            if (self.lost.load(.acquire) or !try self.renew()) {
+                self.lost.store(true, .release);
+                return error.BackupAttemptLeaseLost;
+            }
+        }
+
+        fn run(self: *@This()) void {
+            while (!self.stop_event.isSet()) {
+                self.stop_event.waitTimeout(self.io, .{
+                    .duration = .{
+                        .raw = std.Io.Duration.fromNanoseconds(
+                            backups_api.backup_attempt_lease_renew_interval_ns,
+                        ),
+                        .clock = .awake,
+                    },
+                }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => {
+                        if (self.stop_event.isSet()) return;
+                        self.lost.store(true, .release);
+                        return;
+                    },
+                };
+                if (self.stop_event.isSet()) return;
+                if (self.renew() catch |err| blk: {
+                    const now: u64 = @intCast(std.Io.Timestamp.now(self.io, .real).toNanoseconds());
+                    if (now >= self.expires_at_unix_ns.load(.acquire)) {
+                        std.log.err("cluster backup lease expired after renewal failures class={s}", .{@errorName(err)});
+                        self.lost.store(true, .release);
+                        return;
+                    }
+                    std.log.warn("cluster backup lease renewal deferred class={s}", .{@errorName(err)});
+                    break :blk true;
+                }) continue;
+                self.lost.store(true, .release);
+                return;
+            }
+        }
+    };
+
     const OwnedRestoreOutcome = enum { committed_durable };
 
     const RestoreDefinitionPublication = struct {
@@ -6587,11 +6657,11 @@ pub const ApiHttpServer = struct {
 
         fn rollbackIfReplacementCurrent(self: *@This()) void {
             self.server.source.replaceTableDefinition(self.replacement, self.previous) catch |rollback_err| {
-                std.log.err("restore metadata rollback after publication failure failed table={s} err={s}", .{ self.previous.name, @errorName(rollback_err) });
+                std.log.err("restore metadata rollback failed phase=publication class={s}", .{@errorName(rollback_err)});
                 return;
             };
             self.server.waitForMetadataProjection(self.previous.name, self.previous.schema_json, self.previous.indexes_json) catch |rollback_err| {
-                std.log.err("restore metadata rollback projection failed table={s} err={s}", .{ self.previous.name, @errorName(rollback_err) });
+                std.log.err("restore metadata rollback failed phase=projection class={s}", .{@errorName(rollback_err)});
             };
         }
 
@@ -6608,21 +6678,30 @@ pub const ApiHttpServer = struct {
         return try self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, backup_id, false, false);
     }
 
-    /// The Go portable envelope predates declared artifact checksums. Bind its
-    /// bytes to the restore intent before metadata publication so every Raft
-    /// replica independently verifies the exact artifact admitted here.
-    fn bindExternalRestoreArtifactIntegrity(
+    /// Admit the exact requested artifact immediately before metadata
+    /// publication. Native manifests already carry integrity metadata and are
+    /// streamed once for verification. The Go portable envelope predates
+    /// declared checksums, so derive and bind them to the restore intent.
+    fn admitExternalRestoreArtifactIntegrity(
         self: *ApiHttpServer,
+        io: std.Io,
         backup_location: *backups_api.BackupLocation,
         manifest: *backups_api.TableBackupManifest,
     ) !void {
-        if (manifest.artifact_integrity_mode == .declared) return;
+        if (manifest.artifact_integrity_mode == .declared) {
+            return backups_api.verifyTableBackupArtifactsIntegrityAtLocation(
+                self.alloc,
+                io,
+                backup_location,
+                manifest,
+            );
+        }
         if (manifest.format != .portable) return error.UnsupportedBackupFormat;
 
         switch (backup_location.*) {
             .file => |backup_root| backups_api.deriveManifestArtifactIntegrity(
                 self.alloc,
-                self.sharedApiIo(),
+                io,
                 backup_root,
                 manifest,
             ) catch |err| switch (err) {
@@ -6643,7 +6722,7 @@ pub const ApiHttpServer = struct {
                     defer self.alloc.free(destination);
                     backups_api.copyFileFromLocationUsingIo(
                         self.alloc,
-                        self.sharedApiIo(),
+                        io,
                         backup_location,
                         shard.snapshot_path,
                         destination,
@@ -6654,7 +6733,7 @@ pub const ApiHttpServer = struct {
                 }
                 try backups_api.deriveManifestArtifactIntegrity(
                     self.alloc,
-                    self.sharedApiIo(),
+                    io,
                     staging_root,
                     manifest,
                 );
@@ -6906,6 +6985,7 @@ pub const ApiHttpServer = struct {
                     progress.primary_restored and
                     progress.runtime_repair_complete and
                     std.mem.eql(u8, progress.backup_id, backup_id) and
+                    std.mem.eql(u8, progress.artifact_backup_id, artifact_backup_id) and
                     std.mem.eql(u8, progress.location, location_uri))
                 {
                     found_completed_progress = true;
@@ -8013,7 +8093,11 @@ pub const ApiHttpServer = struct {
                 if (backups_api.isArtifactIntegrityError(err)) return error.BackupIntegrityFailure;
                 return error.InvalidBackupRequest;
             };
-            self.bindExternalRestoreArtifactIntegrity(location, &manifest) catch |err| {
+            self.admitExternalRestoreArtifactIntegrity(
+                self.sharedApiIo() orelse return error.InternalFailure,
+                location,
+                &manifest,
+            ) catch |err| {
                 if (backups_api.isArtifactIntegrityError(err)) return error.BackupIntegrityFailure;
                 return error.InvalidBackupRequest;
             };
@@ -8479,6 +8563,19 @@ pub const ApiHttpServer = struct {
         defer if (fallback_io) |*owned| owned.deinit();
         const backup_io = self.sharedApiIo() orelse fallback_io.?.io();
 
+        const maintenance_now_unix_ns: u64 =
+            @intCast(std.Io.Timestamp.now(backup_io, .real).toNanoseconds());
+        _ = backups_api.reclaimStaleClusterBackupAttempts(
+            op_alloc,
+            backup_io,
+            location,
+            maintenance_now_unix_ns,
+        ) catch |err| {
+            // Maintenance is bounded and best-effort; admission still has an
+            // exact same-ID lease recovery path if this pass is unavailable.
+            std.log.warn("cluster backup stale-attempt maintenance deferred class={s}", .{@errorName(err)});
+        };
+
         self.source.ensureLinearizableRead() catch |err| {
             if (metadata_authority.isRetryableError(err)) return error.NotLeader;
             std.log.warn("cluster backup metadata read barrier failed err={s}", .{@errorName(err)});
@@ -8560,54 +8657,60 @@ pub const ApiHttpServer = struct {
             .format = req.format,
             .tables = attempt_tables,
         };
-        // The conditional reservation is the authoritative pre-execution
-        // conflict check for both filesystem and write-only object-store
-        // connections. It prevents duplicate requests from performing any
-        // table side effects.
-        backups_api.reserveClusterBackupAttemptAtLocation(
-            op_alloc,
-            backup_io,
-            location,
-            req.backup_id,
-            attempt_id,
-        ) catch |err| switch (err) {
-            error.BackupAlreadyExists => return error.BackupAlreadyExists,
-            else => return error.InternalFailure,
-        };
-        var marker_published = false;
-        var marker_cleanup_safe = true;
-        errdefer if (!marker_published) {
-            if (marker_cleanup_safe) {
-                _ = backups_api.cleanupClusterReservationIfOwnedAtLocation(
-                    op_alloc,
-                    backup_io,
-                    location,
-                    req.backup_id,
-                    attempt_id,
-                ) catch |cleanup_err| {
-                    std.log.err("cluster backup reservation cleanup failed phase=admission class={s}", .{@errorName(cleanup_err)});
-                };
-            } else {
-                // Conditional publication may have committed despite a lost
-                // response. Retain the reservation so a retry cannot race the
-                // stale-attempt reclaimer.
-                std.log.err("cluster backup attempt marker outcome ambiguous phase=journal; retaining reservation", .{});
-            }
-        };
-        marker_cleanup_safe = false;
+        // Publish the immutable journal before acquiring the admission fence.
+        // This ordering guarantees that a process crash can never leave an
+        // undiscoverable reservation: every production reservation has an
+        // attempt marker that the bounded stale reclaimer can later retire.
         backups_api.writeClusterBackupAttemptMarker(
             op_alloc,
             backup_io,
             location,
             &attempt_marker,
-        ) catch |err| {
-            marker_cleanup_safe = switch (err) {
-                error.BackupAlreadyExists, error.BackupManifestTooLarge => true,
-                else => false,
+        ) catch return error.InternalFailure;
+
+        // The conditional lease is the authoritative pre-execution conflict
+        // check. A same-ID retry performs one exact, bounded recovery attempt;
+        // no bucket-wide scan is required on the latency-sensitive path.
+        var reservation_retried = false;
+        while (true) {
+            const expires_at_unix_ns =
+                @as(u64, @intCast(std.Io.Timestamp.now(backup_io, .real).toNanoseconds())) +|
+                backups_api.backup_attempt_lease_duration_ns;
+            backups_api.reserveClusterBackupAttemptLeaseAtLocation(
+                op_alloc,
+                backup_io,
+                location,
+                req.backup_id,
+                attempt_id,
+                expires_at_unix_ns,
+            ) catch |err| switch (err) {
+                error.BackupAlreadyExists => {
+                    if (!reservation_retried and (backups_api.reclaimExpiredClusterBackupAttemptAtLocation(
+                        op_alloc,
+                        backup_io,
+                        location,
+                        req.backup_id,
+                        now_unix_ns,
+                    ) catch false)) {
+                        reservation_retried = true;
+                        continue;
+                    }
+                    backups_api.deleteClusterBackupAttemptMarker(
+                        op_alloc,
+                        backup_io,
+                        location,
+                        attempt_id,
+                    ) catch |cleanup_err| {
+                        std.log.warn("cluster backup duplicate marker cleanup deferred phase=admission class={s}", .{@errorName(cleanup_err)});
+                    };
+                    return error.BackupAlreadyExists;
+                },
+                // An unknown conditional-write outcome may have acquired the
+                // reservation. Retain the marker so recovery can resolve it.
+                else => return error.InternalFailure,
             };
-            return error.InternalFailure;
-        };
-        marker_published = true;
+            break;
+        }
         var cluster_committed = false;
         var cluster_cleanup_safe = true;
         errdefer if (!cluster_committed) {
@@ -8623,12 +8726,30 @@ pub const ApiHttpServer = struct {
                 std.log.err("cluster backup publication outcome ambiguous phase=commit; retaining fenced attempt", .{});
             }
         };
-        backups_api.writeClusterBackupAttemptHead(
-            op_alloc,
+        const initial_lease_expiration =
+            @as(u64, @intCast(std.Io.Timestamp.now(backup_io, .real).toNanoseconds())) +|
+            backups_api.backup_attempt_lease_duration_ns;
+        var lease_heartbeat: ClusterBackupLeaseHeartbeat = .{
+            .alloc = op_alloc,
+            .io = backup_io,
+            .location = location,
+            .backup_id = req.backup_id,
+            .attempt_id = attempt_id,
+            .expires_at_unix_ns = .init(initial_lease_expiration),
+        };
+        // Refresh once synchronously so the tracked expiration exactly matches
+        // the stored lease, then keep it alive across long shard snapshots.
+        lease_heartbeat.ensureOwned() catch return error.InternalFailure;
+        var lease_future = std.Io.async(
             backup_io,
-            location,
-            attempt_id,
-        ) catch return error.InternalFailure;
+            ClusterBackupLeaseHeartbeat.run,
+            .{&lease_heartbeat},
+        );
+        var lease_future_running = true;
+        defer if (lease_future_running) {
+            lease_heartbeat.stop_event.set(backup_io);
+            lease_future.await(backup_io);
+        };
         var extension_snapshot_opt = self.source.adminSnapshot() catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             else => if (metadata_authority.isRetryableError(err)) return error.NotLeader else null,
@@ -8637,6 +8758,8 @@ pub const ApiHttpServer = struct {
         const extension_snapshot: ?*const metadata_api.AdminSnapshot = if (extension_snapshot_opt) |*snapshot| snapshot else null;
 
         for (table_names, attempt_tables, 0..) |table_name, attempt_table, i| {
+            if (lease_heartbeat.lost.load(.acquire))
+                return error.InternalFailure;
             const status_name = op_alloc.dupe(u8, table_name) catch return error.InternalFailure;
             status_names[status_name_count] = status_name;
             status_name_count += 1;
@@ -8695,6 +8818,9 @@ pub const ApiHttpServer = struct {
         // publication. If any requested table failed, return its sanitized
         // status without exposing a partial aggregate as a restore candidate.
         if (cluster_tables.items.len == table_names.len) {
+            // Close the last renewal/publication race. If another process took
+            // an expired lease, this conditional renewal fences publication.
+            lease_heartbeat.ensureOwned() catch return error.InternalFailure;
             const installed_extensions = if (extension_snapshot) |snapshot| snapshot.installed_extensions else &.{};
             const extension_members = if (extension_snapshot) |snapshot| snapshot.extension_members else &.{};
             const extension_dependencies = if (extension_snapshot) |snapshot| snapshot.extension_dependencies else &.{};
@@ -8713,12 +8839,23 @@ pub const ApiHttpServer = struct {
                 };
             };
             cluster_committed = true;
-            // Retain the marker as bounded health history so verification
-            // checks the newest attempt instead of an older fallback.
+            backups_api.writeClusterBackupAttemptHead(
+                op_alloc,
+                backup_io,
+                location,
+                attempt_id,
+            ) catch |err| {
+                // The aggregate manifest is already the durable commit point;
+                // a health-index update cannot roll it back safely.
+                std.log.warn("cluster backup health head update deferred class={s}", .{@errorName(err)});
+            };
         } else {
             // A partial aggregate is not a restore candidate. Reclaim every
             // completed table attempt before releasing the cluster reservation
             // so a retry cannot overlap cleanup.
+            lease_heartbeat.stop_event.set(backup_io);
+            lease_future.await(backup_io);
+            lease_future_running = false;
             self.cleanupClusterBackupAttempt(backup_io, location, &attempt_marker) catch
                 return error.InternalFailure;
             cluster_committed = true;
@@ -8760,17 +8897,6 @@ pub const ApiHttpServer = struct {
 
         try self.ensureRestoreActive(cancellation);
 
-        backups_api.ensureNewestClusterBackupAttemptRestorable(
-            op_alloc,
-            self.sharedApiIo() orelse return error.InternalFailure,
-            location,
-        ) catch |err| switch (err) {
-            error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
-            else => if (backups_api.isArtifactIntegrityError(err))
-                return error.BackupIntegrityFailure
-            else
-                return error.InvalidRequest,
-        };
         var manifest = backups_api.readClusterManifestFromLocation(op_alloc, location, req.backup_id) catch |err| switch (err) {
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             else => if (backups_api.isArtifactIntegrityError(err))
@@ -8902,7 +9028,11 @@ pub const ApiHttpServer = struct {
                     statuses[i].@"error" = "table backup manifest does not match table";
                     continue;
                 }
-                self.bindExternalRestoreArtifactIntegrity(location, &table_manifest) catch |err| {
+                self.admitExternalRestoreArtifactIntegrity(
+                    self.sharedApiIo() orelse return error.InternalFailure,
+                    location,
+                    &table_manifest,
+                ) catch |err| {
                     statuses[i].@"error" = if (backups_api.isArtifactIntegrityError(err))
                         backups_api.integrity_failure_message
                     else
@@ -8926,11 +9056,7 @@ pub const ApiHttpServer = struct {
                             if (checkpoint_err == error.RestoreJobFenced or metadata_authority.isRetryableError(checkpoint_err)) return error.NotLeader;
                             return error.InternalFailure;
                         };
-                        std.log.err("cluster restore failed table={s} backup_id={s} err={}", .{
-                            table_name,
-                            table_backup_id,
-                            err,
-                        });
+                        std.log.err("cluster restore failed phase=metadata class={s}", .{@errorName(err)});
                         statuses[i].@"error" = switch (err) {
                             error.UnsupportedBackupFormat => "restore does not support this backup layout",
                             error.UnsupportedMultiRangeTable => "restore does not support multi-range tables",
@@ -8972,11 +9098,7 @@ pub const ApiHttpServer = struct {
             const replace_existing = is_overwrite and (self.tableExists(table_name) catch |err| return metadataAccessFailure(err));
             const outcome = self.restoreOwnedTableWithRetryAndLifecycle(table_name, location, req.location, table_backup_id, artifact_backup_id, false, replace_existing) catch |err| {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-                std.log.err("cluster restore failed table={s} backup_id={s} err={}", .{
-                    table_name,
-                    table_backup_id,
-                    err,
-                });
+                std.log.err("cluster restore failed phase=materialization class={s}", .{@errorName(err)});
                 statuses[i].@"error" = switch (err) {
                     error.UnsupportedOperation => "method not allowed",
                     error.UnsupportedBackupFormat => "restore does not support this backup layout",
@@ -28751,7 +28873,7 @@ test "distributed restore binds Go portable artifact bytes before metadata publi
         .vtable = &.{ .status = Fake.status },
     }, null, null);
     defer server.deinit();
-    try server.bindExternalRestoreArtifactIntegrity(&location, &manifest);
+    try server.admitExternalRestoreArtifactIntegrity(std.testing.io, &location, &manifest);
 
     try std.testing.expectEqual(backups_api.ArtifactIntegrityMode.declared, manifest.artifact_integrity_mode);
     try std.testing.expectEqual(@as(u64, "portable-artifact".len), manifest.shards[0].artifact_size_bytes);

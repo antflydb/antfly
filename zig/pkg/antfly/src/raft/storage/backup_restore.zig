@@ -406,12 +406,7 @@ fn prepareRestoreSnapshot(
     try backups_api.validateRestoreManifest(alloc, manifest, restore.backup_id);
     if (options.expected_table_name) |table_name| {
         if (!std.mem.eql(u8, manifest.table_name, table_name)) {
-            std.log.err("restore manifest table mismatch expected={s} actual={s} backup_id={s} snapshot_path={s}", .{
-                table_name,
-                manifest.table_name,
-                restore.backup_id,
-                restore.snapshot_path,
-            });
+            std.log.err("restore manifest validation failed phase=table_identity class=mismatch", .{});
             return error.InvalidBackupRequest;
         }
     }
@@ -457,7 +452,7 @@ fn prepareRestoreSnapshot(
         shard,
     );
 
-    std.log.info("native restore build staged generation live_path={s} staged_path={s} snapshot_root={s}", .{ path, staged_path, snapshot_root });
+    std.log.info("native restore staged generation phase=materialization", .{});
     try db_mod.DB.restoreSnapshotToDeferredRuntimeRepairWithIo(&staged_generation, alloc, io, snapshot_root, staged_path, .{
         .identity_namespace = options.expected_identity_namespace,
     }, .{
@@ -467,7 +462,7 @@ fn prepareRestoreSnapshot(
         .snapshot_path = snapshot_path,
         .group_id = group_id,
     });
-    std.log.info("native restore generation prepared live_path={s} staged_path={s} snapshot_root={s}", .{ path, staged_path, snapshot_root });
+    std.log.info("native restore staged generation phase=prepared", .{});
     return staged_generation;
 }
 

@@ -736,13 +736,15 @@ const ProjectedCoreSnapshot = struct {
             out.estimated_bytes += @sizeOf(u64) * intent.peer_node_ids.len;
             if (intent.record.snapshot_bootstrap) |record| out.estimated_bytes += record.snapshot_id.len + record.uri.len;
             if (intent.record.backup_restore_bootstrap) |record| {
-                out.estimated_bytes += record.backup_id.len + record.location.len + record.snapshot_path.len +
-                    record.connection.len + record.artifact_sha256.len;
+                out.estimated_bytes += record.backup_id.len + record.artifact_backup_id.len +
+                    record.location.len + record.snapshot_path.len + record.connection.len +
+                    record.artifact_sha256.len;
             }
         }
         for (self.restore_progresses) |record| {
-            out.estimated_bytes += record.backup_id.len + record.location.len + record.snapshot_path.len +
-                record.artifact_sha256.len + record.phase.len + record.last_error.len;
+            out.estimated_bytes += record.backup_id.len + record.artifact_backup_id.len +
+                record.location.len + record.snapshot_path.len + record.artifact_sha256.len +
+                record.phase.len + record.last_error.len;
         }
         for (self.replication_source_statuses) |record| {
             out.estimated_bytes += record.source_kind.len + record.external_table.len + record.cutover_mode.len +
@@ -4965,6 +4967,7 @@ fn syncLocalRestoreProgress(
 
 fn restoreProgressEquivalent(a: metadata_table_manager.RestoreProgressRecord, b: metadata_table_manager.RestoreProgressRecord) bool {
     return std.mem.eql(u8, a.backup_id, b.backup_id) and
+        std.mem.eql(u8, a.artifact_backup_id, b.artifact_backup_id) and
         std.mem.eql(u8, a.location, b.location) and
         std.mem.eql(u8, a.snapshot_path, b.snapshot_path) and
         std.mem.eql(u8, a.artifact_sha256, b.artifact_sha256) and
@@ -5050,6 +5053,7 @@ fn rangeRestoreIntentComplete(
         found_any_placement = true;
         const restored = findRestoreProgress(progress, table_id, intent.record.local_node_id, range.group_id) orelse return false;
         if (!std.mem.eql(u8, restored.backup_id, restore_backup_id)) return false;
+        if (!std.mem.eql(u8, restored.artifact_backup_id, range.restore_artifact_backup_id)) return false;
         if (!std.mem.eql(u8, restored.location, restore_location)) return false;
         if (!std.mem.eql(u8, restored.snapshot_path, range.restore_snapshot_path)) return false;
         if (!std.mem.eql(u8, restored.artifact_sha256, range.restore_artifact_sha256)) return false;
@@ -10392,6 +10396,7 @@ test "metadata service clears restore intent once all placement replicas report 
                 .start_key = "",
                 .end_key = null,
                 .restore_backup_id = "snap1",
+                .restore_artifact_backup_id = "snap1-artifacts",
                 .restore_location = "file:///tmp/backups",
                 .restore_snapshot_path = "snap/groups/7001",
                 .restore_connection = "backups",
@@ -10403,8 +10408,8 @@ test "metadata service clears restore intent once all placement replicas report 
             .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2 } },
         },
         .progress = &.{
-            .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
-            .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+            .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+            .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
         },
     };
     defer service.deinit();
@@ -10424,28 +10429,43 @@ test "metadata service keeps restore intent until runtime repair completes" {
         .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2 } },
     };
     const progress = [_]metadata_table_manager.RestoreProgressRecord{
-        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
-        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = false, .phase = "runtime_repair" },
+        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = false, .phase = "runtime_repair" },
     };
 
     try std.testing.expect(!rangeRestoreIntentComplete(7, .{
         .group_id = 7001,
         .table_id = 7,
         .start_key = "",
+        .restore_artifact_backup_id = "snap1-artifacts",
         .restore_snapshot_path = "snap/groups/7001",
     }, "snap1", "file:///tmp/backups", &placements, &progress));
 
     const stale_progress = [_]metadata_table_manager.RestoreProgressRecord{
-        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "old-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
-        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "old-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "old-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "old-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
     };
     try std.testing.expect(!rangeRestoreIntentComplete(7, .{
         .group_id = 7001,
         .table_id = 7,
         .start_key = "",
+        .restore_artifact_backup_id = "snap1-artifacts",
         .restore_snapshot_path = "snap/groups/7001",
         .restore_artifact_sha256 = "new-artifact",
     }, "snap1", "file:///tmp/backups", &placements, &stale_progress));
+
+    const stale_namespace_progress = [_]metadata_table_manager.RestoreProgressRecord{
+        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "old-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "new-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "old-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "new-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+    };
+    try std.testing.expect(!rangeRestoreIntentComplete(7, .{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+        .restore_artifact_backup_id = "new-artifacts",
+        .restore_snapshot_path = "snap/groups/7001",
+        .restore_artifact_sha256 = "new-artifact",
+    }, "snap1", "file:///tmp/backups", &placements, &stale_namespace_progress));
 }
 
 test "metadata http service catalog cache is independent from volatile projection traffic" {

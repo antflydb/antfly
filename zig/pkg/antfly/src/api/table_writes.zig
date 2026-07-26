@@ -4371,8 +4371,7 @@ pub const BoundTableWriteSource = struct {
             plan.io,
         ) catch |restore_err| {
             self.db.* = db_mod.DB.open(alloc, db_path, recovery_open_options) catch |reopen_err| {
-                std.log.err("bound restore failed and live generation could not be reopened path={s} restore_err={s} reopen_err={s}", .{
-                    db_path,
+                std.log.err("bound restore recovery failed phase=reopen restore_class={s} reopen_class={s}", .{
                     @errorName(restore_err),
                     @errorName(reopen_err),
                 });
@@ -4383,7 +4382,7 @@ pub const BoundTableWriteSource = struct {
             return restore_err;
         };
         self.db.* = db_mod.DB.open(alloc, db_path, restored_open_options) catch |reopen_err| {
-            std.log.err("bound restore committed but published generation could not be reopened path={s} err={s}", .{ db_path, @errorName(reopen_err) });
+            std.log.err("bound restore recovery failed phase=published_reopen class={s}", .{@errorName(reopen_err)});
             return reopen_err;
         };
         self.db.owned_backend_runtime = owned_backend_runtime;
@@ -7857,12 +7856,12 @@ pub const ProvisionedTableWriteSource = struct {
         const source_io = self.table_activity_threaded.io();
         _ = db_mod.DB.recoverIncompleteRestoreImportIfNeededWithIo(alloc, source_io, path, .{}) catch |err| {
             if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
-            std.log.warn("managed startup catch-up restore import recovery failed table={s} err={}", .{ table_name, err });
+            std.log.warn("managed startup restore recovery failed phase=import class={s}", .{@errorName(err)});
             return err;
         };
         const restore_repair_needed = db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, source_io, path) catch |err| {
             if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
-            std.log.warn("managed startup catch-up restore repair probe failed table={s} err={}", .{ table_name, err });
+            std.log.warn("managed startup restore recovery failed phase=repair_probe class={s}", .{@errorName(err)});
             return err;
         };
         const startup_open_mode: ManagedDbOpenMode = if (restore_repair_needed) .restore_repair else .startup_catch_up;
@@ -9558,7 +9557,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn enqueueRestoreRepairComplete(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const alloc = std.heap.page_allocator;
         const owned_table_name = alloc.dupe(u8, table_name) catch |err| {
-            std.log.warn("restore repair completion allocation failed table={s} err={}", .{ table_name, err });
+            std.log.warn("restore repair completion failed phase=allocation class={s}", .{@errorName(err)});
             return;
         };
 
@@ -9567,7 +9566,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.restore_repair_completions.append(alloc, owned_table_name) catch |err| {
             self.restore_repair_completion_mutex.unlock(io);
             alloc.free(owned_table_name);
-            std.log.warn("restore repair completion enqueue failed table={s} err={}", .{ table_name, err });
+            std.log.warn("restore repair completion failed phase=enqueue class={s}", .{@errorName(err)});
             return;
         };
         self.restore_repair_completion_mutex.unlock(io);
@@ -9716,8 +9715,7 @@ pub const ProvisionedTableWriteSource = struct {
                     if (platform_time.monotonicNs() -| open_start_ns >= open_retry_timeout_ns) return err;
                     if (!logged_open_wait) {
                         logged_open_wait = true;
-                        std.log.warn("restore foreground repair waiting for writer table={s} group_id={d} err={s}", .{
-                            table_name,
+                        std.log.warn("restore foreground repair waiting for writer group_id={d} class={s}", .{
                             group_id,
                             @errorName(err),
                         });
@@ -9738,7 +9736,7 @@ pub const ProvisionedTableWriteSource = struct {
             const timeout_ns = 30 * std.time.ns_per_s;
             const start_ns = platform_time.monotonicNs();
             var attempts: usize = 0;
-            std.log.info("restore foreground repair begin table={s} group_id={d}", .{ table_name, group_id });
+            std.log.info("restore foreground repair begin group_id={d}", .{group_id});
             while (try db.restoreRuntimeRepairNeeded()) {
                 attempts += 1;
                 if (try db.repairRestoreRuntimeStateStepIfNeeded(alloc)) {
@@ -9746,8 +9744,7 @@ pub const ProvisionedTableWriteSource = struct {
                 }
                 if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
             }
-            std.log.info("restore foreground repair complete table={s} group_id={d} attempts={d} open_attempts={d}", .{
-                table_name,
+            std.log.info("restore foreground repair complete group_id={d} attempts={d} open_attempts={d}", .{
                 group_id,
                 attempts,
                 open_attempts,
@@ -9772,8 +9769,7 @@ pub const ProvisionedTableWriteSource = struct {
         fn runAndDeinit(work: *@This()) Io.Cancelable!void {
             defer RestoreRepairCatchUpWork.deinit(work);
             work.run() catch |err| {
-                std.log.warn("restore background catch-up failed table={s} group_id={d} err={s}", .{
-                    work.table_name,
+                std.log.warn("restore background catch-up failed group_id={d} class={s}", .{
                     work.group_id,
                     @errorName(err),
                 });
@@ -9785,15 +9781,14 @@ pub const ProvisionedTableWriteSource = struct {
             defer work.alloc.free(path);
 
             var attempts: usize = 0;
-            std.log.info("restore background catch-up begin table={s} group_id={d}", .{ work.table_name, work.group_id });
+            std.log.info("restore background catch-up begin group_id={d}", .{work.group_id});
             while (true) {
                 if (work.source.restore_repair_shutdown.load(.acquire)) return;
                 attempts += 1;
                 const busy = try work.repairOnce(path);
                 if (!busy) {
                     work.source.enqueueRestoreRepairComplete(work.table_name);
-                    std.log.info("restore background catch-up complete table={s} group_id={d} attempts={d}", .{
-                        work.table_name,
+                    std.log.info("restore background catch-up complete group_id={d} attempts={d}", .{
                         work.group_id,
                         attempts,
                     });
@@ -9863,12 +9858,12 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.restore_repair_shutdown.load(.acquire)) return;
         const alloc = std.heap.page_allocator;
         const work = alloc.create(RestoreRepairCatchUpWork) catch |err| {
-            std.log.warn("restore background catch-up allocation failed table={s} group_id={d} err={}", .{ table_name, group_id, err });
+            std.log.warn("restore background catch-up failed phase=allocation group_id={d} class={s}", .{ group_id, @errorName(err) });
             return;
         };
         const owned_table_name = alloc.dupe(u8, table_name) catch |err| {
             alloc.destroy(work);
-            std.log.warn("restore background catch-up table name allocation failed table={s} group_id={d} err={}", .{ table_name, group_id, err });
+            std.log.warn("restore background catch-up failed phase=identity_allocation group_id={d} class={s}", .{ group_id, @errorName(err) });
             return;
         };
         work.* = .{
@@ -9879,7 +9874,7 @@ pub const ProvisionedTableWriteSource = struct {
         };
         self.restore_repair_work_group.concurrent(self.table_activity_threaded.io(), RestoreRepairCatchUpWork.runAndDeinit, .{work}) catch |err| {
             RestoreRepairCatchUpWork.deinit(work);
-            std.log.warn("restore background catch-up submit failed table={s} group_id={d} err={}", .{ table_name, group_id, err });
+            std.log.warn("restore background catch-up failed phase=submit group_id={d} class={s}", .{ group_id, @errorName(err) });
             return;
         };
     }
@@ -12037,23 +12032,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .expected_table_name = table_name,
                 .expected_identity_namespace = identity_namespace,
             }) catch |err| {
-                switch (err) {
-                    error.IdentityNamespaceMismatch => std.log.warn("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_path={s} err={}", .{
-                        table_name,
-                        group_id,
-                        path,
-                        source_shard.snapshot_path,
-                        err,
-                    }),
-                    else => std.log.err("provisioned restoreTable failed table={s} group_id={d} path={s} backup_root={s} snapshot_path={s} err={}", .{
-                        table_name,
-                        group_id,
-                        path,
-                        plan.backup_root,
-                        source_shard.snapshot_path,
-                        err,
-                    }),
-                }
+                if (err == error.IdentityNamespaceMismatch)
+                    std.log.warn("provisioned restore failed phase=identity_validation class={s}", .{@errorName(err)})
+                else
+                    std.log.err("provisioned restore failed phase=materialization class={s}", .{@errorName(err)});
                 return err;
             };
             // Import, derived rebuild, and validation run against the isolated
@@ -12082,7 +12064,7 @@ pub const ProvisionedTableWriteSource = struct {
         var definition_published = false;
         errdefer if (definition_published) {
             if (plan.publication_hook) |hook| hook.rollback() catch |rollback_err| {
-                std.log.err("restore metadata rollback failed table={s} err={s}", .{ table_name, @errorName(rollback_err) });
+                std.log.err("restore metadata rollback failed phase=storage_publication class={s}", .{@errorName(rollback_err)});
             };
         };
 
@@ -12107,7 +12089,7 @@ pub const ProvisionedTableWriteSource = struct {
             publication_outcome = try backup_restore.publishPreparedRestore(alloc, path, generation);
             definition_published = false;
             if (publication_outcome == .durability_uncertain) {
-                std.log.err("restore generation published with uncertain durability table={s} group_id={d} path={s}", .{ table_name, group_id, path });
+                std.log.err("restore generation publication uncertain phase=durability", .{});
             }
         } else {
             // An idempotent retry may only owe runtime repair on the already
@@ -18603,7 +18585,7 @@ fn catchUpManagedDb(
     };
 
     const restore_repair_needed = db.restoreRuntimeRepairNeeded() catch |err| {
-        std.log.warn("managed startup catch-up restore repair probe failed table={s} err={}", .{ table_name, err });
+        std.log.warn("managed startup restore repair failed phase=probe class={s}", .{@errorName(err)});
         return err;
     };
     const needs_dense_artifact_rebuild = db.hasPendingDenseArtifactRebuild(alloc) catch |err| {
@@ -18643,16 +18625,16 @@ fn catchUpManagedDb(
         source.clearDirtyWriteTable(table_name);
     };
     if (restore_repair_needed) {
-        std.log.info("managed restore repair begin table={s} group_id={d}", .{ table_name, group_id });
+        std.log.info("managed restore repair begin group_id={d}", .{group_id});
         progress_ctx.phase = .artifact_rebuild;
         try publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db);
         repaired_restore_runtime = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| {
-            std.log.warn("managed startup catch-up restore repair failed table={s} err={}", .{ table_name, err });
+            std.log.warn("managed startup restore repair failed phase=execution class={s}", .{@errorName(err)});
             return err;
         };
         made_progress = repaired_restore_runtime;
         try publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db);
-        std.log.info("managed restore repair step complete table={s} group_id={d} repaired={}", .{ table_name, group_id, repaired_restore_runtime });
+        std.log.info("managed restore repair step complete group_id={d} repaired={}", .{ group_id, repaired_restore_runtime });
     } else if (had_debt) {
         var pass: usize = 0;
         var last_debt_signature = try startupReplayDebtSignature(alloc, db);
@@ -18792,7 +18774,7 @@ fn catchUpManagedDb(
         };
     }
     if (db.restoreRuntimeRepairNeeded() catch |err| {
-        std.log.warn("managed startup catch-up post-check restore repair probe failed table={s} err={}", .{ table_name, err });
+        std.log.warn("managed startup restore repair failed phase=post_check class={s}", .{@errorName(err)});
         return err;
     }) {
         return .{

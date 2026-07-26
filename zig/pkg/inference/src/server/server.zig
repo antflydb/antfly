@@ -597,11 +597,11 @@ fn appendUniqueOpenAiModelEntry(
 
 const DiscoveredModelListing = struct {
     entry_index: usize,
-    manifest: ?manifest_mod.ModelManifest,
+    manifest: manifest_mod.ModelManifest,
     reader_supported: bool,
 
     fn deinit(self: *@This()) void {
-        if (self.manifest) |*manifest| manifest.deinit();
+        self.manifest.deinit();
         self.* = undefined;
     }
 };
@@ -5581,11 +5581,22 @@ pub const Node = struct {
         }
         try discovered_listings.ensureTotalCapacity(a, discovered.len);
         for (discovered, 0..) |entry, entry_index| {
-            if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(a, entry.path)) continue;
+            var manifest = manifest_mod.loadFromDir(a, entry.path) catch continue;
+            if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) {
+                manifest.deinit();
+                continue;
+            }
+            const reader_candidate = taskMatchesModelListing(
+                "readers",
+                @tagName(entry.kind),
+                manifest.gliner_model_type,
+                manifest.tasks,
+                manifest.capabilities,
+            );
             discovered_listings.appendAssumeCapacity(.{
                 .entry_index = entry_index,
-                .manifest = manifest_mod.loadFromDir(a, entry.path) catch null,
-                .reader_supported = readers_mod.isSupportedModelDir(a, entry.path),
+                .manifest = manifest,
+                .reader_supported = reader_candidate and readers_mod.isSupportedModelDir(a, entry.path),
             });
         }
 
@@ -5615,12 +5626,12 @@ pub const Node = struct {
                 const entry = discovered[listing.entry_index];
                 if (std.mem.eql(u8, task, "readers") and !listing.reader_supported) continue;
 
-                const tasks = if (listing.manifest) |*man| man.tasks else &.{};
-                const capabilities = if (listing.manifest) |*man| man.capabilities else &.{};
-                const gliner_model_type = if (listing.manifest) |*man| man.gliner_model_type else "";
-                const inputs = if (listing.manifest) |*man| man.inputs else &.{};
-                const has_visual = if (listing.manifest) |*man| man.visual_model_path != null or man.visual_projection_path != null else false;
-                const has_audio = if (listing.manifest) |*man| man.audio_model_path != null or man.audio_projection_path != null else false;
+                const tasks = listing.manifest.tasks;
+                const capabilities = listing.manifest.capabilities;
+                const gliner_model_type = listing.manifest.gliner_model_type;
+                const inputs = listing.manifest.inputs;
+                const has_visual = listing.manifest.visual_model_path != null or listing.manifest.visual_projection_path != null;
+                const has_audio = listing.manifest.audio_model_path != null or listing.manifest.audio_projection_path != null;
                 if (!taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) continue;
 
                 if (model_count > 0) try body.append(a, ',');

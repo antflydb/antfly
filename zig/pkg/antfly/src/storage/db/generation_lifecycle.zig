@@ -635,8 +635,7 @@ pub const PreparationTransition = struct {
         self.publication_lock = null;
         const publication_lock = openPublicationLock(self.alloc, path_key, .exclusive) catch |promotion_err| {
             self.publication_lock = openPublicationLock(self.alloc, path_key, .shared) catch |reacquire_err| {
-                std.log.err("generation preparation failed to restore publication read lock path={s} promotion_err={s} reacquire_err={s}", .{
-                    self.path,
+                std.log.err("generation preparation lock recovery failed phase=promote promotion_class={s} reacquire_class={s}", .{
                     @errorName(promotion_err),
                     @errorName(reacquire_err),
                 });
@@ -647,8 +646,7 @@ pub const PreparationTransition = struct {
         self.manager.promotePreparation(self.path, self.id) catch |promotion_err| {
             closePublicationLock(publication_lock);
             self.publication_lock = openPublicationLock(self.alloc, path_key, .shared) catch |reacquire_err| {
-                std.log.err("generation preparation failed to restore publication read lock path={s} promotion_err={s} reacquire_err={s}", .{
-                    self.path,
+                std.log.err("generation preparation lock recovery failed phase=state_promotion promotion_class={s} reacquire_class={s}", .{
                     @errorName(promotion_err),
                     @errorName(reacquire_err),
                 });

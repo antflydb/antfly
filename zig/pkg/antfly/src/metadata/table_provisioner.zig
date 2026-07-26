@@ -662,6 +662,8 @@ fn collectLocalRestoreProgressWithIo(
         var record: table_manager.RestoreProgressRecord = blk: {
             const progress_backup_id = try alloc.dupe(u8, restore.backup_id);
             errdefer alloc.free(progress_backup_id);
+            const progress_artifact_backup_id = try alloc.dupe(u8, restore.artifact_backup_id);
+            errdefer alloc.free(progress_artifact_backup_id);
             const progress_location = try alloc.dupe(u8, restore.location);
             errdefer alloc.free(progress_location);
             break :blk .{
@@ -669,6 +671,7 @@ fn collectLocalRestoreProgressWithIo(
                 .node_id = local_node_id,
                 .group_id = group_id,
                 .backup_id = progress_backup_id,
+                .artifact_backup_id = progress_artifact_backup_id,
                 .location = progress_location,
                 .snapshot_path = &.{},
                 .artifact_sha256 = &.{},

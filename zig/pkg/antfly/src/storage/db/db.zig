@@ -12759,7 +12759,7 @@ pub const DB = struct {
             .snapshot_path = identity_state.snapshot_path,
             .group_id = identity_state.group_id,
         };
-        std.log.warn("recovering incomplete restore import path={s} snapshot_root={s}", .{ path, import_state.snapshot_root });
+        std.log.warn("recovering incomplete restore import phase=startup", .{});
         try restoreSnapshotStoreTo(alloc, import_state.snapshot_root, path, opts, identity, io);
         return true;
     }
@@ -12900,20 +12900,20 @@ pub const DB = struct {
         const phase = state.phase;
 
         if (std.mem.eql(u8, phase, "runtime_repair") or std.mem.eql(u8, phase, "reset_watermarks")) {
-            std.log.info("restore runtime repair reset managed index watermarks path={s}", .{self.core.path});
+            std.log.info("restore runtime repair phase=reset_index_watermarks", .{});
             try self.resetManagedIndexAppliedSequencesForRestoreRepair(alloc);
             try self.refreshManagedIndexWorkersLocked();
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "rebuild_graph", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "rebuild_graph")) {
-            std.log.info("restore runtime repair rebuild graph state path={s}", .{self.core.path});
+            std.log.info("restore runtime repair phase=rebuild_graph", .{});
             _ = try self.rebuildGraphDerivedState();
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "rebuild_artifacts", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "rebuild_artifacts")) {
-            std.log.info("restore runtime repair rebuild stored embedding artifacts path={s}", .{self.core.path});
+            std.log.info("restore runtime repair phase=rebuild_stored_embeddings", .{});
             _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "replay_enrichments", false);
             return true;
@@ -12921,31 +12921,31 @@ pub const DB = struct {
         if (std.mem.eql(u8, phase, "replay_enrichments")) {
             if (self.core.hasGeneratedEnrichmentTargets()) {
                 if (self.enrichment_runtime == null) return error.RestoreRepairRequiresEnrichmentRuntime;
-                std.log.info("restore runtime repair replay generated enrichments path={s}", .{self.core.path});
+                std.log.info("restore runtime repair phase=replay_enrichments", .{});
                 _ = try self.replayGeneratedEnrichmentsFromStoredDocs(alloc);
             }
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "drain_async", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "drain_async")) {
-            std.log.info("restore runtime repair drain async work path={s}", .{self.core.path});
+            std.log.info("restore runtime repair phase=drain_async", .{});
             if (self.core.hasGeneratedEnrichmentTargets()) {
                 try self.runRestoreRepairDrainAsync();
             } else {
-                std.log.info("restore runtime repair skip async drain without generated enrichment targets path={s}", .{self.core.path});
+                std.log.info("restore runtime repair phase=skip_async_drain", .{});
             }
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "rebuild_replayed_artifacts", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "rebuild_replayed_artifacts")) {
-            std.log.info("restore runtime repair rebuild replayed embedding artifacts path={s}", .{self.core.path});
+            std.log.info("restore runtime repair phase=rebuild_replayed_embeddings", .{});
             _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
             _ = try self.rebuildSparseIndexesForTargetCoverage(alloc);
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "sync_indexes", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "sync_indexes")) {
-            std.log.info("restore runtime repair complete runtime indexes path={s}", .{self.core.path});
+            std.log.info("restore runtime repair phase=complete_indexes", .{});
             // Re-evaluate after every replay/rebuild phase. Those phases can
             // advance the durable replay target without rebuilding vectors,
             // leaving a completed artifact projection with an older applied
@@ -12961,7 +12961,7 @@ pub const DB = struct {
             try self.core.index_manager.syncAll(true);
             try self.core.syncStore(true);
             try markRestoreRuntimeRepairCompleteWithIo(alloc, io, self.core.path);
-            std.log.info("restore runtime repair marked complete path={s}", .{self.core.path});
+            std.log.info("restore runtime repair phase=complete", .{});
             return true;
         }
         return error.InvalidRestoreState;

@@ -620,6 +620,10 @@ pub const RestoreProgressRecord = struct {
     node_id: u64,
     group_id: u64,
     backup_id: []const u8,
+    /// Immutable artifact namespace selected by the admitted backup manifest.
+    /// This distinguishes repeated cluster-backup attempts that share a
+    /// logical table backup ID and source location.
+    artifact_backup_id: []const u8 = "",
     location: []const u8 = "",
     snapshot_path: []const u8 = "",
     artifact_sha256: []const u8 = "",
@@ -1333,6 +1337,8 @@ pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
 pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) !RestoreProgressRecord {
     const backup_id = try alloc.dupe(u8, record.backup_id);
     errdefer alloc.free(backup_id);
+    const artifact_backup_id = try alloc.dupe(u8, record.artifact_backup_id);
+    errdefer alloc.free(artifact_backup_id);
     const location = try alloc.dupe(u8, record.location);
     errdefer alloc.free(location);
     const snapshot_path = try alloc.dupe(u8, record.snapshot_path);
@@ -1348,6 +1354,7 @@ pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRec
         .node_id = record.node_id,
         .group_id = record.group_id,
         .backup_id = backup_id,
+        .artifact_backup_id = artifact_backup_id,
         .location = location,
         .snapshot_path = snapshot_path,
         .artifact_sha256 = artifact_sha256,
@@ -1361,6 +1368,7 @@ pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRec
 
 pub fn freeRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) void {
     alloc.free(record.backup_id);
+    alloc.free(record.artifact_backup_id);
     alloc.free(record.location);
     alloc.free(record.snapshot_path);
     alloc.free(record.artifact_sha256);

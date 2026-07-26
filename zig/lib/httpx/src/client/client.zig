@@ -94,7 +94,7 @@ pub const RequestOptions = struct {
     timeout_ms: ?u64 = null,
     follow_redirects: ?bool = null,
     /// Per-request response ceiling. This may lower, but never raise, the
-    /// client-wide maximum and applies after transparent decompression.
+    /// client-wide maximum.
     max_response_size: ?usize = null,
 };
 
@@ -596,7 +596,11 @@ pub const Client = struct {
                 // processed and are always safe to retry on a new connection.
                 const is_goaway_refused = (err == error.GoawayRefused);
                 const is_max_streams = (err == error.MaxConcurrentStreamsExceeded);
-                if ((is_goaway_refused or is_max_streams or (policy.retry_on_connection_error and can_retry_method)) and attempt < policy.max_retries) {
+                if ((is_goaway_refused or
+                    is_max_streams or
+                    (policy.retry_on_connection_error and can_retry_method and mayRetryConnectionError(err))) and
+                    attempt < policy.max_retries)
+                {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
                     if (delay_ms > 0) {
@@ -713,7 +717,11 @@ pub const Client = struct {
                 ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
                 const is_goaway_refused = (err == error.GoawayRefused);
                 const is_max_streams = (err == error.MaxConcurrentStreamsExceeded);
-                if ((is_goaway_refused or is_max_streams or (policy.retry_on_connection_error and can_retry_method)) and attempt < policy.max_retries) {
+                if ((is_goaway_refused or
+                    is_max_streams or
+                    (policy.retry_on_connection_error and can_retry_method and mayRetryConnectionError(err))) and
+                    attempt < policy.max_retries)
+                {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
                     if (delay_ms > 0) {
@@ -750,6 +758,22 @@ pub const Client = struct {
         return @min(req.max_response_size orelse self.config.max_response_size, self.config.max_response_size);
     }
 
+    fn checkedResponseSize(current: usize, incoming: usize, limit: usize) !usize {
+        if (current > limit or incoming > limit - current)
+            return error.ResponseTooLarge;
+        return current + incoming;
+    }
+
+    fn normalizeH2ResponseError(err: anyerror) anyerror {
+        return if (err == error.StreamDataOverflow) error.ResponseTooLarge else err;
+    }
+
+    fn mayRetryConnectionError(err: anyerror) bool {
+        // Local response-policy failures are deterministic. Retrying them
+        // wastes bandwidth and, for writer requests, could duplicate output.
+        return err != error.ResponseTooLarge;
+    }
+
     fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64) !Response {
         try ensureRequestDeadline(self.io, deadline_ms);
         const host = req.uri.host orelse return error.InvalidUri;
@@ -782,7 +806,7 @@ pub const Client = struct {
                     => {},
                     else => entry.broken = true,
                 }
-                return err;
+                return normalizeH2ResponseError(err);
             };
             // Mark broken if peer sent GOAWAY — next request gets a fresh connection.
             if (entry.h2.goaway_received) entry.broken = true;
@@ -916,7 +940,14 @@ pub const Client = struct {
         const bytes = try serializeToSlice(self.allocator, req);
         defer self.allocator.free(bytes);
         try socket.sendAll(bytes);
-        var res = try self.readResponseToWriter(socket, req.method, writer, progress_cb, progress_ctx);
+        var res = try self.readResponseToWriter(
+            socket,
+            req.method,
+            self.responseSizeLimit(req),
+            writer,
+            progress_cb,
+            progress_ctx,
+        );
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
         }
@@ -952,7 +983,14 @@ pub const Client = struct {
         const w = try session.getWriter();
         try w.writeAll(bytes);
         try session.flush();
-        var res = try self.readResponseToWriter(session, req.method, writer, progress_cb, progress_ctx);
+        var res = try self.readResponseToWriter(
+            session,
+            req.method,
+            self.responseSizeLimit(req),
+            writer,
+            progress_cb,
+            progress_ctx,
+        );
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
         }
@@ -1680,13 +1718,14 @@ pub const Client = struct {
         self: *Self,
         source: anytype,
         req_method: types.Method,
+        max_response_size: usize,
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
     ) !Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
-        parser.max_body_size = self.config.max_response_size;
+        parser.max_body_size = max_response_size;
         parser.max_headers = self.config.max_response_headers;
         parser.headers_only = true;
 
@@ -1740,7 +1779,16 @@ pub const Client = struct {
             break;
         }
 
-        return self.writeStreamingResponse(&parser, source, buf[0..leftover], req_method, writer, progress_cb, progress_ctx);
+        return self.writeStreamingResponse(
+            &parser,
+            source,
+            buf[0..leftover],
+            req_method,
+            max_response_size,
+            writer,
+            progress_cb,
+            progress_ctx,
+        );
     }
 
     /// Read bytes from either a Socket or a TlsSession into `buf`.
@@ -1878,7 +1926,7 @@ pub const Client = struct {
                     return error.InvalidResponse;
                 };
                 if (n == 0) break;
-                if (compressed.items.len + n > max_size) return error.ResponseTooLarge;
+                _ = try checkedResponseSize(compressed.items.len, n, max_size);
                 try compressed.appendSlice(self.allocator, read_buf[0..n]);
             }
 
@@ -1892,7 +1940,7 @@ pub const Client = struct {
                     return error.DecompressionFailed;
                 };
                 if (n == 0) break;
-                if (result.items.len + n > max_size) return error.ResponseTooLarge;
+                _ = try checkedResponseSize(result.items.len, n, max_size);
                 try result.appendSlice(self.allocator, read_buf[0..n]);
             }
         } else {
@@ -1903,7 +1951,7 @@ pub const Client = struct {
                     return error.InvalidResponse;
                 };
                 if (n == 0) break;
-                if (result.items.len + n > max_size) return error.ResponseTooLarge;
+                _ = try checkedResponseSize(result.items.len, n, max_size);
                 try result.appendSlice(self.allocator, read_buf[0..n]);
             }
         }
@@ -1923,11 +1971,12 @@ pub const Client = struct {
     }
 
     fn writeStreamingResponse(
-        self: *Self,
+        _: *Self,
         parser: *Parser,
         source: anytype,
         leftover: []const u8,
         req_method: types.Method,
+        max_response_size: usize,
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
@@ -1973,6 +2022,7 @@ pub const Client = struct {
             break :blk &chunked_reader.reader_iface;
         } else if (parser.content_length) |len| blk: {
             if (len > std.math.maxInt(usize)) return error.ResponseTooLarge;
+            if (container == null and len > max_response_size) return error.ResponseTooLarge;
             cl_reader = ContentLengthReader.init(body_source, @intCast(len), &cl_buf);
             break :blk &cl_reader.reader_iface;
         } else blk: {
@@ -1982,7 +2032,7 @@ pub const Client = struct {
         const close_delimited_body = !parser.chunked and parser.content_length == null;
         const is_redirect = code >= 300 and code < 400;
         const progress_total = if (container == null and !parser.chunked) parser.content_length else null;
-        var written_total: u64 = 0;
+        var written_total: usize = 0;
 
         var read_buf: [16 * 1024]u8 = undefined;
 
@@ -1994,8 +2044,11 @@ pub const Client = struct {
                     return error.InvalidResponse;
                 };
                 if (n == 0) break;
-                written_total += n;
-                if (written_total > self.config.max_response_size) return error.ResponseTooLarge;
+                written_total = try checkedResponseSize(
+                    written_total,
+                    n,
+                    max_response_size,
+                );
             }
         } else if (container) |ctr| {
             var decompress_window: [flate.max_window_len]u8 = undefined;
@@ -2008,10 +2061,17 @@ pub const Client = struct {
                     return error.DecompressionFailed;
                 };
                 if (n == 0) break;
-                if (written_total + n > self.config.max_response_size) return error.ResponseTooLarge;
+                const next_total = try checkedResponseSize(
+                    written_total,
+                    n,
+                    max_response_size,
+                );
                 try writer.writeAll(read_buf[0..n]);
-                written_total += n;
-                if (progress_cb) |cb| cb(.{ .bytes_written = written_total, .total_bytes = null }, progress_ctx);
+                written_total = next_total;
+                if (progress_cb) |cb| cb(.{
+                    .bytes_written = @intCast(written_total),
+                    .total_bytes = null,
+                }, progress_ctx);
             }
         } else {
             while (true) {
@@ -2021,9 +2081,17 @@ pub const Client = struct {
                     return error.InvalidResponse;
                 };
                 if (n == 0) break;
+                const next_total = try checkedResponseSize(
+                    written_total,
+                    n,
+                    max_response_size,
+                );
                 try writer.writeAll(read_buf[0..n]);
-                written_total += n;
-                if (progress_cb) |cb| cb(.{ .bytes_written = written_total, .total_bytes = progress_total }, progress_ctx);
+                written_total = next_total;
+                if (progress_cb) |cb| cb(.{
+                    .bytes_written = @intCast(written_total),
+                    .total_bytes = progress_total,
+                }, progress_ctx);
             }
         }
 
@@ -2530,6 +2598,20 @@ test "Client per-request response limit only lowers the configured ceiling" {
     try std.testing.expectEqual(@as(usize, 1024), client.responseSizeLimit(&request));
     request.max_response_size = 0;
     try std.testing.expectEqual(@as(usize, 0), client.responseSizeLimit(&request));
+    try std.testing.expectEqual(
+        @as(usize, 16),
+        try Client.checkedResponseSize(8, 8, 16),
+    );
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        Client.checkedResponseSize(std.math.maxInt(usize), 1, std.math.maxInt(usize)),
+    );
+    try std.testing.expectEqual(
+        error.ResponseTooLarge,
+        Client.normalizeH2ResponseError(error.StreamDataOverflow),
+    );
+    try std.testing.expect(!Client.mayRetryConnectionError(error.ResponseTooLarge));
+    try std.testing.expect(Client.mayRetryConnectionError(error.ConnectionClosed));
 }
 
 test "SliceIoReader reads slice data" {
@@ -2941,17 +3023,18 @@ const python_bounded_response_server_script =
     "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
     "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
     "listener.bind(('127.0.0.1', port))\n" ++
-    "listener.listen(1)\n" ++
-    "conn, _ = listener.accept()\n" ++
-    "with conn:\n" ++
-    "    data = b''\n" ++
-    "    while b'\\r\\n\\r\\n' not in data:\n" ++
-    "        chunk = conn.recv(4096)\n" ++
-    "        if not chunk:\n" ++
-    "            break\n" ++
-    "        data += chunk\n" ++
-    "    body = b'x' * 32\n" ++
-    "    conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 32\\r\\nConnection: close\\r\\n\\r\\n' + body)\n" ++
+    "listener.listen(2)\n" ++
+    "for _ in range(2):\n" ++
+    "    conn, _ = listener.accept()\n" ++
+    "    with conn:\n" ++
+    "        data = b''\n" ++
+    "        while b'\\r\\n\\r\\n' not in data:\n" ++
+    "            chunk = conn.recv(4096)\n" ++
+    "            if not chunk:\n" ++
+    "                break\n" ++
+    "            data += chunk\n" ++
+    "        body = b'x' * 32\n" ++
+    "        conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 32\\r\\nConnection: close\\r\\n\\r\\n' + body)\n" ++
     "listener.close()\n";
 
 fn reserveEphemeralPort(io: Io) !u16 {
@@ -3047,6 +3130,20 @@ test "per-request response limit rejects the body before allocation" {
         error.ResponseTooLarge,
         client.request(.GET, url, .{ .max_response_size = 16 }),
     );
+
+    var streamed = std.ArrayListUnmanaged(u8).empty;
+    defer streamed.deinit(allocator);
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        client.getToWriter(
+            url,
+            .{ .max_response_size = 16 },
+            arrayListWriter(&streamed, allocator),
+            null,
+            null,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), streamed.items.len);
 }
 
 test "request timeout is absolute when streaming a slow-drip response" {
