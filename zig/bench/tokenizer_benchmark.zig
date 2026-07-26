@@ -38,9 +38,16 @@ const Config = struct {
     max_chunks: usize = 256,
     worker_cache_count: usize = 0,
     worker_cache_slots: usize = 0,
+    workspace_retain_max_bytes: usize = 64 * 1024 * 1024,
     validation_mode: ValidationMode = .exact,
     mmap_corpus: bool = false,
+    resident_corpus: bool = false,
     prefault_corpus: bool = false,
+    stable_input: bool = false,
+    segmented_output: bool = false,
+    stable_boundary_index: bool = false,
+    recycle_segmented_output_pages: bool = false,
+    packed_u16_output: bool = false,
 };
 
 fn usage(writer: *std.Io.Writer) !void {
@@ -59,12 +66,19 @@ fn usage(writer: *std.Io.Writer) !void {
         \\  --max-chunks N            cap chunks per encode at 1..256
         \\  --worker-cache-count N    persistent private cache tables (0..64)
         \\  --worker-cache-slots N    power-of-two 32-byte entries per table
+        \\  --workspace-retain-max-mb N retain reusable chunk buffers up to N MiB
         \\  --profile-bpe             collect detailed BPE/cache counters
         \\  --diagnostics             measure scanner-only, serial no-cache, and serial warm stages
         \\  --diagnostic-iterations N stage repetitions (default: 1)
         \\  --validation exact|hash   exact replay or memory-bounded complete BLAKE3 validation
         \\  --mmap-corpus             map the corpus read-only instead of copying it
+        \\  --resident-corpus         copy a temporary mapping into owned resident memory
         \\  --prefault-corpus         touch mapped pages before timing
+        \\  --stable-input            reuse immutable-source segmentation metadata
+        \\  --segmented-output        retain ordered worker chunks without flattening
+        \\  --stable-boundary-index   retain one-bit-per-byte pretoken boundaries
+        \\  --recycle-segment-pages   release prior segmented-output pages to Darwin VM
+        \\  --packed-u16-output       retain lossless u16 token segments when IDs fit
         \\
         \\Measures the native Zig HuggingFace tokenizer's steady-state encodeInto
         \\throughput. The tokenizer and reusable output buffer persist across all
@@ -179,6 +193,17 @@ fn parseArgs(io: std.Io, args_in: std.process.Args) !Config {
                 args.next() orelse return error.MissingArgument,
                 10,
             );
+        } else if (std.mem.eql(u8, arg, "--workspace-retain-max-mb")) {
+            const max_mb = try std.fmt.parseInt(
+                usize,
+                args.next() orelse return error.MissingArgument,
+                10,
+            );
+            cfg.workspace_retain_max_bytes = std.math.mul(
+                usize,
+                max_mb,
+                1024 * 1024,
+            ) catch return error.InvalidConfiguration;
         } else if (std.mem.eql(u8, arg, "--validation")) {
             const mode = args.next() orelse return error.MissingArgument;
             if (std.mem.eql(u8, mode, "exact")) {
@@ -190,8 +215,20 @@ fn parseArgs(io: std.Io, args_in: std.process.Args) !Config {
             }
         } else if (std.mem.eql(u8, arg, "--mmap-corpus")) {
             cfg.mmap_corpus = true;
+        } else if (std.mem.eql(u8, arg, "--resident-corpus")) {
+            cfg.resident_corpus = true;
         } else if (std.mem.eql(u8, arg, "--prefault-corpus")) {
             cfg.prefault_corpus = true;
+        } else if (std.mem.eql(u8, arg, "--stable-input")) {
+            cfg.stable_input = true;
+        } else if (std.mem.eql(u8, arg, "--segmented-output")) {
+            cfg.segmented_output = true;
+        } else if (std.mem.eql(u8, arg, "--stable-boundary-index")) {
+            cfg.stable_boundary_index = true;
+        } else if (std.mem.eql(u8, arg, "--recycle-segment-pages")) {
+            cfg.recycle_segmented_output_pages = true;
+        } else if (std.mem.eql(u8, arg, "--packed-u16-output")) {
+            cfg.packed_u16_output = true;
         } else {
             return error.UnknownArgument;
         }
@@ -206,7 +243,13 @@ fn parseArgs(io: std.Io, args_in: std.process.Args) !Config {
         cfg.diagnostic_iterations == 0 or
         cfg.chunks_per_task > 256 or
         cfg.cache_bulk_slots_per_shard > 131072 or
-        (cfg.prefault_corpus and !cfg.mmap_corpus) or
+        (cfg.segmented_output and !cfg.stable_input) or
+        (cfg.stable_boundary_index and !cfg.stable_input) or
+        (cfg.recycle_segmented_output_pages and !cfg.segmented_output) or
+        (cfg.packed_u16_output and !cfg.segmented_output) or
+        (cfg.prefault_corpus and
+            !cfg.mmap_corpus and
+            !cfg.resident_corpus) or
         cfg.max_chunks == 0 or
         cfg.max_chunks > 256)
     {
@@ -217,15 +260,25 @@ fn parseArgs(io: std.Io, args_in: std.process.Args) !Config {
 
 const Worker = struct {
     tokenizer: tokenizer_mod.Tokenizer,
+    hf: *tokenizer_mod.hf.HfTokenizer,
     io: std.Io,
     corpus: []const u8,
     iterations: usize,
     internal_threads: usize,
+    stable_input_id: ?u64,
+    segmented_output: bool,
+    packed_u16_output: bool,
     ids: std.ArrayListUnmanaged(i32) = .empty,
+    segments: ?tokenizer_mod.hf.HfTokenizer.ParallelTokenSegments = null,
+    segments_u16: ?tokenizer_mod.hf.HfTokenizer.ParallelTokenSegmentsU16 = null,
     token_total: usize = 0,
     failure: ?anyerror = null,
 
     fn deinit(self: *Worker) void {
+        if (self.segments) |*segments| segments.deinit();
+        self.segments = null;
+        if (self.segments_u16) |*segments| segments.deinit();
+        self.segments_u16 = null;
         self.ids.deinit(std.heap.c_allocator);
         self.ids = .empty;
     }
@@ -234,14 +287,72 @@ const Worker = struct {
         const allocator = std.heap.c_allocator;
 
         for (0..self.iterations) |_| {
+            if (self.segments) |*segments| segments.deinit();
+            self.segments = null;
+            if (self.segments_u16) |*segments| segments.deinit();
+            self.segments_u16 = null;
             self.ids.clearRetainingCapacity();
-            self.tokenizer.encodeIntoParallel(
-                self.io,
-                allocator,
-                self.corpus,
-                &self.ids,
-                self.internal_threads,
-            ) catch |err| {
+            if (self.segmented_output) {
+                if (self.packed_u16_output) {
+                    self.segments_u16 =
+                        self.hf.encodeParallelSegmentsU16Stable(
+                            self.io,
+                            self.corpus,
+                            self.internal_threads,
+                            self.stable_input_id.?,
+                        ) catch |err| {
+                            self.failure = err;
+                            if (err == error.Canceled)
+                                return error.Canceled;
+                            return;
+                        };
+                    self.token_total +%=
+                        self.segments_u16.?.tokenCount();
+                    if (self.segments_u16.?.segmentCount() != 0) {
+                        std.mem.doNotOptimizeAway(
+                            self.segments_u16.?.segment(0).ptr,
+                        );
+                    }
+                } else {
+                    self.segments =
+                        self.hf.encodeParallelSegmentsStable(
+                            self.io,
+                            self.corpus,
+                            self.internal_threads,
+                            self.stable_input_id.?,
+                        ) catch |err| {
+                            self.failure = err;
+                            if (err == error.Canceled)
+                                return error.Canceled;
+                            return;
+                        };
+                    self.token_total +%= self.segments.?.tokenCount();
+                    if (self.segments.?.segmentCount() != 0) {
+                        std.mem.doNotOptimizeAway(
+                            self.segments.?.segment(0).ptr,
+                        );
+                    }
+                }
+                continue;
+            }
+            const result = if (self.stable_input_id) |stable_input_id|
+                self.tokenizer.encodeIntoParallelStable(
+                    self.io,
+                    allocator,
+                    self.corpus,
+                    &self.ids,
+                    self.internal_threads,
+                    stable_input_id,
+                )
+            else
+                self.tokenizer.encodeIntoParallel(
+                    self.io,
+                    allocator,
+                    self.corpus,
+                    &self.ids,
+                    self.internal_threads,
+                );
+            result catch |err| {
                 self.failure = err;
                 if (err == error.Canceled) return error.Canceled;
                 return;
@@ -363,6 +474,45 @@ fn hashTokenIdsBlake3(ids: []const i32) [32]u8 {
     return digest;
 }
 
+fn hashTokenSegmentsBlake3(
+    segments: *const tokenizer_mod.hf.HfTokenizer.ParallelTokenSegments,
+) [32]u8 {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    for (0..segments.segmentCount()) |idx| {
+        hasher.update(std.mem.sliceAsBytes(segments.segment(idx)));
+    }
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn hashTokenSegmentsU16Blake3(
+    segments: *const tokenizer_mod.hf.HfTokenizer.ParallelTokenSegmentsU16,
+) [32]u8 {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    var widened: [4096]i32 = undefined;
+    for (0..segments.segmentCount()) |idx| {
+        const segment = segments.segment(idx);
+        var start: usize = 0;
+        while (start < segment.len) {
+            const count = @min(widened.len, segment.len - start);
+            for (
+                segment[start..][0..count],
+                widened[0..count],
+            ) |id, *output| {
+                output.* = id;
+            }
+            hasher.update(
+                std.mem.sliceAsBytes(widened[0..count]),
+            );
+            start += count;
+        }
+    }
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
 const MappedCorpus = struct {
     bytes: []align(std.heap.page_size_min) u8,
     fd: std.posix.fd_t,
@@ -439,6 +589,17 @@ fn elapsedSeconds(started_at: std.Io.Timestamp, finished_at: std.Io.Timestamp) f
     const elapsed_ns = std.Io.Timestamp.durationTo(started_at, finished_at).nanoseconds;
     return @as(f64, @floatFromInt(elapsed_ns)) /
         @as(f64, @floatFromInt(std.time.ns_per_s));
+}
+
+fn prefaultCorpus(corpus: []const u8) void {
+    if (corpus.len == 0) return;
+    var page_checksum: u8 = 0;
+    var offset: usize = 0;
+    while (offset < corpus.len) : (offset += std.heap.page_size_min) {
+        page_checksum +%= corpus[offset];
+    }
+    page_checksum +%= corpus[corpus.len - 1];
+    std.mem.doNotOptimizeAway(page_checksum);
 }
 
 fn runStageDiagnostics(
@@ -526,25 +687,29 @@ pub fn main(init: std.process.Init) !void {
         .limited(256 * 1024 * 1024),
     );
     defer allocator.free(tokenizer_json);
-    var mapped_corpus: ?MappedCorpus = if (cfg.mmap_corpus)
+    var mapped_corpus: ?MappedCorpus = if (cfg.mmap_corpus or
+        cfg.resident_corpus)
         try .init(cfg.corpus_path)
     else
         null;
     defer if (mapped_corpus) |*mapped| mapped.deinit();
-    const corpus_file_owned: ?[]u8 = if (cfg.mmap_corpus)
-        null
-    else
+    const corpus_file_owned: ?[]u8 = if (cfg.resident_corpus) blk: {
+        const owned = try allocator.dupe(u8, mapped_corpus.?.bytes);
+        mapped_corpus.?.deinit();
+        mapped_corpus = null;
+        break :blk owned;
+    } else if (!cfg.mmap_corpus)
         try std.Io.Dir.cwd().readFileAlloc(
             init.io,
             cfg.corpus_path,
             allocator,
             .limited(16 * 1024 * 1024 * 1024),
-        );
-    defer if (corpus_file_owned) |owned| allocator.free(owned);
-    const corpus_file: []const u8 = if (mapped_corpus) |*mapped|
-        mapped.bytes
+        )
     else
-        corpus_file_owned.?;
+        null;
+    defer if (corpus_file_owned) |owned| allocator.free(owned);
+    const corpus_file: []const u8 =
+        corpus_file_owned orelse mapped_corpus.?.bytes;
     const repeated_corpus: ?[]u8 = if (cfg.repeat == 1)
         null
     else blk: {
@@ -560,13 +725,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (repeated_corpus) |repeated| allocator.free(repeated);
     const corpus: []const u8 = repeated_corpus orelse corpus_file;
     if (cfg.prefault_corpus) {
-        var page_checksum: u8 = 0;
-        var offset: usize = 0;
-        while (offset < corpus.len) : (offset += std.heap.page_size_min) {
-            page_checksum +%= corpus[offset];
-        }
-        page_checksum +%= corpus[corpus.len - 1];
-        std.mem.doNotOptimizeAway(page_checksum);
+        prefaultCorpus(corpus);
     }
 
     const hf = try tokenizer_mod.hf.HfTokenizer.loadFromBytes(allocator, tokenizer_json);
@@ -586,6 +745,9 @@ pub fn main(init: std.process.Init) !void {
         .max_chunks = cfg.max_chunks,
         .worker_cache_count = cfg.worker_cache_count,
         .worker_cache_slots = cfg.worker_cache_slots,
+        .max_retained_workspace_bytes = cfg.workspace_retain_max_bytes,
+        .retain_stable_pretoken_boundaries = cfg.stable_boundary_index,
+        .recycle_segmented_output_pages = cfg.recycle_segmented_output_pages,
     });
     const tokenizer = hf.tokenizer();
     const rss_after_load = processPeakRssBytes();
@@ -594,7 +756,43 @@ pub fn main(init: std.process.Init) !void {
     defer ids.deinit(allocator);
     for (0..cfg.warmup_iterations) |_| {
         ids.clearRetainingCapacity();
-        try tokenizer.encodeIntoParallel(init.io, allocator, corpus, &ids, cfg.internal_threads);
+        if (cfg.segmented_output) {
+            if (cfg.packed_u16_output) {
+                var segments =
+                    try hf.encodeParallelSegmentsU16Stable(
+                        init.io,
+                        corpus,
+                        cfg.internal_threads,
+                        1,
+                    );
+                segments.deinit();
+            } else {
+                var segments = try hf.encodeParallelSegmentsStable(
+                    init.io,
+                    corpus,
+                    cfg.internal_threads,
+                    1,
+                );
+                segments.deinit();
+            }
+        } else if (cfg.stable_input) {
+            try tokenizer.encodeIntoParallelStable(
+                init.io,
+                allocator,
+                corpus,
+                &ids,
+                cfg.internal_threads,
+                1,
+            );
+        } else {
+            try tokenizer.encodeIntoParallel(
+                init.io,
+                allocator,
+                corpus,
+                &ids,
+                cfg.internal_threads,
+            );
+        }
     }
     const rss_after_warmup = processPeakRssBytes();
     // Warmup exists to populate tokenizer-owned state. Its output capacity is
@@ -623,13 +821,23 @@ pub fn main(init: std.process.Init) !void {
     for (workers) |*worker| {
         worker.* = .{
             .tokenizer = tokenizer,
+            .hf = hf,
             .io = init.io,
             .corpus = corpus,
             .iterations = cfg.iterations,
             .internal_threads = cfg.internal_threads,
+            .stable_input_id = if (cfg.stable_input) 1 else null,
+            .segmented_output = cfg.segmented_output,
+            .packed_u16_output = cfg.packed_u16_output,
         };
     }
 
+    // Warmup output is no longer live. Re-establish the benchmark's
+    // in-memory-input contract immediately before timing; on Darwin the
+    // optional segmented-page recycling above prevents stale anonymous
+    // token pages from displacing this file-backed corpus.
+    if (cfg.prefault_corpus) prefaultCorpus(corpus);
+    const rss_before_timed = processPeakRssBytes();
     const cpu_started_ns = processCpuNs();
     const started_at = std.Io.Timestamp.now(init.io, .awake);
     var group: std.Io.Group = .init;
@@ -661,7 +869,12 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(timed_digests);
     if (cfg.validation_mode == .complete_hash) {
         for (workers, timed_digests) |*worker, *digest| {
-            digest.* = hashTokenIdsBlake3(worker.ids.items);
+            digest.* = if (worker.segments_u16) |*segments|
+                hashTokenSegmentsU16Blake3(segments)
+            else if (worker.segments) |*segments|
+                hashTokenSegmentsBlake3(segments)
+            else
+                hashTokenIdsBlake3(worker.ids.items);
             worker.deinit();
         }
     }
@@ -685,6 +898,33 @@ pub fn main(init: std.process.Init) !void {
     const expected_token_count = ids.items.len;
 
     if (cfg.validation_mode == .exact) {
+        for (workers) |*worker| {
+            if (worker.segments_u16) |*segments| {
+                try worker.ids.ensureTotalCapacityPrecise(
+                    allocator,
+                    segments.tokenCount(),
+                );
+                for (0..segments.segmentCount()) |idx| {
+                    for (segments.segment(idx)) |id| {
+                        worker.ids.appendAssumeCapacity(id);
+                    }
+                }
+                segments.deinit();
+                worker.segments_u16 = null;
+            } else if (worker.segments) |*segments| {
+                try worker.ids.ensureTotalCapacityPrecise(
+                    allocator,
+                    segments.tokenCount(),
+                );
+                for (0..segments.segmentCount()) |idx| {
+                    worker.ids.appendSliceAssumeCapacity(
+                        segments.segment(idx),
+                    );
+                }
+                segments.deinit();
+                worker.segments = null;
+            }
+        }
         // The final output retained by every timed worker was produced while
         // all external callers and their internal consumers shared the
         // tokenizer. Validate those measured outputs before replay.
@@ -794,13 +1034,24 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
     try stdout.interface.print(
-        "runtime=std_io corpus_storage={s} tokenizer_bytes={d} corpus_bytes={d} repeat={d} warmup_iterations={d} iterations={d} threads={d} internal_threads={d} " ++
+        "runtime=std_io corpus_storage={s} stable_input={} segmented_output={} packed_u16_output={} stable_boundary_index={} recycle_segment_pages={} tokenizer_bytes={d} corpus_bytes={d} repeat={d} warmup_iterations={d} iterations={d} threads={d} internal_threads={d} " ++
             "validation={s} tokens_per_iteration={d} token_hash={x} token_blake3={s} elapsed_seconds={d:.6} " ++
             "cpu_seconds={d:.6} average_cores={d:.3} cpu_ns_per_byte={d:.3} mb_per_second={d:.3} " ++
             "mtokens_per_second={d:.3} chunks_per_task={d} max_chunks={d} " ++
-            "worker_cache_count={d} worker_cache_slots_per_table={d} ",
+            "worker_cache_count={d} worker_cache_slots_per_table={d} " ++
+            "workspace_retain_limit_bytes={d} ",
         .{
-            if (cfg.mmap_corpus) "mmap" else "allocated",
+            if (cfg.resident_corpus)
+                "resident_copy"
+            else if (cfg.mmap_corpus)
+                "mmap"
+            else
+                "allocated",
+            cfg.stable_input,
+            cfg.segmented_output,
+            cfg.packed_u16_output,
+            cfg.stable_boundary_index,
+            cfg.recycle_segmented_output_pages,
             tokenizer_json.len,
             corpus.len,
             cfg.repeat,
@@ -822,6 +1073,7 @@ pub fn main(init: std.process.Init) !void {
             cfg.max_chunks,
             cfg.worker_cache_count,
             cfg.worker_cache_slots,
+            cfg.workspace_retain_max_bytes,
         },
     );
     try stdout.interface.print(
@@ -829,8 +1081,15 @@ pub fn main(init: std.process.Init) !void {
             "cache_bytes={d} cache_limit_bytes={d} cache_rejected_reservations={d} " ++
             "cache_rejected_admissions={d} cache_evictions={d} " ++
             "worker_cache_tables={d} worker_cache_entries={d} worker_cache_slots={d} " ++
-            "worker_cache_bytes={d} rss_after_load_bytes={d} " ++
-            "rss_after_warmup_bytes={d} rss_after_timed_bytes={d} rss_after_validation_bytes={d}\n",
+            "worker_cache_bytes={d} worker_token_arena_ids={d} " ++
+            "worker_cache_superpage_tables={d} " ++
+            "workspace_cached_count={d} " ++
+            "workspace_cached_bytes={d} affinity_learns={d} " ++
+            "affinity_replays={d} affinity_stolen_chunks={d} " ++
+            "stable_offset_learns={d} stable_offset_replays={d} " ++
+            "stable_offset_count={d} stable_offset_bytes={d} " ++
+            "stable_boundary_words={d} stable_boundary_bytes={d} " ++
+            "parallel_max_chunk_bytes={d} parallel_max_chunk_ns={d} ",
         .{
             cache_stats.entries,
             cache_stats.front_entries,
@@ -845,8 +1104,58 @@ pub fn main(init: std.process.Init) !void {
             cache_stats.worker_entries,
             cache_stats.worker_slots,
             cache_stats.worker_bytes,
+            cache_stats.worker_token_arena_ids,
+            cache_stats.worker_superpage_tables,
+            cache_stats.workspace_cached_count,
+            cache_stats.workspace_cached_bytes,
+            cache_stats.affinity_learns,
+            cache_stats.affinity_replays,
+            cache_stats.affinity_stolen_chunks,
+            cache_stats.stable_offset_learns,
+            cache_stats.stable_offset_replays,
+            cache_stats.stable_offset_count,
+            cache_stats.stable_offset_bytes,
+            cache_stats.stable_boundary_words,
+            cache_stats.stable_boundary_bytes,
+            cache_stats.parallel_max_chunk_bytes,
+            cache_stats.parallel_max_chunk_ns,
+        },
+    );
+    try stdout.interface.print(
+        "worker_cache_min_entries={d} worker_cache_max_entries={d} " ++
+            "workspace_total_count={d} workspace_total_bytes={d} " ++
+            "workspace_active_count={d} workspace_active_bytes={d} " ++
+            "workspace_accounted_bytes={d} " ++
+            "segmented_output_bytes={d} " ++
+            "segmented_output_capacity_bytes={d} " ++
+            "parallel_slowest_chunk_bytes={d} " ++
+            "parallel_slowest_chunk_owner={d} " ++
+            "parallel_max_owner_chunk_ns={d} " ++
+            "parallel_min_owner_chunk_ns={d} ",
+        .{
+            cache_stats.worker_min_entries,
+            cache_stats.worker_max_entries,
+            cache_stats.workspace_total_count,
+            cache_stats.workspace_total_bytes,
+            cache_stats.workspace_active_count,
+            cache_stats.workspace_active_bytes,
+            cache_stats.workspace_accounted_bytes,
+            cache_stats.workspace_active_output_bytes,
+            cache_stats.workspace_active_output_capacity_bytes,
+            cache_stats.parallel_slowest_chunk_bytes,
+            cache_stats.parallel_slowest_chunk_owner,
+            cache_stats.parallel_max_owner_chunk_ns,
+            cache_stats.parallel_min_owner_chunk_ns,
+        },
+    );
+    try stdout.interface.print(
+        "rss_after_load_bytes={d} rss_after_warmup_bytes={d} " ++
+            "rss_before_timed_bytes={d} " ++
+            "rss_after_timed_bytes={d} rss_after_validation_bytes={d}\n",
+        .{
             rss_after_load,
             rss_after_warmup,
+            rss_before_timed,
             rss_after_timed,
             rss_after_validation,
         },
