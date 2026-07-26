@@ -901,11 +901,12 @@ pub const H2Connection = struct {
                     if (stream.completion_sem) |sem| sem.post(self.io);
                     return;
                 }
-                if (self.max_stream_data_size > 0) {
+                const stream_data_limit = stream.max_data_size orelse self.max_stream_data_size;
+                if (stream_data_limit > 0) {
                     // Use total_data_received, not data_buf.items.len — compactDataBuf()
                     // shrinks the buffer, so buffer length alone is bypassable.
                     const new_size = stream.total_data_received + data_payload.len;
-                    if (new_size > self.max_stream_data_size) {
+                    if (new_size > stream_data_limit) {
                         stream.stream_error = error.StreamDataOverflow;
                         stream.completed = true;
                         if (stream.data_event) |ev| ev.set(self.io);
@@ -1980,7 +1981,12 @@ test "h2 round-trip over TCP loopback" {
 
     // Build and send a GET / request.
     const req_headers = try H2Connection.buildRequestHeaders(
-        "GET", "/", "http", "localhost", &.{}, allocator,
+        "GET",
+        "/",
+        "http",
+        "localhost",
+        &.{},
+        allocator,
     );
     defer allocator.free(req_headers);
     const stream = try client_h2.stream_manager.createStream();
@@ -2165,7 +2171,7 @@ test "batched WINDOW_UPDATE: END_STREAM flushes connection and stream credit" {
     try std.testing.expectEqual(@as(u32, 0), server.pending_conn_window_update);
 }
 
-test "deliverToMailbox rejects DATA exceeding max_stream_data_size" {
+test "deliverToMailbox lets a per-stream limit lower the connection ceiling" {
     const allocator = std.testing.allocator;
     var server = H2Connection.initServer(allocator, std.testing.io);
     defer server.deinit();
@@ -2174,6 +2180,7 @@ test "deliverToMailbox rejects DATA exceeding max_stream_data_size" {
     // Create a stream.
     const stream = try server.stream_manager.getOrCreateStream(1);
     stream.state = .open;
+    stream.max_data_size = 75;
 
     // Deliver a DATA frame within limits.
     var small_frame = Frame{
@@ -2186,8 +2193,8 @@ test "deliverToMailbox rejects DATA exceeding max_stream_data_size" {
 
     // Deliver a DATA frame that exceeds the limit.
     var big_frame = Frame{
-        .header = .{ .length = 60, .frame_type = .data, .flags = 0, .stream_id = 1 },
-        .payload = @constCast(&([_]u8{0x42} ** 60)),
+        .header = .{ .length = 30, .frame_type = .data, .flags = 0, .stream_id = 1 },
+        .payload = @constCast(&([_]u8{0x42} ** 30)),
     };
     try server.deliverToMailbox(&big_frame);
 

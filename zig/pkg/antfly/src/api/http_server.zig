@@ -8381,7 +8381,7 @@ pub const ApiHttpServer = struct {
         var page = backups_api.listClusterBackupsFromOpenedLocation(alloc, location, location_uri, options) catch |err| {
             if (backups_api.backupLocationErrorMessage(err) != null) return error.UnsupportedBackupLocation;
             if (err == error.InvalidBackupListLimit or err == error.InvalidBackupId) return error.InvalidRequest;
-            std.log.err("cluster backup list failed phase=request class={s}", .{backups_api.backupListErrorClass(err)});
+            backups_api.logBackupListRequestFailure(err);
             return error.InternalFailure;
         };
         defer page.deinit(alloc);

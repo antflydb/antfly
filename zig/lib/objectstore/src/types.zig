@@ -51,6 +51,9 @@ pub const GetOptions = struct {
     /// the response body and response-derived metadata. Defaults to false so
     /// existing callers retain complete metadata semantics.
     skip_metadata_probe: bool = false,
+    /// Bound bytes buffered by transports for this request. Implementations
+    /// must enforce this before returning a response body.
+    max_response_bytes: ?usize = null,
 };
 
 pub const DeleteOptions = struct {

@@ -8,6 +8,17 @@ access_key="antfly-integration"
 secret_key="antfly-integration-secret"
 bucket="antfly-backup-integration"
 
+for command in docker curl zig; do
+  if ! command -v "${command}" >/dev/null 2>&1; then
+    echo "required command not found: ${command}" >&2
+    exit 1
+  fi
+done
+if ! docker info >/dev/null 2>&1; then
+  echo "Docker daemon is unavailable" >&2
+  exit 1
+fi
+
 cleanup() {
   docker rm -f "${container_name}" >/dev/null 2>&1 || true
 }
@@ -21,7 +32,7 @@ docker run --rm --detach \
   "${minio_image}" server /data >/dev/null
 
 endpoint=""
-for _ in $(seq 1 60); do
+for ((attempt = 0; attempt < 60; attempt++)); do
   endpoint="$(docker port "${container_name}" 9000/tcp 2>/dev/null | head -n 1 || true)"
   if [[ -n "${endpoint}" ]] && curl --fail --silent "http://${endpoint}/minio/health/ready" >/dev/null; then
     break

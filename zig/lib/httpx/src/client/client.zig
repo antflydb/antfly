@@ -93,6 +93,9 @@ pub const RequestOptions = struct {
     json: ?[]const u8 = null,
     timeout_ms: ?u64 = null,
     follow_redirects: ?bool = null,
+    /// Per-request response ceiling. This may lower, but never raise, the
+    /// client-wide maximum and applies after transparent decompression.
+    max_response_size: ?usize = null,
 };
 
 pub const WriterProgress = struct {
@@ -352,6 +355,7 @@ pub const Client = struct {
 
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
+        req.max_response_size = reqOpts.max_response_size;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -446,6 +450,7 @@ pub const Client = struct {
 
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
+        req.max_response_size = reqOpts.max_response_size;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -741,6 +746,10 @@ pub const Client = struct {
         socket.setRequestDeadline(deadline_ms);
     }
 
+    fn responseSizeLimit(self: *const Self, req: *const Request) usize {
+        return @min(req.max_response_size orelse self.config.max_response_size, self.config.max_response_size);
+    }
+
     fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64) !Response {
         try ensureRequestDeadline(self.io, deadline_ms);
         const host = req.uri.host orelse return error.InvalidUri;
@@ -888,7 +897,7 @@ pub const Client = struct {
         const bytes = try serializeToSlice(self.allocator, req);
         defer self.allocator.free(bytes);
         try socket.sendAll(bytes);
-        var res = try self.readResponse(socket, req.method);
+        var res = try self.readResponse(socket, req.method, self.responseSizeLimit(req));
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
         }
@@ -922,7 +931,7 @@ pub const Client = struct {
         const w = try session.getWriter();
         try w.writeAll(bytes);
         try session.flush();
-        var res = try self.readResponse(session, req.method);
+        var res = try self.readResponse(session, req.method, self.responseSizeLimit(req));
         if (keep_alive_out) |out| {
             out.* = res.headers.isKeepAlive(.HTTP_1_1);
         }
@@ -1257,6 +1266,7 @@ pub const Client = struct {
             return error.ConnectionClosed;
         }
         const stream = try h2.stream_manager.createStream();
+        stream.max_data_size = self.responseSizeLimit(req);
         const stream_id = stream.id;
         errdefer h2.stream_manager.removeStream(stream_id);
 
@@ -1376,7 +1386,7 @@ pub const Client = struct {
         res.headers = response_headers;
 
         if (s.data_buf.items.len > 0) {
-            if (s.data_buf.items.len > self.config.max_response_size) return error.ResponseTooLarge;
+            if (s.data_buf.items.len > self.responseSizeLimit(req)) return error.ResponseTooLarge;
             res.body = try self.allocator.dupe(u8, s.data_buf.items);
             res.body_owned = true;
         }
@@ -1603,10 +1613,10 @@ pub const Client = struct {
     /// Streaming pipeline: parse headers only → build Io.Reader chain
     /// (leftover → socket/TLS → content-length/chunked → decompress) → read into output.
     /// Only one copy of the body is ever in memory at a time.
-    fn readResponse(self: *Self, source: anytype, req_method: types.Method) !Response {
+    fn readResponse(self: *Self, source: anytype, req_method: types.Method, max_response_size: usize) !Response {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
-        parser.max_body_size = self.config.max_response_size;
+        parser.max_body_size = max_response_size;
         parser.max_headers = self.config.max_response_headers;
         parser.headers_only = true;
 
@@ -1635,6 +1645,9 @@ pub const Client = struct {
                 };
                 if (n == 0) break;
                 total_read += n;
+                // This phase parses response headers into a fixed stack buffer.
+                // The caller-specific body ceiling is enforced by the streaming
+                // body pipeline after framing and decompression.
                 if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
                 const total = leftover + n;
                 const consumed = try parser.feed(buf[0..total]);
@@ -1660,7 +1673,7 @@ pub const Client = struct {
             break;
         }
 
-        return self.buildStreamingResponse(&parser, source, buf[0..leftover], req_method);
+        return self.buildStreamingResponse(&parser, source, buf[0..leftover], req_method, max_response_size);
     }
 
     fn readResponseToWriter(
@@ -1771,7 +1784,14 @@ pub const Client = struct {
 
     /// Builds a Response by streaming the body through an Io.Reader chain.
     /// After headers are parsed, the chain is: leftover bytes → network → framing → decompress → output.
-    fn buildStreamingResponse(self: *Self, parser: *Parser, source: anytype, leftover: []const u8, req_method: types.Method) !Response {
+    fn buildStreamingResponse(
+        self: *Self,
+        parser: *Parser,
+        source: anytype,
+        leftover: []const u8,
+        req_method: types.Method,
+        max_response_size: usize,
+    ) !Response {
         const code = parser.status_code orelse return error.InvalidResponse;
         var res = Response.init(parser.allocator, code);
         errdefer res.deinit();
@@ -1833,17 +1853,18 @@ pub const Client = struct {
         // --- Read from the chain into a single output buffer ---
         var result = std.ArrayListUnmanaged(u8).empty;
         errdefer result.deinit(self.allocator);
+        const max_size = max_response_size;
 
         // Pre-allocate hint: use content_length if known (and not compressed).
         if (container == null) {
             if (parser.content_length) |len| {
+                if (len > max_size) return error.ResponseTooLarge;
                 if (len <= std.math.maxInt(usize)) {
                     try result.ensureTotalCapacity(self.allocator, @intCast(len));
                 }
             }
         }
 
-        const max_size = self.config.max_response_size;
         var read_buf: [16 * 1024]u8 = undefined;
 
         if (container) |ctr| {
@@ -2493,6 +2514,24 @@ test "Client config limits are customizable" {
     try std.testing.expectEqual(@as(usize, 32), client.config.max_response_headers);
 }
 
+test "Client per-request response limit only lowers the configured ceiling" {
+    const allocator = std.testing.allocator;
+    var client = Client.initWithConfig(allocator, std.testing.io, .{
+        .max_response_size = 1024,
+    });
+    defer client.deinit();
+    var request = try Request.init(allocator, .GET, "http://example.com/");
+    defer request.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1024), client.responseSizeLimit(&request));
+    request.max_response_size = 64;
+    try std.testing.expectEqual(@as(usize, 64), client.responseSizeLimit(&request));
+    request.max_response_size = 2048;
+    try std.testing.expectEqual(@as(usize, 1024), client.responseSizeLimit(&request));
+    request.max_response_size = 0;
+    try std.testing.expectEqual(@as(usize, 0), client.responseSizeLimit(&request));
+}
+
 test "SliceIoReader reads slice data" {
     const data = "hello, world!";
     var buf: [64]u8 = undefined;
@@ -2894,6 +2933,27 @@ const python_slow_drip_server_script =
     "        pass\n" ++
     "listener.close()\n";
 
+const python_bounded_response_server_script =
+    "import socket\n" ++
+    "import sys\n" ++
+    "\n" ++
+    "port = int(sys.argv[1])\n" ++
+    "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
+    "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
+    "listener.bind(('127.0.0.1', port))\n" ++
+    "listener.listen(1)\n" ++
+    "conn, _ = listener.accept()\n" ++
+    "with conn:\n" ++
+    "    data = b''\n" ++
+    "    while b'\\r\\n\\r\\n' not in data:\n" ++
+    "        chunk = conn.recv(4096)\n" ++
+    "        if not chunk:\n" ++
+    "            break\n" ++
+    "        data += chunk\n" ++
+    "    body = b'x' * 32\n" ++
+    "    conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 32\\r\\nConnection: close\\r\\n\\r\\n' + body)\n" ++
+    "listener.close()\n";
+
 fn reserveEphemeralPort(io: Io) !u16 {
     const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     var listener = try socket_mod.TcpListener.init(listen_addr, io);
@@ -2950,6 +3010,43 @@ test "request timeout is absolute across a slow-drip response" {
     defer client.deinit();
 
     try std.testing.expectError(error.Timeout, getWithRetry(&client, io, url, 20));
+}
+
+test "per-request response limit rejects the body before allocation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const port = try reserveEphemeralPort(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_bounded_response_server_script });
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = false,
+        .retry_policy = .{ .max_retries = 0 },
+    });
+    defer client.deinit();
+
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        client.request(.GET, url, .{ .max_response_size = 16 }),
+    );
 }
 
 test "request timeout is absolute when streaming a slow-drip response" {

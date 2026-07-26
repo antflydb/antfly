@@ -129,7 +129,7 @@ pub const TransportResponse = struct {
     }
 };
 
-const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8) anyerror!TransportResponse;
+const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, ?usize) anyerror!TransportResponse;
 
 const HttpxTransport = struct {
     alloc: Allocator,
@@ -178,6 +178,7 @@ const HttpxTransport = struct {
         headers: []const HeaderPair,
         body: ?[]const u8,
         content_type: ?[]const u8,
+        max_response_size: ?usize,
     ) !TransportResponse {
         const self: *HttpxTransport = @ptrCast(@alignCast(ctx.?));
 
@@ -191,6 +192,7 @@ const HttpxTransport = struct {
         var response = try self.client.request(method.toHttpx(), url, .{
             .headers = request_headers.items,
             .body = body,
+            .max_response_size = max_response_size,
         });
         defer response.deinit();
 
@@ -472,7 +474,14 @@ pub const JsonApiClient = struct {
             }
         }
 
-        var response = try self.perform(.GET, url, headers.items, null, null);
+        var response = try self.performWithResponseLimit(
+            .GET,
+            url,
+            headers.items,
+            null,
+            null,
+            opts.max_response_bytes,
+        );
         errdefer response.deinit(alloc);
 
         switch (response.status) {
@@ -593,6 +602,18 @@ pub const JsonApiClient = struct {
         body: ?[]const u8,
         content_type: ?[]const u8,
     ) !TransportResponse {
+        return try self.performWithResponseLimit(method, url, headers, body, content_type, null);
+    }
+
+    fn performWithResponseLimit(
+        self: *JsonApiClient,
+        method: HttpMethod,
+        url: []const u8,
+        headers: []const HeaderPair,
+        body: ?[]const u8,
+        content_type: ?[]const u8,
+        max_response_size: ?usize,
+    ) !TransportResponse {
         var merged = std.ArrayListUnmanaged(HeaderPair).empty;
         defer merged.deinit(self.alloc);
         try merged.appendSlice(self.alloc, headers);
@@ -601,7 +622,16 @@ pub const JsonApiClient = struct {
         defer if (auth_value) |value| self.alloc.free(value);
         if (auth_value) |value| try merged.append(self.alloc, .{ "Authorization", value });
 
-        return try self.request_fn(self.request_ctx, self.alloc, method, url, merged.items, body, content_type);
+        return try self.request_fn(
+            self.request_ctx,
+            self.alloc,
+            method,
+            url,
+            merged.items,
+            body,
+            content_type,
+            max_response_size,
+        );
     }
 
     const vtable: client_mod.Client.VTable = .{
@@ -1243,7 +1273,7 @@ test "gcs file upload completes a resumable lifecycle with bounded chunks" {
     const State = struct {
         calls: usize = 0,
 
-        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8) !TransportResponse {
+        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             defer self.calls += 1;
             return switch (self.calls) {
@@ -1302,6 +1332,7 @@ test "json api client get object uses metadata then media with auth and range" {
             headers: []const HeaderPair,
             body: ?[]const u8,
             content_type: ?[]const u8,
+            max_response_size: ?usize,
         ) !TransportResponse {
             _ = body;
             _ = content_type;
@@ -1310,6 +1341,7 @@ test "json api client get object uses metadata then media with auth and range" {
 
             switch (self.calls) {
                 0 => {
+                    try std.testing.expectEqual(@as(?usize, null), max_response_size);
                     try std.testing.expectEqual(HttpMethod.GET, method);
                     try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt", url);
                     try expectHeader(headers, "Authorization", "Bearer token-123");
@@ -1319,6 +1351,7 @@ test "json api client get object uses metadata then media with auth and range" {
                     };
                 },
                 1 => {
+                    try std.testing.expectEqual(@as(?usize, null), max_response_size);
                     try std.testing.expectEqual(HttpMethod.GET, method);
                     try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt?generation=42&alt=media", url);
                     try expectHeader(headers, "Authorization", "Bearer token-123");
@@ -1331,6 +1364,7 @@ test "json api client get object uses metadata then media with auth and range" {
                     };
                 },
                 2 => {
+                    try std.testing.expectEqual(@as(?usize, 4), max_response_size);
                     try std.testing.expectEqual(HttpMethod.GET, method);
                     try std.testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/bucket/o/folder%2Fdoc.txt?generation=42&alt=media", url);
                     try expectHeader(headers, "Authorization", "Bearer token-123");
@@ -1374,6 +1408,7 @@ test "json api client get object uses metadata then media with auth and range" {
         .range = .{ .offset = 2, .length = 4 },
         .if_match_etag = "etag-1",
         .skip_metadata_probe = true,
+        .max_response_bytes = 4,
     });
     defer direct.deinit(alloc);
     try std.testing.expectEqualStrings("cdef", direct.body);
@@ -1395,6 +1430,7 @@ test "json api client put object encodes upload url and returns etag" {
             headers: []const HeaderPair,
             body: ?[]const u8,
             content_type: ?[]const u8,
+            _: ?usize,
         ) !TransportResponse {
             try std.testing.expectEqual(HttpMethod.POST, method);
             try std.testing.expectEqualStrings("https://storage.googleapis.com/upload/storage/v1/b/bucket/o?uploadType=media&name=folder%2Fdoc.txt&ifGenerationMatch=0", url);
@@ -1434,6 +1470,7 @@ test "json api client lists objects and prefixes" {
             headers: []const HeaderPair,
             body: ?[]const u8,
             content_type: ?[]const u8,
+            _: ?usize,
         ) !TransportResponse {
             _ = headers;
             _ = body;
@@ -1482,6 +1519,7 @@ test "json api client make bucket requires project id" {
             _: []const HeaderPair,
             _: ?[]const u8,
             _: ?[]const u8,
+            _: ?usize,
         ) !TransportResponse {
             return error.Unreachable;
         }

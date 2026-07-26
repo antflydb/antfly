@@ -837,12 +837,16 @@ const RemoteBackupStore = struct {
         if (options.known_size) |size| {
             if (size > @as(u64, @intCast(max_bytes))) return error.BackupManifestTooLarge;
         }
-        var result = try self.client.getObject(self.bucket, key, .{
+        var result = self.client.getObject(self.bucket, key, .{
             // Fetch one sentinel byte beyond the accepted limit. The range is
             // authoritative for buffering even if provider metadata is stale.
             .range = .{ .offset = 0, .length = @intCast(max_bytes + 1) },
             .skip_metadata_probe = options.skip_metadata_probe,
-        });
+            .max_response_bytes = max_bytes + 1,
+        }) catch |err| switch (err) {
+            error.ResponseTooLarge => return error.BackupManifestTooLarge,
+            else => return err,
+        };
         defer result.deinit(alloc);
         if (result.body.len > max_bytes) return error.BackupManifestTooLarge;
         return try alloc.dupe(u8, result.body);
@@ -3768,7 +3772,7 @@ pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, loc
         if (!std.mem.endsWith(u8, entry.name, "-cluster-metadata.json")) continue;
         const backup_id = entry.name[0 .. entry.name.len - "-cluster-metadata.json".len];
         validateBackupId(backup_id) catch {
-            std.log.warn("cluster backup list skipped manifest phase=key_validation class=invalid_manifest", .{});
+            logBackupListSkipped(.key_validation, "invalid_manifest");
             continue;
         };
         if (cursor_name) |cursor| if (std.mem.order(u8, entry.name, cursor) != .gt) continue;
@@ -3779,10 +3783,10 @@ pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, loc
         // manifest read.
         var validated = readClusterManifest(alloc, backup_root, backup_id) catch |err| {
             if (!isSkippableBackupListManifestError(err)) {
-                std.log.err("cluster backup list failed phase=manifest_read class={s}", .{backupListManifestErrorClass(err)});
+                logBackupListFailure(.manifest_read, backupListManifestErrorClass(err));
                 return err;
             }
-            std.log.warn("cluster backup list skipped manifest phase=manifest_read class={s}", .{backupListManifestErrorClass(err)});
+            logBackupListSkipped(.manifest_read, backupListManifestErrorClass(err));
             continue;
         };
         if (validated.format_version != cluster_format_version) {
@@ -3806,10 +3810,10 @@ pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, loc
         const backup_id = backupIdFromClusterMetadataKey(manifest_name);
         var manifest = readClusterManifest(alloc, backup_root, backup_id) catch |err| {
             if (!isSkippableBackupListManifestError(err)) {
-                std.log.err("cluster backup list failed phase=manifest_read class={s}", .{backupListManifestErrorClass(err)});
+                logBackupListFailure(.manifest_read, backupListManifestErrorClass(err));
                 return err;
             }
-            std.log.warn("cluster backup list skipped manifest phase=manifest_read class={s}", .{backupListManifestErrorClass(err)});
+            logBackupListSkipped(.manifest_read, backupListManifestErrorClass(err));
             continue;
         };
         defer manifest.deinit(alloc);
@@ -3873,6 +3877,49 @@ pub fn backupListErrorClass(err: anyerror) []const u8 {
         => "transport",
         else => "internal",
     };
+}
+
+pub const BackupListDiagnosticPhase = enum {
+    enumerate,
+    key_validation,
+    manifest_read,
+    request,
+};
+
+const BackupListDiagnosticOutcome = enum {
+    failed,
+    skipped,
+};
+
+fn formatBackupListDiagnostic(
+    buffer: []u8,
+    outcome: BackupListDiagnosticOutcome,
+    phase: BackupListDiagnosticPhase,
+    class: []const u8,
+) ![]const u8 {
+    return try std.fmt.bufPrint(
+        buffer,
+        "cluster backup list {s} phase={s} class={s}",
+        .{ @tagName(outcome), @tagName(phase), class },
+    );
+}
+
+fn logBackupListFailure(phase: BackupListDiagnosticPhase, class: []const u8) void {
+    var buffer: [160]u8 = undefined;
+    const diagnostic = formatBackupListDiagnostic(&buffer, .failed, phase, class) catch
+        "cluster backup list failed phase=request class=internal";
+    std.log.err("{s}", .{diagnostic});
+}
+
+fn logBackupListSkipped(phase: BackupListDiagnosticPhase, class: []const u8) void {
+    var buffer: [160]u8 = undefined;
+    const diagnostic = formatBackupListDiagnostic(&buffer, .skipped, phase, class) catch
+        "cluster backup list skipped phase=manifest_read class=internal";
+    std.log.warn("{s}", .{diagnostic});
+}
+
+pub fn logBackupListRequestFailure(err: anyerror) void {
+    logBackupListFailure(.request, backupListErrorClass(err));
 }
 
 fn backupListManifestErrorClass(err: anyerror) []const u8 {
@@ -3970,7 +4017,7 @@ pub fn listClusterBackupsFromOpenedLocation(
             if (continuation_token == null) start_after else null,
             continuation_token,
         ) catch |err| {
-            std.log.err("cluster backup list failed phase=enumerate class={s}", .{backupListErrorClass(err)});
+            logBackupListFailure(.enumerate, backupListErrorClass(err));
             return err;
         };
         defer listed.deinit(alloc);
@@ -3980,11 +4027,11 @@ pub fn listClusterBackupsFromOpenedLocation(
         for (listed.entries) |entry| {
             if (!std.mem.endsWith(u8, entry.key, "-cluster-metadata.json")) continue;
             const backup_id = backupIdFromListedRemoteClusterMetadataKey(&location.remote, entry.key) orelse {
-                std.log.warn("cluster backup list skipped manifest phase=key_validation class=invalid_manifest", .{});
+                logBackupListSkipped(.key_validation, "invalid_manifest");
                 continue;
             };
             validateBackupId(backup_id) catch {
-                std.log.warn("cluster backup list skipped manifest phase=key_validation class=invalid_manifest", .{});
+                logBackupListSkipped(.key_validation, "invalid_manifest");
                 continue;
             };
             var manifest = readClusterManifestFromRemoteKey(
@@ -3995,10 +4042,10 @@ pub fn listClusterBackupsFromOpenedLocation(
                 backup_id,
             ) catch |err| {
                 if (!isSkippableBackupListManifestError(err)) {
-                    std.log.err("cluster backup list failed phase=manifest_read class={s}", .{backupListManifestErrorClass(err)});
+                    logBackupListFailure(.manifest_read, backupListManifestErrorClass(err));
                     return err;
                 }
-                std.log.warn("cluster backup list skipped manifest phase=manifest_read class={s}", .{backupListManifestErrorClass(err)});
+                logBackupListSkipped(.manifest_read, backupListManifestErrorClass(err));
                 continue;
             };
             defer manifest.deinit(alloc);
@@ -5632,6 +5679,26 @@ test "remote backup key joins canonicalize only the prefix boundary" {
     try std.testing.expect(!isSkippableBackupListManifestError(error.InputOutput));
     try std.testing.expectEqualStrings("internal", backupListManifestErrorClass(error.OutOfMemory));
     try std.testing.expectEqualStrings("internal", backupListManifestErrorClass(error.InputOutput));
+
+    var diagnostic_buffer: [160]u8 = undefined;
+    const diagnostic = try formatBackupListDiagnostic(
+        &diagnostic_buffer,
+        .failed,
+        .manifest_read,
+        backupListManifestErrorClass(error.AccessDenied),
+    );
+    try std.testing.expectEqualStrings(
+        "cluster backup list failed phase=manifest_read class=access_denied",
+        diagnostic,
+    );
+    inline for (&.{
+        "s3://customer-bucket/private-prefix",
+        "AWS4-HMAC-SHA256 Credential=secret",
+        "Authorization: Bearer secret",
+        "customer-backup-id",
+    }) |sensitive| {
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic, sensitive) == null);
+    }
 }
 
 test "remote portable file transfer uses objectstore file paths" {
@@ -5985,6 +6052,7 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
             headers: []const object_storage.S3.HeaderPair,
             _: ?[]const u8,
             _: ?[]const u8,
+            max_response_size: ?usize,
         ) !object_storage.S3.TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             const parsed = try std.Uri.parse(url);
@@ -6049,6 +6117,10 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
                     };
                 },
                 .GET => blk: {
+                    try std.testing.expectEqual(
+                        @as(?usize, max_backup_manifest_bytes + 1),
+                        max_response_size,
+                    );
                     var has_bounded_range = false;
                     for (headers) |header| {
                         if (std.ascii.eqlIgnoreCase(header[0], "Range")) {
@@ -6205,6 +6277,24 @@ test "cluster backup list canonicalizes trailing remote prefix slash" {
         try writeClusterManifestToLocation(alloc, writer, &manifest);
     }
 
+    var canonical_restore = try readClusterManifestFromLocation(alloc, &canonical, "snap-a");
+    defer canonical_restore.deinit(alloc);
+    var trailing_restore = try readClusterManifestFromLocation(alloc, &trailing, "snap-a");
+    defer trailing_restore.deinit(alloc);
+    try std.testing.expectEqualStrings(canonical_restore.backup_id, trailing_restore.backup_id);
+    try verifyClusterBackupArtifactsIntegrityAtLocation(
+        alloc,
+        canonical.remote.io,
+        &canonical,
+        &canonical_restore,
+    );
+    try verifyClusterBackupArtifactsIntegrityAtLocation(
+        alloc,
+        trailing.remote.io,
+        &trailing,
+        &trailing_restore,
+    );
+
     var raw_client = memory.client();
     var listed = try raw_client.listObjects("bucket", .{
         .prefix = "backups/prod/",
@@ -6271,7 +6361,7 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol agai
         }
 
         fn requiredOwned(alloc: std.mem.Allocator, name: [:0]const u8) ![]u8 {
-            const value_z = std.c.getenv(name) orelse return error.SkipZigTest;
+            const value_z = std.c.getenv(name) orelse return error.MissingIntegrationEnvironment;
             return try alloc.dupe(u8, std.mem.span(value_z));
         }
 
@@ -6287,7 +6377,7 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol agai
     const bucket = try Integration.requiredOwned(alloc, "OBJECTSTORE_S3_TEST_BUCKET");
     defer alloc.free(bucket);
 
-    const cfg = object_storage.S3.fromEnvAlloc(
+    const cfg = try object_storage.S3.fromEnvAlloc(
         alloc,
         null,
         true,
@@ -6296,7 +6386,7 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol agai
         null,
         null,
         .path,
-    ) catch return error.SkipZigTest;
+    );
     var s3_impl = try object_storage.S3.Client.init(alloc, cfg);
     var owning_client = s3_impl.client();
     defer owning_client.deinit();
@@ -6370,6 +6460,24 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol agai
         const writer = if (index % 2 == 0) &canonical else &trailing;
         try writeClusterManifestToLocation(alloc, writer, &manifest);
     }
+
+    var canonical_restore = try readClusterManifestFromLocation(alloc, &canonical, backup_ids[0]);
+    defer canonical_restore.deinit(alloc);
+    var trailing_restore = try readClusterManifestFromLocation(alloc, &trailing, backup_ids[0]);
+    defer trailing_restore.deinit(alloc);
+    try std.testing.expectEqualStrings(canonical_restore.backup_id, trailing_restore.backup_id);
+    try verifyClusterBackupArtifactsIntegrityAtLocation(
+        alloc,
+        canonical.remote.io,
+        &canonical,
+        &canonical_restore,
+    );
+    try verifyClusterBackupArtifactsIntegrityAtLocation(
+        alloc,
+        trailing.remote.io,
+        &trailing,
+        &trailing_restore,
+    );
 
     var canonical_first = try listClusterBackupsFromOpenedLocation(
         alloc,
