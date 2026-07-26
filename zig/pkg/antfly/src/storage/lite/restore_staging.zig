@@ -1032,6 +1032,7 @@ test "lite portable backup roundtrips through normal table backup APIs" {
     _ = try normal_source.source().restoreTable(allocator, "docs", .{
         .backup_root = backup_root,
         .manifest = &lite_manifest,
+        .artifact_backup_id = lite_manifest.backup_id,
         .source_location = location,
     });
     _ = try normal_db.rebuildDenseIndexesForTargetCoverage(allocator);
