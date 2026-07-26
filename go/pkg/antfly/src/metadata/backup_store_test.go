@@ -15,6 +15,8 @@ package metadata
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -23,6 +25,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	json "github.com/antflydb/antfly/go/pkg/libaf/json"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
@@ -399,18 +403,20 @@ func TestClusterBackupAttemptMarkersSelectNewestAttempt(t *testing.T) {
 	newer.BackupID = "backup-2"
 	newer.CreatedAt = older.CreatedAt.Add(time.Second)
 
-	require.NoError(t, writeClusterBackupAttempt(
+	_, err := writeClusterBackupAttempt(
 		context.Background(),
 		"file://"+root,
 		nil,
 		older,
-	))
-	require.NoError(t, writeClusterBackupAttempt(
+	)
+	require.NoError(t, err)
+	_, err = writeClusterBackupAttempt(
 		context.Background(),
 		"file://"+root,
 		nil,
 		&newer,
-	))
+	)
+	require.NoError(t, err)
 	latest, err := latestClusterBackupAttempt(
 		context.Background(),
 		"file://"+root,
@@ -423,6 +429,173 @@ func TestClusterBackupAttemptMarkersSelectNewestAttempt(t *testing.T) {
 	require.NotNil(t, latest)
 	assert.Equal(t, newer.AttemptID, latest.AttemptID)
 	assert.Equal(t, newer.BackupID, latest.BackupID)
+}
+
+func TestClusterBackupAttemptHeadAtomicallyPinsExactMarker(t *testing.T) {
+	root := t.TempDir()
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-first",
+		BackupID:           "backup-1",
+		CreatedAt:          time.Now().UTC(),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"documents-backup-1"},
+		ArtifactNames:      []string{"backup-1-1.afb"},
+	}
+	digest, err := writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+	previous, err := publishClusterBackupAttemptHead(
+		context.Background(),
+		"file://"+root,
+		nil,
+		ClusterBackupAttemptHead{
+			Version:      clusterBackupAttemptHeadVersion,
+			AttemptID:    attempt.AttemptID,
+			BackupID:     attempt.BackupID,
+			MarkerSHA256: hex.EncodeToString(digest[:]),
+		},
+	)
+	require.NoError(t, err)
+	require.Nil(t, previous)
+
+	readHead := func() ClusterBackupAttemptHead {
+		body, readErr := os.ReadFile(filepath.Join(root, clusterBackupAttemptHeadName))
+		require.NoError(t, readErr)
+		var head ClusterBackupAttemptHead
+		require.NoError(t, json.Unmarshal(body, &head))
+		return head
+	}
+	firstHead := readHead()
+	assert.Equal(t, attempt.AttemptID, firstHead.AttemptID)
+	assert.Equal(t, attempt.BackupID, firstHead.BackupID)
+	assert.Equal(t, uint64(1), firstHead.Generation)
+	assert.Equal(t, clusterBackupAttemptStateActive, firstHead.State)
+	assert.Equal(t, hex.EncodeToString(digest[:]), firstHead.MarkerSHA256)
+
+	attempt.AttemptID = "afba-second"
+	attempt.BackupID = "backup-2"
+	secondDigest, err := writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+	previous, err = publishClusterBackupAttemptHead(
+		context.Background(),
+		"file://"+root,
+		nil,
+		ClusterBackupAttemptHead{
+			Version:      clusterBackupAttemptHeadVersion,
+			AttemptID:    attempt.AttemptID,
+			BackupID:     attempt.BackupID,
+			MarkerSHA256: hex.EncodeToString(secondDigest[:]),
+		},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, previous)
+	assert.Equal(t, "afba-first", previous.AttemptID)
+	secondHead := readHead()
+	assert.Equal(t, attempt.AttemptID, secondHead.AttemptID)
+	assert.Equal(t, attempt.BackupID, secondHead.BackupID)
+	assert.Equal(t, uint64(2), secondHead.Generation)
+	assert.Equal(t, clusterBackupAttemptStateActive, secondHead.State)
+	assert.Equal(t, hex.EncodeToString(secondDigest[:]), secondHead.MarkerSHA256)
+
+	owned, err := transitionClusterBackupAttemptHead(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt.AttemptID,
+		clusterBackupAttemptStateCommitted,
+	)
+	require.NoError(t, err)
+	require.True(t, owned)
+	committedHead := readHead()
+	assert.Equal(t, uint64(3), committedHead.Generation)
+	assert.Equal(t, clusterBackupAttemptStateCommitted, committedHead.State)
+
+	owned, err = transitionClusterBackupAttemptHead(
+		context.Background(),
+		"file://"+root,
+		nil,
+		"afba-first",
+		clusterBackupAttemptStateFailed,
+	)
+	require.NoError(t, err)
+	require.False(t, owned)
+}
+
+func TestClusterBackupAttemptHeadSerializesConcurrentFilePublishers(t *testing.T) {
+	root := t.TempDir()
+	attemptIDs := [...]string{
+		"afba-concurrent-1",
+		"afba-concurrent-2",
+		"afba-concurrent-3",
+		"afba-concurrent-4",
+		"afba-concurrent-5",
+		"afba-concurrent-6",
+		"afba-concurrent-7",
+		"afba-concurrent-8",
+	}
+	errs := make(chan error, len(attemptIDs))
+	var wg sync.WaitGroup
+	for _, attemptID := range attemptIDs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := publishClusterBackupAttemptHead(
+				context.Background(),
+				"file://"+root,
+				nil,
+				ClusterBackupAttemptHead{
+					Version:      clusterBackupAttemptHeadVersion,
+					AttemptID:    attemptID,
+					BackupID:     "backup-" + attemptID,
+					MarkerSHA256: strings.Repeat("0", sha256.Size*2),
+				},
+			)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	head, err := readClusterBackupAttemptHeadFile(
+		filepath.Join(root, clusterBackupAttemptHeadName),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, head)
+	assert.Equal(t, uint64(len(attemptIDs)), head.Generation)
+	assert.Equal(t, clusterBackupAttemptStateActive, head.State)
+}
+
+func TestGoBackupProducerRejectsRepositoryOwnedByZig(t *testing.T) {
+	root := t.TempDir()
+	headPath := filepath.Join(root, zigClusterBackupAttemptHeadName)
+	require.NoError(t, os.WriteFile(headPath, []byte(`{"version":1}`), 0o600))
+	err := ensureZigClusterBackupAttemptHeadAbsent(
+		context.Background(),
+		"file://"+root,
+		nil,
+	)
+	require.ErrorContains(t, err, "newer producer")
+	require.NoError(t, os.Remove(headPath))
+	require.NoError(t, ensureZigClusterBackupAttemptHeadAbsent(
+		context.Background(),
+		"file://"+root,
+		nil,
+	))
 }
 
 func TestNewestClusterBackupAttemptMustBeCommittedAndRestorable(t *testing.T) {
@@ -527,12 +700,13 @@ func TestStaleUncommittedClusterBackupAttemptIsRetainedWithoutLeaseAuthority(t *
 		MetadataIDs:        []string{"documents-backup-1"},
 		ArtifactNames:      []string{"backup-1-1.afb"},
 	}
-	require.NoError(t, writeClusterBackupAttempt(
+	_, err := writeClusterBackupAttempt(
 		context.Background(),
 		"file://"+root,
 		nil,
 		attempt,
-	))
+	)
+	require.NoError(t, err)
 
 	latest, err := latestClusterBackupAttempt(
 		context.Background(),
@@ -572,12 +746,13 @@ func TestStaleCommittedClusterBackupAttemptRetainsPermanentReservation(t *testin
 		MetadataIDs:        []string{"documents-backup-1"},
 		ArtifactNames:      []string{"backup-1-1.afb"},
 	}
-	require.NoError(t, writeClusterBackupAttempt(
+	_, err := writeClusterBackupAttempt(
 		context.Background(),
 		"file://"+root,
 		nil,
 		attempt,
-	))
+	)
+	require.NoError(t, err)
 	require.NoError(t, writeClusterMetadataToFile(
 		context.Background(),
 		"file://"+root,

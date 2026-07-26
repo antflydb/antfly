@@ -67,6 +67,7 @@ require (
 	github.com/firebase/genkit/go v1.5.0
 	github.com/getkin/kin-openapi v0.134.0
 	github.com/goccy/go-json v0.10.6
+	github.com/gofrs/flock v0.13.0
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pglogrepl v0.0.0-20251213150135-2e8d0df862c1
@@ -120,7 +121,6 @@ require (
 	github.com/earthboundkid/versioninfo/v2 v2.24.1 // indirect
 	github.com/eliben/go-sentencepiece v0.7.0 // indirect
 	github.com/go-errors/errors v1.5.1 // indirect
-	github.com/gofrs/flock v0.13.0 // indirect
 	github.com/gomlx/exceptions v0.0.3 // indirect
 	github.com/gomlx/go-coreml v0.0.0-20260301010621-8fdf6ad8655e // indirect
 	github.com/gomlx/go-coreml/gomlx v0.0.0-20260301010621-8fdf6ad8655e // indirect

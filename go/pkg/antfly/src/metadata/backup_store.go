@@ -132,8 +132,29 @@ func decodeBackupMetadata(data []byte) (*store.Table, common.BackupFormat, error
 }
 
 func writeJSONFileAtomically(ctx context.Context, filePath string, value any) error {
+	var body bytes.Buffer
+	writer := &boundedWriter{writer: &body, remaining: maxBackupMetadataBytes}
+	if err := json.NewEncoder(writer).Encode(value); err != nil {
+		return fmt.Errorf("encoding metadata to JSON: %w", err)
+	}
+	return writeBytesFileAtomically(ctx, filePath, body.Bytes(), false)
+}
+
+// writeBytesFileAtomically publishes an exact byte sequence after fsyncing it.
+// replace=false uses a hard-link commit so immutable metadata cannot be
+// replaced; mutable control records use an atomic rename and
+// last-completed-write order.
+func writeBytesFileAtomically(
+	ctx context.Context,
+	filePath string,
+	body []byte,
+	replace bool,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if len(body) > maxBackupMetadataBytes {
+		return ErrBackupMetadataTooLarge
 	}
 	dir := filepath.Dir(filePath)
 	file, err := os.CreateTemp(dir, "."+filepath.Base(filePath)+".tmp-*") //#nosec G304,G703 -- caller validates the destination directory
@@ -148,9 +169,8 @@ func writeJSONFileAtomically(ctx context.Context, filePath string, value any) er
 	if err := file.Chmod(0o600); err != nil {
 		return fmt.Errorf("setting metadata file permissions: %w", err)
 	}
-	writer := &boundedWriter{writer: file, remaining: maxBackupMetadataBytes}
-	if err := json.NewEncoder(writer).Encode(value); err != nil {
-		return fmt.Errorf("encoding metadata to JSON: %w", err)
+	if _, err := file.Write(body); err != nil {
+		return fmt.Errorf("writing metadata: %w", err)
 	}
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("syncing metadata file: %w", err)
@@ -161,11 +181,17 @@ func writeJSONFileAtomically(ctx context.Context, filePath string, value any) er
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.Link(tempPath, filePath); err != nil {
-		if os.IsExist(err) {
-			return fmt.Errorf("%w: %s", ErrBackupAlreadyExists, filepath.Base(filePath))
+	if replace {
+		if err := os.Rename(tempPath, filePath); err != nil {
+			return fmt.Errorf("replacing metadata file: %w", err)
 		}
-		return fmt.Errorf("publishing metadata file: %w", err)
+	} else {
+		if err := os.Link(tempPath, filePath); err != nil {
+			if os.IsExist(err) {
+				return fmt.Errorf("%w: %s", ErrBackupAlreadyExists, filepath.Base(filePath))
+			}
+			return fmt.Errorf("publishing metadata file: %w", err)
+		}
 	}
 	dirHandle, err := os.Open(dir) //#nosec G304 -- caller validates the destination directory
 	if err != nil {

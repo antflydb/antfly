@@ -20,6 +20,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	stdjson "encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -38,6 +39,7 @@ import (
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/tablemgr"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/usermgr"
+	"github.com/gofrs/flock"
 	"github.com/minio/minio-go/v7"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -388,6 +390,9 @@ type ClusterBackupMetadata struct {
 const (
 	clusterBackupAttemptVersion      = 1
 	clusterBackupAttemptDir          = ".antfly-incomplete"
+	clusterBackupAttemptHeadName     = ".antfly-go-backup-attempt-head.json"
+	zigClusterBackupAttemptHeadName  = ".antfly-backup-attempt-head.json"
+	clusterBackupAttemptHeadVersion  = 1
 	clusterBackupAttemptMaxAge       = 24 * time.Hour
 	clusterBackupAttemptScanLimit    = 64
 	clusterBackupHealthScanLimit     = 10_000
@@ -408,6 +413,24 @@ type ClusterBackupAttempt struct {
 	MetadataIDs        []string            `json:"metadata_ids"`
 	ArtifactNames      []string            `json:"artifact_names"`
 }
+
+// ClusterBackupAttemptHead is the compact Go-to-Zig migration authority.
+// MarkerSHA256 pins the exact immutable journal body, so Zig never needs to
+// scan retained history or depend on provider-specific LIST metadata.
+type ClusterBackupAttemptHead struct {
+	Version      uint32 `json:"version"`
+	Generation   uint64 `json:"generation"`
+	AttemptID    string `json:"attempt_id"`
+	BackupID     string `json:"backup_id"`
+	State        string `json:"state"`
+	MarkerSHA256 string `json:"marker_sha256"`
+}
+
+const (
+	clusterBackupAttemptStateActive    = "active"
+	clusterBackupAttemptStateCommitted = "committed"
+	clusterBackupAttemptStateFailed    = "failed"
+)
 
 func newClusterBackupAttemptID() (string, error) {
 	var entropy [16]byte
@@ -709,24 +732,33 @@ func clusterAttemptObjectKey(prefix, attemptID string) string {
 	return key
 }
 
+func encodeClusterBackupAttempt(attempt *ClusterBackupAttempt) ([]byte, error) {
+	var body bytes.Buffer
+	writer := &boundedWriter{writer: &body, remaining: maxBackupMetadataBytes}
+	if err := json.NewEncoder(writer).Encode(attempt); err != nil {
+		return nil, err
+	}
+	return body.Bytes(), nil
+}
+
 func writeClusterBackupAttempt(
 	ctx context.Context,
 	resolvedLocation string,
 	s3Info *common.S3Info,
 	attempt *ClusterBackupAttempt,
-) error {
+) ([sha256.Size]byte, error) {
 	if err := validateClusterBackupAttempt(attempt, attempt.AttemptID); err != nil {
-		return err
+		return [sha256.Size]byte{}, err
 	}
+	body, err := encodeClusterBackupAttempt(attempt)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	digest := sha256.Sum256(body)
 	if s3Info != nil {
 		client, err := s3Info.EnsureBucket(ctx)
 		if err != nil {
-			return err
-		}
-		var body bytes.Buffer
-		writer := &boundedWriter{writer: &body, remaining: maxBackupMetadataBytes}
-		if err := json.NewEncoder(writer).Encode(attempt); err != nil {
-			return err
+			return [sha256.Size]byte{}, err
 		}
 		options := minio.PutObjectOptions{ContentType: "application/json"}
 		options.SetMatchETagExcept("*")
@@ -734,21 +766,401 @@ func writeClusterBackupAttempt(
 			ctx,
 			s3Info.Bucket,
 			clusterAttemptObjectKey(s3Info.Prefix, attempt.AttemptID),
-			&body,
-			int64(body.Len()),
+			bytes.NewReader(body),
+			int64(len(body)),
 			options,
 		)
-		return err
+		return digest, err
 	}
 	root := strings.TrimPrefix(resolvedLocation, "file://")
 	attemptDir := filepath.Join(root, clusterBackupAttemptDir)
 	if err := os.MkdirAll(attemptDir, 0o750); err != nil {
-		return err
+		return [sha256.Size]byte{}, err
 	}
-	return writeJSONFileAtomically(
+	if err := writeBytesFileAtomically(
 		ctx,
 		filepath.Join(attemptDir, attempt.AttemptID+".json"),
-		attempt,
+		body,
+		false,
+	); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return digest, nil
+}
+
+func validateClusterBackupAttemptHead(head *ClusterBackupAttemptHead) error {
+	if head == nil ||
+		head.Version != clusterBackupAttemptHeadVersion ||
+		head.Generation == 0 ||
+		head.MarkerSHA256 == "" {
+		return errors.New("invalid cluster backup attempt head")
+	}
+	if err := common.ValidateBackupID(head.AttemptID); err != nil {
+		return err
+	}
+	if err := common.ValidateBackupID(head.BackupID); err != nil {
+		return err
+	}
+	switch head.State {
+	case clusterBackupAttemptStateActive,
+		clusterBackupAttemptStateCommitted,
+		clusterBackupAttemptStateFailed:
+	default:
+		return errors.New("invalid cluster backup attempt head state")
+	}
+	digest, err := hex.DecodeString(head.MarkerSHA256)
+	if err != nil || len(digest) != sha256.Size || hex.EncodeToString(digest) != head.MarkerSHA256 {
+		return errors.New("invalid cluster backup attempt marker digest")
+	}
+	return nil
+}
+
+func encodeClusterBackupAttemptHead(head *ClusterBackupAttemptHead) ([]byte, error) {
+	if err := validateClusterBackupAttemptHead(head); err != nil {
+		return nil, err
+	}
+	var body bytes.Buffer
+	writer := &boundedWriter{writer: &body, remaining: maxBackupMetadataBytes}
+	if err := json.NewEncoder(writer).Encode(head); err != nil {
+		return nil, err
+	}
+	return body.Bytes(), nil
+}
+
+func decodeClusterBackupAttemptHead(body []byte) (*ClusterBackupAttemptHead, error) {
+	var head ClusterBackupAttemptHead
+	decoder := stdjson.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&head); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("invalid trailing cluster backup attempt head data")
+	}
+	if err := validateClusterBackupAttemptHead(&head); err != nil {
+		return nil, err
+	}
+	return &head, nil
+}
+
+func nextClusterBackupAttemptHeadGeneration(previous *ClusterBackupAttemptHead) (uint64, error) {
+	if previous == nil {
+		return 1, nil
+	}
+	if previous.Generation == ^uint64(0) {
+		return 0, errors.New("cluster backup attempt head generation exhausted")
+	}
+	return previous.Generation + 1, nil
+}
+
+func readClusterBackupAttemptHeadFile(pathname string) (*ClusterBackupAttemptHead, error) {
+	file, err := os.Open(filepath.Clean(pathname))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	body, err := readBackupMetadata(file)
+	if err != nil {
+		return nil, err
+	}
+	return decodeClusterBackupAttemptHead(body)
+}
+
+// ensureZigClusterBackupAttemptHeadAbsent prevents a downgraded Go producer
+// from publishing into a repository whose ordering authority has already
+// migrated to Zig. A concurrent first Zig publication is still safe: Zig's
+// head has precedence during restore admission and permanently fences later Go
+// backup attempts.
+func ensureZigClusterBackupAttemptHeadAbsent(
+	ctx context.Context,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+) error {
+	if s3Info != nil {
+		client, err := s3Info.EnsureBucket(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = client.StatObject(
+			ctx,
+			s3Info.Bucket,
+			path.Join(s3Info.Prefix, zigClusterBackupAttemptHeadName),
+			minio.StatObjectOptions{},
+		)
+		if err == nil {
+			return errors.New("backup repository is owned by a newer producer")
+		}
+		if isS3ObjectNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	headPath := filepath.Join(
+		strings.TrimPrefix(resolvedLocation, "file://"),
+		zigClusterBackupAttemptHeadName,
+	)
+	_, err := os.Stat(filepath.Clean(headPath))
+	if err == nil {
+		return errors.New("backup repository is owned by a newer producer")
+	}
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+func readClusterBackupAttemptHeadObject(
+	ctx context.Context,
+	client *minio.Client,
+	bucket, objectKey string,
+) (*ClusterBackupAttemptHead, string, error) {
+	info, err := client.StatObject(ctx, bucket, objectKey, minio.StatObjectOptions{})
+	if err != nil {
+		if isS3ObjectNotFound(err) {
+			return nil, "", nil
+		}
+		return nil, "", err
+	}
+	if info.Size > maxBackupMetadataBytes || info.ETag == "" {
+		return nil, "", errors.New("invalid cluster backup attempt head identity")
+	}
+	options := minio.GetObjectOptions{}
+	if err := options.SetMatchETag(info.ETag); err != nil {
+		return nil, "", err
+	}
+	object, err := client.GetObject(ctx, bucket, objectKey, options)
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() { _ = object.Close() }()
+	body, err := readBackupMetadata(object)
+	if err != nil {
+		return nil, "", err
+	}
+	head, err := decodeClusterBackupAttemptHead(body)
+	return head, info.ETag, err
+}
+
+func publishClusterBackupAttemptHead(
+	ctx context.Context,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+	head ClusterBackupAttemptHead,
+) (*ClusterBackupAttemptHead, error) {
+	head.Version = clusterBackupAttemptHeadVersion
+	head.State = clusterBackupAttemptStateActive
+	if s3Info != nil {
+		client, err := s3Info.EnsureBucket(ctx)
+		if err != nil {
+			return nil, err
+		}
+		objectKey := path.Join(s3Info.Prefix, clusterBackupAttemptHeadName)
+		for retry := 0; retry < 16; retry++ {
+			previous, etag, err := readClusterBackupAttemptHeadObject(
+				ctx,
+				client,
+				s3Info.Bucket,
+				objectKey,
+			)
+			if err != nil {
+				if common.IsS3CreateConflict(err) {
+					continue
+				}
+				return nil, err
+			}
+			head.Generation, err = nextClusterBackupAttemptHeadGeneration(previous)
+			if err != nil {
+				return nil, err
+			}
+			body, err := encodeClusterBackupAttemptHead(&head)
+			if err != nil {
+				return nil, err
+			}
+			options := minio.PutObjectOptions{ContentType: "application/json"}
+			if previous == nil {
+				options.SetMatchETagExcept("*")
+			} else {
+				options.SetMatchETag(etag)
+			}
+			if _, err := client.PutObject(
+				ctx,
+				s3Info.Bucket,
+				objectKey,
+				bytes.NewReader(body),
+				int64(len(body)),
+				options,
+			); err != nil {
+				if common.IsS3CreateConflict(err) {
+					continue
+				}
+				return nil, err
+			}
+			return previous, nil
+		}
+		return nil, errors.New("cluster backup attempt head publication conflict")
+	}
+
+	root := strings.TrimPrefix(resolvedLocation, "file://")
+	headPath := filepath.Join(root, clusterBackupAttemptHeadName)
+	headLock := flock.New(headPath + ".publish.lock")
+	locked, err := headLock.TryLockContext(ctx, 10*time.Millisecond)
+	if err != nil {
+		return nil, err
+	}
+	if !locked {
+		return nil, errors.New("cluster backup attempt head lock unavailable")
+	}
+	defer func() { _ = headLock.Close() }()
+	previous, err := readClusterBackupAttemptHeadFile(headPath)
+	if err != nil {
+		return nil, err
+	}
+	head.Generation, err = nextClusterBackupAttemptHeadGeneration(previous)
+	if err != nil {
+		return nil, err
+	}
+	body, err := encodeClusterBackupAttemptHead(&head)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeBytesFileAtomically(ctx, headPath, body, true); err != nil {
+		return nil, err
+	}
+	return previous, nil
+}
+
+func transitionClusterBackupAttemptHead(
+	ctx context.Context,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+	attemptID, targetState string,
+) (bool, error) {
+	if targetState != clusterBackupAttemptStateCommitted &&
+		targetState != clusterBackupAttemptStateFailed {
+		return false, errors.New("invalid cluster backup attempt head transition")
+	}
+	update := func(current *ClusterBackupAttemptHead) (*ClusterBackupAttemptHead, bool, error) {
+		if current == nil || current.AttemptID != attemptID {
+			return nil, false, nil
+		}
+		if current.State == targetState {
+			return current, true, nil
+		}
+		if current.State != clusterBackupAttemptStateActive {
+			return nil, false, nil
+		}
+		next := *current
+		var err error
+		next.Generation, err = nextClusterBackupAttemptHeadGeneration(current)
+		if err != nil {
+			return nil, false, err
+		}
+		next.State = targetState
+		return &next, true, nil
+	}
+
+	if s3Info != nil {
+		client, err := s3Info.EnsureBucket(ctx)
+		if err != nil {
+			return false, err
+		}
+		objectKey := path.Join(s3Info.Prefix, clusterBackupAttemptHeadName)
+		for retry := 0; retry < 16; retry++ {
+			current, etag, err := readClusterBackupAttemptHeadObject(
+				ctx,
+				client,
+				s3Info.Bucket,
+				objectKey,
+			)
+			if err != nil {
+				if common.IsS3CreateConflict(err) {
+					continue
+				}
+				return false, err
+			}
+			next, owned, err := update(current)
+			if err != nil || !owned {
+				return owned, err
+			}
+			if current.State == targetState {
+				return true, nil
+			}
+			body, err := encodeClusterBackupAttemptHead(next)
+			if err != nil {
+				return false, err
+			}
+			options := minio.PutObjectOptions{ContentType: "application/json"}
+			options.SetMatchETag(etag)
+			if _, err := client.PutObject(
+				ctx,
+				s3Info.Bucket,
+				objectKey,
+				bytes.NewReader(body),
+				int64(len(body)),
+				options,
+			); err != nil {
+				if common.IsS3CreateConflict(err) {
+					continue
+				}
+				return false, err
+			}
+			return true, nil
+		}
+		return false, errors.New("cluster backup attempt head transition conflict")
+	}
+
+	root := strings.TrimPrefix(resolvedLocation, "file://")
+	headPath := filepath.Join(root, clusterBackupAttemptHeadName)
+	headLock := flock.New(headPath + ".publish.lock")
+	locked, err := headLock.TryLockContext(ctx, 10*time.Millisecond)
+	if err != nil {
+		return false, err
+	}
+	if !locked {
+		return false, errors.New("cluster backup attempt head lock unavailable")
+	}
+	defer func() { _ = headLock.Close() }()
+	current, err := readClusterBackupAttemptHeadFile(headPath)
+	if err != nil {
+		return false, err
+	}
+	next, owned, err := update(current)
+	if err != nil || !owned {
+		return owned, err
+	}
+	if current.State == targetState {
+		return true, nil
+	}
+	body, err := encodeClusterBackupAttemptHead(next)
+	if err != nil {
+		return false, err
+	}
+	if err := writeBytesFileAtomically(ctx, headPath, body, true); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func compactSupersededClusterBackupAttempt(
+	ctx context.Context,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+	previous *ClusterBackupAttemptHead,
+	currentAttemptID string,
+) error {
+	if previous == nil ||
+		previous.AttemptID == currentAttemptID ||
+		previous.State == clusterBackupAttemptStateActive {
+		return nil
+	}
+	return deleteClusterBackupAttempt(
+		ctx,
+		resolvedLocation,
+		s3Info,
+		previous.AttemptID,
 	)
 }
 
@@ -1190,6 +1602,22 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		Format:           clusterBackupFormatFromRequest(req.Format),
 		ResolvedLocation: metadataStore.ResolvedLocation(),
 	}
+	if err := ensureZigClusterBackupAttemptHeadAbsent(
+		ctx,
+		resolvedLocation,
+		s3Info,
+	); err != nil {
+		t.logger.Warn(
+			"Refusing Go backup into a repository owned by a newer producer",
+			zap.Error(err),
+		)
+		errorResponse(
+			w,
+			"Backup repository requires a newer Antfly producer",
+			http.StatusConflict,
+		)
+		return
+	}
 
 	// Get list of tables to backup
 	var tableNames []string
@@ -1259,7 +1687,8 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		MetadataIDs:        append([]string(nil), cleanupMetadataIDs...),
 		ArtifactNames:      append([]string(nil), allArtifactNames...),
 	}
-	if err := writeClusterBackupAttempt(ctx, resolvedLocation, s3Info, attempt); err != nil {
+	markerDigest, err := writeClusterBackupAttempt(ctx, resolvedLocation, s3Info, attempt)
+	if err != nil {
 		// Conditional publication may have reached storage even when its
 		// response was lost. Retain the reservation so a retry cannot overlap
 		// a marker that the bounded reclaimer may discover.
@@ -1319,8 +1748,52 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 			)
 			return
 		}
-		// Retain the lightweight marker as bounded health history.
+		if owned, err := transitionClusterBackupAttemptHead(
+			cleanupCtx,
+			resolvedLocation,
+			s3Info,
+			attemptID,
+			clusterBackupAttemptStateFailed,
+		); err != nil {
+			t.logger.Error(
+				"Failed to retire abandoned cluster backup attempt head",
+				zap.String("backup_id", req.BackupId),
+				zap.String("attempt_id", attemptID),
+				zap.Error(err),
+			)
+		} else if !owned {
+			// A newer head has already fenced this attempt. Its immutable
+			// marker remains available for bounded follow-up maintenance.
+			t.logger.Debug(
+				"Abandoned cluster backup attempt head was superseded",
+				zap.String("attempt_id", attemptID),
+			)
+		}
 	}()
+	previousHead, err := publishClusterBackupAttemptHead(
+		ctx,
+		resolvedLocation,
+		s3Info,
+		ClusterBackupAttemptHead{
+			Version:      clusterBackupAttemptHeadVersion,
+			AttemptID:    attemptID,
+			BackupID:     req.BackupId,
+			MarkerSHA256: hex.EncodeToString(markerDigest[:]),
+		},
+	)
+	if err != nil {
+		// A timeout may be observed after the head reached storage. Retain the
+		// reservation and immutable marker so either outcome remains safe.
+		cleanupSafe = false
+		t.logger.Error(
+			"Cluster backup attempt head outcome is ambiguous; retaining fenced attempt",
+			zap.String("backup_id", req.BackupId),
+			zap.String("attempt_id", attemptID),
+			zap.Error(err),
+		)
+		errorResponse(w, "Failed to publish backup attempt head", http.StatusInternalServerError)
+		return
+	}
 
 	// Create cluster metadata
 	backupFormat := backupConfig.Format
@@ -1497,9 +1970,42 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if owned, err := transitionClusterBackupAttemptHead(
+			ctx,
+			resolvedLocation,
+			s3Info,
+			attemptID,
+			clusterBackupAttemptStateCommitted,
+		); err != nil {
+			// The aggregate manifest is the immutable commit point. A lost head
+			// transition remains safe because active admission validates it.
+			t.logger.Warn(
+				"Cluster backup committed head update deferred",
+				zap.String("attempt_id", attemptID),
+				zap.Error(err),
+			)
+		} else if !owned {
+			t.logger.Warn(
+				"Cluster backup committed with superseded attempt head",
+				zap.String("attempt_id", attemptID),
+			)
+		}
 		committed = true
-		// Keep the attempt marker long enough for health verification to prove
-		// the newest attempt, rather than an older fallback, is restorable.
+		maintenanceCtx, maintenanceCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := compactSupersededClusterBackupAttempt(
+			maintenanceCtx,
+			resolvedLocation,
+			s3Info,
+			previousHead,
+			attemptID,
+		); err != nil {
+			t.logger.Warn(
+				"Superseded cluster backup journal compaction deferred",
+				zap.String("attempt_id", attemptID),
+				zap.Error(err),
+			)
+		}
+		maintenanceCancel()
 	}
 
 	w.Header().Set("Content-Type", "application/json")

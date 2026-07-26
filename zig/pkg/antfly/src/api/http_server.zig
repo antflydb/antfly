@@ -7208,7 +7208,7 @@ pub const ApiHttpServer = struct {
     };
 
     fn restoreOwnedTable(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, source_location: []const u8, backup_id: []const u8) !OwnedRestoreOutcome {
-        return try self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, backup_id, false, false);
+        return try self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, backup_id, false, false, null);
     }
 
     /// Admit the exact requested artifact immediately before metadata
@@ -7220,13 +7220,15 @@ pub const ApiHttpServer = struct {
         io: std.Io,
         backup_location: *backups_api.BackupLocation,
         manifest: *backups_api.TableBackupManifest,
+        verification_cache: ?*backups_api.ArtifactVerificationCache,
     ) !void {
         if (manifest.artifact_integrity_mode == .declared) {
-            return backups_api.verifyTableBackupArtifactsIntegrityAtLocation(
+            return backups_api.verifyTableBackupArtifactsIntegrityAtLocationWithCache(
                 self.alloc,
                 io,
                 backup_location,
                 manifest,
+                verification_cache,
             );
         }
         if (manifest.format != .portable) return error.UnsupportedBackupFormat;
@@ -7286,6 +7288,7 @@ pub const ApiHttpServer = struct {
         local_backup_root: []const u8,
         materialize_snapshot: bool,
         manifest: *backups_api.TableBackupManifest,
+        verification_cache: ?*backups_api.ArtifactVerificationCache,
     ) !void {
         if (manifest.artifact_integrity_mode == .declared) {
             if (materialize_snapshot) {
@@ -7294,18 +7297,20 @@ pub const ApiHttpServer = struct {
                     // deinitialized and therefore does not assume ownership.
                     .file = @constCast(local_backup_root),
                 };
-                return backups_api.verifyTableBackupArtifactsIntegrityAtLocation(
+                return backups_api.verifyTableBackupArtifactsIntegrityAtLocationWithCache(
                     self.alloc,
                     io,
                     &materialized_location,
                     manifest,
+                    verification_cache,
                 );
             }
-            return backups_api.verifyTableBackupArtifactsIntegrityAtLocation(
+            return backups_api.verifyTableBackupArtifactsIntegrityAtLocationWithCache(
                 self.alloc,
                 io,
                 backup_location,
                 manifest,
+                verification_cache,
             );
         }
         if (manifest.format != .portable) return error.UnsupportedBackupFormat;
@@ -7314,6 +7319,7 @@ pub const ApiHttpServer = struct {
                 io,
                 backup_location,
                 manifest,
+                verification_cache,
             );
         }
         try backups_api.deriveManifestArtifactIntegrity(
@@ -7333,6 +7339,7 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         restore_lifecycle_already_active: bool,
         replace_existing: bool,
+        verification_cache: ?*backups_api.ArtifactVerificationCache,
     ) !OwnedRestoreOutcome {
         var manifest = backups_api.readManifestFromLocationWithArtifactBackupId(
             self.alloc,
@@ -7389,6 +7396,7 @@ pub const ApiHttpServer = struct {
             local_backup_root,
             materialize_snapshot,
             &manifest,
+            verification_cache,
         );
 
         // Remote transfer and validation do not require exclusive table
@@ -7619,7 +7627,7 @@ pub const ApiHttpServer = struct {
         source_location: []const u8,
         backup_id: []const u8,
     ) !OwnedRestoreOutcome {
-        return try self.restoreOwnedTableWithRetryAndLifecycle(table_name, backup_location, source_location, backup_id, backup_id, false, false);
+        return try self.restoreOwnedTableWithRetryAndLifecycle(table_name, backup_location, source_location, backup_id, backup_id, false, false, null);
     }
 
     fn restoreOwnedTableWithRetryAndLifecycle(
@@ -7631,10 +7639,11 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         restore_lifecycle_already_active: bool,
         replace_existing: bool,
+        verification_cache: ?*backups_api.ArtifactVerificationCache,
     ) !OwnedRestoreOutcome {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
-            const outcome = self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, artifact_backup_id, restore_lifecycle_already_active, replace_existing) catch |err| switch (err) {
+            const outcome = self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, artifact_backup_id, restore_lifecycle_already_active, replace_existing, verification_cache) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
                     if (attempt + 1 >= 3) return err;
                     if (!replace_existing and (self.tableExists(table_name) catch false)) {
@@ -8692,6 +8701,7 @@ pub const ApiHttpServer = struct {
                 self.sharedApiIo() orelse return error.InternalFailure,
                 location,
                 &manifest,
+                null,
             ) catch |err| {
                 if (backups_api.isArtifactIntegrityError(err)) return error.BackupIntegrityFailure;
                 if (backups_api.isInvalidBackupManifestError(err))
@@ -9530,11 +9540,14 @@ pub const ApiHttpServer = struct {
         // the read. Keeping coordination in Antfly's durable restore job state
         // preserves restore.read least privilege and supports read-only/WORM
         // archives instead of writing lease sidecars into the source.
-        var manifest = backups_api.readClusterManifestForRestoreAdmission(
+        var verification_cache: backups_api.ArtifactVerificationCache = .{};
+        defer verification_cache.deinit(op_alloc);
+        var manifest = backups_api.readClusterManifestForRestoreAdmissionWithCache(
             op_alloc,
             restore_io,
             location,
             req.backup_id,
+            &verification_cache,
         ) catch |err| {
             const mapped = mapClusterRestoreRepositoryError(err);
             if (mapped == error.InternalFailure) {
@@ -9684,6 +9697,7 @@ pub const ApiHttpServer = struct {
                     restore_io,
                     location,
                     &table_manifest,
+                    &verification_cache,
                 ) catch |err| {
                     switch (mapClusterRestoreRepositoryError(err)) {
                         error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
@@ -9762,7 +9776,7 @@ pub const ApiHttpServer = struct {
             }
 
             const replace_existing = is_overwrite and (self.tableExists(table_name) catch |err| return metadataAccessFailure(err));
-            const outcome = self.restoreOwnedTableWithRetryAndLifecycle(table_name, location, req.location, table_backup_id, artifact_backup_id, false, replace_existing) catch |err| {
+            const outcome = self.restoreOwnedTableWithRetryAndLifecycle(table_name, location, req.location, table_backup_id, artifact_backup_id, false, replace_existing, &verification_cache) catch |err| {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
                 std.log.err("cluster restore failed phase=materialization class={s}", .{@errorName(err)});
                 statuses[i].@"error" = switch (err) {
@@ -29860,7 +29874,12 @@ test "distributed restore binds Go portable artifact bytes before metadata publi
         .vtable = &.{ .status = Fake.status },
     }, null, null);
     defer server.deinit();
-    try server.admitExternalRestoreArtifactIntegrity(std.testing.io, &location, &manifest);
+    try server.admitExternalRestoreArtifactIntegrity(
+        std.testing.io,
+        &location,
+        &manifest,
+        null,
+    );
 
     try std.testing.expectEqual(backups_api.ArtifactIntegrityMode.declared, manifest.artifact_integrity_mode);
     try std.testing.expectEqual(@as(u64, "portable-artifact".len), manifest.shards[0].artifact_size_bytes);
@@ -29925,6 +29944,7 @@ test "owned restore verifies declared artifact identity instead of accepting sta
             root,
             true,
             &manifest,
+            null,
         ),
     );
 }
