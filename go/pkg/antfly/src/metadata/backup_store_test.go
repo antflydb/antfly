@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
 	"github.com/stretchr/testify/assert"
@@ -376,6 +377,7 @@ func TestClusterBackupMetadataRequiresVersionIDAndFormat(t *testing.T) {
 
 func TestClusterBackupAttemptMarkersSelectNewestAttempt(t *testing.T) {
 	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
 	older := &ClusterBackupAttempt{
 		Version:            clusterBackupAttemptVersion,
 		AttemptID:          "afba-older",
@@ -408,12 +410,69 @@ func TestClusterBackupAttemptMarkersSelectNewestAttempt(t *testing.T) {
 		context.Background(),
 		"file://"+root,
 		nil,
+		backupStore,
 		clusterBackupAttemptScanLimit,
+		false,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, latest)
 	assert.Equal(t, newer.AttemptID, latest.AttemptID)
 	assert.Equal(t, newer.BackupID, latest.BackupID)
+}
+
+func TestNewestClusterBackupAttemptMustBeCommittedAndRestorable(t *testing.T) {
+	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
+	table := &store.Table{
+		Name:   "documents",
+		Shards: map[types.ID]*store.ShardConfig{1: {}},
+	}
+	metadataID := tableBackupMetadataID(table.Name, "backup-1")
+	artifactNames := backupArtifactNamesForFormat("backup-1", table, common.BackupFormatPortable)
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-newest",
+		BackupID:           "backup-1",
+		CreatedAt:          time.Now().UTC(),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{table.Name},
+		MetadataIDs:        []string{metadataID},
+		ArtifactNames:      artifactNames,
+	}
+	require.Error(t, validateNewestClusterBackupAttempt(
+		context.Background(), "file://"+root, nil, backupStore, attempt,
+	))
+	require.NoError(t, backupStore.WriteMetadata(
+		context.Background(), metadataID, table, common.BackupFormatPortable,
+	))
+	require.NoError(t, writeClusterMetadataToFile(
+		context.Background(),
+		"file://"+root,
+		attempt.BackupID,
+		&ClusterBackupMetadata{
+			Version:             clusterBackupMetadataVersion,
+			State:               clusterBackupStateComplete,
+			BackupID:            attempt.BackupID,
+			Format:              common.BackupFormatPortable,
+			ExpectedTableCount:  1,
+			CompletedTableCount: 1,
+			Tables: []ClusterBackupTableInfo{{
+				Name:           table.Name,
+				BackupLocation: "file:///backups/" + metadataID + "-metadata.json",
+				Status:         "completed",
+			}},
+		},
+	))
+	require.Error(t, validateNewestClusterBackupAttempt(
+		context.Background(), "file://"+root, nil, backupStore, attempt,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, artifactNames[0]), []byte("artifact"), 0o600,
+	))
+	require.NoError(t, validateNewestClusterBackupAttempt(
+		context.Background(), "file://"+root, nil, backupStore, attempt,
+	))
 }
 
 func TestClusterBackupAttemptRejectsOverlappingIdentifiers(t *testing.T) {
@@ -443,7 +502,7 @@ func TestClusterBackupAttemptRejectsOverlappingIdentifiers(t *testing.T) {
 	)
 }
 
-func TestStaleUncommittedClusterBackupAttemptRemainsFenced(t *testing.T) {
+func TestStaleUncommittedClusterBackupAttemptIsReclaimed(t *testing.T) {
 	root := t.TempDir()
 	backupStore := &fileBackupStore{location: root}
 	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
@@ -474,21 +533,19 @@ func TestStaleUncommittedClusterBackupAttemptRemainsFenced(t *testing.T) {
 		context.Background(),
 		"file://"+root,
 		nil,
+		backupStore,
 		clusterBackupAttemptScanLimit,
+		false,
 	)
 	require.NoError(t, err)
 	require.Nil(t, latest)
-	require.FileExists(t, filepath.Join(root, "backup-1-1.afb"))
-	require.FileExists(t, filepath.Join(
+	require.NoFileExists(t, filepath.Join(root, "backup-1-1.afb"))
+	require.NoFileExists(t, filepath.Join(
 		root,
 		clusterBackupAttemptDir,
 		attempt.AttemptID+".json",
 	))
-	require.ErrorIs(
-		t,
-		backupStore.ReserveBackupID(context.Background(), "backup-1"),
-		ErrBackupAlreadyExists,
-	)
+	require.NoError(t, backupStore.ReserveBackupID(context.Background(), "backup-1"))
 }
 
 func TestStaleCommittedClusterBackupAttemptRetainsPermanentReservation(t *testing.T) {
@@ -535,11 +592,13 @@ func TestStaleCommittedClusterBackupAttemptRetainsPermanentReservation(t *testin
 		context.Background(),
 		"file://"+root,
 		nil,
+		backupStore,
 		clusterBackupAttemptScanLimit,
+		false,
 	)
 	require.NoError(t, err)
 	require.Nil(t, latest)
-	require.NoFileExists(t, filepath.Join(
+	require.FileExists(t, filepath.Join(
 		root,
 		clusterBackupAttemptDir,
 		attempt.AttemptID+".json",

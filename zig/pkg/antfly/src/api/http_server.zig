@@ -8654,21 +8654,8 @@ pub const ApiHttpServer = struct {
                 };
             };
             cluster_committed = true;
-            backups_api.deleteClusterBackupAttemptMarker(
-                op_alloc,
-                backup_io,
-                location,
-                attempt_marker.attempt_id,
-            ) catch |err| {
-                // The aggregate manifest is authoritative and the permanent
-                // reservation remains the write-only admission fence. The
-                // bounded reclaimer can safely retire a stale marker.
-                std.log.warn("committed cluster backup marker cleanup deferred backup_id={s} attempt_id={s} err={s}", .{
-                    req.backup_id,
-                    attempt_marker.attempt_id,
-                    @errorName(err),
-                });
-            };
+            // Retain the marker as bounded health history so verification
+            // checks the newest attempt instead of an older fallback.
         } else {
             // A partial aggregate is not a restore candidate. Reclaim every
             // completed table attempt before releasing the cluster reservation
