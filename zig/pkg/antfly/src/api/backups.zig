@@ -104,7 +104,7 @@ pub const integrity_failure_message = "backup artifact failed integrity verifica
 pub const ArtifactVerificationCache = struct {
     entries: std.AutoHashMapUnmanaged(
         [std.crypto.hash.sha2.Sha256.digest_length]u8,
-        void,
+        [std.crypto.hash.sha2.Sha256.digest_length]u8,
     ) = .empty,
 
     pub fn deinit(self: *ArtifactVerificationCache, alloc: std.mem.Allocator) void {
@@ -112,21 +112,25 @@ pub const ArtifactVerificationCache = struct {
         self.* = .{};
     }
 
-    fn contains(
+    fn receipt(
         self: *const ArtifactVerificationCache,
         key: [std.crypto.hash.sha2.Sha256.digest_length]u8,
-    ) bool {
-        return self.entries.contains(key);
+    ) ?[std.crypto.hash.sha2.Sha256.digest_length]u8 {
+        return self.entries.get(key);
     }
 
     fn record(
         self: *ArtifactVerificationCache,
         alloc: std.mem.Allocator,
         key: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        identity: [std.crypto.hash.sha2.Sha256.digest_length]u8,
     ) !void {
-        if (self.entries.count() >= artifact_verification_cache_max_entries)
+        if (!self.entries.contains(key) and
+            self.entries.count() >= artifact_verification_cache_max_entries)
+        {
             return;
-        try self.entries.put(alloc, key, {});
+        }
+        try self.entries.put(alloc, key, identity);
     }
 };
 
@@ -1072,6 +1076,19 @@ const RemoteBackupStore = struct {
         alloc: std.mem.Allocator,
         shard: *const ShardSnapshot,
     ) !void {
+        return self.verifyPortableArtifactIntegrityWithIdentity(
+            alloc,
+            shard,
+            null,
+        );
+    }
+
+    fn verifyPortableArtifactIntegrityWithIdentity(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        shard: *const ShardSnapshot,
+        identity_hasher: ?*std.crypto.hash.sha2.Sha256,
+    ) !void {
         const key = try self.keyAlloc(alloc, shard.snapshot_path);
         defer alloc.free(key);
         var metadata = try self.client.statObject(self.bucket, key);
@@ -1092,6 +1109,11 @@ const RemoteBackupStore = struct {
         const hex = std.fmt.bytesToHex(digest, .lower);
         if (!std.mem.eql(u8, &hex, shard.artifact_sha256))
             return error.BackupArtifactIntegrityMismatch;
+        if (identity_hasher) |identity| {
+            hashArtifactBytes(identity, key);
+            hashArtifactU64(identity, metadata.content_length);
+            hashArtifactBytes(identity, etag);
+        }
     }
 
     const RemoteNativeArtifactScan = struct {
@@ -1109,6 +1131,7 @@ const RemoteBackupStore = struct {
         alloc: std.mem.Allocator,
         key_prefix: []const u8,
         hasher: ?*std.crypto.hash.sha2.Sha256,
+        identity_hasher: ?*std.crypto.hash.sha2.Sha256,
     ) !RemoteNativeArtifactScan {
         var file_count: u64 = 0;
         var total_size: u64 = 0;
@@ -1152,7 +1175,7 @@ const RemoteBackupStore = struct {
                 total_size = std.math.add(u64, total_size, entry.size) catch
                     return error.BackupArtifactTooLarge;
 
-                if (hasher) |stream| {
+                if (hasher != null or identity_hasher != null) {
                     var owned_etag: ?[]u8 = null;
                     defer if (owned_etag) |value| alloc.free(value);
                     const etag = if (entry.etag) |value|
@@ -1169,15 +1192,22 @@ const RemoteBackupStore = struct {
                         );
                         break :blk owned_etag.?;
                     };
-                    hashArtifactBytes(stream, relative_path);
-                    hashArtifactU64(stream, entry.size);
-                    try self.hashObjectVersion(
-                        alloc,
-                        entry.key,
-                        entry.size,
-                        etag,
-                        stream,
-                    );
+                    if (identity_hasher) |identity| {
+                        hashArtifactBytes(identity, relative_path);
+                        hashArtifactU64(identity, entry.size);
+                        hashArtifactBytes(identity, etag);
+                    }
+                    if (hasher) |stream| {
+                        hashArtifactBytes(stream, relative_path);
+                        hashArtifactU64(stream, entry.size);
+                        try self.hashObjectVersion(
+                            alloc,
+                            entry.key,
+                            entry.size,
+                            etag,
+                            stream,
+                        );
+                    }
                 }
             }
 
@@ -1209,17 +1239,37 @@ const RemoteBackupStore = struct {
         alloc: std.mem.Allocator,
         shard: *const ShardSnapshot,
     ) !void {
+        return self.verifyNativeArtifactIntegrityWithIdentity(
+            alloc,
+            shard,
+            null,
+        );
+    }
+
+    fn verifyNativeArtifactIntegrityWithIdentity(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        shard: *const ShardSnapshot,
+        identity_hasher: ?*std.crypto.hash.sha2.Sha256,
+    ) !void {
         const key_prefix = try self.keyPrefixAlloc(alloc, shard.snapshot_path);
         defer alloc.free(key_prefix);
 
-        const counted = try self.scanNativeArtifact(alloc, key_prefix, null);
+        const counted = try self.scanNativeArtifact(alloc, key_prefix, null, null);
         if (counted.file_count == 0) return error.BackupArtifactMissing;
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hasher.update("antfly-native-backup-tree-v1");
         hashArtifactU64(&hasher, counted.file_count);
-        const streamed = try self.scanNativeArtifact(alloc, key_prefix, &hasher);
+        const streamed = try self.scanNativeArtifact(
+            alloc,
+            key_prefix,
+            &hasher,
+            identity_hasher,
+        );
         if (streamed.file_count != counted.file_count)
             return error.SourceFileChanged;
+        if (identity_hasher) |identity|
+            hashArtifactU64(identity, streamed.file_count);
         hashArtifactU64(&hasher, streamed.total_size);
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         hasher.final(&digest);
@@ -2191,13 +2241,21 @@ const PortableShard = struct {
     start_key: []u8,
     end_key: ?[]u8,
     snapshot_path: []u8,
+    artifact_size_bytes: u64,
+    artifact_sha256: []u8,
 
     fn deinit(self: PortableShard, alloc: std.mem.Allocator) void {
         alloc.free(self.shard_id);
         alloc.free(self.start_key);
         if (self.end_key) |end| alloc.free(end);
         alloc.free(self.snapshot_path);
+        alloc.free(self.artifact_sha256);
     }
+};
+
+const GoPortableArtifactIntegrity = struct {
+    size_bytes: u64,
+    sha256: []const u8,
 };
 
 fn parseGoPortableTableManifest(
@@ -2206,17 +2264,59 @@ fn parseGoPortableTableManifest(
     backup_id: []const u8,
     artifact_backup_id: []const u8,
 ) !TableBackupManifest {
-    if (root.count() != 3) return error.InvalidBackupRequest;
     const version = switch (root.get("version") orelse return error.InvalidBackupRequest) {
         .integer => |value| value,
         else => return error.InvalidBackupRequest,
     };
-    if (version != 1) return error.UnsupportedBackupFormat;
+    if (version != 2) return error.UnsupportedBackupFormat;
+    if (root.count() != 4) return error.InvalidBackupRequest;
     const format = switch (root.get("format") orelse return error.InvalidBackupRequest) {
         .string => |value| value,
         else => return error.InvalidBackupRequest,
     };
     if (!std.mem.eql(u8, format, "portable")) return error.UnsupportedBackupFormat;
+    const artifact_values = switch (root.get("artifacts") orelse
+        return error.InvalidBackupRequest) {
+        .array => |value| value,
+        else => return error.InvalidBackupRequest,
+    };
+    var artifacts = std.StringHashMapUnmanaged(GoPortableArtifactIntegrity).empty;
+    defer artifacts.deinit(alloc);
+    try artifacts.ensureTotalCapacity(alloc, @intCast(artifact_values.items.len));
+    for (artifact_values.items) |artifact_value| {
+        const artifact = switch (artifact_value) {
+            .object => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        if (artifact.count() != 3) return error.InvalidBackupRequest;
+        const name = switch (artifact.get("name") orelse return error.InvalidBackupRequest) {
+            .string => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        try validateArtifactRelativePath(name);
+        if (std.mem.indexOfAny(u8, name, "/\\") != null)
+            return error.InvalidBackupRequest;
+        const size_integer = switch (artifact.get("size_bytes") orelse
+            return error.InvalidBackupRequest) {
+            .integer => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        if (size_integer <= 0) return error.InvalidBackupRequest;
+        const size_bytes = std.math.cast(u64, size_integer) orelse
+            return error.InvalidBackupRequest;
+        const sha256 = switch (artifact.get("sha256") orelse
+            return error.InvalidBackupRequest) {
+            .string => |value| value,
+            else => return error.InvalidBackupRequest,
+        };
+        if (!isLowerSha256Hex(sha256)) return error.BackupIntegrityMissing;
+        const entry = try artifacts.getOrPut(alloc, name);
+        if (entry.found_existing) return error.InvalidBackupRequest;
+        entry.value_ptr.* = .{
+            .size_bytes = size_bytes,
+            .sha256 = sha256,
+        };
+    }
     const table = switch (root.get("table") orelse return error.InvalidBackupRequest) {
         .object => |object| object,
         else => return error.InvalidBackupRequest,
@@ -2289,14 +2389,22 @@ fn parseGoPortableTableManifest(
             entry.key_ptr.*,
         });
         errdefer alloc.free(snapshot_path);
+        const artifact = artifacts.get(snapshot_path) orelse
+            return error.BackupIntegrityMissing;
+        _ = artifacts.remove(snapshot_path);
+        const artifact_sha256 = try alloc.dupe(u8, artifact.sha256);
+        errdefer alloc.free(artifact_sha256);
         try shards_list.append(alloc, .{
             .group_id = group_ids.dataGroupIdFromHash(raw_group_id),
             .shard_id = try alloc.dupe(u8, entry.key_ptr.*),
             .start_key = start_key,
             .end_key = end_key,
             .snapshot_path = snapshot_path,
+            .artifact_size_bytes = artifact.size_bytes,
+            .artifact_sha256 = artifact_sha256,
         });
     }
+    if (artifacts.count() != 0) return error.InvalidBackupRequest;
     std.mem.sort(PortableShard, shards_list.items, {}, portableShardLessThan);
 
     const shards = try alloc.alloc(ShardSnapshot, shards_list.items.len);
@@ -2311,13 +2419,15 @@ fn parseGoPortableTableManifest(
             .start_key = try alloc.dupe(u8, portable_shard.start_key),
             .end_key = if (portable_shard.end_key) |value| try alloc.dupe(u8, value) else null,
             .snapshot_path = try alloc.dupe(u8, portable_shard.snapshot_path),
+            .artifact_size_bytes = portable_shard.artifact_size_bytes,
+            .artifact_sha256 = try alloc.dupe(u8, portable_shard.artifact_sha256),
         };
         initialized += 1;
     }
 
     var manifest: TableBackupManifest = .{
         .format = .portable,
-        .artifact_integrity_mode = .derive_after_materialization,
+        .artifact_integrity_mode = .declared,
         .backup_id = try alloc.dupe(u8, backup_id),
         .table_name = try alloc.dupe(u8, table_name),
         .description = try alloc.dupe(u8, description),
@@ -5354,6 +5464,16 @@ fn hashLocalArtifactStat(
     hashArtifactI128(hasher, stat.ctime.toNanoseconds());
 }
 
+fn localArtifactStatsEqual(
+    lhs: std.Io.File.Stat,
+    rhs: std.Io.File.Stat,
+) bool {
+    return lhs.inode == rhs.inode and
+        lhs.size == rhs.size and
+        std.meta.eql(lhs.mtime, rhs.mtime) and
+        std.meta.eql(lhs.ctime, rhs.ctime);
+}
+
 const LocalNativeIdentityFile = struct {
     path: []u8,
     stat: std.Io.File.Stat,
@@ -5508,13 +5628,11 @@ fn hashRemoteNativeArtifactIdentity(
     hashArtifactU64(hasher, @intCast(file_count));
 }
 
-fn artifactVerificationCacheKey(
-    alloc: std.mem.Allocator,
-    io: std.Io,
+fn artifactVerificationCacheKeyHasher(
     location: *BackupLocation,
     format: BackupFormat,
     shard: *const ShardSnapshot,
-) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+) std.crypto.hash.sha2.Sha256 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-artifact-verification-receipt-v1");
     hasher.update(&.{@intFromEnum(format)});
@@ -5526,6 +5644,37 @@ fn artifactVerificationCacheKey(
         .file => |backup_root| {
             hasher.update("file");
             hashArtifactBytes(&hasher, backup_root);
+        },
+        .remote => |*store| {
+            hasher.update("remote");
+            hashArtifactBytes(&hasher, store.bucket);
+            hashArtifactBytes(&hasher, store.prefix);
+        },
+    }
+    return hasher;
+}
+
+fn artifactVerificationReceiptLookupKey(
+    location: *BackupLocation,
+    format: BackupFormat,
+    shard: *const ShardSnapshot,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = artifactVerificationCacheKeyHasher(location, format, shard);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn artifactVerificationCacheKey(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    format: BackupFormat,
+    shard: *const ShardSnapshot,
+) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = artifactVerificationCacheKeyHasher(location, format, shard);
+    switch (location.*) {
+        .file => |backup_root| {
             const artifact_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
                 backup_root,
                 shard.snapshot_path,
@@ -5550,29 +5699,24 @@ fn artifactVerificationCacheKey(
                 ),
             }
         },
-        .remote => |*store| {
-            hasher.update("remote");
-            hashArtifactBytes(&hasher, store.bucket);
-            hashArtifactBytes(&hasher, store.prefix);
-            switch (format) {
-                .portable => {
-                    const key = try store.keyAlloc(alloc, shard.snapshot_path);
-                    defer alloc.free(key);
-                    var metadata = try store.client.statObject(store.bucket, key);
-                    defer metadata.deinit(alloc);
-                    const etag = metadata.etag orelse
-                        return error.RestoreArtifactIdentityMissing;
-                    hashArtifactBytes(&hasher, key);
-                    hashArtifactU64(&hasher, metadata.content_length);
-                    hashArtifactBytes(&hasher, etag);
-                },
-                .native => try hashRemoteNativeArtifactIdentity(
-                    alloc,
-                    store,
-                    shard,
-                    &hasher,
-                ),
-            }
+        .remote => |*store| switch (format) {
+            .portable => {
+                const key = try store.keyAlloc(alloc, shard.snapshot_path);
+                defer alloc.free(key);
+                var metadata = try store.client.statObject(store.bucket, key);
+                defer metadata.deinit(alloc);
+                const etag = metadata.etag orelse
+                    return error.RestoreArtifactIdentityMissing;
+                hashArtifactBytes(&hasher, key);
+                hashArtifactU64(&hasher, metadata.content_length);
+                hashArtifactBytes(&hasher, etag);
+            },
+            .native => try hashRemoteNativeArtifactIdentity(
+                alloc,
+                store,
+                shard,
+                &hasher,
+            ),
         },
     }
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -5608,23 +5752,40 @@ pub fn verifyTableBackupArtifactsIntegrityAtLocationWithCache(
     if (table_manifest.artifact_integrity_mode != .declared)
         return error.BackupIntegrityMissing;
     for (table_manifest.shards) |*shard| {
-        const before = if (cache != null)
-            artifactVerificationCacheKey(
-                alloc,
-                io,
+        const receipt_key = if (cache != null)
+            artifactVerificationReceiptLookupKey(
                 location,
                 table_manifest.format,
                 shard,
-            ) catch |err| switch (err) {
-                error.FileNotFound => return error.BackupArtifactMissing,
-                else => return err,
-            }
+            )
         else
             null;
-        if (before) |key| {
-            if (cache.?.contains(key)) continue;
+        if (receipt_key) |key| {
+            if (cache.?.receipt(key)) |verified_identity| {
+                const current_identity = artifactVerificationCacheKey(
+                    alloc,
+                    io,
+                    location,
+                    table_manifest.format,
+                    shard,
+                ) catch |err| switch (err) {
+                    error.FileNotFound => return error.BackupArtifactMissing,
+                    else => return err,
+                };
+                if (std.mem.eql(u8, &verified_identity, &current_identity))
+                    continue;
+            }
         }
 
+        var exact_identity_hasher = artifactVerificationCacheKeyHasher(
+            location,
+            table_manifest.format,
+            shard,
+        );
+        const identity_hasher = if (cache != null)
+            &exact_identity_hasher
+        else
+            null;
         switch (location.*) {
             .file => |backup_root| {
                 const artifact_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
@@ -5632,41 +5793,55 @@ pub fn verifyTableBackupArtifactsIntegrityAtLocationWithCache(
                     shard.snapshot_path,
                 });
                 defer alloc.free(artifact_path);
-                verifyShardArtifactIntegrity(
-                    alloc,
-                    io,
-                    table_manifest.format,
-                    artifact_path,
-                    shard,
-                ) catch |err| switch (err) {
+                var actual = switch (table_manifest.format) {
+                    .portable => fileArtifactIntegrityAllocWithIdentity(
+                        alloc,
+                        io,
+                        artifact_path,
+                        identity_hasher,
+                    ),
+                    .native => directoryArtifactIntegrityAllocWithIdentity(
+                        alloc,
+                        io,
+                        artifact_path,
+                        identity_hasher,
+                    ),
+                } catch |err| switch (err) {
                     error.FileNotFound => return error.BackupArtifactMissing,
                     else => return err,
                 };
+                defer actual.deinit(alloc);
+                if (actual.size_bytes != shard.artifact_size_bytes or
+                    !std.mem.eql(u8, actual.sha256, shard.artifact_sha256))
+                {
+                    return error.BackupArtifactIntegrityMismatch;
+                }
             },
-            .remote => |*store| store.verifyArtifactIntegrity(
-                alloc,
-                table_manifest.format,
-                shard,
-            ) catch |err| switch (err) {
+            .remote => |*store| switch (table_manifest.format) {
+                .portable => store.verifyPortableArtifactIntegrityWithIdentity(
+                    alloc,
+                    shard,
+                    identity_hasher,
+                ),
+                .native => store.verifyNativeArtifactIntegrityWithIdentity(
+                    alloc,
+                    shard,
+                    identity_hasher,
+                ),
+            } catch |err| switch (err) {
                 error.FileNotFound => return error.BackupArtifactMissing,
                 else => return err,
             },
         }
 
-        if (before) |initial_key| {
-            const final_key = artifactVerificationCacheKey(
+        if (receipt_key) |key| {
+            var exact_identity: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            exact_identity_hasher.final(&exact_identity);
+            try cache.?.record(
                 alloc,
-                io,
-                location,
-                table_manifest.format,
-                shard,
-            ) catch |err| switch (err) {
-                error.FileNotFound => return error.SourceFileChanged,
-                else => return err,
-            };
-            if (!std.mem.eql(u8, &initial_key, &final_key))
-                return error.SourceFileChanged;
-            try cache.?.record(alloc, final_key);
+                key,
+                exact_identity,
+            );
         }
     }
 }
@@ -5786,6 +5961,7 @@ fn validateNewestCurrentGoBackupAttempt(
     io: std.Io,
     location: *BackupLocation,
     marker: *const CurrentGoClusterBackupAttemptMarker,
+    cache: ?*ArtifactVerificationCache,
 ) !ClusterBackupManifest {
     if (marker.format != .portable) return error.UnsupportedBackupFormat;
 
@@ -5842,7 +6018,7 @@ fn validateNewestCurrentGoBackupAttempt(
         };
         defer table_manifest.deinit(alloc);
         if (table_manifest.format != .portable or
-            table_manifest.artifact_integrity_mode != .derive_after_materialization or
+            table_manifest.artifact_integrity_mode != .declared or
             !std.mem.eql(u8, table_manifest.table_name, table.name))
         {
             return error.IncompleteClusterBackup;
@@ -5850,29 +6026,14 @@ fn validateNewestCurrentGoBackupAttempt(
         for (table_manifest.shards) |*shard| {
             if (!expected_artifacts.remove(shard.snapshot_path))
                 return error.IncompleteClusterBackup;
-            switch (location.*) {
-                .file => |backup_root| validateLocalArtifactAvailable(
-                    alloc,
-                    io,
-                    backup_root,
-                    table_manifest.format,
-                    table_manifest.artifact_integrity_mode,
-                    shard,
-                ) catch |err| switch (err) {
-                    error.FileNotFound => return error.BackupArtifactMissing,
-                    else => return err,
-                },
-                .remote => |*store| store.validateArtifactAvailable(
-                    alloc,
-                    table_manifest.format,
-                    table_manifest.artifact_integrity_mode,
-                    shard,
-                ) catch |err| switch (err) {
-                    error.FileNotFound => return error.BackupArtifactMissing,
-                    else => return err,
-                },
-            }
         }
+        try verifyTableBackupArtifactsIntegrityAtLocationWithCache(
+            alloc,
+            io,
+            location,
+            &table_manifest,
+            cache,
+        );
     }
     if (metadata_by_table.count() != 0 or expected_artifacts.count() != 0)
         return error.IncompleteClusterBackup;
@@ -5884,6 +6045,7 @@ fn readCurrentGoManifestForRestoreAdmission(
     io: std.Io,
     location: *BackupLocation,
     backup_id: []const u8,
+    cache: ?*ArtifactVerificationCache,
 ) !ClusterBackupManifest {
     var before = (try readCurrentGoClusterBackupAttemptHead(
         alloc,
@@ -5916,6 +6078,7 @@ fn readCurrentGoManifestForRestoreAdmission(
         io,
         location,
         newest,
+        cache,
     );
     var decoded: DecodedClusterManifest = if (std.mem.eql(
         u8,
@@ -5990,6 +6153,7 @@ pub fn readClusterManifestForRestoreAdmissionWithCache(
                 io,
                 location,
                 backup_id,
+                cache,
             ) catch |err| switch (err) {
                 error.BackupRepositoryBusy => continue,
                 else => return err,
@@ -6810,6 +6974,15 @@ fn fileArtifactIntegrityAlloc(
     io: std.Io,
     path: []const u8,
 ) !ArtifactIntegrity {
+    return fileArtifactIntegrityAllocWithIdentity(alloc, io, path, null);
+}
+
+fn fileArtifactIntegrityAllocWithIdentity(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    identity_hasher: ?*std.crypto.hash.sha2.Sha256,
+) !ArtifactIntegrity {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
@@ -6819,6 +6992,8 @@ fn fileArtifactIntegrityAlloc(
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     try hashFileContents(io, file, initial_stat, &hasher);
+    if (identity_hasher) |identity|
+        hashLocalArtifactStat(identity, initial_stat);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
@@ -6830,7 +7005,7 @@ fn fileArtifactIntegrityAlloc(
 
 const NativeArtifactFile = struct {
     path: []u8,
-    size: u64,
+    stat: std.Io.File.Stat,
 
     fn deinit(self: NativeArtifactFile, alloc: std.mem.Allocator) void {
         alloc.free(self.path);
@@ -6841,6 +7016,20 @@ fn directoryArtifactIntegrityAlloc(
     alloc: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
+) !ArtifactIntegrity {
+    return directoryArtifactIntegrityAllocWithIdentity(
+        alloc,
+        io,
+        path,
+        null,
+    );
+}
+
+fn directoryArtifactIntegrityAllocWithIdentity(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    identity_hasher: ?*std.crypto.hash.sha2.Sha256,
 ) !ArtifactIntegrity {
     var dir = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true })
@@ -6867,7 +7056,7 @@ fn directoryArtifactIntegrityAlloc(
                         c.* = '/';
                     };
                 }
-                try files.append(alloc, .{ .path = normalized, .size = stat.size });
+                try files.append(alloc, .{ .path = normalized, .stat = stat });
             },
             else => return error.UnsupportedBackupArtifact,
         }
@@ -6878,15 +7067,23 @@ fn directoryArtifactIntegrityAlloc(
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-native-backup-tree-v1");
     hashArtifactU64(&hasher, @intCast(files.items.len));
+    if (identity_hasher) |identity|
+        hashArtifactU64(identity, @intCast(files.items.len));
     for (files.items) |entry| {
-        total_size = std.math.add(u64, total_size, entry.size) catch return error.BackupArtifactTooLarge;
+        total_size = std.math.add(u64, total_size, entry.stat.size) catch
+            return error.BackupArtifactTooLarge;
         hashArtifactBytes(&hasher, entry.path);
-        hashArtifactU64(&hasher, entry.size);
+        hashArtifactU64(&hasher, entry.stat.size);
+        if (identity_hasher) |identity| {
+            hashArtifactBytes(identity, entry.path);
+            hashLocalArtifactStat(identity, entry.stat);
+        }
 
         var file = try dir.openFile(io, entry.path, .{});
         defer file.close(io);
         const initial_stat = try file.stat(io);
-        if (initial_stat.size != entry.size) return error.SourceFileChanged;
+        if (!localArtifactStatsEqual(initial_stat, entry.stat))
+            return error.SourceFileChanged;
         try hashFileContents(io, file, initial_stat, &hasher);
     }
     hashArtifactU64(&hasher, total_size);
@@ -6922,7 +7119,7 @@ fn hashFileContents(
     var extra: [1]u8 = undefined;
     if (try file.readPositionalAll(io, &extra, offset) != 0) return error.SourceFileChanged;
     const final_stat = try file.stat(io);
-    if (final_stat.size != initial_stat.size or !std.meta.eql(final_stat.mtime, initial_stat.mtime))
+    if (!localArtifactStatsEqual(final_stat, initial_stat))
         return error.SourceFileChanged;
 }
 
@@ -7947,25 +8144,20 @@ test "backup manifest round trips through remote objectstore location" {
 test "current Go portable metadata envelope materializes into a verified Zig manifest" {
     const alloc = std.testing.allocator;
     const body =
-        \\{"version":1,"format":"portable","table":{"name":"docs","description":"documents","schema":{"version":0},"indexes":{"embedding":{"provider":"termite"}},"shards":{"1":{"byte_range":["",""]}}}}
+        \\{"version":2,"format":"portable","artifacts":[{"name":"go-snap-1.afb","size_bytes":12,"sha256":"ff45daa2dbf814d8ad252fae57bc62d1980fe8e3f2cff145af1072208db937cf"}],"table":{"name":"docs","description":"documents","schema":{"version":0},"indexes":{"embedding":{"provider":"termite"}},"shards":{"1":{"byte_range":["",""]}}}}
     ;
     var manifest = try parseTableBackupManifest(alloc, body, "go-snap");
     defer manifest.deinit(alloc);
-    try std.testing.expectEqual(ArtifactIntegrityMode.derive_after_materialization, manifest.artifact_integrity_mode);
+    try std.testing.expectEqual(ArtifactIntegrityMode.declared, manifest.artifact_integrity_mode);
     try std.testing.expectEqual(BackupFormat.portable, manifest.format);
     try std.testing.expectEqualStrings("docs", manifest.table_name);
     try std.testing.expectEqualStrings("go-snap-1.afb", manifest.shards[0].snapshot_path);
     try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"provider\":\"antfly\"") != null);
-    try std.testing.expectError(
-        error.BackupIntegrityMissing,
-        validatePublishedTableManifest(alloc, &manifest, manifest.backup_id),
-    );
-    const unverified_current = try stringifyJsonAlloc(alloc, manifest);
-    defer alloc.free(unverified_current);
-    try std.testing.expectError(
-        error.BackupIntegrityMissing,
-        parseTableBackupManifest(alloc, unverified_current, manifest.backup_id),
-    );
+    try validatePublishedTableManifest(alloc, &manifest, manifest.backup_id);
+    const current = try stringifyJsonAlloc(alloc, manifest);
+    defer alloc.free(current);
+    var reparsed = try parseTableBackupManifest(alloc, current, manifest.backup_id);
+    reparsed.deinit(alloc);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7977,8 +8169,6 @@ test "current Go portable metadata envelope materializes into a verified Zig man
     });
     defer alloc.free(artifact_path);
     try writeFileAbsolute(artifact_path, "portable-afb");
-    try deriveManifestArtifactIntegrity(alloc, null, root, &manifest);
-    try std.testing.expectEqual(ArtifactIntegrityMode.declared, manifest.artifact_integrity_mode);
     try std.testing.expectEqual(@as(u64, "portable-afb".len), manifest.shards[0].artifact_size_bytes);
     try verifyShardArtifactIntegrity(alloc, null, .portable, artifact_path, &manifest.shards[0]);
 
@@ -7986,7 +8176,7 @@ test "current Go portable metadata envelope materializes into a verified Zig man
         error.UnsupportedBackupFormat,
         parseTableBackupManifest(
             alloc,
-            "{\"version\":2,\"format\":\"portable\",\"table\":{}}",
+            "{\"version\":1,\"format\":\"portable\",\"table\":{}}",
             "go-snap",
         ),
     );
@@ -8009,7 +8199,7 @@ test "current Go portable cluster envelope resolves table metadata ids" {
 
     var table_manifest = try parseTableBackupManifestWithArtifactBackupId(
         alloc,
-        "{\"version\":1,\"format\":\"portable\",\"table\":{\"name\":\"docs\",\"shards\":{\"1\":{\"byte_range\":[\"\",\"\"]}}}}",
+        "{\"version\":2,\"format\":\"portable\",\"artifacts\":[{\"name\":\"go-cluster-1.afb\",\"size_bytes\":20,\"sha256\":\"54e3c2a20e9aebe140e2f41e79fc798f0ccfae5641fd30da978b594321b9c559\"}],\"table\":{\"name\":\"docs\",\"shards\":{\"1\":{\"byte_range\":[\"\",\"\"]}}}}",
         manifest.tables[0].table_backup_id,
         manifest.tables[0].artifact_backup_id.?,
     );
@@ -8027,7 +8217,13 @@ test "current Go portable cluster envelope resolves table metadata ids" {
     });
     defer alloc.free(artifact_path);
     try writeFileAbsolute(artifact_path, "go-portable-artifact");
-    try deriveManifestArtifactIntegrity(alloc, null, root, &table_manifest);
+    try verifyShardArtifactIntegrity(
+        alloc,
+        null,
+        .portable,
+        artifact_path,
+        &table_manifest.shards[0],
+    );
 
     const table = try deriveRestoreTableRecord(alloc, "docs", "file:///backup", &table_manifest);
     defer metadata_table_manager.freeTable(alloc, table);
@@ -10478,7 +10674,7 @@ test "restore admission validates the stable newest current Go attempt" {
     try location.remote.writeBytes(
         alloc,
         "table-77cfb73404d45d27f72ecbfb232c3fbaf6efbb64592b5ae78fca3e5c544fd3d4-metadata.json",
-        "{\"version\":1,\"format\":\"portable\",\"table\":{\"name\":\"docs\",\"shards\":{\"1\":{\"byte_range\":[\"\",\"\"]}}}}",
+        "{\"version\":2,\"format\":\"portable\",\"artifacts\":[{\"name\":\"go-cluster-1.afb\",\"size_bytes\":17,\"sha256\":\"2042f5c3b5166c9f5cca6eb5c16a9d84c0df1dc673088ebe971e5f20e0e326a6\"}],\"table\":{\"name\":\"docs\",\"shards\":{\"1\":{\"byte_range\":[\"\",\"\"]}}}}",
         "application/json",
     );
     try location.remote.writeBytes(
@@ -10548,11 +10744,11 @@ test "restore admission validates the stable newest current Go attempt" {
     try location.remote.writeBytes(
         alloc,
         "go-cluster-1.afb",
-        "",
+        "PORTABLE-ARTIFACT",
         "application/octet-stream",
     );
     try std.testing.expectError(
-        error.BackupArtifactMissing,
+        error.BackupArtifactIntegrityMismatch,
         readClusterManifestForRestoreAdmission(
             alloc,
             io,

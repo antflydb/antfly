@@ -28,7 +28,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	json "github.com/antflydb/antfly/go/pkg/libaf/json"
@@ -70,7 +72,50 @@ func backupArtifactNamesForFormat(
 		}
 		names = append(names, name)
 	}
+	sort.Strings(names)
 	return names
+}
+
+func (t *TableApi) backupShardsWithIntegrity(
+	ctx context.Context,
+	table *store.Table,
+	backup common.BackupConfig,
+) ([]common.BackupArtifactIntegrity, error) {
+	var mu sync.Mutex
+	artifacts := make([]common.BackupArtifactIntegrity, 0, len(table.Shards))
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(innerFanOutLimit)
+	for shardID := range table.Shards {
+		eg.Go(func() error {
+			release, err := t.acquireBackupTransfer(egCtx)
+			if err != nil {
+				return err
+			}
+			defer release()
+			integrity, err := t.ln.forwardBackupToShard(egCtx, shardID, backup)
+			if err != nil {
+				return fmt.Errorf("backing up shard %s: %w", shardID, err)
+			}
+			if common.NormalizeBackupFormat(backup.Format) != common.BackupFormatPortable {
+				return nil
+			}
+			expectedName := common.ShardPortableBackupFileName(backup.BackupID, shardID)
+			if integrity == nil || integrity.Name != expectedName {
+				return fmt.Errorf("shard %s returned an invalid portable artifact identity", shardID)
+			}
+			mu.Lock()
+			artifacts = append(artifacts, *integrity)
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+	sort.Slice(artifacts, func(i, j int) bool {
+		return artifacts[i].Name < artifacts[j].Name
+	})
+	return artifacts, nil
 }
 
 func cleanupBackupAttempt(
@@ -186,25 +231,11 @@ func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName
 		}
 	}()
 	backupConfig.ResolvedLocation = metadataStore.ResolvedLocation()
-	g, _ := workerpool.NewGroup(ctx, t.pool)
-	for shardID := range table.Shards {
-		g.Go(func(ctx context.Context) error {
-			release, err := t.acquireBackupTransfer(ctx)
-			if err != nil {
-				return err
-			}
-			defer release()
-			// Forward the insert to the appropriate shard
-			if err := t.ln.forwardBackupToShard(ctx, shardID, backupConfig); err != nil {
-				if !errors.Is(err, context.Canceled) {
-					t.logger.Error("Error forwarding backup", zap.Error(err))
-				}
-				return fmt.Errorf("backing up shard %s: %w", shardID, err)
-			}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
+	artifactIntegrities, err := t.backupShardsWithIntegrity(ctx, table, backupConfig)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			t.logger.Error("Error forwarding backup", zap.Error(err))
+		}
 		writeBackupError(w, "Failed to forward backup request", err)
 		return
 	}
@@ -214,7 +245,13 @@ func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName
 	}
 
 	cleanupSafe = false
-	if err := metadataStore.WriteMetadata(ctx, br.BackupId, table, backupConfig.Format); err != nil {
+	if err := metadataStore.WriteMetadata(
+		ctx,
+		br.BackupId,
+		table,
+		backupConfig.Format,
+		artifactIntegrities,
+	); err != nil {
 		cleanupSafe = errors.Is(err, ErrBackupAlreadyExists) ||
 			errors.Is(err, ErrBackupMetadataTooLarge)
 		writeBackupError(w, "Failed to write backup metadata", err)
@@ -783,34 +820,36 @@ func writeClusterBackupAttempt(
 		body,
 		false,
 	); err != nil {
-		return [sha256.Size]byte{}, err
+		return digest, err
 	}
 	return digest, nil
 }
+
+var errInvalidClusterBackupAttemptHead = errors.New("invalid cluster backup attempt head")
 
 func validateClusterBackupAttemptHead(head *ClusterBackupAttemptHead) error {
 	if head == nil ||
 		head.Version != clusterBackupAttemptHeadVersion ||
 		head.Generation == 0 ||
 		head.MarkerSHA256 == "" {
-		return errors.New("invalid cluster backup attempt head")
+		return errInvalidClusterBackupAttemptHead
 	}
 	if err := common.ValidateBackupID(head.AttemptID); err != nil {
-		return err
+		return fmt.Errorf("%w: invalid attempt ID", errInvalidClusterBackupAttemptHead)
 	}
 	if err := common.ValidateBackupID(head.BackupID); err != nil {
-		return err
+		return fmt.Errorf("%w: invalid backup ID", errInvalidClusterBackupAttemptHead)
 	}
 	switch head.State {
 	case clusterBackupAttemptStateActive,
 		clusterBackupAttemptStateCommitted,
 		clusterBackupAttemptStateFailed:
 	default:
-		return errors.New("invalid cluster backup attempt head state")
+		return fmt.Errorf("%w: invalid state", errInvalidClusterBackupAttemptHead)
 	}
 	digest, err := hex.DecodeString(head.MarkerSHA256)
 	if err != nil || len(digest) != sha256.Size || hex.EncodeToString(digest) != head.MarkerSHA256 {
-		return errors.New("invalid cluster backup attempt marker digest")
+		return fmt.Errorf("%w: invalid marker digest", errInvalidClusterBackupAttemptHead)
 	}
 	return nil
 }
@@ -832,10 +871,10 @@ func decodeClusterBackupAttemptHead(body []byte) (*ClusterBackupAttemptHead, err
 	decoder := stdjson.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&head); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errInvalidClusterBackupAttemptHead, err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return nil, errors.New("invalid trailing cluster backup attempt head data")
+		return nil, fmt.Errorf("%w: trailing data", errInvalidClusterBackupAttemptHead)
 	}
 	if err := validateClusterBackupAttemptHead(&head); err != nil {
 		return nil, err
@@ -925,7 +964,10 @@ func readClusterBackupAttemptHeadObject(
 		return nil, "", err
 	}
 	if info.Size > maxBackupMetadataBytes || info.ETag == "" {
-		return nil, "", errors.New("invalid cluster backup attempt head identity")
+		return nil, "", fmt.Errorf(
+			"%w: invalid object identity",
+			errInvalidClusterBackupAttemptHead,
+		)
 	}
 	options := minio.GetObjectOptions{}
 	if err := options.SetMatchETag(info.ETag); err != nil {
@@ -942,6 +984,103 @@ func readClusterBackupAttemptHeadObject(
 	}
 	head, err := decodeClusterBackupAttemptHead(body)
 	return head, info.ETag, err
+}
+
+func clusterBackupAttemptMarkerPublicationMatches(
+	ctx context.Context,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+	attemptID string,
+	expectedDigest [sha256.Size]byte,
+) (bool, error) {
+	var body []byte
+	if s3Info != nil {
+		client, err := s3Info.EnsureBucket(ctx)
+		if err != nil {
+			return false, err
+		}
+		object, err := client.GetObject(
+			ctx,
+			s3Info.Bucket,
+			clusterAttemptObjectKey(s3Info.Prefix, attemptID),
+			minio.GetObjectOptions{},
+		)
+		if err != nil {
+			if isS3ObjectNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		defer func() { _ = object.Close() }()
+		body, err = readBackupMetadata(object)
+		if err != nil {
+			if isS3ObjectNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+	} else {
+		pathname := filepath.Join(
+			strings.TrimPrefix(resolvedLocation, "file://"),
+			clusterBackupAttemptDir,
+			attemptID+".json",
+		)
+		file, err := os.Open(filepath.Clean(pathname))
+		if err != nil {
+			if os.IsNotExist(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		defer func() { _ = file.Close() }()
+		body, err = readBackupMetadata(file)
+		if err != nil {
+			return false, err
+		}
+	}
+	return sha256.Sum256(body) == expectedDigest, nil
+}
+
+func clusterBackupAttemptHeadPublicationMatches(
+	ctx context.Context,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+	expected ClusterBackupAttemptHead,
+) (bool, error) {
+	var (
+		current *ClusterBackupAttemptHead
+		err     error
+	)
+	if s3Info != nil {
+		client, clientErr := s3Info.EnsureBucket(ctx)
+		if clientErr != nil {
+			return false, clientErr
+		}
+		current, _, err = readClusterBackupAttemptHeadObject(
+			ctx,
+			client,
+			s3Info.Bucket,
+			path.Join(s3Info.Prefix, clusterBackupAttemptHeadName),
+		)
+	} else {
+		current, err = readClusterBackupAttemptHeadFile(filepath.Join(
+			strings.TrimPrefix(resolvedLocation, "file://"),
+			clusterBackupAttemptHeadName,
+		))
+	}
+	if errors.Is(err, errInvalidClusterBackupAttemptHead) {
+		// The producer only publishes a validated head atomically, so malformed
+		// bytes cannot be the uncertain result of this attempted publication.
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return current != nil &&
+		current.AttemptID == expected.AttemptID &&
+		current.BackupID == expected.BackupID &&
+		current.State == clusterBackupAttemptStateActive &&
+		current.MarkerSHA256 == expected.MarkerSHA256, nil
 }
 
 func publishClusterBackupAttemptHead(
@@ -1152,8 +1291,7 @@ func compactSupersededClusterBackupAttempt(
 	currentAttemptID string,
 ) error {
 	if previous == nil ||
-		previous.AttemptID == currentAttemptID ||
-		previous.State == clusterBackupAttemptStateActive {
+		previous.AttemptID == currentAttemptID {
 		return nil
 	}
 	return deleteClusterBackupAttempt(
@@ -1689,20 +1827,50 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 	}
 	markerDigest, err := writeClusterBackupAttempt(ctx, resolvedLocation, s3Info, attempt)
 	if err != nil {
-		// Conditional publication may have reached storage even when its
-		// response was lost. Retain the reservation so a retry cannot overlap
-		// a marker that the bounded reclaimer may discover.
-		t.logger.Error(
-			"Cluster backup attempt marker outcome is ambiguous; retaining reservation",
+		reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		published, reconcileErr := clusterBackupAttemptMarkerPublicationMatches(
+			reconcileCtx,
+			resolvedLocation,
+			s3Info,
+			attemptID,
+			markerDigest,
+		)
+		reconcileCancel()
+		if !published {
+			if reconcileErr == nil {
+				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if releaseErr := metadataStore.ReleaseBackupID(
+					releaseCtx,
+					req.BackupId,
+				); releaseErr != nil {
+					t.logger.Error(
+						"Failed to release backup reservation after definitive marker failure",
+						zap.String("backup_id", req.BackupId),
+						zap.Error(releaseErr),
+					)
+				}
+				releaseCancel()
+			} else {
+				t.logger.Error(
+					"Cluster backup attempt marker outcome remains ambiguous; retaining reservation",
+					zap.String("backup_id", req.BackupId),
+					zap.String("attempt_id", attemptID),
+					zap.Error(reconcileErr),
+				)
+			}
+			writeBackupError(w, "Failed to publish backup attempt marker", err)
+			return
+		}
+		t.logger.Warn(
+			"Recovered cluster backup attempt marker after an ambiguous publication response",
 			zap.String("backup_id", req.BackupId),
 			zap.String("attempt_id", attemptID),
 			zap.Error(err),
 		)
-		errorResponse(w, "Failed to publish backup attempt marker", http.StatusInternalServerError)
-		return
 	}
 	committed := false
 	cleanupSafe := true
+	headPublished := false
 	cleanupMetadataPublished := make([]bool, len(tableNames))
 	defer func() {
 		if committed {
@@ -1748,6 +1916,21 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 			)
 			return
 		}
+		if !headPublished {
+			if err := deleteClusterBackupAttempt(
+				cleanupCtx,
+				resolvedLocation,
+				s3Info,
+				attemptID,
+			); err != nil {
+				t.logger.Warn(
+					"Failed to remove unpublished cluster backup attempt marker",
+					zap.String("attempt_id", attemptID),
+					zap.Error(err),
+				)
+			}
+			return
+		}
 		if owned, err := transitionClusterBackupAttemptHead(
 			cleanupCtx,
 			resolvedLocation,
@@ -1762,38 +1945,65 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 				zap.Error(err),
 			)
 		} else if !owned {
-			// A newer head has already fenced this attempt. Its immutable
-			// marker remains available for bounded follow-up maintenance.
-			t.logger.Debug(
-				"Abandoned cluster backup attempt head was superseded",
-				zap.String("attempt_id", attemptID),
-			)
+			// The head read proved this attempt is no longer authoritative.
+			// Its artifacts and reservation are already absent, so retire the
+			// otherwise-unreachable journal without any repository scan.
+			if err := deleteClusterBackupAttempt(
+				cleanupCtx,
+				resolvedLocation,
+				s3Info,
+				attemptID,
+			); err != nil {
+				t.logger.Warn(
+					"Superseded abandoned backup journal compaction deferred",
+					zap.String("attempt_id", attemptID),
+					zap.Error(err),
+				)
+			}
 		}
 	}()
+	expectedHead := ClusterBackupAttemptHead{
+		Version:      clusterBackupAttemptHeadVersion,
+		AttemptID:    attemptID,
+		BackupID:     req.BackupId,
+		MarkerSHA256: hex.EncodeToString(markerDigest[:]),
+	}
 	previousHead, err := publishClusterBackupAttemptHead(
 		ctx,
 		resolvedLocation,
 		s3Info,
-		ClusterBackupAttemptHead{
-			Version:      clusterBackupAttemptHeadVersion,
-			AttemptID:    attemptID,
-			BackupID:     req.BackupId,
-			MarkerSHA256: hex.EncodeToString(markerDigest[:]),
-		},
+		expectedHead,
 	)
 	if err != nil {
-		// A timeout may be observed after the head reached storage. Retain the
-		// reservation and immutable marker so either outcome remains safe.
-		cleanupSafe = false
-		t.logger.Error(
-			"Cluster backup attempt head outcome is ambiguous; retaining fenced attempt",
+		reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		published, reconcileErr := clusterBackupAttemptHeadPublicationMatches(
+			reconcileCtx,
+			resolvedLocation,
+			s3Info,
+			expectedHead,
+		)
+		reconcileCancel()
+		if !published {
+			if reconcileErr != nil {
+				cleanupSafe = false
+				t.logger.Error(
+					"Cluster backup attempt head outcome remains ambiguous; retaining fenced attempt",
+					zap.String("backup_id", req.BackupId),
+					zap.String("attempt_id", attemptID),
+					zap.Error(reconcileErr),
+				)
+			}
+			writeBackupError(w, "Failed to publish backup attempt head", err)
+			return
+		}
+		t.logger.Warn(
+			"Recovered cluster backup attempt head after an ambiguous publication response",
 			zap.String("backup_id", req.BackupId),
 			zap.String("attempt_id", attemptID),
 			zap.Error(err),
 		)
-		errorResponse(w, "Failed to publish backup attempt head", http.StatusInternalServerError)
-		return
 	}
+	headPublished = true
 
 	// Create cluster metadata
 	backupFormat := backupConfig.Format
@@ -1852,33 +2062,12 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 				return nil
 			}
 
-			// Backup all shards for this table.
-			// Use errgroup (not the shared pool) to avoid deadlock: the outer
-			// group already occupies pool workers, so nesting on the same pool
-			// can exhaust all slots when there are many tables.
-			shardEg, shardCtx := errgroup.WithContext(ctx)
-			shardEg.SetLimit(innerFanOutLimit)
-			for shardID := range table.Shards {
-				shardEg.Go(func() error {
-					release, err := t.acquireBackupTransfer(shardCtx)
-					if err != nil {
-						return err
-					}
-					defer release()
-					if err := t.ln.forwardBackupToShard(shardCtx, shardID, backupConfig); err != nil {
-						if !errors.Is(err, context.Canceled) {
-							t.logger.Error("Error forwarding backup", zap.String("table", tableName), zap.Error(err))
-						}
-						return fmt.Errorf("backing up shard %s: %w", shardID, err)
-					}
-					return nil
-				})
-			}
-
-			if err := shardEg.Wait(); err != nil {
+			artifactIntegrities, err := t.backupShardsWithIntegrity(ctx, table, backupConfig)
+			if err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return err
 				}
+				t.logger.Error("Error forwarding backup", zap.String("table", tableName), zap.Error(err))
 				results[i] = TableBackupStatus{
 					Name:   tableName,
 					Status: TableBackupStatusStatusFailed,
@@ -1894,7 +2083,13 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Write table metadata with table-specific backup ID
-			if err := metadataStore.WriteMetadata(ctx, tableBackupID, table, backupFormat); err != nil {
+			if err := metadataStore.WriteMetadata(
+				ctx,
+				tableBackupID,
+				table,
+				backupFormat,
+				artifactIntegrities,
+			); err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return err
 				}
@@ -1970,21 +2165,22 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if owned, err := transitionClusterBackupAttemptHead(
+		headOwned, headTransitionErr := transitionClusterBackupAttemptHead(
 			ctx,
 			resolvedLocation,
 			s3Info,
 			attemptID,
 			clusterBackupAttemptStateCommitted,
-		); err != nil {
+		)
+		if headTransitionErr != nil {
 			// The aggregate manifest is the immutable commit point. A lost head
 			// transition remains safe because active admission validates it.
 			t.logger.Warn(
 				"Cluster backup committed head update deferred",
 				zap.String("attempt_id", attemptID),
-				zap.Error(err),
+				zap.Error(headTransitionErr),
 			)
-		} else if !owned {
+		} else if !headOwned {
 			t.logger.Warn(
 				"Cluster backup committed with superseded attempt head",
 				zap.String("attempt_id", attemptID),
@@ -2004,6 +2200,23 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 				zap.String("attempt_id", attemptID),
 				zap.Error(err),
 			)
+		}
+		if headTransitionErr == nil && !headOwned {
+			// This attempt committed after another writer superseded its active
+			// head. Historical restore needs only the immutable aggregate and
+			// table manifests, so its unreferenced journal can be removed now.
+			if err := deleteClusterBackupAttempt(
+				maintenanceCtx,
+				resolvedLocation,
+				s3Info,
+				attemptID,
+			); err != nil {
+				t.logger.Warn(
+					"Superseded committed backup journal compaction deferred",
+					zap.String("attempt_id", attemptID),
+					zap.Error(err),
+				)
+			}
 		}
 		maintenanceCancel()
 	}

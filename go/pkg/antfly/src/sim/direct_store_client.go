@@ -94,10 +94,14 @@ func (c *directStoreClient) ApplyMergeChunk(
 	}.Build())
 }
 
-func (c *directStoreClient) Backup(ctx context.Context, shardID types.ID, backup common.BackupConfig) error {
+func (c *directStoreClient) Backup(
+	ctx context.Context,
+	shardID types.ID,
+	backup common.BackupConfig,
+) (*common.BackupArtifactIntegrity, error) {
 	shard, err := c.shard(shardID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	shardBackup := backup
 	shardBackup.BackupID = strings.TrimSuffix(
@@ -105,14 +109,14 @@ func (c *directStoreClient) Backup(ctx context.Context, shardID types.ID, backup
 		".tar.zst",
 	)
 	if err := shard.Backup(ctx, shardBackup); err != nil {
-		return err
+		return nil, err
 	}
 	backupDir, ok := strings.CutPrefix(backup.Location, "file://")
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	if err := os.MkdirAll(backupDir, os.ModePerm); err != nil && !os.IsExist(err) { //nolint:gosec // G301: test/sim data dir
-		return fmt.Errorf("creating backup directory: %w", err)
+		return nil, fmt.Errorf("creating backup directory: %w", err)
 	}
 	srcPath := filepath.Join(
 		common.SnapDir(c.h.config.GetBaseDir(), shardID, c.nodeID),
@@ -121,18 +125,18 @@ func (c *directStoreClient) Backup(ctx context.Context, shardID types.ID, backup
 	dstPath := filepath.Join(backupDir, common.ShardBackupFileName(backup.BackupID, shardID))
 	src, err := os.Open(filepath.Clean(srcPath))
 	if err != nil {
-		return fmt.Errorf("opening backup archive %s: %w", srcPath, err)
+		return nil, fmt.Errorf("opening backup archive %s: %w", srcPath, err)
 	}
 	defer func() { _ = src.Close() }()
 	dst, err := os.Create(filepath.Clean(dstPath))
 	if err != nil {
-		return fmt.Errorf("creating backup archive %s: %w", dstPath, err)
+		return nil, fmt.Errorf("creating backup archive %s: %w", dstPath, err)
 	}
 	defer func() { _ = dst.Close() }()
 	if _, err := io.Copy(dst, src); err != nil {
-		return fmt.Errorf("copying backup archive to %s: %w", dstPath, err)
+		return nil, fmt.Errorf("copying backup archive to %s: %w", dstPath, err)
 	}
-	return nil
+	return nil, nil
 }
 
 func (c *directStoreClient) Lookup(ctx context.Context, shardID types.ID, keys []string) (map[string][]byte, error) {

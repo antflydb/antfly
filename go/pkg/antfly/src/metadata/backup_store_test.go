@@ -63,7 +63,13 @@ func (s *cleanupOrderBackupStore) ReleaseBackupID(context.Context, string) error
 	}
 	return nil
 }
-func (*cleanupOrderBackupStore) WriteMetadata(context.Context, string, *store.Table, common.BackupFormat) error {
+func (*cleanupOrderBackupStore) WriteMetadata(
+	context.Context,
+	string,
+	*store.Table,
+	common.BackupFormat,
+	[]common.BackupArtifactIntegrity,
+) error {
 	return nil
 }
 func (*cleanupOrderBackupStore) ReadMetadata(context.Context, string) (*store.Table, common.BackupFormat, error) {
@@ -81,12 +87,62 @@ func TestFileBackupStorePersistsFormatInVersionedEnvelope(t *testing.T) {
 		"backup-1",
 		table,
 		common.BackupFormatNative,
+		nil,
 	))
 
 	restored, format, err := backupStore.ReadMetadata(context.Background(), "backup-1")
 	require.NoError(t, err)
 	assert.Equal(t, common.BackupFormatNative, format)
 	assert.Equal(t, table.Name, restored.Name)
+}
+
+func TestFileBackupStorePersistsPortableArtifactIntegrity(t *testing.T) {
+	root := t.TempDir()
+	backupStore := &fileBackupStore{location: root}
+	table := &store.Table{
+		Name:   "documents",
+		Shards: map[types.ID]*store.ShardConfig{1: {}},
+	}
+	artifacts := []common.BackupArtifactIntegrity{{
+		Name:      "backup-1-1.afb",
+		SizeBytes: uint64(len("artifact")),
+		SHA256:    "c7c5c1d70c5dec4416ab6158afd0b223ef40c29b1dc1f97ed9428b94d4cadb1c",
+	}}
+
+	require.NoError(t, backupStore.WriteMetadata(
+		context.Background(),
+		"backup-1",
+		table,
+		common.BackupFormatPortable,
+		artifacts,
+	))
+	body, err := os.ReadFile(filepath.Join(root, "backup-1-metadata.json"))
+	require.NoError(t, err)
+	var envelope backupMetadata
+	require.NoError(t, json.Unmarshal(body, &envelope))
+	require.Equal(t, uint32(2), envelope.Version)
+	require.Equal(t, artifacts, envelope.Artifacts)
+
+	_, format, err := backupStore.ReadMetadata(context.Background(), "backup-1")
+	require.NoError(t, err)
+	require.Equal(t, common.BackupFormatPortable, format)
+}
+
+func TestFileBackupStoreRejectsIncompletePortableArtifactIntegrity(t *testing.T) {
+	backupStore := &fileBackupStore{location: t.TempDir()}
+	table := &store.Table{
+		Name:   "documents",
+		Shards: map[types.ID]*store.ShardConfig{1: {}},
+	}
+
+	err := backupStore.WriteMetadata(
+		context.Background(),
+		"backup-1",
+		table,
+		common.BackupFormatPortable,
+		nil,
+	)
+	require.ErrorContains(t, err, "do not match table shards")
 }
 
 func TestFileBackupStorePublishesMetadataCreateOnly(t *testing.T) {
@@ -99,13 +155,15 @@ func TestFileBackupStorePublishesMetadataCreateOnly(t *testing.T) {
 		context.Background(),
 		"backup-1",
 		first,
-		common.BackupFormatPortable,
+		common.BackupFormatNative,
+		nil,
 	))
 	err := backupStore.WriteMetadata(
 		context.Background(),
 		"backup-1",
 		second,
-		common.BackupFormatPortable,
+		common.BackupFormatNative,
+		nil,
 	)
 	require.ErrorIs(t, err, ErrBackupAlreadyExists)
 
@@ -195,6 +253,7 @@ func TestFileBackupStoreDoesNotPublishAfterCancellation(t *testing.T) {
 			"metadata",
 			&store.Table{Name: "documents"},
 			common.BackupFormatPortable,
+			nil,
 		),
 		context.Canceled,
 	)
@@ -216,7 +275,8 @@ func TestFileBackupStoreConcurrentPublicationHasSingleWinner(t *testing.T) {
 				context.Background(),
 				"backup-1",
 				&store.Table{Name: "documents"},
-				common.BackupFormatPortable,
+				common.BackupFormatNative,
+				nil,
 			)
 			switch {
 			case err == nil:
@@ -322,6 +382,7 @@ func TestFileBackupStoreRejectsUnknownFormat(t *testing.T) {
 		"backup-1",
 		&store.Table{Name: "documents"},
 		common.BackupFormat("unknown"),
+		nil,
 	)
 	require.ErrorContains(t, err, "unsupported backup format")
 }
@@ -533,6 +594,143 @@ func TestClusterBackupAttemptHeadAtomicallyPinsExactMarker(t *testing.T) {
 	require.False(t, owned)
 }
 
+func TestClusterBackupAttemptPublicationReconciliationIsExact(t *testing.T) {
+	root := t.TempDir()
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-reconcile",
+		BackupID:           "backup-reconcile",
+		CreatedAt:          time.Now().UTC(),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"documents-backup-reconcile"},
+		ArtifactNames:      []string{"backup-reconcile-1.afb"},
+	}
+	digest, err := writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+	matches, err := clusterBackupAttemptMarkerPublicationMatches(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt.AttemptID,
+		digest,
+	)
+	require.NoError(t, err)
+	require.True(t, matches)
+
+	markerPath := filepath.Join(root, clusterBackupAttemptDir, attempt.AttemptID+".json")
+	require.NoError(t, os.WriteFile(markerPath, []byte("{}\n"), 0o600))
+	matches, err = clusterBackupAttemptMarkerPublicationMatches(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt.AttemptID,
+		digest,
+	)
+	require.NoError(t, err)
+	require.False(t, matches)
+
+	expectedHead := ClusterBackupAttemptHead{
+		Version:      clusterBackupAttemptHeadVersion,
+		AttemptID:    attempt.AttemptID,
+		BackupID:     attempt.BackupID,
+		MarkerSHA256: hex.EncodeToString(digest[:]),
+	}
+	_, err = publishClusterBackupAttemptHead(
+		context.Background(),
+		"file://"+root,
+		nil,
+		expectedHead,
+	)
+	require.NoError(t, err)
+	matches, err = clusterBackupAttemptHeadPublicationMatches(
+		context.Background(),
+		"file://"+root,
+		nil,
+		expectedHead,
+	)
+	require.NoError(t, err)
+	require.True(t, matches)
+
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, clusterBackupAttemptHeadName),
+		[]byte("{}\n"),
+		0o600,
+	))
+	matches, err = clusterBackupAttemptHeadPublicationMatches(
+		context.Background(),
+		"file://"+root,
+		nil,
+		expectedHead,
+	)
+	require.NoError(t, err)
+	require.False(t, matches)
+}
+
+func TestClusterBackupAttemptCompactsSupersededActiveMarker(t *testing.T) {
+	root := t.TempDir()
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-old-active",
+		BackupID:           "backup-old",
+		CreatedAt:          time.Now().UTC(),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"documents-backup-old"},
+		ArtifactNames:      []string{"backup-old-1.afb"},
+	}
+	_, err := writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+	attempt.AttemptID = "afba-current"
+	attempt.BackupID = "backup-current"
+	_, err = writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, compactSupersededClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		&ClusterBackupAttemptHead{
+			Version:      clusterBackupAttemptHeadVersion,
+			Generation:   1,
+			AttemptID:    "afba-old-active",
+			BackupID:     "backup-old",
+			State:        clusterBackupAttemptStateActive,
+			MarkerSHA256: strings.Repeat("0", sha256.Size*2),
+		},
+		attempt.AttemptID,
+	))
+	_, err = os.Stat(filepath.Join(
+		root,
+		clusterBackupAttemptDir,
+		"afba-old-active.json",
+	))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	_, err = os.Stat(filepath.Join(
+		root,
+		clusterBackupAttemptDir,
+		attempt.AttemptID+".json",
+	))
+	require.NoError(t, err)
+}
+
 func TestClusterBackupAttemptHeadSerializesConcurrentFilePublishers(t *testing.T) {
 	root := t.TempDir()
 	attemptIDs := [...]string{
@@ -622,7 +820,15 @@ func TestNewestClusterBackupAttemptMustBeCommittedAndRestorable(t *testing.T) {
 		context.Background(), "file://"+root, nil, backupStore, attempt,
 	))
 	require.NoError(t, backupStore.WriteMetadata(
-		context.Background(), metadataID, table, common.BackupFormatPortable,
+		context.Background(),
+		metadataID,
+		table,
+		common.BackupFormatPortable,
+		[]common.BackupArtifactIntegrity{{
+			Name:      artifactNames[0],
+			SizeBytes: uint64(len("artifact")),
+			SHA256:    "c7c5c1d70c5dec4416ab6158afd0b223ef40c29b1dc1f97ed9428b94d4cadb1c",
+		}},
 	))
 	require.NoError(t, writeClusterMetadataToFile(
 		context.Background(),

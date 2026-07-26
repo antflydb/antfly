@@ -501,14 +501,20 @@ func TestHandleBackup_DefaultsToPortable(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Equal(t, "attachment; filename="+common.ShardPortableBackupFileName(backupID, shardID), rr.Header().Get("Content-Disposition"))
 	assert.Equal(t, "portable backup data", rr.Body.String())
-
-	expectedPath := filepath.Join(
-		common.SnapDir(baseDir, shardID, mockStore.ID()),
-		common.ShardPortableBackupFileName(backupID, shardID),
+	assert.Equal(t, common.ShardPortableBackupFileName(backupID, shardID), rr.Header().Get(common.BackupArtifactNameHeader))
+	assert.Equal(t, strconv.Itoa(len("portable backup data")), rr.Header().Get(common.BackupArtifactSizeHeader))
+	assert.Equal(
+		t,
+		"789146fe47e143e9e33e1d83942d0d019baf0f6a4465df201892035461cd1550",
+		rr.Header().Get(common.BackupArtifactSHA256Header),
 	)
-	content, err := os.ReadFile(expectedPath)
+
+	// The store streams from a temporary durable file. The coordinator owns
+	// publication into the authorized destination and the store must not retain
+	// a second copy after the response completes.
+	entries, err := os.ReadDir(common.SnapDir(baseDir, shardID, mockStore.ID()))
 	require.NoError(t, err)
-	assert.Equal(t, "portable backup data", string(content))
+	require.Empty(t, entries)
 	_, err = os.Stat(filepath.Join(tempDir, common.ShardPortableBackupFileName(backupID, shardID)))
 	require.ErrorIs(t, err, os.ErrNotExist)
 

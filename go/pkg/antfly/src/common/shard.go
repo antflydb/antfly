@@ -84,6 +84,22 @@ type BackupConfig struct {
 	ResolvedLocation string       `json:"-"`
 }
 
+// BackupArtifactIntegrity binds an immutable backup object to the bytes
+// produced by the shard. Metadata publishes these identities only after every
+// shard reports durable success, allowing cross-runtime restore admission to
+// verify artifacts without trusting provider-specific ETags.
+type BackupArtifactIntegrity struct {
+	Name      string `json:"name"`
+	SizeBytes uint64 `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
+}
+
+const (
+	BackupArtifactNameHeader   = "X-Antfly-Backup-Artifact-Name"
+	BackupArtifactSizeHeader   = "X-Antfly-Backup-Artifact-Size"
+	BackupArtifactSHA256Header = "X-Antfly-Backup-Artifact-Sha256"
+)
+
 func (rc *BackupConfig) Equal(other *BackupConfig) bool {
 	return rc == nil && other == nil || rc != nil && other != nil &&
 		rc.BackupID == other.BackupID &&

@@ -470,16 +470,8 @@ func (a *mcpAdapter) Backup(
 		}
 	}()
 	backup.ResolvedLocation = metadataStore.ResolvedLocation()
-	eg, egCtx := errgroup.WithContext(ctx)
-	for shardID := range table.Shards {
-		eg.Go(func() error {
-			if err := a.t.ln.forwardBackupToShard(egCtx, shardID, backup); err != nil {
-				return fmt.Errorf("backing up shard %s: %w", shardID, err)
-			}
-			return nil
-		})
-	}
-	if err := eg.Wait(); err != nil {
+	artifactIntegrities, err := a.t.backupShardsWithIntegrity(ctx, table, backup)
+	if err != nil {
 		return fmt.Errorf("backup failed: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -488,7 +480,13 @@ func (a *mcpAdapter) Backup(
 
 	// Write backup metadata
 	cleanupSafe = false
-	if err := metadataStore.WriteMetadata(ctx, backupID, table, backup.Format); err != nil {
+	if err := metadataStore.WriteMetadata(
+		ctx,
+		backupID,
+		table,
+		backup.Format,
+		artifactIntegrities,
+	); err != nil {
 		cleanupSafe = errors.Is(err, ErrBackupAlreadyExists) ||
 			errors.Is(err, ErrBackupMetadataTooLarge)
 		return fmt.Errorf("writing backup metadata: %w", err)

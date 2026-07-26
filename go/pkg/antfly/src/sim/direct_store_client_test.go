@@ -73,11 +73,12 @@ func TestDirectStoreClientBackupWritesRequestedFileArchive(t *testing.T) {
 	client := newDirectStoreClient(h, 1)
 	backupDir := t.TempDir()
 	backupID := "merge_seed_test"
-	require.NoError(t, client.Backup(context.Background(), shardID, common.BackupConfig{
+	_, err = client.Backup(context.Background(), shardID, common.BackupConfig{
 		BackupID: backupID,
 		Location: "file://" + backupDir,
 		Format:   common.BackupFormatNative,
-	}))
+	})
+	require.NoError(t, err)
 
 	archiveFile := filepath.Join(backupDir, common.ShardBackupFileName(backupID, shardID))
 	require.FileExists(t, archiveFile)

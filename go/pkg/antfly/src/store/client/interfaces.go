@@ -43,7 +43,11 @@ type StoreRPC interface {
 		deletes [][]byte,
 		syncLevel db.Op_SyncLevel,
 	) error
-	Backup(ctx context.Context, shardID types.ID, backup common.BackupConfig) error
+	Backup(
+		ctx context.Context,
+		shardID types.ID,
+		backup common.BackupConfig,
+	) (*common.BackupArtifactIntegrity, error)
 	Lookup(ctx context.Context, shardID types.ID, keys []string) (map[string][]byte, error)
 	LookupWithVersion(ctx context.Context, shardID types.ID, key string) ([]byte, uint64, error)
 	AddIndex(ctx context.Context, shardID types.ID, name string, config *indexes.IndexConfig) error

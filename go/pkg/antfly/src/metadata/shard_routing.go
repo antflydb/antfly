@@ -822,10 +822,10 @@ func (ms *MetadataStore) forwardBackupToShard(
 	ctx context.Context,
 	shardID types.ID,
 	backup common.BackupConfig,
-) error {
+) (*common.BackupArtifactIntegrity, error) {
 	targetURL, err := ms.leaderClientForShard(ctx, shardID)
 	if err != nil {
-		return fmt.Errorf("failed to find leader for shard %s: %w", shardID, err)
+		return nil, fmt.Errorf("failed to find leader for shard %s: %w", shardID, err)
 	}
 	return targetURL.Backup(ctx, shardID, backup)
 }

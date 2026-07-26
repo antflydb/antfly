@@ -17,6 +17,8 @@ package metadata
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -40,13 +42,19 @@ type backupStore interface {
 	DeleteArtifact(ctx context.Context, name string) error
 	ValidateArtifact(ctx context.Context, name string) error
 	ReleaseBackupID(ctx context.Context, id string) error
-	WriteMetadata(ctx context.Context, id string, table *store.Table, format common.BackupFormat) error
+	WriteMetadata(
+		ctx context.Context,
+		id string,
+		table *store.Table,
+		format common.BackupFormat,
+		artifacts []common.BackupArtifactIntegrity,
+	) error
 	ReadMetadata(ctx context.Context, id string) (*store.Table, common.BackupFormat, error)
 	ResolvedLocation() string
 }
 
 const (
-	backupMetadataVersion  = 1
+	backupMetadataVersion  = 2
 	maxBackupMetadataBytes = 16 * 1024 * 1024
 )
 
@@ -90,12 +98,17 @@ func readBackupMetadata(r io.Reader) ([]byte, error) {
 }
 
 type backupMetadata struct {
-	Version uint32              `json:"version"`
-	Format  common.BackupFormat `json:"format"`
-	Table   *store.Table        `json:"table"`
+	Version   uint32                           `json:"version"`
+	Format    common.BackupFormat              `json:"format"`
+	Table     *store.Table                     `json:"table"`
+	Artifacts []common.BackupArtifactIntegrity `json:"artifacts,omitempty"`
 }
 
-func newBackupMetadata(table *store.Table, format common.BackupFormat) (*backupMetadata, error) {
+func newBackupMetadata(
+	table *store.Table,
+	format common.BackupFormat,
+	artifacts []common.BackupArtifactIntegrity,
+) (*backupMetadata, error) {
 	if table == nil {
 		return nil, fmt.Errorf("table metadata is required")
 	}
@@ -105,11 +118,41 @@ func newBackupMetadata(table *store.Table, format common.BackupFormat) (*backupM
 	default:
 		return nil, fmt.Errorf("unsupported backup format %q", format)
 	}
+	if format == common.BackupFormatPortable {
+		if err := validatePortableArtifactIntegrities(table, artifacts); err != nil {
+			return nil, err
+		}
+	}
 	return &backupMetadata{
-		Version: backupMetadataVersion,
-		Format:  format,
-		Table:   table,
+		Version:   backupMetadataVersion,
+		Format:    format,
+		Table:     table,
+		Artifacts: append([]common.BackupArtifactIntegrity(nil), artifacts...),
 	}, nil
+}
+
+func validatePortableArtifactIntegrities(
+	table *store.Table,
+	artifacts []common.BackupArtifactIntegrity,
+) error {
+	if table == nil || len(artifacts) != len(table.Shards) {
+		return errors.New("portable backup artifact identities do not match table shards")
+	}
+	seen := make(map[string]struct{}, len(artifacts))
+	for _, artifact := range artifacts {
+		decoded, err := hex.DecodeString(artifact.SHA256)
+		if err != nil || len(decoded) != sha256.Size ||
+			hex.EncodeToString(decoded) != artifact.SHA256 ||
+			artifact.SizeBytes == 0 ||
+			path.Base(artifact.Name) != artifact.Name {
+			return fmt.Errorf("invalid portable backup artifact identity %q", artifact.Name)
+		}
+		if _, duplicate := seen[artifact.Name]; duplicate {
+			return fmt.Errorf("duplicate portable backup artifact identity %q", artifact.Name)
+		}
+		seen[artifact.Name] = struct{}{}
+	}
+	return nil
 }
 
 func decodeBackupMetadata(data []byte) (*store.Table, common.BackupFormat, error) {
@@ -127,6 +170,11 @@ func decodeBackupMetadata(data []byte) (*store.Table, common.BackupFormat, error
 	case common.BackupFormatNative, common.BackupFormatPortable:
 	default:
 		return nil, "", fmt.Errorf("unsupported backup format %q", metadata.Format)
+	}
+	if metadata.Format == common.BackupFormatPortable {
+		if err := validatePortableArtifactIntegrities(metadata.Table, metadata.Artifacts); err != nil {
+			return nil, "", err
+		}
 	}
 	return metadata.Table, metadata.Format, nil
 }
@@ -408,8 +456,9 @@ func (s *fileBackupStore) WriteMetadata(
 	id string,
 	table *store.Table,
 	format common.BackupFormat,
+	artifacts []common.BackupArtifactIntegrity,
 ) error {
-	metadata, err := newBackupMetadata(table, format)
+	metadata, err := newBackupMetadata(table, format, artifacts)
 	if err != nil {
 		return err
 	}
@@ -598,11 +647,12 @@ func (s *s3BackupStore) WriteMetadata(
 	id string,
 	table *store.Table,
 	format common.BackupFormat,
+	artifacts []common.BackupArtifactIntegrity,
 ) error {
 	if err := common.ValidateBackupID(id); err != nil {
 		return err
 	}
-	metadata, err := newBackupMetadata(table, format)
+	metadata, err := newBackupMetadata(table, format, artifacts)
 	if err != nil {
 		return err
 	}

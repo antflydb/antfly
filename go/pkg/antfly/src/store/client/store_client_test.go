@@ -46,10 +46,17 @@ func TestStoreClientBackupUsesResolvedLocationWithoutSerializingIt(t *testing.T)
 	httpClient := &http.Client{
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&received))
+			headers := make(http.Header)
+			headers.Set(common.BackupArtifactNameHeader, "backup-1-2a.afb")
+			headers.Set(common.BackupArtifactSizeHeader, "15")
+			headers.Set(
+				common.BackupArtifactSHA256Header,
+				"45e76a9340241da1ad38b6eca1188b0d971de588021b63f6c4b7b4a8fe61fb67",
+			)
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Body:       io.NopCloser(strings.NewReader("portable backup")),
-				Header:     make(http.Header),
+				Header:     headers,
 			}, nil
 		}),
 	}
@@ -62,7 +69,10 @@ func TestStoreClientBackupUsesResolvedLocationWithoutSerializingIt(t *testing.T)
 		Format:           common.BackupFormatPortable,
 	}
 
-	require.NoError(t, client.Backup(context.Background(), types.ID(42), config))
+	integrity, err := client.Backup(context.Background(), types.ID(42), config)
+	require.NoError(t, err)
+	require.NotNil(t, integrity)
+	assert.Equal(t, uint64(len("portable backup")), integrity.SizeBytes)
 	assert.Equal(t, config.Location, received.Location)
 	assert.Empty(t, received.ResolvedLocation)
 	content, err := os.ReadFile(filepath.Join(
@@ -72,14 +82,14 @@ func TestStoreClientBackupUsesResolvedLocationWithoutSerializingIt(t *testing.T)
 	require.NoError(t, err)
 	assert.Equal(t, "portable backup", string(content))
 
-	err = client.Backup(context.Background(), types.ID(42), config)
+	_, err = client.Backup(context.Background(), types.ID(42), config)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, common.ErrBackupAlreadyExists))
 }
 
 func TestStoreClientBackupRejectsUnresolvedManagedFilesystemLocation(t *testing.T) {
 	client := NewStoreClient(http.DefaultClient, types.ID(1), "http://store.test")
-	err := client.Backup(context.Background(), types.ID(42), common.BackupConfig{
+	_, err := client.Backup(context.Background(), types.ID(42), common.BackupConfig{
 		BackupID:   "backup-1",
 		Connection: "filesystem",
 		Location:   "file:///logical",

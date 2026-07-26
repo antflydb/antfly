@@ -17,6 +17,8 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -1096,7 +1098,8 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	tempPath := file.Name()
 	defer func() { _ = os.Remove(tempPath) }()
 
-	if err := shard.ExportPortable(r.Context(), file); err != nil {
+	artifactHasher := sha256.New()
+	if err := shard.ExportPortable(r.Context(), io.MultiWriter(file, artifactHasher)); err != nil {
 		_ = file.Close()
 		http.Error(w, fmt.Sprintf("Failed to export portable backup: %v", err), http.StatusInternalServerError)
 		return
@@ -1119,6 +1122,14 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, fmt.Sprintf("Portable backup was interrupted: %v", err), http.StatusRequestTimeout)
 		return
 	}
+	fileInfo, err := os.Stat(filepath.Clean(tempPath))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to stat portable backup: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set(common.BackupArtifactNameHeader, fileName)
+	w.Header().Set(common.BackupArtifactSizeHeader, strconv.FormatInt(fileInfo.Size(), 10))
+	w.Header().Set(common.BackupArtifactSHA256Header, hex.EncodeToString(artifactHasher.Sum(nil)))
 	if strings.HasPrefix(req.Location, "s3://") {
 		s3Info, err := h.antflyConfig.ResolveS3Info(
 			req.Connection,
@@ -1153,7 +1164,7 @@ func (h *StoreAPI) handlePortableBackup(w http.ResponseWriter, r *http.Request, 
 	}
 	defer func() { _ = file.Close() }()
 
-	fileInfo, err := file.Stat()
+	fileInfo, err = file.Stat()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to stat backup file: %v", err), http.StatusInternalServerError)
 		return
