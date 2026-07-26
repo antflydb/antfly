@@ -67,6 +67,11 @@ pub const Tokenizer = struct {
         /// without a safe chunking strategy use the serial encodeInto path.
         /// Work is scheduled through the caller's std.Io runtime.
         encodeIntoParallel: ?*const fn (ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32), max_tasks: usize) anyerror!void = null,
+        /// Optional immutable-input variant. A caller-controlled nonzero ID
+        /// identifies the byte generation and must change before the same
+        /// address can contain different bytes. Backends may retain derived
+        /// segmentation metadata while that identity remains stable.
+        encodeIntoParallelStable: ?*const fn (ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32), max_tasks: usize, stable_input_id: u64) anyerror!void = null,
         /// Encode text with model wrapping such as [CLS]/[SEP], optionally including offsets.
         encodeForModel: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!EncodeResult,
         /// Encode text for causal generation, optionally with BOS-aware start-of-sequence semantics.
@@ -114,6 +119,37 @@ pub const Tokenizer = struct {
             }
         }
         return self.encodeInto(allocator, text, out);
+    }
+
+    /// Immutable-input counterpart to `encodeIntoParallel`. `stable_input_id`
+    /// must be nonzero and must change if the bytes can change, even when the
+    /// pointer and length remain the same. This permits production file and
+    /// object-store sources to reuse tokenizer-owned segmentation metadata
+    /// without weakening the ordinary slice API's mutation safety.
+    pub fn encodeIntoParallelStable(
+        self: Tokenizer,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        out: *std.ArrayListUnmanaged(i32),
+        max_tasks: usize,
+        stable_input_id: u64,
+    ) !void {
+        if (stable_input_id == 0) return error.InvalidStableInputId;
+        if (max_tasks > 1) {
+            if (self.vtable.encodeIntoParallelStable) |parallel| {
+                return parallel(
+                    self.ptr,
+                    io,
+                    allocator,
+                    text,
+                    out,
+                    max_tasks,
+                    stable_input_id,
+                );
+            }
+        }
+        return self.encodeIntoParallel(io, allocator, text, out, max_tasks);
     }
 
     pub fn decode(self: Tokenizer, allocator: std.mem.Allocator, ids: []const i32) ![]u8 {

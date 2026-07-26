@@ -1022,6 +1022,7 @@ pub const ModelManager = struct {
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
+    tokenizer_parallel_bpe_config: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
 
     pub fn init(allocator: std.mem.Allocator, session_manager: backends.SessionManager) ModelManager {
         return .{
@@ -1041,6 +1042,19 @@ pub const ModelManager = struct {
         if (self.loaded.count() != 0)
             return error.TokenizerCacheConfigAfterModelLoad;
         self.tokenizer_cache_config = config;
+    }
+
+    /// Configure persistent std.Io-consumer tokenizer state before loading
+    /// models. Private tables use the resource budget supplied through
+    /// `configureTokenizerCaches`, so this is a capacity request rather than
+    /// an unconditional allocation.
+    pub fn configureTokenizerParallelBpe(
+        self: *ModelManager,
+        config: hf_tokenizer.HfTokenizer.ParallelBpeConfig,
+    ) !void {
+        if (self.loaded.count() != 0)
+            return error.TokenizerParallelConfigAfterModelLoad;
+        self.tokenizer_parallel_bpe_config = config;
     }
 
     pub fn deinit(self: *ModelManager) void {
@@ -1159,6 +1173,9 @@ pub const ModelManager = struct {
             .huggingface => {
                 hf_tok = try loadHuggingFaceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
                 try hf_tok.?.configureBpeCache(self.tokenizer_cache_config);
+                try hf_tok.?.configureParallelBpe(
+                    self.tokenizer_parallel_bpe_config,
+                );
             },
             .sentencepiece => {
                 const sp = try loadSentencePieceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);

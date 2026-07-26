@@ -1506,6 +1506,11 @@ pub fn runFromIterator(
 
     antfly_node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(&data_server.provisioned_storage.resource_manager);
     try antfly_node.configureTokenizerCaches(.{
+        // Keep the small lock-free front table hot while providing enough
+        // second-tier slots for large ingestion corpora. The table and every
+        // admitted entry are charged to inference.tokenizer_cache; pressure
+        // can decline the optional table without making model warmup fail.
+        .bulk_slots_per_shard = 16 * 1024,
         .resource_budget = tokenizerCacheResourceBudget(
             &data_server.provisioned_storage.resource_manager,
         ),
