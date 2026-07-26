@@ -91,13 +91,24 @@ pub fn inspectAlloc(
     defer region.deinit();
     const metadata = gguf_format.readSupportMetadata(region.data) catch return result;
     result.artifact_inspected = true;
-    result.expert_count = metadata.expert_count;
-    if (man.config_model_arch.len == 0) {
-        const arch = metadata.architecture orelse return result;
-        allocator.free(result.architecture);
-        result.architecture = try allocator.dupe(u8, arch);
-    }
+    try applyArtifactMetadata(allocator, &result, metadata);
     return result;
+}
+
+fn applyArtifactMetadata(
+    allocator: std.mem.Allocator,
+    result: *Inspection,
+    metadata: gguf_format.SupportMetadata,
+) !void {
+    result.expert_count = metadata.expert_count;
+    // The artifact is authoritative. A config.json sidecar is useful for discovery,
+    // but it must not be able to relabel a GGUF and bypass a family safety block.
+    // Canonical composite bundles are still recognized from their manifest contract
+    // in assessWithFacts(), even when their primary GGUF has a component architecture.
+    const architecture = metadata.architecture orelse "unknown";
+    const owned_architecture = try allocator.dupe(u8, architecture);
+    allocator.free(result.architecture);
+    result.architecture = owned_architecture;
 }
 
 pub fn assess(
@@ -361,6 +372,29 @@ test "known unsafe generators cannot be enabled by unknown opt in" {
     const result = assess(&man, "deepseek4");
     try std.testing.expectEqual(Level.incompatible, result.level);
     try std.testing.expect(!result.allowed(true));
+}
+
+test "artifact architecture remains authoritative over a supported sidecar family" {
+    var man = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    man.model_type = .generator;
+    man.config_model_arch = "llama";
+
+    var inspection = Inspection{
+        .architecture = try std.testing.allocator.dupe(u8, man.config_model_arch),
+    };
+    defer inspection.deinit(std.testing.allocator);
+    try applyArtifactMetadata(std.testing.allocator, &inspection, .{
+        .architecture = "deepseek4",
+    });
+
+    try std.testing.expectEqualStrings("deepseek4", inspection.architecture);
+    const assessment = assessInspection(&man, inspection);
+    try std.testing.expectEqual(Level.incompatible, assessment.level);
+    try std.testing.expect(!assessment.allowed(true));
+
+    try applyArtifactMetadata(std.testing.allocator, &inspection, .{});
+    try std.testing.expectEqualStrings("unknown", inspection.architecture);
+    try std.testing.expectEqual(Level.unknown, assessInspection(&man, inspection).level);
 }
 
 test "gemma 4 E4B architecture is enabled while unified layout is blocked" {

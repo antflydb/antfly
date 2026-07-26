@@ -251,6 +251,9 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     });
     defer node.deinit();
 
+    // Bind the caller-owned runtime before warmup so model loading, tokenizer
+    // work, and backend sessions all compose with the same executor.
+    node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
     std.debug.print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(alloc, io, host, port);
@@ -296,6 +299,7 @@ pub fn spawnServerProcess(
 fn serveThread(node: *inference.server.Node, alloc: std.mem.Allocator, host: []const u8, port: u16) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
+    node.attachIo(io_impl.io());
     node.warmConfiguredGenerators(alloc) catch |err| {
         std.debug.print("inference warmup error: {}\n", .{err});
         return;

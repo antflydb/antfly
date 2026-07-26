@@ -1020,6 +1020,16 @@ fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) b
         manifest.isClipclapGgufBundle();
 }
 
+const LoadFlight = struct {
+    completed: std.Io.Event = .unset,
+    io: std.Io,
+    model: ?*LoadedModel = null,
+    err: ?anyerror = null,
+    /// Protected by ModelManager.load_lock. The owner starts with one reference;
+    /// every waiter takes one before dropping the manager lock.
+    refs: usize = 1,
+};
+
 pub const ModelManager = struct {
     allocator: std.mem.Allocator,
     session_manager: backends.SessionManager,
@@ -1030,11 +1040,10 @@ pub const ModelManager = struct {
     admission_limit_overrides: runtime.tier.memory.Limits = .{},
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
-    /// Model construction mutates the caches below and initializes shared backend state.
-    /// Cold requests can arrive concurrently, so cache lookup through insertion must be
-    /// one critical section. Model loads are rare enough that a single manager-wide lock
-    /// is safer than introducing a per-key in-flight registry for 0.2.0.
+    /// Protects loaded-model maps and the in-flight registry. Expensive tokenizer,
+    /// weight, and backend initialization always runs outside this lock.
     load_lock: std.atomic.Mutex = .unlocked,
+    in_flight_loads: std.StringHashMapUnmanaged(*LoadFlight) = .empty,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe_config: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
 
@@ -1140,6 +1149,8 @@ pub const ModelManager = struct {
     }
 
     pub fn deinit(self: *ModelManager) void {
+        std.debug.assert(self.in_flight_loads.count() == 0);
+        self.in_flight_loads.deinit(self.allocator);
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -1155,6 +1166,8 @@ pub const ModelManager = struct {
     }
 
     pub fn attachIo(self: *ModelManager, io: std.Io) void {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
         self.session_manager.io = io;
         var it = self.loaded.iterator();
         while (it.next()) |entry| entry.value_ptr.*.attachIo(io);
@@ -1199,11 +1212,7 @@ pub const ModelManager = struct {
 
     /// Load a model from a directory path. Returns a cached model if already loaded.
     pub fn loadFromDir(self: *ModelManager, model_dir: []const u8) !*LoadedModel {
-        spinLock(&self.load_lock);
-        defer self.load_lock.unlock();
-        if (self.loaded.get(model_dir)) |model| return model;
-        if (self.loaded_aliases.get(model_dir)) |model| return model;
-        return self.loadFromDirWithPreferredBackendsLocked(model_dir, self.session_manager.preferred_backends, true);
+        return self.loadFromDirCoordinated(model_dir, self.session_manager.preferred_backends, true);
     }
 
     pub fn loadFromDirWithPreferredBackends(
@@ -1212,17 +1221,19 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
     ) !*LoadedModel {
-        spinLock(&self.load_lock);
-        defer self.load_lock.unlock();
-        return self.loadFromDirWithPreferredBackendsLocked(model_dir, preferred_backends, cache_default_alias);
+        return self.loadFromDirCoordinated(model_dir, preferred_backends, cache_default_alias);
     }
 
-    fn loadFromDirWithPreferredBackendsLocked(
+    fn lookupLoadedModelLocked(
         self: *ModelManager,
         model_dir: []const u8,
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
-    ) !*LoadedModel {
+    ) !?*LoadedModel {
+        if (cache_default_alias) {
+            if (self.loaded.get(model_dir)) |model| return model;
+            if (self.loaded_aliases.get(model_dir)) |model| return model;
+        }
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
             const variant_key = try backendVariantCacheKey(self.allocator, model_dir, backend);
@@ -1230,9 +1241,140 @@ pub const ModelManager = struct {
             if (self.loaded.get(variant_key)) |model| return model;
             if (self.loaded_aliases.get(variant_key)) |model| return model;
         }
+        return null;
+    }
 
-        var session_manager = sessionManagerForPreferredBackends(self.allocator, preferred_backends, &self.session_manager);
-        return self.loadFromDirUncached(model_dir, &session_manager, cache_default_alias);
+    fn loadFlightKey(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+    ) ![]u8 {
+        const prefix = try std.fmt.allocPrint(
+            self.allocator,
+            "{d}:{s}:{d}:",
+            .{ model_dir.len, model_dir, @intFromBool(cache_default_alias) },
+        );
+        defer self.allocator.free(prefix);
+        const key = try self.allocator.alloc(u8, prefix.len + preferred_backends.len);
+        @memcpy(key[0..prefix.len], prefix);
+        for (preferred_backends, 0..) |backend, idx| {
+            key[prefix.len + idx] = @intCast(@intFromEnum(backend));
+        }
+        return key;
+    }
+
+    fn finishLoadFlight(flight: *LoadFlight, model: ?*LoadedModel, err: ?anyerror) void {
+        flight.model = model;
+        flight.err = err;
+        flight.completed.set(flight.io);
+    }
+
+    fn releaseLoadFlight(
+        self: *ModelManager,
+        flight_key: []const u8,
+        flight: *LoadFlight,
+    ) void {
+        self.lockLoadedModels();
+        std.debug.assert(flight.refs > 0);
+        flight.refs -= 1;
+        if (flight.refs != 0) {
+            self.unlockLoadedModels();
+            return;
+        }
+        const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
+        std.debug.assert(removed.value == flight);
+        self.unlockLoadedModels();
+
+        self.allocator.free(removed.key);
+        self.allocator.destroy(flight);
+    }
+
+    fn waitForLoadFlight(
+        self: *ModelManager,
+        flight_key: []const u8,
+        flight: *LoadFlight,
+    ) !*LoadedModel {
+        flight.completed.waitUncancelable(flight.io);
+        const model = flight.model;
+        const maybe_err = flight.err;
+
+        self.releaseLoadFlight(flight_key, flight);
+        if (maybe_err) |err| return err;
+        return model orelse error.NoBackendAvailable;
+    }
+
+    fn loadFromDirCoordinated(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+    ) !*LoadedModel {
+        const flight_key = try self.loadFlightKey(model_dir, preferred_backends, cache_default_alias);
+        defer self.allocator.free(flight_key);
+
+        self.lockLoadedModels();
+        const cached = self.lookupLoadedModelLocked(
+            model_dir,
+            preferred_backends,
+            cache_default_alias,
+        ) catch |err| {
+            self.unlockLoadedModels();
+            return err;
+        };
+        if (cached) |model| {
+            self.unlockLoadedModels();
+            return model;
+        }
+        if (self.in_flight_loads.get(flight_key)) |flight| {
+            flight.refs += 1;
+            self.unlockLoadedModels();
+            return self.waitForLoadFlight(flight_key, flight);
+        }
+
+        const flight = self.allocator.create(LoadFlight) catch |err| {
+            self.unlockLoadedModels();
+            return err;
+        };
+        // Antfly injects BackendRuntime.io through Node.attachIo. Keep the
+        // inference package coupled only to the std.Io capability so standalone
+        // and embedded owners can provide different runtime implementations.
+        // The process-local fallback is only for offline callers that do not
+        // attach a runtime.
+        const coordination_io = self.session_manager.io orelse
+            std.Io.Threaded.global_single_threaded.io();
+        flight.* = .{
+            .io = coordination_io,
+        };
+        const owned_flight_key = self.allocator.dupe(u8, flight_key) catch |err| {
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        self.in_flight_loads.put(self.allocator, owned_flight_key, flight) catch |err| {
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        // Snapshot the injected runtime while holding load_lock. attachIo may
+        // update the manager between cold loads, but a load must use one stable
+        // runtime for its complete construction.
+        var session_manager = sessionManagerForPreferredBackends(
+            self.allocator,
+            preferred_backends,
+            &self.session_manager,
+        );
+        self.unlockLoadedModels();
+
+        const model = self.loadFromDirUncached(model_dir, &session_manager, cache_default_alias) catch |err| {
+            finishLoadFlight(flight, null, err);
+            self.releaseLoadFlight(flight_key, flight);
+            return err;
+        };
+        finishLoadFlight(flight, model, null);
+        self.releaseLoadFlight(flight_key, flight);
+        return model;
     }
 
     fn loadFromDirUncached(
@@ -1408,15 +1550,85 @@ pub const ModelManager = struct {
             }
         }
 
-        // Cache by actual loaded session backend.
-        const variant_key = try backendVariantCacheKey(self.allocator, model_dir, model.session.backend());
-        try self.loaded.put(self.allocator, variant_key, model);
-        if (cache_default_alias and self.loaded.get(model_dir) == null and self.loaded_aliases.get(model_dir) == null) {
-            const alias_key = try self.allocator.dupe(u8, model_dir);
-            try self.loaded_aliases.put(self.allocator, alias_key, model);
+        return self.publishLoadedModel(model, cache_default_alias);
+    }
+
+    /// Publish a fully constructed model with only a short map critical section.
+    /// Distinct request keys can occasionally converge on the same actual backend;
+    /// in that case retain the first model and dispose of the duplicate outside
+    /// the lock.
+    fn publishLoadedModel(
+        self: *ModelManager,
+        model: *LoadedModel,
+        cache_default_alias: bool,
+    ) !*LoadedModel {
+        var model_owned = true;
+        errdefer if (model_owned) {
+            model.deinit();
+            self.allocator.destroy(model);
+        };
+
+        const variant_key = try backendVariantCacheKey(
+            self.allocator,
+            model.model_dir,
+            model.session.backend(),
+        );
+        var variant_key_owned = true;
+        defer if (variant_key_owned) self.allocator.free(variant_key);
+
+        const alias_key = if (cache_default_alias)
+            try self.allocator.dupe(u8, model.model_dir)
+        else
+            null;
+        var alias_key_owned = alias_key != null;
+        defer if (alias_key_owned) self.allocator.free(alias_key.?);
+
+        var selected = model;
+        self.lockLoadedModels();
+        if (self.loaded.get(variant_key)) |existing| {
+            selected = existing;
+            if (alias_key != null and
+                self.loaded.get(model.model_dir) == null and
+                self.loaded_aliases.get(model.model_dir) == null)
+            {
+                self.loaded_aliases.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+                    self.unlockLoadedModels();
+                    return err;
+                };
+                self.loaded_aliases.putAssumeCapacity(alias_key.?, existing);
+                alias_key_owned = false;
+            }
+            self.unlockLoadedModels();
+
+            model.deinit();
+            self.allocator.destroy(model);
+            model_owned = false;
+            return selected;
         }
 
-        return model;
+        const needs_alias = alias_key != null and
+            self.loaded.get(model.model_dir) == null and
+            self.loaded_aliases.get(model.model_dir) == null;
+        self.loaded.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.unlockLoadedModels();
+            return err;
+        };
+        if (needs_alias) {
+            self.loaded_aliases.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+                self.unlockLoadedModels();
+                return err;
+            };
+        }
+        self.loaded.putAssumeCapacity(variant_key, model);
+        variant_key_owned = false;
+        if (needs_alias) {
+            self.loaded_aliases.putAssumeCapacity(alias_key.?, model);
+            alias_key_owned = false;
+        }
+        self.unlockLoadedModels();
+
+        model_owned = false;
+        return selected;
     }
 };
 
