@@ -1637,6 +1637,8 @@ pub const ApiHttpServer = struct {
     repair_job_owner_id: u64 = 0,
     restore_job_owner_id: std.atomic.Value(u64) = .init(0),
     restore_retry_wakeup_in_flight: std.atomic.Value(bool) = .init(false),
+    restore_retry_wakeup_generation: std.atomic.Value(u64) = .init(0),
+    restore_retry_wakeup_event: std.Io.Event = .unset,
     restore_jobs_resumed: std.atomic.Value(bool) = .init(false),
     restore_jobs_closing: std.atomic.Value(bool) = .init(false),
     restore_leadership_term: std.atomic.Value(u64) = .init(0),
@@ -1915,6 +1917,7 @@ pub const ApiHttpServer = struct {
 
     pub fn deinit(self: *ApiHttpServer) void {
         self.restore_jobs_closing.store(true, .release);
+        self.signalRestoreRetryWakeup();
         self.backup_maintenance_closing.store(true, .release);
         if (self.cfg.backend_runtime) |runtime| {
             if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
@@ -1967,6 +1970,7 @@ pub const ApiHttpServer = struct {
         // callbacks only request a later pass while paused, so draining the old
         // owner cannot wait on its own dispatch mutex.
         self.restore_dispatch_paused.store(true, .release);
+        self.signalRestoreRetryWakeup();
         platform_sync.lockYielding(&self.restore_dispatch_mutex);
         const transition_result = self.prepareRestoreLeadershipLocked(runtime, leadership_term);
         self.restore_dispatch_mutex.unlock();
@@ -11100,6 +11104,11 @@ pub const ApiHttpServer = struct {
         });
     }
 
+    fn signalRestoreRetryWakeup(self: *ApiHttpServer) void {
+        _ = self.restore_retry_wakeup_generation.fetchAdd(1, .release);
+        if (self.sharedApiIo()) |io| self.restore_retry_wakeup_event.set(io);
+    }
+
     fn unmarkScheduledRestoreJob(self: *ApiHttpServer, job_id: u64) void {
         platform_sync.lockYielding(&self.restore_schedule_mutex);
         _ = self.scheduled_restore_jobs.remove(job_id);
@@ -11234,6 +11243,7 @@ pub const ApiHttpServer = struct {
                         retry_delay_ns,
                     );
                     self.alloc.free(retried);
+                    self.signalRestoreRetryWakeup();
                     try self.ensureRestoreRetryWakeup();
                     return;
                 }
@@ -11266,10 +11276,12 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicRestoreJob(self: *ApiHttpServer, job_id: u64, cancel: bool) !http_common.HttpResponse {
-        const encoded = if (cancel)
-            (try self.restore_job_store.cancel(self.alloc, job_id)) orelse return try jsonErrorResponse(self.alloc, 404, "not found")
-        else
-            (try self.restore_job_store.load(self.alloc, job_id)) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+        const encoded = if (cancel) blk: {
+            const cancelled = (try self.restore_job_store.cancel(self.alloc, job_id)) orelse
+                return try jsonErrorResponse(self.alloc, 404, "not found");
+            self.signalRestoreRetryWakeup();
+            break :blk cancelled;
+        } else (try self.restore_job_store.load(self.alloc, job_id)) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
         defer self.alloc.free(encoded);
         return try self.restoreJobResponse(200, encoded);
     }
@@ -11447,17 +11459,20 @@ const RestoreRetryWakeWork = struct {
         while (!self.server.restore_jobs_closing.load(.acquire) and
             self.server.restore_job_owner_id.load(.acquire) == self.owner_id)
         {
+            const observed_generation =
+                self.server.restore_retry_wakeup_generation.load(.acquire);
             const delay_ms = self.server.restore_job_store.nextPendingDelayMs() orelse
                 return;
             if (delay_ms == 0) {
                 try self.server.schedulePendingRestoreJobs();
                 return;
             }
-            // Bound shutdown latency while retaining one timer regardless of
-            // the number of delayed jobs.
-            io.sleep(
-                std.Io.Duration.fromMilliseconds(@min(delay_ms, 100)),
-                .awake,
+            _ = waitForRestoreRetryDeadline(
+                io,
+                &self.server.restore_retry_wakeup_event,
+                &self.server.restore_retry_wakeup_generation,
+                observed_generation,
+                delay_ms,
             ) catch |err| switch (err) {
                 error.Canceled => return,
             };
@@ -11481,6 +11496,63 @@ const RestoreRetryWakeWork = struct {
         };
     }
 };
+
+/// Wait once until the durable eligibility deadline or a queue/ownership
+/// change. The generation check closes the set-before-reset race: a signal
+/// that arrives between the caller's snapshot and `reset` cannot be lost.
+fn waitForRestoreRetryDeadline(
+    io: std.Io,
+    event: *std.Io.Event,
+    generation: *std.atomic.Value(u64),
+    observed_generation: u64,
+    delay_ms: u64,
+) error{Canceled}!bool {
+    event.reset();
+    if (generation.load(.acquire) != observed_generation) return false;
+    const bounded_delay_ms: i64 = @intCast(@min(
+        delay_ms,
+        @as(u64, @intCast(std.math.maxInt(i64))),
+    ));
+    event.waitTimeout(io, .{
+        .duration = .{
+            .raw = std.Io.Duration.fromMilliseconds(bounded_delay_ms),
+            .clock = .awake,
+        },
+    }) catch |err| switch (err) {
+        error.Timeout => return true,
+        error.Canceled => return error.Canceled,
+    };
+    return false;
+}
+
+test "restore retry deadline wakeup is interruptible without polling" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var event: std.Io.Event = .unset;
+    var generation: std.atomic.Value(u64) = .init(0);
+    const observed_generation = generation.load(.acquire);
+    const Wake = struct {
+        fn run(
+            wake_io: std.Io,
+            wake_event: *std.Io.Event,
+            wake_generation: *std.atomic.Value(u64),
+        ) void {
+            wake_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+            _ = wake_generation.fetchAdd(1, .release);
+            wake_event.set(wake_io);
+        }
+    };
+    var wake = try io.concurrent(Wake.run, .{ io, &event, &generation });
+    defer _ = wake.await(io);
+    try std.testing.expect(!try waitForRestoreRetryDeadline(
+        io,
+        &event,
+        &generation,
+        observed_generation,
+        60 * 1000,
+    ));
+}
 
 const RestoreJobWork = struct {
     server: *ApiHttpServer,
