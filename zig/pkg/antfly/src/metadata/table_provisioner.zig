@@ -168,6 +168,7 @@ pub fn provisioningFingerprint(
         hashBytes(&hasher, range.restore_connection);
         hasher.update(std.mem.asBytes(&range.restore_artifact_size_bytes));
         hashBytes(&hasher, range.restore_artifact_sha256);
+        hasher.update(&range.completed_restore_fingerprint);
         hasher.update(std.mem.asBytes(&table.table_id));
         hashBytes(&hasher, table.name);
         hashBytes(&hasher, table.schema_json);

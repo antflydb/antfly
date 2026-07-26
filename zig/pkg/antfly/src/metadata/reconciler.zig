@@ -2669,6 +2669,11 @@ fn rangeRecordsEqual(a: table_manager.RangeRecord, b: table_manager.RangeRecord)
         std.mem.eql(u8, a.restore_connection, b.restore_connection) and
         a.restore_artifact_size_bytes == b.restore_artifact_size_bytes and
         std.mem.eql(u8, a.restore_artifact_sha256, b.restore_artifact_sha256) and
+        std.mem.eql(
+            u8,
+            &a.completed_restore_fingerprint,
+            &b.completed_restore_fingerprint,
+        ) and
         a.split_attempt_epoch == b.split_attempt_epoch;
 }
 

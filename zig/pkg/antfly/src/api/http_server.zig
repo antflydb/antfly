@@ -6956,12 +6956,33 @@ pub const ApiHttpServer = struct {
         var snapshot = (try self.source.adminSnapshot()) orelse return .missing;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return .missing;
+        const completed_fingerprint =
+            metadata_table_manager.restoreCompletionFingerprint(
+                backup_id,
+                artifact_backup_id,
+                location_uri,
+            );
         var found_range = false;
         var found_pending = false;
         for (snapshot.ranges) |range| {
             if (range.table_id != table.table_id) continue;
             found_range = true;
-            if (range.restore_backup_id.len == 0 and range.restore_location.len == 0) continue;
+            const has_active_restore =
+                range.restore_backup_id.len > 0 or
+                range.restore_artifact_backup_id.len > 0 or
+                range.restore_location.len > 0 or
+                range.restore_snapshot_path.len > 0 or
+                range.restore_connection.len > 0 or
+                range.restore_artifact_size_bytes > 0 or
+                range.restore_artifact_sha256.len > 0;
+            if (!has_active_restore) {
+                if (!std.mem.eql(
+                    u8,
+                    &range.completed_restore_fingerprint,
+                    &completed_fingerprint,
+                )) return .conflicting;
+                continue;
+            }
             if (range.restore_backup_id.len == 0 or range.restore_location.len == 0)
                 return .conflicting;
             if (!std.mem.eql(u8, range.restore_backup_id, backup_id) or
@@ -6971,29 +6992,9 @@ pub const ApiHttpServer = struct {
         }
         if (!found_range) return .conflicting;
         if (found_pending) return .pending;
-
-        // Completed intents are cleared from table/range metadata. Adopt only
-        // when every current range still has completed replica provenance for
-        // this exact backup and source location; an arbitrary existing table
-        // must never become resumable merely because it has no active intent.
-        for (snapshot.ranges) |range| {
-            if (range.table_id != table.table_id) continue;
-            var found_completed_progress = false;
-            for (snapshot.restore_progresses) |progress| {
-                if (progress.table_id == table.table_id and
-                    progress.group_id == range.group_id and
-                    progress.primary_restored and
-                    progress.runtime_repair_complete and
-                    std.mem.eql(u8, progress.backup_id, backup_id) and
-                    std.mem.eql(u8, progress.artifact_backup_id, artifact_backup_id) and
-                    std.mem.eql(u8, progress.location, location_uri))
-                {
-                    found_completed_progress = true;
-                    break;
-                }
-            }
-            if (!found_completed_progress) return .conflicting;
-        }
+        // Completion provenance is retained on each range after transient
+        // per-replica progress is collected. This makes async job resumption
+        // deterministic without retaining unbounded node-scoped status rows.
         return .completed;
     }
 

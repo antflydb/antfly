@@ -107,7 +107,60 @@ pub const RangeRecord = struct {
     /// admission. New restores require a SHA-256 binding.
     restore_artifact_size_bytes: u64 = 0,
     restore_artifact_sha256: []const u8 = "",
+    /// Durable, bounded idempotency provenance for the most recently
+    /// completed restore. Active replica progress can be garbage-collected
+    /// without making an exact job retry ambiguous.
+    completed_restore_fingerprint: RestoreCompletionFingerprint =
+        empty_restore_completion_fingerprint,
 };
+
+pub const RestoreCompletionFingerprint =
+    [std.crypto.hash.sha2.Sha256.digest_length]u8;
+pub const empty_restore_completion_fingerprint: RestoreCompletionFingerprint =
+    [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+
+fn hashRestoreCompletionPart(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    value: []const u8,
+) void {
+    var len_bytes: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &len_bytes, @intCast(value.len), .little);
+    hasher.update(&len_bytes);
+    hasher.update(value);
+}
+
+pub fn restoreCompletionFingerprint(
+    backup_id: []const u8,
+    artifact_backup_id: []const u8,
+    location: []const u8,
+) RestoreCompletionFingerprint {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-restore-completion-v1");
+    hashRestoreCompletionPart(&hasher, backup_id);
+    hashRestoreCompletionPart(&hasher, artifact_backup_id);
+    hashRestoreCompletionPart(&hasher, location);
+    var fingerprint: RestoreCompletionFingerprint = undefined;
+    hasher.final(&fingerprint);
+    return fingerprint;
+}
+
+pub fn rangeRestoreCompletionMatches(
+    record: RangeRecord,
+    backup_id: []const u8,
+    artifact_backup_id: []const u8,
+    location: []const u8,
+) bool {
+    const expected = restoreCompletionFingerprint(
+        backup_id,
+        artifact_backup_id,
+        location,
+    );
+    return std.mem.eql(
+        u8,
+        &record.completed_restore_fingerprint,
+        &expected,
+    );
+}
 
 /// Exact identity of a range-scoped restore intent. Completion commands carry
 /// this value so a delayed proposal cannot clear a superseding restore.
@@ -191,6 +244,11 @@ pub fn freeRestoreIntentIdentity(
 }
 
 pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeRecord) !void {
+    const completed_restore_fingerprint = restoreCompletionFingerprint(
+        record.restore_backup_id,
+        record.restore_artifact_backup_id,
+        record.restore_location,
+    );
     const backup_id = try alloc.dupe(u8, "");
     errdefer alloc.free(backup_id);
     const artifact_backup_id = try alloc.dupe(u8, "");
@@ -217,6 +275,7 @@ pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeReco
     record.restore_connection = connection;
     record.restore_artifact_size_bytes = 0;
     record.restore_artifact_sha256 = artifact_sha256;
+    record.completed_restore_fingerprint = completed_restore_fingerprint;
 }
 
 pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
@@ -235,7 +294,12 @@ pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
         std.mem.eql(u8, lhs.restore_snapshot_path, rhs.restore_snapshot_path) and
         std.mem.eql(u8, lhs.restore_connection, rhs.restore_connection) and
         lhs.restore_artifact_size_bytes == rhs.restore_artifact_size_bytes and
-        std.mem.eql(u8, lhs.restore_artifact_sha256, rhs.restore_artifact_sha256);
+        std.mem.eql(u8, lhs.restore_artifact_sha256, rhs.restore_artifact_sha256) and
+        std.mem.eql(
+            u8,
+            &lhs.completed_restore_fingerprint,
+            &rhs.completed_restore_fingerprint,
+        );
 }
 
 /// Returns true when an existing topology is either the exact requested
@@ -1056,6 +1120,7 @@ pub const TableManager = struct {
             .doc_identity_shard_id = source.doc_identity_shard_id,
             .doc_identity_range_id = source.doc_identity_range_id,
             .split_attempt_epoch = source.split_attempt_epoch,
+            .completed_restore_fingerprint = source.completed_restore_fingerprint,
         });
         try self.upsertRange(.{
             .group_id = record.destination_group_id,
@@ -1066,6 +1131,7 @@ pub const TableManager = struct {
             .doc_identity_shard_id = identity_shard_id,
             .doc_identity_range_id = identity_range_id,
             .split_attempt_epoch = 0,
+            .completed_restore_fingerprint = source.completed_restore_fingerprint,
         });
         _ = self.removeSplitIntent(record.transition_id);
     }
@@ -1084,6 +1150,14 @@ pub const TableManager = struct {
             .eq => receiver.end_key,
             .gt => donor.end_key,
         };
+        const completed_restore_fingerprint = if (std.mem.eql(
+            u8,
+            &donor.completed_restore_fingerprint,
+            &receiver.completed_restore_fingerprint,
+        ))
+            receiver.completed_restore_fingerprint
+        else
+            empty_restore_completion_fingerprint;
 
         try self.upsertRange(.{
             .group_id = receiver.group_id,
@@ -1093,6 +1167,7 @@ pub const TableManager = struct {
             .end_key = merged_end,
             .doc_identity_shard_id = receiver.doc_identity_shard_id,
             .doc_identity_range_id = receiver.doc_identity_range_id,
+            .completed_restore_fingerprint = completed_restore_fingerprint,
         });
         _ = self.removeRange(donor.group_id);
         _ = self.removeMergeIntent(record.transition_id);
@@ -1311,6 +1386,7 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
         .restore_connection = restore_connection,
         .restore_artifact_size_bytes = record.restore_artifact_size_bytes,
         .restore_artifact_sha256 = restore_artifact_sha256,
+        .completed_restore_fingerprint = record.completed_restore_fingerprint,
     };
 }
 
@@ -1924,6 +2000,11 @@ test "table manager rehydrates projected transitions without consuming split epo
 test "table manager applies finalized split to desired topology" {
     var manager = TableManager.init(std.testing.allocator);
     defer manager.deinit();
+    const completion_fingerprint = restoreCompletionFingerprint(
+        "nightly",
+        "nightly-artifacts",
+        "s3://backups",
+    );
 
     try manager.upsertTable(.{
         .table_id = 10,
@@ -1934,6 +2015,7 @@ test "table manager applies finalized split to desired topology" {
         .table_id = 10,
         .start_key = "doc:a",
         .end_key = "doc:z",
+        .completed_restore_fingerprint = completion_fingerprint,
     });
     try manager.requestSplit(.{
         .transition_id = 5003,
@@ -1966,6 +2048,11 @@ test "table manager applies finalized split to desired topology" {
     defer manager.freeRanges(std.testing.allocator, ranges);
     try std.testing.expectEqual(@as(usize, 2), ranges.len);
     for (ranges) |range| {
+        try std.testing.expectEqualSlices(
+            u8,
+            &completion_fingerprint,
+            &range.completed_restore_fingerprint,
+        );
         if (range.group_id == 101) try std.testing.expectEqual(@as(u64, 101), range.range_id);
         if (range.group_id == 102) {
             try std.testing.expectEqual(@as(u64, 102), range.range_id);
@@ -1979,6 +2066,11 @@ test "table manager applies finalized split to desired topology" {
 test "table manager applies finalized merge preserving receiver range id" {
     var manager = TableManager.init(std.testing.allocator);
     defer manager.deinit();
+    const completion_fingerprint = restoreCompletionFingerprint(
+        "nightly",
+        "nightly-artifacts",
+        "s3://backups",
+    );
 
     try manager.upsertTable(.{
         .table_id = 10,
@@ -1990,6 +2082,7 @@ test "table manager applies finalized merge preserving receiver range id" {
         .table_id = 10,
         .start_key = "doc:a",
         .end_key = "doc:m",
+        .completed_restore_fingerprint = completion_fingerprint,
     });
     try manager.upsertRange(.{
         .group_id = 102,
@@ -1997,6 +2090,7 @@ test "table manager applies finalized merge preserving receiver range id" {
         .table_id = 10,
         .start_key = "doc:m",
         .end_key = "doc:z",
+        .completed_restore_fingerprint = completion_fingerprint,
     });
     try manager.requestMerge(.{
         .transition_id = 6003,
@@ -2027,6 +2121,11 @@ test "table manager applies finalized merge preserving receiver range id" {
     try std.testing.expectEqual(@as(u64, 0), ranges[0].doc_identity_range_id);
     try std.testing.expectEqualStrings("doc:a", ranges[0].start_key);
     try std.testing.expectEqualStrings("doc:z", ranges[0].end_key.?);
+    try std.testing.expectEqualSlices(
+        u8,
+        &completion_fingerprint,
+        &ranges[0].completed_restore_fingerprint,
+    );
     try std.testing.expect(manager.merge_intents.count() == 0);
 }
 

@@ -314,7 +314,8 @@ test "metadata raft apply store decodes range values before split attempt epochs
         @sizeOf(u32) + // empty restore_connection
         @sizeOf(u64) + // restore_artifact_size_bytes
         @sizeOf(u32) + // empty restore_artifact_sha256
-        @sizeOf(u32); // empty restore_artifact_backup_id
+        @sizeOf(u32) + // empty restore_artifact_backup_id
+        @sizeOf(metadata_table_manager.RestoreCompletionFingerprint);
     const legacy = encoded[0 .. encoded.len - appended_fields_size];
     const decoded = try decodeRangeRecord(std.testing.allocator, legacy);
     defer metadata_table_manager.freeRange(std.testing.allocator, decoded);
@@ -325,6 +326,11 @@ test "metadata raft apply store decodes range values before split attempt epochs
     try std.testing.expectEqualStrings("", decoded.restore_connection);
     try std.testing.expectEqual(@as(u64, 0), decoded.restore_artifact_size_bytes);
     try std.testing.expectEqualStrings("", decoded.restore_artifact_sha256);
+    try std.testing.expectEqualSlices(
+        u8,
+        &metadata_table_manager.empty_restore_completion_fingerprint,
+        &decoded.completed_restore_fingerprint,
+    );
 }
 
 fn validateRestoreJobLogicalKey(key: []const u8) !void {
@@ -4666,6 +4672,7 @@ fn appendRangeRecord(
     try out.appendSlice(alloc, record.restore_artifact_sha256);
     try appendInt(alloc, out, u32, @intCast(record.restore_artifact_backup_id.len));
     try out.appendSlice(alloc, record.restore_artifact_backup_id);
+    try out.appendSlice(alloc, &record.completed_restore_fingerprint);
 }
 
 fn appendSplitTransitionRecord(
@@ -5109,6 +5116,20 @@ fn readRangeRecord(
     else
         try alloc.dupe(u8, "");
     errdefer alloc.free(restore_artifact_backup_id);
+    var completed_restore_fingerprint =
+        metadata_table_manager.empty_restore_completion_fingerprint;
+    if (pos.* < encoded.len) {
+        if (encoded.len - pos.* <
+            @sizeOf(metadata_table_manager.RestoreCompletionFingerprint))
+        {
+            return error.InvalidMetadataTransitionEncoding;
+        }
+        @memcpy(
+            &completed_restore_fingerprint,
+            encoded[pos.*..][0..@sizeOf(metadata_table_manager.RestoreCompletionFingerprint)],
+        );
+        pos.* += @sizeOf(metadata_table_manager.RestoreCompletionFingerprint);
+    }
     return .{
         .group_id = group_id,
         .range_id = if (range_id == 0) group_id else range_id,
@@ -5125,6 +5146,7 @@ fn readRangeRecord(
         .restore_connection = restore_connection,
         .restore_artifact_size_bytes = restore_artifact_size_bytes,
         .restore_artifact_sha256 = restore_artifact_sha256,
+        .completed_restore_fingerprint = completed_restore_fingerprint,
     };
 }
 
@@ -6841,6 +6863,12 @@ test "metadata raft apply store completes only the matching restore intent and p
     try std.testing.expectEqualStrings("", ranges[0].restore_connection);
     try std.testing.expectEqual(@as(u64, 0), ranges[0].restore_artifact_size_bytes);
     try std.testing.expectEqualStrings("", ranges[0].restore_artifact_sha256);
+    try std.testing.expect(metadata_table_manager.rangeRestoreCompletionMatches(
+        ranges[0],
+        "new",
+        "new-artifact-namespace",
+        "s3://backups/new",
+    ));
 }
 
 test "metadata raft apply store rejects reserved data group ids in transition records" {
