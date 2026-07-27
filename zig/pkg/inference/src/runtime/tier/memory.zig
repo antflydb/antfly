@@ -925,6 +925,23 @@ fn controllerListContains(controllers: []const u8, expected: []const u8) bool {
     return false;
 }
 
+fn isSafeAbsoluteCgroupPath(path: []const u8) bool {
+    if (path.len == 0 or path[0] != '/' or
+        std.mem.indexOfScalar(u8, path, 0) != null)
+    {
+        return false;
+    }
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn parseCgroupPaths(bytes: []const u8) CgroupPaths {
     var result = CgroupPaths{};
     var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -934,7 +951,7 @@ fn parseCgroupPaths(bytes: []const u8) CgroupPaths {
         const hierarchy = line[0..first];
         const controllers = line[first + 1 .. second];
         const path = line[second + 1 ..];
-        if (path.len == 0 or path[0] != '/' or std.mem.indexOf(u8, path, "..") != null) continue;
+        if (!isSafeAbsoluteCgroupPath(path)) continue;
         if (std.mem.eql(u8, hierarchy, "0") and controllers.len == 0) {
             result.v2 = path;
         } else if (controllerListContains(controllers, "memory")) {
@@ -1469,6 +1486,12 @@ test "cgroup paths and limits constrain host memory" {
     );
     try std.testing.expectEqualStrings("/system.slice/antfly.service", paths.v2.?);
     try std.testing.expectEqualStrings("/production/antfly", paths.v1_memory.?);
+    const dotted = parseCgroupPaths(
+        \\0::/system.slice/worker..scope
+        \\
+    );
+    try std.testing.expectEqualStrings("/system.slice/worker..scope", dotted.v2.?);
+    try std.testing.expect(parseCgroupPaths("0::/safe/../escape\n").v2 == null);
 
     const effective = applyCgroupMemoryInfo(
         .{ .total_bytes = gib(64), .available_bytes = gib(32) },

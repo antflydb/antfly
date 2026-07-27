@@ -275,8 +275,8 @@ pub const Vision2SeqRecognizer = struct {
     pub fn loadFromStagePaths(
         allocator: std.mem.Allocator,
         model_path: []const u8,
-        encoder_file: []const u8,
-        decoder_file: []const u8,
+        encoder_path: []const u8,
+        decoder_path: []const u8,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !Vision2SeqRecognizer {
         return .{
@@ -284,8 +284,8 @@ pub const Vision2SeqRecognizer = struct {
             .reader = try vision_reader.LoadedVisionReader.loadFromStagePaths(
                 allocator,
                 model_path,
-                encoder_file,
-                decoder_file,
+                encoder_path,
+                decoder_path,
                 component_loader,
             ),
         };

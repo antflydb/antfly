@@ -22,6 +22,75 @@ const ctc_decode = @import("../pipelines/ctc_decode.zig");
 const image = @import("../pipelines/image.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
 
+const AssetResolver = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    canonical_root: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model_path: []const u8,
+    ) !AssetResolver {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .canonical_root = try realPathAlloc(
+                allocator,
+                io,
+                model_path,
+            ),
+        };
+    }
+
+    fn deinit(self: *AssetResolver) void {
+        self.allocator.free(self.canonical_root);
+        self.* = undefined;
+    }
+
+    fn resolve(self: *const AssetResolver, relative: []const u8) ![]u8 {
+        if (!metadata_mod.isSafeRelativeAssetPath(relative))
+            return error.InvalidMetadata;
+        const joined = try std.fs.path.join(
+            self.allocator,
+            &.{ self.canonical_root, relative },
+        );
+        defer self.allocator.free(joined);
+        const canonical = try realPathAlloc(
+            self.allocator,
+            self.io,
+            joined,
+        );
+        errdefer self.allocator.free(canonical);
+        if (!pathIsWithinRoot(self.canonical_root, canonical))
+            return error.ModelAssetOutsideRoot;
+        return canonical;
+    }
+};
+
+fn realPathAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) ![]u8 {
+    const sentinel_path = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        path,
+        allocator,
+    );
+    defer allocator.free(sentinel_path);
+    return try allocator.dupe(u8, sentinel_path);
+}
+
+fn pathIsWithinRoot(root: []const u8, path: []const u8) bool {
+    if (std.mem.eql(u8, root, path)) return true;
+    if (root.len == 1 and root[0] == std.fs.path.sep)
+        return path.len > 0 and path[0] == std.fs.path.sep;
+    return path.len > root.len and
+        std.mem.startsWith(u8, path, root) and
+        path[root.len] == std.fs.path.sep;
+}
+
 pub const LoadedMultiStageReader = struct {
     allocator: std.mem.Allocator,
     pipeline: multistage_ocr.MultiStageOCRPipeline,
@@ -36,7 +105,19 @@ pub const LoadedMultiStageReader = struct {
         var metadata = try metadata_mod.loadFromDir(allocator, model_path);
         defer metadata.deinit();
         if (!metadata_mod.isMultiStage(&metadata)) return error.InvalidMetadata;
-        const component_paths = try collectComponentPaths(allocator, model_path, &metadata);
+        const runtime_io = session_manager.io orelse
+            std.Io.Threaded.global_single_threaded.io();
+        var asset_resolver = try AssetResolver.init(
+            allocator,
+            runtime_io,
+            model_path,
+        );
+        defer asset_resolver.deinit();
+        const component_paths = try collectComponentPaths(
+            allocator,
+            &asset_resolver,
+            &metadata,
+        );
         defer {
             for (component_paths) |path| allocator.free(path);
             allocator.free(component_paths);
@@ -48,26 +129,29 @@ pub const LoadedMultiStageReader = struct {
             component_paths,
             .multistage_ocr,
         );
+        var first_err: ?anyerror = null;
         for (component_loader.preferredBackends()) |backend| {
             var backend_loader = try component_loader.restrictToBackend(backend);
             return loadFromDirWithSessionManager(
                 allocator,
                 model_path,
+                &asset_resolver,
                 &metadata,
                 &backend_loader,
             ) catch |err| {
-                if (err == error.MultiStageReaderNotYetSupported) return err;
+                if (backendIndependentLoadError(err)) return err;
+                if (first_err == null) first_err = err;
                 std.log.err("multistage reader backend {s} failed for {s}: {s}", .{ @tagName(backend), model_path, @errorName(err) });
                 continue;
             };
         }
 
-        return error.NoBackendAvailable;
+        return first_err orelse error.NoBackendAvailable;
     }
 
     fn collectComponentPaths(
         allocator: std.mem.Allocator,
-        model_path: []const u8,
+        asset_resolver: *const AssetResolver,
         metadata: *const metadata_mod.MultiStageMetadata,
     ) ![]const []const u8 {
         var paths = std.ArrayListUnmanaged([]const u8).empty;
@@ -85,10 +169,7 @@ pub const LoadedMultiStageReader = struct {
             };
             for (candidates) |maybe_relative| {
                 const relative = maybe_relative orelse continue;
-                const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{
-                    model_path,
-                    relative,
-                });
+                const path = try asset_resolver.resolve(relative);
                 var duplicate = false;
                 for (paths.items) |existing| {
                     if (std.mem.eql(u8, existing, path)) {
@@ -110,6 +191,7 @@ pub const LoadedMultiStageReader = struct {
     fn loadFromDirWithSessionManager(
         allocator: std.mem.Allocator,
         model_path: []const u8,
+        asset_resolver: *const AssetResolver,
         metadata: *const metadata_mod.MultiStageMetadata,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !LoadedMultiStageReader {
@@ -120,7 +202,7 @@ pub const LoadedMultiStageReader = struct {
         }
         const detection_stage = metadata.stages.get("detection") orelse return error.InvalidMetadata;
         const detection_file = detection_stage.model_file orelse return error.InvalidMetadata;
-        const detection_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, detection_file });
+        const detection_path = try asset_resolver.resolve(detection_file);
         defer allocator.free(detection_path);
 
         var detector_managed = try component_loader.load(detection_path);
@@ -133,7 +215,7 @@ pub const LoadedMultiStageReader = struct {
 
         const detection_preprocess = try loadStagePreprocessConfig(
             allocator,
-            model_path,
+            asset_resolver,
             metadata,
             &detection_stage,
             detector,
@@ -155,7 +237,7 @@ pub const LoadedMultiStageReader = struct {
             const stage_type = recognition_stage.stage_type orelse return error.InvalidMetadata;
             if (std.mem.eql(u8, stage_type, "ctc")) {
                 const model_file = recognition_stage.model_file orelse return error.InvalidMetadata;
-                const rec_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, model_file });
+                const rec_path = try asset_resolver.resolve(model_file);
                 defer allocator.free(rec_path);
 
                 var rec_managed = try component_loader.load(rec_path);
@@ -167,7 +249,7 @@ pub const LoadedMultiStageReader = struct {
                 rec_managed.resource_lease = null;
 
                 const char_dict_rel = recognition_stage.char_dict_file orelse return error.InvalidMetadata;
-                const char_dict_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, char_dict_rel });
+                const char_dict_path = try asset_resolver.resolve(char_dict_rel);
                 defer allocator.free(char_dict_path);
                 const char_dict = try ctc_decode.loadCharDictFile(allocator, char_dict_path);
                 var char_dict_owned = true;
@@ -175,7 +257,7 @@ pub const LoadedMultiStageReader = struct {
 
                 const recognition_preprocess = try loadStagePreprocessConfig(
                     allocator,
-                    model_path,
+                    asset_resolver,
                     metadata,
                     &recognition_stage,
                     rec_session,
@@ -193,11 +275,15 @@ pub const LoadedMultiStageReader = struct {
             } else if (std.mem.eql(u8, stage_type, "vision2seq")) {
                 const encoder_file = recognition_stage.encoder_file orelse return error.InvalidMetadata;
                 const decoder_file = recognition_stage.decoder_file orelse return error.InvalidMetadata;
+                const encoder_path = try asset_resolver.resolve(encoder_file);
+                defer allocator.free(encoder_path);
+                const decoder_path = try asset_resolver.resolve(decoder_file);
+                defer allocator.free(decoder_path);
                 pipeline.recognizer = .{ .vision2seq = try multistage_ocr.Vision2SeqRecognizer.loadFromStagePaths(
                     allocator,
                     model_path,
-                    encoder_file,
-                    decoder_file,
+                    encoder_path,
+                    decoder_path,
                     component_loader,
                 ) };
             } else {
@@ -207,7 +293,7 @@ pub const LoadedMultiStageReader = struct {
 
         if (metadata.stages.get("layout")) |layout_stage| {
             const model_file = layout_stage.model_file orelse return error.InvalidMetadata;
-            const layout_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, model_file });
+            const layout_path = try asset_resolver.resolve(model_file);
             defer allocator.free(layout_path);
 
             var layout_managed = try component_loader.load(layout_path);
@@ -219,7 +305,7 @@ pub const LoadedMultiStageReader = struct {
 
         if (metadata.stages.get("order")) |order_stage| {
             const model_file = order_stage.model_file orelse return error.InvalidMetadata;
-            const order_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, model_file });
+            const order_path = try asset_resolver.resolve(model_file);
             defer allocator.free(order_path);
 
             var order_managed = try component_loader.load(order_path);
@@ -298,7 +384,7 @@ fn loadPostProcessor(stage: metadata_mod.StageMetadata) !multistage_ocr.Detectio
 
 fn loadStagePreprocessConfig(
     allocator: std.mem.Allocator,
-    model_path: []const u8,
+    asset_resolver: *const AssetResolver,
     metadata: *const metadata_mod.MultiStageMetadata,
     stage: *const metadata_mod.StageMetadata,
     session: backends.Session,
@@ -308,15 +394,23 @@ fn loadStagePreprocessConfig(
     var loaded_stage_preprocessor = false;
 
     if (stage.processor_dir) |processor_dir| {
-        const preproc_path = try std.fmt.allocPrint(allocator, "{s}/{s}/preprocessor_config.json", .{ model_path, processor_dir });
-        defer allocator.free(preproc_path);
-
-        if (c_file.readFile(allocator, preproc_path)) |bytes| {
-            defer allocator.free(bytes);
-            if (parsePreprocessorConfig(bytes, &config)) |_| {
-                loaded_stage_preprocessor = true;
+        const relative = try std.fs.path.join(
+            allocator,
+            &.{ processor_dir, "preprocessor_config.json" },
+        );
+        defer allocator.free(relative);
+        if (asset_resolver.resolve(relative)) |preproc_path| {
+            defer allocator.free(preproc_path);
+            if (c_file.readFileMax(allocator, preproc_path, 1024 * 1024)) |bytes| {
+                defer allocator.free(bytes);
+                if (parsePreprocessorConfig(bytes, &config)) |_| {
+                    loaded_stage_preprocessor = true;
+                } else |_| {}
             } else |_| {}
-        } else |_| {}
+        } else |err| switch (err) {
+            error.InvalidMetadata, error.ModelAssetOutsideRoot => return err,
+            else => {},
+        }
     }
 
     if (session.inputInfo().len > 0 and session.inputInfo()[0].shape.len == 4) {
@@ -328,6 +422,69 @@ fn loadStagePreprocessConfig(
     }
     if (metadata.model_type) |model_type| applyModelTypeStageDefaults(model_type, stage_kind, &config);
     return config;
+}
+
+fn backendIndependentLoadError(err: anyerror) bool {
+    return err == error.InvalidMetadata or
+        err == error.ModelAssetOutsideRoot or
+        err == error.MultiStageReaderNotYetSupported or
+        err == error.UnsupportedDetectionPostProcessor;
+}
+
+test "multistage asset resolver rejects symlinks outside the model root" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.createDir(std.testing.io, "model", .default_dir);
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model/inside.onnx",
+        .data = "inside",
+    });
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "outside.onnx",
+        .data = "outside",
+    });
+
+    const base = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(base);
+    const model_path = try std.fs.path.join(allocator, &.{ base, "model" });
+    defer allocator.free(model_path);
+    const outside_path = try std.fs.path.join(allocator, &.{ base, "outside.onnx" });
+    defer allocator.free(outside_path);
+    const canonical_outside = try realPathAlloc(
+        allocator,
+        std.testing.io,
+        outside_path,
+    );
+    defer allocator.free(canonical_outside);
+    const escape_path = try std.fs.path.join(allocator, &.{ model_path, "escape.onnx" });
+    defer allocator.free(escape_path);
+    try std.Io.Dir.cwd().symLink(
+        std.testing.io,
+        canonical_outside,
+        escape_path,
+        .{},
+    );
+
+    var resolver = try AssetResolver.init(allocator, std.testing.io, model_path);
+    defer resolver.deinit();
+    const inside = try resolver.resolve("inside.onnx");
+    defer allocator.free(inside);
+    try std.testing.expect(pathIsWithinRoot(resolver.canonical_root, inside));
+    try std.testing.expectError(
+        error.ModelAssetOutsideRoot,
+        resolver.resolve("escape.onnx"),
+    );
+}
+
+test "multistage backend-independent failures stop fallback" {
+    try std.testing.expect(backendIndependentLoadError(error.InvalidMetadata));
+    try std.testing.expect(backendIndependentLoadError(error.ModelAssetOutsideRoot));
+    try std.testing.expect(!backendIndependentLoadError(error.NoBackendAvailable));
+    try std.testing.expect(!backendIndependentLoadError(error.ResourceTemporarilyUnavailable));
 }
 
 fn defaultPreprocessConfig(stage_kind: StageKind) multistage_ocr.PreprocessConfig {

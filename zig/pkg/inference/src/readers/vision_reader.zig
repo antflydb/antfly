@@ -93,17 +93,12 @@ pub const LoadedVisionReader = struct {
     pub fn loadFromStagePaths(
         allocator: std.mem.Allocator,
         model_path: []const u8,
-        encoder_file: []const u8,
-        decoder_file: []const u8,
+        encoder_path: []const u8,
+        decoder_path: []const u8,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !LoadedVisionReader {
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         const preproc = loadPreprocessorConfig(allocator, model_path);
-
-        const encoder_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, encoder_file });
-        defer allocator.free(encoder_path);
-        const decoder_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, decoder_file });
-        defer allocator.free(decoder_path);
 
         return loadEncoderDecoderPaths(allocator, model_path, encoder_path, decoder_path, dec_config, preproc, component_loader);
     }
