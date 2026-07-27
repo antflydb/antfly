@@ -5106,6 +5106,21 @@ fn appendCanonicalPublicQueryAlloc(
             if (bool_value.object.get("must_not")) |must_not_value| {
                 try appendPublicFilterClausesAlloc(alloc, exclusion_clauses, must_not_value, limit);
             }
+            // A non-scoring required clause makes `should` optional. Preserve
+            // that boolean contract after filters are split into their own
+            // execution bucket by anchoring the scoring bool with match_all.
+            // Without this marker the text executor treats a pure should bool
+            // as a mandatory disjunction and drops filter-matching documents.
+            const has_required_non_scoring_clause =
+                bool_value.object.get("filter") != null or
+                (bool_value.object.get("must") != null and
+                    bool_scoring_must.items.len == 0);
+            if (has_required_non_scoring_clause and
+                bool_scoring_must.items.len == 0 and
+                bool_scoring_should.items.len > 0)
+            {
+                try bool_scoring_must.append(alloc, .{ .match_all = {} });
+            }
             if (try buildScoringTextQueryAlloc(
                 alloc,
                 &bool_scoring_must,
@@ -5135,6 +5150,7 @@ fn appendCanonicalPublicQueryAlloc(
 
 fn parseCanonicalBoolBoost(value: ?std.json.Value) !f32 {
     const raw = value orelse return 1.0;
+    if (raw == .null) return 1.0;
     const number: f64 = switch (raw) {
         .integer => |item| @floatFromInt(item),
         .float => |item| item,
@@ -5142,8 +5158,9 @@ fn parseCanonicalBoolBoost(value: ?std.json.Value) !f32 {
             return error.InvalidQueryRequest,
         else => return error.InvalidQueryRequest,
     };
-    if (!std.math.isFinite(number) or number <= 0 or
-        number > std.math.floatMax(f32))
+    const max_f32: f64 = std.math.floatMax(f32);
+    if (!std.math.isFinite(number) or
+        number > max_f32 or number < -max_f32)
     {
         return error.InvalidQueryRequest;
     }
@@ -8538,13 +8555,46 @@ test "api query contract preserves canonical boolean boost scope" {
     try std.testing.expect(full_text.bool_query.must[1] == .match);
 }
 
-test "api query contract rejects invalid canonical boolean boosts" {
+test "api query contract preserves schema-valid canonical boolean boosts" {
+    const alloc = std.testing.allocator;
+    var null_boost = try parsePublicQueryRequest(
+        alloc,
+        null,
+        "files",
+        \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":null}}}
+        ,
+    );
+    defer null_boost.deinit(alloc);
+    try std.testing.expect(null_boost.req.full_text.? == .match);
+
+    inline for ([_]struct {
+        body: []const u8,
+        expected: f32,
+    }{
+        .{
+            .body =
+            \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":0}}}
+            ,
+            .expected = 0,
+        },
+        .{
+            .body =
+            \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":-1}}}
+            ,
+            .expected = -1,
+        },
+    }) |case| {
+        var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
+        defer parsed.deinit(alloc);
+        const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
+        try std.testing.expect(full_text == .bool_query);
+        try std.testing.expectEqual(case.expected, full_text.bool_query.boost);
+    }
+}
+
+test "api query contract rejects unrepresentable canonical boolean boosts" {
     const alloc = std.testing.allocator;
     inline for ([_][]const u8{
-        \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":0}}}
-        ,
-        \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":-1}}}
-        ,
         \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":"bad"}}}
         ,
         \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":1e100}}}
@@ -8555,6 +8605,31 @@ test "api query contract rejects invalid canonical boolean boosts" {
             parsePublicQueryRequest(alloc, null, "files", body),
         );
     }
+}
+
+test "api query contract keeps should optional beside required filters" {
+    const alloc = std.testing.allocator;
+    var parsed = try parsePublicQueryRequest(
+        alloc,
+        null,
+        "files",
+        \\{"query":{"bool":{"filter":[{"term":{"path":"status","value":"active"}}],"should":[{"match":{"field":"body","text":"computer"}}]}}}
+        ,
+    );
+    defer parsed.deinit(alloc);
+
+    const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
+    try std.testing.expect(full_text == .bool_query);
+    try std.testing.expectEqual(@as(u32, 0), full_text.bool_query.min_should);
+    try std.testing.expectEqual(@as(usize, 1), full_text.bool_query.must.len);
+    try std.testing.expect(full_text.bool_query.must[0] == .match_all);
+    try std.testing.expectEqual(@as(usize, 1), full_text.bool_query.should.len);
+    try std.testing.expect(full_text.bool_query.should[0] == .match);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        parsed.req.filter_query_json,
+        "\"status\"",
+    ) != null);
 }
 
 test "api query contract classifies public phrase variants as unsupported" {
