@@ -833,6 +833,51 @@ evaluated later, but adopting them requires explicit codec, error, replay, and
 reranking tests; it should not be assumed solely because the reference demo
 uses Arrow `float16`.
 
+### Packed bipolar candidate representation
+
+A strictly bipolar hypervector can encode each coordinate in one bit:
+
+```text
++1 -> 1
+-1 -> 0
+```
+
+At 10,000 dimensions this reduces one vector from 40,000 bytes of `f32` to
+10,000 bits, or 1,250 bytes, before framing: a theoretical 32x reduction.
+With this encoding, coordinate-wise bipolar binding is XNOR, disagreement is
+XOR, and similarity can use word-sized XOR plus population count. For bipolar
+vectors `a` and `b` with dimension `D`:
+
+```text
+dot(a, b) = D - 2 * hamming_distance(a, b)
+```
+
+This is still a dense representation: every coordinate is present. It is not a
+fit for the sparse-vector index, which would have to store almost every
+coordinate and its index.
+
+Packed bits cannot directly preserve the current authoritative complete-node
+vector. Structural bundling requires counters before thresholding, and
+association-count normalization plus the weighted semantic term produces
+real-valued magnitudes. Taking only the final sign changes cosine geometry and
+loses evidence strength; it is therefore a new retrieval approximation and
+coordinate-system contract, not a lossless codec.
+
+A safe experiment is a three-level path:
+
+```text
+authoritative complete f32 hypervector
+  -> packed sign sketch for inexpensive candidate selection
+  -> exact cosine rerank from the authoritative f32 artifact
+```
+
+That path must be compared directly with HBC/RaBitQ for recall, latency,
+storage, candidate budget, and update cost. If persisted, the bit mapping,
+threshold/tie algorithm, packing order, and version must participate in index
+identity. Packed bipolar storage should not become a public configuration or a
+specialized physical layout until it demonstrates a durable advantage over
+RaBitQ on representative complete-HDC distributions.
+
 ### Search index
 
 RaBitQ is already present in the HBC dense index. Its compressed representation
@@ -842,6 +887,8 @@ reranking can load the durable vector according to the configured rerank policy.
 The benchmark must measure:
 
 - RaBitQ recall against exact cosine for HDC distributions;
+- packed-sign candidate recall and throughput against both exact cosine and
+  RaBitQ;
 - sensitivity to raw bundle magnitude and semantic weight;
 - the cost of exact reranking 10,000-dimensional candidates;
 - index, artifact, cache, and working-memory bytes;
