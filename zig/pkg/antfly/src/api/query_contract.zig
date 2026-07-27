@@ -2125,8 +2125,9 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
 }
 
 pub fn queryExecutionDeadlineNsFromBody(alloc: std.mem.Allocator, body: []const u8) !?u64 {
+    const started_ns = platform_time.monotonicNs();
     const timeout_ms = (try parseQueryTimeoutMs(alloc, body)) orelse return null;
-    return platform_time.monotonicNs() +| timeout_ms *| std.time.ns_per_ms;
+    return started_ns +| timeout_ms *| std.time.ns_per_ms;
 }
 
 fn ensureQueryDeadline(deadline_ns: ?u64) !void {
@@ -2134,6 +2135,23 @@ fn ensureQueryDeadline(deadline_ns: ?u64) !void {
         if (platform_time.monotonicNs() >= deadline) return error.Timeout;
     }
 }
+
+const QueryDeadlinePoller = struct {
+    deadline_ns: ?u64,
+    work_until_check: u8 = 1,
+
+    fn poll(self: *@This()) !void {
+        self.work_until_check -|= 1;
+        if (self.work_until_check != 0) return;
+        self.work_until_check = 64;
+        try ensureQueryDeadline(self.deadline_ns);
+    }
+
+    fn check(self: *@This()) !void {
+        self.work_until_check = 64;
+        try ensureQueryDeadline(self.deadline_ns);
+    }
+};
 
 pub fn parseQueryRequest(
     alloc: std.mem.Allocator,
@@ -2264,12 +2282,18 @@ pub fn parseQueryRequestWithDeadline(
     req.exclusion_query_json = normalized_query.exclusion_query_json;
     normalized_query.exclusion_query_json = "";
     try parseInternalFilterQueryJsonAlloc(alloc, effective_body, &req);
-    req.doc_filter_bindings = try parsePublicDocFilterBindingsAlloc(alloc, effective_body, req.limit);
+    req.doc_filter_bindings = try parsePublicDocFilterBindingsAlloc(
+        alloc,
+        effective_body,
+        req.limit,
+        execution_deadline_ns,
+    );
     try validatePublicDocFilterRootRefsAlloc(
         alloc,
         req.doc_filter_bindings,
         req.filter_query_json,
         req.exclusion_query_json,
+        execution_deadline_ns,
     );
     try ensureQueryDeadline(execution_deadline_ns);
 
@@ -8935,13 +8959,18 @@ fn parsePublicDocFilterBindingsAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
     limit: u32,
+    deadline_ns: ?u64,
 ) ![]const db_mod.types.NamedDocFilterBinding {
-    if (!(try queryBodyHasPublicDocFilterBindings(alloc, body))) return &.{};
+    if (std.mem.indexOf(u8, body, "\"with\"") == null) return &.{};
 
+    var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns };
+    try deadline.check();
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
+    try deadline.check();
     if (parsed.value != .object) return error.InvalidQueryRequest;
-    try validatePublicQueryTraversalBudgetAlloc(alloc, parsed.value);
+    try validatePublicQueryTraversalBudgetWithDeadlineAlloc(alloc, parsed.value, deadline_ns);
+    try deadline.check();
     const with_value = parsed.value.object.get("with") orelse return &.{};
     if (with_value != .object) return error.InvalidQueryRequest;
 
@@ -8956,6 +8985,7 @@ fn parsePublicDocFilterBindingsAlloc(
     try out.ensureTotalCapacity(alloc, with_value.object.count());
     var it = with_value.object.iterator();
     while (it.next()) |entry| {
+        try deadline.poll();
         if (entry.key_ptr.*.len == 0) return error.InvalidQueryRequest;
 
         var clauses = std.ArrayListUnmanaged([]u8).empty;
@@ -8963,6 +8993,7 @@ fn parsePublicDocFilterBindingsAlloc(
         try appendPublicFilterClausesAlloc(alloc, &clauses, entry.value_ptr.*, limit);
         var filter_query_json = try buildStructuredFilterClausesJsonAlloc(alloc, clauses.items, .all);
         errdefer if (filter_query_json.len > 0) alloc.free(filter_query_json);
+        try deadline.check();
         if (filter_query_json.len == 0) return error.InvalidQueryRequest;
         var name = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer if (name.len > 0) alloc.free(name);
@@ -8977,10 +9008,14 @@ fn parsePublicDocFilterBindingsAlloc(
     const order = try sortPublicDocFilterBindingsByDependenciesAlloc(
         alloc,
         out.items,
+        deadline_ns,
     );
     defer alloc.free(order);
+    try deadline.check();
     const sorted = try alloc.alloc(db_mod.types.NamedDocFilterBinding, out.items.len);
+    errdefer alloc.free(sorted);
     for (order, 0..) |source_index, target_index| {
+        try deadline.poll();
         sorted[target_index] = out.items[source_index];
     }
     out.deinit(alloc);
@@ -8994,7 +9029,24 @@ fn collectPublicDocFilterRefs(
     by_name: *const std.StringHashMapUnmanaged(usize),
     dependencies: ?*std.AutoHashMapUnmanaged(usize, void),
 ) !void {
+    return collectPublicDocFilterRefsWithDeadline(
+        alloc,
+        value,
+        by_name,
+        dependencies,
+        null,
+    );
+}
+
+fn collectPublicDocFilterRefsWithDeadline(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    by_name: *const std.StringHashMapUnmanaged(usize),
+    dependencies: ?*std.AutoHashMapUnmanaged(usize, void),
+    deadline_ns: ?u64,
+) !void {
     var remaining_nodes: usize = public_query_max_tree_nodes;
+    var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns };
     return collectPublicDocFilterRefsBounded(
         alloc,
         value,
@@ -9002,6 +9054,7 @@ fn collectPublicDocFilterRefs(
         dependencies,
         0,
         &remaining_nodes,
+        &deadline,
     );
 }
 
@@ -9012,7 +9065,9 @@ fn collectPublicDocFilterRefsBounded(
     dependencies: ?*std.AutoHashMapUnmanaged(usize, void),
     depth: usize,
     remaining_nodes: *usize,
+    deadline: *QueryDeadlinePoller,
 ) !void {
+    try deadline.poll();
     if (depth > public_query_max_tree_depth or
         remaining_nodes.* == 0 or
         value != .object or
@@ -9045,6 +9100,7 @@ fn collectPublicDocFilterRefsBounded(
                     dependencies,
                     depth + 1,
                     remaining_nodes,
+                    deadline,
                 );
             }
             return;
@@ -9065,6 +9121,7 @@ fn collectPublicDocFilterRefsBounded(
                         dependencies,
                         depth + 1,
                         remaining_nodes,
+                        deadline,
                     );
                 }
             }
@@ -9075,10 +9132,14 @@ fn collectPublicDocFilterRefsBounded(
 fn sortPublicDocFilterBindingsByDependenciesAlloc(
     alloc: std.mem.Allocator,
     bindings: []const db_mod.types.NamedDocFilterBinding,
+    deadline_ns: ?u64,
 ) ![]usize {
+    var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns };
+    try deadline.check();
     var by_name = std.StringHashMapUnmanaged(usize).empty;
     defer by_name.deinit(alloc);
     for (bindings, 0..) |binding, index| {
+        try deadline.poll();
         const result = try by_name.getOrPut(alloc, binding.name);
         if (result.found_existing) return error.InvalidQueryRequest;
         result.value_ptr.* = index;
@@ -9099,6 +9160,7 @@ fn sortPublicDocFilterBindingsByDependenciesAlloc(
     @memset(indegrees, 0);
 
     for (bindings, 0..) |binding, binding_index| {
+        try deadline.poll();
         var parsed = std.json.parseFromSlice(
             std.json.Value,
             alloc,
@@ -9109,17 +9171,20 @@ fn sortPublicDocFilterBindingsByDependenciesAlloc(
             else => return error.InvalidQueryRequest,
         };
         defer parsed.deinit();
+        try deadline.check();
 
         var dependencies = std.AutoHashMapUnmanaged(usize, void).empty;
         defer dependencies.deinit(alloc);
-        try collectPublicDocFilterRefs(
+        try collectPublicDocFilterRefsWithDeadline(
             alloc,
             parsed.value,
             &by_name,
             &dependencies,
+            deadline_ns,
         );
         var dependency_it = dependencies.keyIterator();
         while (dependency_it.next()) |dependency_index| {
+            try deadline.poll();
             try dependents[dependency_index.*].append(alloc, binding_index);
             indegrees[binding_index] += 1;
         }
@@ -9130,12 +9195,14 @@ fn sortPublicDocFilterBindingsByDependenciesAlloc(
     var queue = std.ArrayListUnmanaged(usize).empty;
     defer queue.deinit(alloc);
     for (indegrees, 0..) |indegree, index| {
+        try deadline.poll();
         if (indegree == 0) try queue.append(alloc, index);
     }
 
     var read_index: usize = 0;
     var order_len: usize = 0;
     while (read_index < queue.items.len) : (read_index += 1) {
+        try deadline.poll();
         const dependency_index = queue.items[read_index];
         order[order_len] = dependency_index;
         order_len += 1;
@@ -9155,10 +9222,14 @@ fn validatePublicDocFilterRootRefsAlloc(
     bindings: []const db_mod.types.NamedDocFilterBinding,
     filter_query_json: []const u8,
     exclusion_query_json: []const u8,
+    deadline_ns: ?u64,
 ) !void {
+    var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns };
+    try deadline.check();
     var by_name = std.StringHashMapUnmanaged(usize).empty;
     defer by_name.deinit(alloc);
     for (bindings, 0..) |binding, index| {
+        try deadline.poll();
         try by_name.put(alloc, binding.name, index);
     }
     for ([_][]const u8{ filter_query_json, exclusion_query_json }) |encoded| {
@@ -9173,7 +9244,14 @@ fn validatePublicDocFilterRootRefsAlloc(
             else => return error.InvalidQueryRequest,
         };
         defer parsed.deinit();
-        try collectPublicDocFilterRefs(alloc, parsed.value, &by_name, null);
+        try deadline.check();
+        try collectPublicDocFilterRefsWithDeadline(
+            alloc,
+            parsed.value,
+            &by_name,
+            null,
+            deadline_ns,
+        );
     }
 }
 
@@ -9941,6 +10019,24 @@ test "api query contract expansion budget checks its absolute deadline" {
     try std.testing.expectError(error.Timeout, budget.consumeNode(0));
 }
 
+test "api query contract final binding validation observes caller deadline" {
+    try std.testing.expectError(
+        error.Timeout,
+        parsePublicDocFilterBindingsAlloc(
+            std.testing.allocator,
+            \\{
+            \\  "with": {
+            \\    "visible": {"term":{"path":"/tenant","value":"acme"}}
+            \\  },
+            \\  "filter_query": {"ref":"visible"}
+            \\}
+        ,
+            10,
+            0,
+        ),
+    );
+}
+
 test "api query contract limits binding expansion growth not input size" {
     const input_bytes = public_limits.max_request_body_bytes;
     try std.testing.expectEqual(
@@ -10295,6 +10391,7 @@ test "api query contract public parser rejects internal shard doc identity contr
     const deadline_ns = timeout_request.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
     try std.testing.expect(deadline_ns >= timeout_before_ns);
     try std.testing.expect(deadline_ns >= timeout_after_ns);
+    try std.testing.expect(deadline_ns <= timeout_before_ns + 250 * std.time.ns_per_ms);
     try std.testing.expect(deadline_ns <= timeout_after_ns + 250 * std.time.ns_per_ms);
 
     try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
@@ -12493,6 +12590,7 @@ test "api query contract maps timeout_ms to execution deadline" {
     const deadline_ns = parsed.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
     try std.testing.expect(deadline_ns >= before_ns);
     try std.testing.expect(deadline_ns >= after_ns);
+    try std.testing.expect(deadline_ns <= before_ns + 250 * std.time.ns_per_ms);
     try std.testing.expect(deadline_ns <= after_ns + 250 * std.time.ns_per_ms);
 }
 

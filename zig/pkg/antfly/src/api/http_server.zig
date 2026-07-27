@@ -2189,19 +2189,32 @@ pub const ApiHttpServer = struct {
         _ = try self.source.removeJoinShuffleLease(job_id);
     }
 
-    fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) anyerror!query_api.QueryResponse {
+    fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64) anyerror!query_api.QueryResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, .{ .domain = .internal, .value = "" });
+        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, execution_deadline_ns, .{ .domain = .internal, .value = "" });
     }
 
-    fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) anyerror![]u8 {
+    fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64) anyerror![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.executePublicTableQueryDispatch(alloc, source, table_name, body, row_filter_json);
+        return try self.executePublicTableQueryDispatchWithIdentity(
+            alloc,
+            source,
+            table_name,
+            body,
+            row_filter_json,
+            null,
+            execution_deadline_ns,
+        );
     }
 
-    fn joinCtxBuildOwnedSearchRequest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value) anyerror!query_api.OwnedQueryRequest {
+    fn joinCtxBuildOwnedSearchRequest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, execution_deadline_ns: ?u64) anyerror!query_api.OwnedQueryRequest {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.buildOwnedSearchRequestFromQueryValue(alloc, table_name, query_value);
+        return try self.buildOwnedSearchRequestFromQueryValue(
+            alloc,
+            table_name,
+            query_value,
+            execution_deadline_ns,
+        );
     }
 
     fn joinCtxEnsureForeignRegistry(ptr: *anyopaque) anyerror!*const foreign_mod.Registry {
@@ -8084,7 +8097,16 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
     ) ![]u8 {
-        return try self.executePublicTableQueryDispatchWithIdentity(alloc, source, table_name, body, row_filter_json, null, null);
+        const execution_deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(alloc, body);
+        return try self.executePublicTableQueryDispatchWithIdentity(
+            alloc,
+            source,
+            table_name,
+            body,
+            row_filter_json,
+            null,
+            execution_deadline_ns,
+        );
     }
 
     fn executePublicTableQueryDispatchWithReadinessRetry(
@@ -8141,6 +8163,7 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
     ) ![]u8 {
+        try ensureRequestDeadline(request_deadline_ns);
         if (try shouldDispatchPlainPublicSearch(alloc, body)) {
             var result = self.executePlainPublicTableQuery(
                 alloc,
@@ -8186,7 +8209,8 @@ pub const ApiHttpServer = struct {
         var contract_req = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer contract_req.deinit();
 
-        if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity) catch |err| switch (err) {
+        try ensureRequestDeadline(request_deadline_ns);
+        if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -8204,6 +8228,7 @@ pub const ApiHttpServer = struct {
             error.TableNotFound, error.NotFound => return error.NotFound,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
+            error.Timeout => return error.Timeout,
             else => {
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -8219,13 +8244,15 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
+        try ensureRequestDeadline(request_deadline_ns);
         if (join_req) |owned_join| {
             var parsed_join = owned_join;
             defer parsed_join.deinit(alloc);
             if (authenticated_identity) |identity| {
                 try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
             }
-            return distributed_join.executeSupportedJoinedPublicTableQueryRequest(self.joinContext(), &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources);
+            const join_ctx = self.joinContext().withExecutionDeadline(request_deadline_ns);
+            return distributed_join.executeSupportedJoinedPublicTableQueryRequest(join_ctx, &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources);
         }
 
         var result = self.executePlainPublicTableQuery(
@@ -8310,9 +8337,12 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
+        request_deadline_ns: ?u64,
     ) anyerror!?[]u8 {
+        try ensureRequestDeadline(request_deadline_ns);
         var parsed_request = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
+        try ensureRequestDeadline(request_deadline_ns);
         const request = &parsed_request.value;
         if (row_filter_json) |value| {
             try injectRowFilterIntoOpenApiQueryRequest(alloc, request, value);
@@ -8323,6 +8353,7 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         defer foreign_sources.deinit(alloc);
+        try ensureRequestDeadline(request_deadline_ns);
 
         const foreign_source = foreign_sources.get(table_name) orelse return null;
         try validateSupportedForeignPublicQueryRequest(request);
@@ -8342,10 +8373,11 @@ pub const ApiHttpServer = struct {
                 foreign_source,
                 parsed_join.join,
                 parsed_join.foreign_sources,
+                request_deadline_ns,
             );
         }
 
-        return try self.encodeForeignPublicTableQueryResponseAlloc(alloc, table_name, request.*, foreign_source);
+        return try self.encodeForeignPublicTableQueryResponseAlloc(alloc, table_name, request.*, foreign_source, request_deadline_ns);
     }
 
     fn encodeForeignPublicTableQueryResponseAlloc(
@@ -8354,7 +8386,9 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         request: anytype,
         foreign_source: foreign_mod.PostgresConfig,
+        request_deadline_ns: ?u64,
     ) ![]u8 {
+        try ensureRequestDeadline(request_deadline_ns);
         const registry = try self.ensureForeignRegistry();
         const started_ns = platform_time.monotonicNs();
         const limit = try foreignQueryLimit(request.limit);
@@ -8369,6 +8403,7 @@ pub const ApiHttpServer = struct {
         else
             &.{};
         defer query_api.freeAggregationRequests(alloc, aggregation_requests);
+        try ensureRequestDeadline(request_deadline_ns);
 
         const raw_filter_query_json = if (request.filter_query) |query|
             try stringifyJsonValueAlloc(alloc, query)
@@ -8394,13 +8429,16 @@ pub const ApiHttpServer = struct {
             .order_by = foreign_order_by,
         });
         defer params.deinit(alloc);
+        try ensureRequestDeadline(request_deadline_ns);
 
         const source_config = try foreign_source.toSourceConfig(alloc);
         var foreign_query_source = try registry.create(alloc, source_config);
         defer foreign_query_source.deinit(alloc);
+        try ensureRequestDeadline(request_deadline_ns);
 
         var query_result = try foreign_query_source.query(alloc, params);
         defer query_result.deinit(alloc);
+        try ensureRequestDeadline(request_deadline_ns);
         const aggregation_results: []db_mod.aggregations.SearchAggregationResult = if (aggregation_requests.len > 0) blk: {
             var aggregate_params = try foreign_sources_api.buildPostgresAggregateParamsAlloc(
                 alloc,
@@ -8414,8 +8452,13 @@ pub const ApiHttpServer = struct {
                 else => return err,
             };
             defer aggregate_result.deinit(alloc);
+            try ensureRequestDeadline(request_deadline_ns);
             break :blk try foreign_sources_api.foreignAggregateResultsToSearchResultsAlloc(alloc, aggregation_requests, aggregate_result);
         } else @constCast(@as([]const db_mod.aggregations.SearchAggregationResult, &.{}));
+        var response_meta: query_api.QueryResponseMeta = .{
+            .aggregation_results = aggregation_results,
+        };
+        defer response_meta.deinit(alloc);
 
         const result_hits = if (request.count == true)
             try alloc.alloc(db_mod.types.SearchHit, 0)
@@ -8427,6 +8470,7 @@ pub const ApiHttpServer = struct {
             .total_hits = @intCast(@min(query_result.total, std.math.maxInt(u32))),
         };
         defer result.deinit();
+        try ensureRequestDeadline(request_deadline_ns);
 
         const response_req: db_mod.types.SearchRequest = .{
             .count_only = request.count == true,
@@ -8434,11 +8478,7 @@ pub const ApiHttpServer = struct {
             .aggregations_json = if (aggregations_json) |json| try alloc.dupe(u8, json) else &.{},
         };
         defer if (response_req.aggregations_json.len > 0) alloc.free(response_req.aggregations_json);
-        var response_meta: query_api.QueryResponseMeta = .{
-            .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - started_ns, std.time.ns_per_ms)),
-            .aggregation_results = aggregation_results,
-        };
-        defer response_meta.deinit(alloc);
+        response_meta.took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - started_ns, std.time.ns_per_ms));
 
         var response = try query_api.encodeQueryResponses(alloc, table_name, .{
             .count_only = response_req.count_only,
@@ -8448,7 +8488,11 @@ pub const ApiHttpServer = struct {
             .aggregations_json = response_req.aggregations_json,
         }, response_meta, result);
         defer response.deinit(alloc);
-        return try alloc.dupe(u8, response.json);
+        try ensureRequestDeadline(request_deadline_ns);
+        const response_json = try alloc.dupe(u8, response.json);
+        errdefer alloc.free(response_json);
+        try ensureRequestDeadline(request_deadline_ns);
+        return response_json;
     }
 
     fn executeSupportedJoinedForeignPublicTableQueryRequest(
@@ -8461,9 +8505,12 @@ pub const ApiHttpServer = struct {
         foreign_source: foreign_mod.PostgresConfig,
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
+        request_deadline_ns: ?u64,
     ) anyerror![]u8 {
+        try ensureRequestDeadline(request_deadline_ns);
         var contract_request = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer contract_request.deinit();
+        try ensureRequestDeadline(request_deadline_ns);
         const requested_left_fields = contract_request.value.fields orelse &.{};
         if (contract_request.value.count == true) return error.InvalidQueryRequest;
         const rewrite = try distributed_join.rewriteJoinedBaseQueryBodyAlloc(alloc, contract_request.value, join.left_field);
@@ -8476,15 +8523,21 @@ pub const ApiHttpServer = struct {
         if (row_filter_json) |value| {
             try injectRowFilterIntoOpenApiQueryRequest(alloc, &primary_request.value, value);
         }
-        const primary_json = try self.encodeForeignPublicTableQueryResponseAlloc(alloc, table_name, primary_request.value, foreign_source);
+        const primary_json = try self.encodeForeignPublicTableQueryResponseAlloc(alloc, table_name, primary_request.value, foreign_source, request_deadline_ns);
         defer alloc.free(primary_json);
 
         var owned_response = try parseOwnedJsonValueAlloc(alloc, primary_json);
         defer ApiHttpServer.deinitJsonValue(alloc, &owned_response);
         const hits_ptr = try distributed_join.queryHitsArrayPtr(&owned_response);
-        if (hits_ptr.items.len == 0) return try alloc.dupe(u8, primary_json);
+        if (hits_ptr.items.len == 0) {
+            const empty_response = try alloc.dupe(u8, primary_json);
+            errdefer alloc.free(empty_response);
+            try ensureRequestDeadline(request_deadline_ns);
+            return empty_response;
+        }
 
-        const ctx = self.joinContext();
+        try ensureRequestDeadline(request_deadline_ns);
+        const ctx = self.joinContext().withExecutionDeadline(request_deadline_ns);
         const plan = try distributed_join.planSupportedJoinExecution(ctx, alloc, table_name, join, hits_ptr.items, foreign_sources);
         var right_result = try distributed_join.executeSupportedRightJoinQueryCoordinatorOnly(ctx, &self.join_job_store, alloc, source, join, hits_ptr.items, plan, foreign_sources);
         defer right_result.deinit(alloc);
@@ -8498,7 +8551,11 @@ pub const ApiHttpServer = struct {
             appended_left_field,
         );
         try distributed_join.maybeAttachJoinProfile(alloc, &owned_response, stats, plan, right_result.strategy_used, right_result.distributed_execution, right_result.groups_queried);
-        return try distributed_join.stringifyJsonValueAlloc(alloc, owned_response);
+        try ensureRequestDeadline(request_deadline_ns);
+        const response_json = try distributed_join.stringifyJsonValueAlloc(alloc, owned_response);
+        errdefer alloc.free(response_json);
+        try ensureRequestDeadline(request_deadline_ns);
+        return response_json;
     }
 
     fn validateSupportedForeignPublicQueryRequest(request: anytype) !void {
@@ -8722,11 +8779,19 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         query_value: std.json.Value,
+        execution_deadline_ns: ?u64,
     ) !query_api.OwnedQueryRequest {
         const query_body = try stringifyJsonValueAlloc(alloc, query_value);
         defer alloc.free(query_body);
         var semantic_resolver = self.semanticStatusResolver(.internal, "");
-        var owned = try query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, query_body);
+        semantic_resolver.query_embedding_deadline_ns = execution_deadline_ns;
+        var owned = try query_api.parsePublicQueryRequestWithDeadline(
+            alloc,
+            semantic_resolver.iface(),
+            table_name,
+            query_body,
+            execution_deadline_ns,
+        );
         errdefer owned.deinit(alloc);
         try self.maybeRouteQueryToReadSchema(table_name, &owned.req);
         try self.validatePublicQuerySortCapabilities(table_name, owned.req);
@@ -11990,6 +12055,10 @@ fn sleepNs(duration_ns: u64) void {
 fn retryDeadlineExpired(deadline_ns: ?u64, now_ns: u64) bool {
     const deadline = deadline_ns orelse return false;
     return now_ns >= deadline;
+}
+
+fn ensureRequestDeadline(deadline_ns: ?u64) !void {
+    if (retryDeadlineExpired(deadline_ns, platform_time.monotonicNs())) return error.Timeout;
 }
 
 fn boundedRetrySleepNs(
@@ -34471,7 +34540,13 @@ test "api http server executes direct foreign table query through registry" {
         \\{"fields":["name"],"limit":1,"offset":2,"order_by":[{"field":"name"}],"filter_query":{"term":"active","field":"status"},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"${secret:pg_dsn}","postgres_table":"customers","columns":[{"name":"status","type":"text"}]}}}
     ;
 
-    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null)).?;
+    try std.testing.expectError(
+        error.Timeout,
+        server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, 0),
+    );
+    try std.testing.expect(DummyForeign.last_dsn == null);
+
+    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
@@ -34560,7 +34635,7 @@ test "api http server executes direct foreign table aggregations through registr
         \\{"fields":["name"],"aggregations":{"version_stats":{"type":"stats","field":"version"},"name_terms":{"type":"terms","field":"name","size":5}},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"postgres://db","postgres_table":"customers","columns":[{"name":"version","type":"bigint"},{"name":"name","type":"text"}]}}}
     ;
 
-    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null)).?;
+    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
