@@ -238,19 +238,25 @@ fn estimateGpuHostedResidentTensorBytes(tensor: *const Tensor, force_f32: bool) 
 }
 
 pub fn estimateNativeWeightBytes(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest) !u64 {
-    if (mf.gguf_path) |path| {
-        var total = try c_file.fileSize(allocator, path);
-        if (mf.gliner_head_gguf_path) |head_path| {
-            total += try c_file.fileSize(allocator, head_path);
-        }
-        if (mf.gliner_head_safetensors_path) |head_path| {
-            total += try c_file.fileSize(allocator, head_path);
-        }
-        return total;
-    }
-    if (mf.safetensors_index_path) |path| return shardedSafetensorsTotalBytes(allocator, path);
-    if (mf.safetensors_path) |path| return c_file.fileSize(allocator, path);
-    return 0;
+    return switch (mf.nativeWeightArtifactKind() orelse return 0) {
+        .gguf => blk: {
+            var total = try c_file.fileSize(allocator, mf.gguf_path.?);
+            if (mf.gliner_head_gguf_path) |head_path| {
+                total = std.math.add(u64, total, try c_file.fileSize(allocator, head_path)) catch
+                    return error.ResourceLimitExceeded;
+            }
+            if (mf.gliner_head_safetensors_path) |head_path| {
+                total = std.math.add(u64, total, try c_file.fileSize(allocator, head_path)) catch
+                    return error.ResourceLimitExceeded;
+            }
+            break :blk total;
+        },
+        .safetensors => c_file.fileSize(allocator, mf.safetensors_path.?),
+        .sharded_safetensors => shardedSafetensorsTotalBytes(
+            allocator,
+            mf.safetensors_index_path.?,
+        ),
+    };
 }
 
 /// Keep backend-specific materialization policy behind the session factory.

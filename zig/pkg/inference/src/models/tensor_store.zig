@@ -1084,19 +1084,14 @@ pub fn openFromManifest(allocator: std.mem.Allocator, manifest: manifest_mod.Mod
         const store = try CompositeGlinerStore.initAbsolute(allocator, manifest.gguf_path.?, head_path, manifest.gliner_head_gguf_path != null);
         return store.tensorStore();
     }
-    if (manifest.safetensors_path) |path| {
-        const store = try SafetensorsStore.initAbsolute(allocator, path);
-        return store.tensorStore();
-    }
-    if (manifest.safetensors_index_path) |path| {
-        const store = try ShardedSafetensorsStore.initAbsolute(allocator, path);
-        return store.tensorStore();
-    }
-    if (manifest.gguf_path) |path| {
-        const store = try GgufStore.initAbsolute(allocator, path);
-        return store.tensorStore();
-    }
-    return error.NoTensorStoreFound;
+    return switch (manifest.nativeWeightArtifactKind() orelse return error.NoTensorStoreFound) {
+        .gguf => (try GgufStore.initAbsolute(allocator, manifest.gguf_path.?)).tensorStore(),
+        .safetensors => (try SafetensorsStore.initAbsolute(allocator, manifest.safetensors_path.?)).tensorStore(),
+        .sharded_safetensors => (try ShardedSafetensorsStore.initAbsolute(
+            allocator,
+            manifest.safetensors_index_path.?,
+        )).tensorStore(),
+    };
 }
 
 test "open sharded safetensors tensor store from manifest" {
@@ -1274,7 +1269,13 @@ test "open gguf tensor store from manifest" {
     defer allocator.free(path);
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = data.items });
 
-    var manifest = manifest_mod.ModelManifest{ .allocator = allocator, .gguf_path = try allocator.dupe(u8, path) };
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .gguf_path = try allocator.dupe(u8, path),
+        // A directory may contain exports in multiple formats. The centralized
+        // route must keep runtime loading aligned with compatibility/admission.
+        .safetensors_path = try allocator.dupe(u8, "unused-model.safetensors"),
+    };
     defer manifest.deinit();
 
     const store = try openFromManifest(allocator, manifest);

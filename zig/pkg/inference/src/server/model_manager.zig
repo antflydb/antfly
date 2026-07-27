@@ -25,6 +25,7 @@ const backends = @import("../backends/backends.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const model_compatibility = @import("../models/compatibility.zig");
+const safetensors_mod = @import("../models/safetensors.zig");
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
@@ -85,7 +86,7 @@ fn nativeBackendsAvailable() bool {
 }
 
 fn manifestHasNativeAssets(man: manifest_mod.ModelManifest) bool {
-    return man.gguf_path != null or man.safetensors_path != null or man.safetensors_index_path != null;
+    return man.nativeWeightArtifactKind() != null;
 }
 
 const ArtifactCandidateKind = enum {
@@ -101,8 +102,11 @@ fn artifactCandidateForBackend(
 ) ?ArtifactCandidateKind {
     if (backend == .pjrt) return null;
     if (backend == .onnx) return if (man.onnx_path != null) .onnx else null;
-    if (manifestHasNativeAssets(man)) {
-        return if (man.gguf_path != null) .gguf else .safetensors;
+    if (man.nativeWeightArtifactKind()) |artifact| {
+        return switch (artifact) {
+            .gguf => .gguf,
+            .safetensors, .sharded_safetensors => .safetensors,
+        };
     }
     if (man.onnx_path != null) return .onnx;
     if (man.visual_model_path != null or
@@ -189,11 +193,24 @@ pub fn compatibilitySummaryForBackend(
             }
         }
     }
+    if (candidate == .safetensors) {
+        safetensors_mod.validateArtifactSet(
+            allocator,
+            man.safetensors_path,
+            man.safetensors_index_path,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return .{
+                .level = .incompatible,
+                .code = .artifact_unreadable,
+                .message = "safetensors file, index, or referenced shard is invalid or unreadable",
+            };
+        };
+    }
 
-    // Every ONNX graph that this bundle can load participates in the policy
-    // decision, not only the primary text graph. This prevents a compatible
-    // primary graph from admitting an invalid vision/audio/projection graph
-    // that would be loaded lazily after the request starts.
+    // Validate only ONNX graphs reachable from the selected artifact route.
+    // Native GGUF/safetensors routes can still lazily load vision/audio and
+    // projection components, but never consume the optional primary ONNX graph.
     const onnx_paths = [_]?[]const u8{
         man.onnx_path,
         man.visual_model_path,
@@ -202,11 +219,12 @@ pub fn compatibilitySummaryForBackend(
         man.visual_projection_path,
         man.audio_projection_path,
     };
-    for (onnx_paths, 0..) |maybe_path, path_index| {
+    const first_onnx_path: usize = if (candidate == .onnx) 0 else 1;
+    for (onnx_paths[first_onnx_path..], first_onnx_path..) |maybe_path, path_index| {
         const path = maybe_path orelse continue;
         if (!std.mem.endsWith(u8, path, ".onnx")) continue;
         var duplicate = false;
-        for (onnx_paths[0..path_index]) |previous| {
+        for (onnx_paths[first_onnx_path..path_index]) |previous| {
             if (previous) |existing| {
                 if (std.mem.eql(u8, existing, path)) {
                     duplicate = true;
@@ -3531,6 +3549,80 @@ test "hybrid artifact candidates are isolated by backend" {
         ArtifactCandidateKind.gguf,
         artifactCandidateForBackend(hybrid, .metal).?,
     );
+}
+
+test "native compatibility ignores an unrelated primary ONNX graph" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeTinyHeadSafetensorsForModelManagerTest(
+        dir.dir,
+        allocator,
+        "model.safetensors",
+    );
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "stale.onnx",
+        .data = "not an ONNX model",
+    });
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "llama"),
+        .safetensors_path = try std.fs.path.join(allocator, &.{ root, "model.safetensors" }),
+        .onnx_path = try std.fs.path.join(allocator, &.{ root, "stale.onnx" }),
+    };
+    defer man.deinit();
+
+    const summary = (try compatibilitySummaryForBackend(
+        allocator,
+        root,
+        &man,
+        .native,
+    )).?;
+    try std.testing.expectEqual(model_compatibility.Level.compatible, summary.level);
+}
+
+test "safetensors compatibility rejects a missing referenced shard" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model.safetensors.index.json",
+        .data =
+        \\{"weight_map":{"model.embed_tokens.weight":"missing-00001-of-00001.safetensors"}}
+        ,
+    });
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "llama"),
+        .safetensors_index_path = try std.fs.path.join(
+            allocator,
+            &.{ root, "model.safetensors.index.json" },
+        ),
+    };
+    defer man.deinit();
+
+    const summary = (try compatibilitySummaryForBackend(
+        allocator,
+        root,
+        &man,
+        .native,
+    )).?;
+    try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
+    try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
 }
 
 test "compatible artifact candidate wins aggregate compatibility" {

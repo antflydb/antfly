@@ -108,6 +108,16 @@ pub const NativeArchHint = enum {
     layoutlmv3,
 };
 
+/// Primary native weight source selected consistently by compatibility,
+/// admission, and runtime loading. GGUF is preferred when a model directory
+/// contains multiple export formats; the remaining ordering matches the
+/// canonical single-file and sharded safetensors names.
+pub const NativeWeightArtifactKind = enum {
+    gguf,
+    safetensors,
+    sharded_safetensors,
+};
+
 /// SafeTensors file candidates in priority order.
 pub const safetensors_candidates = [_][]const u8{
     "model.safetensors",
@@ -285,6 +295,13 @@ pub const ModelManifest = struct {
             if (std.mem.eql(u8, candidate, task)) return true;
         }
         return false;
+    }
+
+    pub fn nativeWeightArtifactKind(self: *const ModelManifest) ?NativeWeightArtifactKind {
+        if (self.gguf_path != null) return .gguf;
+        if (self.safetensors_path != null) return .safetensors;
+        if (self.safetensors_index_path != null) return .sharded_safetensors;
+        return null;
     }
 
     pub fn prefersGenerationEncodingForLateInteraction(self: *const ModelManifest) bool {
@@ -1892,6 +1909,28 @@ fn parseTokenizerJsonSpecialTokens(manifest: *ModelManifest, allocator: std.mem.
             }
         }
     }
+}
+
+test "native weight artifact selection has one deterministic precedence" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    manifest.safetensors_index_path = try allocator.dupe(u8, "model.safetensors.index.json");
+    try std.testing.expectEqual(
+        NativeWeightArtifactKind.sharded_safetensors,
+        manifest.nativeWeightArtifactKind().?,
+    );
+    manifest.safetensors_path = try allocator.dupe(u8, "model.safetensors");
+    try std.testing.expectEqual(
+        NativeWeightArtifactKind.safetensors,
+        manifest.nativeWeightArtifactKind().?,
+    );
+    manifest.gguf_path = try allocator.dupe(u8, "model.gguf");
+    try std.testing.expectEqual(
+        NativeWeightArtifactKind.gguf,
+        manifest.nativeWeightArtifactKind().?,
+    );
 }
 
 test "inferModelTypeFromPath detects classifier directory" {

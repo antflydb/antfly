@@ -38,7 +38,7 @@ pub const TensorMeta = struct {
 pub const Header = struct {
     allocator: std.mem.Allocator,
     tensors: std.StringHashMapUnmanaged(TensorMeta),
-    metadata: ?std.json.Value,
+    metadata: std.StringHashMapUnmanaged([]const u8),
 
     pub fn deinit(self: *Header) void {
         var it = self.tensors.iterator();
@@ -47,6 +47,12 @@ pub const Header = struct {
             self.allocator.free(entry.value_ptr.shape);
         }
         self.tensors.deinit(self.allocator);
+        var metadata_it = self.metadata.iterator();
+        while (metadata_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.metadata.deinit(self.allocator);
     }
 
     pub fn tensorNames(self: *const Header, allocator: std.mem.Allocator) ![][]const u8 {
@@ -79,7 +85,23 @@ pub fn parseHeader(allocator: std.mem.Allocator, file_bytes: []const u8) !struct
     if (root != .object) return error.InvalidHeader;
 
     var tensors = std.StringHashMapUnmanaged(TensorMeta){};
-    var meta_value: ?std.json.Value = null;
+    errdefer {
+        var tensor_it = tensors.iterator();
+        while (tensor_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.shape);
+        }
+        tensors.deinit(allocator);
+    }
+    var metadata = std.StringHashMapUnmanaged([]const u8){};
+    errdefer {
+        var metadata_it = metadata.iterator();
+        while (metadata_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        metadata.deinit(allocator);
+    }
 
     var obj_it = root.object.iterator();
     while (obj_it.next()) |entry| {
@@ -87,7 +109,19 @@ pub fn parseHeader(allocator: std.mem.Allocator, file_bytes: []const u8) !struct
         const val = entry.value_ptr.*;
 
         if (std.mem.eql(u8, key, "__metadata__")) {
-            meta_value = val;
+            if (val != .object) return error.InvalidMetadata;
+            var metadata_it = val.object.iterator();
+            while (metadata_it.next()) |metadata_entry| {
+                const metadata_value = switch (metadata_entry.value_ptr.*) {
+                    .string => |value| value,
+                    else => return error.InvalidMetadata,
+                };
+                const owned_metadata_key = try allocator.dupe(u8, metadata_entry.key_ptr.*);
+                errdefer allocator.free(owned_metadata_key);
+                const owned_metadata_value = try allocator.dupe(u8, metadata_value);
+                errdefer allocator.free(owned_metadata_value);
+                try metadata.put(allocator, owned_metadata_key, owned_metadata_value);
+            }
             continue;
         }
 
@@ -95,11 +129,14 @@ pub fn parseHeader(allocator: std.mem.Allocator, file_bytes: []const u8) !struct
 
         const dtype = parseDType(jsonString(val.object.get("dtype"))) orelse return error.UnsupportedDType;
         const shape = try parseShape(allocator, val.object.get("shape") orelse return error.MissingShape);
+        errdefer allocator.free(shape);
         const offsets = val.object.get("data_offsets") orelse return error.MissingOffsets;
+        if (offsets != .array or offsets.array.items.len != 2) return error.InvalidOffset;
         const data_start = jsonU64(offsets.array.items[0]) orelse return error.InvalidOffset;
         const data_end = jsonU64(offsets.array.items[1]) orelse return error.InvalidOffset;
 
         const owned_key = try allocator.dupe(u8, key);
+        errdefer allocator.free(owned_key);
         try tensors.put(allocator, owned_key, .{
             .dtype = dtype,
             .shape = shape,
@@ -112,7 +149,7 @@ pub fn parseHeader(allocator: std.mem.Allocator, file_bytes: []const u8) !struct
         .header = .{
             .allocator = allocator,
             .tensors = tensors,
-            .metadata = meta_value,
+            .metadata = metadata,
         },
         .data_offset = total_header,
     };
@@ -128,7 +165,7 @@ fn jsonString(val: ?std.json.Value) ?[]const u8 {
 
 fn jsonU64(val: std.json.Value) ?u64 {
     return switch (val) {
-        .integer => |i| @intCast(i),
+        .integer => |i| if (i >= 0) @intCast(i) else null,
         else => null,
     };
 }
@@ -137,9 +174,10 @@ fn parseShape(allocator: std.mem.Allocator, val: std.json.Value) ![]const i64 {
     if (val != .array) return error.InvalidShape;
     const items = val.array.items;
     const shape = try allocator.alloc(i64, items.len);
+    errdefer allocator.free(shape);
     for (items, 0..) |item, i| {
         shape[i] = switch (item) {
-            .integer => |v| v,
+            .integer => |v| if (v >= 0) v else return error.InvalidShape,
             else => return error.InvalidShape,
         };
     }
@@ -282,13 +320,23 @@ pub const ShardedIndex = struct {
         if (wm != .object) return error.InvalidWeightMap;
 
         var weight_map = std.StringHashMapUnmanaged([]const u8){};
+        errdefer {
+            var cleanup_it = weight_map.iterator();
+            while (cleanup_it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
+            weight_map.deinit(allocator);
+        }
         var it = wm.object.iterator();
         while (it.next()) |entry| {
             const tensor_name = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(tensor_name);
             const filename = switch (entry.value_ptr.*) {
                 .string => |s| try allocator.dupe(u8, s),
                 else => return error.InvalidWeightMap,
             };
+            errdefer allocator.free(filename);
             try weight_map.put(allocator, tensor_name, filename);
         }
 
@@ -305,6 +353,137 @@ pub const ShardedIndex = struct {
     }
 };
 
+const TensorInterval = struct {
+    start: u64,
+    end: u64,
+};
+
+fn tensorIntervalLessThan(_: void, lhs: TensorInterval, rhs: TensorInterval) bool {
+    return lhs.start < rhs.start or (lhs.start == rhs.start and lhs.end < rhs.end);
+}
+
+/// Validate the complete structural contract of one safetensors file without
+/// materializing tensor payloads. The file is mmap'd, so only the bounded JSON
+/// header and filesystem pages needed by the kernel are touched.
+fn validateReader(allocator: std.mem.Allocator, reader: *const MMapReader) !void {
+    if (reader.header.tensors.count() == 0) return error.EmptyTensorSet;
+    const data_bytes: u64 = @intCast(reader.file_bytes.len - @as(usize, @intCast(reader.data_offset)));
+    const intervals = try allocator.alloc(TensorInterval, reader.header.tensors.count());
+    defer allocator.free(intervals);
+
+    var interval_index: usize = 0;
+    var tensor_it = reader.header.tensors.iterator();
+    while (tensor_it.next()) |entry| : (interval_index += 1) {
+        const tensor = entry.value_ptr.*;
+        if (tensor.data_start > tensor.data_end or tensor.data_end > data_bytes)
+            return error.DataOutOfBounds;
+
+        var element_count: usize = 1;
+        for (tensor.shape) |dim| {
+            const size = std.math.cast(usize, dim) orelse return error.InvalidShape;
+            element_count = std.math.mul(usize, element_count, size) catch
+                return error.InvalidShape;
+        }
+        const expected_bytes = std.math.mul(usize, element_count, tensor.dtype.byteSize()) catch
+            return error.InvalidTensorSize;
+        const encoded_bytes = tensor.data_end - tensor.data_start;
+        const encoded_size = std.math.cast(usize, encoded_bytes) orelse
+            return error.InvalidTensorSize;
+        if (encoded_size != expected_bytes) return error.InvalidTensorSize;
+        intervals[interval_index] = .{ .start = tensor.data_start, .end = tensor.data_end };
+    }
+
+    std.mem.sort(TensorInterval, intervals, {}, tensorIntervalLessThan);
+    var covered_end: u64 = 0;
+    for (intervals) |interval| {
+        if (interval.start != covered_end) return error.InvalidTensorLayout;
+        covered_end = interval.end;
+    }
+    if (covered_end != data_bytes) return error.InvalidTensorLayout;
+}
+
+fn validateFile(allocator: std.mem.Allocator, path: []const u8) !void {
+    var reader = try MMapReader.openFileAbsolute(allocator, path);
+    defer reader.deinit();
+    return validateReader(allocator, &reader);
+}
+
+fn validateShardPath(path: []const u8) !void {
+    if (path.len == 0 or std.fs.path.isAbsolute(path)) return error.InvalidShardPath;
+    if (std.mem.indexOfScalar(u8, path, 0) != null or
+        std.mem.indexOfScalar(u8, path, '\\') != null)
+        return error.InvalidShardPath;
+
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+            return error.InvalidShardPath;
+    }
+}
+
+/// Validate the exact safetensors route selected by the runtime. A standalone
+/// file takes precedence over an index, matching TensorStore.openFromManifest.
+/// For sharded models every unique shard is opened once, its header is checked,
+/// and every index entry must resolve to a tensor declared by that shard.
+pub fn validateArtifactSet(
+    allocator: std.mem.Allocator,
+    single_path: ?[]const u8,
+    index_path: ?[]const u8,
+) !void {
+    if (single_path) |path| return validateFile(allocator, path);
+    const path = index_path orelse return error.NoSafetensorsArtifact;
+    const index_bytes = try c_file.readFileMax(allocator, path, max_header_size);
+    defer allocator.free(index_bytes);
+    var index = try ShardedIndex.load(allocator, index_bytes);
+    defer index.deinit();
+    if (index.weight_map.count() == 0) return error.EmptyWeightMap;
+
+    const ShardPlan = struct {
+        path: []u8,
+        tensor_names: std.ArrayListUnmanaged([]const u8) = .empty,
+    };
+    var plans = std.StringHashMapUnmanaged(ShardPlan).empty;
+    defer {
+        var cleanup_it = plans.valueIterator();
+        while (cleanup_it.next()) |plan| {
+            allocator.free(plan.path);
+            plan.tensor_names.deinit(allocator);
+        }
+        plans.deinit(allocator);
+    }
+
+    const model_dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    var index_it = index.weight_map.iterator();
+    while (index_it.next()) |entry| {
+        const shard_name = entry.value_ptr.*;
+        try validateShardPath(shard_name);
+        if (plans.getPtr(shard_name)) |plan| {
+            try plan.tensor_names.append(allocator, entry.key_ptr.*);
+            continue;
+        }
+
+        const shard_path = try std.fs.path.join(allocator, &.{ model_dir, shard_name });
+        plans.put(allocator, shard_name, .{ .path = shard_path }) catch |err| {
+            allocator.free(shard_path);
+            return err;
+        };
+        try plans.getPtr(shard_name).?.tensor_names.append(allocator, entry.key_ptr.*);
+    }
+
+    var plan_it = plans.valueIterator();
+    while (plan_it.next()) |plan| {
+        var reader = try MMapReader.openFileAbsolute(allocator, plan.path);
+        defer reader.deinit();
+        try validateReader(allocator, &reader);
+        for (plan.tensor_names.items) |tensor_name| {
+            if (!reader.header.tensors.contains(tensor_name))
+                return error.IndexTensorMissingFromShard;
+        }
+    }
+}
+
 // -- Tests --
 
 test "parse header" {
@@ -312,7 +491,7 @@ test "parse header" {
 
     // Build a minimal safetensors file in memory.
     const json_str =
-        \\{"test_tensor": {"dtype": "F32", "shape": [2, 3], "data_offsets": [0, 24]}}
+        \\{"__metadata__":{"format":"pt"},"test_tensor":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]}}
     ;
     var buf: [8 + json_str.len + 24]u8 = undefined;
     std.mem.writeInt(u64, buf[0..8], json_str.len, .little);
@@ -330,7 +509,20 @@ test "parse header" {
     try std.testing.expectEqual(@as(i64, 3), meta.shape[1]);
     try std.testing.expectEqual(@as(u64, 0), meta.data_start);
     try std.testing.expectEqual(@as(u64, 24), meta.data_end);
+    try std.testing.expectEqualStrings("pt", result.header.metadata.get("format").?);
     try std.testing.expectEqual(@as(u64, 8 + json_str.len), result.data_offset);
+}
+
+test "parse header rejects negative offsets" {
+    const allocator = std.testing.allocator;
+    const json_str =
+        \\{"test_tensor":{"dtype":"F32","shape":[1],"data_offsets":[-1,3]}}
+    ;
+    var buf: [8 + json_str.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], json_str.len, .little);
+    @memcpy(buf[8..][0..json_str.len], json_str);
+    @memset(buf[8 + json_str.len ..], 0);
+    try std.testing.expectError(error.InvalidOffset, parseHeader(allocator, &buf));
 }
 
 test "read tensor from bytes" {
@@ -378,4 +570,76 @@ test "sharded index" {
 
     const shard2 = index.weight_map.get("bert.encoder.weight") orelse return error.TestFailed;
     try std.testing.expectEqualStrings("model-00002-of-00002.safetensors", shard2);
+}
+
+test "artifact validation checks shard headers and index membership" {
+    const allocator = std.testing.allocator;
+    const shard_json =
+        \\{"weight":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}
+    ;
+    var shard_bytes: [8 + shard_json.len + 8]u8 = undefined;
+    std.mem.writeInt(u64, shard_bytes[0..8], shard_json.len, .little);
+    @memcpy(shard_bytes[8..][0..shard_json.len], shard_json);
+    @memset(shard_bytes[8 + shard_json.len ..], 0);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model-00001-of-00001.safetensors",
+        .data = &shard_bytes,
+    });
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model.safetensors.index.json",
+        .data =
+        \\{"weight_map":{"weight":"model-00001-of-00001.safetensors"}}
+        ,
+    });
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+    const index_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "model.safetensors.index.json" },
+    );
+    defer allocator.free(index_path);
+    try validateArtifactSet(allocator, null, index_path);
+
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model.safetensors.index.json",
+        .data =
+        \\{"weight_map":{"other":"model-00001-of-00001.safetensors"}}
+        ,
+    });
+    try std.testing.expectError(
+        error.IndexTensorMissingFromShard,
+        validateArtifactSet(allocator, null, index_path),
+    );
+}
+
+test "artifact validation rejects shard path traversal" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model.safetensors.index.json",
+        .data =
+        \\{"weight_map":{"weight":"../outside.safetensors"}}
+        ,
+    });
+    const index_path = try std.fs.path.join(
+        allocator,
+        &.{
+            ".zig-cache",
+            "tmp",
+            dir.sub_path[0..],
+            "model.safetensors.index.json",
+        },
+    );
+    defer allocator.free(index_path);
+    try std.testing.expectError(
+        error.InvalidShardPath,
+        validateArtifactSet(allocator, null, index_path),
+    );
 }

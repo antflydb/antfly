@@ -4296,6 +4296,32 @@ pub const Node = struct {
         @"error": ?api.GenerateBatchError = null,
     };
 
+    fn applyBatchGenerateTaskResult(
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        task_result: BatchGenerateTaskResult,
+        result: *api.GenerateBatchResultItem,
+    ) !void {
+        if (task_result.@"error") |batch_err| {
+            result.@"error" = batch_err;
+        } else if (task_result.text) |text| {
+            result.response = try buildGenerateResponseValue(
+                allocator,
+                model_name,
+                text,
+                task_result.finish_reason,
+                task_result.prompt_tokens,
+                task_result.completion_tokens,
+            );
+        } else {
+            result.@"error" = .{
+                .code = "GENERATION_FAILED",
+                .message = "missing batch generation result",
+                .retryable = true,
+            };
+        }
+    }
+
     fn batchModelLoadError(err: anyerror) api.GenerateBatchError {
         return switch (err) {
             error.UnknownModelCompatibility => .{
@@ -4365,6 +4391,54 @@ pub const Node = struct {
             self.out.completion_tokens = result.tokens_used;
         }
     };
+
+    const BatchExecutionMode = enum {
+        /// NativeCompute is cheap request state over a shared, internally
+        /// synchronized weight store. Give each item its own instance so task
+        /// allocators and RunBudget accounting remain independent.
+        isolated_parallel,
+        /// Metal/CUDA sessions own stateful command/runtime objects. Reusing
+        /// those objects serially avoids racing streams, scratch buffers, and
+        /// graph-capture state while still amortizing backend construction.
+        shared_serial,
+    };
+
+    fn batchExecutionMode(backend: runtime.kv.pool.BackendKind) BatchExecutionMode {
+        return switch (backend) {
+            .native => .isolated_parallel,
+            .metal, .cuda => .shared_serial,
+        };
+    }
+
+    const BatchAdmission = struct {
+        lease: runtime.tier.memory.AdmissionLease,
+        estimate: runtime.tier.memory.Estimate,
+    };
+
+    fn acquireBatchAdmission(
+        self: *Node,
+        limits: runtime.tier.memory.Limits,
+        run_budget: *runtime.tier.memory.RunBudget,
+        estimate: runtime.tier.memory.Estimate,
+    ) !BatchAdmission {
+        try run_budget.reserveEstimate(estimate);
+        errdefer run_budget.releaseEstimate(estimate);
+        return .{
+            .lease = try self.model_manager.acquireRunResources(limits, estimate),
+            .estimate = estimate,
+        };
+    }
+
+    fn releaseBatchAdmission(
+        run_budget: *runtime.tier.memory.RunBudget,
+        admission: *?BatchAdmission,
+    ) void {
+        if (admission.*) |*owned| {
+            owned.lease.release();
+            run_budget.releaseEstimate(owned.estimate);
+            admission.* = null;
+        }
+    }
 
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
         var parsed = (try ctx.parseJson(api.GenerateBatchRequest)) orelse
@@ -4565,21 +4639,37 @@ pub const Node = struct {
                     model.session,
                     runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
                 ));
-                var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-                const BatchAdmission = struct {
-                    lease: runtime.tier.memory.AdmissionLease,
-                    estimate: runtime.tier.memory.Estimate,
-                };
+                const execution_mode = batchExecutionMode(backend_kind);
+                var shared_run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+                const task_run_budgets = try ctx.allocator.alloc(
+                    runtime.tier.memory.RunBudget,
+                    group_indices.items.len,
+                );
+                defer ctx.allocator.free(task_run_budgets);
+                for (task_run_budgets) |*budget| {
+                    budget.* = runtime.tier.memory.RunBudget.init(budget_limits);
+                }
+                const resource_estimates = try ctx.allocator.alloc(
+                    ?runtime.tier.memory.Estimate,
+                    group_indices.items.len,
+                );
+                @memset(resource_estimates, null);
+                defer ctx.allocator.free(resource_estimates);
                 // Allocate ownership slots before acquiring capacity. Once a
                 // process-wide lease is granted, publishing it here cannot fail.
                 const admissions = try ctx.allocator.alloc(?BatchAdmission, group_indices.items.len);
                 @memset(admissions, null);
                 defer {
-                    for (admissions) |*maybe_admission| {
-                        if (maybe_admission.*) |*admission| admission.lease.release();
+                    for (admissions, 0..) |*maybe_admission, pos| {
+                        const item_run_budget = if (execution_mode == .isolated_parallel)
+                            &task_run_budgets[pos]
+                        else
+                            &shared_run_budget;
+                        releaseBatchAdmission(item_run_budget, maybe_admission);
                     }
                     ctx.allocator.free(admissions);
                 }
+                var runnable_count: usize = 0;
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
                     const admission_prefill_chunk = if (configs[pos].prefill_chunk_size > 0) configs[pos].prefill_chunk_size else 256;
@@ -4599,36 +4689,64 @@ pub const Node = struct {
                         pending[idx] = false;
                         continue;
                     };
-                    run_budget.reserveEstimate(resource_estimate) catch |err| {
-                        results[idx].@"error" = .{ .code = "MODEL_RESOURCE_LIMIT", .message = @errorName(err), .retryable = false };
-                        pending[idx] = false;
+                    resource_estimates[pos] = resource_estimate;
+                    if (execution_mode == .shared_serial) {
+                        runnable_count += 1;
                         continue;
-                    };
-                    const lease = self.model_manager.acquireRunResources(budget_limits, resource_estimate) catch |err| {
+                    }
+                    admissions[pos] = self.acquireBatchAdmission(
+                        budget_limits,
+                        &task_run_budgets[pos],
+                        resource_estimate,
+                    ) catch |err| {
                         results[idx].@"error" = .{
                             .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
                             .message = @errorName(err),
                             .retryable = err == error.ResourceTemporarilyUnavailable,
                         };
-                        run_budget.releaseEstimate(resource_estimate);
                         pending[idx] = false;
                         continue;
                     };
-                    admissions[pos] = .{
-                        .lease = lease,
-                        .estimate = resource_estimate,
+                    runnable_count += 1;
+                }
+                if (runnable_count == 0) continue;
+
+                var shared_cb: ?ops.ComputeBackend = null;
+                if (execution_mode == .shared_serial) {
+                    var provision_admitted = false;
+                    for (group_indices.items, 0..) |idx, pos| {
+                        if (!pending[idx]) continue;
+                        admissions[pos] = self.acquireBatchAdmission(
+                            budget_limits,
+                            &shared_run_budget,
+                            resource_estimates[pos].?,
+                        ) catch |err| {
+                            results[idx].@"error" = .{
+                                .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
+                                .message = @errorName(err),
+                                .retryable = err == error.ResourceTemporarilyUnavailable,
+                            };
+                            pending[idx] = false;
+                            continue;
+                        };
+                        provision_admitted = true;
+                        break;
+                    }
+                    if (!provision_admitted) continue;
+                    shared_cb = session_factory.getComputeBackendWithBudget(
+                        model.session,
+                        ctx.allocator,
+                        &shared_run_budget,
+                    ) catch |err| {
+                        for (group_indices.items) |idx| {
+                            if (!pending[idx]) continue;
+                            results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                            pending[idx] = false;
+                        }
+                        continue;
                     };
                 }
-
-                var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
-                    for (group_indices.items) |idx| {
-                        if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
-                        pending[idx] = false;
-                    }
-                    continue;
-                };
-                defer cb.deinit();
+                defer if (shared_cb) |*cb| cb.deinit();
 
                 var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
                 defer kv_manager.deinit();
@@ -4673,14 +4791,16 @@ pub const Node = struct {
                     continue;
                 };
                 defer kv_storage.deinit();
-                cb.provisionKvDeviceWriteHook(&kv_storage) catch |err| {
-                    for (group_indices.items) |idx| {
-                        if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
-                        pending[idx] = false;
-                    }
-                    continue;
-                };
+                if (shared_cb) |*cb| {
+                    cb.provisionKvDeviceWriteHook(&kv_storage) catch |err| {
+                        for (group_indices.items) |idx| {
+                            if (!pending[idx]) continue;
+                            results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                            pending[idx] = false;
+                        }
+                        continue;
+                    };
+                }
 
                 var kv_mutex: std.atomic.Mutex = .unlocked;
                 var task_arenas = try ctx.allocator.alloc(std.heap.ArenaAllocator, group_indices.items.len);
@@ -4688,6 +4808,14 @@ pub const Node = struct {
                 defer {
                     for (task_arenas) |*arena| arena.deinit();
                     ctx.allocator.free(task_arenas);
+                }
+                const task_cbs = try ctx.allocator.alloc(?ops.ComputeBackend, group_indices.items.len);
+                @memset(task_cbs, null);
+                defer {
+                    for (task_cbs) |*maybe_cb| {
+                        if (maybe_cb.*) |*cb| cb.deinit();
+                    }
+                    ctx.allocator.free(task_cbs);
                 }
                 const decode_states = try ctx.allocator.alloc(generation.NativeDecodeState, group_indices.items.len);
                 for (decode_states) |*state| state.* = generation.NativeDecodeState.initContiguous(ctx.allocator);
@@ -4722,6 +4850,38 @@ pub const Node = struct {
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
                     const task_alloc = task_arenas[pos].allocator();
+                    if (execution_mode == .shared_serial and admissions[pos] == null) {
+                        const resource_estimate = resource_estimates[pos].?;
+                        admissions[pos] = self.acquireBatchAdmission(
+                            budget_limits,
+                            &shared_run_budget,
+                            resource_estimate,
+                        ) catch |err| {
+                            results[idx].@"error" = .{
+                                .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
+                                .message = @errorName(err),
+                                .retryable = err == error.ResourceTemporarilyUnavailable,
+                            };
+                            pending[idx] = false;
+                            continue;
+                        };
+                    }
+                    if (execution_mode == .isolated_parallel) {
+                        task_cbs[pos] = session_factory.getComputeBackendWithBudget(
+                            model.session,
+                            task_alloc,
+                            &task_run_budgets[pos],
+                        ) catch |err| {
+                            releaseBatchAdmission(&task_run_budgets[pos], &admissions[pos]);
+                            results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                            pending[idx] = false;
+                            continue;
+                        };
+                    }
+                    const task_cb = if (execution_mode == .isolated_parallel)
+                        task_cbs[pos].?
+                    else
+                        shared_cb.?;
                     const queue_item_units = self.estimateGenerateQueueUnits(owned_messages[idx].messages, configs[pos].max_tokens);
                     decode_states[pos] = generation.NativeDecodeState.initPaged(task_alloc, &kv_manager, pool_id, model.shared_moe_cache);
                     decode_states[pos].kv_lock = &kv_mutex;
@@ -4732,11 +4892,11 @@ pub const Node = struct {
                             .prompt_bytes = prompt_bytes[pos],
                             .max_tokens = configs[pos].max_tokens,
                         }) catch |err| {
-                            if (admissions[pos]) |*admission| {
-                                admission.lease.release();
-                                run_budget.releaseEstimate(admission.estimate);
-                                admissions[pos] = null;
-                            }
+                            const item_run_budget = if (execution_mode == .isolated_parallel)
+                                &task_run_budgets[pos]
+                            else
+                                &shared_run_budget;
+                            releaseBatchAdmission(item_run_budget, &admissions[pos]);
                             results[idx].@"error" = .{ .code = "QUEUE_FULL", .message = @errorName(err), .retryable = true };
                             pending[idx] = false;
                             continue;
@@ -4749,7 +4909,7 @@ pub const Node = struct {
                         .pipeline = .{
                             .allocator = task_alloc,
                             .io = ctx.io,
-                            .cb = cb,
+                            .cb = task_cb,
                             .session = model.session,
                             .gpt_config = gpt_config,
                             .kv_dtype = kv_dtype,
@@ -4771,6 +4931,28 @@ pub const Node = struct {
                         .out = &task_results[pos],
                     };
                     task_ran[pos] = true;
+                    if (execution_mode == .shared_serial) {
+                        tasks[pos].run() catch {};
+                        if (model.native_generate_coordinator) |coordinator| {
+                            if (leases[pos].request_id != 0) {
+                                coordinator.release(leases[pos]);
+                                leases[pos].request_id = 0;
+                            }
+                        }
+                        releaseBatchAdmission(&shared_run_budget, &admissions[pos]);
+                        decode_states[pos].deinit();
+                        decode_states[pos] = generation.NativeDecodeState.initContiguous(ctx.allocator);
+                        try applyBatchGenerateTaskResult(
+                            response_alloc,
+                            body.requests[idx].body.model,
+                            task_results[pos],
+                            &results[idx],
+                        );
+                        pending[idx] = false;
+                        task_arenas[pos].deinit();
+                        task_arenas[pos] = std.heap.ArenaAllocator.init(ctx.allocator);
+                        continue;
+                    }
                     group.concurrent(ctx.io, BatchGenerateTask.run, .{&tasks[pos]}) catch {
                         tasks[pos].run() catch {};
                         continue;
@@ -4784,20 +4966,12 @@ pub const Node = struct {
                         pending[idx] = false;
                         continue;
                     }
-                    if (task_results[pos].@"error") |batch_err| {
-                        results[idx].@"error" = batch_err;
-                    } else if (task_results[pos].text) |text| {
-                        results[idx].response = try buildGenerateResponseValue(
-                            response_alloc,
-                            body.requests[idx].body.model,
-                            text,
-                            task_results[pos].finish_reason,
-                            task_results[pos].prompt_tokens,
-                            task_results[pos].completion_tokens,
-                        );
-                    } else {
-                        results[idx].@"error" = .{ .code = "GENERATION_FAILED", .message = "missing batch generation result", .retryable = true };
-                    }
+                    try applyBatchGenerateTaskResult(
+                        response_alloc,
+                        body.requests[idx].body.model,
+                        task_results[pos],
+                        &results[idx],
+                    );
                     pending[idx] = false;
                 }
             }
@@ -8059,6 +8233,21 @@ test "generate batch preflight rejects image content without parsing media" {
 
     const reason = Node.generateBatchUnsupportedReasonPreflight(parsed.value) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("UNSUPPORTED_MULTIMODAL", reason.code);
+}
+
+test "generate batch isolates native execution and serializes stateful GPU backends" {
+    try std.testing.expectEqual(
+        Node.BatchExecutionMode.isolated_parallel,
+        Node.batchExecutionMode(.native),
+    );
+    try std.testing.expectEqual(
+        Node.BatchExecutionMode.shared_serial,
+        Node.batchExecutionMode(.metal),
+    );
+    try std.testing.expectEqual(
+        Node.BatchExecutionMode.shared_serial,
+        Node.batchExecutionMode(.cuda),
+    );
 }
 
 test "generate batch queue units sum pending generation work" {
