@@ -9303,6 +9303,15 @@ fn validateStructuredFilterGrammar(
     _ = try pattern_filter_contract.requireSingleRoot(value);
     remaining_nodes.* -= 1;
 
+    if (value.object.get("ref")) |reference| {
+        if (value.object.count() != 1 or
+            reference != .string or
+            reference.string.len == 0)
+        {
+            return error.InvalidArgument;
+        }
+        return;
+    }
     if (value.object.get("match")) |match| {
         try validateStructuredMatchGrammar(match);
         return;
@@ -9354,7 +9363,18 @@ fn validateStructuredFilterGrammar(
         return;
     }
 
-    _ = try patternFilterValueToSearchQuery(alloc, value, .{}, null);
+    _ = patternFilterValueToSearchQuery(alloc, value, .{}, null) catch |search_err| {
+        if (search_err == error.OutOfMemory) return error.OutOfMemory;
+        // Some canonical predicates (notably typed scalar terms) cannot be
+        // lowered to an inverted-index query without a runtime schema, but
+        // are executable by the prepared stored-document matcher. Admission
+        // must accept the union of those two production execution paths.
+        _ = graph_exec.compilePatternFilter(alloc, value) catch |stored_err| {
+            if (stored_err == error.OutOfMemory) return error.OutOfMemory;
+            return search_err;
+        };
+        return;
+    };
 }
 
 fn validateStructuredFilterChildren(
@@ -10024,6 +10044,22 @@ test "structured filter grammar validates ranges without a runtime schema" {
     try validateStructuredFilterValueAlloc(alloc, valid.value);
 
     inline for ([_][]const u8{
+        \\{"term":{"path":"/published","value":true}}
+        ,
+        \\{"ref":"published"}
+        ,
+    }) |encoded| {
+        var valid_leaf = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            encoded,
+            .{},
+        );
+        defer valid_leaf.deinit();
+        try validateStructuredFilterValueAlloc(alloc, valid_leaf.value);
+    }
+
+    inline for ([_][]const u8{
         \\{"range":{"price":{}}}
         ,
         \\{"range":{"price":{"gte":null}}}
@@ -10039,6 +10075,12 @@ test "structured filter grammar validates ranges without a runtime schema" {
         \\{"bool":{"should":[{"match_all":{}}],"minimum_should_match":0,"min_should":0}}
         ,
         \\{"bool":{"should":[{"match_all":{}}],"unknown":true}}
+        ,
+        \\{"ref":""}
+        ,
+        \\{"ref":42}
+        ,
+        \\{"ref":"published","match_all":{}}
         ,
     }) |encoded| {
         var invalid = try std.json.parseFromSlice(

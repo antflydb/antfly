@@ -74,7 +74,8 @@ pub const testing = if (builtin.is_test) struct {
 
         try std.testing.expect(owned.req.full_text != null);
         try std.testing.expect(owned.req.full_text.? == .match_all);
-        try std.testing.expect(std.mem.indexOf(u8, owned.req.filter_query_json, "\"status\":\"active\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, owned.req.filter_query_json, "\"path\":\"status\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, owned.req.filter_query_json, "\"text\":\"active\"") != null);
     }
 } else struct {};
 
@@ -7787,13 +7788,15 @@ test "api query contract normalizes canonical query with legacy shorthands" {
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"must\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"/tenant\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"values\":[\"gold\",2,true]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"status\":\"published\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"term\":\"published\"") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"should\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"minimum_should_match\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"exists\":{\"path\":\"/deleted_at\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"path\":\"/archived\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"status\":\"deleted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"path\":\"status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"term\":\"deleted\"") != null);
 }
 
 test "api query contract parses public with document filter bindings" {
