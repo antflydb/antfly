@@ -4378,14 +4378,16 @@ export interface components {
              */
             fields?: string[];
             /**
-             * @description Antfly query to filter documents. Only documents matching this query
-             *     are included in results. Uses the sear library for efficient per-document
-             *     matching without requiring a full index.
+             * @description Structured subset of the Antfly query AST used to filter a primary-key
+             *     scan. Only documents matching this query are included in results.
+             *     Because scans do not open a text index, text-index-only variants such
+             *     as phrase and multi-match queries are rejected with a validation error
+             *     instead of being evaluated with slower stored-document semantics.
              *
              *     Examples:
-             *     - Status filtering: `{"query": "status:published"}`
-             *     - Date ranges: `{"query": "created_at:>2023-01-01"}`
-             *     - Field matching: `{"query": "category:technology"}`
+             *     - Status filtering: `{"term":{"path":"/status","value":"published"}}`
+             *     - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}`
+             *     - Field existence: `{"exists":{"path":"/category"}}`
              */
             filter_query?: components["schemas"]["Query"] & unknown;
             /**
@@ -5790,12 +5792,12 @@ export interface components {
              *
              *     Boolean clauses are normalized before planning:
              *     - `bool.must` is scoring query input.
-             *     - `bool.filter` is a non-scoring structured filter.
-             *     - `bool.must_not` is a structured exclusion filter.
+             *     - `bool.filter` is non-scoring query input.
+             *     - `bool.must_not` is non-scoring exclusion query input.
              *
-             *     The same AST accepts direct structured filters using `field` or JSON-pointer
-             *     `path`, scalar `term` values, multi-value `terms`, and `exists`.
-             *     Query-string objects remain supported as a full-text escape hatch.
+             *     Filter branches accept the same query variants as `filter_query` and
+             *     `exclusion_query`. Structured clauses use the native document-value
+             *     path; text clauses are resolved through the text index before scoring.
              * @example {
              *       "bool": {
              *         "must": [
