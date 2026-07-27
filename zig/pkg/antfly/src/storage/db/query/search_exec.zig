@@ -2196,25 +2196,31 @@ fn deriveNativeDocIdConstraintsAlloc(
             }
         }
 
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const arena_alloc = arena.allocator();
-        const parsed = try std.json.parseFromSlice(std.json.Value, arena_alloc, req.filter_query_json, .{});
-        if (try compilePatternFilterOptional(arena_alloc, parsed.value)) |compiled| {
-            var excluded_doc_ids = std.ArrayListUnmanaged([]const u8).empty;
-            defer excluded_doc_ids.deinit(arena_alloc);
-            try collectBoolMustNotExactDocIds(arena_alloc, compiled, &excluded_doc_ids);
-            if (excluded_doc_ids.items.len > 0) {
-                const owned_excludes = try dupeDocIdSliceAlloc(alloc, excluded_doc_ids.items);
-                if (out.exclude_doc_ids.len > 0) {
-                    const merged = try unionDocIdsAlloc(alloc, out.exclude_doc_ids, owned_excludes);
-                    if (out.exclude_doc_ids_owned) freeDocIdSlice(alloc, out.exclude_doc_ids);
-                    freeDocIdSlice(alloc, owned_excludes);
-                    out.exclude_doc_ids = merged;
-                } else {
-                    out.exclude_doc_ids = owned_excludes;
+        // An exactly resolved filter already includes its bool.must_not
+        // semantics. Only mine exact exclusions from an unresolved stored tree;
+        // recompiling a resolved analyzer-backed match would incorrectly route
+        // it through the deliberately unsupported stored evaluator.
+        if (!out.filter_query_json_resolved) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const arena_alloc = arena.allocator();
+            const parsed = try std.json.parseFromSlice(std.json.Value, arena_alloc, req.filter_query_json, .{});
+            if (try compilePatternFilterOptional(arena_alloc, parsed.value)) |compiled| {
+                var excluded_doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+                defer excluded_doc_ids.deinit(arena_alloc);
+                try collectBoolMustNotExactDocIds(arena_alloc, compiled, &excluded_doc_ids);
+                if (excluded_doc_ids.items.len > 0) {
+                    const owned_excludes = try dupeDocIdSliceAlloc(alloc, excluded_doc_ids.items);
+                    if (out.exclude_doc_ids.len > 0) {
+                        const merged = try unionDocIdsAlloc(alloc, out.exclude_doc_ids, owned_excludes);
+                        if (out.exclude_doc_ids_owned) freeDocIdSlice(alloc, out.exclude_doc_ids);
+                        freeDocIdSlice(alloc, owned_excludes);
+                        out.exclude_doc_ids = merged;
+                    } else {
+                        out.exclude_doc_ids = owned_excludes;
+                    }
+                    out.exclude_doc_ids_owned = true;
                 }
-                out.exclude_doc_ids_owned = true;
             }
         }
         if (bench_query_profile) filter_json_ns += platform_time.monotonicNs() - phase_start_ns;
@@ -8701,6 +8707,7 @@ fn collectStructuredFilterDocIdsAlloc(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
     const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
+    if (patternFilterValueHasRole(parsed.value)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
     const snapshot = text_entry.persistent.acquireSnapshot();
@@ -9218,21 +9225,19 @@ fn patternFilterValueToSearchQuery(
     return error.UnsupportedQueryRequest;
 }
 
-/// Match filters depend on the selected query analyzer and the field's index
-/// analyzer. Stored JSON does not carry enough analyzer configuration to
-/// reproduce those semantics, so an unresolved match must fail closed instead
-/// of degrading to substring matching.
+/// Match filters always depend on the field's index analyzer, even when the
+/// request does not select an analyzer explicitly. Stored JSON cannot reproduce
+/// those token semantics, so every unresolved match must fail closed instead of
+/// degrading to substring matching.
 fn rejectStoredMatchFallback(value: std.json.Value) !void {
-    if (try patternFilterContainsExplicitAnalyzer(value, 0)) {
+    if (try patternFilterContainsMatch(value, 0)) {
         return error.UnsupportedQueryRequest;
     }
 }
 
-fn patternFilterContainsExplicitAnalyzer(value: std.json.Value, depth: u8) !bool {
+fn patternFilterContainsMatch(value: std.json.Value, depth: u8) !bool {
     if (depth >= 64 or value != .object) return error.InvalidArgument;
-    if (value.object.get("match")) |match| {
-        return match == .object and match.object.get("analyzer") != null;
-    }
+    if (value.object.get("match") != null) return true;
 
     inline for ([_][]const u8{ "conjuncts", "disjuncts" }) |compound| {
         if (value.object.get(compound)) |children| {
@@ -9240,7 +9245,7 @@ fn patternFilterContainsExplicitAnalyzer(value: std.json.Value, depth: u8) !bool
                 return error.InvalidArgument;
             }
             for (children.array.items) |child| {
-                if (try patternFilterContainsExplicitAnalyzer(child, depth + 1)) return true;
+                if (try patternFilterContainsMatch(child, depth + 1)) return true;
             }
             return false;
         }
@@ -9253,7 +9258,7 @@ fn patternFilterContainsExplicitAnalyzer(value: std.json.Value, depth: u8) !bool
                     return error.InvalidArgument;
                 }
                 for (children.array.items) |child| {
-                    if (try patternFilterContainsExplicitAnalyzer(child, depth + 1)) return true;
+                    if (try patternFilterContainsMatch(child, depth + 1)) return true;
                 }
             }
         }
@@ -9340,12 +9345,12 @@ fn validateStructuredFilterGrammar(
             _ = try patternFilterValueToSearchQuery(alloc, value, .{}, null);
             return;
         }
-        if (bool_query.object.get("minimum_should_match") orelse
-            bool_query.object.get("min_should")) |minimum|
-        {
-            const parsed = jsonU32(minimum) orelse return error.InvalidArgument;
-            if (@as(usize, parsed) > should_count) return error.InvalidArgument;
-        }
+        _ = try pattern_filter_contract.minimumShould(
+            bool_query.object,
+            should_count,
+            bool_query.object.get("filter") != null or
+                bool_query.object.get("must") != null,
+        );
         return;
     }
 
@@ -9400,9 +9405,15 @@ fn validateStructuredMatchGrammar(value: std.json.Value) !void {
             return error.InvalidArgument;
         }
     }
+    if (value.object.get("role")) |role| {
+        if (role != .string or role.string.len == 0) {
+            return error.InvalidArgument;
+        }
+    }
 
     var recognized: usize = 2;
     if (value.object.get("analyzer") != null) recognized += 1;
+    if (value.object.get("role") != null) recognized += 1;
     if (recognized != value.object.count()) return error.InvalidArgument;
 }
 
@@ -9465,13 +9476,11 @@ fn patternBoolFilterToSearchQuery(
         try patternFilterArrayToSearchQueries(alloc, should_value, text_analysis, runtime_schema)
     else
         &.{};
-    const default_min_should: u32 = if (!has_must and has_should) 1 else 0;
-    const min_should = if (value.object.get("minimum_should_match") orelse
-        value.object.get("min_should")) |minimum|
-        jsonU32(minimum) orelse return error.InvalidArgument
-    else
-        default_min_should;
-    if (@as(usize, min_should) > should.len) return error.InvalidArgument;
+    const min_should: u32 = @intCast(try pattern_filter_contract.minimumShould(
+        value.object,
+        should.len,
+        has_must,
+    ));
     return .{ .bool_query = .{
         .must = if (must_out.items.len > 0)
             try must_out.toOwnedSlice(alloc)
@@ -9703,6 +9712,17 @@ test "pattern bool filter preserves explicit minimum should match" {
     try std.testing.expect(query == .bool_query);
     try std.testing.expectEqual(@as(usize, 2), query.bool_query.should.len);
     try std.testing.expectEqual(@as(u32, 2), query.bool_query.min_should);
+
+    const pure_should_zero = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool":{"should":[{"term":{"status":"missing"}}],"minimum_should_match":0}}
+    , .{});
+    const pure_should_query = try patternFilterValueToSearchQuery(
+        alloc,
+        pure_should_zero.value,
+        .{},
+        null,
+    );
+    try std.testing.expectEqual(@as(u32, 1), pure_should_query.bool_query.min_should);
 }
 
 test "pattern date range filter lowers public date and timestamp bounds" {
@@ -10042,12 +10062,14 @@ test "structured filter grammar validates ranges without a runtime schema" {
     }
 }
 
-test "stored fallback rejects analyzer-dependent match filters" {
+test "stored fallback rejects every analyzer-dependent match filter" {
     const alloc = std.testing.allocator;
     inline for ([_][]const u8{
         \\{"match":{"path":"status","text":"active user","analyzer":"tenant_search"}}
         ,
         \\{"bool":{"must":[{"term":{"path":"tenant","term":"acme"}},{"match":{"path":"status","text":"active","analyzer":"keyword"}}]}}
+        ,
+        \\{"match":{"path":"status","text":"active","role":"measure"}}
         ,
     }) |encoded| {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
@@ -10077,7 +10099,10 @@ test "stored fallback rejects analyzer-dependent match filters" {
         .{},
     );
     defer analyzerless_match.deinit();
-    try rejectStoredMatchFallback(analyzerless_match.value);
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        rejectStoredMatchFallback(analyzerless_match.value),
+    );
 }
 
 fn parseFuzzyOptions(object: anytype, out: *FieldFuzzy) !void {

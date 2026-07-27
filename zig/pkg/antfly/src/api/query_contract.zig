@@ -5063,6 +5063,17 @@ fn appendCanonicalPublicQueryAlloc(
     if (query == .object) {
         if (query.object.get("bool")) |bool_value| {
             if (bool_value != .object) return error.InvalidQueryRequest;
+            // `bool` is an operator root, not a discriminator that may coexist
+            // with another query operator. Reject ambiguous trees instead of
+            // silently selecting bool and dropping its siblings.
+            if (query.object.count() != 1) return error.InvalidQueryRequest;
+            var recognized: usize = 0;
+            inline for ([_][]const u8{ "must", "should", "filter", "must_not" }) |branch| {
+                if (bool_value.object.get(branch) != null) recognized += 1;
+            }
+            if (recognized != bool_value.object.count()) {
+                return error.InvalidQueryRequest;
+            }
             if (bool_value.object.get("must")) |must_value| {
                 try appendBoolMustClausesAlloc(alloc, must_value, limit, scoring_must, filter_clauses);
             }
@@ -8439,6 +8450,21 @@ test "api query contract preserves schema-dependent canonical ranges" {
         try std.testing.expectError(
             error.InvalidFilterQueryRequest,
             parsePublicQueryRequest(alloc, null, "products", invalid_body),
+        );
+    }
+}
+
+test "api query contract rejects ambiguous canonical query roots" {
+    const alloc = std.testing.allocator;
+    inline for ([_][]const u8{
+        \\{"query":{"bool":{"filter":[{"term":{"path":"status","value":"active"}}]},"term":{"path":"tier","value":"gold"}}}
+        ,
+        \\{"query":{"bool":{"filter":[{"term":{"path":"status","value":"active"}}],"unknown":true}}}
+        ,
+    }) |body| {
+        try std.testing.expectError(
+            error.InvalidQueryRequest,
+            parsePublicQueryRequest(alloc, null, "files", body),
         );
     }
 }

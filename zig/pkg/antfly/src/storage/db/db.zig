@@ -41546,7 +41546,7 @@ test "db dense stored symbolic filter candidate window covers offset pagination"
         .limit = 1,
         .offset = 1024,
         .include_stored = false,
-        .filter_query_json = "{\"match\":{\"field\":\"body\",\"text\":\"keep\"}}",
+        .filter_query_json = "{\"term\":{\"field\":\"body\",\"term\":\"keep\"}}",
     }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
     defer dense_result.result.deinit();
 

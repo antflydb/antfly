@@ -28,6 +28,12 @@ pub fn storedDocMatchesPatternFilter(alloc: Allocator, key: []const u8, stored: 
 }
 
 pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.json.Value, filter_query: std.json.Value) !bool {
+    var remaining_nodes: usize = 16 * 1024;
+    try validatePatternFilter(alloc, filter_query, 0, &remaining_nodes);
+    return try jsonDocMatchesPatternFilterUnchecked(alloc, key, doc, filter_query);
+}
+
+fn jsonDocMatchesPatternFilterUnchecked(alloc: Allocator, key: []const u8, doc: std.json.Value, filter_query: std.json.Value) !bool {
     _ = try contract.requireSingleRoot(filter_query);
 
     if (filter_query.object.get("match_all") != null) return true;
@@ -37,7 +43,7 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
     if (filter_query.object.get("conjuncts")) |conjuncts| {
         if (conjuncts != .array) return error.InvalidArgument;
         for (conjuncts.array.items) |item| {
-            if (!(try jsonDocMatchesPatternFilter(alloc, key, doc, item))) return false;
+            if (!(try jsonDocMatchesPatternFilterUnchecked(alloc, key, doc, item))) return false;
         }
         return true;
     }
@@ -45,7 +51,7 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
     if (filter_query.object.get("disjuncts")) |disjuncts| {
         if (disjuncts != .array) return error.InvalidArgument;
         for (disjuncts.array.items) |item| {
-            if (try jsonDocMatchesPatternFilter(alloc, key, doc, item)) return true;
+            if (try jsonDocMatchesPatternFilterUnchecked(alloc, key, doc, item)) return true;
         }
         return false;
     }
@@ -59,13 +65,13 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
         if (bool_query.object.get("must")) |must| {
             if (must != .array or must.array.items.len == 0) return error.InvalidArgument;
             for (must.array.items) |item| {
-                if (!(try jsonDocMatchesPatternFilter(alloc, key, doc, item))) return false;
+                if (!(try jsonDocMatchesPatternFilterUnchecked(alloc, key, doc, item))) return false;
             }
         }
         if (bool_query.object.get("filter")) |filter| {
             if (filter != .array or filter.array.items.len == 0) return error.InvalidArgument;
             for (filter.array.items) |item| {
-                if (!(try jsonDocMatchesPatternFilter(alloc, key, doc, item))) return false;
+                if (!(try jsonDocMatchesPatternFilterUnchecked(alloc, key, doc, item))) return false;
             }
         }
 
@@ -83,7 +89,7 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
         if (min_should > 0) {
             var matched: usize = 0;
             for (should_items) |item| {
-                if (try jsonDocMatchesPatternFilter(alloc, key, doc, item)) {
+                if (try jsonDocMatchesPatternFilterUnchecked(alloc, key, doc, item)) {
                     matched += 1;
                     if (matched >= min_should) break;
                 }
@@ -94,7 +100,7 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
         if (bool_query.object.get("must_not")) |must_not| {
             if (must_not != .array or must_not.array.items.len == 0) return error.InvalidArgument;
             for (must_not.array.items) |item| {
-                if (try jsonDocMatchesPatternFilter(alloc, key, doc, item)) return false;
+                if (try jsonDocMatchesPatternFilterUnchecked(alloc, key, doc, item)) return false;
             }
         }
 
@@ -113,12 +119,6 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
         if (filter_query.object.get("terms")) |terms| {
             if (terms != .object or terms.object.count() != 1) return error.InvalidArgument;
             var it = terms.object.iterator();
-            const entry = it.next() orelse return error.InvalidArgument;
-            break :blk entry.key_ptr.*;
-        }
-        if (filter_query.object.get("match")) |match| {
-            if (match != .object or match.object.count() != 1) return error.InvalidArgument;
-            var it = match.object.iterator();
             const entry = it.next() orelse return error.InvalidArgument;
             break :blk entry.key_ptr.*;
         }
@@ -185,12 +185,6 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
         }
         return false;
     }
-    if (filter_query.object.get("match")) |match| {
-        var it = match.object.iterator();
-        const entry = it.next() orelse return error.InvalidArgument;
-        if (entry.value_ptr.* != .string) return error.InvalidArgument;
-        return jsonValuesContainMatch(values.items, entry.value_ptr.string);
-    }
     if (filter_query.object.get("prefix")) |prefix| {
         var it = prefix.object.iterator();
         const entry = it.next() orelse return error.InvalidArgument;
@@ -217,6 +211,129 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
     if (filter_query.object.get("numeric_range")) |range_query| return try jsonValuesContainNumericRange(values.items, range_query);
     if (filter_query.object.get("date_range")) |range_query| return try jsonValuesContainDateRange(values.items, range_query);
     return error.InvalidArgument;
+}
+
+fn validatePatternFilter(
+    alloc: Allocator,
+    filter_query: std.json.Value,
+    depth: u8,
+    remaining_nodes: *usize,
+) !void {
+    if (depth >= 64 or remaining_nodes.* == 0) return error.InvalidArgument;
+    _ = try contract.requireSingleRoot(filter_query);
+    remaining_nodes.* -= 1;
+
+    if (filter_query.object.get("match_all") != null or
+        filter_query.object.get("match_none") != null)
+    {
+        return;
+    }
+    if (filter_query.object.get("doc_id")) |doc_id| {
+        try validatePatternDocIds(doc_id);
+        return;
+    }
+    inline for ([_][]const u8{ "conjuncts", "disjuncts" }) |compound| {
+        if (filter_query.object.get(compound)) |children| {
+            if (children != .array or children.array.items.len == 0) {
+                return error.InvalidArgument;
+            }
+            for (children.array.items) |child| {
+                try validatePatternFilter(alloc, child, depth + 1, remaining_nodes);
+            }
+            return;
+        }
+    }
+    if (filter_query.object.get("bool")) |bool_query| {
+        if (bool_query != .object) return error.InvalidArgument;
+        try contract.validateBool(bool_query.object);
+        inline for ([_][]const u8{ "filter", "must", "should", "must_not" }) |branch| {
+            if (bool_query.object.get(branch)) |children| {
+                for (children.array.items) |child| {
+                    try validatePatternFilter(alloc, child, depth + 1, remaining_nodes);
+                }
+            }
+        }
+        const should_len = if (bool_query.object.get("should")) |should|
+            should.array.items.len
+        else
+            0;
+        _ = try contract.minimumShould(
+            bool_query.object,
+            should_len,
+            bool_query.object.get("filter") != null or
+                bool_query.object.get("must") != null,
+        );
+        return;
+    }
+
+    // Match semantics require an index analyzer and cannot be reproduced from
+    // stored JSON. Authorization and backfill filters therefore fail closed.
+    if (filter_query.object.get("match") != null) {
+        return error.UnsupportedQueryRequest;
+    }
+
+    inline for ([_][]const u8{ "term", "prefix", "wildcard" }) |operator| {
+        if (filter_query.object.get(operator)) |predicate| {
+            const entry = try singlePatternFieldEntry(predicate);
+            if (entry.value != .string) return error.InvalidArgument;
+            return;
+        }
+    }
+    if (filter_query.object.get("regexp")) |regexp| {
+        const entry = try singlePatternFieldEntry(regexp);
+        if (entry.value != .string) return error.InvalidArgument;
+        var compiled = try regex_mod.compile(alloc, entry.value.string);
+        compiled.deinit();
+        return;
+    }
+    if (filter_query.object.get("terms")) |terms| {
+        const entry = try singlePatternFieldEntry(terms);
+        if (entry.value != .array or entry.value.array.items.len == 0) {
+            return error.InvalidArgument;
+        }
+        for (entry.value.array.items) |item| {
+            if (item != .string) return error.InvalidArgument;
+        }
+        return;
+    }
+    if (filter_query.object.get("fuzzy")) |fuzzy| {
+        const entry = try singlePatternFieldEntry(fuzzy);
+        _ = try jsonValuesContainFuzzy(alloc, &.{}, entry.value);
+        return;
+    }
+    if (filter_query.object.get("numeric_range")) |range_query| {
+        _ = try jsonValuesContainNumericRange(&.{}, range_query);
+        return;
+    }
+    if (filter_query.object.get("date_range")) |range_query| {
+        _ = try jsonValuesContainDateRange(&.{}, range_query);
+        return;
+    }
+    return error.InvalidArgument;
+}
+
+const PatternFieldEntry = struct {
+    field: []const u8,
+    value: std.json.Value,
+};
+
+fn singlePatternFieldEntry(value: std.json.Value) !PatternFieldEntry {
+    if (value != .object or value.object.count() != 1) return error.InvalidArgument;
+    var it = value.object.iterator();
+    const entry = it.next() orelse return error.InvalidArgument;
+    if (entry.key_ptr.len == 0) return error.InvalidArgument;
+    return .{ .field = entry.key_ptr.*, .value = entry.value_ptr.* };
+}
+
+fn validatePatternDocIds(doc_id: std.json.Value) !void {
+    if (doc_id != .object) return error.InvalidArgument;
+    const ids = doc_id.object.get("ids") orelse return error.InvalidArgument;
+    if (doc_id.object.count() != 1 or ids != .array or ids.array.items.len == 0) {
+        return error.InvalidArgument;
+    }
+    for (ids.array.items) |item| {
+        if (item != .string or item.string.len == 0) return error.InvalidArgument;
+    }
 }
 
 fn docIdMatchesPatternKey(key: []const u8, doc_id: std.json.Value) !bool {
@@ -269,14 +386,6 @@ fn jsonValuesContainTerm(values: []const std.json.Value, term: []const u8) bool 
         .bool => |boolean| {
             if ((boolean and std.mem.eql(u8, term, "true")) or (!boolean and std.mem.eql(u8, term, "false"))) return true;
         },
-        else => {},
-    };
-    return false;
-}
-
-fn jsonValuesContainMatch(values: []const std.json.Value, text: []const u8) bool {
-    for (values) |value| switch (value) {
-        .string => |candidate| if (containsCaseInsensitive(candidate, text)) return true,
         else => {},
     };
     return false;
@@ -551,24 +660,6 @@ fn asciiLowerDup(alloc: Allocator, input: []const u8) ![]u8 {
     return out;
 }
 
-fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (asciiEqualIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
-
-fn asciiEqualIgnoreCase(left: []const u8, right: []const u8) bool {
-    if (left.len != right.len) return false;
-    for (left, right) |l, r| {
-        if (std.ascii.toLower(l) != std.ascii.toLower(r)) return false;
-    }
-    return true;
-}
-
 test "stored doc matches simple term filter" {
     try std.testing.expect(try storedDocMatchesPatternFilter(
         std.testing.allocator,
@@ -645,6 +736,12 @@ test "row filters enforce bool thresholds and fuzzy complexity bounds" {
         stored,
         "{\"bool\":{\"must\":[{\"term\":{\"tenant\":\"acme\"}}],\"should\":[{\"term\":{\"tier\":\"missing\"}}]}}",
     ));
+    try std.testing.expect(!(try storedDocMatchesPatternFilter(
+        alloc,
+        "doc:gold",
+        stored,
+        "{\"bool\":{\"should\":[{\"term\":{\"tier\":\"missing\"}}],\"minimum_should_match\":0}}",
+    )));
     try std.testing.expectError(
         error.InvalidArgument,
         storedDocMatchesPatternFilter(
@@ -661,6 +758,33 @@ test "row filters enforce bool thresholds and fuzzy complexity bounds" {
             "doc:gold",
             stored,
             "{\"term\":{\"tier\":\"gold\"},\"prefix\":{\"tier\":\"g\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidArgument,
+        storedDocMatchesPatternFilter(
+            alloc,
+            "doc:gold",
+            stored,
+            "{\"bool\":{\"must\":[{\"term\":{\"tenant\":\"acme\"}}],\"should\":[{\"unknown\":{}}],\"minimum_should_match\":0}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidRegex,
+        storedDocMatchesPatternFilter(
+            alloc,
+            "doc:gold",
+            stored,
+            "{\"bool\":{\"must\":[{\"term\":{\"tenant\":\"acme\"}}],\"should\":[{\"regexp\":{\"tier\":\"[\"}}],\"minimum_should_match\":0}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        storedDocMatchesPatternFilter(
+            alloc,
+            "doc:gold",
+            stored,
+            "{\"match\":{\"tier\":\"gold\"}}",
         ),
     );
 }

@@ -40,7 +40,7 @@ pub fn validateBool(object: std.json.ObjectMap) !void {
         "minimum_should_match",
         "min_should",
     }) |key| {
-        if (object.get(key) != null) {
+        if (object.get(key)) |value| {
             recognized += 1;
             if (comptime std.mem.eql(u8, key, "filter") or
                 std.mem.eql(u8, key, "must") or
@@ -48,6 +48,9 @@ pub fn validateBool(object: std.json.ObjectMap) !void {
                 std.mem.eql(u8, key, "must_not"))
             {
                 branches += 1;
+                if (value != .array or value.array.items.len == 0) {
+                    return error.InvalidArgument;
+                }
             }
         }
     }
@@ -61,12 +64,12 @@ pub fn minimumShould(
     should_len: usize,
     has_required: bool,
 ) !usize {
-    const default_value: usize = if (!has_required and should_len > 0) 1 else 0;
+    const semantic_floor: usize = if (!has_required and should_len > 0) 1 else 0;
     const value = object.get("minimum_should_match") orelse
-        object.get("min_should") orelse return default_value;
+        object.get("min_should") orelse return semantic_floor;
     const parsed = try jsonU32(value);
     if (parsed > should_len) return error.InvalidArgument;
-    return parsed;
+    return @max(parsed, semantic_floor);
 }
 
 fn jsonU32(value: std.json.Value) !u32 {
@@ -109,18 +112,27 @@ test "pattern filter contract enforces roots bool keys and thresholds" {
     var bool_value = try std.json.parseFromSlice(
         std.json.Value,
         alloc,
-        \\{"should":[],"minimum_should_match":2}
+        \\{"should":[{"match_all":{}}],"minimum_should_match":0}
     ,
         .{},
     );
     defer bool_value.deinit();
     try validateBool(bool_value.value.object);
     try std.testing.expectEqual(
-        @as(usize, 2),
-        try minimumShould(bool_value.value.object, 3, false),
+        @as(usize, 1),
+        try minimumShould(bool_value.value.object, 1, false),
     );
+
+    var too_many = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"should":[{"match_all":{}}],"minimum_should_match":2}
+    ,
+        .{},
+    );
+    defer too_many.deinit();
     try std.testing.expectError(
         error.InvalidArgument,
-        minimumShould(bool_value.value.object, 1, false),
+        minimumShould(too_many.value.object, 1, false),
     );
 }

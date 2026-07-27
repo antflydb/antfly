@@ -1295,114 +1295,10 @@ pub fn storedDocMatchesPatternFilter(alloc: Allocator, key: []const u8, stored: 
 }
 
 pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.json.Value, filter_query: std.json.Value) !bool {
-    _ = try pattern_filter_contract.requireSingleRoot(filter_query);
-
-    if (filter_query.object.get("match_all") != null) return true;
-    if (filter_query.object.get("match_none") != null) return false;
-    if (filter_query.object.get("doc_id")) |doc_id| return docIdMatchesPatternKey(key, doc_id);
-
-    if (filter_query.object.get("conjuncts")) |conjuncts| {
-        if (conjuncts != .array) return error.InvalidArgument;
-        for (conjuncts.array.items) |item| {
-            if (!(try jsonDocMatchesPatternFilter(alloc, key, doc, item))) return false;
-        }
-        return true;
-    }
-
-    if (filter_query.object.get("disjuncts")) |disjuncts| {
-        if (disjuncts != .array) return error.InvalidArgument;
-        for (disjuncts.array.items) |item| {
-            if (try jsonDocMatchesPatternFilter(alloc, key, doc, item)) return true;
-        }
-        return false;
-    }
-
-    if (filter_query.object.get("bool")) |bool_query| {
-        if (bool_query != .object) return error.InvalidArgument;
-        try pattern_filter_contract.validateBool(bool_query.object);
-
-        const has_required = bool_query.object.get("must") != null or
-            bool_query.object.get("filter") != null;
-        if (bool_query.object.get("must")) |must| {
-            if (must != .array or must.array.items.len == 0) return error.InvalidArgument;
-            for (must.array.items) |item| {
-                if (!(try jsonDocMatchesPatternFilter(alloc, key, doc, item))) return false;
-            }
-        }
-        if (bool_query.object.get("filter")) |filter| {
-            if (filter != .array or filter.array.items.len == 0) return error.InvalidArgument;
-            for (filter.array.items) |item| {
-                if (!(try jsonDocMatchesPatternFilter(alloc, key, doc, item))) return false;
-            }
-        }
-
-        const should_items = if (bool_query.object.get("should")) |should| blk: {
-            if (should != .array or should.array.items.len == 0) {
-                return error.InvalidArgument;
-            }
-            break :blk should.array.items;
-        } else &.{};
-        const min_should = try pattern_filter_contract.minimumShould(
-            bool_query.object,
-            should_items.len,
-            has_required,
-        );
-        if (min_should > 0) {
-            var matched: usize = 0;
-            for (should_items) |item| {
-                if (try jsonDocMatchesPatternFilter(alloc, key, doc, item)) {
-                    matched += 1;
-                    if (matched >= min_should) break;
-                }
-            }
-            if (matched < min_should) return false;
-        }
-
-        if (bool_query.object.get("must_not")) |must_not| {
-            if (must_not != .array or must_not.array.items.len == 0) return error.InvalidArgument;
-            for (must_not.array.items) |item| {
-                if (try jsonDocMatchesPatternFilter(alloc, key, doc, item)) return false;
-            }
-        }
-
-        return true;
-    }
-
-    const field = try extractPatternField(filter_query);
-    var values = std.ArrayListUnmanaged(std.json.Value).empty;
-    defer values.deinit(alloc);
-    if (std.mem.indexOfScalar(u8, field, '.') == null) {
-        try collectJsonValuesAtSingleSegment(alloc, doc, field, &values);
-    } else {
-        var path_stack: [8][]const u8 = undefined;
-        var path_len: usize = 0;
-        var path_heap = std.ArrayListUnmanaged([]const u8).empty;
-        defer path_heap.deinit(alloc);
-        var parts = std.mem.splitScalar(u8, field, '.');
-        while (parts.next()) |part| {
-            if (path_heap.capacity > 0) {
-                try path_heap.append(alloc, part);
-                continue;
-            }
-            if (path_len < path_stack.len) {
-                path_stack[path_len] = part;
-                path_len += 1;
-                continue;
-            }
-            try path_heap.ensureTotalCapacity(alloc, path_len + 1);
-            for (path_stack[0..path_len]) |existing| {
-                path_heap.appendAssumeCapacity(existing);
-            }
-            try path_heap.append(alloc, part);
-        }
-        const path_items = if (path_heap.capacity > 0) path_heap.items else path_stack[0..path_len];
-        if (path_items.len == 0) return false;
-        try collectJsonValuesAtPath(alloc, doc, path_items, 0, &values);
-    }
-
-    var predicate_arena = std.heap.ArenaAllocator.init(alloc);
-    defer predicate_arena.deinit();
-    return try (try compilePatternFieldPredicate(predicate_arena.allocator(), filter_query)).matches(alloc, values.items);
+    var matcher_arena = std.heap.ArenaAllocator.init(alloc);
+    defer matcher_arena.deinit();
+    const compiled = try compilePatternFilter(matcher_arena.allocator(), filter_query);
+    return try compiled.matches(alloc, key, doc);
 }
 
 pub fn patternFilterNeedsStoredDoc(filter_query: std.json.Value) !bool {
@@ -1411,6 +1307,7 @@ pub fn patternFilterNeedsStoredDoc(filter_query: std.json.Value) !bool {
     if (filter_query.object.get("match_all") != null) return false;
     if (filter_query.object.get("match_none") != null) return false;
     if (filter_query.object.get("doc_id") != null) return false;
+    if (filter_query.object.get("match") != null) return error.UnsupportedQueryRequest;
 
     if (filter_query.object.get("conjuncts")) |conjuncts| {
         if (conjuncts != .array) return error.InvalidArgument;
@@ -1506,7 +1403,6 @@ pub const CompiledPatternFilter = union(enum) {
     pub const FieldPredicate = union(enum) {
         term: []const u8,
         terms: []const []const u8,
-        match: []const u8,
         prefix: []const u8,
         wildcard: []const u8,
         regexp: regex_mod.RegexAutomaton,
@@ -1526,7 +1422,6 @@ pub const CompiledPatternFilter = union(enum) {
             return switch (self) {
                 .term => |value| jsonValuesContainTerm(values, value),
                 .terms => |terms| jsonValuesContainAnyTerm(values, terms),
-                .match => |value| jsonValuesContainMatch(values, value),
                 .prefix => |value| jsonValuesContainPrefix(values, value),
                 .wildcard => |value| jsonValuesContainWildcard(values, value),
                 .regexp => |value| jsonValuesContainCompiledRegexp(values, @constCast(&value)),
@@ -1636,6 +1531,9 @@ pub fn compilePatternFilter(alloc: Allocator, filter_query: std.json.Value) anye
     if (filter_query.object.get("disjuncts")) |disjuncts| {
         return .{ .disjuncts = try compilePatternFilterArray(alloc, disjuncts) };
     }
+    if (filter_query.object.get("match") != null) {
+        return error.UnsupportedQueryRequest;
+    }
     if (filter_query.object.get("bool")) |bool_query| {
         if (bool_query != .object) return error.InvalidArgument;
         try pattern_filter_contract.validateBool(bool_query.object);
@@ -1723,9 +1621,6 @@ fn extractPatternField(filter_query: std.json.Value) ![]const u8 {
         }
         if (filter_query.object.get("terms")) |terms| {
             break :blk try extractPatternTermsField(terms);
-        }
-        if (filter_query.object.get("match")) |match| {
-            break :blk try extractPatternFieldFromStringShape(match, "text");
         }
         if (filter_query.object.get("prefix")) |prefix| {
             break :blk try extractPatternFieldFromStringShape(prefix, "prefix");
@@ -1949,12 +1844,6 @@ fn compilePatternFieldPredicate(alloc: Allocator, filter_query: std.json.Value) 
     if (filter_query.object.get("terms")) |terms| {
         return .{ .terms = (try extractPatternFieldTerms(alloc, terms)).terms };
     }
-    if (filter_query.object.get("match")) |match| {
-        if (match == .object and match.object.get("analyzer") != null) {
-            return error.UnsupportedQueryRequest;
-        }
-        return .{ .match = (try extractPatternFieldString(alloc, match, "text")).value };
-    }
     if (filter_query.object.get("prefix")) |prefix| {
         return .{ .prefix = (try extractPatternFieldString(alloc, prefix, "prefix")).value };
     }
@@ -2084,18 +1973,6 @@ fn jsonValuesContainTerm(values: []const std.json.Value, term: []const u8) bool 
 fn jsonValuesContainAnyTerm(values: []const std.json.Value, terms: []const []const u8) bool {
     for (terms) |term| {
         if (jsonValuesContainTerm(values, term)) return true;
-    }
-    return false;
-}
-
-fn jsonValuesContainMatch(values: []const std.json.Value, text: []const u8) bool {
-    for (values) |value| {
-        switch (value) {
-            .string => |candidate| {
-                if (containsCaseInsensitive(candidate, text)) return true;
-            },
-            else => {},
-        }
     }
     return false;
 }
@@ -2801,24 +2678,6 @@ fn asciiLowerDup(alloc: Allocator, input: []const u8) ![]u8 {
     return out;
 }
 
-fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (asciiEqualIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
-
-fn asciiEqualIgnoreCase(left: []const u8, right: []const u8) bool {
-    if (left.len != right.len) return false;
-    for (left, right) |l, r| {
-        if (std.ascii.toLower(l) != std.ascii.toLower(r)) return false;
-    }
-    return true;
-}
-
 pub fn resolveGraphSelectorFromSets(
     alloc: Allocator,
     selector: graph_query_mod.NodeSelector,
@@ -3051,6 +2910,21 @@ test "compiled stored filters preserve bool thresholds and reject unsafe leaves"
     try std.testing.expectEqual(@as(usize, 0), compiled_optional.bool_query.min_should);
     try std.testing.expect(try compiled_optional.matches(alloc, "doc:a", doc.value));
 
+    var pure_should_zero = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"bool":{"should":[{"term":{"tier":"missing"}}],"minimum_should_match":0}}
+    ,
+        .{},
+    );
+    defer pure_should_zero.deinit();
+    const compiled_pure_should = try compilePatternFilter(
+        arena.allocator(),
+        pure_should_zero.value,
+    );
+    try std.testing.expectEqual(@as(usize, 1), compiled_pure_should.bool_query.min_should);
+    try std.testing.expect(!(try compiled_pure_should.matches(alloc, "doc:a", doc.value)));
+
     inline for ([_]struct {
         encoded: []const u8,
         expected: anyerror,
@@ -3076,6 +2950,12 @@ test "compiled stored filters preserve bool thresholds and reject unsafe leaves"
         .{
             .encoded =
             \\{"match":{"path":"tier","text":"gold","analyzer":"keyword"}}
+            ,
+            .expected = error.UnsupportedQueryRequest,
+        },
+        .{
+            .encoded =
+            \\{"match":{"path":"tier","text":"gold"}}
             ,
             .expected = error.UnsupportedQueryRequest,
         },
