@@ -20586,6 +20586,8 @@ pub const DB = struct {
 
         var next = req;
         next.resolved_doc_filter = resolved_filter;
+        next.filter_text = null;
+        next.exclusion_text = null;
         next.filter_query_json = "";
         next.exclusion_query_json = "";
         return .{
@@ -40807,6 +40809,27 @@ test "db default dynamic schema vector term filters project through doc identity
     try std.testing.expectEqual(@as(usize, 1), dense_text_exclusion_filter.result.hits.len);
     try std.testing.expectEqualStrings("doc:c", dense_text_exclusion_filter.result.hits[0].id);
     try std.testing.expectEqual(@as(u32, 1), dense_text_exclusion_filter.profile.raw_hit_count);
+
+    var dense_native_text_filters = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 3,
+        .include_stored = false,
+        .filter_text = .{ .match_phrase = .{
+            .field = "body",
+            .text = "alpha winner",
+        } },
+        .exclusion_text = .{ .term = .{
+            .field = "status.keyword",
+            .term = "draft",
+        } },
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 3 });
+    defer dense_native_text_filters.result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), dense_native_text_filters.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), dense_native_text_filters.result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", dense_native_text_filters.result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", dense_native_text_filters.result.hits[1].id);
+    try std.testing.expectEqual(@as(u32, 2), dense_native_text_filters.profile.raw_hit_count);
 
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
     try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "status.keyword", "active"));

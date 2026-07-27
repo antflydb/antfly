@@ -2210,6 +2210,8 @@ const AlgebraicVectorWorkerCandidate = struct {
 fn algebraicVectorWorkerCandidateForSearchRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ?AlgebraicVectorWorkerCandidate {
     if (req.aggregations_json.len != 0 or
         req.full_text != null or
+        req.filter_text != null or
+        req.exclusion_text != null or
         req.full_text_queries.len != 0 or
         req.dense_queries.len != 0 or
         req.sparse_queries.len != 0 or
@@ -2269,7 +2271,11 @@ fn annotateVectorWorkerPreflight(
 ) void {
     if (!searchRequestHasSingleVectorWorkerKnn(req)) return;
     summary.vector_worker_filter_constraint_count +|= vectorWorkerFilterConstraintCount(req);
-    if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) {
+    if (req.filter_text != null or
+        req.exclusion_text != null or
+        req.filter_query_json.len > 0 or
+        req.exclusion_query_json.len > 0)
+    {
         summary.vector_worker_requires_algebraic_filter_resolution = true;
     }
     if (algebraicVectorWorkerCandidateForSearchRequest(alloc, req) != null) {
@@ -2292,6 +2298,8 @@ fn searchRequestHasSingleVectorWorkerKnn(req: db_mod.types.SearchRequest) bool {
 
 fn vectorWorkerFilterConstraintCount(req: db_mod.types.SearchRequest) u32 {
     var count: u32 = 0;
+    if (req.filter_text != null) count += 1;
+    if (req.exclusion_text != null) count += 1;
     if (req.filter_query_json.len > 0) count += 1;
     if (req.exclusion_query_json.len > 0) count += 1;
     if (req.filter_ids.len > 0) count += 1;
@@ -6278,6 +6286,7 @@ fn readPreparationKindForQuery(req: db_mod.types.SearchRequest) ReadPreparation.
 
 fn isDenseOnlyQuery(req: db_mod.types.SearchRequest) bool {
     if (req.full_text != null or req.full_text_queries.len > 0) return false;
+    if (req.filter_text != null or req.exclusion_text != null) return false;
     if (req.sparse != null or req.sparse_queries.len > 0) return false;
     if (req.graph_queries.len > 0) return false;
     if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) return false;
@@ -7074,6 +7083,8 @@ fn algebraicIndexFreshEnoughForName(
 
 fn canConsiderAlgebraicAggregations(req: db_mod.types.SearchRequest) bool {
     return req.full_text == null and
+        req.filter_text == null and
+        req.exclusion_text == null and
         req.exclusion_query_json.len == 0 and
         req.full_text_queries.len == 0 and
         req.dense == null and
@@ -13724,6 +13735,12 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     if (req.exclusion_query_json.len > 0) {
         try appendJsonFieldString(alloc, &out, &first, "_exclusion_query_json", req.exclusion_query_json);
     }
+    if (req.filter_text) |filter_text| {
+        try appendTextQueryField(alloc, &out, &first, "filter_query", filter_text);
+    }
+    if (req.exclusion_text) |exclusion_text| {
+        try appendTextQueryField(alloc, &out, &first, "exclusion_query", exclusion_text);
+    }
     if (req.graph_queries.len > 0) {
         try appendGraphQueriesField(alloc, &out, &first, req.graph_queries);
     }
@@ -14256,7 +14273,7 @@ fn appendTextQueryValue(
             try out.append(alloc, '}');
         },
         .multi_match_bool_prefix => |multi_match| {
-            if (!std.math.isFinite(multi_match.boost) or multi_match.boost <= 0) {
+            if (!std.math.isFinite(multi_match.boost)) {
                 return error.InvalidQueryRequest;
             }
             try out.appendSlice(alloc, "{\"multi_match\":{\"query\":");
@@ -17200,6 +17217,32 @@ test "encode query request round-trips all public phrase geo and ip queries" {
     try std.testing.expectEqual(db_mod.types.GeoShapeRelation.within, should[5].geo_shape.relation);
     try std.testing.expectEqual(@as(usize, 1), should[5].geo_shape.polygons.len);
     try std.testing.expectEqual(@as(usize, polygon.len), should[5].geo_shape.polygons[0].len);
+
+    const filtered_encoded = try encodeQueryRequest(alloc, .{
+        .full_text = .{ .match_all = {} },
+        .filter_text = should_queries[0],
+        .exclusion_text = should_queries[5],
+        .filter_query_json = "{\"term\":{\"path\":\"status\",\"term\":\"active\"}}",
+        .exclusion_query_json = "{\"term\":{\"path\":\"tenant\",\"term\":\"blocked\"}}",
+    });
+    defer alloc.free(filtered_encoded);
+
+    var filtered_owned = try query_api.parseQueryRequest(alloc, null, "docs", filtered_encoded);
+    defer filtered_owned.deinit(alloc);
+    const filter_text = filtered_owned.req.filter_text orelse return error.TestExpectedEqual;
+    try std.testing.expect(filter_text == .phrase);
+    try std.testing.expectEqualStrings("quick", filter_text.phrase.terms[0]);
+    try std.testing.expectEqualStrings(
+        "{\"term\":{\"path\":\"status\",\"term\":\"active\"}}",
+        filtered_owned.req.filter_query_json,
+    );
+    const exclusion_text = filtered_owned.req.exclusion_text orelse return error.TestExpectedEqual;
+    try std.testing.expect(exclusion_text == .geo_shape);
+    try std.testing.expectEqual(db_mod.types.GeoShapeRelation.within, exclusion_text.geo_shape.relation);
+    try std.testing.expectEqualStrings(
+        "{\"term\":{\"path\":\"tenant\",\"term\":\"blocked\"}}",
+        filtered_owned.req.exclusion_query_json,
+    );
 }
 
 test "encode query request round-trips every scalar Query text variant" {
@@ -17321,24 +17364,39 @@ test "encode query request round-trips every scalar Query text variant" {
     }
 }
 
-test "encode query request rejects non-round-trippable multi match boosts" {
+test "encode query request round-trips schema valid multi match boosts" {
     const alloc = std.testing.allocator;
-    inline for ([_]db_mod.types.TextQuery{
-        .{ .multi_match_bool_prefix = .{
-            .query = "quick fox",
-            .fields = &.{.{ .field = "body" }},
-            .boost = 0,
-        } },
-        .{ .multi_match_bool_prefix = .{
-            .query = "quick fox",
-            .fields = &.{.{ .field = "body", .boost = -1 }},
-        } },
-    }) |query| {
-        try std.testing.expectError(
-            error.InvalidQueryRequest,
-            encodeQueryRequest(alloc, .{ .full_text = query }),
+    inline for ([_]f32{ 0, -1 }) |boost| {
+        const encoded = try encodeQueryRequest(alloc, .{ .full_text = .{
+            .multi_match_bool_prefix = .{
+                .query = "quick fox",
+                .fields = &.{.{ .field = "body" }},
+                .boost = boost,
+            },
+        } });
+        defer alloc.free(encoded);
+        var owned = try query_contract.parsePublicQueryRequest(
+            alloc,
+            null,
+            "files",
+            encoded,
+        );
+        defer owned.deinit(alloc);
+        try std.testing.expectEqual(
+            boost,
+            owned.req.full_text.?.multi_match_bool_prefix.boost,
         );
     }
+
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        encodeQueryRequest(alloc, .{ .full_text = .{
+            .multi_match_bool_prefix = .{
+                .query = "quick fox",
+                .fields = &.{.{ .field = "body", .boost = -1 }},
+            },
+        } }),
+    );
 }
 
 test "encode query request rejects invalid public phrase geo and ip values" {

@@ -263,7 +263,7 @@ pub fn parseMultiMatchBoolPrefixQueryAlloc(
     if (std.mem.trim(u8, query_text, &std.ascii.whitespace).len == 0) return error.InvalidQueryRequest;
     if (!std.mem.eql(u8, query_type, "bool_prefix")) return error.UnsupportedQueryRequest;
     if (field_specs.len == 0) return error.UnsupportedQueryRequest;
-    if (!std.math.isFinite(boost) or boost <= 0) return error.UnsupportedQueryRequest;
+    if (!std.math.isFinite(boost)) return error.InvalidQueryRequest;
 
     var fields = try alloc.alloc(db_types.TextMultiMatchField, field_specs.len);
     errdefer alloc.free(fields);

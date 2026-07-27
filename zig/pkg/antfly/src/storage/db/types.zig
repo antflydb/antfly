@@ -1210,6 +1210,12 @@ pub const SearchRequest = struct {
     count_only: bool = false,
     profile: bool = false,
     full_text: ?TextQuery = null,
+    /// Text-native positive filter. Unlike `full_text`, this constrains every
+    /// retrieval source without contributing a score.
+    filter_text: ?TextQuery = null,
+    /// Text-native negative filter. Matches are removed from every retrieval
+    /// source without contributing a score.
+    exclusion_text: ?TextQuery = null,
     filter_query_json: []const u8 = "",
     exclusion_query_json: []const u8 = "",
     full_text_queries: []const NamedFullTextQuery = &.{},

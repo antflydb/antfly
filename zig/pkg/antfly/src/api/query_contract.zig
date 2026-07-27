@@ -2201,10 +2201,18 @@ pub fn parseQueryRequest(
     if (normalized_query.full_text) |query| {
         req.full_text = query;
         normalized_query.full_text = null;
-    } else if (normalized_query.filter_query_json.len > 0 or normalized_query.exclusion_query_json.len > 0) {
+    } else if (normalized_query.filter_text != null or
+        normalized_query.exclusion_text != null or
+        normalized_query.filter_query_json.len > 0 or
+        normalized_query.exclusion_query_json.len > 0)
+    {
         req.full_text = .{ .match_all = {} };
     }
 
+    req.filter_text = normalized_query.filter_text;
+    normalized_query.filter_text = null;
+    req.exclusion_text = normalized_query.exclusion_text;
+    normalized_query.exclusion_text = null;
     req.filter_query_json = normalized_query.filter_query_json;
     normalized_query.filter_query_json = "";
     req.exclusion_query_json = normalized_query.exclusion_query_json;
@@ -2408,15 +2416,10 @@ fn publicFilterQueryValueNormalizesAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
 ) error{OutOfMemory}!bool {
-    const normalized = normalizePublicFilterQueryJsonAlloc(
-        alloc,
-        value,
-        10,
-    ) catch |err| switch (err) {
+    validatePublicFilterOrTextQueryAlloc(alloc, value, 10) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return false,
     };
-    alloc.free(normalized);
     return true;
 }
 
@@ -2493,11 +2496,7 @@ fn classifyPublicFilterContractErrorAlloc(
     };
     for (fields) |field| {
         const value = request.get(field.name) orelse continue;
-        const normalized = normalizePublicFilterQueryJsonAlloc(
-            alloc,
-            value,
-            10,
-        ) catch |err| return switch (err) {
+        validatePublicFilterOrTextQueryAlloc(alloc, value, 10) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.UnsupportedQueryRequest => field.unsupported,
             else => if (isStructuredFilterValue(value))
@@ -2505,7 +2504,6 @@ fn classifyPublicFilterContractErrorAlloc(
             else
                 field.unsupported,
         };
-        alloc.free(normalized);
     }
     return error.InvalidQueryRequest;
 }
@@ -2578,7 +2576,14 @@ fn buildPreflightSearchRequestAlloc(
     if (normalized_query.full_text) |query| {
         req.full_text = query;
         normalized_query.full_text = null;
-    } else if (normalized_query.filter_query_json.len > 0 or normalized_query.exclusion_query_json.len > 0 or request.order_by != null or request.search_after != null or request.search_before != null) {
+    } else if (normalized_query.filter_text != null or
+        normalized_query.exclusion_text != null or
+        normalized_query.filter_query_json.len > 0 or
+        normalized_query.exclusion_query_json.len > 0 or
+        request.order_by != null or
+        request.search_after != null or
+        request.search_before != null)
+    {
         req.full_text = .{ .match_all = {} };
     }
 
@@ -2586,6 +2591,10 @@ fn buildPreflightSearchRequestAlloc(
         req.reranker_query_text = try buildRerankerQueryText(alloc, request);
     }
 
+    req.filter_text = normalized_query.filter_text;
+    normalized_query.filter_text = null;
+    req.exclusion_text = normalized_query.exclusion_text;
+    normalized_query.exclusion_text = null;
     req.filter_query_json = normalized_query.filter_query_json;
     normalized_query.filter_query_json = "";
     req.exclusion_query_json = normalized_query.exclusion_query_json;
@@ -2610,6 +2619,7 @@ fn buildPreflightSearchRequestAlloc(
 fn preflightRequestHasFullTextResults(req: db_mod.types.SearchRequest) bool {
     if (req.full_text != null) return true;
     if (req.full_text_queries.len > 0) return true;
+    if (req.filter_text != null or req.exclusion_text != null) return true;
     return req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0;
 }
 
@@ -5008,11 +5018,15 @@ fn canDeferStoredProjection(fields: []const []const u8) bool {
 
 const NormalizedPublicQueryBuckets = struct {
     full_text: ?db_mod.types.TextQuery = null,
+    filter_text: ?db_mod.types.TextQuery = null,
+    exclusion_text: ?db_mod.types.TextQuery = null,
     filter_query_json: []const u8 = "",
     exclusion_query_json: []const u8 = "",
 
     fn deinit(self: *NormalizedPublicQueryBuckets, alloc: std.mem.Allocator) void {
         if (self.full_text) |query| freeTextQuery(alloc, query);
+        if (self.filter_text) |query| freeTextQuery(alloc, query);
+        if (self.exclusion_text) |query| freeTextQuery(alloc, query);
         if (self.filter_query_json.len > 0) alloc.free(@constCast(self.filter_query_json));
         if (self.exclusion_query_json.len > 0) alloc.free(@constCast(self.exclusion_query_json));
         self.* = .{};
@@ -5032,6 +5046,10 @@ fn normalizePublicQueryBucketsAlloc(
     errdefer deinitOwnedStringArrayList(alloc, &filter_clauses);
     var exclusion_clauses = std.ArrayListUnmanaged([]u8).empty;
     errdefer deinitOwnedStringArrayList(alloc, &exclusion_clauses);
+    var filter_text_queries = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+    errdefer deinitTextQueryArrayList(alloc, &filter_text_queries);
+    var exclusion_text_queries = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+    errdefer deinitTextQueryArrayList(alloc, &exclusion_text_queries);
 
     if (request.query) |query| {
         try appendCanonicalPublicQueryAlloc(alloc, query, limit, &scoring_must, &filter_clauses, &exclusion_clauses);
@@ -5041,14 +5059,26 @@ fn normalizePublicQueryBucketsAlloc(
         try appendScoringQueryClausesAlloc(alloc, &scoring_must, full_text_search, limit);
     }
     if (request.filter_query) |filter_query| {
-        appendPublicFilterClausesAlloc(alloc, &filter_clauses, filter_query, limit) catch |err| switch (err) {
+        appendPublicFilterOrTextClausesAlloc(
+            alloc,
+            &filter_clauses,
+            &filter_text_queries,
+            filter_query,
+            limit,
+        ) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidFilterQueryRequest,
             error.UnsupportedQueryRequest => return error.UnsupportedFilterQueryRequest,
             else => return err,
         };
     }
     if (request.exclusion_query) |exclusion_query| {
-        appendPublicFilterClausesAlloc(alloc, &exclusion_clauses, exclusion_query, limit) catch |err| switch (err) {
+        appendPublicFilterOrTextClausesAlloc(
+            alloc,
+            &exclusion_clauses,
+            &exclusion_text_queries,
+            exclusion_query,
+            limit,
+        ) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedQueryRequest => return error.UnsupportedExclusionQueryRequest,
             else => return err,
@@ -5070,17 +5100,94 @@ fn normalizePublicQueryBucketsAlloc(
     errdefer if (filter_query_json.len > 0) alloc.free(filter_query_json);
     const exclusion_query_json = try buildStructuredFilterClausesJsonAlloc(alloc, exclusion_clauses.items, .any);
     errdefer if (exclusion_query_json.len > 0) alloc.free(exclusion_query_json);
+    const filter_text = try buildTextFilterQueryAlloc(alloc, &filter_text_queries, .all);
+    errdefer if (filter_text) |query| freeTextQuery(alloc, query);
+    const exclusion_text = try buildTextFilterQueryAlloc(alloc, &exclusion_text_queries, .any);
+    errdefer if (exclusion_text) |query| freeTextQuery(alloc, query);
 
     deinitOwnedStringArrayList(alloc, &filter_clauses);
     deinitOwnedStringArrayList(alloc, &exclusion_clauses);
 
     const out = NormalizedPublicQueryBuckets{
         .full_text = full_text,
+        .filter_text = filter_text,
+        .exclusion_text = exclusion_text,
         .filter_query_json = filter_query_json,
         .exclusion_query_json = exclusion_query_json,
     };
     full_text = null;
+    filter_text_queries = .empty;
+    exclusion_text_queries = .empty;
     return out;
+}
+
+const TextFilterMode = enum { all, any };
+
+fn buildTextFilterQueryAlloc(
+    alloc: std.mem.Allocator,
+    queries: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
+    mode: TextFilterMode,
+) !?db_mod.types.TextQuery {
+    if (queries.items.len == 0) {
+        queries.deinit(alloc);
+        queries.* = .empty;
+        return null;
+    }
+    if (queries.items.len == 1) {
+        const query = queries.items[0];
+        queries.deinit(alloc);
+        queries.* = .empty;
+        return query;
+    }
+    const owned = try queries.toOwnedSlice(alloc);
+    queries.* = .empty;
+    return .{ .bool_query = switch (mode) {
+        .all => .{ .must = owned },
+        .any => .{ .should = owned, .min_should = 1 },
+    } };
+}
+
+fn appendPublicFilterOrTextClausesAlloc(
+    alloc: std.mem.Allocator,
+    structured: *std.ArrayListUnmanaged([]u8),
+    text: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
+    query_or_queries: std.json.Value,
+    limit: u32,
+) !void {
+    if (query_or_queries == .array) {
+        if (query_or_queries.array.items.len == 0) return error.InvalidQueryRequest;
+        for (query_or_queries.array.items) |item| {
+            try appendPublicFilterOrTextClausesAlloc(alloc, structured, text, item, limit);
+        }
+        return;
+    }
+
+    appendPublicFilterClausesAlloc(alloc, structured, query_or_queries, limit) catch |err| switch (err) {
+        error.UnsupportedQueryRequest => {
+            const parsed = try parseSupportedFullTextQuery(alloc, query_or_queries, limit);
+            errdefer freeTextQuery(alloc, parsed);
+            try text.append(alloc, parsed);
+        },
+        else => return err,
+    };
+}
+
+fn validatePublicFilterOrTextQueryAlloc(
+    alloc: std.mem.Allocator,
+    query: std.json.Value,
+    limit: u32,
+) !void {
+    var structured = std.ArrayListUnmanaged([]u8).empty;
+    defer deinitOwnedStringArrayList(alloc, &structured);
+    var text = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+    defer deinitTextQueryArrayList(alloc, &text);
+    try appendPublicFilterOrTextClausesAlloc(
+        alloc,
+        &structured,
+        &text,
+        query,
+        limit,
+    );
 }
 
 fn appendCanonicalPublicQueryAlloc(
@@ -7484,6 +7591,8 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
         if (merge_config.weights.len > 0) alloc.free(merge_config.weights);
     }
     if (req.full_text) |full_text| freeTextQuery(alloc, full_text);
+    if (req.filter_text) |filter_text| freeTextQuery(alloc, filter_text);
+    if (req.exclusion_text) |exclusion_text| freeTextQuery(alloc, exclusion_text);
     if (req.filter_query_json.len > 0) alloc.free(req.filter_query_json);
     if (req.exclusion_query_json.len > 0) alloc.free(req.exclusion_query_json);
     for (req.order_by) |field| alloc.free(field.field);
@@ -9520,18 +9629,70 @@ test "api query contract distinguishes explicit zero from implicit pure should m
     ) != null);
 }
 
-test "api query contract classifies public phrase variants as unsupported" {
+test "api query contract preserves text native public filter variants" {
     const alloc = std.testing.allocator;
-    inline for ([_][]const u8{
-        \\{"filter_query":{"terms":["quick","fox"],"field":"body"}}
-        ,
-        \\{"filter_query":{"terms":[["quick","fast"],["fox"]],"field":"body"}}
-        ,
-    }) |body| {
-        try std.testing.expectError(
-            error.UnsupportedFilterQueryRequest,
-            parsePublicQueryRequest(alloc, null, "files", body),
-        );
+    inline for ([_]struct {
+        body: []const u8,
+        expected: std.meta.Tag(db_mod.types.TextQuery),
+        exclusion: bool = false,
+    }{
+        .{
+            .body =
+            \\{"filter_query":{"terms":["quick","fox"],"field":"body"}}
+            ,
+            .expected = .phrase,
+        },
+        .{
+            .body =
+            \\{"filter_query":{"terms":[["quick","fast"],["fox"]],"field":"body"}}
+            ,
+            .expected = .multi_phrase,
+        },
+        .{
+            .body =
+            \\{"filter_query":{"match_phrase":"quick fox","field":"body"}}
+            ,
+            .expected = .match_phrase,
+        },
+        .{
+            .body =
+            \\{"filter_query":{"multi_match":{"query":"quick fox","type":"bool_prefix","fields":["title","body^2"]}}}
+            ,
+            .expected = .multi_match_bool_prefix,
+        },
+        .{
+            .body =
+            \\{"filter_query":{"cidr":"10.0.0.0/8","field":"client_ip"}}
+            ,
+            .expected = .ip_range,
+        },
+        .{
+            .body =
+            \\{"filter_query":{"location":[-122.4,37.8],"distance":"10km","field":"location"}}
+            ,
+            .expected = .geo_distance,
+        },
+        .{
+            .body =
+            \\{"filter_query":{"field":"location","min_lat":37,"min_lon":-123,"max_lat":38,"max_lon":-122}}
+            ,
+            .expected = .geo_bbox,
+        },
+        .{
+            .body =
+            \\{"exclusion_query":{"geometry":{"shape":{"type":"Polygon","coordinates":[[[-123,37],[-122,37],[-122,38],[-123,37]]]},"relation":"within"},"field":"location"}}
+            ,
+            .expected = .geo_shape,
+            .exclusion = true,
+        },
+    }) |case| {
+        var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
+        defer parsed.deinit(alloc);
+        const query = if (case.exclusion)
+            parsed.req.exclusion_text orelse return error.TestExpectedEqual
+        else
+            parsed.req.filter_text orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(case.expected, std.meta.activeTag(query));
     }
 }
 

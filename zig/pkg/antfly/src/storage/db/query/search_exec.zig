@@ -1093,6 +1093,8 @@ pub fn searchComposed(
     if (shared_filter) |*filter| {
         shared_req.resolved_doc_filter = filter;
         shared_req.resolved_doc_filter_owned = false;
+        shared_req.filter_text = null;
+        shared_req.exclusion_text = null;
         shared_req.filter_query_json = "";
         shared_req.exclusion_query_json = "";
     }
@@ -1451,6 +1453,7 @@ pub fn isDefaultMatchAll(query: types.Query) bool {
 fn hasSearchRequestFullTextResults(req: types.SearchRequest) bool {
     if (req.full_text != null) return true;
     if (req.full_text_queries.len > 0) return true;
+    if (req.filter_text != null or req.exclusion_text != null) return true;
     if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) return true;
     return !isDefaultMatchAll(req.query) and isTextQuery(req.query);
 }
@@ -1682,12 +1685,19 @@ fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {
 }
 
 fn hasStoredPatternFilters(req: types.SearchRequest) bool {
-    return req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0;
+    return req.filter_text != null or
+        req.exclusion_text != null or
+        req.filter_query_json.len > 0 or
+        req.exclusion_query_json.len > 0;
 }
 
 fn requestWithoutResolvedStoredFilters(req: types.SearchRequest, filter_query_json_resolved: bool, exclusion_query_json_resolved: bool) types.SearchRequest {
-    if (!filter_query_json_resolved and !exclusion_query_json_resolved) return req;
     var next = req;
+    // Native text filters are resolved into the candidate constraints before
+    // post-processing. Clear the borrowed query views so later stages cannot
+    // accidentally resolve or apply them a second time.
+    next.filter_text = null;
+    next.exclusion_text = null;
     if (filter_query_json_resolved) next.filter_query_json = "";
     if (exclusion_query_json_resolved) next.exclusion_query_json = "";
     return next;
@@ -1825,7 +1835,13 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     executor: StructuredFilterResolverExecutor,
 ) !?doc_set.ResolvedDocFilter {
     if (req.resolved_doc_filter != null) return null;
-    if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return null;
+    if (req.filter_text == null and
+        req.exclusion_text == null and
+        req.filter_query_json.len == 0 and
+        req.exclusion_query_json.len == 0)
+    {
+        return null;
+    }
 
     var active_executor = executor;
     if (active_executor.identity_read_generation == null) active_executor.identity_read_generation = req.identity_read_generation;
@@ -1836,6 +1852,24 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     var owns_out = true;
     defer if (owns_out) out.deinit(alloc);
     var changed = false;
+
+    if (req.filter_text) |filter_text| {
+        var include = (try collectFullTextResolvedDocSetAlloc(alloc, req, active_executor, filter_text)) orelse return null;
+        defer include.deinit(alloc);
+        const next_include = (try doc_set.intersectAlloc(alloc, &out.include, &include)) orelse return null;
+        out.include.deinit(alloc);
+        out.include = next_include;
+        changed = true;
+    }
+
+    if (req.exclusion_text) |exclusion_text| {
+        var exclude = (try collectFullTextResolvedDocSetAlloc(alloc, req, active_executor, exclusion_text)) orelse return null;
+        defer exclude.deinit(alloc);
+        const next_exclude = (try doc_set.unionAlloc(alloc, &out.exclude, &exclude)) orelse return null;
+        out.exclude.deinit(alloc);
+        out.exclude = next_exclude;
+        changed = true;
+    }
 
     if (req.filter_query_json.len > 0) {
         var include = (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &cache, req.filter_query_json)) orelse return null;
@@ -2147,6 +2181,38 @@ fn deriveNativeDocIdConstraintsAlloc(
         }
     }
 
+    if (req.filter_text) |filter_text| {
+        const resolved = (try collectFullTextResolvedDocSetAlloc(
+            alloc,
+            req,
+            active_executor,
+            filter_text,
+        )) orelse return error.UnsupportedQueryRequest;
+        var owned_resolved = resolved;
+        defer owned_resolved.deinit(alloc);
+        const filter = doc_set.ResolvedDocFilter{
+            .include = owned_resolved,
+            .exclude = .none,
+        };
+        try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, active_executor);
+    }
+
+    if (req.exclusion_text) |exclusion_text| {
+        const resolved = (try collectFullTextResolvedDocSetAlloc(
+            alloc,
+            req,
+            active_executor,
+            exclusion_text,
+        )) orelse return error.UnsupportedQueryRequest;
+        var owned_resolved = resolved;
+        defer owned_resolved.deinit(alloc);
+        const filter = doc_set.ResolvedDocFilter{
+            .include = .all,
+            .exclude = owned_resolved,
+        };
+        try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, active_executor);
+    }
+
     if (req.filter_query_json.len > 0) {
         const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
         if (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &structured_filter_doc_sets, req.filter_query_json)) |resolved| {
@@ -2312,7 +2378,14 @@ fn collectFullTextResolvedDocSetAlloc(
     const arena_alloc = arena.allocator();
     const search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
 
-    return try collectSearchQueryResolvedDocSetAlloc(alloc, arena_alloc, executor, text_entry, search_query);
+    return try collectSearchQueryResolvedDocSetAlloc(
+        alloc,
+        arena_alloc,
+        executor,
+        text_entry,
+        search_query,
+        true,
+    );
 }
 
 fn resolvedDocFilterFromRequest(req: types.SearchRequest) ?*const doc_set.ResolvedDocFilter {
@@ -8524,7 +8597,14 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     if (patternFilterValueHasRole(parsed.value)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
-    return try collectSearchQueryResolvedDocSetAlloc(alloc, arena_alloc, executor, text_entry, search_query);
+    return try collectSearchQueryResolvedDocSetAlloc(
+        alloc,
+        arena_alloc,
+        executor,
+        text_entry,
+        search_query,
+        false,
+    );
 }
 
 fn collectSearchQueryResolvedDocSetAlloc(
@@ -8533,6 +8613,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
     executor: StructuredFilterResolverExecutor,
     text_entry: *index_manager_mod.IndexManager.TextIndex,
     search_query: search_mod.SearchQuery,
+    allow_analyzed_terms: bool,
 ) !?doc_set.ResolvedDocSet {
     const bench_profile = getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
     const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
@@ -8551,6 +8632,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
         search_query,
         text_entry.text_analysis,
         text_entry.runtime_schema,
+        allow_analyzed_terms,
     ))) return null;
     if (bench_profile) capability_ns = platform_time.monotonicNs() - capability_start_ns;
 
@@ -8626,6 +8708,7 @@ fn collectStructuredFilterTextDocNumsAlloc(
         search_query,
         text_entry.text_analysis,
         text_entry.runtime_schema,
+        false,
     ))) return null;
 
     const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
@@ -8717,6 +8800,7 @@ fn collectStructuredFilterDocIdsAlloc(
         search_query,
         text_entry.text_analysis,
         text_entry.runtime_schema,
+        false,
     ))) return null;
     const k: u32 = @intCast(@min(snapshot.global_doc_count, @as(u64, std.math.maxInt(u32))));
     var result = try search_mod.execute(alloc, snapshot, .{
@@ -8746,6 +8830,7 @@ fn searchQueryCanUseSnapshot(
     query: search_mod.SearchQuery,
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
+    allow_analyzed_terms: bool,
 ) !bool {
     return switch (query) {
         .match_none,
@@ -8759,7 +8844,8 @@ fn searchQueryCanUseSnapshot(
         .phrase => |item| try snapshot.hasInvertedField(item.field),
         .term_phrase => |item| try snapshot.hasInvertedField(item.field),
         .multi_phrase => |item| try snapshot.hasInvertedField(item.field),
-        .term => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
+        .term => |item| (allow_analyzed_terms or
+            try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
             try snapshot.hasInvertedField(item.field),
         .fuzzy => |item| try snapshot.hasInvertedField(item.field),
         .numeric_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .numeric),
@@ -8777,13 +8863,13 @@ fn searchQueryCanUseSnapshot(
         .regexp => |item| try snapshot.hasInvertedField(item.field),
         .bool_query => |item| {
             for (item.must) |child| {
-                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema))) return false;
+                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms))) return false;
             }
             for (item.should) |child| {
-                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema))) return false;
+                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms))) return false;
             }
             for (item.must_not) |child| {
-                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema))) return false;
+                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms))) return false;
             }
             return true;
         },
@@ -9922,12 +10008,14 @@ test "native string range filters require exact keyword-style postings coverage"
         ip_query,
         text_analysis,
         keyword_schema,
+        false,
     ));
     try std.testing.expect(try searchQueryCanUseSnapshot(
         keyword_snapshot,
         term_range_query,
         text_analysis,
         keyword_schema,
+        false,
     ));
 
     const text_schema = runtime_schema_mod.TableSchema{
@@ -9958,12 +10046,14 @@ test "native string range filters require exact keyword-style postings coverage"
         ip_query,
         text_analysis,
         text_schema,
+        false,
     )));
     try std.testing.expect(!(try searchQueryCanUseSnapshot(
         text_snapshot,
         term_range_query,
         text_analysis,
         text_schema,
+        false,
     )));
 }
 
@@ -13310,8 +13400,8 @@ fn logBenchDenseQueryProfile(
         .{
             req.index_name orelse "",
             req.primary_text_index_name orelse "",
-            req.filter_query_json.len > 0,
-            req.exclusion_query_json.len > 0,
+            req.filter_text != null or req.filter_query_json.len > 0,
+            req.exclusion_text != null or req.exclusion_query_json.len > 0,
             dense.k,
             req.limit,
             req.offset,

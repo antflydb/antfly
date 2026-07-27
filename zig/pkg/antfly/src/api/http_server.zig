@@ -21470,6 +21470,11 @@ test "api http server executes public Query filter roots and compositions" {
         "{\"term\":\"active\",\"field\":\"field\"}",
         "{\"prefix\":\"pre\",\"field\":\"prefix\"}",
         "{\"term\":\"gold\",\"field\":\"value\"}",
+        "{\"terms\":[\"receipt\"],\"field\":\"content\"}",
+        "{\"terms\":[[\"receipt\"]],\"field\":\"content\"}",
+        "{\"match_phrase\":\"receipt\",\"field\":\"content\"}",
+        "{\"multi_match\":{\"query\":\"rece\",\"type\":\"bool_prefix\",\"fields\":[\"content\"]}}",
+        "{\"disjuncts\":[{\"terms\":[\"receipt\"],\"field\":\"content\"},{\"term\":\"missing\",\"field\":\"status\"}],\"min\":1}",
     };
     for (filters) |filter| {
         const body = try std.fmt.allocPrint(
@@ -21503,6 +21508,26 @@ test "api http server executes public Query filter roots and compositions" {
             parsed.value.responses.?[0].hits.?.hits.?[0]._id,
         );
     }
+
+    var exclusion_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/files/query",
+        .content_type = "application/json",
+        .body = "{\"exclusion_query\":{\"terms\":[\"receipt\"],\"field\":\"content\"},\"full_text_search\":{\"match\":\"receipt\",\"field\":\"content\"}}",
+    });
+    defer exclusion_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), exclusion_resp.status);
+    var exclusion_parsed = try std.json.parseFromSlice(
+        metadata_openapi.QueryResponses,
+        alloc,
+        exclusion_resp.body,
+        .{},
+    );
+    defer exclusion_parsed.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        exclusion_parsed.value.responses.?[0].hits.?.hits.?.len,
+    );
 
     var unsupported_resp = try server.handle(.{
         .method = .POST,

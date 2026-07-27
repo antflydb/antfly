@@ -753,8 +753,15 @@ pub const IPRangeFilter = struct {
 };
 
 /// GeoShape filter: point-in-polygon test on geo_point typed doc values.
+pub const GeoShapeRelation = enum {
+    intersects,
+    within,
+    contains,
+};
+
 pub const GeoShapeFilter = struct {
     field: []const u8,
+    relation: GeoShapeRelation = .intersects,
     polygons: []const []const geo.GeoPoint,
 
     pub fn execute(self: GeoShapeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
@@ -768,6 +775,11 @@ pub const GeoShapeFilter = struct {
 
         for (0..seg.reader.doc_count) |doc_id| {
             const point = (try reader.getGeoPoint(@intCast(doc_id))) orelse continue;
+            // Indexed geo values are points. A point can intersect or be
+            // within a query polygon, but it cannot contain a non-empty
+            // polygon. Keep that relation exact instead of silently treating
+            // `contains` as `within`.
+            if (self.relation == .contains) continue;
             for (self.polygons) |polygon| {
                 if (geo.pointInPolygon(.{ .lat = point.lat, .lon = point.lon }, polygon)) {
                     try result.add(@intCast(doc_id));
@@ -3143,6 +3155,15 @@ test "geo shape filter point in polygon" {
     try testing.expect(bm.contains(0)); // (5,5) inside
     try testing.expect(!bm.contains(1)); // (15,5) outside
     try testing.expect(bm.contains(2)); // (3,3) inside
+
+    const contains_filter = Filter{ .geo_shape = .{
+        .field = "location",
+        .relation = .contains,
+        .polygons = filter.geo_shape.polygons,
+    } };
+    var contains = try contains_filter.execute(alloc, seg);
+    defer contains.deinit();
+    try testing.expect(contains.isEmpty());
 }
 
 test "term filter with synonym expansion" {

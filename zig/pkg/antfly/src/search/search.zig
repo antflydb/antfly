@@ -1204,8 +1204,17 @@ fn executeGeoShape(
 ) !SearchResult {
     return executeFilterQuery(alloc, snap, .{ .geo_shape = .{
         .field = gq.field,
+        .relation = geoShapeFilterRelation(gq.relation),
         .polygons = gq.polygons,
     } }, request, gq.boost);
+}
+
+fn geoShapeFilterRelation(relation: GeoShapeRelation) query_mod.GeoShapeRelation {
+    return switch (relation) {
+        .intersects => .intersects,
+        .within => .within,
+        .contains => .contains,
+    };
 }
 
 fn executeWildcard(
@@ -2429,6 +2438,7 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
         } },
         .geo_shape => |gq| .{ .geo_shape = .{
             .field = gq.field,
+            .relation = geoShapeFilterRelation(gq.relation),
             .polygons = gq.polygons,
         } },
         .match => |mq| blk: {
@@ -2611,7 +2621,11 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             .filter_slice = &.{},
         },
         .geo_shape => |gq| .{
-            .filter = .{ .geo_shape = .{ .field = gq.field, .polygons = gq.polygons } },
+            .filter = .{ .geo_shape = .{
+                .field = gq.field,
+                .relation = geoShapeFilterRelation(gq.relation),
+                .polygons = gq.polygons,
+            } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },
