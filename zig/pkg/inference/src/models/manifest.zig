@@ -119,6 +119,19 @@ pub const safetensors_index_candidates = [_][]const u8{
     "pytorch_model.safetensors.index.json",
 };
 
+/// Files read by `loadListingFromDir` whose paths are not necessarily retained
+/// on ModelManifest. Compatibility caches must include every entry so their
+/// decision describes the same metadata snapshot that listing parsed.
+pub const listing_compatibility_sidecars = [_][]const u8{
+    "antfly_inference_bundle.json",
+    "antfly_inference_variants.json",
+    "gliner_config.json",
+    "added_tokens.json",
+    "clip_config.json",
+    "special_tokens_map.json",
+    "1_SpladePooling/config.json",
+};
+
 /// Resolved model configuration loaded from a model directory.
 pub const ModelManifest = struct {
     allocator: std.mem.Allocator,

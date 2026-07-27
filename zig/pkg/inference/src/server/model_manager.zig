@@ -1960,7 +1960,7 @@ fn nativeModelLoadAdmission(
     return switch (backend) {
         .metal => .{
             // Device weights plus conservative host-side import/repacking staging.
-            .backend_weight_bytes = weights,
+            .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.metal, weights),
             .host_weight_bytes = weights / 4,
         },
         .cuda => .{
@@ -1968,7 +1968,7 @@ fn nativeModelLoadAdmission(
             // then uploads every resident weight before releasing the native copy.
             // Admit that full host peak as well as device residency; charging only
             // a repacking fraction allows large cold loads to pass and be OOM-killed.
-            .backend_weight_bytes = weights,
+            .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
             .host_weight_bytes = weights,
         },
         .native, .onnx, .wasm => .{
@@ -2243,7 +2243,7 @@ test "cuda model admission includes full native staging peak" {
     const weights: usize = 1024 * 1024;
     const cuda = try nativeModelLoadAdmission(weights, .cuda);
     try std.testing.expectEqual(weights, cuda.host_weight_bytes);
-    try std.testing.expectEqual(weights, cuda.backend_weight_bytes);
+    try std.testing.expect(cuda.backend_weight_bytes >= weights);
 
     const metal = try nativeModelLoadAdmission(weights, .metal);
     try std.testing.expectEqual(weights / 4, metal.host_weight_bytes);

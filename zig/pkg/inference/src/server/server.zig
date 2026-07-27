@@ -643,7 +643,7 @@ fn addShardedArtifactStatsToSignature(
     }
 }
 
-test "compatibility signature tracks classification sidecars" {
+test "compatibility signature tracks implicit GLiNER classification sidecar" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -658,19 +658,19 @@ test "compatibility signature tracks classification sidecars" {
         std.testing.io,
         &missing,
         model_dir,
-        "antfly_inference_bundle.json",
+        "special_tokens_map.json",
     );
 
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "antfly_inference_bundle.json",
-        .data = "{\"family\":\"clipclap_gguf_bundle/v1\"}",
+        .sub_path = "special_tokens_map.json",
+        .data = "{\"additional_special_tokens\":[\"[P]\",\"[C]\",\"[E]\",\"[R]\",\"[SEP_TEXT]\"]}",
     });
     var present = std.hash.Wyhash.init(0);
     addModelSidecarStatToSignature(
         std.testing.io,
         &present,
         model_dir,
-        "antfly_inference_bundle.json",
+        "special_tokens_map.json",
     );
     try std.testing.expect(missing.final() != present.final());
 }
@@ -1079,13 +1079,7 @@ pub const Node = struct {
         // completeness without necessarily changing an artifact path. Include
         // their stats explicitly so a hot compatibility cache cannot retain the
         // prior policy decision after an in-place model update.
-        for ([_][]const u8{
-            "antfly_inference_bundle.json",
-            "antfly_inference_variants.json",
-            "gliner_config.json",
-            "added_tokens.json",
-            "clip_config.json",
-        }) |sidecar_name| {
+        for (manifest_mod.listing_compatibility_sidecars) |sidecar_name| {
             addModelSidecarStatToSignature(
                 io,
                 &signature,

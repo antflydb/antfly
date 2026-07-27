@@ -63,6 +63,7 @@ const export_source_mod = @import("../models/export_source.zig");
 const gguf_mod = @import("../gguf/root.zig");
 const c_file = @import("../util/c_file.zig");
 const runtime = @import("../runtime/root.zig");
+const cuda_load_plan = @import("../ops/cuda/load_plan.zig");
 
 const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 pub const CudaRuntimeStats = if (build_options.enable_cuda) cuda_compute_mod.RuntimeStats else void;
@@ -250,6 +251,21 @@ pub fn estimateNativeWeightBytes(allocator: std.mem.Allocator, mf: manifest_mod.
     if (mf.safetensors_index_path) |path| return shardedSafetensorsTotalBytes(allocator, path);
     if (mf.safetensors_path) |path| return c_file.fileSize(allocator, path);
     return 0;
+}
+
+/// Keep backend-specific materialization policy behind the session factory.
+/// ModelManager owns admission orchestration, while each backend owns the
+/// physical representation it will create.
+pub fn estimateBackendWeightResidencyBytes(
+    backend: BackendType,
+    encoded_bytes: usize,
+) !usize {
+    return switch (backend) {
+        .cuda => cuda_load_plan.estimateEncodedArtifactDeviceBytes(encoded_bytes),
+        .metal => encoded_bytes,
+        .native, .onnx, .wasm => 0,
+        .pjrt => error.UnsupportedBackend,
+    };
 }
 
 fn glinerBaseWeightKey(full_name: []const u8) []const u8 {

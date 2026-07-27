@@ -1091,7 +1091,11 @@ fn readCgroupHierarchy(
 }
 
 fn canonicalCgroupProbeIsAuthoritative(probe: CgroupHierarchyProbe) bool {
-    return probe.leaf_present and probe.info.limit_bytes != null;
+    // A readable controller file proves that the canonical process directory
+    // exists. The hierarchy walk has already inspected every ancestor up to
+    // the mount root, so absence of a finite limit is itself authoritative and
+    // must not trigger a serialized /proc/self/mountinfo scan per admission.
+    return probe.leaf_present;
 }
 
 fn probeCgroupMemoryInfoLinux() CgroupMemoryInfo {
@@ -1413,6 +1417,10 @@ test "canonical cgroup probe rejects ancestor-only subtree matches" {
     }));
     try std.testing.expect(canonicalCgroupProbeIsAuthoritative(.{
         .info = .{ .limit_bytes = gib(2), .current_bytes = gib(1) },
+        .leaf_present = true,
+    }));
+    try std.testing.expect(canonicalCgroupProbeIsAuthoritative(.{
+        .info = .{},
         .leaf_present = true,
     }));
 }

@@ -423,6 +423,10 @@ pub const TokenCallback = *const fn (ctx: *anyopaque, token_text: []const u8) bo
 
 const StreamingTextState = struct {
     emitted_text: []u8,
+    /// Set from the model contract, independently of tokenizer resolution.
+    /// A channel-aware model must never fall back to decoding its raw generated
+    /// tokens merely because one of the protocol tokens is missing or malformed.
+    final_channel_required: bool = false,
     final_channel_end_token_id: ?i32 = null,
     /// Exact token sequence for `<|channel>final\n<channel|>`. A bare
     /// `<channel|>` also terminates private/intermediate channel headers, so it
@@ -480,13 +484,20 @@ fn finalChannelTokenSlice(token_ids: []const i64, marker_id: ?i32) []const i64 {
 
 fn finalResponseTokenSlice(
     token_ids: []const i64,
+    final_channel_required: bool,
     marker_id: ?i32,
     final_header_token_ids: []const i32,
     channel_start_id: ?i32,
     turn_end_id: ?i32,
-    finish_reason: []const u8,
 ) []const i64 {
-    if (marker_id == null or turn_end_id == null) return token_ids;
+    if (!final_channel_required) return token_ids;
+    if (marker_id == null or
+        turn_end_id == null or
+        channel_start_id == null or
+        final_header_token_ids.len == 0)
+    {
+        return token_ids[0..0];
+    }
     if (completeFinalChannelRange(
         token_ids,
         final_header_token_ids,
@@ -495,18 +506,11 @@ fn finalResponseTokenSlice(
     )) |range| {
         return token_ids[range.start..range.end];
     }
-    // A channel boundary without the exact final-channel header is private or
-    // malformed protocol output. Fail closed rather than treating the last
-    // generic boundary as public content. This keeps buffered and streaming
-    // projections identical when a model emits another channel after `final`.
-    if (finalChannelContentStart(token_ids, marker_id) != null or
-        std.mem.eql(u8, finish_reason, "length"))
-    {
-        return token_ids[0..0];
-    }
-    // A normal EOS without any channel protocol remains a valid direct-answer
-    // fallback for compatible checkpoints that do not emit PLE channels.
-    return token_ids;
+    // The generation prompt for a channel-aware model opens the private
+    // `thought` channel. Until the exact final-channel header is present, every
+    // generated token is private regardless of whether generation ended by
+    // length, EOS, cancellation, or a malformed protocol boundary.
+    return token_ids[0..0];
 }
 
 fn resolveTokenId(
@@ -551,7 +555,12 @@ fn emitDecodedDeltaForTokenizer(
     on_token_ctx: *anyopaque,
 ) !bool {
     var projected_ids = generated_token_ids;
-    if (state.final_channel_end_token_id != null and state.turn_end_token_id != null) {
+    if (state.final_channel_required) {
+        if (state.final_channel_end_token_id == null) return true;
+        const turn_end = state.turn_end_token_id orelse return true;
+        const channel_start_token = state.channel_start_token_id orelse return true;
+        if (state.final_channel_header_token_ids.len == 0) return true;
+
         if (state.final_channel_content_start == null) {
             // Generation grows monotonically. Only consider newly appended
             // sequence ends, while allowing the header itself to straddle
@@ -582,16 +591,13 @@ fn emitDecodedDeltaForTokenizer(
             const turn_end_offset = std.mem.indexOfScalar(
                 i64,
                 generated_token_ids[scan_start..],
-                state.turn_end_token_id.?,
+                turn_end,
             );
-            const next_channel_offset = if (state.channel_start_token_id) |channel_token|
-                std.mem.indexOfScalar(
-                    i64,
-                    generated_token_ids[scan_start..],
-                    channel_token,
-                )
-            else
-                null;
+            const next_channel_offset = std.mem.indexOfScalar(
+                i64,
+                generated_token_ids[scan_start..],
+                channel_start_token,
+            );
             const content_end_offset = if (turn_end_offset) |turn_offset|
                 if (next_channel_offset) |channel_offset|
                     @min(turn_offset, channel_offset)
@@ -2760,6 +2766,8 @@ pub const NativeGenerationPipeline = struct {
             }
         }
         const stream_enabled = on_token_fn != null and on_token_ctx != null;
+        const final_channel_required =
+            self.gpt_config.family == .gemma and self.gpt_config.hasPle();
         // Resolve the channel protocol once for the whole request. Buffered and
         // streaming callers must use the same exact final-header projection;
         // resolving only the generic terminator at completion can expose a
@@ -2780,6 +2788,7 @@ pub const NativeGenerationPipeline = struct {
         defer if (owned_final_channel_header) |ids| allocator.free(ids);
         var streaming_text = StreamingTextState{
             .emitted_text = if (stream_enabled) try allocator.dupe(u8, "") else &.{},
+            .final_channel_required = final_channel_required,
             .final_channel_end_token_id = final_channel_end,
             .final_channel_header_token_ids = owned_final_channel_header orelse &.{},
             .channel_start_token_id = channel_start,
@@ -3308,11 +3317,11 @@ pub const NativeGenerationPipeline = struct {
         const turn_end_token_id = streaming_text.turn_end_token_id;
         const projected_gen_token_ids = finalResponseTokenSlice(
             token_ids[gen_start..seq_len],
+            streaming_text.final_channel_required,
             final_channel_end_token_id,
             streaming_text.final_channel_header_token_ids,
             streaming_text.channel_start_token_id,
             turn_end_token_id,
-            finish_reason,
         );
         const projected_gen_ids = try allocator.alloc(i32, projected_gen_token_ids.len);
         errdefer allocator.free(projected_gen_ids);
@@ -3320,15 +3329,6 @@ pub const NativeGenerationPipeline = struct {
 
         const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const text = try self.tokenizer.decode(allocator, projected_gen_ids);
-        if (stream_enabled and
-            final_channel_end_token_id != null and
-            turn_end_token_id != null and
-            !streaming_text.saw_final_channel and
-            !std.mem.eql(u8, finish_reason, "length") and
-            text.len > 0)
-        {
-            _ = on_token_fn.?(on_token_ctx.?, text);
-        }
         const finished_generate_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const timing_ms: ?GenerationTimingMs = if (self.io != null) .{
             .prompt_format = timestampDurationMillis(started_at, formatted_prompt_at),
@@ -8101,7 +8101,7 @@ test "final channel projection requires exact header and stops before trailing c
     try std.testing.expectEqualSlices(
         i64,
         &.{10},
-        finalResponseTokenSlice(&ids, 101, &header, 102, 106, "stop"),
+        finalResponseTokenSlice(&ids, true, 101, &header, 102, 106),
     );
 
     const malformed_trailing = [_]i64{
@@ -8111,22 +8111,32 @@ test "final channel projection requires exact header and stops before trailing c
     try std.testing.expectEqualSlices(
         i64,
         &.{10},
-        finalResponseTokenSlice(&malformed_trailing, 101, &header, 102, 106, "stop"),
+        finalResponseTokenSlice(&malformed_trailing, true, 101, &header, 102, 106),
     );
     try std.testing.expectEqualSlices(
         i64,
         &.{},
-        finalResponseTokenSlice(&.{ 7, 101, 10 }, 101, &header, 102, 106, "stop"),
+        finalResponseTokenSlice(&.{ 7, 101, 10 }, true, 101, &header, 102, 106),
     );
     try std.testing.expectEqualSlices(
         i64,
         &.{},
-        finalResponseTokenSlice(&.{ 7, 8 }, 101, &header, 102, 106, "length"),
+        finalResponseTokenSlice(&.{ 7, 8 }, true, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        finalResponseTokenSlice(&.{ 7, 8 }, true, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        finalResponseTokenSlice(&.{ 7, 8 }, true, null, &.{}, null, null),
     );
     try std.testing.expectEqualSlices(
         i64,
         &.{ 7, 8 },
-        finalResponseTokenSlice(&.{ 7, 8 }, 101, &header, 102, 106, "stop"),
+        finalResponseTokenSlice(&.{ 7, 8 }, false, null, &.{}, null, null),
     );
 }
 
@@ -8174,6 +8184,7 @@ test "streaming final channel projection ignores intermediate boundaries and str
     defer capture.text.deinit(allocator);
     var state = StreamingTextState{
         .emitted_text = try allocator.dupe(u8, ""),
+        .final_channel_required = true,
         .final_channel_end_token_id = 101,
         .final_channel_header_token_ids = &.{ 102, 103, 104, 101 },
         .channel_start_token_id = 102,
@@ -8244,6 +8255,7 @@ test "streaming final channel projection ignores intermediate boundaries and str
     defer trailing_capture.text.deinit(allocator);
     var trailing_state = StreamingTextState{
         .emitted_text = try allocator.dupe(u8, ""),
+        .final_channel_required = true,
         .final_channel_end_token_id = 101,
         .final_channel_header_token_ids = &.{ 102, 103, 104, 101 },
         .channel_start_token_id = 102,
@@ -8259,6 +8271,30 @@ test "streaming final channel projection ignores intermediate boundaries and str
         &trailing_capture,
     ));
     try std.testing.expectEqualStrings("answer follows", trailing_capture.text.items);
+
+    // Tokenizer metadata is part of the security boundary. A channel-aware
+    // model with an incomplete protocol vocabulary must buffer indefinitely
+    // rather than falling back to raw reasoning text.
+    var incomplete_capture = Capture{ .allocator = allocator };
+    defer incomplete_capture.text.deinit(allocator);
+    var incomplete_state = StreamingTextState{
+        .emitted_text = try allocator.dupe(u8, ""),
+        .final_channel_required = true,
+        .final_channel_end_token_id = 101,
+        .final_channel_header_token_ids = &.{ 102, 103, 104, 101 },
+        .channel_start_token_id = 102,
+        .turn_end_token_id = null,
+    };
+    defer allocator.free(incomplete_state.emitted_text);
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8 },
+        &incomplete_state,
+        Capture.callback,
+        &incomplete_capture,
+    ));
+    try std.testing.expectEqualStrings("", incomplete_capture.text.items);
 }
 
 test "shouldAddBosToken keeps bos when prompt lacks literal prefix" {
