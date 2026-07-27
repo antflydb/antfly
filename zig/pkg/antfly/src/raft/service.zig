@@ -1497,6 +1497,39 @@ test "managed host service seeds queued transitions from projected metadata stor
     defer restarted.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), restarted.metrics.queued_split_transitions);
+
+    // Fail after the replacement adapter has been allocated, while persisted
+    // transitions are being read for seeding. The old executor, queue, metrics,
+    // and adapter must remain live, and the partial replacement must be freed.
+    const previous_adapter = restarted.shardOperationAdapter() orelse return error.TestExpectedEqual;
+    var replacement_runtime = transition_runtime.TransitionRuntime{
+        .split = fake_split.iface(),
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 1,
+    });
+    {
+        const service_alloc = restarted.alloc;
+        restarted.alloc = failing.allocator();
+        defer restarted.alloc = service_alloc;
+        try std.testing.expectError(
+            error.OutOfMemory,
+            restarted.replaceTransitionOps(replacement_runtime.shardOperationAdapter()),
+        );
+    }
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), failing.allocations);
+    try std.testing.expectEqual(failing.allocations, failing.deallocations);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expectEqual(@as(usize, 1), restarted.metrics.queued_split_transitions);
+    try std.testing.expect(restarted.transition_svc.?.splitRecord(901) != null);
+    _ = try previous_adapter.observeSplit(.{
+        .transition_id = 901,
+        .attempt_epoch = 1,
+        .source_group_id = 1300,
+        .destination_group_id = 1301,
+    });
+
     try establishManagedHostTransitionAuthorityForTest(&restarted, 1300);
 
     try restarted.runRound();
@@ -2143,8 +2176,8 @@ test "managed host service preserves leader-routed observation roles from transi
     try std.testing.expect(!merge.donor_local_leader);
     try std.testing.expect(merge.receiver_local_leader);
 
-    // Replacement is failure-atomic: construction or metadata seeding errors
-    // leave the live transition executor and its callback admission intact.
+    // Replacement construction errors leave the live transition executor and
+    // its callback admission intact.
     const previous_adapter = svc.shardOperationAdapter() orelse return error.TestExpectedEqual;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
         .fail_index = 0,

@@ -97,6 +97,7 @@ pub const TransitionStepResult = struct {
 pub const TransitionService = struct {
     alloc: std.mem.Allocator,
     retry_clock: RetryClock,
+    retry_jitter_salt: u64,
     ops: union(enum) {
         runtime: transition_runtime.TransitionRuntime,
         adapter: shard_ops.OwnedShardOperationAdapter,
@@ -128,10 +129,12 @@ pub const TransitionService = struct {
         return .{
             .alloc = alloc,
             .retry_clock = retry_clock,
+            .retry_jitter_salt = randomRetryJitterSalt(),
             .ops = if (@hasField(OpsType, "ptr") and @hasField(OpsType, "vtable"))
                 .{ .adapter = try shard_ops.OwnedShardOperationAdapter.init(alloc, .{
                     .ptr = ops.ptr,
                     .vtable = ops.vtable,
+                    .context_id = if (@hasField(OpsType, "context_id")) ops.context_id else 0,
                 }) }
             else
                 .{ .runtime = .{
@@ -402,6 +405,7 @@ pub const TransitionService = struct {
                     &self.split_observation_retries,
                     record.transition_id,
                     now_ms,
+                    self.retry_jitter_salt,
                 );
                 std.log.warn("split transition background observation failed transition_id={d} err={s}", .{
                     record.transition_id,
@@ -427,6 +431,7 @@ pub const TransitionService = struct {
                     &self.merge_observation_retries,
                     record.transition_id,
                     now_ms,
+                    self.retry_jitter_salt,
                 );
                 std.log.warn("merge transition background observation failed transition_id={d} err={s}", .{
                     record.transition_id,
@@ -448,7 +453,7 @@ pub const TransitionService = struct {
             if (record.phase == .finalized or record.phase == .rolled_back) continue;
             if (retryPending(&self.split_retries, record.transition_id, now_ms)) continue;
             const observation = runtime.observeSplit(record.*) catch |err| {
-                try recordRetry(self.alloc, &self.split_retries, record.transition_id, now_ms);
+                try recordRetry(self.alloc, &self.split_retries, record.transition_id, now_ms, self.retry_jitter_salt);
                 std.log.warn("split transition observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
                 continue;
             };
@@ -468,7 +473,7 @@ pub const TransitionService = struct {
                 else => {},
             }
             _ = metadata.TransitionDriver.stepSplitObserved(runtime, record, observation) catch |err| {
-                try recordRetry(self.alloc, &self.split_retries, record.transition_id, now_ms);
+                try recordRetry(self.alloc, &self.split_retries, record.transition_id, now_ms, self.retry_jitter_salt);
                 std.log.warn("split transition step failed transition_id={d} phase={s} err={s}", .{ record.transition_id, @tagName(record.phase), @errorName(err) });
                 continue;
             };
@@ -479,6 +484,7 @@ pub const TransitionService = struct {
                     &self.split_retries,
                     record.transition_id,
                     now_ms,
+                    self.retry_jitter_salt,
                 );
                 std.log.warn("split transition post-step observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
                 break :blk null;
@@ -506,7 +512,7 @@ pub const TransitionService = struct {
             if (record.phase == .finalized or record.phase == .rolled_back) continue;
             if (retryPending(&self.merge_retries, record.transition_id, now_ms)) continue;
             const observation = runtime.observeMerge(record.*) catch |err| {
-                try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms);
+                try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms, self.retry_jitter_salt);
                 std.log.warn("merge transition observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
                 continue;
             };
@@ -521,7 +527,7 @@ pub const TransitionService = struct {
                 else => {},
             }
             _ = metadata.TransitionDriver.stepMergeObserved(runtime, record, observation) catch |err| {
-                try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms);
+                try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms, self.retry_jitter_salt);
                 std.log.warn("merge transition step failed transition_id={d} phase={s} err={s}", .{ record.transition_id, @tagName(record.phase), @errorName(err) });
                 continue;
             };
@@ -532,6 +538,7 @@ pub const TransitionService = struct {
                     &self.merge_retries,
                     record.transition_id,
                     now_ms,
+                    self.retry_jitter_salt,
                 );
                 std.log.warn("merge transition post-step observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
                 break :blk null;
@@ -634,6 +641,7 @@ pub const TransitionService = struct {
                     &self.split_retries,
                     record.transition_id,
                     now_ms,
+                    self.retry_jitter_salt,
                 );
                 std.log.warn("terminal split transition observation failed transition_id={d} err={s}", .{
                     record.transition_id,
@@ -669,6 +677,7 @@ pub const TransitionService = struct {
                     &self.merge_retries,
                     record.transition_id,
                     now_ms,
+                    self.retry_jitter_salt,
                 );
                 std.log.warn("terminal merge transition observation failed transition_id={d} err={s}", .{
                     record.transition_id,
@@ -869,6 +878,38 @@ fn realMonotonicMillis(_: ?*anyopaque) u64 {
     return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
 }
 
+fn randomRetryJitterSalt() u64 {
+    var salt: u64 = undefined;
+    std.Options.debug_io.random(std.mem.asBytes(&salt));
+    return if (salt == 0) 1 else salt;
+}
+
+fn mixRetryJitter(value: u64) u64 {
+    var mixed = value;
+    mixed = (mixed ^ (mixed >> 30)) *% 0xbf58_476d_1ce4_e5b9;
+    mixed = (mixed ^ (mixed >> 27)) *% 0x94d0_49bb_1331_11eb;
+    return mixed ^ (mixed >> 31);
+}
+
+fn retryDelayMs(
+    jitter_salt: u64,
+    transition_id: u64,
+    failures: u8,
+) u64 {
+    const shift: u6 = @intCast(@min(failures - 1, 6));
+    const ceiling_ms = @min(transition_retry_initial_ms << shift, transition_retry_max_ms);
+    // A zero salt is reserved for deterministic tests. Production services
+    // receive an independently randomized salt so replicas and transitions do
+    // not synchronize their retry waves during a shared outage.
+    if (jitter_salt == 0) return ceiling_ms;
+    const floor_ms = @max(ceiling_ms / 2, 1);
+    const span_ms = ceiling_ms - floor_ms + 1;
+    const entropy = mixRetryJitter(
+        jitter_salt ^ transition_id ^ (@as(u64, failures) *% 0x9e37_79b9_7f4a_7c15),
+    );
+    return floor_ms + (entropy % span_ms);
+}
+
 fn retryPending(retries: *const std.AutoHashMapUnmanaged(u64, TransitionRetry), transition_id: u64, now_ms: u64) bool {
     const retry = retries.get(transition_id) orelse return false;
     return now_ms < retry.retry_at_ms;
@@ -879,15 +920,35 @@ fn recordRetry(
     retries: *std.AutoHashMapUnmanaged(u64, TransitionRetry),
     transition_id: u64,
     now_ms: u64,
+    jitter_salt: u64,
 ) !void {
     const entry = try retries.getOrPut(alloc, transition_id);
     const failures = if (entry.found_existing) @min(entry.value_ptr.failures +| 1, 8) else 1;
-    const shift: u6 = @intCast(@min(failures - 1, 6));
-    const delay_ms = @min(transition_retry_initial_ms << shift, transition_retry_max_ms);
+    const delay_ms = retryDelayMs(jitter_salt, transition_id, failures);
     entry.value_ptr.* = .{
         .failures = failures,
         .retry_at_ms = now_ms +| delay_ms,
     };
+}
+
+test "transition retry jitter is bounded and desynchronizes services" {
+    for (1..9) |failure_index| {
+        const failures: u8 = @intCast(failure_index);
+        const ceiling_ms = retryDelayMs(0, 77, failures);
+        const jittered_ms = retryDelayMs(0x1234_5678_9abc_def0, 77, failures);
+        try std.testing.expect(jittered_ms >= @max(ceiling_ms / 2, 1));
+        try std.testing.expect(jittered_ms <= ceiling_ms);
+    }
+
+    const baseline_ms = retryDelayMs(1, 77, 4);
+    var found_distinct_delay = false;
+    for (2..32) |salt| {
+        if (retryDelayMs(@intCast(salt), 77, 4) != baseline_ms) {
+            found_distinct_delay = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_distinct_delay);
 }
 
 fn findSplitIndex(records: []const metadata.SplitTransitionRecord, transition_id: u64) ?usize {
@@ -1198,6 +1259,78 @@ test "transition service steps split and merge queues through runtime" {
     try std.testing.expect(merge.status.allow_doc_identity_reassignment);
 }
 
+test "transition service preserves nested guarded adapter identity" {
+    const Split = struct {
+        fn iface(self: *@This()) transition_runtime.SplitRuntime {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .observe_status = observeStatus,
+                    .prepare_source = unsupportedPrepare,
+                    .start_source = unsupportedBool,
+                    .bootstrap_destination = unsupportedBool,
+                    .catch_up_destination = unsupportedUsize,
+                    .finalize_source = unsupportedBool,
+                    .rollback_source = unsupportedBool,
+                },
+            };
+        }
+
+        fn observeStatus(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !data.SplitTransitionStatus {
+            return .{
+                .phase = .prepare,
+                .source_split_phase = .prepare,
+                .bootstrapped = false,
+                .replay_required = false,
+                .replay_caught_up = false,
+                .cutover_ready = false,
+                .destination_ready_for_reads = false,
+                .source_delta_sequence = 0,
+                .dest_delta_sequence = 0,
+            };
+        }
+
+        fn unsupportedPrepare(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []const u8, _: ?[]const u8) !bool {
+            return error.TestUnexpectedResult;
+        }
+
+        fn unsupportedBool(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !bool {
+            return error.TestUnexpectedResult;
+        }
+
+        fn unsupportedUsize(_: *anyopaque, _: u64, _: u64, _: u64, _: u64) !usize {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    const record = metadata.SplitTransitionRecord{
+        .transition_id = 31,
+        .attempt_epoch = 1,
+        .source_group_id = 41,
+        .destination_group_id = 42,
+    };
+    var split = Split{};
+    var runtime = transition_runtime.TransitionRuntime{ .split = split.iface() };
+    var owner = try shard_ops.OwnedShardOperationAdapter.init(
+        std.testing.allocator,
+        runtime.shardOperationAdapter(),
+    );
+    defer owner.deinit();
+    var registration = owner.registration();
+    defer registration.deinit();
+
+    var svc = try TransitionService.init(std.testing.allocator, owner.adapter());
+    defer svc.deinit();
+    const observation = try svc.shardOperationAdapter().observeSplit(record);
+    try std.testing.expectEqual(data.RangeTransitionPhase.prepare, observation.status.phase);
+
+    registration.deinit();
+    try std.testing.expectError(
+        error.TransitionOperationsRetired,
+        svc.shardOperationAdapter().observeSplit(record),
+    );
+}
+
 test "transition service retries split bootstrap after leader recovery" {
     const Clock = struct {
         now_ms: u64 = 1_000,
@@ -1327,6 +1460,7 @@ test "transition service retries split bootstrap after leader recovery" {
         clock.source(),
     );
     defer svc.deinit();
+    svc.retry_jitter_salt = 0;
     try svc.submitSplit(.{
         .transition_id = 7,
         .attempt_epoch = 1,
@@ -1951,6 +2085,7 @@ test "transition service refreshes bounded observations and preserves terminal s
         clock.source(),
     );
     defer svc.deinit();
+    svc.retry_jitter_salt = 0;
 
     try svc.submitSplit(.{
         .transition_id = 71,
@@ -2123,6 +2258,7 @@ test "transition service retains terminal records until terminal observation suc
         clock.source(),
     );
     defer svc.deinit();
+    svc.retry_jitter_salt = 0;
 
     try svc.submitSplit(.{
         .transition_id = 73,

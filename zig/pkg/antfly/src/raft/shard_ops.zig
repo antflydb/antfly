@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const metadata_actions = @import("../metadata/transition_actions.zig");
 const metadata_driver = @import("../metadata/transition_driver.zig");
 const metadata_state = @import("../metadata/transition_state.zig");
@@ -192,6 +193,45 @@ pub const OwnedShardOperationAdapter = struct {
         [_]RegistryBucket{.{}} ** registry_bucket_count;
     var next_context_id: std.atomic.Value(u64) = .init(1);
 
+    const AdmissionTest = if (builtin.is_test) struct {
+        const Gate = struct {
+            mutex: std.Io.Mutex = .init,
+            changed: std.Io.Condition = .init,
+            entered: bool = false,
+            released: bool = false,
+
+            fn waitUntilEntered(self: *Gate) void {
+                self.mutex.lockUncancelable(std.Options.debug_io);
+                defer self.mutex.unlock(std.Options.debug_io);
+                while (!self.entered) {
+                    self.changed.waitUncancelable(std.Options.debug_io, &self.mutex);
+                }
+            }
+
+            fn release(self: *Gate) void {
+                self.mutex.lockUncancelable(std.Options.debug_io);
+                defer self.mutex.unlock(std.Options.debug_io);
+                self.released = true;
+                self.changed.broadcast(std.Options.debug_io);
+            }
+        };
+
+        var gate: ?*Gate = null;
+
+        fn pauseBeforeAcquire() void {
+            const active = gate orelse return;
+            active.mutex.lockUncancelable(std.Options.debug_io);
+            defer active.mutex.unlock(std.Options.debug_io);
+            active.entered = true;
+            active.changed.broadcast(std.Options.debug_io);
+            while (!active.released) {
+                active.changed.waitUncancelable(std.Options.debug_io, &active.mutex);
+            }
+        }
+    } else struct {
+        fn pauseBeforeAcquire() void {}
+    };
+
     const CallLease = struct {
         state: *State,
 
@@ -228,6 +268,7 @@ pub const OwnedShardOperationAdapter = struct {
     }
 
     fn acquireRegistered(ptr: *anyopaque, context_id: u64) !CallLease {
+        AdmissionTest.pauseBeforeAcquire();
         if (context_id == 0) return error.TransitionOperationsRetired;
         const bucket = registryBucket(context_id);
         bucket.lock();
@@ -530,4 +571,61 @@ test "shard operation adapter metadata runtime dispatches actions" {
             .destination_group_id = 21,
         }),
     );
+
+    // Exercise the exact pre-admission window: the callback has been
+    // dispatched, but teardown retires and frees its state before it can look
+    // up a lease. The stale pointer must only be compared as an address.
+    const Worker = struct {
+        const Result = enum {
+            pending,
+            succeeded,
+            retired,
+            unexpected_error,
+        };
+
+        adapter: ShardOperationAdapter,
+        result: Result = .pending,
+
+        fn run(self: *@This()) void {
+            _ = self.adapter.observeSplit(.{
+                .transition_id = 3,
+                .attempt_epoch = 1,
+                .source_group_id = 30,
+                .destination_group_id = 31,
+            }) catch |err| {
+                self.result = if (err == error.TransitionOperationsRetired)
+                    .retired
+                else
+                    .unexpected_error;
+                return;
+            };
+            self.result = .succeeded;
+        }
+    };
+
+    var concurrent_owner = try OwnedShardOperationAdapter.init(
+        std.testing.allocator,
+        fake.adapter(),
+    );
+    defer concurrent_owner.deinit();
+    var concurrent_registration = concurrent_owner.registration();
+    defer concurrent_registration.deinit();
+    var gate = OwnedShardOperationAdapter.AdmissionTest.Gate{};
+    OwnedShardOperationAdapter.AdmissionTest.gate = &gate;
+    defer OwnedShardOperationAdapter.AdmissionTest.gate = null;
+    var worker = Worker{ .adapter = concurrent_owner.adapter() };
+    var thread: ?std.Thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer if (thread) |pending_thread| {
+        gate.release();
+        pending_thread.join();
+    };
+
+    gate.waitUntilEntered();
+    concurrent_registration.deinit();
+    concurrent_owner.deinit();
+    gate.release();
+    const joined_thread = thread.?;
+    thread = null;
+    joined_thread.join();
+    try std.testing.expectEqual(Worker.Result.retired, worker.result);
 }
