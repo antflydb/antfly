@@ -54,8 +54,15 @@ echo "traces:   ${#trace_files[@]} file(s)"
 echo "parallel: ${PARALLEL}"
 echo ""
 
-STATEDIR="$(mktemp -d)"
-trap 'rm -rf "${STATEDIR}"' EXIT
+# Honor an externally supplied STATEDIR (and leave it in place for the
+# caller — e.g. the trace visualizer reads tlc.log for its verdict overlay);
+# otherwise use a self-cleaning temp dir. Note the FAIL path printed below is
+# only readable after exit when STATEDIR was supplied.
+if [ -z "${STATEDIR:-}" ]; then
+    STATEDIR="$(mktemp -d)"
+    trap 'rm -rf "${STATEDIR}"' EXIT
+fi
+mkdir -p "${STATEDIR}"
 
 preprocess_trace() {
     local trace="${1}"
