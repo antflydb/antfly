@@ -178,20 +178,60 @@ pub fn compatibilitySummaryForBackend(
                 };
             }
         }
-    } else if (candidate == .onnx and
-        (backend != .onnx or !build_options.enable_onnx))
-    {
-        backends.imported_onnx_session.inspectGraphCompatibility(
+    }
+
+    // Every ONNX graph that this bundle can load participates in the policy
+    // decision, not only the primary text graph. This prevents a compatible
+    // primary graph from admitting an invalid vision/audio/projection graph
+    // that would be loaded lazily after the request starts.
+    const onnx_paths = [_]?[]const u8{
+        man.onnx_path,
+        man.visual_model_path,
+        man.audio_model_path,
+        man.text_projection_path,
+        man.visual_projection_path,
+        man.audio_projection_path,
+    };
+    for (onnx_paths, 0..) |maybe_path, path_index| {
+        const path = maybe_path orelse continue;
+        if (!std.mem.endsWith(u8, path, ".onnx")) continue;
+        var duplicate = false;
+        for (onnx_paths[0..path_index]) |previous| {
+            if (previous) |existing| {
+                if (std.mem.eql(u8, existing, path)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+        }
+        if (duplicate) continue;
+
+        var artifacts = backends.imported_onnx_session.inspectArtifactSet(
             allocator,
-            man.onnx_path.?,
+            path,
         ) catch |err| {
             if (err == error.OutOfMemory) return err;
             return .{
                 .level = .incompatible,
                 .code = .invalid_graph,
-                .message = "ONNX graph cannot be converted and validated by the selected backend",
+                .message = "ONNX graph or external tensor data is invalid or unreadable",
             };
         };
+        artifacts.deinit();
+
+        if (backend != .onnx or !build_options.enable_onnx) {
+            backends.imported_onnx_session.inspectGraphCompatibility(
+                allocator,
+                path,
+            ) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return .{
+                    .level = .incompatible,
+                    .code = .invalid_graph,
+                    .message = "ONNX graph cannot be converted and validated by the selected backend",
+                };
+            };
+        }
     }
     return summaryFromAssessment(assessment);
 }
@@ -1002,13 +1042,18 @@ pub const LoadedModel = struct {
         if (slot.* != null) return;
         const session_path = path orelse return;
         const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
-        var loaded = try self.model_manager.loadOptionalSessionWithAdmission(
+        const strict_backend = [_]backends.BackendType{if (shared_ctx) |shared|
+            shared.backendType()
+        else
+            self.session.backend()};
+        var loaded = try self.model_manager.loadManagedSessionWithAdmission(
             session_path,
-            self.session.backend(),
+            strict_backend[0..],
             shared_ctx,
         );
         slot.* = loaded.session;
         lease_slot.* = loaded.resource_lease;
+        loaded.owns_session = false;
         loaded.resource_lease = null;
     }
 
@@ -1339,6 +1384,130 @@ pub const ModelManager = struct {
         self.admission_limit_overrides = overrides;
     }
 
+    /// A short-lived, policy-validated handle for loading every graph in a
+    /// composite model bundle. Creating the loader evaluates serving policy
+    /// once; every session then uses the same allowed backend order, injected
+    /// graph runtime, and process-wide admission controller.
+    pub const ComponentLoader = struct {
+        manager: *ModelManager,
+        allowed_backends: [7]backends.BackendType = undefined,
+        allowed_backend_count: usize = 0,
+
+        pub fn preferredBackends(self: *const ComponentLoader) []const backends.BackendType {
+            return self.allowed_backends[0..self.allowed_backend_count];
+        }
+
+        pub fn restrictToBackend(
+            self: *const ComponentLoader,
+            backend: backends.BackendType,
+        ) !ComponentLoader {
+            for (self.preferredBackends()) |allowed| {
+                if (allowed == backend) {
+                    var restricted = ComponentLoader{ .manager = self.manager };
+                    restricted.allowed_backends[0] = backend;
+                    restricted.allowed_backend_count = 1;
+                    return restricted;
+                }
+            }
+            return error.IncompatibleModel;
+        }
+
+        pub fn load(
+            self: *const ComponentLoader,
+            model_path: []const u8,
+        ) !ManagedSession {
+            return self.manager.loadManagedSessionWithAdmission(
+                model_path,
+                self.preferredBackends(),
+                null,
+            );
+        }
+
+        pub fn loadWithImportedOnnxContext(
+            self: *const ComponentLoader,
+            model_path: []const u8,
+            shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
+        ) !ManagedSession {
+            return self.manager.loadManagedSessionWithAdmission(
+                model_path,
+                self.preferredBackends(),
+                shared_backend_ctx,
+            );
+        }
+
+        /// Adapter for SessionPool's lazy factory. The heap box keeps the
+        /// admission lease paired with the session until the pool closes it.
+        pub fn sessionPoolLoader(self: *ComponentLoader) backends.SessionPool.Loader {
+            return .{
+                .context = self,
+                .load_fn = loadForSessionPool,
+            };
+        }
+
+        fn loadForSessionPool(
+            context: *anyopaque,
+            model_path: []const u8,
+        ) !backends.SessionPool.OwnedSession {
+            const self: *ComponentLoader = @ptrCast(@alignCast(context));
+            const managed = try self.load(model_path);
+            const boxed = self.manager.allocator.create(PoolManagedSession) catch |err| {
+                var cleanup = managed;
+                cleanup.deinit();
+                return err;
+            };
+            boxed.* = .{
+                .allocator = self.manager.allocator,
+                .managed = managed,
+            };
+            return .{
+                .session = managed.session,
+                .close_context = boxed,
+                .close_fn = closeSessionPoolSession,
+            };
+        }
+
+        fn closeSessionPoolSession(context: ?*anyopaque, _: backends.Session) void {
+            const boxed: *PoolManagedSession = @ptrCast(@alignCast(context.?));
+            const allocator = boxed.allocator;
+            boxed.managed.deinit();
+            allocator.destroy(boxed);
+        }
+
+        const PoolManagedSession = struct {
+            allocator: std.mem.Allocator,
+            managed: ManagedSession,
+        };
+    };
+
+    pub fn componentLoader(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+    ) !ComponentLoader {
+        var loader = ComponentLoader{ .manager = self };
+        var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
+        defer man.deinit();
+        const allowed = if (self.serving_policy) |policy|
+            try policyAllowedBackends(
+                self.allocator,
+                &loader.allowed_backends,
+                model_dir,
+                &man,
+                preferred_backends,
+                policy,
+            )
+        else
+            preferred_backends;
+        for (allowed) |backend| {
+            if (!backend.supportsDirectSessionLoad()) continue;
+            if (loader.allowed_backend_count == loader.allowed_backends.len) break;
+            loader.allowed_backends[loader.allowed_backend_count] = backend;
+            loader.allowed_backend_count += 1;
+        }
+        if (loader.allowed_backend_count == 0) return error.NoBackendAvailable;
+        return loader;
+    }
+
     fn admissionLimitsForBackend(
         self: *const ModelManager,
         backend: backends.BackendType,
@@ -1360,44 +1529,27 @@ pub const ModelManager = struct {
     /// process-wide admission accounting as the primary session. Reserve their
     /// construction peak immediately before import, then retain only completed
     /// residency for the component lifetime.
-    fn loadOptionalSessionWithAdmission(
+    fn loadManagedSessionWithAdmission(
         self: *ModelManager,
         model_path: []const u8,
-        primary_backend: backends.BackendType,
+        preferred_backends: []const backends.BackendType,
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
-    ) !LoadedSessionPlan {
+    ) !ManagedSession {
         var first_err: ?anyerror = null;
         const is_onnx = std.mem.endsWith(u8, model_path, ".onnx");
-        const artifact_bytes = if (self.admission_enabled)
-            std.math.cast(usize, try c_file.fileSize(self.allocator, model_path)) orelse
-                return error.ResourceLimitExceeded
-        else
-            0;
+        const artifact_bytes = if (!self.admission_enabled)
+            0
+        else if (is_onnx) blk: {
+            var artifacts = try backends.imported_onnx_session.inspectArtifactSet(
+                self.allocator,
+                model_path,
+            );
+            defer artifacts.deinit();
+            break :blk artifacts.encoded_bytes;
+        } else std.math.cast(usize, try c_file.fileSize(self.allocator, model_path)) orelse
+            return error.ResourceLimitExceeded;
 
-        // At most one entry per backend enum value can survive deduplication.
-        // Deriving the capacity keeps this safe when a backend is added later.
-        var backend_scratch: [std.meta.fields(backends.BackendType).len]backends.BackendType = undefined;
-        var backend_count: usize = 0;
-        backend_scratch[backend_count] = if (shared_backend_ctx) |shared|
-            shared.backendType()
-        else
-            primary_backend;
-        backend_count += 1;
-        for (self.session_manager.preferred_backends) |backend| {
-            var duplicate = false;
-            for (backend_scratch[0..backend_count]) |existing| {
-                if (existing == backend) {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if (!duplicate) {
-                backend_scratch[backend_count] = backend;
-                backend_count += 1;
-            }
-        }
-
-        for (backend_scratch[0..backend_count]) |backend| {
+        for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
             if (shared_backend_ctx) |shared| {
                 if (shared.backendType() != backend) continue;
@@ -2050,10 +2202,27 @@ fn sessionManagerForPreferredBackends(
     };
 }
 
-const LoadedSessionPlan = struct {
+pub const ManagedSession = struct {
     session: backends.Session,
     resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    owns_session: bool = true,
+
+    pub fn deinit(self: *ManagedSession) void {
+        if (self.owns_session) self.session.close();
+        if (self.resource_lease) |*lease| lease.release();
+        self.resource_lease = null;
+        self.owns_session = false;
+    }
+
+    /// Transfer session ownership while leaving admission accounting with the
+    /// caller. Useful for pipelines that already own and close their sessions.
+    pub fn disownSession(self: *ManagedSession) backends.Session {
+        self.owns_session = false;
+        return self.session;
+    }
 };
+
+const LoadedSessionPlan = ManagedSession;
 
 const ModelLoadAdmissionPlan = struct {
     /// Maximum simultaneous bytes while parsing/importing/repacking.
@@ -2064,7 +2233,11 @@ const ModelLoadAdmissionPlan = struct {
 
 fn addArtifactBytes(total: *usize, allocator: std.mem.Allocator, maybe_path: ?[]const u8) !void {
     const path = maybe_path orelse return;
-    const size = std.math.cast(usize, try c_file.fileSize(allocator, path)) orelse
+    const size = if (std.mem.endsWith(u8, path, ".onnx")) blk: {
+        var artifacts = try backends.imported_onnx_session.inspectArtifactSet(allocator, path);
+        defer artifacts.deinit();
+        break :blk artifacts.encoded_bytes;
+    } else std.math.cast(usize, try c_file.fileSize(allocator, path)) orelse
         return error.ResourceLimitExceeded;
     total.* = std.math.add(usize, total.*, size) catch return error.ResourceLimitExceeded;
 }

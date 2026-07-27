@@ -20,6 +20,7 @@ const crop = @import("crop.zig");
 const ctc_decode = @import("ctc_decode.zig");
 const connected_components = @import("connected_components.zig");
 const vision_reader = @import("../readers/vision_reader.zig");
+const model_manager_mod = @import("../server/model_manager.zig");
 
 pub const TextRegion = struct {
     bbox: [4]f64,
@@ -276,7 +277,7 @@ pub const Vision2SeqRecognizer = struct {
         model_path: []const u8,
         encoder_file: []const u8,
         decoder_file: []const u8,
-        session_manager: *backends.SessionManager,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !Vision2SeqRecognizer {
         return .{
             .allocator = allocator,
@@ -285,7 +286,7 @@ pub const Vision2SeqRecognizer = struct {
                 model_path,
                 encoder_file,
                 decoder_file,
-                session_manager,
+                component_loader,
             ),
         };
     }

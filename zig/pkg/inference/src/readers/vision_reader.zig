@@ -46,6 +46,8 @@ pub const LoadedVisionReader = struct {
     loaded_model: ?*model_manager_mod.LoadedModel = null,
     hf_tok: ?*hf_tokenizer.HfTokenizer = null,
     owns_sessions: bool = false,
+    encoder_managed: ?model_manager_mod.ManagedSession = null,
+    decoder_managed: ?model_manager_mod.ManagedSession = null,
     florence_final_logits_bias_zero: ?bool = null,
 
     pub fn loadFromDir(
@@ -60,7 +62,8 @@ pub const LoadedVisionReader = struct {
             defer allocator.free(paths.encoder);
             defer allocator.free(paths.decoder);
 
-            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), session_manager);
+            var loader = try model_manager.componentLoader(model_path, session_manager.preferred_backends);
+            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), &loader);
         } else |_| {}
 
         const model = try model_manager.loadFromDir(model_path);
@@ -88,7 +91,7 @@ pub const LoadedVisionReader = struct {
         model_path: []const u8,
         encoder_file: []const u8,
         decoder_file: []const u8,
-        session_manager: *backends.SessionManager,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !LoadedVisionReader {
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         const preproc = loadPreprocessorConfig(allocator, model_path);
@@ -98,7 +101,7 @@ pub const LoadedVisionReader = struct {
         const decoder_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, decoder_file });
         defer allocator.free(decoder_path);
 
-        return loadEncoderDecoderPaths(allocator, model_path, encoder_path, decoder_path, dec_config, preproc, session_manager);
+        return loadEncoderDecoderPaths(allocator, model_path, encoder_path, decoder_path, dec_config, preproc, component_loader);
     }
 
     fn loadEncoderDecoderPaths(
@@ -108,13 +111,16 @@ pub const LoadedVisionReader = struct {
         decoder_path: []const u8,
         dec_config: enc_dec_mod.DecoderConfig,
         preproc: PreprocessorConfig,
-        session_manager: *backends.SessionManager,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !LoadedVisionReader {
-        const encoder_session = try session_manager.loadModel(encoder_path);
-        errdefer encoder_session.close();
+        var encoder_managed = try component_loader.load(encoder_path);
+        errdefer encoder_managed.deinit();
+        const encoder_session = encoder_managed.session;
 
-        const decoder_session = try session_manager.loadModel(decoder_path);
-        errdefer decoder_session.close();
+        var strict_loader = try component_loader.restrictToBackend(encoder_session.backend());
+        var decoder_managed = try strict_loader.load(decoder_path);
+        errdefer decoder_managed.deinit();
+        const decoder_session = decoder_managed.session;
 
         const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_path});
         defer allocator.free(tok_path);
@@ -132,14 +138,16 @@ pub const LoadedVisionReader = struct {
             .preproc = preproc,
             .hf_tok = tok,
             .owns_sessions = true,
+            .encoder_managed = encoder_managed,
+            .decoder_managed = decoder_managed,
         };
     }
 
     pub fn deinit(self: *LoadedVisionReader) void {
         if (self.hf_tok) |tok| tok.deinitSelf();
         if (self.owns_sessions) {
-            self.encoder_session.close();
-            self.decoder_session.close();
+            if (self.encoder_managed) |*managed| managed.deinit() else self.encoder_session.close();
+            if (self.decoder_managed) |*managed| managed.deinit() else self.decoder_session.close();
         }
     }
 

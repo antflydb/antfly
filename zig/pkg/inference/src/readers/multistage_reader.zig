@@ -20,15 +20,18 @@ const reader_types = @import("types.zig");
 const multistage_ocr = @import("../pipelines/multistage_ocr.zig");
 const ctc_decode = @import("../pipelines/ctc_decode.zig");
 const image = @import("../pipelines/image.zig");
+const model_manager_mod = @import("../server/model_manager.zig");
 
 pub const LoadedMultiStageReader = struct {
     allocator: std.mem.Allocator,
     pipeline: multistage_ocr.MultiStageOCRPipeline,
+    managed_sessions: std.ArrayListUnmanaged(model_manager_mod.ManagedSession) = .empty,
 
     pub fn loadFromDir(
         allocator: std.mem.Allocator,
         model_path: []const u8,
         session_manager: *backends.SessionManager,
+        model_manager: *model_manager_mod.ModelManager,
     ) !LoadedMultiStageReader {
         var metadata = try metadata_mod.loadFromDir(allocator, model_path);
         defer metadata.deinit();
@@ -39,11 +42,18 @@ pub const LoadedMultiStageReader = struct {
             var single_backend = [_]backends.BackendType{backend};
             var stage_session_manager = session_manager.*;
             stage_session_manager.preferred_backends = single_backend[0..];
+            var component_loader = model_manager.componentLoader(
+                model_path,
+                stage_session_manager.preferred_backends,
+            ) catch |err| {
+                if (err == error.IncompatibleModel or err == error.UnknownModelCompatibility) return err;
+                continue;
+            };
             return loadFromDirWithSessionManager(
                 allocator,
                 model_path,
                 &metadata,
-                &stage_session_manager,
+                &component_loader,
             ) catch |err| {
                 if (err == error.MultiStageReaderNotYetSupported) return err;
                 std.log.err("multistage reader backend {s} failed for {s}: {s}", .{ @tagName(backend), model_path, @errorName(err) });
@@ -58,15 +68,25 @@ pub const LoadedMultiStageReader = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
         metadata: *const metadata_mod.MultiStageMetadata,
-        session_manager: *backends.SessionManager,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !LoadedMultiStageReader {
+        var managed_sessions = std.ArrayListUnmanaged(model_manager_mod.ManagedSession).empty;
+        errdefer {
+            for (managed_sessions.items) |*managed| managed.deinit();
+            managed_sessions.deinit(allocator);
+        }
         const detection_stage = metadata.stages.get("detection") orelse return error.InvalidMetadata;
         const detection_file = detection_stage.model_file orelse return error.InvalidMetadata;
         const detection_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, detection_file });
         defer allocator.free(detection_path);
 
-        const detector = try session_manager.loadModel(detection_path);
-        errdefer detector.close();
+        var detector_managed = try component_loader.load(detection_path);
+        errdefer detector_managed.deinit();
+        const detector = detector_managed.disownSession();
+        var detector_owned = true;
+        errdefer if (detector_owned) detector.close();
+        try managed_sessions.append(allocator, detector_managed);
+        detector_managed.resource_lease = null;
 
         const detection_preprocess = try loadStagePreprocessConfig(
             allocator,
@@ -86,6 +106,7 @@ pub const LoadedMultiStageReader = struct {
             .post_processor = post_processor,
         };
         errdefer pipeline.deinit();
+        detector_owned = false;
 
         if (metadata.stages.get("recognition")) |recognition_stage| {
             const stage_type = recognition_stage.stage_type orelse return error.InvalidMetadata;
@@ -94,14 +115,20 @@ pub const LoadedMultiStageReader = struct {
                 const rec_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, model_file });
                 defer allocator.free(rec_path);
 
-                const rec_session = try session_manager.loadModel(rec_path);
-                errdefer rec_session.close();
+                var rec_managed = try component_loader.load(rec_path);
+                errdefer rec_managed.deinit();
+                const rec_session = rec_managed.disownSession();
+                var rec_session_owned = true;
+                errdefer if (rec_session_owned) rec_session.close();
+                try managed_sessions.append(allocator, rec_managed);
+                rec_managed.resource_lease = null;
 
                 const char_dict_rel = recognition_stage.char_dict_file orelse return error.InvalidMetadata;
                 const char_dict_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, char_dict_rel });
                 defer allocator.free(char_dict_path);
                 const char_dict = try ctc_decode.loadCharDictFile(allocator, char_dict_path);
-                errdefer ctc_decode.freeCharDict(allocator, char_dict);
+                var char_dict_owned = true;
+                errdefer if (char_dict_owned) ctc_decode.freeCharDict(allocator, char_dict);
 
                 const recognition_preprocess = try loadStagePreprocessConfig(
                     allocator,
@@ -118,6 +145,8 @@ pub const LoadedMultiStageReader = struct {
                     .char_dict = char_dict,
                     .preprocess = recognition_preprocess,
                 } };
+                rec_session_owned = false;
+                char_dict_owned = false;
             } else if (std.mem.eql(u8, stage_type, "vision2seq")) {
                 const encoder_file = recognition_stage.encoder_file orelse return error.InvalidMetadata;
                 const decoder_file = recognition_stage.decoder_file orelse return error.InvalidMetadata;
@@ -126,7 +155,7 @@ pub const LoadedMultiStageReader = struct {
                     model_path,
                     encoder_file,
                     decoder_file,
-                    session_manager,
+                    component_loader,
                 ) };
             } else {
                 return error.MultiStageReaderNotYetSupported;
@@ -138,7 +167,11 @@ pub const LoadedMultiStageReader = struct {
             const layout_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, model_file });
             defer allocator.free(layout_path);
 
-            pipeline.layout = try session_manager.loadModel(layout_path);
+            var layout_managed = try component_loader.load(layout_path);
+            errdefer layout_managed.deinit();
+            pipeline.layout = layout_managed.disownSession();
+            try managed_sessions.append(allocator, layout_managed);
+            layout_managed.resource_lease = null;
         }
 
         if (metadata.stages.get("order")) |order_stage| {
@@ -146,17 +179,24 @@ pub const LoadedMultiStageReader = struct {
             const order_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, model_file });
             defer allocator.free(order_path);
 
-            pipeline.order = try session_manager.loadModel(order_path);
+            var order_managed = try component_loader.load(order_path);
+            errdefer order_managed.deinit();
+            pipeline.order = order_managed.disownSession();
+            try managed_sessions.append(allocator, order_managed);
+            order_managed.resource_lease = null;
         }
 
         return .{
             .allocator = allocator,
             .pipeline = pipeline,
+            .managed_sessions = managed_sessions,
         };
     }
 
     pub fn deinit(self: *LoadedMultiStageReader) void {
         self.pipeline.deinit();
+        for (self.managed_sessions.items) |*managed| managed.deinit();
+        self.managed_sessions.deinit(self.allocator);
     }
 
     pub fn read(self: *LoadedMultiStageReader, image_data: []const u8, _: reader_types.ReadOptions) !reader_types.Result {

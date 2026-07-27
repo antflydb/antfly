@@ -576,6 +576,7 @@ fn isOpenAiListTask(task: []const u8) bool {
 const CompatibilitySummary = model_manager_mod.CompatibilitySummary;
 const CompatibilitySignature = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 const compatibility_sidecar_hash_limit: u64 = 4 * 1024 * 1024;
+const compatibility_artifact_sample_bytes: usize = 64 * 1024;
 
 const CachedCompatibility = struct {
     signature: CompatibilitySignature,
@@ -607,16 +608,87 @@ fn addArtifactIdentityToSignature(
     signature.update(std.mem.asBytes(&stat.inode));
     signature.update(std.mem.asBytes(&stat.size));
     const mtime_ns = stat.mtime.toNanoseconds();
+    const ctime_ns = stat.ctime.toNanoseconds();
     signature.update(std.mem.asBytes(&mtime_ns));
-    if (!hash_small_contents or stat.size > compatibility_sidecar_hash_limit) return;
+    signature.update(std.mem.asBytes(&ctime_ns));
+    if (hash_small_contents and stat.size <= compatibility_sidecar_hash_limit) {
+        const bytes = c_file.readFileMax(
+            allocator,
+            artifact_path,
+            compatibility_sidecar_hash_limit,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            signature.update("content-unreadable");
+            return;
+        };
+        defer allocator.free(bytes);
+        updateCompatibilitySignatureSlice(signature, bytes);
+    } else if (stat.size > 0) {
+        // Stat identity alone misses atomic/in-place deployments that preserve
+        // inode, length, and timestamp. Hash bounded samples so cache hits stay
+        // O(1) in artifact size while still tracking large graph/weight swaps.
+        const sample_len: usize = @intCast(@min(
+            stat.size,
+            compatibility_artifact_sample_bytes,
+        ));
+        const offsets = [_]u64{
+            0,
+            if (stat.size > sample_len) (stat.size - sample_len) / 2 else 0,
+            if (stat.size > sample_len) stat.size - sample_len else 0,
+        };
+        for (offsets, 0..) |offset, index| {
+            if (index > 0 and offset == offsets[index - 1]) continue;
+            const bytes = c_file.readRegion(allocator, artifact_path, offset, sample_len) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                signature.update("sample-unreadable");
+                return;
+            };
+            defer allocator.free(bytes);
+            signature.update(std.mem.asBytes(&offset));
+            updateCompatibilitySignatureSlice(signature, bytes);
+        }
+    }
 
-    const bytes = c_file.readFile(allocator, artifact_path) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        signature.update("content-unreadable");
+    const final_stat = std.Io.Dir.cwd().statFile(io, artifact_path, .{}) catch {
+        signature.update("changed-during-read");
         return;
     };
-    defer allocator.free(bytes);
-    updateCompatibilitySignatureSlice(signature, bytes);
+    const final_mtime_ns = final_stat.mtime.toNanoseconds();
+    const final_ctime_ns = final_stat.ctime.toNanoseconds();
+    if (final_stat.inode != stat.inode or
+        final_stat.size != stat.size or
+        final_mtime_ns != mtime_ns or
+        final_ctime_ns != ctime_ns)
+        signature.update("changed-during-read");
+}
+
+fn addOnnxArtifactSetToSignature(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    signature: *std.crypto.hash.sha2.Sha256,
+    maybe_path: ?[]const u8,
+) !void {
+    const path = maybe_path orelse return;
+    try addArtifactIdentityToSignature(allocator, io, signature, path, false);
+    if (!std.mem.endsWith(u8, path, ".onnx")) return;
+    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSet(
+        allocator,
+        path,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        signature.update("invalid-onnx-artifact-set");
+        return;
+    };
+    defer artifacts.deinit();
+    for (artifacts.external_paths) |external_path| {
+        try addArtifactIdentityToSignature(
+            allocator,
+            io,
+            signature,
+            external_path,
+            false,
+        );
+    }
 }
 
 fn addModelSidecarToSignature(
@@ -729,14 +801,14 @@ fn computeCompatibilitySignature(
         if (err == error.OutOfMemory) return err;
         signature.update("invalid-sharded-index");
     };
-    try addArtifactIdentityToSignature(allocator, io, &signature, man.onnx_path, false);
+    try addOnnxArtifactSetToSignature(allocator, io, &signature, man.onnx_path);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.gliner_head_gguf_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.gliner_head_safetensors_path, false);
-    try addArtifactIdentityToSignature(allocator, io, &signature, man.visual_model_path, false);
-    try addArtifactIdentityToSignature(allocator, io, &signature, man.audio_model_path, false);
-    try addArtifactIdentityToSignature(allocator, io, &signature, man.text_projection_path, false);
-    try addArtifactIdentityToSignature(allocator, io, &signature, man.visual_projection_path, false);
-    try addArtifactIdentityToSignature(allocator, io, &signature, man.audio_projection_path, false);
+    try addOnnxArtifactSetToSignature(allocator, io, &signature, man.visual_model_path);
+    try addOnnxArtifactSetToSignature(allocator, io, &signature, man.audio_model_path);
+    try addOnnxArtifactSetToSignature(allocator, io, &signature, man.text_projection_path);
+    try addOnnxArtifactSetToSignature(allocator, io, &signature, man.visual_projection_path);
+    try addOnnxArtifactSetToSignature(allocator, io, &signature, man.audio_projection_path);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.tokenizer_json_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.tokenizer_config_path, true);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.preprocessor_config_path, true);
@@ -3102,7 +3174,11 @@ pub const Node = struct {
             var formatted_response_text: ?[]u8 = null;
             defer if (formatted_response_text) |text| ctx.allocator.free(text);
             if (parsed_tool_calls == null) {
-                formatted_response_text = try coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text);
+                formatted_response_text = coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text) catch |err|
+                    return ctx.status(500).json(.{
+                        .@"error" = "STRUCTURED_OUTPUT_INVALID",
+                        .message = @errorName(err),
+                    });
                 if (formatted_response_text) |text| response_text = text;
             }
 
@@ -3209,7 +3285,11 @@ pub const Node = struct {
                 var formatted_response_text: ?[]u8 = null;
                 defer if (formatted_response_text) |text| ctx.allocator.free(text);
                 if (parsed_tool_calls == null) {
-                    formatted_response_text = try coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text);
+                    formatted_response_text = coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text) catch |err|
+                        return ctx.status(500).json(.{
+                            .@"error" = "STRUCTURED_OUTPUT_INVALID",
+                            .message = @errorName(err),
+                        });
                     if (formatted_response_text) |text| response_text = text;
                 }
 
@@ -3705,7 +3785,11 @@ pub const Node = struct {
         var formatted_response_text: ?[]u8 = null;
         defer if (formatted_response_text) |text| ctx.allocator.free(text);
         if (parsed_tool_calls == null) {
-            formatted_response_text = try coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text);
+            formatted_response_text = coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text) catch |err|
+                return ctx.status(500).json(.{
+                    .@"error" = "STRUCTURED_OUTPUT_INVALID",
+                    .message = @errorName(err),
+                });
             if (formatted_response_text) |text| response_text = text;
         }
 
@@ -4005,7 +4089,18 @@ pub const Node = struct {
 
         fn run(self: *@This()) std.Io.Cancelable!void {
             self.runInner() catch |err| {
-                self.out.@"error" = .{ .code = "GENERATION_FAILED", .message = @errorName(err), .retryable = true };
+                self.out.@"error" = switch (err) {
+                    error.InvalidStructuredOutput => .{
+                        .code = "STRUCTURED_OUTPUT_INVALID",
+                        .message = @errorName(err),
+                        .retryable = true,
+                    },
+                    else => .{
+                        .code = "GENERATION_FAILED",
+                        .message = @errorName(err),
+                        .retryable = true,
+                    },
+                };
             };
         }
 
@@ -5076,6 +5171,8 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, model_name, "recognizers") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
+        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
+
         if (rebel_mod.isRebelModel(ctx.allocator, model_path)) {
             return self.recognizeRebel(ctx, model_path, body);
         }
@@ -5145,26 +5242,27 @@ pub const Node = struct {
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         if (dec_config.max_length > 0) config.max_length = dec_config.max_length;
 
-        const sessions = blk: {
-            var encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-            errdefer encoder_session.close();
-
-            const decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-
-            break :blk .{
-                .encoder = encoder_session,
-                .decoder = decoder_session,
-            };
-        };
+        var component_loader = self.model_manager.componentLoader(
+            model_path,
+            self.session_manager.preferred_backends,
+        ) catch |err| return modelLoadFailureResponse(ctx, err);
+        var encoder_managed = component_loader.load(paths.encoder) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer encoder_managed.deinit();
+        var strict_loader = component_loader.restrictToBackend(encoder_managed.session.backend()) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        var decoder_managed = strict_loader.load(paths.decoder) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer decoder_managed.deinit();
+        const encoder_session = encoder_managed.disownSession();
+        const decoder_session = decoder_managed.disownSession();
 
         var pipeline = rebel_mod.RebelPipeline{
             .allocator = ctx.allocator,
             .enc_dec = .{
                 .allocator = ctx.allocator,
-                .encoder = sessions.encoder,
-                .decoder = sessions.decoder,
+                .encoder = encoder_session,
+                .decoder = decoder_session,
                 .config = dec_config,
             },
             .tokenizer = hf_tok.tokenizer(),
@@ -5690,25 +5788,20 @@ pub const Node = struct {
         defer ctx.allocator.free(paths.encoder);
         defer ctx.allocator.free(paths.decoder);
 
-        // Load encoder and decoder sessions via the session manager.
-        // Sessions are owned by this handler: a close flag guards all exit
-        // paths (both error returns and ctx.status non-error returns), and
-        // the enclosing pipeline is kept as a plain value (no deinit) so
-        // closes never run twice.
-        var encoder_session: backends_mod.Session = undefined;
-        var close_encoder = false;
-        defer if (close_encoder) encoder_session.close();
-        var decoder_session: backends_mod.Session = undefined;
-        var close_decoder = false;
-        defer if (close_decoder) decoder_session.close();
-
-        encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
+        var component_loader = self.model_manager.componentLoader(
+            model_path,
+            self.session_manager.preferred_backends,
+        ) catch |err| return modelLoadFailureResponse(ctx, err);
+        var encoder_managed = component_loader.load(paths.encoder) catch |err|
             return modelLoadFailureResponse(ctx, err);
-        close_encoder = true;
-
-        decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
+        defer encoder_managed.deinit();
+        var strict_loader = component_loader.restrictToBackend(encoder_managed.session.backend()) catch |err|
             return modelLoadFailureResponse(ctx, err);
-        close_decoder = true;
+        var decoder_managed = strict_loader.load(paths.decoder) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer decoder_managed.deinit();
+        const encoder_session = encoder_managed.session;
+        const decoder_session = decoder_managed.session;
 
         // Parse decoder config
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
@@ -5973,16 +6066,18 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, transcribe_model_name, "transcribers") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
+        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
+
         // Find encoder/decoder sessions
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const tokenizer_mod = @import("inference_tokenizer");
         const hf_tokenizer = @import("inference_hf_tokenizer");
         var encoder_session: backends_mod.Session = undefined;
         var decoder_session: backends_mod.Session = undefined;
-        var close_encoder = false;
-        defer if (close_encoder) encoder_session.close();
-        var close_decoder = false;
-        defer if (close_decoder) decoder_session.close();
+        var encoder_managed: ?model_manager_mod.ManagedSession = null;
+        defer if (encoder_managed) |*managed| managed.deinit();
+        var decoder_managed: ?model_manager_mod.ManagedSession = null;
+        defer if (decoder_managed) |*managed| managed.deinit();
         var tokenizer: tokenizer_mod.Tokenizer = undefined;
         var hf_tok_owned: ?*hf_tokenizer.HfTokenizer = null;
         defer if (hf_tok_owned) |hf_tok| hf_tok.deinitSelf();
@@ -5991,13 +6086,18 @@ pub const Node = struct {
             defer ctx.allocator.free(paths.encoder);
             defer ctx.allocator.free(paths.decoder);
 
-            encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
+            var component_loader = self.model_manager.componentLoader(
+                model_path,
+                self.session_manager.preferred_backends,
+            ) catch |err| return modelLoadFailureResponse(ctx, err);
+            encoder_managed = component_loader.load(paths.encoder) catch |err|
                 return modelLoadFailureResponse(ctx, err);
-            close_encoder = true;
-
-            decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
+            encoder_session = encoder_managed.?.session;
+            var strict_loader = component_loader.restrictToBackend(encoder_session.backend()) catch |err|
                 return modelLoadFailureResponse(ctx, err);
-            close_decoder = true;
+            decoder_managed = strict_loader.load(paths.decoder) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            decoder_session = decoder_managed.?.session;
 
             const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
@@ -7807,6 +7907,24 @@ test "node attachIo wires model session manager" {
 
     try std.testing.expect(node.session_manager.io != null);
     try std.testing.expect(node.model_manager.session_manager.io != null);
+}
+
+test "component session pool adapter retains explicit resource-managed backend policy" {
+    const session_manager = backends_mod.SessionManager.init(std.testing.allocator);
+    var manager = model_manager_mod.ModelManager.init(std.testing.allocator, session_manager);
+    defer manager.deinit();
+
+    var loader = model_manager_mod.ModelManager.ComponentLoader{ .manager = &manager };
+    loader.allowed_backends[0] = .native;
+    loader.allowed_backends[1] = .metal;
+    loader.allowed_backend_count = 2;
+    const strict = try loader.restrictToBackend(.metal);
+    try std.testing.expectEqualSlices(
+        backends_mod.BackendType,
+        &.{.metal},
+        strict.preferredBackends(),
+    );
+    _ = loader.sessionPoolLoader();
 }
 
 test "registerAiRoutesOn excludes Traditional ML predictor routes" {
@@ -9857,20 +9975,17 @@ fn coerceGenerateResponseFormat(
     const rf = response_format orelse return null;
     if (std.mem.eql(u8, rf.type, "json_object")) {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch
-            return try allocator.dupe(u8, "{}");
+            return error.InvalidStructuredOutput;
         defer parsed.deinit();
         if (parsed.value == .object) return null;
-        return try allocator.dupe(u8, "{}");
+        return error.InvalidStructuredOutput;
     }
     if (!std.mem.eql(u8, rf.type, "json_schema")) return null;
 
     const schema_cfg = rf.json_schema orelse return error.MissingJsonSchema;
-    validateGeneratedJsonSchema(allocator, json_text, schema_cfg) catch {
-        const schema = schema_cfg.schema orelse return error.MissingJsonSchema;
-        const fallback = try minimalJsonForSchema(allocator, schema);
-        errdefer allocator.free(fallback);
-        try validateGeneratedJsonSchema(allocator, fallback, schema_cfg);
-        return fallback;
+    validateGeneratedJsonSchema(allocator, json_text, schema_cfg) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidStructuredOutput;
     };
     return null;
 }
@@ -9886,104 +10001,54 @@ fn validateGeneratedJsonSchema(
     try jsonschema.validateJsonSchemaValue(allocator, schema, parsed.value);
 }
 
-fn minimalJsonForSchema(allocator: std.mem.Allocator, schema: std.json.Value) ![]u8 {
-    var buf = std.ArrayListUnmanaged(u8).empty;
-    errdefer buf.deinit(allocator);
-    try appendMinimalJsonForSchema(&buf, allocator, schema);
-    return try buf.toOwnedSlice(allocator);
-}
+test "structured output validation fails closed instead of fabricating JSON" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidStructuredOutput,
+        coerceGenerateResponseFormat(
+            allocator,
+            .{ .type = "json_object" },
+            "not json",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidStructuredOutput,
+        coerceGenerateResponseFormat(
+            allocator,
+            .{ .type = "json_object" },
+            "[]",
+        ),
+    );
 
-fn appendMinimalJsonForSchema(
-    buf: *std.ArrayListUnmanaged(u8),
-    allocator: std.mem.Allocator,
-    schema: std.json.Value,
-) anyerror!void {
-    if (schema != .object) {
-        try buf.appendSlice(allocator, "null");
-        return;
-    }
-
-    const obj = schema.object;
-    if (obj.get("const")) |value| {
-        const rendered = try std.json.Stringify.valueAlloc(allocator, value, .{});
-        defer allocator.free(rendered);
-        try buf.appendSlice(allocator, rendered);
-        return;
-    }
-    if (obj.get("enum")) |values| {
-        if (values == .array and values.array.items.len > 0) {
-            const rendered = try std.json.Stringify.valueAlloc(allocator, values.array.items[0], .{});
-            defer allocator.free(rendered);
-            try buf.appendSlice(allocator, rendered);
-            return;
-        }
-    }
-
-    const type_name = if (obj.get("type")) |type_value|
-        if (type_value == .string) type_value.string else null
-    else
-        null;
-
-    if (type_name) |name| {
-        if (std.mem.eql(u8, name, "object")) {
-            try appendMinimalObjectForSchema(buf, allocator, obj);
-            return;
-        }
-        if (std.mem.eql(u8, name, "array")) {
-            try buf.appendSlice(allocator, "[]");
-            return;
-        }
-        if (std.mem.eql(u8, name, "string")) {
-            try buf.appendSlice(allocator, "\"\"");
-            return;
-        }
-        if (std.mem.eql(u8, name, "integer") or std.mem.eql(u8, name, "number")) {
-            try buf.append(allocator, '0');
-            return;
-        }
-        if (std.mem.eql(u8, name, "boolean")) {
-            try buf.appendSlice(allocator, "false");
-            return;
-        }
-        if (std.mem.eql(u8, name, "null")) {
-            try buf.appendSlice(allocator, "null");
-            return;
-        }
-    }
-
-    if (obj.get("properties") != null or obj.get("required") != null) {
-        try appendMinimalObjectForSchema(buf, allocator, obj);
-        return;
-    }
-
-    try buf.appendSlice(allocator, "null");
-}
-
-fn appendMinimalObjectForSchema(
-    buf: *std.ArrayListUnmanaged(u8),
-    allocator: std.mem.Allocator,
-    schema_obj: std.json.ObjectMap,
-) anyerror!void {
-    try buf.append(allocator, '{');
-    var first = true;
-    const properties = schema_obj.get("properties");
-    if (schema_obj.get("required")) |required| {
-        if (required == .array) {
-            for (required.array.items) |name_value| {
-                if (name_value != .string) continue;
-                if (!first) try buf.append(allocator, ',');
-                first = false;
-                try jsonEncodeString(buf, allocator, name_value.string);
-                try buf.append(allocator, ':');
-                const property_schema = if (properties != null and properties.? == .object)
-                    properties.?.object.get(name_value.string) orelse .null
-                else
-                    .null;
-                try appendMinimalJsonForSchema(buf, allocator, property_schema);
-            }
-        }
-    }
-    try buf.append(allocator, '}');
+    var parsed_schema = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"type\":\"object\",\"required\":[\"answer\"],\"properties\":{\"answer\":{\"type\":\"string\"}}}",
+        .{},
+    );
+    defer parsed_schema.deinit();
+    try std.testing.expectError(
+        error.InvalidStructuredOutput,
+        coerceGenerateResponseFormat(
+            allocator,
+            .{
+                .type = "json_schema",
+                .json_schema = .{ .schema = parsed_schema.value },
+            },
+            "{}",
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(?[]u8, null),
+        try coerceGenerateResponseFormat(
+            allocator,
+            .{
+                .type = "json_schema",
+                .json_schema = .{ .schema = parsed_schema.value },
+            },
+            "{\"answer\":\"ok\"}",
+        ),
+    );
 }
 
 test "shared json schema validator: additionalProperties schema object" {

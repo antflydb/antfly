@@ -231,7 +231,12 @@ pub const LoadedReader = union(enum) {
         model_manager: *model_manager_mod.ModelManager,
     ) !LoadedReader {
         if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
-            return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDir(allocator, model_path, session_manager) };
+            return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDir(
+                allocator,
+                model_path,
+                session_manager,
+                model_manager,
+            ) };
         }
 
         const parser_kind = try detectParserKind(allocator, model_path);
