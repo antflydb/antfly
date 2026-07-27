@@ -1049,6 +1049,49 @@ func TestHandleStartShard_Success_Multipart_WithFile(t *testing.T) {
 	mockStore.AssertExpectations(t)
 }
 
+func TestHandleStartShard_MultipartRejectsFilenameFormatMismatch(t *testing.T) {
+	api, mockStore, baseDir := setupStoreAPI(t, types.ID(1))
+	newShardID := types.ID(0x301)
+	backupID := "native-declaration"
+	portableFileName := common.ShardPortableBackupFileName(backupID, newShardID)
+	startReq := ShardStartRequest{
+		ShardConfig: ShardConfig{
+			ByteRange: types.Range{[]byte("e"), []byte("f")},
+			RestoreConfig: &common.BackupConfig{
+				BackupID: backupID,
+				Format:   common.BackupFormatNative,
+			},
+		},
+		Peers: []common.Peer{{ID: 3}},
+	}
+	payloadBytes, err := json.Marshal(startReq)
+	require.NoError(t, err)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("payload", string(payloadBytes)))
+	fileWriter, err := writer.CreateFormFile("backup_file", portableFileName)
+	require.NoError(t, err)
+	_, err = fileWriter.Write([]byte("unverified portable payload"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	mockStore.On("Shard", newShardID).Return(nil, false)
+	req := httptest.NewRequest(http.MethodPost, "/shard", &body)
+	req.Header.Set("X-Raft-Shard-Id", newShardID.String())
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, req)
+
+	require.Equal(t, http.StatusBadRequest, response.Code)
+	require.Contains(t, response.Body.String(), "does not match canonical native backup file")
+	mockStore.AssertNotCalled(t, "StartRaftGroup")
+	require.NoFileExists(t, filepath.Join(
+		common.SnapDir(baseDir, newShardID, mockStore.ID()),
+		portableFileName,
+	))
+	mockStore.AssertExpectations(t)
+}
+
 func TestHandleStartShard_PortableMultipartVerifiesArtifactIntegrity(t *testing.T) {
 	for _, testCase := range []struct {
 		name       string
@@ -1650,7 +1693,10 @@ func TestHandleStartShard_Failure_Multipart_CreateSnapDirFails(t *testing.T) {
 	var reqBodyBuf bytes.Buffer
 	writer := multipart.NewWriter(&reqBodyBuf)
 	writer.WriteField("payload", string(payloadBytes))
-	_, err = writer.CreateFormFile("backup_file", "backup_snap_fail-205.tar.zst")
+	_, err = writer.CreateFormFile(
+		"backup_file",
+		common.ShardBackupFileName(backupID, newShardID),
+	)
 	require.NoError(t, err)
 	err = writer.Close()
 	require.NoError(t, err)

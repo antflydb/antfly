@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	stdjson "encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,11 +27,13 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
 	json "github.com/antflydb/antfly/go/pkg/libaf/json"
+	"github.com/gofrs/flock"
 	"github.com/minio/minio-go/v7"
 )
 
@@ -38,7 +41,8 @@ import (
 // local filesystem or S3-compatible object storage.
 type backupStore interface {
 	EnsureMetadataAbsent(ctx context.Context, id string) error
-	ReserveBackupID(ctx context.Context, id string) error
+	ReserveBackupID(ctx context.Context, id, owner string) error
+	BackupIDReservationOwnedBy(ctx context.Context, id, owner string) (bool, error)
 	DeleteMetadata(ctx context.Context, id string) error
 	DeleteArtifact(ctx context.Context, name string) error
 	ValidateArtifact(ctx context.Context, name string) error
@@ -46,7 +50,7 @@ type backupStore interface {
 		ctx context.Context,
 		artifact common.BackupArtifactIntegrity,
 	) error
-	ReleaseBackupID(ctx context.Context, id string) error
+	ReleaseBackupID(ctx context.Context, id, owner string) (bool, error)
 	WriteMetadata(
 		ctx context.Context,
 		id string,
@@ -61,6 +65,11 @@ type backupStore interface {
 const (
 	backupMetadataVersion  = 2
 	maxBackupMetadataBytes = 16 * 1024 * 1024
+
+	backupReservationVersion       = 1
+	maxBackupReservationBytes      = 4 * 1024
+	backupReservationStateActive   = "active"
+	backupReservationStateReleased = "released"
 )
 
 var (
@@ -72,6 +81,75 @@ type boundedWriter struct {
 	writer    io.Writer
 	remaining int64
 }
+
+type backupReservation struct {
+	Version    uint32 `json:"version"`
+	Owner      string `json:"owner"`
+	Generation uint64 `json:"generation"`
+	State      string `json:"state"`
+}
+
+func validateBackupReservation(reservation *backupReservation) error {
+	if reservation == nil ||
+		reservation.Version != backupReservationVersion ||
+		reservation.Generation == 0 {
+		return errors.New("invalid backup reservation")
+	}
+	if err := common.ValidateBackupID(reservation.Owner); err != nil {
+		return fmt.Errorf("invalid backup reservation owner: %w", err)
+	}
+	switch reservation.State {
+	case backupReservationStateActive, backupReservationStateReleased:
+		return nil
+	default:
+		return errors.New("invalid backup reservation state")
+	}
+}
+
+func encodeBackupReservation(reservation *backupReservation) ([]byte, error) {
+	if err := validateBackupReservation(reservation); err != nil {
+		return nil, err
+	}
+	var body bytes.Buffer
+	if err := stdjson.NewEncoder(&body).Encode(reservation); err != nil {
+		return nil, err
+	}
+	if body.Len() > maxBackupReservationBytes {
+		return nil, errors.New("backup reservation is too large")
+	}
+	return body.Bytes(), nil
+}
+
+func decodeBackupReservation(body []byte) (*backupReservation, error) {
+	if bytes.Equal(bytes.TrimSpace(body), []byte("reserved")) {
+		// Anonymous reservations from older Go releases cannot be attributed
+		// safely. Treat them as active but unowned so automated cleanup fails
+		// closed rather than deleting a retry's objects.
+		return &backupReservation{
+			State: backupReservationStateActive,
+		}, nil
+	}
+	if len(body) == 0 || len(body) > maxBackupReservationBytes {
+		return nil, errors.New("invalid backup reservation size")
+	}
+	var reservation backupReservation
+	decoder := stdjson.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&reservation); err != nil {
+		return nil, fmt.Errorf("decoding backup reservation: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("invalid trailing backup reservation data")
+	}
+	if err := validateBackupReservation(&reservation); err != nil {
+		return nil, err
+	}
+	return &reservation, nil
+}
+
+type backupReservationMutation func(
+	current *backupReservation,
+) (next *backupReservation, result bool, err error)
 
 func (w *boundedWriter) Write(data []byte) (int, error) {
 	if w.remaining <= 0 {
@@ -379,55 +457,147 @@ func (s *fileBackupStore) EnsureMetadataAbsent(ctx context.Context, id string) e
 	return nil
 }
 
-func (s *fileBackupStore) ReserveBackupID(ctx context.Context, id string) error {
-	if err := ctx.Err(); err != nil {
-		return err
+func (s *fileBackupStore) reservationPath(id string) (string, error) {
+	filePath, err := s.resolveAndValidate(id)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(filePath, "-metadata.json") + "-reservation", nil
+}
+
+func readFileBackupReservation(reservationPath string) (*backupReservation, error) {
+	file, err := os.Open(filepath.Clean(reservationPath))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() ||
+		info.Size() <= 0 ||
+		info.Size() > maxBackupReservationBytes {
+		return nil, errors.New("invalid backup reservation file identity")
+	}
+	body, err := io.ReadAll(io.LimitReader(file, maxBackupReservationBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	return decodeBackupReservation(body)
+}
+
+func (s *fileBackupStore) mutateBackupReservation(
+	ctx context.Context,
+	id string,
+	mutate backupReservationMutation,
+) (bool, error) {
+	reservationPath, err := s.reservationPath(id)
+	if err != nil {
+		return false, err
+	}
+	if err := os.MkdirAll(filepath.Dir(reservationPath), 0o750); err != nil {
+		return false, fmt.Errorf("creating backup metadata directory: %w", err)
+	}
+	reservationLock := flock.New(reservationPath + ".lock")
+	locked, err := reservationLock.TryLockContext(ctx, 10*time.Millisecond)
+	if err != nil {
+		return false, err
+	}
+	if !locked {
+		return false, errors.New("backup reservation lock unavailable")
+	}
+	defer func() { _ = reservationLock.Close() }()
+	current, err := readFileBackupReservation(reservationPath)
+	if err != nil {
+		return false, err
+	}
+	next, result, err := mutate(current)
+	if err != nil || next == nil {
+		return result, err
+	}
+	body, err := encodeBackupReservation(next)
+	if err != nil {
+		return false, err
+	}
+	if err := writeBytesFileAtomically(
+		ctx,
+		reservationPath,
+		body,
+		current != nil,
+	); err != nil {
+		return false, err
+	}
+	return result, nil
+}
+
+func reserveBackupIDMutation(
+	id, owner string,
+) backupReservationMutation {
+	return func(current *backupReservation) (*backupReservation, bool, error) {
+		if current != nil && current.State != backupReservationStateReleased {
+			return nil, false, fmt.Errorf("%w: %s", ErrBackupAlreadyExists, id)
+		}
+		generation := uint64(1)
+		if current != nil {
+			if current.Generation == ^uint64(0) {
+				return nil, false, errors.New("backup reservation generation exhausted")
+			}
+			generation = current.Generation + 1
+		}
+		return &backupReservation{
+			Version:    backupReservationVersion,
+			Owner:      owner,
+			Generation: generation,
+			State:      backupReservationStateActive,
+		}, true, nil
+	}
+}
+
+func reservationOwnedByMutation(
+	owner string,
+) backupReservationMutation {
+	return func(current *backupReservation) (*backupReservation, bool, error) {
+		owned := current != nil &&
+			current.Version == backupReservationVersion &&
+			current.State == backupReservationStateActive &&
+			current.Owner == owner
+		return nil, owned, nil
+	}
+}
+
+func releaseBackupIDMutation(
+	owner string,
+) backupReservationMutation {
+	return func(current *backupReservation) (*backupReservation, bool, error) {
+		if current == nil ||
+			current.Version != backupReservationVersion ||
+			current.State != backupReservationStateActive ||
+			current.Owner != owner {
+			return nil, false, nil
+		}
+		if current.Generation == ^uint64(0) {
+			return nil, false, errors.New("backup reservation generation exhausted")
+		}
+		next := *current
+		next.Generation++
+		next.State = backupReservationStateReleased
+		return &next, true, nil
+	}
+}
+
+func (s *fileBackupStore) ReserveBackupID(ctx context.Context, id, owner string) error {
+	if err := common.ValidateBackupID(owner); err != nil {
+		return fmt.Errorf("invalid backup reservation owner: %w", err)
 	}
 	if err := s.EnsureMetadataAbsent(ctx, id); err != nil {
 		return err
 	}
-	filePath, err := s.resolveAndValidate(id)
-	if err != nil {
-		return err
-	}
-	reservationPath := strings.TrimSuffix(filePath, "-metadata.json") + "-reservation"
-	if err := os.MkdirAll(filepath.Dir(reservationPath), 0o750); err != nil {
-		return fmt.Errorf("creating backup metadata directory: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	file, err := os.OpenFile(
-		reservationPath,
-		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
-		0o600,
-	) //#nosec G304 -- path validated by resolveAndValidate
-	if err != nil {
-		if os.IsExist(err) {
-			return fmt.Errorf("%w: %s", ErrBackupAlreadyExists, id)
-		}
-		return fmt.Errorf("reserving backup ID: %w", err)
-	}
-	if _, err := file.WriteString("reserved\n"); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("writing backup reservation: %w", err)
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("syncing backup reservation: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("closing backup reservation: %w", err)
-	}
-	dir, err := os.Open(filepath.Dir(reservationPath)) //#nosec G304 -- authorized backup directory
-	if err != nil {
-		return fmt.Errorf("opening backup directory for sync: %w", err)
-	}
-	defer func() { _ = dir.Close() }()
-	if err := dir.Sync(); err != nil {
-		return fmt.Errorf("syncing backup directory: %w", err)
-	}
-	return nil
+	_, err := s.mutateBackupReservation(ctx, id, reserveBackupIDMutation(id, owner))
+	return err
 }
 
 func removeFileAndSyncDirectory(ctx context.Context, filePath string) error {
@@ -549,13 +719,24 @@ func (s *fileBackupStore) ValidateArtifactIdentity(
 	return nil
 }
 
-func (s *fileBackupStore) ReleaseBackupID(ctx context.Context, id string) error {
-	filePath, err := s.resolveAndValidate(id)
-	if err != nil {
-		return err
+func (s *fileBackupStore) BackupIDReservationOwnedBy(
+	ctx context.Context,
+	id, owner string,
+) (bool, error) {
+	if err := common.ValidateBackupID(owner); err != nil {
+		return false, fmt.Errorf("invalid backup reservation owner: %w", err)
 	}
-	reservationPath := strings.TrimSuffix(filePath, "-metadata.json") + "-reservation"
-	return removeFileAndSyncDirectory(ctx, reservationPath)
+	return s.mutateBackupReservation(ctx, id, reservationOwnedByMutation(owner))
+}
+
+func (s *fileBackupStore) ReleaseBackupID(
+	ctx context.Context,
+	id, owner string,
+) (bool, error) {
+	if err := common.ValidateBackupID(owner); err != nil {
+		return false, fmt.Errorf("invalid backup reservation owner: %w", err)
+	}
+	return s.mutateBackupReservation(ctx, id, releaseBackupIDMutation(owner))
 }
 
 func (s *fileBackupStore) WriteMetadata(
@@ -661,31 +842,113 @@ func (s *s3BackupStore) EnsureMetadataAbsent(ctx context.Context, id string) err
 	return nil
 }
 
-func (s *s3BackupStore) ReserveBackupID(ctx context.Context, id string) error {
-	if err := s.EnsureMetadataAbsent(ctx, id); err != nil {
-		return err
+func readS3BackupReservation(
+	ctx context.Context,
+	client *minio.Client,
+	bucket, objectKey string,
+) (*backupReservation, string, error) {
+	info, err := client.StatObject(ctx, bucket, objectKey, minio.StatObjectOptions{})
+	if err != nil {
+		if isS3ObjectNotFound(err) {
+			return nil, "", nil
+		}
+		return nil, "", err
+	}
+	if info.Size <= 0 ||
+		info.Size > maxBackupReservationBytes ||
+		info.ETag == "" {
+		return nil, "", errors.New("invalid backup reservation object identity")
+	}
+	options := minio.GetObjectOptions{}
+	if err := options.SetMatchETag(info.ETag); err != nil {
+		return nil, "", err
+	}
+	object, err := client.GetObject(ctx, bucket, objectKey, options)
+	if err != nil {
+		if isS3ObjectNotFound(err) {
+			return nil, "", nil
+		}
+		return nil, "", err
+	}
+	defer func() { _ = object.Close() }()
+	body, err := io.ReadAll(io.LimitReader(object, maxBackupReservationBytes+1))
+	if err != nil {
+		if isS3ObjectNotFound(err) || common.IsS3CreateConflict(err) {
+			return nil, "", nil
+		}
+		return nil, "", err
+	}
+	reservation, err := decodeBackupReservation(body)
+	return reservation, info.ETag, err
+}
+
+func (s *s3BackupStore) mutateBackupReservation(
+	ctx context.Context,
+	id string,
+	mutate backupReservationMutation,
+) (bool, error) {
+	if err := common.ValidateBackupID(id); err != nil {
+		return false, err
 	}
 	client, err := s.s3Config.EnsureBucket(ctx)
 	if err != nil {
+		return false, err
+	}
+	objectKey := s.reservationKey(id)
+	for range 16 {
+		current, etag, err := readS3BackupReservation(
+			ctx,
+			client,
+			s.s3Config.Bucket,
+			objectKey,
+		)
+		if err != nil {
+			if common.IsS3CreateConflict(err) {
+				continue
+			}
+			return false, err
+		}
+		next, result, err := mutate(current)
+		if err != nil || next == nil {
+			return result, err
+		}
+		body, err := encodeBackupReservation(next)
+		if err != nil {
+			return false, err
+		}
+		options := minio.PutObjectOptions{ContentType: "application/json"}
+		if etag == "" {
+			options.SetMatchETagExcept("*")
+		} else {
+			options.SetMatchETag(etag)
+		}
+		if _, err := client.PutObject(
+			ctx,
+			s.s3Config.Bucket,
+			objectKey,
+			bytes.NewReader(body),
+			int64(len(body)),
+			options,
+		); err != nil {
+			if common.IsS3CreateConflict(err) {
+				continue
+			}
+			return false, err
+		}
+		return result, nil
+	}
+	return false, errors.New("backup reservation update conflict")
+}
+
+func (s *s3BackupStore) ReserveBackupID(ctx context.Context, id, owner string) error {
+	if err := common.ValidateBackupID(owner); err != nil {
+		return fmt.Errorf("invalid backup reservation owner: %w", err)
+	}
+	if err := s.EnsureMetadataAbsent(ctx, id); err != nil {
 		return err
 	}
-	payload := strings.NewReader("reserved\n")
-	options := minio.PutObjectOptions{ContentType: "text/plain"}
-	options.SetMatchETagExcept("*")
-	if _, err := client.PutObject(
-		ctx,
-		s.s3Config.Bucket,
-		s.reservationKey(id),
-		payload,
-		int64(payload.Len()),
-		options,
-	); err != nil {
-		if common.IsS3CreateConflict(err) {
-			return fmt.Errorf("%w: %s", ErrBackupAlreadyExists, id)
-		}
-		return fmt.Errorf("reserving backup ID: %w", err)
-	}
-	return nil
+	_, err := s.mutateBackupReservation(ctx, id, reserveBackupIDMutation(id, owner))
+	return err
 }
 
 func (s *s3BackupStore) artifactKey(name string) (string, error) {
@@ -816,11 +1079,24 @@ func (s *s3BackupStore) ValidateArtifactIdentity(
 	return nil
 }
 
-func (s *s3BackupStore) ReleaseBackupID(ctx context.Context, id string) error {
-	if err := common.ValidateBackupID(id); err != nil {
-		return err
+func (s *s3BackupStore) BackupIDReservationOwnedBy(
+	ctx context.Context,
+	id, owner string,
+) (bool, error) {
+	if err := common.ValidateBackupID(owner); err != nil {
+		return false, fmt.Errorf("invalid backup reservation owner: %w", err)
 	}
-	return s.removeObject(ctx, s.reservationKey(id))
+	return s.mutateBackupReservation(ctx, id, reservationOwnedByMutation(owner))
+}
+
+func (s *s3BackupStore) ReleaseBackupID(
+	ctx context.Context,
+	id, owner string,
+) (bool, error) {
+	if err := common.ValidateBackupID(owner); err != nil {
+		return false, fmt.Errorf("invalid backup reservation owner: %w", err)
+	}
+	return s.mutateBackupReservation(ctx, id, releaseBackupIDMutation(owner))
 }
 
 func (s *s3BackupStore) WriteMetadata(

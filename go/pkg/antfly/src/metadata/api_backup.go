@@ -192,15 +192,33 @@ func (t *TableApi) backupShardsWithIntegrity(
 
 func cleanupBackupAttempt(
 	metadataStore backupStore,
-	backupID string,
+	backupID, reservationOwner string,
 	metadataIDs, artifactNames []string,
 ) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	owned, err := metadataStore.BackupIDReservationOwnedBy(
+		ctx,
+		backupID,
+		reservationOwner,
+	)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errors.New("backup cleanup no longer owns the backup ID reservation")
+	}
 	if err := cleanupBackupAttemptContents(ctx, metadataStore, metadataIDs, artifactNames); err != nil {
 		return err
 	}
-	return metadataStore.ReleaseBackupID(ctx, backupID)
+	released, err := metadataStore.ReleaseBackupID(ctx, backupID, reservationOwner)
+	if err != nil {
+		return err
+	}
+	if !released {
+		return errors.New("backup cleanup lost the backup ID reservation")
+	}
+	return nil
 }
 
 func cleanupBackupAttemptContents(
@@ -275,7 +293,12 @@ func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName
 		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
 		return
 	}
-	if err := metadataStore.ReserveBackupID(ctx, br.BackupId); err != nil {
+	reservationOwner, err := newClusterBackupAttemptID()
+	if err != nil {
+		errorResponse(w, "Failed to initialize backup attempt", http.StatusInternalServerError)
+		return
+	}
+	if err := metadataStore.ReserveBackupID(ctx, br.BackupId, reservationOwner); err != nil {
 		writeBackupError(w, "Backup ID is not available", err)
 		return
 	}
@@ -296,6 +319,7 @@ func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName
 		if err := cleanupBackupAttempt(
 			metadataStore,
 			br.BackupId,
+			reservationOwner,
 			nil,
 			createdArtifacts,
 		); err != nil {
@@ -522,7 +546,6 @@ const (
 	clusterBackupCommitTimeout       = 2 * time.Minute
 	clusterBackupMaintenanceTimeout  = 30 * time.Second
 	clusterBackupAttemptScanLimit    = 64
-	clusterBackupHealthScanLimit     = 10_000
 	clusterBackupAttemptReclaimLimit = 2
 	clusterBackupAttemptMaxTables    = 4096
 	clusterBackupAttemptMaxNameBytes = 4096
@@ -1499,6 +1522,17 @@ func reclaimStaleClusterBackupAttempt(
 		if err != nil || !claimed {
 			return false, err
 		}
+		reservationOwned, err := metadataStore.BackupIDReservationOwnedBy(
+			ctx,
+			attempt.BackupID,
+			attempt.AttemptID,
+		)
+		if err != nil || !reservationOwned {
+			// This attempt predates the current reservation owner (or uses an
+			// anonymous legacy reservation). It must not touch shared backup-ID
+			// objects belonging to a retry.
+			return false, err
+		}
 		head, err := currentClusterBackupAttemptHead(
 			ctx,
 			resolvedLocation,
@@ -1551,8 +1585,16 @@ func reclaimStaleClusterBackupAttempt(
 		); err != nil {
 			return false, err
 		}
-		if err := metadataStore.ReleaseBackupID(ctx, attempt.BackupID); err != nil {
+		released, err := metadataStore.ReleaseBackupID(
+			ctx,
+			attempt.BackupID,
+			attempt.AttemptID,
+		)
+		if err != nil {
 			return false, err
+		}
+		if !released {
+			return false, errors.New("stale backup cleanup lost reservation ownership")
 		}
 		if !retainJournal {
 			if err := deleteClusterBackupAttempt(
@@ -1600,72 +1642,6 @@ func currentClusterBackupAttemptHead(
 		strings.TrimPrefix(resolvedLocation, "file://"),
 		clusterBackupAttemptHeadName,
 	))
-}
-
-func readClusterBackupAttemptForHead(
-	ctx context.Context,
-	resolvedLocation string,
-	s3Info *common.S3Info,
-	head *ClusterBackupAttemptHead,
-) (*ClusterBackupAttempt, error) {
-	if err := validateClusterBackupAttemptHead(head); err != nil {
-		return nil, err
-	}
-	expectedDigest, err := hex.DecodeString(head.MarkerSHA256)
-	if err != nil {
-		return nil, err
-	}
-	var body []byte
-	if s3Info != nil {
-		client, err := s3Info.NewMinioClient()
-		if err != nil {
-			return nil, err
-		}
-		object, err := client.GetObject(
-			ctx,
-			s3Info.Bucket,
-			clusterAttemptObjectKey(s3Info.Prefix, head.AttemptID),
-			minio.GetObjectOptions{},
-		)
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = object.Close() }()
-		body, err = readBackupMetadata(object)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		pathname := filepath.Join(
-			strings.TrimPrefix(resolvedLocation, "file://"),
-			clusterBackupAttemptDir,
-			head.AttemptID+".json",
-		)
-		file, err := os.Open(filepath.Clean(pathname))
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = file.Close() }()
-		body, err = readBackupMetadata(file)
-		if err != nil {
-			return nil, err
-		}
-	}
-	actualDigest := sha256.Sum256(body)
-	if !bytes.Equal(actualDigest[:], expectedDigest) {
-		return nil, errors.New("cluster backup attempt head marker digest mismatch")
-	}
-	var attempt ClusterBackupAttempt
-	if err := json.Unmarshal(body, &attempt); err != nil {
-		return nil, err
-	}
-	if err := validateClusterBackupAttempt(&attempt, head.AttemptID); err != nil {
-		return nil, err
-	}
-	if attempt.BackupID != head.BackupID {
-		return nil, errors.New("cluster backup attempt head backup ID mismatch")
-	}
-	return &attempt, nil
 }
 
 func latestClusterBackupAttempt(
@@ -1900,61 +1876,6 @@ func validateClusterBackupArtifacts(
 	return group.Wait()
 }
 
-func validateNewestClusterBackupRepository(
-	ctx context.Context,
-	resolvedLocation string,
-	s3Info *common.S3Info,
-	metadataStore backupStore,
-) error {
-	head, err := currentClusterBackupAttemptHead(
-		ctx,
-		resolvedLocation,
-		s3Info,
-	)
-	if err != nil {
-		return err
-	}
-	if head == nil {
-		// A producer publishes the immutable marker before its authoritative
-		// head. Scan only in that crash window so an incomplete newest attempt
-		// cannot be hidden by an older aggregate.
-		latestAttempt, err := latestClusterBackupAttempt(
-			ctx,
-			resolvedLocation,
-			s3Info,
-			metadataStore,
-			clusterBackupHealthScanLimit,
-			true,
-		)
-		if err != nil || latestAttempt == nil {
-			return err
-		}
-		return validateNewestClusterBackupAttempt(
-			ctx,
-			resolvedLocation,
-			s3Info,
-			metadataStore,
-			latestAttempt,
-		)
-	}
-	latestAttempt, err := readClusterBackupAttemptForHead(
-		ctx,
-		resolvedLocation,
-		s3Info,
-		head,
-	)
-	if err != nil {
-		return err
-	}
-	return validateNewestClusterBackupAttempt(
-		ctx,
-		resolvedLocation,
-		s3Info,
-		metadataStore,
-		latestAttempt,
-	)
-}
-
 func (t *TableApi) scheduleClusterBackupMaintenance(
 	repositoryIdentity string,
 	resolvedLocation string,
@@ -2187,14 +2108,13 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		writeBackupError(w, "Backup ID is not available", err)
 		return
 	}
-	if err := metadataStore.ReserveBackupID(ctx, req.BackupId); err != nil {
-		writeBackupError(w, "Backup ID is not available", err)
-		return
-	}
 	attemptID, err := newClusterBackupAttemptID()
 	if err != nil {
-		_ = metadataStore.ReleaseBackupID(context.Background(), req.BackupId)
 		errorResponse(w, "Failed to initialize backup attempt", http.StatusInternalServerError)
+		return
+	}
+	if err := metadataStore.ReserveBackupID(ctx, req.BackupId, attemptID); err != nil {
+		writeBackupError(w, "Backup ID is not available", err)
 		return
 	}
 	attempt := &ClusterBackupAttempt{
@@ -2222,10 +2142,15 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		if !published {
 			if reconcileErr == nil {
 				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				if releaseErr := metadataStore.ReleaseBackupID(
+				released, releaseErr := metadataStore.ReleaseBackupID(
 					releaseCtx,
 					req.BackupId,
-				); releaseErr != nil {
+					attemptID,
+				)
+				if releaseErr == nil && !released {
+					releaseErr = errors.New("backup reservation ownership was lost")
+				}
+				if releaseErr != nil {
 					t.logger.Error(
 						"Failed to release backup reservation after definitive marker failure",
 						zap.String("backup_id", req.BackupId),
@@ -2310,6 +2235,20 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 			clusterBackupAttemptCleanupTimeout,
 		)
 		defer cleanupCancel()
+		reservationOwned, reservationErr := metadataStore.BackupIDReservationOwnedBy(
+			cleanupCtx,
+			req.BackupId,
+			attemptID,
+		)
+		if reservationErr != nil || !reservationOwned {
+			t.logger.Error(
+				"Cluster backup attempt no longer owns reservation cleanup",
+				zap.String("backup_id", req.BackupId),
+				zap.String("attempt_id", attemptID),
+				zap.Error(reservationErr),
+			)
+			return
+		}
 		if err := cleanupBackupAttemptContents(
 			cleanupCtx,
 			metadataStore,
@@ -2319,7 +2258,15 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 			t.logger.Error("Failed to clean abandoned cluster backup", zap.String("backup_id", req.BackupId), zap.Error(err))
 			return
 		}
-		if err := metadataStore.ReleaseBackupID(cleanupCtx, req.BackupId); err != nil {
+		released, err := metadataStore.ReleaseBackupID(
+			cleanupCtx,
+			req.BackupId,
+			attemptID,
+		)
+		if err == nil && !released {
+			err = errors.New("backup reservation ownership was lost")
+		}
+		if err != nil {
 			// Keep the marker as the durable recovery authority until retry
 			// admission is possible. A later maintenance pass may safely
 			// inspect it without confusing this failed attempt with a retry.
@@ -3046,33 +2993,6 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 	)
 	if err != nil {
 		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
-		return
-	}
-	metadataStore, err := newBackupStore(
-		t.ln.config,
-		params.Connection,
-		"restore.read",
-		location,
-	)
-	if err != nil {
-		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
-		return
-	}
-	if err := validateNewestClusterBackupRepository(
-		ctx,
-		resolvedLocation,
-		s3Info,
-		metadataStore,
-	); err != nil {
-		t.logger.Error(
-			"Newest cluster backup attempt is unhealthy",
-			zap.String("class", sanitizedBackupFailure(err)),
-		)
-		errorResponse(
-			w,
-			"Newest cluster backup attempt is incomplete or not restorable",
-			http.StatusInternalServerError,
-		)
 		return
 	}
 	var backups []BackupInfo

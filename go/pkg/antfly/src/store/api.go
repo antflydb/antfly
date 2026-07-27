@@ -483,15 +483,24 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 					if err := common.ValidateBackupID(req.RestoreConfig.BackupID); err != nil {
 						return fmt.Errorf("%w: invalid backup ID: %v", ErrBadRequest, err)
 					}
-					if !strings.HasPrefix(filePart.FileName(), req.RestoreConfig.BackupID) {
-						return fmt.Errorf("%w: uploaded file name %s does not match expected backup ID %s", ErrBadRequest, filePart.FileName(), req.RestoreConfig.BackupID)
+					format, err := common.ValidateBackupFormat(req.RestoreConfig.Format)
+					if err != nil {
+						return fmt.Errorf("%w: %v", ErrBadRequest, err)
 					}
 
 					// Here newShardID is shardIDForBackup and req.ShardConfig.RestoreConfig.BackupID is backupIDForLeader
 					backupFileName := common.ShardBackupFileName(req.RestoreConfig.BackupID, newShardID)
-					// Auto-detect portable backup from uploaded filename
-					if strings.HasSuffix(filePart.FileName(), ".afb") {
+					if format == common.BackupFormatPortable {
 						backupFileName = common.ShardPortableBackupFileName(req.RestoreConfig.BackupID, newShardID)
+					}
+					if filePart.FileName() != backupFileName {
+						return fmt.Errorf(
+							"%w: uploaded file name %q does not match canonical %s backup file %q",
+							ErrBadRequest,
+							filePart.FileName(),
+							format,
+							backupFileName,
+						)
 					}
 					artifact, err := restoreArtifactForFile(
 						req.RestoreConfig,

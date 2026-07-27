@@ -443,7 +443,11 @@ func (a *mcpAdapter) Backup(
 	if err != nil {
 		return err
 	}
-	if err := metadataStore.ReserveBackupID(ctx, backupID); err != nil {
+	reservationOwner, err := newClusterBackupAttemptID()
+	if err != nil {
+		return fmt.Errorf("initializing backup attempt: %w", err)
+	}
+	if err := metadataStore.ReserveBackupID(ctx, backupID, reservationOwner); err != nil {
 		return err
 	}
 	committed := false
@@ -463,6 +467,7 @@ func (a *mcpAdapter) Backup(
 		if err := cleanupBackupAttempt(
 			metadataStore,
 			backupID,
+			reservationOwner,
 			nil,
 			createdArtifacts,
 		); err != nil {
