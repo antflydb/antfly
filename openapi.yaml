@@ -16567,14 +16567,6 @@ components:
           $ref: '#/components/schemas/Boost'
       required:
         - term
-    Fuzziness:
-      description: The fuzziness of the query. Can be an integer or "auto".
-      anyOf:
-        - type: integer
-          format: int32
-        - type: string
-          enum:
-            - auto
     MatchQuery:
       type: object
       properties:
@@ -16586,16 +16578,6 @@ components:
           type: string
         boost:
           $ref: '#/components/schemas/Boost'
-        prefix_length:
-          type: integer
-          format: int32
-        fuzziness:
-          $ref: '#/components/schemas/Fuzziness'
-        operator:
-          type: string
-          enum:
-            - or
-            - and
       required:
         - match
     MultiMatchBody:
@@ -16625,6 +16607,16 @@ components:
           $ref: '#/components/schemas/MultiMatchBody'
       required:
         - multi_match
+    Fuzziness:
+      description: The fuzziness of the query. Can be an integer or "auto".
+      anyOf:
+        - type: integer
+          format: int32
+          minimum: 0
+          maximum: 2
+        - type: string
+          enum:
+            - auto
     MatchPhraseQuery:
       type: object
       properties:
@@ -16680,6 +16672,8 @@ components:
         prefix_length:
           type: integer
           format: int32
+          minimum: 0
+          maximum: 255
         fuzziness:
           $ref: '#/components/schemas/Fuzziness'
         field:

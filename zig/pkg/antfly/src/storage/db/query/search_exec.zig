@@ -9134,10 +9134,22 @@ fn patternFilterValueToSearchQuery(
     }
     if (value.object.get("match")) |match| {
         const field_value = try singleFieldString(match, "text");
+        const analyzer_name = if (match == .object)
+            if (match.object.get("analyzer")) |analyzer|
+                jsonString(analyzer) orelse return error.InvalidArgument
+            else
+                null
+        else
+            null;
         return .{ .match = .{
             .field = field_value.field,
             .text = field_value.value,
-            .analyzer = try resolveQueryAnalyzer(field_value.field, null, text_analysis, runtime_schema),
+            .analyzer = try resolveQueryAnalyzer(
+                field_value.field,
+                analyzer_name,
+                text_analysis,
+                runtime_schema,
+            ),
         } };
     }
     if (value.object.get("prefix")) |prefix| {
@@ -9214,7 +9226,132 @@ pub fn validateStructuredFilterValueAlloc(
 ) !void {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    _ = try patternFilterValueToSearchQuery(arena.allocator(), value, .{}, null);
+    var remaining_nodes: usize = 16 * 1024;
+    try validateStructuredFilterGrammar(
+        arena.allocator(),
+        value,
+        0,
+        &remaining_nodes,
+    );
+}
+
+/// Validates the schema-independent shape of the structured-filter DSL.
+/// Standard `range` nodes cannot be lowered until the table schema identifies
+/// their scalar type, so validation handles those nodes structurally and
+/// delegates every other leaf to the production parser.
+fn validateStructuredFilterGrammar(
+    alloc: Allocator,
+    value: std.json.Value,
+    depth: u8,
+    remaining_nodes: *usize,
+) anyerror!void {
+    if (remaining_nodes.* == 0 or depth >= 64 or value != .object) {
+        return error.InvalidArgument;
+    }
+    remaining_nodes.* -= 1;
+
+    if (value.object.get("range")) |range_query| {
+        try validateStandardRangeGrammar(range_query);
+        return;
+    }
+    inline for ([_][]const u8{ "conjuncts", "disjuncts" }) |compound| {
+        if (value.object.get(compound)) |children| {
+            try validateStructuredFilterChildren(
+                alloc,
+                children,
+                depth + 1,
+                remaining_nodes,
+            );
+            return;
+        }
+    }
+    if (value.object.get("bool")) |bool_query| {
+        if (bool_query != .object) return error.InvalidArgument;
+        var should_count: usize = 0;
+        var has_branch = false;
+        inline for ([_][]const u8{ "filter", "must", "should", "must_not" }) |branch| {
+            if (bool_query.object.get(branch)) |children| {
+                has_branch = true;
+                try validateStructuredFilterChildren(
+                    alloc,
+                    children,
+                    depth + 1,
+                    remaining_nodes,
+                );
+                if (comptime std.mem.eql(u8, branch, "should")) {
+                    should_count = children.array.items.len;
+                }
+            }
+        }
+        if (!has_branch) {
+            _ = try patternFilterValueToSearchQuery(alloc, value, .{}, null);
+            return;
+        }
+        if (bool_query.object.get("minimum_should_match") orelse
+            bool_query.object.get("min_should")) |minimum|
+        {
+            const parsed = jsonU32(minimum) orelse return error.InvalidArgument;
+            if (@as(usize, parsed) > should_count) return error.InvalidArgument;
+        }
+        return;
+    }
+
+    _ = try patternFilterValueToSearchQuery(alloc, value, .{}, null);
+}
+
+fn validateStructuredFilterChildren(
+    alloc: Allocator,
+    value: std.json.Value,
+    depth: u8,
+    remaining_nodes: *usize,
+) anyerror!void {
+    if (value != .array or value.array.items.len == 0) {
+        return error.InvalidArgument;
+    }
+    for (value.array.items) |child| {
+        try validateStructuredFilterGrammar(
+            alloc,
+            child,
+            depth,
+            remaining_nodes,
+        );
+    }
+}
+
+fn validateStandardRangeGrammar(value: std.json.Value) !void {
+    if (value != .object) return error.InvalidArgument;
+    const bounds = if (value.object.get("field") orelse value.object.get("path")) |field_value| blk: {
+        const field = jsonString(field_value) orelse return error.InvalidArgument;
+        if (field.len == 0) return error.InvalidArgument;
+        break :blk value.object;
+    } else blk: {
+        if (value.object.count() != 1) return error.InvalidArgument;
+        var it = value.object.iterator();
+        const entry = it.next() orelse return error.InvalidArgument;
+        if (entry.key_ptr.len == 0 or entry.value_ptr.* != .object) {
+            return error.InvalidArgument;
+        }
+        break :blk entry.value_ptr.object;
+    };
+
+    const lower = try standardRangeLowerBound(bounds);
+    const upper = try standardRangeUpperBound(bounds);
+    if (lower == null and upper == null) return error.InvalidArgument;
+    if (lower) |bound| try validateStandardRangeBound(bound.value);
+    if (upper) |bound| try validateStandardRangeBound(bound.value);
+}
+
+fn validateStandardRangeBound(value: std.json.Value) !void {
+    switch (value) {
+        .integer, .string, .null => {},
+        .float => |number| if (!std.math.isFinite(number)) return error.InvalidArgument,
+        .number_string => |text| {
+            const number = std.fmt.parseFloat(f64, text) catch
+                return error.InvalidArgument;
+            if (!std.math.isFinite(number)) return error.InvalidArgument;
+        },
+        else => return error.InvalidArgument,
+    }
 }
 
 fn patternBoolFilterToSearchQuery(
@@ -9776,8 +9913,43 @@ test "pattern standard range filter lowers through runtime scalar mappings" {
     try std.testing.expect(!keyword_query.term_range.inclusive_max);
 }
 
+test "structured filter grammar validates ranges without a runtime schema" {
+    const alloc = std.testing.allocator;
+    var valid = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool":{"must":[{"range":{"price":{"gte":10,"lt":20}}}],"must_not":[{"range":{"created_at":{"lt":"2026-07-01"}}}]}}
+    , .{});
+    defer valid.deinit();
+    try validateStructuredFilterValueAlloc(alloc, valid.value);
+
+    inline for ([_][]const u8{
+        \\{"range":{"price":{}}}
+        ,
+        \\{"range":{"price":{"gte":10,"gt":11}}}
+        ,
+        \\{"range":{"price":{"gte":{"nested":"value"}}}}
+        ,
+        \\{"range":{"field":"price","from":10,"include_lower":"yes"}}
+        ,
+    }) |encoded| {
+        var invalid = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            encoded,
+            .{},
+        );
+        defer invalid.deinit();
+        try std.testing.expectError(
+            error.InvalidArgument,
+            validateStructuredFilterValueAlloc(alloc, invalid.value),
+        );
+    }
+}
+
 fn parseFuzzyOptions(object: anytype, out: *FieldFuzzy) !void {
-    if (object.get("max_edits")) |edits| out.max_edits = jsonU8(edits) orelse return error.InvalidArgument;
+    if (object.get("max_edits")) |edits| {
+        out.max_edits = jsonU8(edits) orelse return error.InvalidArgument;
+        if (out.max_edits > 2) return error.InvalidArgument;
+    }
     if (object.get("prefix_length")) |prefix| out.prefix_len = jsonU8(prefix) orelse return error.InvalidArgument;
     if (object.get("auto_fuzzy")) |auto| {
         if (auto != .bool) return error.InvalidArgument;

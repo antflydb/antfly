@@ -86,12 +86,18 @@ pub fn parseStatefulDirectTextOperatorQueryAlloc(
             } };
         }
     }
-    if (try directStringOperatorValue(value, "match", &.{ "text", "match", "value" }, true)) |parsed| {
-        return .{ .match = .{
-            .field = try alloc.dupe(u8, parsed.field),
-            .text = try alloc.dupe(u8, parsed.value),
-            .boost = boost,
-        } };
+    // Option-bearing public MatchQuery values must go through the generated
+    // schema parser. That path preserves analyzer/boost and rejects options
+    // that the Zig execution model cannot represent instead of silently
+    // changing their semantics here.
+    if (!matchQueryHasPublicOptions(value)) {
+        if (try directStringOperatorValue(value, "match", &.{ "text", "match", "value" }, true)) |parsed| {
+            return .{ .match = .{
+                .field = try alloc.dupe(u8, parsed.field),
+                .text = try alloc.dupe(u8, parsed.value),
+                .boost = boost,
+            } };
+        }
     }
     if (try directStringOperatorValue(value, "match_phrase", &.{ "text", "match_phrase", "value" }, true)) |parsed| {
         return .{ .match_phrase = .{
@@ -140,6 +146,24 @@ fn termQueryHasFuzzyOptions(value: std.json.Value) bool {
     const term = value.object.get("term").?;
     return term == .object and
         (term.object.contains("fuzziness") or term.object.contains("prefix_length"));
+}
+
+fn matchQueryHasPublicOptions(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const match = value.object.get("match") orelse return false;
+    const options = if (match == .object) match.object else value.object;
+    inline for ([_][]const u8{
+        "analyzer",
+        "boost",
+        "fuzziness",
+        "prefix_length",
+        "operator",
+    }) |key| {
+        if (options.get(key)) |option| {
+            if (option != .null) return true;
+        }
+    }
+    return false;
 }
 
 pub fn parseStatefulDirectTextRangeQueryAlloc(
@@ -395,8 +419,13 @@ fn directFuzzyOperatorValue(query: std.json.Value) !?DirectFuzzyOperatorValue {
     return .{
         .field = field.string,
         .value = try directNonBlankString(term),
-        .max_edits = try directOptionalU8(fuzzy.object, "max_edits", 1),
-        .prefix_len = try directOptionalU8(fuzzy.object, "prefix_length", 0),
+        .max_edits = try directOptionalBoundedU8(fuzzy.object, "max_edits", 1, 2),
+        .prefix_len = try directOptionalBoundedU8(
+            fuzzy.object,
+            "prefix_length",
+            0,
+            std.math.maxInt(u8),
+        ),
         .auto_fuzzy = try directOptionalBool(fuzzy.object, "auto_fuzzy", false),
     };
 }
@@ -459,10 +488,17 @@ fn directFieldValue(object: std.json.ObjectMap) ?std.json.Value {
     return object.get("field") orelse object.get("path");
 }
 
-fn directOptionalU8(object: std.json.ObjectMap, key: []const u8, default_value: u8) !u8 {
+fn directOptionalBoundedU8(
+    object: std.json.ObjectMap,
+    key: []const u8,
+    default_value: u8,
+    maximum: u8,
+) !u8 {
     const value = object.get(key) orelse return default_value;
     if (value == .null) return default_value;
-    if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u8)) return error.UnsupportedQueryRequest;
+    if (value != .integer or value.integer < 0 or value.integer > maximum) {
+        return error.InvalidQueryRequest;
+    }
     return @intCast(value.integer);
 }
 
