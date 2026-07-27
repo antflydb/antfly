@@ -3245,12 +3245,12 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     defer parsed_terms_with_null.deinit();
 
     var parsed_bool_with_filter = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"bool":{"must":[{"term":{"published":"true"}}],"filter":[{"term":{"tag":"mango"}}]}}
+        \\{"bool":{"must":[{"term":{"published":true}}],"filter":[{"term":{"tag":"mango"}}]}}
     , .{});
     defer parsed_bool_with_filter.deinit();
 
     var parsed_bool_with_filter_miss = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"bool":{"must":[{"term":{"published":"true"}}],"filter":[{"term":{"tag":"missing"}}]}}
+        \\{"bool":{"must":[{"term":{"published":true}}],"filter":[{"term":{"tag":"missing"}}]}}
     , .{});
     defer parsed_bool_with_filter_miss.deinit();
 

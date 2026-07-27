@@ -6024,7 +6024,18 @@ fn parseGeneratedBleveTextQuery(alloc: std.mem.Allocator, query: std.json.Value)
     const arena = arena_impl.allocator();
 
     const normalized = try normalizeGeneratedBleveQuery(arena, query);
-    const parsed = try std.json.parseFromValue(query_openapi.Query, arena, normalized, .{});
+    const parsed = std.json.parseFromValue(
+        query_openapi.Query,
+        arena,
+        normalized,
+        .{},
+    ) catch |err| switch (err) {
+        // Generated oneOf dispatch uses UnexpectedToken when no supported
+        // query discriminator matches. Keep that implementation detail out of
+        // the public contract while preserving allocator and parser failures.
+        error.UnexpectedToken => return error.UnsupportedQueryRequest,
+        else => return err,
+    };
     return try parseGeneratedBleveQueryValue(alloc, parsed.value);
 }
 

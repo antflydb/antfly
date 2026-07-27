@@ -4375,6 +4375,7 @@ pub fn build(b: *std.Build) void {
         "optional pure should preserves zero baseline and text scores",
         "remote query preserves optional should and named filter bindings",
         "compiled stored filters honor canonical JSON pointer fields and escapes",
+        "jsonDocMatchesPatternFilter supports stored structured filters",
         "stored term filters preserve JSON scalar kinds",
         "api http invalid filter query response names the offending node",
         "api http unsupported filter query response names the offending node",
