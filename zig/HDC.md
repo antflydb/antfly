@@ -30,6 +30,10 @@ This worktree now contains the first engine-owned Phase 1 slice:
 - a ReleaseFast `zig build hdc-bench` harness for projection latency,
   structural encoding throughput, checksum cost, memory accounting, and a
   synthetic complete-HDC RaBitQ recall/latency/storage smoke measurement;
+- a deterministic controlled-composition diagnostic that compares embeddings,
+  embeddings plus exact filters, embeddings plus transparent structured score
+  fusion, semantic-only HDC, and complete HDC on both present and deliberately
+  absent structured combinations;
 - a managed backfill-to-retrieval fixture that uses natural-language HDC search
   to select a location and then follows only the exact stored graph edge, closes
   and reopens the database, repeats the query, and verifies resumed HDC
@@ -49,7 +53,7 @@ fuzzy-seed-to-exact-graph fixture remain required.
 | Canonical document-to-association projection | implemented for selected JSON paths | replay fixtures against stored typed/schema values |
 | Managed ingest, backfill, rebuild, and quarantine | ingest/backfill and close/reopen/resumed writes tested through existing dense lifecycle; HDC seed/model drift receives a distinct artifact namespace | interrupted-backfill and config-drift rebuild fault injection |
 | Text and structured query composition | implemented | managed local-provider projection, exact-path validation, and public query forwarding tests |
-| Dense HBC/RaBitQ retrieval quality | synthetic complete-HDC smoke evaluated | representative recall, candidate-budget, and rerank matrix |
+| Dense HBC/RaBitQ retrieval quality | synthetic complete-HDC smoke evaluated; controlled composition result does not yet beat the simpler baseline | representative recall, candidate-budget, rerank, and application-quality matrix |
 | Fuzzy seed to exact graph result | managed backfill/retrieval fixture implemented | distributed graph fixture and public HTTP contract |
 | Operational status and resource counters | normal index status exposes public hypervector config, semantic config fingerprint, coverage outcomes, replay target, backfill progress/state, cardinality, and disk use | HDC encode/query/resource/fallback counters and pressure tests |
 
@@ -67,6 +71,38 @@ Production success means fast fuzzy-to-exact graph queries, predictable memory
 and storage, no manual vector materialization, fail-closed coordinate-system
 drift, and lifecycle/status behavior identical to other managed derived
 indexes. The graph remains exact: HDC only chooses ranked seed nodes.
+
+## Experiment Goal
+
+This experiment must determine whether complete hypervectors provide a
+meaningful retrieval advantage over ordinary embeddings plus exact filters or a
+simple structured-score baseline, without introducing a new physical index
+engine or weakening graph correctness.
+
+Concretely, it must answer:
+
+> Can Antfly combine semantic and structured evidence into one managed
+> hypervector that selects better graph entry points while meeting production
+> requirements for latency, recall, storage, rebuilds, and a simple user
+> experience?
+
+Success requires all of the following:
+
+- measurably better retrieval, or uniquely useful composition, on
+  representative workloads;
+- exact graph facts, authorization constraints, and filters remaining
+  authoritative;
+- competitive HBC/RaBitQ performance and bounded resource use;
+- deterministic, fail-closed encoder identity and lifecycle behavior;
+- a straightforward UX: declare a hypervector index, write normal documents,
+  and query with text plus optional structured associations.
+
+The experiment is allowed to reject HDC. If complete hypervectors cannot
+outperform ordinary embeddings with exact filtering or transparent structured
+score fusion enough to justify their additional dimensions, scoring cost, and
+lifecycle surface, Antfly should prefer the simpler existing approach. A
+successful implementation of the primitive is not, by itself, a successful
+product experiment.
 
 ## User Experience
 
@@ -1093,11 +1129,16 @@ Measure at least:
 5. complete structural-plus-semantic node HDC, exact cosine, then graph;
 6. complete node HDC, HBC/RaBitQ, then graph;
 7. structured exact filter plus original semantic embedding plus graph;
-8. structured exact filter plus complete node HDC plus graph.
+8. original semantic embedding plus transparent structured score fusion plus
+   graph;
+9. structured exact filter plus complete node HDC plus graph.
 
 The semantic-only HDC case isolates the cost and recall effect of random
 projection. The complete-node case measures whether HDC composition changes
-entry-point quality.
+entry-point quality. The structured-score baseline is required because exact
+filters intentionally have no soft-fallback behavior; comparing HDC only with a
+fail-closed filter would incorrectly attribute the general value of soft
+evidence to HDC's representation.
 
 ### Workloads
 
@@ -1202,6 +1243,65 @@ operate on complete HDC distributions; it does not establish application
 quality or a safe production candidate budget. The benchmark is parameterized
 so dimension, association-count, dataset-size, semantic-weight, query-count,
 and `k` sweeps can be recorded without changing code.
+
+### Controlled composition diagnostic
+
+The benchmark also contains a deterministic diagnostic with 262 documents
+drawn from 12 semantic topics, 6 regions, and 4 features. Twenty-six of the 288
+possible topic/region/feature combinations are deliberately absent. It evaluates:
+
+- 262 hard-match queries with one exact relevant seed and one exact graph
+  answer owned by that seed;
+- 26 soft-fallback queries where the requested combination is absent and
+  same-topic, same-region alternatives are relevant;
+- original 768-dimensional semantic vectors;
+- those vectors with exact region and feature filters;
+- those vectors with a transparent score
+  `cosine + 0.25 * region_match + 0.25 * feature_match`;
+- semantic-only and complete 10,000-dimensional HDC vectors.
+
+The exact graph traversal is not timed in this diagnostic. Because every
+relevant hard-match seed owns one exact answer, hard-match top-1 is also the
+controlled graph-answer accuracy; production evidence must still execute the
+distributed traversal.
+
+On the 2026-07-26 local `arm64` ReleaseFast run with the public HDC semantic
+weight of 8:
+
+| Method | Hard top-1 / MRR / hit@10 | Soft top-1 / MRR / hit@10 | Exact scoring ms/query |
+| --- | --- | --- | ---: |
+| embedding | 0.046 / 0.162 / 0.485 | 0.154 / 0.352 / 0.923 | 0.017 |
+| embedding + exact filter | 1.000 / 1.000 / 1.000 | 0.000 / 0.000 / 0.000 | 0.001 |
+| embedding + structured score | 1.000 / 1.000 / 1.000 | 0.462 / 0.671 / 1.000 | 0.018 |
+| semantic-only HDC | 0.046 / 0.161 / 0.466 | 0.154 / 0.400 / 0.846 | 0.149 |
+| complete HDC, text query | 0.042 / 0.160 / 0.458 | 0.231 / 0.450 / 0.846 | 0.146 |
+| complete HDC, structured query | 1.000 / 1.000 / 1.000 | 0.154 / 0.336 / 0.923 | 0.149 |
+
+The HDC semantic-weight sweep exposes a tradeoff rather than a clear win:
+
+| HDC semantic weight | Hard top-1 / MRR | Soft top-1 / MRR |
+| ---: | --- | --- |
+| 4 | 0.939 / 0.966 | 0.000 / 0.078 |
+| 8 | 1.000 / 1.000 | 0.154 / 0.336 |
+| 12 | 1.000 / 1.000 | 0.423 / 0.636 |
+| 16 | 1.000 / 1.000 | 0.423 / 0.630 |
+| 24 | 1.000 / 1.000 | 0.423 / 0.630 |
+| 32 | 0.992 / 0.996 | 0.500 / 0.668 |
+
+At weight 32, complete HDC has slightly higher soft top-1 than structured score
+fusion, but slightly lower soft MRR, lower hard accuracy, 13 times as many
+stored coordinates, and about 8 times the exact scoring time in this scan. At
+weight 8, the structured-score baseline dominates complete HDC on soft quality
+while tying its hard quality.
+
+This result does not graduate HDC and should not be used to select a production
+default. The workload is synthetic, small enough for exact scans, and designed
+to test composition mechanics rather than application semantics. Its useful
+conclusion is negative: complete HDC has not yet demonstrated unique retrieval
+value over a simpler representation. The next experiment must reproduce or
+reverse that result on independently labeled, representative data using the
+same ANN candidate budgets and end-to-end graph traversal. Hard constraints
+must continue to use exact filters regardless of the result.
 
 ### Graduation criteria
 
