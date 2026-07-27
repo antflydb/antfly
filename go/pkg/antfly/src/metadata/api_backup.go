@@ -377,6 +377,7 @@ func (t *TableApi) BackupTable(w http.ResponseWriter, r *http.Request, tableName
 		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
 		return
 	}
+	defer closeBackupStore(metadataStore)
 	reservationOwner, err := newClusterBackupAttemptID()
 	if err != nil {
 		errorResponse(w, "Failed to initialize backup attempt", http.StatusInternalServerError)
@@ -485,6 +486,7 @@ func (t *TableApi) RestoreTable(
 		errorResponse(w, fmt.Sprintf("Invalid restore location: %v", err), http.StatusBadRequest)
 		return
 	}
+	defer closeBackupStore(metadataStore)
 	metadata, err := metadataStore.ReadMetadata(ctx, rr.BackupId)
 	if err != nil {
 		errorResponse(w, fmt.Sprintf("Failed to read backup metadata: %v", err), http.StatusInternalServerError)
@@ -869,6 +871,46 @@ func readClusterMetadataFromFile(_ context.Context, location, id string) (*Clust
 	data, err := readBackupMetadata(file)
 	if err != nil {
 		return nil, fmt.Errorf("reading cluster metadata file %s: %w", filePath, err)
+	}
+	var meta ClusterBackupMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, fmt.Errorf("unmarshalling cluster metadata: %w", err)
+	}
+	if err := validateClusterBackupMetadata(id, &meta); err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
+func readClusterMetadataFromBackupStore(
+	ctx context.Context,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+	metadataStore backupStore,
+	id string,
+) (*ClusterBackupMetadata, error) {
+	if s3Info != nil {
+		return readClusterMetadataFromBlobStore(ctx, id, s3Info)
+	}
+	fileStore, ok := metadataStore.(*fileBackupStore)
+	if !ok || fileStore.root == nil {
+		return readClusterMetadataFromFile(ctx, resolvedLocation, id)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := common.ValidateBackupID(id); err != nil {
+		return nil, err
+	}
+	name := id + "-cluster-metadata.json"
+	file, err := fileStore.openRepositoryFile(name)
+	if err != nil {
+		return nil, fmt.Errorf("reading cluster metadata file %s: %w", name, err)
+	}
+	defer func() { _ = file.Close() }()
+	data, err := readBackupMetadata(file)
+	if err != nil {
+		return nil, fmt.Errorf("reading cluster metadata file %s: %w", name, err)
 	}
 	var meta ClusterBackupMetadata
 	if err := json.Unmarshal(data, &meta); err != nil {
@@ -1728,10 +1770,42 @@ func currentClusterBackupAttemptHead(
 	))
 }
 
+func currentClusterBackupAttemptHeadForStore(
+	ctx context.Context,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+	metadataStore backupStore,
+) (*ClusterBackupAttemptHead, error) {
+	if s3Info != nil {
+		return currentClusterBackupAttemptHead(ctx, resolvedLocation, s3Info)
+	}
+	fileStore, ok := metadataStore.(*fileBackupStore)
+	if !ok || fileStore.root == nil {
+		return currentClusterBackupAttemptHead(ctx, resolvedLocation, s3Info)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	file, err := fileStore.openRepositoryFile(clusterBackupAttemptHeadName)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	body, err := readBackupMetadata(file)
+	if err != nil {
+		return nil, err
+	}
+	return decodeClusterBackupAttemptHead(body)
+}
+
 func readClusterBackupAttemptForHead(
 	ctx context.Context,
 	resolvedLocation string,
 	s3Info *common.S3Info,
+	metadataStore backupStore,
 	head *ClusterBackupAttemptHead,
 ) (*ClusterBackupAttempt, error) {
 	if err := validateClusterBackupAttemptHead(head); err != nil {
@@ -1762,12 +1836,20 @@ func readClusterBackupAttemptForHead(
 			return nil, err
 		}
 	} else {
-		pathname := filepath.Join(
-			strings.TrimPrefix(resolvedLocation, "file://"),
-			clusterBackupAttemptDir,
-			head.AttemptID+".json",
-		)
-		file, err := os.Open(filepath.Clean(pathname))
+		var file *os.File
+		if fileStore, ok := metadataStore.(*fileBackupStore); ok && fileStore.root != nil {
+			file, err = fileStore.openRepositoryFile(path.Join(
+				clusterBackupAttemptDir,
+				head.AttemptID+".json",
+			))
+		} else {
+			pathname := filepath.Join(
+				strings.TrimPrefix(resolvedLocation, "file://"),
+				clusterBackupAttemptDir,
+				head.AttemptID+".json",
+			)
+			file, err = os.Open(filepath.Clean(pathname))
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1798,6 +1880,7 @@ func clusterBackupAttemptRecordsExist(
 	ctx context.Context,
 	resolvedLocation string,
 	s3Info *common.S3Info,
+	metadataStore backupStore,
 ) (bool, error) {
 	if s3Info != nil {
 		client, err := s3Info.NewMinioClient()
@@ -1824,11 +1907,21 @@ func clusterBackupAttemptRecordsExist(
 		}
 		return false, nil
 	}
+	if fileStore, ok := metadataStore.(*fileBackupStore); ok && fileStore.root != nil {
+		entries, err := fileStore.readRepositoryDir(clusterBackupAttemptDir, 1)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return len(entries) != 0, nil
+	}
 	attemptDir := filepath.Join(
 		strings.TrimPrefix(resolvedLocation, "file://"),
 		clusterBackupAttemptDir,
 	)
-	dir, err := os.Open(attemptDir) //#nosec G304 -- resolved backup root is policy-validated
+	dir, err := os.Open(attemptDir) //#nosec G304 -- used only by already-authorized internal stores
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
@@ -2174,12 +2267,16 @@ func readClusterBackupMetadataForAttempt(
 	ctx context.Context,
 	resolvedLocation string,
 	s3Info *common.S3Info,
+	metadataStore backupStore,
 	attempt *ClusterBackupAttempt,
 ) (*ClusterBackupMetadata, error) {
-	if s3Info != nil {
-		return readClusterMetadataFromBlobStore(ctx, attempt.BackupID, s3Info)
-	}
-	return readClusterMetadataFromFile(ctx, resolvedLocation, attempt.BackupID)
+	return readClusterMetadataFromBackupStore(
+		ctx,
+		resolvedLocation,
+		s3Info,
+		metadataStore,
+		attempt.BackupID,
+	)
 }
 
 func validateNewestClusterBackupRepositoryMetadata(
@@ -2188,7 +2285,12 @@ func validateNewestClusterBackupRepositoryMetadata(
 	s3Info *common.S3Info,
 	metadataStore backupStore,
 ) (*ClusterBackupMetadata, error) {
-	head, err := currentClusterBackupAttemptHead(ctx, resolvedLocation, s3Info)
+	head, err := currentClusterBackupAttemptHeadForStore(
+		ctx,
+		resolvedLocation,
+		s3Info,
+		metadataStore,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -2197,6 +2299,7 @@ func validateNewestClusterBackupRepositoryMetadata(
 			ctx,
 			resolvedLocation,
 			s3Info,
+			metadataStore,
 		)
 		if err != nil {
 			return nil, err
@@ -2208,7 +2311,7 @@ func validateNewestClusterBackupRepositoryMetadata(
 		}
 		return nil, nil
 	}
-	if head.State != clusterBackupAttemptStateCommitted {
+	if head.State == clusterBackupAttemptStateFailed {
 		return nil, fmt.Errorf(
 			"authoritative cluster backup attempt is %s",
 			head.State,
@@ -2218,6 +2321,7 @@ func validateNewestClusterBackupRepositoryMetadata(
 		ctx,
 		resolvedLocation,
 		s3Info,
+		metadataStore,
 		head,
 	)
 	if err != nil {
@@ -2227,6 +2331,7 @@ func validateNewestClusterBackupRepositoryMetadata(
 		ctx,
 		resolvedLocation,
 		s3Info,
+		metadataStore,
 		attempt,
 	)
 	if err != nil {
@@ -2388,6 +2493,7 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
 		return
 	}
+	defer closeBackupStore(metadataStore)
 	backupConfig := common.BackupConfig{
 		BackupID:         req.BackupId,
 		Connection:       req.Connection,
@@ -3086,14 +3192,17 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request, _ RestorePara
 		errorResponse(w, fmt.Sprintf("Invalid restore location: %v", err), http.StatusBadRequest)
 		return
 	}
+	defer closeBackupStore(metadataStore)
 
-	// Read cluster backup metadata
-	var clusterMeta *ClusterBackupMetadata
-	if strings.HasPrefix(req.Location, "s3://") {
-		clusterMeta, err = readClusterMetadataFromBlobStore(ctx, req.BackupId, s3Info)
-	} else {
-		clusterMeta, err = readClusterMetadataFromFile(ctx, resolvedLocation, req.BackupId)
-	}
+	// Read cluster backup metadata from the same authorized repository snapshot
+	// used for table manifests and artifact validation.
+	clusterMeta, err := readClusterMetadataFromBackupStore(
+		ctx,
+		resolvedLocation,
+		s3Info,
+		metadataStore,
+		req.BackupId,
+	)
 	if err != nil {
 		t.logger.Error("Failed to read cluster backup metadata", zap.String("class", sanitizedBackupFailure(err)))
 		errorResponse(w, "Failed to read cluster backup metadata", http.StatusInternalServerError)
@@ -3334,6 +3443,30 @@ func (t *TableApi) Restore(w http.ResponseWriter, r *http.Request, _ RestorePara
 	}
 }
 
+func clusterMetadataObjectListPrefix(prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	return strings.TrimSuffix(path.Clean(prefix), "/") + "/"
+}
+
+func clusterMetadataBackupIDFromObjectKey(
+	prefix, objectKey string,
+) (string, bool) {
+	relative, ok := strings.CutPrefix(
+		objectKey,
+		clusterMetadataObjectListPrefix(prefix),
+	)
+	if !ok || relative == "" || strings.Contains(relative, "/") {
+		return "", false
+	}
+	backupID, ok := strings.CutSuffix(relative, "-cluster-metadata.json")
+	if !ok || common.ValidateBackupID(backupID) != nil {
+		return "", false
+	}
+	return backupID, true
+}
+
 // ListBackups lists available cluster backups at a location
 func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params ListBackupsParams) {
 	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, "*", usermgr.PermissionTypeRead) {
@@ -3362,6 +3495,7 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
 		return
 	}
+	defer closeBackupStore(metadataStore)
 	authoritativeMeta, err := validateNewestClusterBackupRepositoryMetadata(
 		ctx,
 		resolvedLocation,
@@ -3399,12 +3533,8 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 		})
 	}
 	if strings.HasPrefix(location, "s3://") {
-		// e.g. "s3://my-bucket-name/optional/prefix"
-		bucket, prefix, err := common.ParseS3URL(location)
-		if err != nil {
-			errorResponse(w, fmt.Sprintf("Invalid location URL: %v", err), http.StatusBadRequest)
-			return
-		}
+		bucket := s3Info.Bucket
+		prefix := s3Info.Prefix
 		minioClient, err := s3Info.NewMinioClient()
 		if err != nil {
 			t.logger.Error("Failed to initialize backup storage client", zap.String("class", sanitizedBackupFailure(err)))
@@ -3414,7 +3544,7 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 
 		// List objects with cluster-metadata suffix
 		objectCh := minioClient.ListObjects(ctx, bucket, minio.ListObjectsOptions{
-			Prefix:    prefix,
+			Prefix:    clusterMetadataObjectListPrefix(prefix),
 			Recursive: true,
 		})
 		for object := range objectCh {
@@ -3423,19 +3553,22 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 				errorResponse(w, "Failed to list backup metadata", http.StatusInternalServerError)
 				return
 			}
-			if before, ok := strings.CutSuffix(object.Key, "-cluster-metadata.json"); ok {
+			if backupID, ok := clusterMetadataBackupIDFromObjectKey(
+				prefix,
+				object.Key,
+			); ok {
 				sawClusterMetadata = true
-				// Extract backup ID from filename (strip the prefix if present)
-				backupID := before
-				if prefix != "" {
-					backupID = strings.TrimPrefix(backupID, prefix)
-					backupID = strings.TrimPrefix(backupID, "/")
-				}
 				if authoritativeMeta != nil && backupID == authoritativeMeta.BackupID {
 					continue
 				}
 				// Read the metadata
-				meta, err := readClusterMetadataFromBlobStore(ctx, backupID, s3Info)
+				meta, err := readClusterMetadataFromBackupStore(
+					ctx,
+					resolvedLocation,
+					s3Info,
+					metadataStore,
+					backupID,
+				)
 				if err != nil {
 					// A stale-version, corrupt, or partially uploaded
 					// manifest must not make unrelated backups unavailable.
@@ -3448,7 +3581,12 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 	} else {
 		// File-based listing
 		dirPath := strings.TrimPrefix(resolvedLocation, "file://")
-		entries, err := os.ReadDir(dirPath)
+		var entries []os.DirEntry
+		if fileStore, ok := metadataStore.(*fileBackupStore); ok && fileStore.root != nil {
+			entries, err = fileStore.readRepositoryDir(".", -1)
+		} else {
+			entries, err = os.ReadDir(dirPath)
+		}
 		if err != nil {
 			t.logger.Error("Failed to enumerate backup metadata", zap.String("class", sanitizedBackupFailure(err)))
 			errorResponse(w, "Failed to enumerate backup metadata", http.StatusInternalServerError)
@@ -3460,14 +3598,23 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 				continue
 			}
 			if before, ok := strings.CutSuffix(entry.Name(), "-cluster-metadata.json"); ok {
-				sawClusterMetadata = true
 				// Extract backup ID from filename
 				backupID := before
+				if common.ValidateBackupID(backupID) != nil {
+					continue
+				}
+				sawClusterMetadata = true
 				if authoritativeMeta != nil && backupID == authoritativeMeta.BackupID {
 					continue
 				}
 				// Read the metadata
-				meta, err := readClusterMetadataFromFile(ctx, resolvedLocation, backupID)
+				meta, err := readClusterMetadataFromBackupStore(
+					ctx,
+					resolvedLocation,
+					s3Info,
+					metadataStore,
+					backupID,
+				)
 				if err != nil {
 					t.logger.Warn("Skipping invalid cluster backup metadata", zap.String("class", sanitizedBackupFailure(err)))
 					continue

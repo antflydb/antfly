@@ -220,6 +220,117 @@ func TestFileBackupStorePersistsFormatInVersionedEnvelope(t *testing.T) {
 	assert.Equal(t, table.Name, metadata.Table.Name)
 }
 
+func TestReadOnlyFileBackupStoreRetainsAuthorizedRepositoryRoot(t *testing.T) {
+	connectionRoot := t.TempDir()
+	repositoryPath := filepath.Join(connectionRoot, "repository")
+	require.NoError(t, os.Mkdir(repositoryPath, 0o750))
+	const backupID = "backup-1"
+	const artifactName = "backup-1-1.backup"
+	authorizedArtifact := []byte("authorized artifact")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(repositoryPath, artifactName),
+		authorizedArtifact,
+		0o600,
+	))
+	originalTable := &store.Table{Name: "authorized"}
+	require.NoError(t, (&fileBackupStore{location: repositoryPath}).WriteMetadata(
+		context.Background(),
+		backupID,
+		originalTable,
+		common.BackupFormatNative,
+		nil,
+	))
+	originalCluster := &ClusterBackupMetadata{
+		Version:             clusterBackupMetadataVersion,
+		State:               clusterBackupStateComplete,
+		BackupID:            backupID,
+		Timestamp:           time.Now().UTC(),
+		Format:              common.BackupFormatNative,
+		ExpectedTableCount:  1,
+		CompletedTableCount: 1,
+		Tables: []ClusterBackupTableInfo{{
+			Name:           originalTable.Name,
+			BackupLocation: "file:///repository",
+			Status:         "completed",
+		}},
+	}
+	require.NoError(t, writeClusterMetadataToFile(
+		context.Background(),
+		"file://"+repositoryPath,
+		backupID,
+		originalCluster,
+	))
+
+	outsidePath := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(outsidePath, artifactName),
+		[]byte("outside artifact with a different size"),
+		0o600,
+	))
+	outsideTable := &store.Table{Name: "outside"}
+	require.NoError(t, (&fileBackupStore{location: outsidePath}).WriteMetadata(
+		context.Background(),
+		backupID,
+		outsideTable,
+		common.BackupFormatNative,
+		nil,
+	))
+	outsideCluster := *originalCluster
+	outsideCluster.Tables = []ClusterBackupTableInfo{{
+		Name:           outsideTable.Name,
+		BackupLocation: "file:///outside",
+		Status:         "completed",
+	}}
+	require.NoError(t, writeClusterMetadataToFile(
+		context.Background(),
+		"file://"+outsidePath,
+		backupID,
+		&outsideCluster,
+	))
+
+	var filesystemConnection common.ConnectionConfig
+	require.NoError(t, filesystemConnection.UnmarshalJSON([]byte(fmt.Sprintf(`{
+		"kind":"external_io",
+		"capabilities":["restore.read"],
+		"external_io":{"protocol":"filesystem","root":%q}
+	}`, connectionRoot))))
+	config := &common.Config{Connections: map[string]common.ConnectionConfig{
+		"filesystem": filesystemConnection,
+	}}
+	metadataStore, err := newBackupStore(
+		config,
+		"filesystem",
+		"restore.read",
+		"file:///repository",
+	)
+	require.NoError(t, err)
+	defer closeBackupStore(metadataStore)
+
+	movedPath := filepath.Join(connectionRoot, "repository-moved")
+	require.NoError(t, os.Rename(repositoryPath, movedPath))
+	if err := os.Symlink(outsidePath, repositoryPath); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+
+	metadata, err := metadataStore.ReadMetadata(context.Background(), backupID)
+	require.NoError(t, err)
+	require.Equal(t, originalTable.Name, metadata.Table.Name)
+	clusterMetadata, err := readClusterMetadataFromBackupStore(
+		context.Background(),
+		"file://"+repositoryPath,
+		nil,
+		metadataStore,
+		backupID,
+	)
+	require.NoError(t, err)
+	require.Equal(t, originalTable.Name, clusterMetadata.Tables[0].Name)
+	require.NoError(t, metadataStore.ValidateArtifactMetadata(
+		context.Background(),
+		artifactName,
+		uint64(len(authorizedArtifact)),
+	))
+}
+
 func TestFileBackupStorePersistsPortableArtifactIntegrity(t *testing.T) {
 	root := t.TempDir()
 	backupStore := &fileBackupStore{location: root}
@@ -1582,8 +1693,10 @@ func TestNewestClusterBackupAttemptMustBeCommittedAndRestorable(t *testing.T) {
 		nil,
 		healthStore,
 	)
-	require.Nil(t, validatedMeta)
-	require.ErrorContains(t, err, clusterBackupAttemptStateActive)
+	require.NoError(t, err)
+	require.NotNil(t, validatedMeta)
+	require.Equal(t, attempt.BackupID, validatedMeta.BackupID)
+	require.Zero(t, healthStore.identityChecks.Load())
 	owned, err := transitionClusterBackupAttemptHead(
 		context.Background(),
 		"file://"+root,
@@ -1662,6 +1775,112 @@ func TestNewestClusterBackupRepositoryRejectsMarkerWithoutHead(t *testing.T) {
 	)
 	require.Nil(t, validatedMeta)
 	require.ErrorContains(t, err, "without an authoritative head")
+}
+
+func TestNewestClusterBackupRepositoryRejectsFailedHead(t *testing.T) {
+	root := t.TempDir()
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-failed",
+		BackupID:           "backup-1",
+		CreatedAt:          time.Now().UTC(),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"documents-backup-1"},
+		ArtifactNames:      []string{"backup-1-1.afb"},
+	}
+	markerDigest, err := writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+	_, err = publishClusterBackupAttemptHead(
+		context.Background(),
+		"file://"+root,
+		nil,
+		ClusterBackupAttemptHead{
+			AttemptID:    attempt.AttemptID,
+			BackupID:     attempt.BackupID,
+			MarkerSHA256: hex.EncodeToString(markerDigest[:]),
+		},
+	)
+	require.NoError(t, err)
+	owned, err := transitionClusterBackupAttemptHead(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt.AttemptID,
+		clusterBackupAttemptStateFailed,
+	)
+	require.NoError(t, err)
+	require.True(t, owned)
+	validatedMeta, err := validateNewestClusterBackupRepositoryMetadata(
+		context.Background(),
+		"file://"+root,
+		nil,
+		&fileBackupStore{location: root},
+	)
+	require.Nil(t, validatedMeta)
+	require.ErrorContains(t, err, clusterBackupAttemptStateFailed)
+}
+
+func TestClusterMetadataObjectBackupIDIsRepositoryScoped(t *testing.T) {
+	testCases := []struct {
+		name      string
+		prefix    string
+		objectKey string
+		backupID  string
+		ok        bool
+	}{
+		{
+			name:      "direct child",
+			prefix:    "tenant/repository",
+			objectKey: "tenant/repository/backup-1-cluster-metadata.json",
+			backupID:  "backup-1",
+			ok:        true,
+		},
+		{
+			name:      "trailing slash",
+			prefix:    "tenant/repository/",
+			objectKey: "tenant/repository/backup-1-cluster-metadata.json",
+			backupID:  "backup-1",
+			ok:        true,
+		},
+		{
+			name:      "empty prefix direct child",
+			objectKey: "backup-1-cluster-metadata.json",
+			backupID:  "backup-1",
+			ok:        true,
+		},
+		{
+			name:      "sibling byte prefix",
+			prefix:    "tenant/repository",
+			objectKey: "tenant/repository-other/backup-1-cluster-metadata.json",
+		},
+		{
+			name:      "nested child",
+			prefix:    "tenant/repository",
+			objectKey: "tenant/repository/nested/backup-1-cluster-metadata.json",
+		},
+		{
+			name:      "invalid backup ID",
+			prefix:    "tenant/repository",
+			objectKey: "tenant/repository/../-cluster-metadata.json",
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			backupID, ok := clusterMetadataBackupIDFromObjectKey(
+				testCase.prefix,
+				testCase.objectKey,
+			)
+			require.Equal(t, testCase.ok, ok)
+			require.Equal(t, testCase.backupID, backupID)
+		})
+	}
 }
 
 func TestClusterBackupAttemptRejectsOverlappingIdentifiers(t *testing.T) {

@@ -443,6 +443,7 @@ func (a *mcpAdapter) Backup(
 	if err != nil {
 		return err
 	}
+	defer closeBackupStore(metadataStore)
 	reservationOwner, err := newClusterBackupAttemptID()
 	if err != nil {
 		return fmt.Errorf("initializing backup attempt: %w", err)
@@ -518,6 +519,7 @@ func (a *mcpAdapter) Restore(
 	if err != nil {
 		return err
 	}
+	defer closeBackupStore(metadataStore)
 	metadata, err := metadataStore.ReadMetadata(ctx, backupID)
 	if err != nil {
 		return fmt.Errorf("reading backup metadata: %w", err)

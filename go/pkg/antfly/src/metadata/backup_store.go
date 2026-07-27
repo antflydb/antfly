@@ -389,7 +389,25 @@ func newBackupStore(
 	if strings.HasPrefix(location, "s3://") {
 		return &s3BackupStore{s3Config: s3Config}, nil
 	}
-	return &fileBackupStore{location: resolvedLocation}, nil
+	store := &fileBackupStore{location: resolvedLocation}
+	if capability == "restore.read" {
+		root, err := config.OpenFilesystemPath(
+			connection,
+			capability,
+			location,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("anchoring filesystem backup location: %w", err)
+		}
+		store.root = root
+	}
+	return store, nil
+}
+
+func closeBackupStore(store backupStore) {
+	if closer, ok := store.(io.Closer); ok {
+		_ = closer.Close()
+	}
 }
 
 func resolveBackupLocation(
@@ -417,6 +435,56 @@ func resolveBackupLocation(
 // fileBackupStore reads/writes backup metadata to the local filesystem.
 type fileBackupStore struct {
 	location string
+	root     *os.Root
+}
+
+func (s *fileBackupStore) Close() error {
+	if s.root == nil {
+		return nil
+	}
+	return s.root.Close()
+}
+
+func (s *fileBackupStore) repositoryRoot() (*os.Root, bool, error) {
+	if s.root != nil {
+		return s.root, false, nil
+	}
+	rootPath := strings.TrimPrefix(s.location, "file://")
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return nil, false, fmt.Errorf("opening backup root: %w", err)
+	}
+	return root, true, nil
+}
+
+func (s *fileBackupStore) openRepositoryFile(name string) (*os.File, error) {
+	root, closeRoot, err := s.repositoryRoot()
+	if err != nil {
+		return nil, err
+	}
+	if closeRoot {
+		defer func() { _ = root.Close() }()
+	}
+	return root.Open(name)
+}
+
+func (s *fileBackupStore) readRepositoryDir(
+	name string,
+	limit int,
+) ([]os.DirEntry, error) {
+	root, closeRoot, err := s.repositoryRoot()
+	if err != nil {
+		return nil, err
+	}
+	if closeRoot {
+		defer func() { _ = root.Close() }()
+	}
+	dir, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = dir.Close() }()
+	return dir.ReadDir(limit)
 }
 
 func (s *fileBackupStore) resolveAndValidate(id string) (string, error) {
@@ -650,13 +718,7 @@ func (s *fileBackupStore) ValidateArtifactMetadata(
 	if name == "" || filepath.Base(name) != name {
 		return fmt.Errorf("invalid backup artifact name %q", name)
 	}
-	rootPath := strings.TrimPrefix(s.location, "file://")
-	root, err := os.OpenRoot(rootPath)
-	if err != nil {
-		return fmt.Errorf("opening backup root: %w", err)
-	}
-	defer func() { _ = root.Close() }()
-	file, err := root.Open(name)
+	file, err := s.openRepositoryFile(name)
 	if err != nil {
 		return err
 	}
@@ -691,13 +753,7 @@ func (s *fileBackupStore) ValidateArtifactIdentity(
 	if artifact.Name == "" || filepath.Base(artifact.Name) != artifact.Name {
 		return fmt.Errorf("invalid backup artifact name %q", artifact.Name)
 	}
-	rootPath := strings.TrimPrefix(s.location, "file://")
-	root, err := os.OpenRoot(rootPath)
-	if err != nil {
-		return fmt.Errorf("opening backup root: %w", err)
-	}
-	defer func() { _ = root.Close() }()
-	file, err := root.Open(artifact.Name)
+	file, err := s.openRepositoryFile(artifact.Name)
 	if err != nil {
 		return err
 	}
@@ -721,7 +777,7 @@ func (s *fileBackupStore) ValidateArtifactIdentity(
 	if err != nil {
 		return err
 	}
-	currentFile, err := root.Open(artifact.Name)
+	currentFile, err := s.openRepositoryFile(artifact.Name)
 	if err != nil {
 		return err
 	}
@@ -797,7 +853,12 @@ func (s *fileBackupStore) ReadMetadata(
 	if err != nil {
 		return nil, err
 	}
-	file, err := os.Open(filePath) //#nosec G304 -- path validated by resolveAndValidate
+	var file *os.File
+	if s.root != nil {
+		file, err = s.openRepositoryFile(filepath.Base(filePath))
+	} else {
+		file, err = os.Open(filePath) //#nosec G304 -- path validated by resolveAndValidate
+	}
 	if err != nil {
 		return nil, fmt.Errorf("reading metadata file %s: %w", filePath, err)
 	}
