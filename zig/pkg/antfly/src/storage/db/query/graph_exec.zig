@@ -23,6 +23,7 @@ const levenshtein_mod = @import("../../../search/levenshtein.zig");
 const pattern_filter_contract = @import("../../../search/pattern_filter_contract.zig");
 const regex_mod = @import("../../../search/regex.zig");
 const doc_set = @import("../doc_set.zig");
+const pathfact_mod = @import("../algebraic/pathfact.zig");
 
 pub const NamedResultSet = struct {
     name: []const u8,
@@ -1521,12 +1522,14 @@ pub const CompiledPatternFilter = union(enum) {
 
     pub const FieldPath = union(enum) {
         single: []const u8,
-        multi: []const []const u8,
+        dotted: []const []const u8,
+        json_pointer: []const []const u8,
 
         fn collectValues(self: FieldPath, alloc: Allocator, doc: std.json.Value, out: *std.ArrayListUnmanaged(std.json.Value)) !void {
             switch (self) {
                 .single => |segment| try collectJsonValuesAtSingleSegment(alloc, doc, segment, out),
-                .multi => |segments| try collectJsonValuesAtPath(alloc, doc, segments, 0, out),
+                .dotted => |segments| try collectJsonValuesAtPath(alloc, doc, segments, 0, out),
+                .json_pointer => |segments| try collectJsonValueAtPointer(alloc, doc, segments, out),
             }
         }
     };
@@ -1537,8 +1540,8 @@ pub const CompiledPatternFilter = union(enum) {
     };
 
     pub const FieldPredicate = union(enum) {
-        term: []const u8,
-        terms: []const []const u8,
+        term: PatternScalar,
+        terms: []const PatternScalar,
         prefix: []const u8,
         wildcard: []const u8,
         regexp: regex_mod.RegexAutomaton,
@@ -1835,7 +1838,7 @@ fn compilePatternFieldPath(
 ) !CompiledPatternFilter.FieldPath {
     if (field.json_pointer) {
         if (field.value.len == 0) {
-            return .{ .multi = try alloc.alloc([]const u8, 0) };
+            return .{ .json_pointer = try alloc.alloc([]const u8, 0) };
         }
         var parts = std.mem.splitScalar(u8, field.value[1..], '/');
         var count: usize = 0;
@@ -1847,7 +1850,7 @@ fn compilePatternFieldPath(
         while (parts2.next()) |part| : (i += 1) {
             compiled[i] = try decodePatternJsonPointerSegmentAlloc(alloc, part);
         }
-        return .{ .multi = compiled };
+        return .{ .json_pointer = compiled };
     }
 
     if (std.mem.indexOfScalar(u8, field.value, '.') == null) {
@@ -1863,7 +1866,7 @@ fn compilePatternFieldPath(
     while (parts2.next()) |part| : (i += 1) {
         compiled[i] = part;
     }
-    return .{ .multi = compiled };
+    return .{ .dotted = compiled };
 }
 
 fn decodePatternJsonPointerSegmentAlloc(
@@ -1960,9 +1963,19 @@ const PatternFieldString = struct {
     value: []const u8,
 };
 
+const PatternScalar = struct {
+    kind: pathfact_mod.Kind,
+    value: []const u8,
+};
+
+const PatternFieldScalar = struct {
+    field: []const u8,
+    value: PatternScalar,
+};
+
 const PatternFieldTerms = struct {
     field: []const u8,
-    terms: []const []const u8,
+    terms: []const PatternScalar,
 };
 
 fn patternFieldOrPathValue(object: std.json.ObjectMap) ?std.json.Value {
@@ -1999,12 +2012,26 @@ fn extractPatternFieldString(alloc: Allocator, value: std.json.Value, value_key:
     if (value.object.count() == 1) {
         var it = value.object.iterator();
         const entry = it.next() orelse return error.InvalidArgument;
-        return .{ .field = entry.key_ptr.*, .value = try jsonScalarTermAlloc(alloc, entry.value_ptr.*) };
+        if (entry.value_ptr.* != .string) return error.InvalidArgument;
+        return .{ .field = entry.key_ptr.*, .value = try alloc.dupe(u8, entry.value_ptr.string) };
+    }
+    const raw_value = value.object.get(value_key) orelse value.object.get("value") orelse return error.InvalidArgument;
+    const field_value = patternFieldOrPathValue(value.object) orelse return error.InvalidArgument;
+    if (field_value != .string or raw_value != .string) return error.InvalidArgument;
+    return .{ .field = field_value.string, .value = try alloc.dupe(u8, raw_value.string) };
+}
+
+fn extractPatternFieldScalar(alloc: Allocator, value: std.json.Value, value_key: []const u8) !PatternFieldScalar {
+    if (value != .object) return error.InvalidArgument;
+    if (value.object.count() == 1) {
+        var it = value.object.iterator();
+        const entry = it.next() orelse return error.InvalidArgument;
+        return .{ .field = entry.key_ptr.*, .value = try compilePatternScalar(alloc, entry.value_ptr.*) };
     }
     const raw_value = value.object.get(value_key) orelse value.object.get("value") orelse return error.InvalidArgument;
     const field_value = patternFieldOrPathValue(value.object) orelse return error.InvalidArgument;
     if (field_value != .string) return error.InvalidArgument;
-    return .{ .field = field_value.string, .value = try jsonScalarTermAlloc(alloc, raw_value) };
+    return .{ .field = field_value.string, .value = try compilePatternScalar(alloc, raw_value) };
 }
 
 fn extractPatternFieldTerms(alloc: Allocator, value: std.json.Value) !PatternFieldTerms {
@@ -2053,27 +2080,25 @@ fn extractPatternFuzzyPredicate(value: std.json.Value) !std.json.Value {
     return value;
 }
 
-fn compilePatternTerms(alloc: Allocator, value: std.json.Value) ![]const []const u8 {
+fn compilePatternTerms(alloc: Allocator, value: std.json.Value) ![]const PatternScalar {
     if (value != .array or value.array.items.len == 0) return error.InvalidArgument;
     if (value.array.items.len > pattern_filter_max_leaf_values) {
         return error.InvalidArgument;
     }
-    const out = try alloc.alloc([]const u8, value.array.items.len);
+    const out = try alloc.alloc(PatternScalar, value.array.items.len);
     for (value.array.items, 0..) |item, i| {
-        out[i] = try jsonScalarTermAlloc(alloc, item);
+        out[i] = try compilePatternScalar(alloc, item);
     }
     return out;
 }
 
-fn jsonScalarTermAlloc(alloc: Allocator, value: std.json.Value) ![]const u8 {
+fn compilePatternScalar(alloc: Allocator, value: std.json.Value) !PatternScalar {
     return switch (value) {
-        .string => |text| try alloc.dupe(u8, text),
-        .integer => |number| try std.fmt.allocPrint(alloc, "{}", .{number}),
-        .float => |number| try std.fmt.allocPrint(alloc, "{d}", .{number}),
-        .number_string => |text| try alloc.dupe(u8, text),
-        .bool => |boolean| try alloc.dupe(u8, if (boolean) "true" else "false"),
-        .null => try alloc.dupe(u8, "null"),
-        else => error.InvalidArgument,
+        .null, .bool, .integer, .float, .number_string, .string => .{
+            .kind = pathfact_mod.kindFromJsonValue(value),
+            .value = try pathfact_mod.scalarValueAlloc(alloc, value),
+        },
+        .object, .array => error.InvalidArgument,
     };
 }
 
@@ -2112,7 +2137,7 @@ fn extractStandardRangePredicate(range_query: std.json.Value) !std.json.Value {
 
 fn compilePatternFieldPredicate(alloc: Allocator, filter_query: std.json.Value) !CompiledPatternFilter.FieldPredicate {
     if (filter_query.object.get("term")) |term| {
-        return .{ .term = (try extractPatternFieldString(alloc, term, "term")).value };
+        return .{ .term = (try extractPatternFieldScalar(alloc, term, "term")).value };
     }
     if (filter_query.object.get("terms")) |terms| {
         return .{ .terms = (try extractPatternFieldTerms(alloc, terms)).terms };
@@ -2264,33 +2289,69 @@ fn collectJsonValuesAtPath(
     }
 }
 
-fn jsonValuesContainTerm(values: []const std.json.Value, term: []const u8) bool {
+fn collectJsonValueAtPointer(
+    alloc: Allocator,
+    root: std.json.Value,
+    path: []const []const u8,
+    out: *std.ArrayListUnmanaged(std.json.Value),
+) !void {
+    var current = root;
+    for (path) |segment| {
+        current = switch (current) {
+            .object => |object| object.get(segment) orelse return,
+            .array => |array| blk: {
+                if (!isCanonicalJsonPointerArrayIndex(segment)) return;
+                const index = std.fmt.parseInt(usize, segment, 10) catch return;
+                if (index >= array.items.len) return;
+                break :blk array.items[index];
+            },
+            else => return,
+        };
+    }
+    try out.append(alloc, current);
+}
+
+fn isCanonicalJsonPointerArrayIndex(segment: []const u8) bool {
+    if (segment.len == 0) return false;
+    if (segment.len > 1 and segment[0] == '0') return false;
+    for (segment) |char| {
+        if (char < '0' or char > '9') return false;
+    }
+    return true;
+}
+
+fn jsonValuesContainTerm(values: []const std.json.Value, term: PatternScalar) bool {
     for (values) |value| {
+        if (value == .array) {
+            if (jsonValuesContainTerm(value.array.items, term)) return true;
+            continue;
+        }
+        if (pathfact_mod.kindFromJsonValue(value) != term.kind) continue;
         switch (value) {
-            .string => |text| if (std.mem.eql(u8, text, term)) return true,
-            .number_string => |text| if (std.mem.eql(u8, text, term)) return true,
+            .string => |text| if (std.mem.eql(u8, text, term.value)) return true,
+            .number_string => |text| if (std.mem.eql(u8, text, term.value)) return true,
             .integer => |number| {
                 var buf: [32]u8 = undefined;
                 const rendered = std.fmt.bufPrint(&buf, "{}", .{number}) catch continue;
-                if (std.mem.eql(u8, rendered, term)) return true;
+                if (std.mem.eql(u8, rendered, term.value)) return true;
             },
             .float => |number| {
                 var buf: [64]u8 = undefined;
                 const rendered = std.fmt.bufPrint(&buf, "{d}", .{number}) catch continue;
-                if (std.mem.eql(u8, rendered, term)) return true;
+                if (std.mem.eql(u8, rendered, term.value)) return true;
             },
             .bool => |boolean| {
-                if ((boolean and std.mem.eql(u8, term, "true")) or (!boolean and std.mem.eql(u8, term, "false"))) return true;
+                if ((boolean and std.mem.eql(u8, term.value, "true")) or (!boolean and std.mem.eql(u8, term.value, "false"))) return true;
             },
-            .null => if (std.mem.eql(u8, term, "null")) return true,
-            .array => |array| if (jsonValuesContainTerm(array.items, term)) return true,
+            .null => return true,
+            .array => unreachable,
             else => {},
         }
     }
     return false;
 }
 
-fn jsonValuesContainAnyTerm(values: []const std.json.Value, terms: []const []const u8) bool {
+fn jsonValuesContainAnyTerm(values: []const std.json.Value, terms: []const PatternScalar) bool {
     for (terms) |term| {
         if (jsonValuesContainTerm(values, term)) return true;
     }
@@ -3411,7 +3472,7 @@ test "compiled stored filters honor canonical JSON pointer fields and escapes" {
     var doc = try std.json.parseFromSlice(
         std.json.Value,
         alloc,
-        \\{"meta":{"tier":"gold","a/b":{"~key":"escaped"}},"/meta/tier":"literal"}
+        \\{"meta":{"tier":"gold","a/b":{"~key":"escaped"}},"items":[{"role":"admin"},{"role":"reader"}],"/meta/tier":"literal"}
     ,
         .{},
     );
@@ -3451,6 +3512,30 @@ test "compiled stored filters honor canonical JSON pointer fields and escapes" {
             ,
             .expected = false,
         },
+        .{
+            .encoded =
+            \\{"term":{"path":"/items/0/role","value":"admin"}}
+            ,
+            .expected = true,
+        },
+        .{
+            .encoded =
+            \\{"term":{"path":"/items/role","value":"admin"}}
+            ,
+            .expected = false,
+        },
+        .{
+            .encoded =
+            \\{"term":{"path":"/items/01/role","value":"reader"}}
+            ,
+            .expected = false,
+        },
+        .{
+            .encoded =
+            \\{"term":{"field":"items.role","value":"admin"}}
+            ,
+            .expected = true,
+        },
     }) |case| {
         var parsed = try std.json.parseFromSlice(
             std.json.Value,
@@ -3480,6 +3565,51 @@ test "compiled stored filters honor canonical JSON pointer fields and escapes" {
                 ),
             );
         }
+    }
+}
+
+test "stored term filters preserve JSON scalar kinds" {
+    const alloc = std.testing.allocator;
+    var doc = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"string_true":"true","bool_true":true,"string_one":"1","number_one":1,"string_null":"null","null_value":null,"mixed":["1",1,false]}
+    ,
+        .{},
+    );
+    defer doc.deinit();
+
+    inline for ([_]struct {
+        encoded: []const u8,
+        expected: bool,
+    }{
+        .{ .encoded = "{\"term\":{\"string_true\":\"true\"}}", .expected = true },
+        .{ .encoded = "{\"term\":{\"string_true\":true}}", .expected = false },
+        .{ .encoded = "{\"term\":{\"bool_true\":true}}", .expected = true },
+        .{ .encoded = "{\"term\":{\"bool_true\":\"true\"}}", .expected = false },
+        .{ .encoded = "{\"term\":{\"string_one\":1}}", .expected = false },
+        .{ .encoded = "{\"term\":{\"number_one\":1}}", .expected = true },
+        .{ .encoded = "{\"term\":{\"string_null\":null}}", .expected = false },
+        .{ .encoded = "{\"term\":{\"null_value\":null}}", .expected = true },
+        .{ .encoded = "{\"terms\":{\"mixed\":[1,true]}}", .expected = true },
+        .{ .encoded = "{\"terms\":{\"mixed\":[true]}}", .expected = false },
+    }) |case| {
+        var parsed_filter = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            case.encoded,
+            .{},
+        );
+        defer parsed_filter.deinit();
+        try std.testing.expectEqual(
+            case.expected,
+            try jsonDocMatchesPatternFilter(
+                alloc,
+                "doc:typed",
+                doc.value,
+                parsed_filter.value,
+            ),
+        );
     }
 }
 

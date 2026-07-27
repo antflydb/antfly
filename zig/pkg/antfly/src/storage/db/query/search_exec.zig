@@ -16214,6 +16214,7 @@ pub fn textQueryToSearchQuery(
             .should = try textQuerySliceToSearchQuerySlice(alloc, bool_query.should, text_analysis, runtime_schema),
             .must_not = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must_not, text_analysis, runtime_schema),
             .min_should = bool_query.min_should,
+            .pure_should_optional = bool_query.pure_should_optional,
             .boost = bool_query.boost,
         } },
     };

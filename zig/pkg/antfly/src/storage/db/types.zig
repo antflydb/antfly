@@ -635,6 +635,9 @@ pub const TextBoolQuery = struct {
     should: []const TextQuery = &.{},
     must_not: []const TextQuery = &.{},
     min_should: u32 = 0,
+    /// Distinguishes an explicitly optional pure-`should` query from the
+    /// conventional pure disjunction whose implicit minimum is one.
+    pure_should_optional: bool = false,
     boost: f32 = 1.0,
 };
 

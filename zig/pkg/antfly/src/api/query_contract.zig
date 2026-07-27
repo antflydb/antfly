@@ -2211,6 +2211,12 @@ pub fn parseQueryRequest(
     normalized_query.exclusion_query_json = "";
     try parseInternalFilterQueryJsonAlloc(alloc, body, &req);
     req.doc_filter_bindings = try parsePublicDocFilterBindingsAlloc(alloc, body, req.limit);
+    try validatePublicDocFilterRootRefsAlloc(
+        alloc,
+        req.doc_filter_bindings,
+        req.filter_query_json,
+        req.exclusion_query_json,
+    );
 
     const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, req.limit);
     errdefer vector_queries.deinit(alloc);
@@ -5033,6 +5039,7 @@ fn normalizePublicQueryBucketsAlloc(
         alloc,
         &scoring_must,
         &scoring_should,
+        false,
         1.0,
     );
     errdefer if (full_text) |query| freeTextQuery(alloc, query);
@@ -5107,25 +5114,15 @@ fn appendCanonicalPublicQueryAlloc(
             if (bool_value.object.get("must_not")) |must_not_value| {
                 try appendPublicFilterClausesAlloc(alloc, exclusion_clauses, must_not_value, limit);
             }
-            // A non-scoring required clause makes `should` optional. Preserve
-            // that boolean contract after filters are split into their own
-            // execution bucket by anchoring the scoring bool with match_all.
-            // Without this marker the text executor treats a pure should bool
-            // as a mandatory disjunction and drops filter-matching documents.
             const has_required_non_scoring_clause =
                 bool_value.object.get("filter") != null or
                 (bool_value.object.get("must") != null and
                     bool_scoring_must.items.len == 0);
-            if (has_required_non_scoring_clause and
-                bool_scoring_must.items.len == 0 and
-                bool_scoring_should.items.len > 0)
-            {
-                try bool_scoring_must.append(alloc, .{ .match_all = {} });
-            }
             if (try buildScoringTextQueryAlloc(
                 alloc,
                 &bool_scoring_must,
                 &bool_scoring_should,
+                has_required_non_scoring_clause,
                 try parseCanonicalBoolBoost(bool_value.object.get("boost")),
             )) |scoring_query| {
                 errdefer freeTextQuery(alloc, scoring_query);
@@ -5634,6 +5631,7 @@ fn buildScoringTextQueryAlloc(
     alloc: std.mem.Allocator,
     must: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
     should: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
+    pure_should_optional: bool,
     boost: f32,
 ) !?db_mod.types.TextQuery {
     if (must.items.len == 0 and should.items.len == 0) return null;
@@ -5658,7 +5656,12 @@ fn buildScoringTextQueryAlloc(
     return .{ .bool_query = .{
         .must = owned_must,
         .should = owned_should,
-        .min_should = if (owned_should.len > 0 and owned_must.len == 0) 1 else 0,
+        .min_should = if (owned_should.len > 0 and
+            owned_must.len == 0 and
+            !pure_should_optional) 1 else 0,
+        .pure_should_optional = pure_should_optional and
+            owned_should.len > 0 and
+            owned_must.len == 0,
         .boost = boost,
     } };
 }
@@ -7290,7 +7293,207 @@ fn parsePublicDocFilterBindingsAlloc(
         filter_query_json = "";
     }
 
-    return try out.toOwnedSlice(alloc);
+    const order = try sortPublicDocFilterBindingsByDependenciesAlloc(
+        alloc,
+        out.items,
+    );
+    defer alloc.free(order);
+    const sorted = try alloc.alloc(db_mod.types.NamedDocFilterBinding, out.items.len);
+    for (order, 0..) |source_index, target_index| {
+        sorted[target_index] = out.items[source_index];
+    }
+    out.deinit(alloc);
+    out = .empty;
+    return sorted;
+}
+
+fn collectPublicDocFilterRefs(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    by_name: *const std.StringHashMapUnmanaged(usize),
+    dependencies: ?*std.AutoHashMapUnmanaged(usize, void),
+) !void {
+    var remaining_nodes: usize = public_query_max_tree_nodes;
+    return collectPublicDocFilterRefsBounded(
+        alloc,
+        value,
+        by_name,
+        dependencies,
+        0,
+        &remaining_nodes,
+    );
+}
+
+fn collectPublicDocFilterRefsBounded(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    by_name: *const std.StringHashMapUnmanaged(usize),
+    dependencies: ?*std.AutoHashMapUnmanaged(usize, void),
+    depth: usize,
+    remaining_nodes: *usize,
+) !void {
+    if (depth >= public_query_max_tree_depth or
+        remaining_nodes.* == 0 or
+        value != .object or
+        value.object.count() != 1)
+    {
+        return error.InvalidQueryRequest;
+    }
+    remaining_nodes.* -= 1;
+    const object = value.object;
+    if (object.get("ref")) |reference| {
+        if (reference != .string or reference.string.len == 0) {
+            return error.InvalidQueryRequest;
+        }
+        const dependency = by_name.get(reference.string) orelse {
+            return error.InvalidQueryRequest;
+        };
+        if (dependencies) |items| try items.put(alloc, dependency, {});
+        return;
+    }
+    inline for ([_][]const u8{ "conjuncts", "disjuncts" }) |compound| {
+        if (object.get(compound)) |children| {
+            if (children != .array or children.array.items.len == 0) {
+                return error.InvalidQueryRequest;
+            }
+            for (children.array.items) |child| {
+                try collectPublicDocFilterRefsBounded(
+                    alloc,
+                    child,
+                    by_name,
+                    dependencies,
+                    depth + 1,
+                    remaining_nodes,
+                );
+            }
+            return;
+        }
+    }
+    if (object.get("bool")) |bool_query| {
+        if (bool_query != .object) return error.InvalidQueryRequest;
+        inline for ([_][]const u8{ "filter", "must", "should", "must_not" }) |branch| {
+            if (bool_query.object.get(branch)) |children| {
+                if (children != .array or children.array.items.len == 0) {
+                    return error.InvalidQueryRequest;
+                }
+                for (children.array.items) |child| {
+                    try collectPublicDocFilterRefsBounded(
+                        alloc,
+                        child,
+                        by_name,
+                        dependencies,
+                        depth + 1,
+                        remaining_nodes,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn sortPublicDocFilterBindingsByDependenciesAlloc(
+    alloc: std.mem.Allocator,
+    bindings: []const db_mod.types.NamedDocFilterBinding,
+) ![]usize {
+    var by_name = std.StringHashMapUnmanaged(usize).empty;
+    defer by_name.deinit(alloc);
+    for (bindings, 0..) |binding, index| {
+        const result = try by_name.getOrPut(alloc, binding.name);
+        if (result.found_existing) return error.InvalidQueryRequest;
+        result.value_ptr.* = index;
+    }
+
+    const dependents = try alloc.alloc(
+        std.ArrayListUnmanaged(usize),
+        bindings.len,
+    );
+    defer {
+        for (dependents) |*items| items.deinit(alloc);
+        alloc.free(dependents);
+    }
+    for (dependents) |*items| items.* = .empty;
+
+    const indegrees = try alloc.alloc(usize, bindings.len);
+    defer alloc.free(indegrees);
+    @memset(indegrees, 0);
+
+    for (bindings, 0..) |binding, binding_index| {
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            binding.filter_query_json,
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidQueryRequest,
+        };
+        defer parsed.deinit();
+
+        var dependencies = std.AutoHashMapUnmanaged(usize, void).empty;
+        defer dependencies.deinit(alloc);
+        try collectPublicDocFilterRefs(
+            alloc,
+            parsed.value,
+            &by_name,
+            &dependencies,
+        );
+        var dependency_it = dependencies.keyIterator();
+        while (dependency_it.next()) |dependency_index| {
+            try dependents[dependency_index.*].append(alloc, binding_index);
+            indegrees[binding_index] += 1;
+        }
+    }
+
+    const order = try alloc.alloc(usize, bindings.len);
+    errdefer alloc.free(order);
+    var queue = std.ArrayListUnmanaged(usize).empty;
+    defer queue.deinit(alloc);
+    for (indegrees, 0..) |indegree, index| {
+        if (indegree == 0) try queue.append(alloc, index);
+    }
+
+    var read_index: usize = 0;
+    var order_len: usize = 0;
+    while (read_index < queue.items.len) : (read_index += 1) {
+        const dependency_index = queue.items[read_index];
+        order[order_len] = dependency_index;
+        order_len += 1;
+        for (dependents[dependency_index].items) |dependent_index| {
+            indegrees[dependent_index] -= 1;
+            if (indegrees[dependent_index] == 0) {
+                try queue.append(alloc, dependent_index);
+            }
+        }
+    }
+    if (order_len != bindings.len) return error.InvalidQueryRequest;
+    return order;
+}
+
+fn validatePublicDocFilterRootRefsAlloc(
+    alloc: std.mem.Allocator,
+    bindings: []const db_mod.types.NamedDocFilterBinding,
+    filter_query_json: []const u8,
+    exclusion_query_json: []const u8,
+) !void {
+    var by_name = std.StringHashMapUnmanaged(usize).empty;
+    defer by_name.deinit(alloc);
+    for (bindings, 0..) |binding, index| {
+        try by_name.put(alloc, binding.name, index);
+    }
+    for ([_][]const u8{ filter_query_json, exclusion_query_json }) |encoded| {
+        if (encoded.len == 0) continue;
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            encoded,
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidQueryRequest,
+        };
+        defer parsed.deinit();
+        try collectPublicDocFilterRefs(alloc, parsed.value, &by_name, null);
+    }
 }
 
 fn parseInternalFilterQueryJsonAlloc(
@@ -7832,6 +8035,73 @@ test "api query contract parses public with document filter bindings" {
     try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.match.text);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"visible\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"published\"") != null);
+}
+
+test "api query contract orders forward document filter dependencies" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseQueryRequest(
+        alloc,
+        null,
+        "docs",
+        \\{
+        \\  "with": {
+        \\    "visible": {"bool":{"must":[{"ref":"tenant"},{"ref":"published"}]}},
+        \\    "published": {"bool_field":{"field":"published","value":true}},
+        \\    "tenant": {"term":{"path":"/tenant","value":"acme"}}
+        \\  },
+        \\  "filter_query": {"ref":"visible"}
+        \\}
+        ,
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), parsed.req.doc_filter_bindings.len);
+    try std.testing.expectEqualStrings("published", parsed.req.doc_filter_bindings[0].name);
+    try std.testing.expectEqualStrings("tenant", parsed.req.doc_filter_bindings[1].name);
+    try std.testing.expectEqualStrings("visible", parsed.req.doc_filter_bindings[2].name);
+}
+
+test "api query contract rejects invalid document filter dependency graphs" {
+    const alloc = std.testing.allocator;
+    inline for ([_][]const u8{
+        \\{"with":{"visible":{"ref":"missing"}},"filter_query":{"ref":"visible"}}
+        ,
+        \\{"with":{"first":{"ref":"second"},"second":{"ref":"first"}},"filter_query":{"ref":"first"}}
+        ,
+        \\{"with":{"visible":{"match_all":{}}},"filter_query":{"ref":"missing"}}
+        ,
+        \\{"filter_query":{"ref":"missing"}}
+        ,
+    }) |body| {
+        try std.testing.expectError(
+            error.InvalidQueryRequest,
+            parseQueryRequest(alloc, null, "docs", body),
+        );
+    }
+}
+
+test "api query contract keeps compact ref fields distinct from binding references" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseQueryRequest(
+        alloc,
+        null,
+        "docs",
+        \\{
+        \\  "with": {
+        \\    "literal_ref": {"term":{"ref":"published"}}
+        \\  },
+        \\  "filter_query": {"ref":"literal_ref"}
+        \\}
+        ,
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.doc_filter_bindings.len);
+    try std.testing.expectEqualStrings("literal_ref", parsed.req.doc_filter_bindings[0].name);
+    try std.testing.expectEqualStrings(
+        "{\"term\":{\"ref\":\"published\"}}",
+        parsed.req.doc_filter_bindings[0].filter_query_json,
+    );
 }
 
 test "api query contract keeps ambiguous direct text operators score-bearing" {
@@ -8624,8 +8894,8 @@ test "api query contract keeps should optional beside required filters" {
     const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
     try std.testing.expect(full_text == .bool_query);
     try std.testing.expectEqual(@as(u32, 0), full_text.bool_query.min_should);
-    try std.testing.expectEqual(@as(usize, 1), full_text.bool_query.must.len);
-    try std.testing.expect(full_text.bool_query.must[0] == .match_all);
+    try std.testing.expect(full_text.bool_query.pure_should_optional);
+    try std.testing.expectEqual(@as(usize, 0), full_text.bool_query.must.len);
     try std.testing.expectEqual(@as(usize, 1), full_text.bool_query.should.len);
     try std.testing.expect(full_text.bool_query.should[0] == .match);
     try std.testing.expect(std.mem.indexOf(

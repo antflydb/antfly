@@ -14524,9 +14524,26 @@ pub fn resolveAuthRowFilterJson(
     try validateAuthRowFilterValue(parsed.value);
     var remaining_nodes: usize = auth_filter_max_tree_nodes;
 
+    var parsed_metadata: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_metadata) |*metadata| metadata.deinit();
+    if (authFilterUsesMetadataReference(parsed.value)) {
+        parsed_metadata = std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            if (identity.metadata_json.len > 0) identity.metadata_json else "{}",
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return try alloc.dupe(u8, "{\"match_none\":{}}"),
+        };
+    }
+    const context = AuthRowFilterResolveContext{
+        .identity = identity,
+        .metadata = if (parsed_metadata) |metadata| metadata.value else null,
+    };
     var resolved = resolveAuthRowFilterValue(
         alloc,
-        identity,
+        context,
         parsed.value,
         .filter,
         &remaining_nodes,
@@ -14722,6 +14739,31 @@ fn materializeAuthFilterTemplateValue(
 const auth_filter_max_tree_depth: u8 = 64;
 const auth_filter_max_tree_nodes: usize = 16_384;
 
+fn authFilterUsesMetadataReference(value: std.json.Value) bool {
+    return switch (value) {
+        .object => |object| blk: {
+            if (object.get("$auth")) |auth_ref| {
+                break :blk auth_ref == .string and
+                    std.mem.startsWith(u8, auth_ref.string, "metadata.");
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (authFilterUsesMetadataReference(entry.value_ptr.*)) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .array => |array| blk: {
+            for (array.items) |item| {
+                if (authFilterUsesMetadataReference(item)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
 fn validateAuthRowFilterValue(value: std.json.Value) !void {
     var remaining_nodes: usize = auth_filter_max_tree_nodes;
     return try validateAuthRowFilterValueBounded(value, 0, &remaining_nodes);
@@ -14767,9 +14809,14 @@ fn validateAuthRowFilterValueBounded(
     }
 }
 
+const AuthRowFilterResolveContext = struct {
+    identity: AuthenticatedIdentity,
+    metadata: ?std.json.Value,
+};
+
 fn resolveAuthRowFilterValue(
     alloc: std.mem.Allocator,
-    identity: AuthenticatedIdentity,
+    context: AuthRowFilterResolveContext,
     value: std.json.Value,
     expectation: AuthFilterTemplateExpectation,
     remaining_nodes: *usize,
@@ -14790,21 +14837,21 @@ fn resolveAuthRowFilterValue(
                 if (std.mem.eql(u8, path, "username") and expectation != .scalar) {
                     return error.InvalidQueryRequest;
                 }
-                const context = authContextJsonValueBounded(
+                const auth_value = authContextJsonValueBounded(
                     alloc,
-                    identity,
+                    context,
                     path,
                     remaining_nodes.*,
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.AuthRowFilterNoMatch,
                 };
-                var resolved = context.value;
+                var resolved = auth_value.value;
                 errdefer json_helpers.deinitJsonValue(alloc, &resolved);
                 if (!authFilterValueMatchesExpectation(resolved, expectation)) {
                     return error.AuthRowFilterNoMatch;
                 }
-                remaining_nodes.* -= context.node_count;
+                remaining_nodes.* -= auth_value.node_count;
                 break :blk resolved;
             }
             if (remaining_nodes.* == 0) return error.AuthRowFilterNoMatch;
@@ -14834,7 +14881,7 @@ fn resolveAuthRowFilterValue(
                 errdefer if (!key_transferred) alloc.free(key);
                 var resolved = try resolveAuthRowFilterValue(
                     alloc,
-                    identity,
+                    context,
                     entry.value_ptr.*,
                     child_expectation,
                     remaining_nodes,
@@ -14859,7 +14906,7 @@ fn resolveAuthRowFilterValue(
             for (array.items) |item| {
                 var resolved = try resolveAuthRowFilterValue(
                     alloc,
-                    identity,
+                    context,
                     item,
                     child_expectation,
                     remaining_nodes,
@@ -14918,7 +14965,7 @@ const BoundedAuthContextJsonValue = struct {
 
 fn authContextJsonValueBounded(
     alloc: std.mem.Allocator,
-    identity: AuthenticatedIdentity,
+    context: AuthRowFilterResolveContext,
     path: []const u8,
     max_nodes: usize,
 ) !BoundedAuthContextJsonValue {
@@ -14926,22 +14973,22 @@ fn authContextJsonValueBounded(
     if (isSupportedAuthPath(path)) {
         if (std.mem.eql(u8, path, "username")) {
             return .{
-                .value = .{ .string = try alloc.dupe(u8, identity.username) },
+                .value = .{ .string = try alloc.dupe(u8, context.identity.username) },
                 .node_count = 1,
             };
         }
         if (std.mem.eql(u8, path, "roles")) {
-            if (identity.roles.len == 0 or identity.roles.len >= max_nodes) {
+            if (context.identity.roles.len == 0 or context.identity.roles.len >= max_nodes) {
                 return error.InvalidQueryRequest;
             }
             return .{
-                .value = try rolesAuthJsonValue(alloc, identity.roles),
-                .node_count = 1 + identity.roles.len,
+                .value = try rolesAuthJsonValue(alloc, context.identity.roles),
+                .node_count = 1 + context.identity.roles.len,
             };
         }
         return try metadataAuthJsonValueBounded(
             alloc,
-            identity.metadata_json,
+            context.metadata orelse return error.InvalidQueryRequest,
             path["metadata.".len..],
             max_nodes,
         );
@@ -14979,14 +15026,11 @@ fn rolesAuthJsonValue(
 
 fn metadataAuthJsonValueBounded(
     alloc: std.mem.Allocator,
-    metadata_json: []const u8,
+    metadata: std.json.Value,
     path: []const u8,
     max_nodes: usize,
 ) !BoundedAuthContextJsonValue {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, if (metadata_json.len > 0) metadata_json else "{}", .{}) catch return error.InvalidQueryRequest;
-    defer parsed.deinit();
-
-    var current = parsed.value;
+    var current = metadata;
     var segments = std.mem.splitScalar(u8, path, '.');
     while (segments.next()) |segment| {
         if (segment.len == 0 or current != .object) return error.InvalidQueryRequest;
@@ -15037,6 +15081,24 @@ test "auth row filter resolver expands username references" {
     const alloc = std.testing.allocator;
     var identity = AuthenticatedIdentity{
         .username = try alloc.dupe(u8, "alice"),
+    };
+    defer identity.deinit(alloc);
+
+    const resolved = try resolveAuthRowFilterJson(
+        alloc,
+        identity,
+        "{\"term\":{\"owner\":{\"$auth\":\"username\"}}}",
+    );
+    defer alloc.free(resolved);
+
+    try std.testing.expectEqualStrings("{\"term\":{\"owner\":\"alice\"}}", resolved);
+}
+
+test "auth row filter resolver does not parse unused malformed metadata" {
+    const alloc = std.testing.allocator;
+    var identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "alice"),
+        .metadata_json = try alloc.dupe(u8, "{"),
     };
     defer identity.deinit(alloc);
 
@@ -15141,11 +15203,22 @@ test "auth row filter resolver shares one bounded metadata expansion budget" {
         .{},
     );
     defer auth_ref.deinit();
+    var metadata = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        identity.metadata_json,
+        .{},
+    );
+    defer metadata.deinit();
+    const context = AuthRowFilterResolveContext{
+        .identity = identity,
+        .metadata = metadata.value,
+    };
 
     var remaining_nodes: usize = 4;
     var first = try resolveAuthRowFilterValue(
         alloc,
-        identity,
+        context,
         auth_ref.value,
         .array,
         &remaining_nodes,
@@ -15156,7 +15229,7 @@ test "auth row filter resolver shares one bounded metadata expansion budget" {
         error.AuthRowFilterNoMatch,
         resolveAuthRowFilterValue(
             alloc,
-            identity,
+            context,
             auth_ref.value,
             .array,
             &remaining_nodes,
