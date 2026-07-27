@@ -99,12 +99,14 @@ pub fn parseStatefulDirectTextOperatorQueryAlloc(
             } };
         }
     }
-    if (try directStringOperatorValue(value, "match_phrase", &.{ "text", "match_phrase", "value" }, true)) |parsed| {
-        return .{ .match_phrase = .{
-            .field = try alloc.dupe(u8, parsed.field),
-            .text = try alloc.dupe(u8, parsed.value),
-            .boost = boost,
-        } };
+    if (!matchPhraseQueryHasPublicOptions(value)) {
+        if (try directStringOperatorValue(value, "match_phrase", &.{ "text", "match_phrase", "value" }, true)) |parsed| {
+            return .{ .match_phrase = .{
+                .field = try alloc.dupe(u8, parsed.field),
+                .text = try alloc.dupe(u8, parsed.value),
+                .boost = boost,
+            } };
+        }
     }
     if (try directStringOperatorValue(value, "prefix", &.{ "prefix", "text", "value" }, true)) |parsed| {
         return .{ .prefix = .{
@@ -159,6 +161,18 @@ fn matchQueryHasPublicOptions(value: std.json.Value) bool {
         "prefix_length",
         "operator",
     }) |key| {
+        if (options.get(key)) |option| {
+            if (option != .null) return true;
+        }
+    }
+    return false;
+}
+
+fn matchPhraseQueryHasPublicOptions(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const match_phrase = value.object.get("match_phrase") orelse return false;
+    const options = if (match_phrase == .object) match_phrase.object else value.object;
+    inline for ([_][]const u8{ "analyzer", "fuzziness" }) |key| {
         if (options.get(key)) |option| {
             if (option != .null) return true;
         }

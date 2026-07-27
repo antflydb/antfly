@@ -13715,6 +13715,9 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     if (native_doc_id_constraints.hasConstraints()) {
         try appendNativeDocIdConstraintsField(alloc, &out, &first, native_doc_id_constraints);
     }
+    if (req.doc_filter_bindings.len > 0) {
+        try appendDocFilterBindingsField(alloc, &out, &first, req.doc_filter_bindings);
+    }
     if (req.filter_query_json.len > 0) {
         try appendJsonFieldString(alloc, &out, &first, "_filter_query_json", req.filter_query_json);
     }
@@ -13741,6 +13744,38 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
 
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendDocFilterBindingsField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    bindings: []const db_mod.types.NamedDocFilterBinding,
+) !void {
+    if (bindings.len == 0) return;
+
+    var seen = std.StringHashMap(void).init(alloc);
+    defer seen.deinit();
+    const binding_count = std.math.cast(u32, bindings.len) orelse {
+        return error.InvalidQueryRequest;
+    };
+    try seen.ensureTotalCapacity(binding_count);
+
+    try appendJsonFieldName(alloc, out, first, "with");
+    try out.append(alloc, '{');
+    for (bindings, 0..) |binding, index| {
+        if (binding.name.len == 0 or binding.filter_query_json.len == 0) {
+            return error.InvalidQueryRequest;
+        }
+        const entry = try seen.getOrPut(binding.name);
+        if (entry.found_existing) return error.InvalidQueryRequest;
+
+        if (index > 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, binding.name);
+        try out.append(alloc, ':');
+        try out.appendSlice(alloc, binding.filter_query_json);
+    }
+    try out.append(alloc, '}');
 }
 
 fn appendNativeDocIdConstraintsField(
@@ -14014,6 +14049,7 @@ fn appendQueryField(
             try appendJsonString(alloc, out, term.term);
             try out.appendSlice(alloc, ",\"field\":");
             try appendJsonString(alloc, out, term.field);
+            try appendTextQueryBoost(alloc, out, term.boost);
             try out.append(alloc, '}');
         },
         .match => |match| {
@@ -14021,6 +14057,11 @@ fn appendQueryField(
             try appendJsonString(alloc, out, match.text);
             try out.appendSlice(alloc, ",\"field\":");
             try appendJsonString(alloc, out, match.field);
+            if (match.analyzer) |analyzer| {
+                try out.appendSlice(alloc, ",\"analyzer\":");
+                try appendJsonString(alloc, out, analyzer);
+            }
+            try appendTextQueryBoost(alloc, out, match.boost);
             try out.append(alloc, '}');
         },
         .dense_knn => |dense| {
@@ -14076,6 +14117,7 @@ fn appendTextQueryValue(
             try appendJsonString(alloc, out, term.term);
             try out.appendSlice(alloc, ",\"field\":");
             try appendJsonString(alloc, out, term.field);
+            try appendTextQueryBoost(alloc, out, term.boost);
             try out.append(alloc, '}');
         },
         .match => |match| {
@@ -14087,6 +14129,7 @@ fn appendTextQueryValue(
                 try out.appendSlice(alloc, ",\"analyzer\":");
                 try appendJsonString(alloc, out, analyzer);
             }
+            try appendTextQueryBoost(alloc, out, match.boost);
             try out.append(alloc, '}');
         },
         .multi_match_bool_prefix => |multi_match| {
@@ -14095,6 +14138,7 @@ fn appendTextQueryValue(
             try out.appendSlice(alloc, ",\"type\":\"bool_prefix\",\"fields\":[");
             for (multi_match.fields, 0..) |field, i| {
                 if (i > 0) try out.append(alloc, ',');
+                if (!std.math.isFinite(field.boost)) return error.InvalidQueryRequest;
                 if (field.boost == 1.0) {
                     try appendJsonString(alloc, out, field.field);
                 } else {
@@ -14104,10 +14148,7 @@ fn appendTextQueryValue(
                 }
             }
             try out.append(alloc, ']');
-            if (multi_match.boost != 1.0) {
-                try out.appendSlice(alloc, ",\"boost\":");
-                try out.print(alloc, "{d}", .{multi_match.boost});
-            }
+            try appendTextQueryBoost(alloc, out, multi_match.boost);
             try out.appendSlice(alloc, "}}");
         },
         .match_phrase => |phrase| {
@@ -14125,6 +14166,7 @@ fn appendTextQueryValue(
                 try out.appendSlice(alloc, ",\"fuzziness\":");
                 try out.print(alloc, "{d}", .{phrase.max_edits});
             }
+            try appendTextQueryBoost(alloc, out, phrase.boost);
             try out.append(alloc, '}');
         },
         .fuzzy => |fuzzy| {
@@ -14142,6 +14184,7 @@ fn appendTextQueryValue(
                 try out.appendSlice(alloc, ",\"fuzziness\":");
                 try out.print(alloc, "{d}", .{fuzzy.max_edits});
             }
+            try appendTextQueryBoost(alloc, out, fuzzy.boost);
             try out.append(alloc, '}');
         },
         .prefix => |prefix| {
@@ -14149,6 +14192,7 @@ fn appendTextQueryValue(
             try appendJsonString(alloc, out, prefix.prefix);
             try out.appendSlice(alloc, ",\"field\":");
             try appendJsonString(alloc, out, prefix.field);
+            try appendTextQueryBoost(alloc, out, prefix.boost);
             try out.append(alloc, '}');
         },
         .wildcard => |wildcard| {
@@ -14156,6 +14200,7 @@ fn appendTextQueryValue(
             try appendJsonString(alloc, out, wildcard.pattern);
             try out.appendSlice(alloc, ",\"field\":");
             try appendJsonString(alloc, out, wildcard.field);
+            try appendTextQueryBoost(alloc, out, wildcard.boost);
             try out.append(alloc, '}');
         },
         .regexp => |regexp| {
@@ -14163,6 +14208,7 @@ fn appendTextQueryValue(
             try appendJsonString(alloc, out, regexp.pattern);
             try out.appendSlice(alloc, ",\"field\":");
             try appendJsonString(alloc, out, regexp.field);
+            try appendTextQueryBoost(alloc, out, regexp.boost);
             try out.append(alloc, '}');
         },
         .numeric_range => |range_query| {
@@ -14179,6 +14225,7 @@ fn appendTextQueryValue(
             try appendJsonFieldString(alloc, out, &first, "field", range_query.field);
             if (!range_query.inclusive_min) try appendJsonFieldBool(alloc, out, &first, "inclusive_min", false);
             if (range_query.inclusive_max) try appendJsonFieldBool(alloc, out, &first, "inclusive_max", true);
+            try appendOptionalTextQueryBoostField(alloc, out, &first, range_query.boost);
             try out.append(alloc, '}');
         },
         .date_range => |range_query| {
@@ -14197,6 +14244,7 @@ fn appendTextQueryValue(
             try appendJsonFieldString(alloc, out, &first, "field", range_query.field);
             if (!range_query.inclusive_start) try appendJsonFieldBool(alloc, out, &first, "inclusive_start", false);
             if (range_query.inclusive_end) try appendJsonFieldBool(alloc, out, &first, "inclusive_end", true);
+            try appendOptionalTextQueryBoostField(alloc, out, &first, range_query.boost);
             try out.append(alloc, '}');
         },
         .term_range => |range_query| {
@@ -14207,6 +14255,7 @@ fn appendTextQueryValue(
             try appendJsonFieldString(alloc, out, &first, "field", range_query.field);
             if (!range_query.inclusive_min) try appendJsonFieldBool(alloc, out, &first, "inclusive_min", false);
             if (range_query.inclusive_max) try appendJsonFieldBool(alloc, out, &first, "inclusive_max", true);
+            try appendOptionalTextQueryBoostField(alloc, out, &first, range_query.boost);
             try out.append(alloc, '}');
         },
         .doc_id => |doc_id| {
@@ -14215,13 +14264,16 @@ fn appendTextQueryValue(
                 if (i > 0) try out.append(alloc, ',');
                 try appendJsonString(alloc, out, id);
             }
-            try out.appendSlice(alloc, "]}");
+            try out.append(alloc, ']');
+            try appendTextQueryBoost(alloc, out, doc_id.boost);
+            try out.append(alloc, '}');
         },
         .bool_field => |bool_field| {
             try out.appendSlice(alloc, "{\"bool\":");
             try out.appendSlice(alloc, if (bool_field.value) "true" else "false");
             try out.appendSlice(alloc, ",\"field\":");
             try appendJsonString(alloc, out, bool_field.field);
+            try appendTextQueryBoost(alloc, out, bool_field.boost);
             try out.append(alloc, '}');
         },
         .bool_query => |bool_query| {
@@ -14244,7 +14296,7 @@ fn appendTextQueryValue(
                     try appendTextQueryValue(alloc, out, item);
                 }
                 try out.append(alloc, ']');
-                if (bool_query.min_should > 0) {
+                if (bool_query.min_should > 0 or bool_query.pure_should_optional) {
                     try out.appendSlice(alloc, ",\"min\":");
                     try out.print(alloc, "{d}", .{bool_query.min_should});
                 }
@@ -14259,10 +14311,32 @@ fn appendTextQueryValue(
                 }
                 try out.appendSlice(alloc, "]}");
             }
+            try appendOptionalTextQueryBoostField(alloc, out, &first, bool_query.boost);
             try out.append(alloc, '}');
         },
         else => return error.UnsupportedQueryRequest,
     }
+}
+
+fn appendTextQueryBoost(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    boost: f32,
+) !void {
+    if (!std.math.isFinite(boost)) return error.InvalidQueryRequest;
+    if (boost == 1.0) return;
+    try out.appendSlice(alloc, ",\"boost\":");
+    try out.print(alloc, "{d}", .{boost});
+}
+
+fn appendOptionalTextQueryBoostField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    boost: f32,
+) !void {
+    if (!std.math.isFinite(boost)) return error.InvalidQueryRequest;
+    if (boost != 1.0) try appendJsonFieldF32(alloc, out, first, "boost", boost);
 }
 
 fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
@@ -17034,6 +17108,95 @@ test "encode query request with distributed text stats parses through query cont
     try std.testing.expectEqualStrings("hello", owned.req.distributed_text_stats[0].term_doc_freqs[0].term);
 }
 
+test "encode query request losslessly carries optional should and named filter bindings" {
+    const alloc = std.testing.allocator;
+    const should_queries = [_]db_mod.types.TextQuery{
+        .{ .match = .{ .field = "body", .text = "computer", .boost = 3.0 } },
+        .{ .term = .{ .field = "status", .term = "active", .boost = 4.0 } },
+        .{ .match_phrase = .{
+            .field = "body",
+            .text = "distributed storage",
+            .analyzer = "standard",
+            .boost = 5.0,
+        } },
+    };
+    const binding_defs = [_]db_mod.types.NamedDocFilterBinding{
+        .{
+            .name = "tenant",
+            .filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
+        },
+        .{
+            .name = "visible",
+            .filter_query_json = "{\"bool\":{\"must\":[{\"ref\":\"tenant\"},{\"bool_field\":{\"field\":\"published\",\"value\":true}}]}}",
+        },
+    };
+
+    const encoded = try encodeQueryRequest(alloc, .{
+        .full_text = .{ .bool_query = .{
+            .should = should_queries[0..],
+            .pure_should_optional = true,
+            .boost = 2.0,
+        } },
+        .filter_query_json = "{\"ref\":\"visible\"}",
+        .doc_filter_bindings = binding_defs[0..],
+    });
+    defer alloc.free(encoded);
+
+    var parsed_json = try parseJsonTestBody(std.json.Value, alloc, encoded);
+    defer parsed_json.deinit();
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        parsed_json.value.object.get("full_text_search").?.object
+            .get("should").?.object.get("min").?.integer,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        parsed_json.value.object.get("with").?.object.count(),
+    );
+
+    var owned = try query_api.parseQueryRequest(alloc, null, "docs", encoded);
+    defer owned.deinit(alloc);
+    const full_text = owned.req.full_text orelse return error.TestExpectedEqual;
+    try std.testing.expect(full_text == .bool_query);
+    try std.testing.expect(full_text.bool_query.pure_should_optional);
+    try std.testing.expectEqual(@as(u32, 0), full_text.bool_query.min_should);
+    try std.testing.expectEqual(@as(f32, 2.0), full_text.bool_query.boost);
+    try std.testing.expect(full_text.bool_query.should[0] == .match);
+    try std.testing.expectEqual(@as(f32, 3.0), full_text.bool_query.should[0].match.boost);
+    try std.testing.expect(full_text.bool_query.should[1] == .term);
+    try std.testing.expectEqual(@as(f32, 4.0), full_text.bool_query.should[1].term.boost);
+    try std.testing.expect(full_text.bool_query.should[2] == .match_phrase);
+    try std.testing.expectEqualStrings(
+        "standard",
+        full_text.bool_query.should[2].match_phrase.analyzer.?,
+    );
+    try std.testing.expectEqual(@as(f32, 5.0), full_text.bool_query.should[2].match_phrase.boost);
+    try std.testing.expectEqual(@as(usize, 2), owned.req.doc_filter_bindings.len);
+    try std.testing.expectEqualStrings("tenant", owned.req.doc_filter_bindings[0].name);
+    try std.testing.expectEqualStrings("visible", owned.req.doc_filter_bindings[1].name);
+    try std.testing.expectEqualStrings("{\"ref\":\"visible\"}", owned.req.filter_query_json);
+}
+
+test "encode query request rejects duplicate named filter bindings" {
+    const alloc = std.testing.allocator;
+    const duplicate_bindings = [_]db_mod.types.NamedDocFilterBinding{
+        .{
+            .name = "visible",
+            .filter_query_json = "{\"match_all\":{}}",
+        },
+        .{
+            .name = "visible",
+            .filter_query_json = "{\"match_none\":{}}",
+        },
+    };
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        encodeQueryRequest(alloc, .{
+            .doc_filter_bindings = duplicate_bindings[0..],
+        }),
+    );
+}
+
 test "encode query request carries internal native doc id constraints through query contract" {
     const alloc = std.testing.allocator;
 
@@ -17412,6 +17575,96 @@ test "remote simple vector query uses vector worker route" {
     try std.testing.expectEqual(@as(u32, 0), fallback_result.total_hits);
     try std.testing.expectEqual(db_mod.types.TotalHitsRelation.exact, fallback_result.total_hits_relation);
     try std.testing.expectEqual(@as(?u64, 88), fallback_result.identity_read_generation);
+}
+
+test "remote query preserves optional should and named filter bindings" {
+    const alloc = std.testing.allocator;
+    const ExecutorState = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(
+            ptr: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            req: http_common.HttpRequest,
+        ) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(
+                u8,
+                req.uri,
+                "/internal/v1/groups/11/tables/docs/query",
+            ));
+
+            var parsed = try query_api.parseQueryRequest(
+                alloc_inner,
+                null,
+                "docs",
+                req.body,
+            );
+            defer parsed.deinit(alloc_inner);
+            const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(full_text == .bool_query);
+            try std.testing.expect(full_text.bool_query.pure_should_optional);
+            try std.testing.expectEqual(@as(u32, 0), full_text.bool_query.min_should);
+            try std.testing.expectEqual(@as(f32, 2.0), full_text.bool_query.boost);
+            try std.testing.expect(full_text.bool_query.should[0] == .match);
+            try std.testing.expectEqual(@as(f32, 3.0), full_text.bool_query.should[0].match.boost);
+            try std.testing.expectEqual(@as(usize, 2), parsed.req.doc_filter_bindings.len);
+            try std.testing.expectEqualStrings("tenant", parsed.req.doc_filter_bindings[0].name);
+            try std.testing.expectEqualStrings("visible", parsed.req.doc_filter_bindings[1].name);
+            try std.testing.expectEqualStrings("{\"ref\":\"visible\"}", parsed.req.filter_query_json);
+
+            return .{
+                .status = 200,
+                .body = try alloc_inner.dupe(
+                    u8,
+                    "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"hits\":[]},\"took\":0,\"status\":200,\"table\":\"docs\"}]}",
+                ),
+            };
+        }
+    };
+
+    const should_queries = [_]db_mod.types.TextQuery{
+        .{ .match = .{ .field = "body", .text = "computer", .boost = 3.0 } },
+    };
+    const binding_defs = [_]db_mod.types.NamedDocFilterBinding{
+        .{
+            .name = "tenant",
+            .filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
+        },
+        .{
+            .name = "visible",
+            .filter_query_json = "{\"bool\":{\"must\":[{\"ref\":\"tenant\"},{\"bool_field\":{\"field\":\"published\",\"value\":true}}]}}",
+        },
+    };
+    var state = ExecutorState{};
+    var result = try queryRemote(
+        state.iface(),
+        alloc,
+        "http://remote.test",
+        11,
+        "docs",
+        .{
+            .full_text = .{ .bool_query = .{
+                .should = should_queries[0..],
+                .pure_should_optional = true,
+                .boost = 2.0,
+            } },
+            .filter_query_json = "{\"ref\":\"visible\"}",
+            .doc_filter_bindings = binding_defs[0..],
+        },
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
 }
 
 test "remote query rejects resolved doc filters before vector worker encoding" {
