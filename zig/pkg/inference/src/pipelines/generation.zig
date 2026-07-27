@@ -425,7 +425,10 @@ const StreamingTextState = struct {
     emitted_text: []u8,
     final_channel_end_token_id: ?i32 = null,
     turn_end_token_id: ?i32 = null,
-    saw_complete_final_channel: bool = false,
+    inspected_token_count: usize = 0,
+    final_channel_content_start: ?usize = null,
+    final_channel_content_end: ?usize = null,
+    saw_final_channel: bool = false,
 };
 
 fn finalChannelContentStart(token_ids: []const i64, marker_id: ?i32) ?usize {
@@ -475,16 +478,16 @@ fn finalResponseTokenSlice(
     if (completeFinalChannelRange(token_ids, marker_id, turn_end_id)) |range| {
         return token_ids[range.start..range.end];
     }
+    // Stop tokens are intentionally not appended to the generated sequence.
+    // A channel-aware completion can therefore contain the channel marker and
+    // final content without the sampled <turn|>. The same projection also
+    // preserves a partial final answer when the output budget is exhausted.
+    if (finalChannelContentStart(token_ids, marker_id)) |start| return token_ids[start..];
     // If a channel-aware model exhausts its output budget before closing the
     // reasoning channel, there is no final answer to expose. Fail closed rather
     // than returning a private/incomplete reasoning trace. A normal EOS without
     // a channel marker remains a valid direct-answer fallback.
     if (std.mem.eql(u8, finish_reason, "length")) return token_ids[0..0];
-    // Stop tokens are intentionally not appended to the generated sequence.
-    // A normal channel-aware completion therefore contains the channel marker
-    // and final content, while the sampled <turn|> exists only as the stop
-    // condition. Project from the last marker in that case.
-    if (finalChannelContentStart(token_ids, marker_id)) |start| return token_ids[start..];
     return token_ids;
 }
 
@@ -507,17 +510,45 @@ fn emitDecodedDeltaForTokenizer(
     on_token_fn: TokenCallback,
     on_token_ctx: *anyopaque,
 ) !bool {
-    const channel_range = completeFinalChannelRange(
-        generated_token_ids,
-        state.final_channel_end_token_id,
-        state.turn_end_token_id,
-    );
-    if (state.final_channel_end_token_id != null and state.turn_end_token_id != null and channel_range == null) return true;
-    if (channel_range != null) state.saw_complete_final_channel = true;
-    const projected_ids = if (channel_range) |range|
-        generated_token_ids[range.start..range.end]
-    else
-        generated_token_ids;
+    var projected_ids = generated_token_ids;
+    if (state.final_channel_end_token_id != null and state.turn_end_token_id != null) {
+        if (state.final_channel_content_start == null) {
+            // Generation grows monotonically, so inspect only IDs appended since
+            // the previous callback instead of rescanning the reasoning prefix.
+            const scan_start = @min(state.inspected_token_count, generated_token_ids.len);
+            if (std.mem.indexOfScalar(
+                i64,
+                generated_token_ids[scan_start..],
+                state.final_channel_end_token_id.?,
+            )) |marker_offset| {
+                state.final_channel_content_start = scan_start + marker_offset + 1;
+                state.saw_final_channel = true;
+                // Continue below from the boundary so a retained turn token in
+                // the same speculative batch is discovered without rescanning.
+                state.inspected_token_count = scan_start + marker_offset + 1;
+            } else {
+                state.inspected_token_count = generated_token_ids.len;
+            }
+        }
+
+        const channel_start = state.final_channel_content_start orelse return true;
+        if (state.final_channel_content_end == null) {
+            const scan_start = @max(
+                channel_start,
+                @min(state.inspected_token_count, generated_token_ids.len),
+            );
+            if (std.mem.indexOfScalar(
+                i64,
+                generated_token_ids[scan_start..],
+                state.turn_end_token_id.?,
+            )) |turn_end_offset| {
+                state.final_channel_content_end = scan_start + turn_end_offset;
+            }
+            state.inspected_token_count = generated_token_ids.len;
+        }
+        const channel_end = state.final_channel_content_end orelse generated_token_ids.len;
+        projected_ids = generated_token_ids[channel_start..channel_end];
+    }
 
     const decoded_ids = try allocator.alloc(i32, projected_ids.len);
     defer allocator.free(decoded_ids);
@@ -3218,7 +3249,7 @@ pub const NativeGenerationPipeline = struct {
         if (stream_enabled and
             final_channel_end_token_id != null and
             turn_end_token_id != null and
-            !streaming_text.saw_complete_final_channel and
+            !streaming_text.saw_final_channel and
             !std.mem.eql(u8, finish_reason, "length") and
             text.len > 0)
         {
@@ -7973,11 +8004,12 @@ test "final channel projection keeps only tokens after the last channel boundary
     try std.testing.expectEqual(@as(usize, 6), range.end);
     try std.testing.expectEqualSlices(i64, &.{10}, finalResponseTokenSlice(&ids, 101, 106, "stop"));
     try std.testing.expectEqualSlices(i64, &.{10}, finalResponseTokenSlice(&.{ 7, 101, 10 }, 101, 106, "stop"));
+    try std.testing.expectEqualSlices(i64, &.{10}, finalResponseTokenSlice(&.{ 7, 101, 10 }, 101, 106, "length"));
     try std.testing.expectEqualSlices(i64, &.{}, finalResponseTokenSlice(&ids, 999, 106, "length"));
     try std.testing.expectEqualSlices(i64, &ids, finalResponseTokenSlice(&ids, 999, 106, "stop"));
 }
 
-test "streaming final channel projection withholds reasoning and emits final text" {
+test "streaming final channel projection withholds reasoning and streams final text" {
     const allocator = std.testing.allocator;
     const tokenizer_json =
         \\{
@@ -7987,6 +8019,7 @@ test "streaming final channel projection withholds reasoning and emits final tex
         \\      "<unk>": 0,
         \\      "reasoning": 7,
         \\      "answer": 8,
+        \\      " follows": 9,
         \\      "<channel|>": 101,
         \\      "<turn|>": 106
         \\    },
@@ -8034,7 +8067,7 @@ test "streaming final channel projection withholds reasoning and emits final tex
         &capture,
     ));
     try std.testing.expectEqualStrings("", capture.text.items);
-    try std.testing.expect(!state.saw_complete_final_channel);
+    try std.testing.expect(!state.saw_final_channel);
 
     try std.testing.expect(try emitDecodedDeltaForTokenizer(
         tokenizer,
@@ -8044,19 +8077,32 @@ test "streaming final channel projection withholds reasoning and emits final tex
         Capture.callback,
         &capture,
     ));
-    try std.testing.expectEqualStrings("", capture.text.items);
-    try std.testing.expect(!state.saw_complete_final_channel);
+    try std.testing.expectEqualStrings("answer", capture.text.items);
+    try std.testing.expect(state.saw_final_channel);
 
     try std.testing.expect(try emitDecodedDeltaForTokenizer(
         tokenizer,
         allocator,
-        &.{ 7, 101, 8, 106 },
+        &.{ 7, 101, 8, 9 },
         &state,
         Capture.callback,
         &capture,
     ));
-    try std.testing.expectEqualStrings("answer", capture.text.items);
-    try std.testing.expect(state.saw_complete_final_channel);
+    try std.testing.expectEqualStrings("answer follows", capture.text.items);
+    try std.testing.expect(state.saw_final_channel);
+
+    // The normal autoregressive decoder consumes the turn token as EOS without
+    // appending it, while speculative paths may retain it. Neither path should
+    // delay or duplicate the final streamed text.
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(
+        tokenizer,
+        allocator,
+        &.{ 7, 101, 8, 9, 106 },
+        &state,
+        Capture.callback,
+        &capture,
+    ));
+    try std.testing.expectEqualStrings("answer follows", capture.text.items);
 }
 
 test "shouldAddBosToken keeps bos when prompt lacks literal prefix" {
