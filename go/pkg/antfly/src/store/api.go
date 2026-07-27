@@ -114,6 +114,31 @@ func safeJoinUnder(base, name string) (string, error) {
 	return joined, nil
 }
 
+func openLocalRestoreArtifact(base, name string) (*os.File, error) {
+	if _, err := safeJoinUnder(base, name); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		return nil, fmt.Errorf("opening local restore root: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	file, err := root.OpenFile(name, os.O_RDONLY|localRestoreNonblockingFlag, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, fmt.Errorf("local restore artifact %q is not a regular file", name)
+	}
+	return file, nil
+}
+
 func (h *StoreAPI) allowedLocalBackupDirs() ([]string, error) {
 	baseDir, err := filepath.Abs(h.antflyConfig.GetBaseDir())
 	if err != nil {
@@ -628,18 +653,11 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 					return fmt.Errorf("%w: invalid destination backup path: %v", ErrBadRequest, err)
 				}
 
-				info, err := os.Stat(srcPath) //nolint:gosec // G703: path from authorized internal config
+				input, err := openLocalRestoreArtifact(localBasePath, backupFileName)
 				if err != nil {
-					if os.IsNotExist(err) {
+					if errors.Is(err, os.ErrNotExist) {
 						return fmt.Errorf("local restore artifact %s does not exist", srcPath)
 					}
-					return fmt.Errorf("stating local restore artifact %s: %w", srcPath, err)
-				}
-				if !info.Mode().IsRegular() {
-					return fmt.Errorf("local restore artifact %s is not a regular file", srcPath)
-				}
-				input, err := os.Open(filepath.Clean(srcPath))
-				if err != nil {
 					return fmt.Errorf("opening local backup file %s: %w", srcPath, err)
 				}
 				defer func() { _ = input.Close() }()

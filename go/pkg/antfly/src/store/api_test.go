@@ -1252,6 +1252,31 @@ func TestDownloadFromS3VerifiesBeforeAtomicPublication(t *testing.T) {
 	require.Equal(t, validBody, published)
 }
 
+func TestOpenLocalRestoreArtifactIsRootedAndDescriptorValidated(t *testing.T) {
+	root := t.TempDir()
+	const artifactName = "backup-1-1.afb"
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, artifactName),
+		[]byte("portable artifact"),
+		0o600,
+	))
+	file, err := openLocalRestoreArtifact(root, artifactName)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	outside := filepath.Join(t.TempDir(), artifactName)
+	require.NoError(t, os.WriteFile(outside, []byte("outside artifact"), 0o600))
+	require.NoError(t, os.Remove(filepath.Join(root, artifactName)))
+	if err := os.Symlink(outside, filepath.Join(root, artifactName)); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+	file, err = openLocalRestoreArtifact(root, artifactName)
+	if file != nil {
+		_ = file.Close()
+	}
+	require.Error(t, err)
+}
+
 func TestCopyLocalBackupToSnapDirVerifiesBeforePublishing(t *testing.T) {
 	const backupID = "portable-local"
 	shardID := types.ID(0x302)
