@@ -1,0 +1,1264 @@
+# Hyperdimensional Computing in Antfly
+
+- Status: experimental managed-index implementation
+- Target: end-to-end retrieval, lifecycle, and quality validation before release
+- Related design: [ALGEBRAIC.md](ALGEBRAIC.md)
+
+## Implementation Status
+
+This worktree now contains the first engine-owned Phase 1 slice:
+
+- a versioned MAP encoder identity with SHA-256 fingerprints;
+- deterministic, domain-separated bipolar atomic symbols;
+- typed key/value binding and exactly compensating raw structural bundles;
+- streaming Rademacher projection with deterministic zero ties;
+- projection checksums and fail-closed identity validation;
+- explicit vector, projection, and working-memory byte estimates;
+- semantic/structural combination into the existing dense `f32` artifact shape;
+- canonical HDC configuration and deterministic selected-path JSON projection;
+- public OpenAPI configuration on ordinary managed embeddings indexes;
+- managed query projection while preserving the provider's source dimensions;
+- document composition before the existing dense artifact and HBC write;
+- canonical configuration propagation through source invalidation and batch
+  identity, reusing existing backfill, artifact, coverage, and rebuild paths;
+- golden compatibility, algebra, drift, invalid-input, translation, and
+  enrichment tests;
+- a ReleaseFast `zig build hdc-bench` harness for projection latency,
+  structural encoding throughput, checksum cost, memory accounting, and a
+  synthetic complete-HDC RaBitQ recall/latency/storage smoke measurement;
+- a managed backfill-to-retrieval fixture that uses natural-language HDC search
+  to select a location and then follows only the exact stored graph edge, closes
+  and reopens the database, repeats the query, and verifies resumed HDC
+  enrichment for a new document.
+
+This is not release-ready. Interrupted-backfill fault injection, HDC-specific
+resource attribution, representative-corpus HBC recall/latency measurements, a
+public HTTP query fixture, and a distributed fuzzy-seed-to-exact-graph fixture
+remain required.
+
+| Production capability | State | Required evidence |
+| --- | --- | --- |
+| Versioned deterministic MAP algebra | implemented | golden and algebra tests |
+| Bounded streaming semantic projection | implemented | unit tests and `hdc-bench` |
+| Public managed-index configuration | implemented experimentally | generated OpenAPI and translation contract tests |
+| Canonical document-to-association projection | implemented for selected JSON paths | replay fixtures against stored typed/schema values |
+| Managed ingest, backfill, rebuild, and quarantine | ingest/backfill and close/reopen/resumed writes tested through existing dense lifecycle; HDC seed/model drift receives a distinct artifact namespace | interrupted-backfill and config-drift rebuild fault injection |
+| Text query embedding plus HDC projection | implemented | managed local-provider projection test |
+| Dense HBC/RaBitQ retrieval quality | synthetic complete-HDC smoke evaluated | representative recall, candidate-budget, and rerank matrix |
+| Fuzzy seed to exact graph result | managed backfill/retrieval fixture implemented | distributed graph fixture and public HTTP contract |
+| Operational status and resource counters | normal index status exposes public HDC config, semantic config fingerprint, coverage outcomes, replay target, backfill progress/state, cardinality, and disk use | HDC encode/query/resource/fallback counters and pressure tests |
+
+## Product Goal
+
+For users, HDC should feel like an option on ordinary semantic search, not a
+second database subsystem:
+
+> Add one `hdc` object to a managed embeddings index, write normal documents,
+> query with normal text, and let Antfly deterministically derive, backfill,
+> rebuild, cache, and search the complete hypervectors.
+
+Production success means fast fuzzy-to-exact graph queries, predictable memory
+and storage, no manual vector materialization, fail-closed coordinate-system
+drift, and lifecycle/status behavior identical to other managed derived
+indexes. The graph remains exact: HDC only chooses ranked seed nodes.
+
+## User Experience
+
+HDC is configured and operated as an ordinary managed embeddings index. Users
+do not create projection matrices, write vector fields, choose internal
+artifact names, or submit 10,000-dimensional query vectors.
+
+### 1. Add HDC to a managed embeddings index
+
+The table definition adds one `hdc` object to the existing embeddings index
+shape:
+
+```json
+{
+  "location_hdc": {
+    "type": "embeddings",
+    "field": "description",
+    "dimension": 768,
+    "distance_metric": "cosine",
+    "embedder": {
+      "provider": "antfly",
+      "model": "location-semantics"
+    },
+    "hdc": {
+      "dimensions": 10000,
+      "semantic_weight": 8,
+      "structural_paths": [
+        "features",
+        "name",
+        "region",
+        "timezone"
+      ]
+    }
+  }
+}
+```
+
+The top-level `dimension` is the provider embedding dimension.
+`hdc.dimensions` is the stored complete-vector dimension and defaults to
+10,000. The default seeds are deterministic, so most users only choose the
+structural paths and, after evaluation, the semantic weight.
+
+### 2. Write ordinary documents and graph facts
+
+Documents contain their normal source fields:
+
+```json
+{
+  "_id": "location:seattle",
+  "name": "Seattle",
+  "description": "Pacific Northwest city on Puget Sound",
+  "region": "pacific_northwest",
+  "timezone": "pacific",
+  "features": ["waterfront", "mountains", "nature_access"]
+}
+```
+
+Graph facts remain ordinary exact edges. For example:
+
+```json
+{
+  "_id": "person:ada",
+  "name": "Ada",
+  "_edges": {
+    "travel_graph": {
+      "VISITED": [
+        {
+          "target": "location:seattle",
+          "weight": 1.0
+        }
+      ]
+    }
+  }
+}
+```
+
+After the source write commits, the managed enrichment lifecycle embeds
+`description`, projects it into HDC space, binds and bundles the configured
+structural fields, persists the complete derived vector, and updates the
+existing dense index. The caller does not generate or write `_embeddings` for
+this managed HDC index.
+
+### 3. Observe readiness through normal index status
+
+Adding the index to a populated table starts the existing managed backfill.
+The normal index status surface reports:
+
+- public HDC configuration and semantic configuration fingerprint;
+- backfill state and progress;
+- produced, pending, skipped, and terminal-failed source counts;
+- replay applied and target sequences;
+- vector cardinality and disk usage.
+
+There is no separate HDC administration API. Callers that require complete
+coverage use the same readiness and coverage policy they use for other managed
+derived indexes.
+
+### 4. Search with ordinary text
+
+The public request uses `semantic_search`; Antfly performs both provider
+embedding and deterministic HDC projection:
+
+```http
+POST /tables/travel/query
+Content-Type: application/json
+```
+
+```json
+{
+  "semantic_search": "persons who visited cities on the Pacific coast",
+  "indexes": ["location_hdc"],
+  "limit": 10
+}
+```
+
+The ordinary embedding hits contain ranked location documents and cosine
+scores. The client does not select an HDC query mode or know the internal
+generation-scoped artifact name.
+
+### 5. Use fuzzy hits as seeds for exact graph work
+
+The same request can hand the ranked embedding results to an existing graph
+query:
+
+```json
+{
+  "semantic_search": "persons who visited cities on the Pacific coast",
+  "indexes": ["location_hdc"],
+  "limit": 10,
+  "graph_searches": {
+    "visitors": {
+      "type": "neighbors",
+      "index_name": "travel_graph",
+      "start_nodes": {
+        "result_ref": "$embeddings_results",
+        "limit": 1
+      },
+      "params": {
+        "edge_types": ["VISITED"],
+        "direction": "in",
+        "max_depth": 1,
+        "include_paths": true
+      }
+    }
+  }
+}
+```
+
+For the motivating fixture, the embedding hits rank
+`location:seattle` first. The relevant graph response shape is:
+
+```json
+{
+  "graph_results": {
+    "visitors": {
+      "type": "neighbors",
+      "total": 1,
+      "nodes": [
+        {
+          "key": "person:ada",
+          "depth": 1,
+          "path": ["location:seattle", "person:ada"]
+        }
+      ]
+    }
+  }
+}
+```
+
+The seed and its cosine score are approximate retrieval evidence. The returned
+person and path come only from the stored incoming `VISITED` edge. Similarity
+never creates or proves a graph fact.
+
+### 6. Let the managed lifecycle handle change
+
+Changing a document's semantic source or selected structural fields recomputes
+its complete vector. Deleting a document removes its derived artifact and dense
+entry. Closing and reopening the database preserves the encoder configuration,
+indexed vectors, graph facts, and enrichment replay position.
+
+Changing a seed, dimension, structural path, semantic weight, source field, or
+embedder configuration changes the generation identity. Antfly assigns the new
+coordinate system a different internal artifact namespace and drives it through
+the normal rebuild and coverage lifecycle rather than mixing compatible-looking
+dimensions.
+
+### 7. Reject ambiguous or unbounded configurations early
+
+Index creation fails before ingestion when HDC is combined with sparse or
+external vectors, chunking, templates, artifact-backed embeddings, multimodal
+sources, or a non-cosine metric. It also rejects dimensions or logical
+projection work above the configured resource limits. These are explicit
+creation errors, not silent fallback to a different retrieval mode.
+
+## Decision Summary
+
+Antfly can support the fuzzy-entry-point-to-exact-graph-query described in the
+GraphCon 2026 HDC example without adding a new graph engine or putting dense
+hypervectors into the algebraic sidecar.
+
+The proposed ownership boundary is:
+
+```text
+source documents and graph facts
+  -> HDC enrichment produces versioned, rebuildable hypervector artifacts
+  -> existing dense-vector index ranks candidate node ids
+  -> algebraic planning proves and composes candidate and graph access paths
+  -> existing graph index traverses exact stored edges
+```
+
+More specifically:
+
+1. **HDC encoding is a new enrichment capability.** It owns deterministic
+   symbol encoding, semantic projection, binding, bundling, encoder identity,
+   and derived-artifact lifecycle.
+2. **HDC retrieval initially uses the existing dense-vector index.** A
+   10,000-dimensional HDC vector is a dense vector for nearest-neighbor
+   retrieval. Antfly already supports cosine distance, HBC search, RaBitQ
+   quantization, exact reranking, precomputed query vectors, and graph expansion
+   from embedding results.
+3. **The algebraic layer owns composition, not HDC ranking storage.** It should
+   type-check and connect `vector_search(doc, score)` to
+   `graph_traverse(src, dst)` while keeping the approximate candidate score
+   distinct from exact graph provenance.
+4. **The graph remains the source of relational truth.** HDC proposes likely
+   entry points. Stored directed edges determine what is known to be true.
+5. **A dedicated hypervector physical index is deferred.** It becomes justified
+   only if the existing dense path cannot meet measured cost/recall targets, or
+   if Antfly needs server-side HDC operations such as bind, unbind, permutation,
+   or online prototype updates.
+
+The HDC representation must not be expanded into one algebraic sidecar row per
+coordinate. That would turn every document into roughly 10,000 dense sidecar
+facts, defeat the sparse-token layout, and mix approximate ranking state with
+the exact symbolic facts on which algebraic law proofs rely.
+
+## Motivation
+
+The motivating GraphCon 2026 query asks:
+
+> Can we find Seattle's visitors without naming Seattle?
+
+The reference flow is:
+
+1. Embed a natural-language description such as "persons who visited cities on
+   the Pacific coast."
+2. Project the semantic embedding into a 10,000-dimensional MAP hypervector.
+3. Search a complete `Location.hv` column containing structural property
+   associations plus weighted semantic evidence.
+4. Select Seattle as a fuzzy candidate.
+5. Follow exact `VISITED` edges to return people connected to Seattle.
+
+Step 3 is approximate ranked retrieval. Step 5 is exact graph evaluation. The
+boundary matters: a high HDC score does not prove an edge exists, and a graph
+edge must not be invented from vector similarity.
+
+Antfly already exposes this general query composition. A graph selector may use
+`$embeddings_results` as its start set, dense queries may carry precomputed
+vectors, and the algebraic IR already describes vector and graph physical access
+paths. The missing product capability is an HDC encoder with a durable,
+versioned coordinate system.
+
+## Scope
+
+This design covers:
+
+- deterministic MAP-style hypervector encoding for structured properties;
+- optional semantic embedding projection into the same HDC coordinate system;
+- complete node hypervectors used for cosine candidate retrieval;
+- optional relationship hypervectors keyed by existing edge identity;
+- lifecycle, storage, query, distributed, and planner integration;
+- an evidence plan for deciding whether the feature should graduate beyond an
+  external-vector prototype.
+
+This design does not initially cover:
+
+- replacing ordinary dense semantic embeddings;
+- inferring or persisting graph edges merely because two vectors are similar;
+- arbitrary path-hypervector materialization;
+- exposing a general-purpose HDC programming language in the public API;
+- training embedding models or learning the random projection;
+- making cosine similarity an exact algebraic law;
+- adding online prototype learning before retrieval correctness and storage
+  economics are established.
+
+## HDC Model
+
+### Coordinate space
+
+The initial model follows the reference demo's Multiply-Add-Permute (MAP)
+representation:
+
+```text
+dimension:       d, initially 10,000
+atomic values:   {-1, +1}^d
+bundle values:   integer or floating-point sums in R^d
+similarity:      cosine
+binding:         element-wise multiplication
+bundling:        element-wise addition
+permutation:     a deterministic invertible coordinate permutation
+```
+
+Unrelated deterministic atomic vectors should be approximately orthogonal at
+large `d`. This property makes it possible to compose multiple associations in
+one distributed representation and later rank related representations by
+similarity.
+
+The dimension is part of encoder identity, not an implicit global. Ten thousand
+is a starting point inherited from the reference implementation, not a
+hard-coded database invariant.
+
+### Atomic symbols
+
+An atomic structural symbol is generated from a canonical token:
+
+```text
+token_hv("key:region")
+token_hv("value:pacific_northwest")
+token_hv("predicate:VISITED")
+```
+
+The generation function must be deterministic across processes, architectures,
+replay, and shards. It must not use a process-randomized language hash.
+
+Conceptually:
+
+```text
+seed_material = encoder_seed || canonical_token
+token_seed    = stable_cryptographic_hash(seed_material)
+token_hv      = deterministic_bipolar_vector(token_seed, d)
+```
+
+Canonicalization rules are observable semantics. Field paths, value kinds,
+numeric formatting, Unicode normalization, null handling, arrays, objects,
+timestamps, and bytes all require stable definitions. The encoder should reuse
+Antfly's typed value and path canonicalization where those semantics match
+rather than creating an HDC-only interpretation of JSON.
+
+### Binding
+
+A key/value association binds the key and value vectors:
+
+```text
+association("region", "pacific_northwest")
+  = token_hv("key:region") * token_hv("value:pacific_northwest")
+```
+
+For bipolar MAP factors, element-wise multiplication is self-inverse:
+
+```text
+(K * V) * K = V
+```
+
+This is useful for associative lookup, but it does not by itself retain schema,
+direction, or provenance. Those remain explicit metadata.
+
+### Bundling
+
+A node's structural representation bundles its associations:
+
+```text
+structural_hv(node)
+  = sum(association(field, value) for canonical fields in node)
+```
+
+The raw sum should remain unnormalized while it is maintained. Preserving the
+sum allows an association to be added or subtracted exactly. Normalizing after
+every update discards multiplicity and makes delete compensation approximate.
+
+When a composite is used as a factor in a later MAP binding operation, it is
+projected back to bipolar values. Zero coordinates need a deterministic
+context-specific tie breaker so replay cannot choose a different factor.
+
+### Semantic projection
+
+The reference design projects a normalized semantic embedding `x` into HDC
+space with a deterministic Rademacher matrix `R`:
+
+```text
+x             in R^m
+R             in {-1, +1}^{m x d}
+semantic_hv   = sign(xR)
+```
+
+The projection is a coordinate transform, not a new semantic model. It cannot
+add information absent from `x`. Its value is putting semantic and structural
+signals into a composable HDC space.
+
+Document and query embedding modes must match. If the underlying embedder uses
+different query and document prefixes, the HDC runtime must preserve them.
+
+The projection matrix may be regenerated deterministically, stored as an
+artifact, or both. In all cases its checksum is part of encoder identity.
+Changing the matrix, seed, dimensions, embedding model, model digest, or
+embedding normalization invalidates all derived HDC vectors.
+
+### Complete node vector
+
+The initial complete node vector is:
+
+```text
+node_hv = structural_hv + semantic_weight * semantic_hv
+```
+
+The semantic weight is configuration and part of encoder identity. The
+reference value of `8` is a demo choice, not a universal default. Structural
+field count changes the relative magnitude of the two channels, so the weight
+must be evaluated across realistic schemas and document sizes.
+
+A semantic-only query hypervector can be compared directly with this complete
+node vector:
+
+```text
+query_hv = sign(embed_query(text) * R)
+score    = cosine(query_hv, node_hv)
+```
+
+The score is a ranking signal, not a probability or graph fact.
+
+### Relationship vector
+
+An optional relationship vector can bind subject, predicate, and object:
+
+```text
+edge_hv = bipolar(subject_hv)
+        * token_hv("predicate:VISITED")
+        * bipolar(object_hv)
+```
+
+This is not required for the motivating query. Slide 13 searches node
+hypervectors and then traverses ordinary graph edges.
+
+MAP multiplication is commutative. Therefore the hypervector alone does not
+preserve edge direction. The graph index and edge record must continue to store
+source, target, type, identity, and other exact metadata.
+
+Relationship vectors, if enabled, are derived artifacts keyed by existing edge
+identity. They must not create edges and must not replace the graph layout.
+
+## Antfly Ownership Model
+
+| Concern | Owner |
+| --- | --- |
+| Canonical source document | primary document store |
+| Exact typed facts and aggregate materializations | algebraic sidecar |
+| Directed source/target/type topology | graph index |
+| Semantic embedding generation | embedding enrichment/runtime |
+| HDC token, projection, bind, bundle, and permutation semantics | HDC enrichment |
+| Authoritative derived node/edge hypervector | versioned HDC artifact |
+| Approximate candidate ranking | dense-vector executor initially |
+| RaBitQ candidate compression and exact rerank policy | HBC dense index |
+| Exact symbolic prefilters | algebraic `docfact`/`pathfact` resolution |
+| Vector-to-graph plan construction and proof | algebraic planner/IR |
+| User-visible graph result hydration | graph/query execution |
+
+This follows the rule already established in `ALGEBRAIC.md`: the algebraic
+planner should consume search-engine candidate tensors rather than embedding a
+second ranking engine in the algebraic sidecar.
+
+## Current Antfly Primitives
+
+The initial prototype can be assembled from existing primitives:
+
+- `dense_vector` is already a typed algebraic physical layout.
+- `vector_search` already produces `(doc, score)`.
+- dense search supports cosine distance and precomputed query vectors.
+- dense HBC indexes already support RaBitQ quantization and reranking.
+- algebraic symbolic filters can produce native include/exclude document sets
+  before dense traversal.
+- `graph_traverse` and graph-edge access paths already exist in the algebraic
+  IR.
+- graph query selectors already accept `$embeddings_results`.
+- graph traversal can remain on the normal graph executor for query shapes that
+  do not have a proven provenance-semiring plan.
+
+Consequently, phase 0 requires no new physical index kind. It needs an external
+encoder, an external dense-vector field, and a query that expands graph results
+from the embedding candidate set.
+
+## Proposed Data Flow
+
+### Ingest and replay
+
+```text
+primary mutation
+  -> commit canonical document and graph facts
+  -> derive semantic source text and structural typed facts
+  -> embed semantic source text
+  -> project semantic embedding into HDC space
+  -> bind and bundle structural facts
+  -> combine structural and semantic channels
+  -> persist versioned HDC artifact
+  -> apply vector to the configured dense index
+  -> mark artifact/index coverage at the source generation
+```
+
+Base documents remain canonical. HDC state is rebuildable. The primary write
+must not become unrecoverable because HDC enrichment is unavailable.
+
+The existing asynchronous derived-enrichment pattern is preferred. Tables that
+require synchronous HDC coverage may opt into the same readiness and
+fail-closed behavior used by other required derived artifacts, but synchronous
+remote embedding on the primary mutation path is not the default.
+
+### Query
+
+```text
+natural-language query
+  -> embed_query
+  -> deterministic HDC projection
+  -> vector_search(Location.hv, cosine, top-k)
+  -> candidate Location ids with scores
+  -> graph_traverse(candidate ids, edge_type=VISITED, direction=in)
+  -> exact Person/Location paths
+  -> hydrate stored documents and expose retrieval provenance
+```
+
+The implemented managed path accepts the ordinary public `semantic_search`
+field shown in [User Experience](#user-experience). The managed embedder
+computes and projects the query vector, and graph search selects
+`$embeddings_results`. The lower-level `embeddings` field remains useful for
+Phase 0 external-vector experiments and internal tests, but is not part of the
+managed HDC user journey.
+
+### Result semantics
+
+The composed execution must distinguish these fields:
+
+```text
+seed_doc          fuzzy candidate selected by HDC
+seed_score        cosine ranking signal for seed_doc
+result_doc        node reached through stored graph edges
+graph_provenance  exact edge/path provenance
+```
+
+If multiple seeds reach the same result, the engine must not silently reinterpret
+cosine ranking as a path law. The safe initial behavior is to return one result
+per seed/path. A collapsed result view may use a declared deterministic rule
+such as maximum seed score, while retaining the winning seed and path
+provenance.
+
+## Encoder Configuration and Identity
+
+An HDC encoder needs a complete durable identity. At minimum:
+
+```text
+encoder_kind
+encoder_version
+vsa_model                         // initially MAP
+dimensions
+atomic_vector_algorithm
+atomic_vector_seed
+canonicalization_version
+included_paths and excluded_paths
+value-kind policy
+array/object policy
+binding_normalization_version
+zero_tie_break_version
+permutation_version, if used
+semantic_enabled
+semantic_source/template_version
+embedding_provider and model
+embedding_model_digest
+embedding_dimensions
+embedding_normalization
+projection_kind
+projection_seed
+projection_dimensions
+projection_artifact_checksum
+semantic_weight
+output_precision
+```
+
+Every persisted vector artifact and distributed query envelope must identify
+the encoder coordinate system. Two 10,000-dimensional vectors are not
+compatible merely because their lengths match.
+
+An encoder identity change causes:
+
+1. derived HDC lifecycle to become stale or rebuild-required;
+2. old and new vectors to be prevented from sharing one index generation;
+3. backfill into a new artifact/index generation;
+4. atomic publication only after coverage is ready;
+5. cleanup of the superseded generation after readers release it.
+
+This should reuse Antfly's existing artifact identity, coverage generation,
+rebuild, and quarantine mechanisms rather than introduce an HDC-only lifecycle.
+
+## Proposed Configuration Surface
+
+Phase 0 uses a normal external embeddings index. Conceptually:
+
+```json
+{
+  "location_hdc": {
+    "type": "embeddings",
+    "field": "hv",
+    "dimension": 10000,
+    "metric": "cosine",
+    "external": true,
+    "use_quantization": true
+  }
+}
+```
+
+Phase 1 adds the engine-owned `hdc` option to an ordinary managed embeddings
+index. This is the experimental public schema implemented in this worktree:
+
+```json
+{
+  "location_hdc": {
+    "type": "embeddings",
+    "field": "description",
+    "dimension": 768,
+    "distance_metric": "cosine",
+    "embedder": {
+      "provider": "antfly",
+      "model": "location-semantics"
+    },
+    "hdc": {
+      "dimensions": 10000,
+      "seed": 13,
+      "projection_seed": 13,
+      "semantic_weight": 8,
+      "structural_paths": ["features", "name", "region", "timezone"]
+    }
+  }
+}
+```
+
+The top-level `dimension` is the provider embedding dimension and may be
+auto-probed. `hdc.dimensions` is the stored dense-vector dimension. Defaults and
+structural path order are canonicalized into the internal generator config, so
+semantically equivalent configurations share an identity and meaningful
+changes use the existing rebuild/coverage lifecycle.
+
+The internal embedding artifact name includes a short SHA-256-derived suffix of
+the canonical HDC configuration, semantic source field, provider dimensions,
+and canonical embedder configuration. A seed, dimension, structural-path,
+weight, model, or semantic-source change therefore writes a new artifact
+namespace instead of allowing same-dimensional vectors from different
+coordinate systems to alias during a rebuild. Users continue to address the
+index by its ordinary public name.
+
+The experimental guardrails cap HDC output at 65,536 dimensions, source
+embeddings at 65,536 dimensions, and one logical projection at 134,217,728
+matrix coordinates. Projection remains streaming, so its working allocation is
+one output `f32` vector, but configurations whose deterministic compute cost
+exceeds that limit are rejected before ingest or query execution.
+
+Canonicalization version 1 supports dot-separated object paths. Missing paths
+are omitted; scalar null, boolean, integer, number, and string values retain
+their JSON type; configured objects recursively contribute typed leaf values;
+and arrays are order-independent multisets whose duplicates retain
+multiplicity. Literal-dot keys, templates, chunks, sparse/external vectors,
+multimodal sources, artifact-backed embeddings, and non-cosine metrics are
+rejected in this first slice rather than assigned ambiguous semantics.
+
+The API describes a capability rather than exposing manual materialization
+state. The normal index status surface already returns the public HDC config,
+the derived semantic configuration fingerprint, generation-scoped
+produced/skipped/terminal-failed/pending coverage, replay target and applied
+sequence, backfill state/progress, vector cardinality, and disk usage. This
+gives users one readiness model shared with ordinary managed embeddings.
+
+HDC-specific encode/query time, projection-coordinate count, rejected-resource
+count, artifact bytes, and query fallback counters are not yet attributed
+separately. Those should be metrics and status extensions on the dense index,
+not a second HDC administration API.
+
+## Storage and Precision
+
+### Authoritative artifact
+
+HDC algebra should compute in `f32` initially. A 10,000-dimensional vector is
+40,000 raw bytes before metadata and storage framing.
+
+The complete node vector is generally not bipolar because it contains bundled
+structural counts and a weighted semantic term. It therefore cannot be reduced
+to one bit per coordinate without losing the authoritative additive state.
+
+The first Antfly implementation should use the existing dense artifact codec
+and exact-vector loading/reranking path. `f16` authoritative artifacts may be
+evaluated later, but adopting them requires explicit codec, error, replay, and
+reranking tests; it should not be assumed solely because the reference demo
+uses Arrow `float16`.
+
+### Search index
+
+RaBitQ is already present in the HBC dense index. Its compressed representation
+is a candidate-search structure, not the authoritative HDC vector. Exact
+reranking can load the durable vector according to the configured rerank policy.
+
+The benchmark must measure:
+
+- RaBitQ recall against exact cosine for HDC distributions;
+- sensitivity to raw bundle magnitude and semantic weight;
+- the cost of exact reranking 10,000-dimensional candidates;
+- index, artifact, cache, and working-memory bytes;
+- whether random orthogonal transformation changes HDC recall or is redundant
+  for already distributed coordinates.
+
+### Projection artifact
+
+For a 768-to-10,000 Rademacher projection, an `int8` matrix is approximately
+7.68 MB before framing, or about 0.96 MB if packed to one bit per sign. The
+initial Zig primitive generates deterministic matrix rows as a stream and keeps
+only the 40 KB `f32` output accumulator for 10,000 dimensions. This removes the
+matrix allocation from the hot-path working set while retaining a checksum over
+the logical matrix. A materialized or SIMD-packed projection artifact remains a
+benchmark-driven optimization.
+
+The projection should be:
+
+- addressed by encoder identity;
+- checksum-validated at load;
+- shared by matching enrichments on a process if materialized;
+- accounted through the resource manager;
+- bounded in batch working memory;
+- immutable for the lifetime of an index generation.
+
+## Update and Delete Semantics
+
+There are two valid maintenance strategies.
+
+### Recompute the complete node
+
+On a document overwrite:
+
+1. canonicalize all included properties;
+2. rebuild the structural sum;
+3. rebuild semantic text and embedding if it changed;
+4. combine the channels;
+5. replace the durable artifact and vector-index entry.
+
+This is the safest first implementation. Most nodes have few properties, and
+semantic regeneration often dominates cost.
+
+### Incremental structural maintenance
+
+Because raw bundling is additive, structural associations may be compensated:
+
+```text
+next_structural = prior_structural
+                - removed_associations
+                + added_associations
+```
+
+This optimization is valid only when the prior raw structural accumulator is
+available and encoder identity is unchanged. It does not eliminate semantic
+re-embedding when the semantic document changes. It should be added only after
+recompute performance is measured.
+
+Document deletion removes the artifact and vector-index entry by the same source
+generation used for other derived indexes. Edge deletion independently removes
+any optional edge HDC artifact; it never derives graph deletion from vector
+arithmetic.
+
+## Algebraic Planner Integration
+
+### Phase 0: existing result-set handoff
+
+The existing request executor runs vector retrieval and exposes
+`$embeddings_results`; graph execution resolves that named set into node keys.
+This is sufficient to reproduce the motivating flow and should be the first
+correctness target.
+
+### Phase 1: typed composed program
+
+The planner should eventually express the composition in one typed program:
+
+```text
+input query_hv(dim{})
+
+step 0:
+  vector_search(query_hv, layout=location_hdc)
+  -> candidates(doc{}, score{})
+
+step 1:
+  graph_traverse(
+    graph=travel_graph,
+    starts=project(doc{}, step0),
+    edge_type=VISITED,
+    direction=in
+  )
+  -> paths(seed{}, doc{}, provenance{})
+
+step 2:
+  join(paths(seed{}), candidates(doc{}, score{}), seed=doc)
+  -> results(seed{}, doc{}, score{}, provenance{})
+```
+
+The current IR has `vector_search`, `graph_traverse`, step references, and
+`doc`/`score`/`src`/`dst` dimensions. The extension should focus on:
+
+- proving that the graph step consumes the vector step's document axis;
+- representing top-k/limit and score ownership in typed metadata;
+- retaining seed identity through traversal;
+- attaching exact graph provenance without declaring cosine a semiring;
+- validating both vector and graph physical owners;
+- serializing compatible distributed program envelopes;
+- preserving existing fallback for unsupported graph shapes.
+
+No new HDC-specific tensor fragment is needed for candidate retrieval.
+`vector_search` is semantically correct when its metadata identifies the HDC
+encoder space.
+
+HDC-specific fragments become reasonable only for server-side operations:
+
+```text
+hdc_bind
+hdc_bundle
+hdc_unbind
+hdc_permute
+hdc_prototype_update
+```
+
+Those operations require their own dimensional, encoder-identity, numeric, and
+update-law proofs. They should not be added speculatively.
+
+### Exact constraints
+
+Algebraic `docfact` and `pathfact` filters can prune the HDC vector search to an
+exact document set before ranking:
+
+```text
+exact symbolic filter
+  -> native include doc ids
+  -> HDC cosine search within candidates
+  -> graph traversal from top-k
+```
+
+This is preferable to encoding hard security, tenancy, lifecycle, or type
+constraints into the hypervector. Required exact constraints must fail closed
+if their algebraic lifecycle or distributed envelope is stale.
+
+## Distributed Execution
+
+The coordinator should compute a query hypervector once per encoder identity and
+fan it out using the existing dense query protocol. Shards must validate:
+
+- index owner and generation;
+- dimensions and metric;
+- encoder fingerprint;
+- required symbolic constraint envelope;
+- identity read generation.
+
+Shard-local top-k results merge by the existing dense ranking contract. The
+coordinator then supplies the selected canonical document identities to graph
+execution.
+
+If vector and graph layouts are sharded differently, the planner must make the
+handoff explicit. A vector hit is a document identity, not a shard-local vector
+id. Graph traversal must resolve the canonical identity under the request's
+identity generation.
+
+Projection or embedder drift on any shard is a hard incompatibility. A shard
+must not silently compute a query vector in a different coordinate system or
+mix old and new HDC generations in one result set.
+
+## Correctness and Safety Invariants
+
+1. **Candidate is not fact.** HDC scores only rank where to begin exact work.
+2. **Direction stays explicit.** MAP binding is commutative; graph source and
+   target are authoritative.
+3. **Encoder identity is complete.** Same dimension does not imply compatible
+   vectors.
+4. **Model drift fails closed.** A changed semantic model or projection requires
+   rebuild before generated semantic queries use the index.
+5. **Base documents remain canonical.** HDC artifacts are derived and
+   rebuildable.
+6. **Exact filters stay exact.** Authorization, tenancy, deletion visibility,
+   and hard query predicates cannot be approximated by HDC similarity.
+7. **Graph paths remain exact.** Similarity never materializes an asserted edge
+   without a separate explicit product operation and provenance.
+8. **Scores retain provenance.** A propagated seed score identifies the fuzzy
+   seed that produced it and is not presented as edge confidence.
+9. **Resource use is bounded.** Projection, batch tensors, exact rerank vectors,
+   and rebuild state are resource-manager accounted.
+10. **Replay is deterministic.** Rebuilding from the same source generation and
+    encoder identity produces byte-compatible coordinate semantics and
+    tolerance-compatible vectors.
+
+## Evaluation Plan
+
+The first question is not whether HDC can be stored. It can. The question is
+whether it provides enough value over ordinary dense semantic retrieval to
+justify its additional dimensions, encoding lifecycle, and update cost.
+
+### Baselines
+
+Measure at least:
+
+1. original semantic embedding, exact cosine, then graph expansion;
+2. original semantic embedding, existing HBC/RaBitQ, then graph expansion;
+3. semantic-only HDC projection, exact cosine, then graph expansion;
+4. semantic-only HDC projection, HBC/RaBitQ, then graph expansion;
+5. complete structural-plus-semantic node HDC, exact cosine, then graph;
+6. complete node HDC, HBC/RaBitQ, then graph;
+7. structured exact filter plus original semantic embedding plus graph;
+8. structured exact filter plus complete node HDC plus graph.
+
+The semantic-only HDC case isolates the cost and recall effect of random
+projection. The complete-node case measures whether HDC composition changes
+entry-point quality.
+
+### Workloads
+
+Include:
+
+- natural-language descriptions that omit the target entity name;
+- partial structured descriptions;
+- contradictory structural and semantic evidence;
+- near-miss locations;
+- varying structural property counts;
+- multi-tenant exact filters;
+- inserts, overwrites, deletes, and schema/encoder drift;
+- graph fanout from one and many fuzzy seeds;
+- enough nodes to require approximate search;
+- skewed node types and fields absent from some rows.
+
+### Measurements
+
+Retrieval quality:
+
+- Recall@k, MRR, and nDCG for intended entry nodes;
+- end-to-end graph-answer precision and recall;
+- RaBitQ ANN recall against exact HDC cosine;
+- result stability across replay and distributed merge;
+- sensitivity to dimension, semantic weight, and field selection.
+
+Cost:
+
+- encode time per document and batch;
+- query embedding and projection time;
+- vector search, exact rerank, graph traversal, and end-to-end latency;
+- authoritative artifact bytes per document;
+- quantized index bytes per document;
+- projection/cache/working-memory peaks;
+- write amplification and rebuild duration;
+- overwrite/delete churn cost;
+- distributed query bytes for a 10,000-dimensional query vector.
+
+Operational behavior:
+
+- stale/rebuild-required transitions;
+- interrupted backfill recovery;
+- mixed-generation rejection;
+- resource-limit fallback;
+- unavailable embedder behavior;
+- query and graph fallback counters.
+
+### Pinned reference regression
+
+The motivating repository's corpus at commit
+[`de6abda83ee5fa1e46d540fc3ed6c74eecd15b73`](https://github.com/prrao87/hdc-lancedb/tree/de6abda83ee5fa1e46d540fc3ed6c74eecd15b73)
+contains three locations, nine discriminative semantic-ranking queries, and
+three semantic-to-`VISITED` path checks. With `nomic-embed-text`, the upstream
+runner reports 9/9 top-1 semantic queries and 3/3 exact path checks.
+
+That fixture is valuable as a compatibility regression and supplies the
+Seattle query shape used by the managed Antfly test. It is not a held-out
+benchmark—the upstream README says so explicitly—and cannot establish
+production quality or ANN behavior at scale. A release benchmark should consume
+the pinned CSVs and provider model digest as an external fixture, then add a
+larger independently labeled corpus rather than treating those twelve checks as
+a graduation threshold.
+
+### Initial encoder baseline
+
+On 2026-07-26, the ReleaseFast streaming implementation on the local `arm64`
+development host produced this smoke baseline:
+
+```text
+zig build hdc-bench -Doptimize=ReleaseFast
+projection 768 -> 10,000:       2.039 ms/query
+projection throughput:          3.77 billion matrix coordinates/second
+projection checksum:            0.361 ms
+8 structural associations:      43.742 us/document
+authoritative vector bytes:      40,000
+projection working bytes:        40,000
+logical packed matrix bytes:     960,000
+
+synthetic complete-HDC RaBitQ:
+  vectors / queries / k:         256 / 20 / 10
+  raw approximate recall@10:     0.835
+  recall@10 after 40 reranks:    1.000
+  exact scoring:                 0.143 ms/query
+  quantized scoring:             0.057 ms/query
+  exact rerank of 40:            0.024 ms/query
+  exact vectors:                 10,240,000 bytes
+  quantized set:                 365,632 bytes
+  measured compression:          28.0x
+
+candidate-budget sweep:
+  candidates:                    10       20       40       80
+  reranked recall@10:            0.835    1.000    1.000    1.000
+  rerank ms/query:               0.007    0.014    0.024    0.048
+```
+
+This is evidence for the primitive, not a production SLO. CI and release
+guardrails should use representative production hosts and must add embedding,
+dense search, reranking, graph traversal, concurrent ingestion, and resource
+pressure. The RaBitQ run uses random provider vectors plus deterministic
+structural associations, so it demonstrates that the existing quantizer can
+operate on complete HDC distributions; it does not establish application
+quality or a safe production candidate budget. The benchmark is parameterized
+so dimension, association-count, dataset-size, semantic-weight, query-count,
+and `k` sweeps can be recorded without changing code.
+
+### Graduation criteria
+
+The HDC enrichment may become engine-owned when:
+
+- it has an end-to-end use case where complete-node HDC materially improves
+  quality or enables composition unavailable from the baseline;
+- exact graph answers remain equivalent for the same selected seeds;
+- vector index recall is acceptable under production quantization settings;
+- artifact, index, latency, rebuild, and churn costs have explicit guardrails;
+- encoder drift and distributed generation checks fail closed;
+- the public API can describe the capability without exposing manual
+  materialization mechanics.
+
+A dedicated hypervector index layout is considered only when the engine-owned
+enrichment passes those criteria and profiling shows the existing dense layout
+is the dominant unacceptable cost.
+
+## Implementation Sequence
+
+### Phase 0: external feasibility spike
+
+- Reproduce the reference MAP encoder outside Antfly.
+- Store complete node hypervectors through an external embeddings index.
+- Query with a packed precomputed vector.
+- Expand from `$embeddings_results` through the existing graph query API.
+- Add an end-to-end fixture that proves fuzzy seed selection and exact edge
+  traversal are separate.
+- Run all baselines from the evaluation plan on a bounded dataset.
+
+Exit: a reproducible quality/cost report, not a new public feature.
+
+### Phase 1: engine-owned HDC enrichment
+
+- Add a versioned HDC generator and encoder identity.
+- Reuse canonical typed/path projection for structural inputs.
+- Integrate semantic embedding and projection artifact caching.
+- Persist derived HDC artifacts through existing artifact lifecycle machinery.
+- Backfill, resume, rebuild, quarantine, and status like other managed
+  enrichments.
+- Feed existing dense indexes without adding a new index kind.
+
+Exit: deterministic rebuild and lifecycle tests plus benchmark guardrails.
+
+### Phase 2: planner-owned composition
+
+- Build a typed vector-candidate-to-graph tensor program.
+- Prove both access paths and the document-identity handoff.
+- Preserve seed score and exact graph provenance.
+- Export/validate the distributed program envelope.
+- Retain explicit fallbacks for unsupported graph shapes.
+
+Exit: local and distributed equivalence with the existing result-set handoff.
+
+### Phase 3: optional relationship HDC
+
+- Add only for a demonstrated associative edge/path retrieval use case.
+- Key every vector by an existing edge identity.
+- Keep source, target, direction, and type in graph storage.
+- Avoid all-pairs or arbitrary path materialization.
+- Evaluate selected/top-k derived adjacency separately from asserted graph
+  edges.
+
+Exit: evidence that relationship HDC adds value beyond node seeding and exact
+graph traversal.
+
+### Phase 4: conditional specialized physical layout
+
+Potential optimizations include packed bipolar operands, SIMD bind/unbind,
+specialized bundle accumulators, compressed authoritative sums, GPU projection,
+and prototype-update storage. Each requires a benchmark showing a durable win
+over the dense-vector path and a precise lifecycle contract.
+
+## Alternatives Considered
+
+### Put all HDC coordinates in the algebraic sidecar
+
+Rejected. The sidecar is optimized around sparse symbolic facts and
+materialized exact-law tensors. Complete HDC vectors are dense approximate
+features. Per-coordinate rows would create extreme row and write amplification,
+and ordinary cosine ranking would still require a vector executor.
+
+### Add a new top-level HDC index immediately
+
+Rejected for the first implementation. Existing dense HBC and RaBitQ provide
+the required candidate retrieval. A new kind would duplicate lifecycle,
+distributed, status, filtering, and ANN work before a workload demonstrates a
+missing physical capability.
+
+### Use only ordinary semantic embeddings
+
+This is the baseline and may be the right answer for slide 13 alone. A random
+sign projection does not introduce semantic information. HDC is justified by
+its ability to compose structural roles, values, relationships, sequences, or
+online memories in one coordinate system, not by dimensional expansion itself.
+
+### Replace graph traversal with S-P-O similarity
+
+Rejected. Similarity is approximate, MAP binding is commutative, and a retrieved
+path vector does not have the same truth semantics as a stored directed edge.
+HDC may select or rank candidate paths, but exact graph facts remain
+authoritative.
+
+### Materialize similarity edges
+
+Deferred and separate from this proposal. A product may explicitly create a
+derived top-k similarity graph with provenance and bounded degree, but those
+edges are not asserted domain facts. Such a graph needs its own refresh,
+staleness, threshold, and user-visible semantics.
+
+## Open Questions
+
+- Which canonical JSON value kinds should participate in structural HDC by
+  default?
+- Should HDC structural fields be schema-declared only, or may path observation
+  recommend them?
+- Is one complete node vector preferable to separate structural and semantic
+  vector columns with late score fusion?
+- What dimension/weight combinations survive realistic property-count skew?
+- Should the projection matrix be stored or only regenerated and checksum
+  verified?
+- Does existing artifact `f32` storage meet scale targets, or is `f16`
+  authoritative storage worth the extra error contract?
+- How should graph result scoring collapse multiple fuzzy seeds?
+- Is query-vector projection best placed at the coordinator, inference service,
+  or a reusable managed embedder wrapper?
+- Do edge/path hypervectors have a concrete query that cannot be served by node
+  HDC plus exact graph execution?
+- At what measured scale, if any, does a specialized hypervector layout beat
+  existing HBC/RaBitQ enough to justify a new index kind?
+
+## Antfly Code References
+
+- [Algebraic design and search-engine ownership](ALGEBRAIC.md)
+- [Algebraic tensor IR](pkg/antfly/src/storage/db/algebraic/ir.zig)
+- [Algebraic planner](pkg/antfly/src/storage/db/algebraic/planner.zig)
+- [Sparse formal-vector implementation](pkg/antfly/src/storage/db/algebraic/vector.zig)
+- [Graph query model and traversal](pkg/antfly/src/graph/query.zig)
+- [Graph result-set handoff](pkg/antfly/src/storage/db/query/graph_exec.zig)
+- [Dense index catalog and configuration](pkg/antfly/src/storage/db/catalog/index_manager.zig)
+- [Managed embedder configuration and query projection](pkg/antfly/src/inference/managed_embedder.zig)
+- [Managed enrichment execution](pkg/antfly/src/storage/db/enrichment/enrichment_runtime.zig)
+- [HDC MAP encoder and JSON composition](pkg/antfly/src/hdc.zig)
+- [HDC microbenchmark](pkg/antfly/src/bench/hdc_bench.zig)
+- [Public embeddings/HDC schema](../specs/openapi/antfly/indexes.yaml)
+- [HBC storage and RaBitQ integration](pkg/antfly/src/storage/hbc_adapter.zig)
+- [Embedding enrichment interface](pkg/antfly/src/storage/db/enrichment/embedder.zig)
+- [Derived artifact codec](pkg/antfly/src/storage/db/enrichment/artifact_codec.zig)
+- [Public query contract](pkg/antfly/src/api/query_contract.zig)
+
+## External References
+
+### Motivating implementation
+
+- Prashanth Rao, [Multimodal Knowledge Graphs for
+  Agents](https://prrao87.github.io/slidev-talks/graphcon-2026/#/13), GraphCon
+  2026, slide 13.
+- [GraphCon slide
+  source](https://github.com/prrao87/slidev-talks/blob/main/talks/graphcon-2026/slides.md#L1684-L1759),
+  including the semantic-query-to-exact-graph flow.
+- [`prrao87/hdc-lancedb`](https://github.com/prrao87/hdc-lancedb/tree/de6abda83ee5fa1e46d540fc3ed6c74eecd15b73),
+  pinned reference code and data.
+- [MAP token, binding, bundling, and triple
+  encoder](https://github.com/prrao87/hdc-lancedb/blob/de6abda83ee5fa1e46d540fc3ed6c74eecd15b73/src/hdc/core.py).
+- [Structural and semantic complete-node
+  encoder](https://github.com/prrao87/hdc-lancedb/blob/de6abda83ee5fa1e46d540fc3ed6c74eecd15b73/src/hdc/location.py).
+- [Semantic embedding and deterministic random
+  projection](https://github.com/prrao87/hdc-lancedb/blob/de6abda83ee5fa1e46d540fc3ed6c74eecd15b73/src/hdc/semantic.py).
+- [Node/edge artifact encoding and
+  persistence](https://github.com/prrao87/hdc-lancedb/blob/de6abda83ee5fa1e46d540fc3ed6c74eecd15b73/src/hdc/encode.py).
+- [HDC candidate search followed by exact graph
+  traversal](https://github.com/prrao87/hdc-lancedb/blob/de6abda83ee5fa1e46d540fc3ed6c74eecd15b73/src/hdc/retrieve.py).
+- [Storage and compression
+  notes](https://github.com/prrao87/hdc-lancedb/blob/de6abda83ee5fa1e46d540fc3ed6c74eecd15b73/COMPRESSION_TRICKS.md).
+
+### HDC and VSA background
+
+- Pentti Kanerva, [Hyperdimensional Computing: An Introduction to Computing in
+  Distributed Representation with High-Dimensional Random
+  Vectors](https://doi.org/10.1007/s12559-009-9009-8), Cognitive Computation,
+  2009.
+- Denis Kleyko et al., [Vector Symbolic Architectures as a Computing Framework
+  for Emerging Hardware](https://doi.org/10.1109/JPROC.2022.3209104),
+  Proceedings of the IEEE, 2022.
+- Denis Kleyko et al., [A Survey on Hyperdimensional Computing aka Vector
+  Symbolic Architectures, Part I: Models and Data
+  Transformations](https://arxiv.org/abs/2111.06077), 2021.
+- Mike Heddes et al., [Torchhd: An Open Source Python Library to Support
+  Research on Hyperdimensional Computing and Vector Symbolic
+  Architectures](https://www.jmlr.org/papers/v24/23-0300.html), Journal of
+  Machine Learning Research, 2023.
+- [Torchhd documentation](https://torchhd.readthedocs.io/en/stable/).

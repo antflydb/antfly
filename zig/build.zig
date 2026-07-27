@@ -6815,6 +6815,25 @@ pub fn build(b: *std.Build) void {
     const hbc_bench_step = b.step("hbc-bench", "Benchmark HBC kmeans vs hilbert split algorithms");
     hbc_bench_step.dependOn(&run_hbc_bench.step);
 
+    const hdc_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/bench/hdc_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    hdc_bench_mod.addImport("antfly-zig", lib_mod);
+
+    const hdc_bench = b.addExecutable(.{
+        .name = "hdc_bench",
+        .root_module = hdc_bench_mod,
+    });
+
+    const run_hdc_bench = b.addRunArtifact(hdc_bench);
+    if (b.args) |args| {
+        run_hdc_bench.addArgs(args);
+    }
+    const hdc_bench_step = b.step("hdc-bench", "Benchmark deterministic HDC encoding and projection");
+    hdc_bench_step.dependOn(&run_hdc_bench.step);
+
     const hbc_write_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/hbc_write_bench.zig"),
         .target = target,

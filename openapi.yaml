@@ -15582,6 +15582,49 @@ components:
       example:
         provider: openai
         model: text-embedding-3-small
+    HdcIndexConfig:
+      type: object
+      additionalProperties: false
+      description: Hyperdimensional-computing transform for a managed dense embeddings index. Defaults
+        are canonicalized into the index identity so changes automatically trigger the ordinary managed-index
+        rebuild lifecycle.
+      properties:
+        dimensions:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          maximum: 65536
+          default: 10000
+          description: Stored HDC vector dimensions.
+        seed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          default: 13
+          description: Seed for deterministic typed structural symbols.
+        projection_seed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Seed for deterministic semantic projection. Defaults to seed.
+        semantic_weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: float
+          minimum: 0
+          default: 8
+          description: Relative contribution of the projected semantic vector to each document hypervector.
+        structural_paths:
+          type: array
+          maxItems: 256
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 1024
+          default: []
+          description: Dot-separated document paths bound into the vector. Paths are canonicalized in
+            sorted order; arrays are encoded as order-independent multisets.
     GoogleGeneratorConfig:
       type: object
       description: >
@@ -16158,9 +16201,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           minimum: 1
-          description: Vector dimension for dense indexes. Required for external dense indexes. Can be
-            omitted for managed dense indexes when an embedder is configured (auto-detected via probe).
-            Ignored for sparse indexes.
+          description: Provider embedding dimension for managed dense indexes, or stored vector dimension
+            for ordinary/external dense indexes. When hdc is configured, the stored vector dimension is
+            hdc.dimensions. Can be omitted for managed dense indexes when an embedder is configured (auto-detected
+            via probe). Ignored for sparse indexes.
         field:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -16193,6 +16237,12 @@ components:
           description: Configuration for the embeddings plugin (managed indexes only; not allowed when
             external=true)
           $ref: '#/components/schemas/EmbedderConfig'
+        hdc:
+          $ref: '#/components/schemas/HdcIndexConfig'
+          description: Deterministically projects semantic embeddings into a hypervector and binds selected
+            document fields into the same stored dense vector. HDC indexes are managed dense cosine indexes
+            and currently cannot be combined with external vectors, sparse mode, templates, chunking,
+            or artifact-backed embedding enrichments.
         summarizer:
           description: Configuration for the summarizer plugin (dense managed indexes only)
           $ref: '#/components/schemas/GeneratorConfig'

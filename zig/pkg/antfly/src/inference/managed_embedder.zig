@@ -44,6 +44,7 @@ const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
+const hdc = @import("../hdc.zig");
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
@@ -382,6 +383,8 @@ pub const ManagedEmbeddingEntry = struct {
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     dimensions: u32,
+    provider_dimensions: u32,
+    hdc_config: ?hdc.UserConfig = null,
     sparse: bool = false,
     multimodal: bool = false,
     requests_per_minute: u32 = 0,
@@ -398,6 +401,7 @@ pub const ManagedEmbeddingEntry = struct {
         if (self.region.len > 0) alloc.free(self.region);
         if (self.input_type.len > 0) alloc.free(self.input_type);
         if (self.truncate.len > 0) alloc.free(self.truncate);
+        if (self.hdc_config) |*config| config.deinit();
         self.bedrock_credentials.deinit(alloc);
         if (self.api_key) |*api_key| api_key.deinit(alloc);
         self.auth_header_cache.deinit(alloc);
@@ -475,6 +479,8 @@ fn managedEmbeddingEntriesEquivalentForLookup(
 ) bool {
     return lhs.provider == rhs.provider and
         lhs.dimensions == rhs.dimensions and
+        lhs.provider_dimensions == rhs.provider_dimensions and
+        managedHdcConfigsEqual(lhs.hdc_config, rhs.hdc_config) and
         lhs.sparse == rhs.sparse and
         lhs.multimodal == rhs.multimodal and
         lhs.requests_per_minute == rhs.requests_per_minute and
@@ -486,6 +492,12 @@ fn managedEmbeddingEntriesEquivalentForLookup(
         std.mem.eql(u8, lhs.region, rhs.region) and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
         std.mem.eql(u8, lhs.truncate, rhs.truncate);
+}
+
+fn managedHdcConfigsEqual(left: ?hdc.UserConfig, right: ?hdc.UserConfig) bool {
+    if ((left == null) != (right == null)) return false;
+    if (left) |left_config| return hdc.UserConfig.eql(left_config, right.?);
+    return true;
 }
 
 fn validateManagedEmbeddingLookupName(
@@ -726,6 +738,15 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheField(&hasher, entry.input_type);
         hashQueryCacheField(&hasher, entry.truncate);
         hashQueryCacheU64(&hasher, entry.dimensions);
+        hashQueryCacheU64(&hasher, entry.provider_dimensions);
+        if (entry.hdc_config) |config| {
+            hashQueryCacheField(&hasher, "hdc-v1");
+            hashQueryCacheU64(&hasher, config.dimensions);
+            hashQueryCacheU64(&hasher, config.atomic_seed);
+            hashQueryCacheU64(&hasher, config.projection_seed);
+            hashQueryCacheU64(&hasher, @as(u32, @bitCast(config.semantic_weight)));
+            for (config.structural_paths) |path| hashQueryCacheField(&hasher, path);
+        }
         hashQueryCacheSecretIdentity(&hasher, entry.api_key);
         hashQueryCacheU64(&hasher, if (entry.secret_store) |store| store.generationFast() else 0);
         hashQueryCacheField(&hasher, text);
@@ -1022,8 +1043,21 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
     const sparse = cfg.sparse orelse false;
     const external = cfg.external orelse false;
+    var hdc_config: ?hdc.UserConfig = if (root.get("hdc")) |hdc_value|
+        hdc.UserConfig.parseValue(alloc, hdc_value) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidCreateTableRequest,
+        }
+    else
+        null;
+    defer if (hdc_config) |*config| config.deinit();
 
     if (root.get("summarizer") != null) return error.UnsupportedCreateTableRequest;
+    if (hdc_config != null and
+        (external or sparse or root.get("chunker") != null or root.get("template") != null))
+    {
+        return error.UnsupportedCreateTableRequest;
+    }
 
     const field_name = cfg.field;
     const template_value = cfg.template;
@@ -1136,12 +1170,40 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     defer if (embedder_json) |raw| alloc.free(raw);
     if (!external and embedder_json == null and chunker_json == null) return error.InvalidCreateTableRequest;
 
-    const dims = if (embedder_value) |embedder|
+    const provider_dims = if (embedder_value) |embedder|
         try resolveEmbeddingDimensionsForManagedConfig(alloc, index_name, cfg, embedder, options)
     else
         try resolveDeclaredEmbeddingDimensionsRequired(cfg);
+    const dims = if (hdc_config) |config| config.dimensions else provider_dims;
+    if (hdc_config) |config| {
+        config.projection(provider_dims).validate() catch return error.InvalidCreateTableRequest;
+    }
     if (artifact_embedding_name != null and external) return error.InvalidCreateTableRequest;
     if (artifact_source_name != null and artifact_embedding_name == null) return error.InvalidCreateTableRequest;
+    if (hdc_config != null and artifact_embedding_name != null) return error.UnsupportedCreateTableRequest;
+    if (hdc_config != null and !std.mem.eql(u8, metric, "cosine")) {
+        return error.UnsupportedCreateTableRequest;
+    }
+
+    const hdc_json = if (hdc_config) |config| try config.stringifyAlloc(alloc) else null;
+    defer if (hdc_json) |raw| alloc.free(raw);
+    const hdc_embedder_identity_json = if (hdc_config != null) blk: {
+        const raw_embedder = embedder_value orelse return error.InvalidCreateTableRequest;
+        var identity_config = try parseEmbedderConfigFromValue(alloc, raw_embedder);
+        defer identity_config.deinit(alloc);
+        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, identity_config, raw_embedder, null);
+    } else null;
+    defer if (hdc_embedder_identity_json) |raw| alloc.free(raw);
+    const generated_embedding_name = if (hdc_json) |raw| try hdcEmbeddingNameAlloc(
+        alloc,
+        index_name,
+        raw,
+        source_field,
+        provider_dims,
+        hdc_embedder_identity_json.?,
+    ) else null;
+    defer if (generated_embedding_name) |name| alloc.free(name);
+    const effective_embedding_name = artifact_embedding_name orelse generated_embedding_name orelse index_name;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -1155,7 +1217,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try out.appendSlice(alloc, ",\"metric\":");
     try appendJsonString(alloc, &out, metric);
     try out.appendSlice(alloc, ",\"embedding_name\":");
-    try appendJsonString(alloc, &out, artifact_embedding_name orelse index_name);
+    try appendJsonString(alloc, &out, effective_embedding_name);
 
     if (artifact_embedding_name != null) {
         if (chunker_json != null or template_value != null) return error.InvalidCreateTableRequest;
@@ -1171,7 +1233,11 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         defer alloc.free(artifact_name);
         try appendJsonString(alloc, &out, artifact_name);
         try out.appendSlice(alloc, ",\"embedding_name\":");
-        try appendJsonString(alloc, &out, index_name);
+        try appendJsonString(alloc, &out, effective_embedding_name);
+        if (hdc_json) |raw| {
+            try out.appendSlice(alloc, ",\"hdc\":");
+            try out.appendSlice(alloc, raw);
+        }
         if (chunker_json) |chunker| {
             try out.appendSlice(alloc, ",\"chunker\":");
             try out.appendSlice(alloc, chunker);
@@ -1184,6 +1250,10 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     if (embedder_json) |embedder| {
         try out.appendSlice(alloc, ",\"embedder\":");
         try out.appendSlice(alloc, embedder);
+    }
+    if (hdc_json) |raw| {
+        try out.appendSlice(alloc, ",\"hdc\":");
+        try out.appendSlice(alloc, raw);
     }
 
     try appendExecutionObjectIfPresent(alloc, &out, root);
@@ -1280,8 +1350,48 @@ fn parseManagedEmbeddingEntry(
     const sparse = cfg.sparse orelse false;
 
     const embedder = root.get("embedder") orelse return null;
-    const dims = if (sparse) 0 else try resolveEmbeddingDimensionsForManagedConfig(alloc, index_name, cfg, embedder, options);
-    return try buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, dims);
+    const provider_dimensions = if (sparse) 0 else try resolveEmbeddingDimensionsForManagedConfig(alloc, index_name, cfg, embedder, options);
+    var hdc_config: ?hdc.UserConfig = if (root.get("hdc")) |hdc_value|
+        hdc.UserConfig.parseValue(alloc, hdc_value) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidManagedEmbeddingIndex,
+        }
+    else
+        null;
+    errdefer if (hdc_config) |*config| config.deinit();
+    if (hdc_config != null and
+        (sparse or
+            root.get("template") != null or
+            root.get("chunker") != null or
+            root.get("embedding_name") != null or
+            root.get("source_artifact_name") != null or
+            root.get("summarizer") != null))
+    {
+        return error.InvalidManagedEmbeddingIndex;
+    }
+    if (hdc_config != null) {
+        if (root.get("distance_metric")) |metric| {
+            if (metric != .string or !std.mem.eql(u8, metric.string, "cosine")) {
+                return error.InvalidManagedEmbeddingIndex;
+            }
+        }
+    }
+    if (hdc_config) |config| {
+        config.projection(provider_dimensions).validate() catch return error.InvalidManagedEmbeddingIndex;
+    }
+    const dimensions = if (hdc_config) |config| config.dimensions else provider_dimensions;
+    const result = try buildManagedEmbeddingEntry(
+        alloc,
+        index_name,
+        cfg,
+        embedder,
+        options,
+        provider_dimensions,
+        dimensions,
+        hdc_config,
+    );
+    hdc_config = null;
+    return result;
 }
 
 fn shouldUseAntflyProvider(embedder: embeddings_types.Config, options: InitOptions) bool {
@@ -1302,7 +1412,9 @@ fn buildManagedEmbeddingEntry(
     cfg: indexes_openapi.EmbeddingsIndexConfig,
     embedder: std.json.Value,
     options: InitOptions,
+    provider_dimensions: u32,
     dimensions: u32,
+    hdc_config: ?hdc.UserConfig,
 ) !ManagedEmbeddingEntry {
     const sparse = cfg.sparse orelse false;
     var embedder_cfg = try parseEmbedderConfigFromValue(alloc, embedder);
@@ -1310,6 +1422,7 @@ fn buildManagedEmbeddingEntry(
 
     const provider = try parseEmbedderProvider(embedder_cfg);
     if (embedder_cfg.model.len == 0 and provider != .antfly) return error.InvalidManagedEmbeddingIndex;
+    if (hdc_config != null and embedder_cfg.multimodal) return error.InvalidManagedEmbeddingIndex;
     const requests_per_minute = try resolveEmbedderRequestsPerMinute(embedder, provider);
     const burst = try resolveEmbedderBurst(embedder, provider);
     const antfly_provider = if (isAntflyProvider(provider) and shouldUseAntflyProvider(embedder_cfg, options))
@@ -1318,7 +1431,26 @@ fn buildManagedEmbeddingEntry(
         null;
     const owned_index_name = try alloc.dupe(u8, index_name);
     errdefer alloc.free(owned_index_name);
-    const owned_embedding_name: []u8 = if (cfg.embedding_name) |embedding_name| try alloc.dupe(u8, embedding_name) else @constCast("");
+    const hdc_json = if (hdc_config) |config| try config.stringifyAlloc(alloc) else null;
+    defer if (hdc_json) |raw| alloc.free(raw);
+    const hdc_embedder_identity_json = if (hdc_config != null)
+        try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, null)
+    else
+        null;
+    defer if (hdc_embedder_identity_json) |raw| alloc.free(raw);
+    const owned_embedding_name: []u8 = if (hdc_json) |raw|
+        try hdcEmbeddingNameAlloc(
+            alloc,
+            index_name,
+            raw,
+            cfg.field orelse return error.InvalidManagedEmbeddingIndex,
+            provider_dimensions,
+            hdc_embedder_identity_json.?,
+        )
+    else if (cfg.embedding_name) |embedding_name|
+        try alloc.dupe(u8, embedding_name)
+    else
+        @constCast("");
     errdefer if (owned_embedding_name.len > 0) alloc.free(owned_embedding_name);
     const owned_model = try alloc.dupe(u8, embedder_cfg.model);
     errdefer alloc.free(owned_model);
@@ -1366,12 +1498,35 @@ fn buildManagedEmbeddingEntry(
         .secret_store = options.secret_store,
         .remote_content = options.remote_content,
         .dimensions = dimensions,
+        .provider_dimensions = provider_dimensions,
+        .hdc_config = hdc_config,
         .sparse = sparse,
         .multimodal = embedder_cfg.multimodal,
         .requests_per_minute = requests_per_minute,
         .burst = burst,
         .antfly_provider = antfly_provider,
     };
+}
+
+fn hdcEmbeddingNameAlloc(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    canonical_hdc_json: []const u8,
+    source_field: []const u8,
+    provider_dimensions: u32,
+    canonical_embedder_json: []const u8,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-hdc-artifact-name-v1");
+    hashQueryCacheField(&hasher, index_name);
+    hashQueryCacheField(&hasher, canonical_hdc_json);
+    hashQueryCacheField(&hasher, source_field);
+    hashQueryCacheU64(&hasher, provider_dimensions);
+    hashQueryCacheField(&hasher, canonical_embedder_json);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest[0..8].*, .lower);
+    return try std.fmt.allocPrint(alloc, "{s}@hdc-{s}", .{ index_name, &hex });
 }
 
 fn isAntflyProvider(provider: ProviderKind) bool {
@@ -1413,7 +1568,7 @@ fn resolveEmbeddingDimensionsForManagedConfig(
     options: InitOptions,
 ) !u32 {
     if (try resolveDeclaredEmbeddingDimensions(cfg)) |declared| return declared;
-    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0) catch |err| switch (err) {
+    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0, 0, null) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
         error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
@@ -1431,7 +1586,16 @@ fn resolveEmbeddingDimensionsForManagedConfigWithValidation(
     validation: DimensionProbeValidation,
 ) !u32 {
     const declared = try resolveDeclaredEmbeddingDimensions(cfg);
-    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, declared orelse 0) catch |err| switch (err) {
+    var managed = buildManagedEmbeddingEntry(
+        alloc,
+        index_name,
+        cfg,
+        embedder,
+        options,
+        declared orelse 0,
+        declared orelse 0,
+        null,
+    ) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
         error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
@@ -1449,7 +1613,7 @@ fn validateSparseEmbeddingForManagedConfig(
     embedder: std.json.Value,
     options: InitOptions,
 ) !void {
-    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0) catch |err| switch (err) {
+    var managed = buildManagedEmbeddingEntry(alloc, index_name, cfg, embedder, options, 0, 0, null) catch |err| switch (err) {
         error.InvalidManagedEmbeddingIndex, error.InvalidAntflyInferenceBaseUrl => return error.InvalidCreateTableRequest,
         error.UnsupportedEmbeddingProvider => return error.UnsupportedCreateTableRequest,
         else => return err,
@@ -1880,6 +2044,9 @@ fn embedWithEntryParts(
     parts: []const template_mod.ContentPart,
     dims: u32,
 ) ![]f32 {
+    if (entry.hdc_config != null and (entry.multimodal or partsContainMedia(parts))) {
+        return error.UnsupportedEmbeddingProvider;
+    }
     if (entry.provider == .bedrock and (entry.multimodal or partsContainMedia(parts))) {
         try waitForEntryPacer(entry);
         var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
@@ -2159,6 +2326,41 @@ fn embedWithEntry(
 }
 
 fn embedBatchWithEntry(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    texts: []const []const u8,
+    dims: u32,
+) ![]const []const f32 {
+    const config = entry.hdc_config orelse
+        return try embedProviderBatchWithEntry(alloc, entry, texts, dims);
+    if (dims != config.dimensions) return error.InvalidEmbeddingDimensions;
+
+    const source_vectors = try embedProviderBatchWithEntry(
+        alloc,
+        entry,
+        texts,
+        entry.provider_dimensions,
+    );
+    defer db_embedder.freeDenseEmbeddingBatch(alloc, source_vectors);
+
+    const projected = try alloc.alloc([]const f32, source_vectors.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (projected[0..initialized]) |vector| alloc.free(@constCast(vector));
+        alloc.free(projected);
+    }
+    const projection = config.projection(entry.provider_dimensions);
+    for (source_vectors, projected) |source, *destination| {
+        const vector = try alloc.alloc(f32, config.dimensions);
+        errdefer alloc.free(vector);
+        try projection.project(source, vector);
+        destination.* = vector;
+        initialized += 1;
+    }
+    return projected;
+}
+
+fn embedProviderBatchWithEntry(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
     texts: []const []const u8,
@@ -2629,6 +2831,93 @@ test "managed embedder translates managed embeddings config into db generator co
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"generator\":{\"kind\":\"dense_embedding\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"execution\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding\":{\"batch_items\":16,\"batch_bytes\":262144}") != null);
+}
+
+test "managed embedder projects HDC queries and translates canonical lifecycle config" {
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+    const public_json =
+        \\{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"hdc":{"dimensions":64,"seed":17,"semantic_weight":4,"structural_paths":["region","name"]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, public_json, .{});
+    defer parsed.deinit();
+
+    const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() });
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"dims\":64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"hdc\":{\"dimensions\":64,\"seed\":17,\"projection_seed\":17,\"semantic_weight\":4,\"structural_paths\":[\"name\",\"region\"]}") != null);
+    const raw_embedder = parsed.value.object.get("embedder").?;
+    var identity_config = try parseEmbedderConfigFromValue(std.testing.allocator, raw_embedder);
+    defer identity_config.deinit(std.testing.allocator);
+    const identity_json = try stringifyManagedEmbedderConfigAlloc(std.testing.allocator, identity_config, raw_embedder, null);
+    defer std.testing.allocator.free(identity_json);
+    const artifact_name = try hdcEmbeddingNameAlloc(
+        std.testing.allocator,
+        "semantic_idx",
+        "{\"dimensions\":64,\"seed\":17,\"projection_seed\":17,\"semantic_weight\":4,\"structural_paths\":[\"name\",\"region\"]}",
+        "body",
+        3,
+        identity_json,
+    );
+    defer std.testing.allocator.free(artifact_name);
+    try std.testing.expect(std.mem.count(u8, config_json, artifact_name) == 2);
+
+    const indexes_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"semantic_idx\":{s}}}", .{public_json});
+    defer std.testing.allocator.free(indexes_json);
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, indexes_json, local.provider());
+    defer managed.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), managed.entries[0].provider_dimensions);
+    try std.testing.expectEqual(@as(u32, 64), managed.entries[0].dimensions);
+    try std.testing.expect(managed.findEntry(artifact_name) != null);
+    const vector = try managed.embedQuery(std.testing.allocator, "semantic_idx", "graph databases");
+    defer std.testing.allocator.free(vector);
+    try std.testing.expectEqual(@as(usize, 64), vector.len);
+    for (vector) |coordinate| {
+        try std.testing.expect(coordinate == -1 or coordinate == 1);
+    }
+
+    const first_cache_key = try managed.queryCacheKey("semantic_idx", .anonymous, "", "graph databases");
+    var changed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(
+        std.testing.allocator,
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"hdc":{"dimensions":64,"seed":18,"semantic_weight":4,"structural_paths":["name","region"]}}}
+    ,
+        local.provider(),
+    );
+    defer changed.deinit();
+    const changed_cache_key = try changed.queryCacheKey("semantic_idx", .anonymous, "", "graph databases");
+    try std.testing.expect(!std.mem.eql(u8, &first_cache_key, &changed_cache_key));
+    try std.testing.expect(!std.mem.eql(u8, artifact_name, changed.entries[0].embedding_name));
+
+    var changed_model = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(
+        std.testing.allocator,
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap-v2"},"hdc":{"dimensions":64,"seed":17,"semantic_weight":4,"structural_paths":["name","region"]}}}
+    ,
+        local.provider(),
+    );
+    defer changed_model.deinit();
+    const changed_model_cache_key = try changed_model.queryCacheKey("semantic_idx", .anonymous, "", "graph databases");
+    try std.testing.expect(!std.mem.eql(u8, &first_cache_key, &changed_model_cache_key));
+    try std.testing.expect(!std.mem.eql(u8, artifact_name, changed_model.entries[0].embedding_name));
+}
+
+test "managed embedder rejects incompatible HDC index modes" {
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+    const invalid_configs = [_][]const u8{
+        \\{"type":"embeddings","field":"body","dimension":3,"sparse":true,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"hdc":{"dimensions":64}}
+        ,
+        \\{"type":"embeddings","field":"body","dimension":3,"distance_metric":"l2_squared","embedder":{"provider":"antfly","model":"antflydb/clipclap"},"hdc":{"dimensions":64}}
+        ,
+        \\{"type":"embeddings","template":"{{body}}","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"hdc":{"dimensions":64}}
+        ,
+    };
+    for (invalid_configs) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(
+            error.UnsupportedCreateTableRequest,
+            translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() }),
+        );
+    }
 }
 
 test "managed embedder rejects invalid execution batch policy" {

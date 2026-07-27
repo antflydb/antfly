@@ -2514,7 +2514,7 @@ pub const EmbeddingsIndexConfig = struct {
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
     sparse: ?bool = null,
-    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    /// Provider embedding dimension for managed dense indexes, or stored vector dimension for ordinary/external dense indexes. When hdc is configured, the stored vector dimension is hdc.dimensions. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
@@ -2529,6 +2529,8 @@ pub const EmbeddingsIndexConfig = struct {
     mem_only: ?bool = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
     embedder: ?EmbedderConfig = null,
+    /// Deterministically projects semantic embeddings into a hypervector and binds selected document fields into the same stored dense vector. HDC indexes are managed dense cosine indexes and currently cannot be combined with external vectors, sparse mode, templates, chunking, or artifact-backed embedding enrichments.
+    hdc: ?HdcIndexConfig = null,
     /// Configuration for the summarizer plugin (dense managed indexes only)
     summarizer: ?GeneratorConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
@@ -3888,6 +3890,20 @@ pub const GroundTruth = struct {
     expectations: ?[]const u8 = null,
 };
 
+/// Hyperdimensional-computing transform for a managed dense embeddings index. Defaults are canonicalized into the index identity so changes automatically trigger the ordinary managed-index rebuild lifecycle.
+pub const HdcIndexConfig = struct {
+    /// Stored HDC vector dimensions.
+    dimensions: ?i64 = null,
+    /// Seed for deterministic typed structural symbols.
+    seed: ?i64 = null,
+    /// Seed for deterministic semantic projection. Defaults to seed.
+    projection_seed: ?i64 = null,
+    /// Relative contribution of the projected semantic vector to each document hypervector.
+    semantic_weight: ?f32 = null,
+    /// Dot-separated document paths bound into the vector. Paths are canonicalized in sorted order; arrays are encoded as order-independent multisets.
+    structural_paths: ?[]const []const u8 = null,
+};
+
 pub const IPRangeQuery = struct {
     cidr: []const u8,
     field: ?[]const u8 = null,
@@ -3931,7 +3947,7 @@ pub const IndexConfig = struct {
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
     sparse: ?bool = null,
-    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    /// Provider embedding dimension for managed dense indexes, or stored vector dimension for ordinary/external dense indexes. When hdc is configured, the stored vector dimension is hdc.dimensions. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
@@ -3944,6 +3960,8 @@ pub const IndexConfig = struct {
     distance_metric: ?DistanceMetric = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
     embedder: ?EmbedderConfig = null,
+    /// Deterministically projects semantic embeddings into a hypervector and binds selected document fields into the same stored dense vector. HDC indexes are managed dense cosine indexes and currently cannot be combined with external vectors, sparse mode, templates, chunking, or artifact-backed embedding enrichments.
+    hdc: ?HdcIndexConfig = null,
     /// Configuration for the summarizer plugin (dense managed indexes only)
     summarizer: ?GeneratorConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
@@ -4023,6 +4041,10 @@ pub const IndexConfig = struct {
         }
         if (self.embedder) |value| {
             try jw.objectField("embedder");
+            try jw.write(value);
+        }
+        if (self.hdc) |value| {
+            try jw.objectField("hdc");
             try jw.write(value);
         }
         if (self.summarizer) |value| {

@@ -76,6 +76,9 @@ pub const graph_pattern = @import("graph/pattern.zig");
 // Sparse embeddings
 pub const sparse = @import("sparse/sparse.zig");
 
+// Hyperdimensional enrichment primitives
+pub const hdc = @import("hdc.zig");
+
 // Inference clients (Antfly, OpenAI/Ollama)
 pub const inference = @import("inference/mod.zig");
 pub const table_schema = @import("schema/mod.zig");
@@ -237,6 +240,9 @@ test {
 
     // Sparse
     _ = sparse;
+
+    // Hyperdimensional enrichment
+    _ = hdc;
 
     // Inference
     _ = inference;
