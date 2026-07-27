@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 const planner = @import("planner.zig");
 const kv_pool = @import("../kv/pool.zig");
 const gpt_mod = @import("../../models/gpt.zig");
@@ -166,6 +167,15 @@ pub const RunBudget = struct {
         try self.tryReserve(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
         errdefer self.release(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
         try self.tryReserve(.{ .kind = .scratch, .tier = estimate.scratch_tier, .bytes = estimate.scratch_bytes });
+    }
+
+    /// Roll back a previously successful reserveEstimate call. Batch admission
+    /// uses this when the process-wide controller rejects an otherwise valid
+    /// per-run reservation, so one rejected request cannot consume the local
+    /// budget of later requests in the same batch.
+    pub fn releaseEstimate(self: *RunBudget, estimate: Estimate) void {
+        self.release(.{ .kind = .scratch, .tier = estimate.scratch_tier, .bytes = estimate.scratch_bytes });
+        self.release(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
     }
 
     pub fn tryReserveWeight(self: *RunBudget, tier: ResidencyTier, bytes: usize) !Reservation {
@@ -525,7 +535,7 @@ pub const AdmissionController = struct {
 };
 
 fn spinLockAdmission(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform.sync.lockYielding(mutex);
 }
 
 fn addAdmissionAmounts(a: AdmissionAmounts, b: AdmissionAmounts) ?AdmissionAmounts {
@@ -551,8 +561,21 @@ fn checkAdmissionLimit(request: usize, next: usize, limit: usize) !void {
 
 fn checkLiveHostMemory(incremental_bytes: usize) !void {
     const info = currentSystemMemoryInfo() orelse return;
+    return checkLiveHostMemoryWithInfo(info, incremental_bytes);
+}
+
+/// Preserve the release default on large hosts while guaranteeing that a
+/// container or smaller machine can use at least half of its effective memory.
+/// A fixed multi-GiB floor cannot be applied after cgroup constraints: when the
+/// effective total is below that floor, every positive admission is impossible.
+fn liveHostMemoryHeadroom(total_bytes: usize) usize {
+    const preferred = clampBytes(@max(total_bytes / 4, gib(6)), gib(4), gib(24));
+    return @min(preferred, total_bytes / 2);
+}
+
+fn checkLiveHostMemoryWithInfo(info: SystemMemoryInfo, incremental_bytes: usize) !void {
     const available = info.available_bytes orelse return;
-    const headroom = clampBytes(@max(info.total_bytes / 4, gib(6)), gib(4), gib(24));
+    const headroom = liveHostMemoryHeadroom(info.total_bytes);
     const required = std.math.add(usize, incremental_bytes, headroom) catch
         return error.ResourceLimitExceeded;
     if (available < required) return error.ResourceTemporarilyUnavailable;
@@ -1066,6 +1089,27 @@ test "cgroup paths and limits constrain host memory" {
     try std.testing.expectEqual(@as(?usize, gib(32)), v1_unlimited.available_bytes);
 }
 
+test "live memory headroom scales down for constrained containers" {
+    try std.testing.expectEqual(gib(1), liveHostMemoryHeadroom(gib(2)));
+    try std.testing.expectEqual(gib(2), liveHostMemoryHeadroom(gib(4)));
+    try std.testing.expectEqual(gib(3), liveHostMemoryHeadroom(gib(6)));
+    try std.testing.expectEqual(gib(4), liveHostMemoryHeadroom(gib(8)));
+    try std.testing.expectEqual(gib(6), liveHostMemoryHeadroom(gib(12)));
+    try std.testing.expectEqual(gib(24), liveHostMemoryHeadroom(gib(128)));
+
+    try checkLiveHostMemoryWithInfo(
+        .{ .total_bytes = gib(2), .available_bytes = gib(2) },
+        mib(128),
+    );
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        checkLiveHostMemoryWithInfo(
+            .{ .total_bytes = gib(2), .available_bytes = gib(1) },
+            mib(128),
+        ),
+    );
+}
+
 test "shared admission accounts for concurrent leases and releases capacity" {
     var controller = AdmissionController{};
     const limits = Limits{
@@ -1084,6 +1128,42 @@ test "shared admission accounts for concurrent leases and releases capacity" {
     var second = try controller.tryAcquire(limits, .{ .host_kv_bytes = 50 }, false);
     defer second.release();
     try std.testing.expectEqual(@as(usize, 50), controller.snapshot().hostTotalBytes());
+}
+
+test "estimate reservations can be rolled back transactionally" {
+    var budget = RunBudget.init(.{
+        .host_limit_bytes = 100,
+        .combined_limit_bytes = 100,
+        .kv_limit_bytes = 100,
+        .scratch_limit_bytes = 100,
+    });
+    const estimate = Estimate{
+        .prompt_tokens = 1,
+        .retained_tokens = 1,
+        .kv_bytes = 60,
+        .kv_tier = .host,
+        .scratch_bytes = 30,
+        .scratch_tier = .host,
+    };
+    try budget.reserveEstimate(estimate);
+    try std.testing.expectEqual(@as(usize, 90), budget.hostTotalBytes());
+    budget.releaseEstimate(estimate);
+    try std.testing.expectEqual(@as(usize, 0), budget.hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), budget.kvTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), budget.scratchTotalBytes());
+
+    const next_estimate = Estimate{
+        .prompt_tokens = 1,
+        .retained_tokens = 1,
+        .kv_bytes = 70,
+        .kv_tier = .host,
+        .scratch_bytes = 30,
+        .scratch_tier = .host,
+    };
+    try budget.reserveEstimate(next_estimate);
+    try std.testing.expectEqual(@as(usize, 100), budget.hostTotalBytes());
+    budget.releaseEstimate(next_estimate);
+    try std.testing.expectEqual(@as(usize, 0), budget.hostTotalBytes());
 }
 
 test "single admission larger than policy is a resource limit" {
