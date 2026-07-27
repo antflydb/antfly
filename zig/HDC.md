@@ -34,6 +34,10 @@ This worktree now contains the first engine-owned Phase 1 slice:
   embeddings plus exact filters, embeddings plus transparent structured score
   fusion, semantic-only HDC, and complete HDC on both present and deliberately
   absent structured combinations;
+- a pinned WANDS product-search experiment over 42,994 products, 480 queries,
+  and 233,448 human relevance judgments, with real BGE embeddings,
+  validation-only weight selection, holdout quality, exact graph-answer
+  scoring, and equal RaBitQ candidate budgets;
 - a managed backfill-to-retrieval fixture that uses natural-language HDC search
   to select a location and then follows only the exact stored graph edge, closes
   and reopens the database, repeats the query, and verifies resumed HDC
@@ -53,7 +57,7 @@ fuzzy-seed-to-exact-graph fixture remain required.
 | Canonical document-to-association projection | implemented for selected JSON paths | replay fixtures against stored typed/schema values |
 | Managed ingest, backfill, rebuild, and quarantine | ingest/backfill and close/reopen/resumed writes tested through existing dense lifecycle; HDC seed/model drift receives a distinct artifact namespace | interrupted-backfill and config-drift rebuild fault injection |
 | Text and structured query composition | implemented | managed local-provider projection, exact-path validation, and public query forwarding tests |
-| Dense HBC/RaBitQ retrieval quality | synthetic complete-HDC smoke evaluated; controlled composition result does not yet beat the simpler baseline | representative recall, candidate-budget, rerank, and application-quality matrix |
+| Dense HBC/RaBitQ retrieval quality | pinned WANDS exact and RaBitQ evaluation finds no quality/cost win over tuned embedding score fusion | HBC-tree confirmation only if a later workload reverses the no-go result |
 | Fuzzy seed to exact graph result | managed backfill/retrieval fixture implemented | distributed graph fixture and public HTTP contract |
 | Operational status and resource counters | normal index status exposes public hypervector config, semantic config fingerprint, coverage outcomes, replay target, backfill progress/state, cardinality, and disk use | HDC encode/query/resource/fallback counters and pressure tests |
 
@@ -103,6 +107,23 @@ score fusion enough to justify their additional dimensions, scoring cost, and
 lifecycle surface, Antfly should prefer the simpler existing approach. A
 successful implementation of the primitive is not, by itself, a successful
 product experiment.
+
+### Current decision
+
+The current experiment is a **no-go for productionizing HDC as a stable public
+index**. On the pinned human-labelled WANDS workload, validation-tuned complete
+HDC and validation-tuned embedding score fusion are effectively tied on
+application quality. The embedding baseline is materially smaller and faster,
+and its semantic ANN candidates can be reranked with the structured score
+without adding a new physical index.
+
+This does not invalidate the deterministic HDC primitive or its lifecycle
+tests. It means the primitive has not earned the public API, dimensions, or
+operational cost. The `hypervector` API in this branch must remain experimental
+and must not be declared stable based on the GraphCon example, the controlled
+diagnostic, or WANDS. A later proposal must reverse this result on a workload
+whose composition cannot be reproduced by exact filtering or simple late
+fusion.
 
 ## User Experience
 
@@ -1302,6 +1323,122 @@ value over a simpler representation. The next experiment must reproduce or
 reverse that result on independently labeled, representative data using the
 same ANN candidate budgets and end-to-end graph traversal. Hard constraints
 must continue to use exact filters regardless of the result.
+
+### Pinned WANDS experiment
+
+The representative external experiment uses the MIT-licensed
+[Wayfair ANnotation Dataset](https://github.com/wayfair/WANDS) at revision
+`3b74dcf4ba29ab8ff3e6a50b5b09fc627cb882b5`. WANDS contains 42,994 products,
+480 real product-search queries, and 233,448 human `Exact`, `Partial`, or
+`Irrelevant` judgments. Wayfair designed its cross-referencing process to
+increase judgment completeness and make the corpus discriminate between
+retrieval systems.
+
+The semantic model is
+[BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) at
+revision `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`. The fixture generator rejects
+source or model files whose SHA-256 digests do not match the pinned revisions.
+It embeds:
+
+- `product_name + product_description` as the semantic document, truncated to
+  128 tokens;
+- the published query with BGE's retrieval-query instruction;
+- `product_class` and `query_class` as the only structured association;
+- the stored category hierarchy as the exact graph answer reached from a
+  selected product seed.
+
+The benchmark uses gains `Exact=2`, `Partial=1`, and `Irrelevant=0`. It ranks
+the full 42,994-product catalog and treats unjudged pairs as irrelevant. That is
+consistent with WANDS's completeness-oriented candidate mining, but remains an
+explicit evaluation assumption. Query IDs divisible by five form a 96-query
+validation split; the remaining 383 queries with at least one relevant judgment
+are an untouched holdout. Hyperparameters are selected only by validation
+NDCG@10:
+
+- complete HDC semantic-weight candidates: `4, 8, 12, 16, 24, 32`; selected
+  weight: `4`;
+- structured-fusion boost candidates:
+  `0, .01, .025, .05, .075, .1, .15, .2, .25, .35, .5, .75, 1`; selected
+  boost: `.075`.
+
+The 2026-07-26 local `arm64` ReleaseFast exact holdout result is:
+
+| Method | NDCG@10 | MRR@10 | Recall@10 | Relevant top-1 | Graph answer top-1 | Score ms/query |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| embedding | 0.7387 | 0.9139 | 0.0576 | 0.8799 | 0.9426 | 0.94 |
+| embedding + exact class filter | 0.7293 | 0.8974 | 0.0542 | 0.8695 | 0.9582 | 0.05 |
+| embedding + tuned class score | **0.7688** | 0.9256 | **0.0610** | 0.8982 | **0.9739** | **0.94** |
+| complete HDC + class, weight 4 | 0.7643 | **0.9294** | 0.0600 | **0.9060** | **0.9739** | 24.51 |
+
+HDC's small MRR and relevant-top-1 gains do not constitute a Pareto
+improvement: tuned fusion has higher NDCG and recall, graph-answer accuracy is
+identical, and HDC exact scoring is about 26 times slower. The HDC query also
+adds approximately 1.09 ms for deterministic 384-to-10,000 projection after
+the common embedding step.
+
+Storage and RaBitQ measurements over all 42,994 products are:
+
+| Representation | Authoritative bytes | RaBitQ bytes | Quantization | Approximate ms/query |
+| --- | ---: | ---: | ---: | ---: |
+| 384-dimensional embedding | 66,038,784 | 2,753,152 | 13.6 ms | 3.47 |
+| 10,000-dimensional complete HDC | 1,719,760,000 | 54,728,368 | 552.1 ms | 7.63 |
+
+At the same 50-candidate RaBitQ budget, a production-shaped baseline first
+retrieves semantic candidates and then applies the class boost during exact
+rerank:
+
+| Method | NDCG@10 | MRR@10 | Recall@10 | Relevant top-1 | Graph answer top-1 | Exact top-10 recall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| embedding candidates + structured rerank | **0.7674** | **0.9299** | 0.0597 | **0.9060** | **0.9739** | 0.8825 |
+| complete HDC candidates + exact rerank | 0.7643 | 0.9294 | **0.0600** | **0.9060** | **0.9739** | 0.9995 |
+
+HDC preserves its own exact top ten more faithfully, but that does not improve
+the labelled application result. The simpler candidate-plus-rerank path is
+slightly better on NDCG and MRR, ties top-1 and graph-answer accuracy, uses
+about one twentieth of the quantized bytes, and takes less than half the
+approximate scoring time in this direct RaBitQ scan. At 100 candidates the
+baseline reaches 0.7700 NDCG@10 and 0.9765 graph-answer top-1, so the conclusion
+does not depend on a single narrow budget.
+
+The RaBitQ measurement deliberately isolates quantization, candidate selection,
+and exact reranking over the entire corpus. It is not an HBC tree-topology
+benchmark. Because the application result is already a no-go, building a
+production HBC tree for HDC would not change the decision; HBC-tree validation
+becomes necessary only if a later representative workload first demonstrates a
+quality advantage.
+
+Reproduction:
+
+```text
+# Pull WANDS revision 3b74dcf... into /tmp/antfly-hdc-wands.
+./zig-out/bin/antfly inference pull \
+  hf:BAAI/bge-small-en-v1.5:native \
+  --tasks embed \
+  --models-dir /tmp/antfly-hdc-models
+
+UV_CACHE_DIR=/tmp/uv-cache uv run --project e2e/inference \
+  python tools/prepare_hdc_wands_fixture.py \
+  --dataset-dir /tmp/antfly-hdc-wands \
+  --model-dir /tmp/antfly-hdc-models/BAAI/bge-small-en-v1.5 \
+  --output /tmp/antfly-hdc-wands/wands-bge-small.afhw \
+  --batch-size 64 \
+  --max-tokens 128 \
+  --threads 8
+
+zig build hdc-wands-bench -- \
+  --fixture /tmp/antfly-hdc-wands/wands-bge-small.afhw \
+  --hdc-dims 10000 \
+  --semantic-weights 4 \
+  --fusion-weight 0.075 \
+  --ann-semantic-weight 4 \
+  --ann-candidates 50,100,200
+```
+
+The benchmark implementation and fixture helper are:
+
+- [WANDS quality and RaBitQ benchmark](pkg/antfly/src/bench/hdc_wands_bench.zig)
+- [pinned WANDS/BGE fixture generator](tools/prepare_hdc_wands_fixture.py)
+- [machine-readable WANDS result](bench/baselines/hdc-wands-bge-small-2026-07-26.json)
 
 ### Graduation criteria
 

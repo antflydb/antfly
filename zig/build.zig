@@ -6838,6 +6838,38 @@ pub fn build(b: *std.Build) void {
     const hdc_bench_step = b.step("hdc-bench", "Benchmark deterministic HDC encoding and projection");
     hdc_bench_step.dependOn(&run_hdc_bench.step);
 
+    const hdc_wands_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/bench/hdc_wands_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    hdc_wands_bench_mod.addImport("antfly-zig", lib_mod);
+
+    const hdc_wands_bench = b.addExecutable(.{
+        .name = "hdc_wands_bench",
+        .root_module = hdc_wands_bench_mod,
+    });
+
+    const run_hdc_wands_bench = b.addRunArtifact(hdc_wands_bench);
+    if (b.args) |args| {
+        run_hdc_wands_bench.addArgs(args);
+    }
+    const hdc_wands_bench_step = b.step(
+        "hdc-wands-bench",
+        "Compare HDC with dense baselines on a prepared WANDS fixture",
+    );
+    hdc_wands_bench_step.dependOn(&run_hdc_wands_bench.step);
+
+    const hdc_wands_bench_tests = b.addTest(.{
+        .root_module = hdc_wands_bench_mod,
+    });
+    const run_hdc_wands_bench_tests = b.addRunArtifact(hdc_wands_bench_tests);
+    const hdc_wands_bench_test_step = b.step(
+        "hdc-wands-bench-test",
+        "Test the WANDS HDC benchmark fixture and ranking helpers",
+    );
+    hdc_wands_bench_test_step.dependOn(&run_hdc_wands_bench_tests.step);
+
     const hbc_write_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/hbc_write_bench.zig"),
         .target = target,
