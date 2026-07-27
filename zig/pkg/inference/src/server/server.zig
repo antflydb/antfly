@@ -1268,6 +1268,13 @@ pub const Node = struct {
         self.config.tokenizer_cache = config;
     }
 
+    pub fn configureAdmissionResourceBudget(
+        self: *Node,
+        resource_budget: ?runtime.tier.memory.AdmissionResourceBudget,
+    ) void {
+        self.model_manager.configureAdmissionResourceBudget(resource_budget);
+    }
+
     /// Configure the std.Io tokenizer scheduler and optional consumer-local
     /// tables before model load. Table memory is admitted by the cache
     /// resource budget configured above.
@@ -5171,8 +5178,6 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, model_name, "recognizers") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
-        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-
         if (rebel_mod.isRebelModel(ctx.allocator, model_path)) {
             return self.recognizeRebel(ctx, model_path, body);
         }
@@ -5242,9 +5247,10 @@ pub const Node = struct {
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         if (dec_config.max_length > 0) config.max_length = dec_config.max_length;
 
-        var component_loader = self.model_manager.componentLoader(
+        var component_loader = self.model_manager.componentLoaderForPaths(
             model_path,
             self.session_manager.preferred_backends,
+            &.{ paths.encoder, paths.decoder },
         ) catch |err| return modelLoadFailureResponse(ctx, err);
         var encoder_managed = component_loader.load(paths.encoder) catch |err|
             return modelLoadFailureResponse(ctx, err);
@@ -5776,8 +5782,6 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, model_name, "rewriters") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
-        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-
         // Check if this is an encoder-decoder model and find ONNX file paths
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const paths = enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path) catch
@@ -5788,9 +5792,10 @@ pub const Node = struct {
         defer ctx.allocator.free(paths.encoder);
         defer ctx.allocator.free(paths.decoder);
 
-        var component_loader = self.model_manager.componentLoader(
+        var component_loader = self.model_manager.componentLoaderForPaths(
             model_path,
             self.session_manager.preferred_backends,
+            &.{ paths.encoder, paths.decoder },
         ) catch |err| return modelLoadFailureResponse(ctx, err);
         var encoder_managed = component_loader.load(paths.encoder) catch |err|
             return modelLoadFailureResponse(ctx, err);
@@ -5901,8 +5906,6 @@ pub const Node = struct {
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         const model_path = self.resolveModelPath(ctx.io, model_name, "readers") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
-
-        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
 
         var reader = readers_mod.LoadedReader.loadFromDir(
             ctx.allocator,
@@ -6066,8 +6069,6 @@ pub const Node = struct {
         const model_path = self.resolveModelPath(ctx.io, transcribe_model_name, "transcribers") catch
             return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
 
-        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-
         // Find encoder/decoder sessions
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const tokenizer_mod = @import("inference_tokenizer");
@@ -6086,9 +6087,10 @@ pub const Node = struct {
             defer ctx.allocator.free(paths.encoder);
             defer ctx.allocator.free(paths.decoder);
 
-            var component_loader = self.model_manager.componentLoader(
+            var component_loader = self.model_manager.componentLoaderForPaths(
                 model_path,
                 self.session_manager.preferred_backends,
+                &.{ paths.encoder, paths.decoder },
             ) catch |err| return modelLoadFailureResponse(ctx, err);
             encoder_managed = component_loader.load(paths.encoder) catch |err|
                 return modelLoadFailureResponse(ctx, err);
@@ -7918,13 +7920,25 @@ test "component session pool adapter retains explicit resource-managed backend p
     loader.allowed_backends[0] = .native;
     loader.allowed_backends[1] = .metal;
     loader.allowed_backend_count = 2;
+    std.crypto.hash.sha2.Sha256.hash(
+        "/models/component.onnx",
+        &loader.component_path_digests[0],
+        .{},
+    );
+    loader.component_path_count = 1;
     const strict = try loader.restrictToBackend(.metal);
     try std.testing.expectEqualSlices(
         backends_mod.BackendType,
         &.{.metal},
         strict.preferredBackends(),
     );
-    _ = loader.sessionPoolLoader();
+    var pool_loader = try loader.sessionPoolLoader();
+    defer pool_loader.deinit();
+    loader = undefined;
+    try std.testing.expectError(
+        error.UnvalidatedModelComponent,
+        pool_loader.load("/models/substituted.onnx"),
+    );
 }
 
 test "registerAiRoutesOn excludes Traditional ML predictor routes" {

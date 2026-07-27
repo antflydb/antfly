@@ -19,7 +19,6 @@
 
 const std = @import("std");
 const Session = @import("session.zig").Session;
-const SessionManager = @import("backends.zig").SessionManager;
 
 pub const SessionPool = struct {
     pub const OwnedSession = struct {
@@ -40,35 +39,38 @@ pub const SessionPool = struct {
     pub const Loader = struct {
         context: *anyopaque,
         load_fn: *const fn (*anyopaque, []const u8) anyerror!OwnedSession,
+        deinit_fn: *const fn (*anyopaque) void,
 
         pub fn load(self: Loader, model_path: []const u8) !OwnedSession {
             return self.load_fn(self.context, model_path);
+        }
+
+        pub fn deinit(self: *Loader) void {
+            self.deinit_fn(self.context);
+            self.* = undefined;
         }
     };
 
     sessions: []?OwnedSession,
     in_use: []bool,
-    model_path: []const u8,
+    model_path: []u8,
     loader: Loader,
     allocator: std.mem.Allocator,
     size: usize,
 
-    pub fn init(allocator: std.mem.Allocator, session_manager: *SessionManager, model_path: []const u8, size: usize) !SessionPool {
-        return initWithLoader(allocator, .{
-            .context = session_manager,
-            .load_fn = loadWithSessionManager,
-        }, model_path, size);
-    }
-
-    /// Construct a pool with a resource-aware loader. Serving callers should
-    /// use this form so each lazily-created session can carry an admission
-    /// lease (or another resource-manager handle) in its close callback.
+    /// Construct a pool by taking ownership of a resource-aware loader. The
+    /// loader context remains alive until pool deinit, so lazy acquisition
+    /// cannot retain caller stack state.
     pub fn initWithLoader(
         allocator: std.mem.Allocator,
         loader: Loader,
         model_path: []const u8,
         size: usize,
     ) !SessionPool {
+        var owned_loader = loader;
+        errdefer owned_loader.deinit();
+        const owned_model_path = try allocator.dupe(u8, model_path);
+        errdefer allocator.free(owned_model_path);
         const sessions = try allocator.alloc(?OwnedSession, size);
         errdefer allocator.free(sessions);
         @memset(sessions, null);
@@ -78,8 +80,8 @@ pub const SessionPool = struct {
         return .{
             .sessions = sessions,
             .in_use = in_use,
-            .model_path = model_path,
-            .loader = loader,
+            .model_path = owned_model_path,
+            .loader = owned_loader,
             .allocator = allocator,
             .size = size,
         };
@@ -94,6 +96,8 @@ pub const SessionPool = struct {
         }
         self.allocator.free(self.sessions);
         self.allocator.free(self.in_use);
+        self.allocator.free(self.model_path);
+        self.loader.deinit();
     }
 
     /// Acquire a session from the pool. Creates lazily if needed.
@@ -142,11 +146,6 @@ pub const SessionPool = struct {
         }
         return count;
     }
-
-    fn loadWithSessionManager(context: *anyopaque, model_path: []const u8) !OwnedSession {
-        const session_manager: *SessionManager = @ptrCast(@alignCast(context));
-        return .{ .session = try session_manager.loadModel(model_path) };
-    }
 };
 
 test "pool acquire release" {
@@ -154,10 +153,23 @@ test "pool acquire release" {
     const allocator = std.testing.allocator;
 
     // We can't create real sessions without a model, so just test init/deinit
-    var sm = @import("backends.zig").SessionManager.init(allocator);
-    var pool = try SessionPool.init(allocator, &sm, "/nonexistent", 2);
+    const TestLoader = struct {
+        fn load(_: *anyopaque, _: []const u8) !SessionPool.OwnedSession {
+            return error.FileNotFound;
+        }
+        fn deinit(_: *anyopaque) void {}
+    };
+    var context: u8 = 0;
+    const input_path = try allocator.dupe(u8, "/nonexistent");
+    var pool = try SessionPool.initWithLoader(allocator, .{
+        .context = &context,
+        .load_fn = TestLoader.load,
+        .deinit_fn = TestLoader.deinit,
+    }, input_path, 2);
     defer pool.deinit();
+    allocator.free(input_path);
 
+    try std.testing.expectEqualStrings("/nonexistent", pool.model_path);
     try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
     try std.testing.expectEqual(@as(usize, 0), pool.availableCount());
 }

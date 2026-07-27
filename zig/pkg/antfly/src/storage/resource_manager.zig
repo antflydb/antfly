@@ -100,6 +100,9 @@ pub const Slice = enum(u8) {
     lite_docstore_snapshot_cache,
     inference_prompt_cache,
     inference_tokenizer_cache,
+    inference_model_residency,
+    inference_kv_working_set,
+    inference_scratch_working_set,
     dense_repair_working_set,
     shard_transition_working_set,
 
@@ -130,6 +133,9 @@ pub const Slice = enum(u8) {
             .lite_docstore_snapshot_cache => "lite.docstore_snapshot_cache",
             .inference_prompt_cache => "inference.prompt_cache",
             .inference_tokenizer_cache => "inference.tokenizer_cache",
+            .inference_model_residency => "inference.model_residency",
+            .inference_kv_working_set => "inference.kv_working_set",
+            .inference_scratch_working_set => "inference.scratch_working_set",
             .dense_repair_working_set => "dense_repair.working_set",
             .shard_transition_working_set => "shard_transition.working_set",
         };
@@ -141,6 +147,11 @@ pub const slice_count: usize = @typeInfo(Slice).@"enum".fields.len;
 pub const Budget = struct {
     soft_limit_bytes: u64 = 0,
     hard_limit_bytes: u64 = 0,
+};
+
+pub const SliceAmount = struct {
+    slice: Slice,
+    bytes: u64,
 };
 
 /// Internal HBC cache safety ceilings. These are not index configuration:
@@ -241,6 +252,12 @@ pub const Options = struct {
             .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
             .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
+            // ModelManager owns hardware-aware host/backend limits. These
+            // owner-bridge slices are unlimited by default, while deployments
+            // may set coordinated node budgets through ResourceManager options.
+            .{},
+            .{},
+            .{},
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
         };
@@ -273,6 +290,9 @@ pub const Options = struct {
             .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
             .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
             .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .{ .soft_action = .report, .hard_action = .reject_work },
+            .{ .soft_action = .report, .hard_action = .reject_work },
+            .{ .soft_action = .report, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
         };
@@ -765,6 +785,57 @@ pub const ResourceManager = struct {
             .high_sequences = self.derived_backlog_high_sequences,
             .resume_sequences = self.derived_backlog_resume_sequences,
         };
+    }
+
+    /// Atomically reserve several independent slices. Callers must provide at
+    /// most one entry per slice. This is used when one operation spans multiple
+    /// resource classes and partial admission would create a race or require
+    /// externally visible rollback.
+    pub fn reserveBatch(self: *ResourceManager, amounts: []const SliceAmount) !void {
+        for (amounts, 0..) |amount, index| {
+            if (amount.bytes == 0) continue;
+            for (amounts[0..index]) |previous| {
+                if (previous.bytes > 0 and previous.slice == amount.slice)
+                    return error.DuplicateResourceSlice;
+            }
+        }
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        for (amounts) |amount| {
+            if (amount.bytes == 0) continue;
+            const state = &self.slices[sliceIndex(amount.slice)];
+            const next = std.math.add(u64, state.used_bytes, amount.bytes) catch {
+                state.hard_limit_rejections +|= 1;
+                return error.ResourceBudgetExceeded;
+            };
+            if (state.budget.hard_limit_bytes > 0 and next > state.budget.hard_limit_bytes) {
+                state.hard_limit_rejections +|= 1;
+                return error.ResourceBudgetExceeded;
+            }
+        }
+
+        for (amounts) |amount| {
+            if (amount.bytes == 0) continue;
+            const state = &self.slices[sliceIndex(amount.slice)];
+            state.used_bytes += amount.bytes;
+            state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
+            if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
+                state.soft_limit_events +|= 1;
+        }
+        self.pressure_change.advance();
+    }
+
+    pub fn releaseBatch(self: *ResourceManager, amounts: []const SliceAmount) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        for (amounts) |amount| {
+            if (amount.bytes == 0) continue;
+            const state = &self.slices[sliceIndex(amount.slice)];
+            state.used_bytes -|= amount.bytes;
+        }
+        self.pressure_change.advance();
     }
 
     pub fn reserve(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
@@ -1517,6 +1588,40 @@ test "resource manager tracks reservations and releases" {
     reservation.release();
     stats = manager.snapshot();
     try std.testing.expectEqual(@as(u64, 0), stats.slices[sliceIndex(.full_text_pending_segments)].used_bytes);
+}
+
+test "batch reservation is atomic across inference resource slices" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.inference_model_residency)] = .{ .hard_limit_bytes = 100 };
+    budgets[sliceIndex(.inference_kv_working_set)] = .{ .hard_limit_bytes = 20 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        manager.reserveBatch(&.{
+            .{ .slice = .inference_model_residency, .bytes = 80 },
+            .{ .slice = .inference_kv_working_set, .bytes = 21 },
+        }),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+
+    const admitted = [_]SliceAmount{
+        .{ .slice = .inference_model_residency, .bytes = 80 },
+        .{ .slice = .inference_kv_working_set, .bytes = 20 },
+    };
+    try manager.reserveBatch(&admitted);
+    try std.testing.expectEqual(
+        @as(u64, 80),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+    manager.releaseBatch(&admitted);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
 }
 
 test "resource manager coordinates growable capacity by physical domain" {

@@ -36,15 +36,21 @@ pub const LoadedMultiStageReader = struct {
         var metadata = try metadata_mod.loadFromDir(allocator, model_path);
         defer metadata.deinit();
         if (!metadata_mod.isMultiStage(&metadata)) return error.InvalidMetadata;
+        const component_paths = try collectComponentPaths(allocator, model_path, &metadata);
+        defer {
+            for (component_paths) |path| allocator.free(path);
+            allocator.free(component_paths);
+        }
 
         for (session_manager.preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
             var single_backend = [_]backends.BackendType{backend};
             var stage_session_manager = session_manager.*;
             stage_session_manager.preferred_backends = single_backend[0..];
-            var component_loader = model_manager.componentLoader(
+            var component_loader = model_manager.componentLoaderForPaths(
                 model_path,
                 stage_session_manager.preferred_backends,
+                component_paths,
             ) catch |err| {
                 if (err == error.IncompatibleModel or err == error.UnknownModelCompatibility) return err;
                 continue;
@@ -62,6 +68,48 @@ pub const LoadedMultiStageReader = struct {
         }
 
         return error.NoBackendAvailable;
+    }
+
+    fn collectComponentPaths(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        metadata: *const metadata_mod.MultiStageMetadata,
+    ) ![]const []const u8 {
+        var paths = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (paths.items) |path| allocator.free(path);
+            paths.deinit(allocator);
+        }
+
+        var stages = metadata.stages.valueIterator();
+        while (stages.next()) |stage| {
+            const candidates = [_]?[]const u8{
+                stage.model_file,
+                stage.encoder_file,
+                stage.decoder_file,
+            };
+            for (candidates) |maybe_relative| {
+                const relative = maybe_relative orelse continue;
+                const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{
+                    model_path,
+                    relative,
+                });
+                var duplicate = false;
+                for (paths.items) |existing| {
+                    if (std.mem.eql(u8, existing, path)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) {
+                    allocator.free(path);
+                    continue;
+                }
+                try paths.append(allocator, path);
+            }
+        }
+        if (paths.items.len == 0) return error.InvalidMetadata;
+        return try paths.toOwnedSlice(allocator);
     }
 
     fn loadFromDirWithSessionManager(

@@ -52,6 +52,8 @@ const ChatTemplate = generation.ChatTemplate;
 const session_factory = @import("../architectures/session_factory.zig");
 const graph_mod = @import("../graph/root.zig");
 const runtime = @import("../runtime/root.zig");
+const onnx_graph = @import("onnx_graph");
+const ml = @import("ml");
 
 fn shouldPreferNativeSession(man: manifest_mod.ModelManifest) bool {
     // GLiNER has a native DeBERTa + span-head path. When native weights are
@@ -323,6 +325,123 @@ fn policyAllowedBackends(
     if (bundle_assessment.level == .unknown and !policy.allow_unknown)
         return error.UnknownModelCompatibility;
     return error.IncompatibleModel;
+}
+
+fn componentCompatibilityForBackend(
+    allocator: std.mem.Allocator,
+    man: *const manifest_mod.ModelManifest,
+    backend: backends.BackendType,
+    component_paths: []const []const u8,
+) !CompatibilitySummary {
+    var component_manifest = man.*;
+    // Component ONNX sessions do not consume an optional GGUF payload. Do not
+    // let unrelated GGUF metadata classify the route selected below.
+    component_manifest.gguf_path = null;
+    var inspection = try model_compatibility.inspectAlloc(allocator, &component_manifest);
+    defer inspection.deinit(allocator);
+    const assessment = model_compatibility.assessInspection(&component_manifest, inspection);
+    if (assessment.level == .incompatible) return summaryFromAssessment(assessment);
+
+    var has_onnx_component = false;
+    var has_native_component = false;
+    for (component_paths, 0..) |path, path_index| {
+        var duplicate = false;
+        for (component_paths[0..path_index]) |previous| {
+            if (std.mem.eql(u8, previous, path)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
+        if (!std.mem.endsWith(u8, path, ".onnx")) {
+            has_native_component = true;
+            continue;
+        }
+        has_onnx_component = true;
+        var artifacts = backends.imported_onnx_session.inspectArtifactSet(
+            allocator,
+            path,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return .{
+                .level = .incompatible,
+                .code = .invalid_graph,
+                .message = "a component ONNX graph or its external tensor data is invalid or unreadable",
+            };
+        };
+        artifacts.deinit();
+
+        if (backend != .onnx or !build_options.enable_onnx) {
+            backends.imported_onnx_session.inspectGraphCompatibility(
+                allocator,
+                path,
+            ) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return .{
+                    .level = .incompatible,
+                    .code = .invalid_graph,
+                    .message = "a component ONNX graph cannot be converted and validated by the selected backend",
+                };
+            };
+        }
+    }
+
+    if (backend == .onnx and has_native_component) {
+        return .{
+            .level = .incompatible,
+            .code = .unsupported_backend,
+            .message = "the ONNX Runtime backend cannot load a directory-backed component",
+        };
+    }
+    if (!has_onnx_component and has_native_component and !manifestHasNativeAssets(man.*)) {
+        return .{
+            .level = .incompatible,
+            .code = .incomplete_bundle,
+            .message = "a directory-backed component has no native model assets",
+        };
+    }
+    return summaryFromAssessment(assessment);
+}
+
+fn policyAllowedComponentBackends(
+    allocator: std.mem.Allocator,
+    scratch: *[7]backends.BackendType,
+    man: *const manifest_mod.ModelManifest,
+    preferred_backends: []const backends.BackendType,
+    component_paths: []const []const u8,
+    policy: model_compatibility.Policy,
+) ![]const backends.BackendType {
+    if (component_paths.len == 0) return error.IncompleteModelBundle;
+
+    var count: usize = 0;
+    var first_policy_err: ?anyerror = null;
+    for (preferred_backends) |backend| {
+        if (!backend.supportsDirectSessionLoad()) continue;
+        const summary = try componentCompatibilityForBackend(
+            allocator,
+            man,
+            backend,
+            component_paths,
+        );
+        const allowed = switch (summary.level) {
+            .compatible => true,
+            .unknown => policy.allow_unknown,
+            .incompatible => false,
+        };
+        if (allowed) {
+            scratch[count] = backend;
+            count += 1;
+        } else if (first_policy_err == null) {
+            first_policy_err = if (summary.level == .unknown)
+                error.UnknownModelCompatibility
+            else
+                error.IncompatibleModel;
+        }
+    }
+    if (count > 0) return scratch[0..count];
+    if (first_policy_err) |err| return err;
+    return error.NoBackendAvailable;
 }
 
 fn shouldUseMetalWholeModelExecutor(session: backends.Session) bool {
@@ -1384,17 +1503,51 @@ pub const ModelManager = struct {
         self.admission_limit_overrides = overrides;
     }
 
+    pub fn configureAdmissionResourceBudget(
+        self: *ModelManager,
+        resource_budget: ?runtime.tier.memory.AdmissionResourceBudget,
+    ) void {
+        std.debug.assert(self.loaded.count() == 0);
+        self.admission.configureResourceBudget(resource_budget);
+    }
+
     /// A short-lived, policy-validated handle for loading every graph in a
     /// composite model bundle. Creating the loader evaluates serving policy
     /// once; every session then uses the same allowed backend order, injected
     /// graph runtime, and process-wide admission controller.
     pub const ComponentLoader = struct {
+        const max_component_paths = 32;
+        const PathDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
         manager: *ModelManager,
         allowed_backends: [7]backends.BackendType = undefined,
         allowed_backend_count: usize = 0,
+        component_path_digests: [max_component_paths]PathDigest = undefined,
+        component_path_count: usize = 0,
 
         pub fn preferredBackends(self: *const ComponentLoader) []const backends.BackendType {
             return self.allowed_backends[0..self.allowed_backend_count];
+        }
+
+        fn addComponentPath(self: *ComponentLoader, path: []const u8) !void {
+            var digest: PathDigest = undefined;
+            std.crypto.hash.sha2.Sha256.hash(path, &digest, .{});
+            for (self.component_path_digests[0..self.component_path_count]) |existing| {
+                if (std.mem.eql(u8, existing[0..], digest[0..])) return;
+            }
+            if (self.component_path_count == self.component_path_digests.len)
+                return error.TooManyModelComponents;
+            self.component_path_digests[self.component_path_count] = digest;
+            self.component_path_count += 1;
+        }
+
+        fn ensureComponentPath(self: *const ComponentLoader, path: []const u8) !void {
+            var digest: PathDigest = undefined;
+            std.crypto.hash.sha2.Sha256.hash(path, &digest, .{});
+            for (self.component_path_digests[0..self.component_path_count]) |expected| {
+                if (std.mem.eql(u8, expected[0..], digest[0..])) return;
+            }
+            return error.UnvalidatedModelComponent;
         }
 
         pub fn restrictToBackend(
@@ -1403,7 +1556,7 @@ pub const ModelManager = struct {
         ) !ComponentLoader {
             for (self.preferredBackends()) |allowed| {
                 if (allowed == backend) {
-                    var restricted = ComponentLoader{ .manager = self.manager };
+                    var restricted = self.*;
                     restricted.allowed_backends[0] = backend;
                     restricted.allowed_backend_count = 1;
                     return restricted;
@@ -1416,6 +1569,7 @@ pub const ModelManager = struct {
             self: *const ComponentLoader,
             model_path: []const u8,
         ) !ManagedSession {
+            try self.ensureComponentPath(model_path);
             return self.manager.loadManagedSessionWithAdmission(
                 model_path,
                 self.preferredBackends(),
@@ -1428,6 +1582,7 @@ pub const ModelManager = struct {
             model_path: []const u8,
             shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
         ) !ManagedSession {
+            try self.ensureComponentPath(model_path);
             return self.manager.loadManagedSessionWithAdmission(
                 model_path,
                 self.preferredBackends(),
@@ -1435,12 +1590,19 @@ pub const ModelManager = struct {
             );
         }
 
-        /// Adapter for SessionPool's lazy factory. The heap box keeps the
-        /// admission lease paired with the session until the pool closes it.
-        pub fn sessionPoolLoader(self: *ComponentLoader) backends.SessionPool.Loader {
+        /// Adapter for SessionPool's lazy factory. The pool takes ownership of
+        /// a heap copy of this immutable plan, so lazy loads cannot retain a
+        /// pointer to a caller's stack-local ComponentLoader.
+        pub fn sessionPoolLoader(self: *const ComponentLoader) !backends.SessionPool.Loader {
+            const context = try self.manager.allocator.create(PoolLoaderContext);
+            context.* = .{
+                .allocator = self.manager.allocator,
+                .loader = self.*,
+            };
             return .{
-                .context = self,
+                .context = context,
                 .load_fn = loadForSessionPool,
+                .deinit_fn = deinitSessionPoolLoader,
             };
         }
 
@@ -1448,15 +1610,15 @@ pub const ModelManager = struct {
             context: *anyopaque,
             model_path: []const u8,
         ) !backends.SessionPool.OwnedSession {
-            const self: *ComponentLoader = @ptrCast(@alignCast(context));
-            const managed = try self.load(model_path);
-            const boxed = self.manager.allocator.create(PoolManagedSession) catch |err| {
+            const pool_context: *PoolLoaderContext = @ptrCast(@alignCast(context));
+            const managed = try pool_context.loader.load(model_path);
+            const boxed = pool_context.allocator.create(PoolManagedSession) catch |err| {
                 var cleanup = managed;
                 cleanup.deinit();
                 return err;
             };
             boxed.* = .{
-                .allocator = self.manager.allocator,
+                .allocator = pool_context.allocator,
                 .managed = managed,
             };
             return .{
@@ -1464,6 +1626,12 @@ pub const ModelManager = struct {
                 .close_context = boxed,
                 .close_fn = closeSessionPoolSession,
             };
+        }
+
+        fn deinitSessionPoolLoader(context: *anyopaque) void {
+            const pool_context: *PoolLoaderContext = @ptrCast(@alignCast(context));
+            const allocator = pool_context.allocator;
+            allocator.destroy(pool_context);
         }
 
         fn closeSessionPoolSession(context: ?*anyopaque, _: backends.Session) void {
@@ -1477,23 +1645,31 @@ pub const ModelManager = struct {
             allocator: std.mem.Allocator,
             managed: ManagedSession,
         };
+
+        const PoolLoaderContext = struct {
+            allocator: std.mem.Allocator,
+            loader: ComponentLoader,
+        };
     };
 
-    pub fn componentLoader(
+    pub fn componentLoaderForPaths(
         self: *ModelManager,
         model_dir: []const u8,
         preferred_backends: []const backends.BackendType,
+        component_paths: []const []const u8,
     ) !ComponentLoader {
         var loader = ComponentLoader{ .manager = self };
+        for (component_paths) |path| try loader.addComponentPath(path);
+        if (loader.component_path_count == 0) return error.IncompleteModelBundle;
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         defer man.deinit();
         const allowed = if (self.serving_policy) |policy|
-            try policyAllowedBackends(
+            try policyAllowedComponentBackends(
                 self.allocator,
                 &loader.allowed_backends,
-                model_dir,
                 &man,
                 preferred_backends,
+                component_paths,
                 policy,
             )
         else
@@ -2604,6 +2780,78 @@ test "compatible artifact candidate wins aggregate compatibility" {
     try std.testing.expectEqual(
         model_compatibility.Level.compatible,
         selectBetterCompatibility(incompatible, compatible).level,
+    );
+}
+
+test "component compatibility validates explicit split ONNX graphs" {
+    const allocator = std.testing.allocator;
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const bias = try builder.tensorConst(
+        &.{ 0.1, 0.2, 0.3, 0.4 },
+        ml.graph.Shape.init(.f32, &.{4}),
+    );
+    const output = try builder.add(input, bias);
+    try graph.markOutput(output);
+    const model_bytes = try onnx_graph.exportGraph(allocator, &graph, .{});
+    defer allocator.free(model_bytes);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "encoder_model.onnx",
+        .data = model_bytes,
+    });
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "decoder_model.onnx",
+        .data = model_bytes,
+    });
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+    const encoder = try std.fs.path.join(allocator, &.{ root, "encoder_model.onnx" });
+    defer allocator.free(encoder);
+    const decoder = try std.fs.path.join(allocator, &.{ root, "decoder_model.onnx" });
+    defer allocator.free(decoder);
+
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .transcriber,
+        .native_arch_hint = .whisper,
+        .config_model_arch = try allocator.dupe(u8, "whisper"),
+    };
+    defer man.deinit();
+    const summary = try componentCompatibilityForBackend(
+        allocator,
+        &man,
+        .native,
+        &.{ encoder, decoder },
+    );
+    try std.testing.expectEqual(model_compatibility.Level.compatible, summary.level);
+}
+
+test "component loader rejects paths outside its validated plan" {
+    const session_manager = backends.SessionManager.init(std.testing.allocator);
+    var manager = ModelManager.init(std.testing.allocator, session_manager);
+    defer manager.deinit();
+
+    var loader = ModelManager.ComponentLoader{ .manager = &manager };
+    try loader.addComponentPath("/models/encoder_model.onnx");
+    loader.allowed_backends[0] = .native;
+    loader.allowed_backend_count = 1;
+    try std.testing.expectError(
+        error.UnvalidatedModelComponent,
+        loader.load("/models/substituted.onnx"),
+    );
+
+    const restricted = try loader.restrictToBackend(.native);
+    try std.testing.expectError(
+        error.UnvalidatedModelComponent,
+        restricted.load("/models/substituted.onnx"),
     );
 }
 

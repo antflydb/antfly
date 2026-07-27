@@ -62,7 +62,11 @@ pub const LoadedVisionReader = struct {
             defer allocator.free(paths.encoder);
             defer allocator.free(paths.decoder);
 
-            var loader = try model_manager.componentLoader(model_path, session_manager.preferred_backends);
+            var loader = try model_manager.componentLoaderForPaths(
+                model_path,
+                session_manager.preferred_backends,
+                &.{ paths.encoder, paths.decoder },
+            );
             return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), &loader);
         } else |_| {}
 

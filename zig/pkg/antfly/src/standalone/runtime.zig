@@ -1541,6 +1541,9 @@ pub fn runFromIterator(
         antfly_node.deinit();
     }
 
+    antfly_node.configureAdmissionResourceBudget(inferenceAdmissionResourceBudget(
+        &data_server.provisioned_storage.resource_manager,
+    ));
     antfly_node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(&data_server.provisioned_storage.resource_manager);
     try antfly_node.configureTokenizerCaches(.{
         // Keep the small lock-free front table hot while providing enough
@@ -1763,6 +1766,64 @@ fn promptCacheResourceUsageObserver(manager: *antfly.resource_manager.ResourceMa
         .context = manager,
         .update = observePromptCacheResourceUsage,
     };
+}
+
+fn inferenceAdmissionResourceBudget(
+    manager: *antfly.resource_manager.ResourceManager,
+) inference.runtime.tier.memory.AdmissionResourceBudget {
+    return .{
+        .context = manager,
+        .try_reserve = reserveInferenceAdmissionResources,
+        .release = releaseInferenceAdmissionResources,
+    };
+}
+
+fn inferenceAdmissionSliceAmounts(
+    amounts: inference.runtime.tier.memory.AdmissionAmounts,
+) ![3]antfly.resource_manager.SliceAmount {
+    const model_residency = try std.math.add(
+        usize,
+        amounts.host_weight_bytes,
+        amounts.backend_weight_bytes,
+    );
+    const kv_working_set = try std.math.add(
+        usize,
+        amounts.host_kv_bytes,
+        amounts.backend_kv_bytes,
+    );
+    const scratch_working_set = try std.math.add(
+        usize,
+        amounts.host_scratch_bytes,
+        amounts.backend_scratch_bytes,
+    );
+    return .{
+        .{ .slice = .inference_model_residency, .bytes = @intCast(model_residency) },
+        .{ .slice = .inference_kv_working_set, .bytes = @intCast(kv_working_set) },
+        .{ .slice = .inference_scratch_working_set, .bytes = @intCast(scratch_working_set) },
+    };
+}
+
+fn reserveInferenceAdmissionResources(
+    context: *anyopaque,
+    amounts: inference.runtime.tier.memory.AdmissionAmounts,
+) inference.runtime.tier.memory.AdmissionResourceError!void {
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    const slices = inferenceAdmissionSliceAmounts(amounts) catch
+        return error.ResourceLimitExceeded;
+    manager.reserveBatch(&slices) catch |err| switch (err) {
+        error.ResourceBudgetExceeded => return error.ResourceLimitExceeded,
+        // Duplicate slices are impossible in the fixed bridge plan.
+        error.DuplicateResourceSlice => unreachable,
+    };
+}
+
+fn releaseInferenceAdmissionResources(
+    context: *anyopaque,
+    amounts: inference.runtime.tier.memory.AdmissionAmounts,
+) void {
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    const slices = inferenceAdmissionSliceAmounts(amounts) catch unreachable;
+    manager.releaseBatch(&slices);
 }
 
 fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) void {

@@ -455,6 +455,20 @@ pub const AdmissionAmounts = struct {
     }
 };
 
+/// Optional process-owner bridge for coordinating inference admission with a
+/// broader resource manager. The inference runtime remains independent of the
+/// owner implementation; leases mirror every acquire, retain, and release.
+pub const AdmissionResourceError = error{
+    ResourceLimitExceeded,
+    ResourceTemporarilyUnavailable,
+};
+
+pub const AdmissionResourceBudget = struct {
+    context: *anyopaque,
+    try_reserve: *const fn (*anyopaque, AdmissionAmounts) AdmissionResourceError!void,
+    release: *const fn (*anyopaque, AdmissionAmounts) void,
+};
+
 pub const AdmissionLease = struct {
     controller: ?*AdmissionController,
     amounts: AdmissionAmounts,
@@ -481,6 +495,17 @@ pub const AdmissionLease = struct {
 pub const AdmissionController = struct {
     mutex: std.atomic.Mutex = .unlocked,
     admitted: AdmissionAmounts = .{},
+    resource_budget: ?AdmissionResourceBudget = null,
+
+    pub fn configureResourceBudget(
+        self: *AdmissionController,
+        resource_budget: ?AdmissionResourceBudget,
+    ) void {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        std.debug.assert(std.meta.eql(self.admitted, AdmissionAmounts{}));
+        self.resource_budget = resource_budget;
+    }
 
     pub fn tryAcquire(
         self: *AdmissionController,
@@ -520,6 +545,13 @@ pub const AdmissionController = struct {
             self.admitted = next;
         }
 
+        if (self.resource_budget) |resource_budget| {
+            resource_budget.try_reserve(resource_budget.context, amounts) catch |err| {
+                self.releaseLocal(amounts);
+                return err;
+            };
+        }
+
         if (check_live_memory) {
             // Metal allocations consume unified system memory. CUDA allocations are
             // accounted against the backend budget and must not also be charged to
@@ -544,6 +576,12 @@ pub const AdmissionController = struct {
     }
 
     fn release(self: *AdmissionController, amounts: AdmissionAmounts) void {
+        self.releaseLocal(amounts);
+        if (self.resource_budget) |resource_budget|
+            resource_budget.release(resource_budget.context, amounts);
+    }
+
+    fn releaseLocal(self: *AdmissionController, amounts: AdmissionAmounts) void {
         spinLockAdmission(&self.mutex);
         defer self.mutex.unlock();
         self.admitted.host_weight_bytes -|= amounts.host_weight_bytes;
@@ -1583,6 +1621,41 @@ test "admission lease releases transient construction bytes while retaining resi
         error.InvalidAdmissionLeaseReduction,
         lease.retain(.{ .backend_weight_bytes = 181 }),
     );
+}
+
+test "admission resource budget mirrors acquire retain and release" {
+    const Recorder = struct {
+        current: AdmissionAmounts = .{},
+
+        fn reserve(context: *anyopaque, amounts: AdmissionAmounts) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.current = try self.current.merge(amounts);
+        }
+
+        fn release(context: *anyopaque, amounts: AdmissionAmounts) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.current = subtractAdmissionAmounts(self.current, amounts) orelse unreachable;
+        }
+    };
+
+    var recorder = Recorder{};
+    var controller = AdmissionController{};
+    controller.configureResourceBudget(.{
+        .context = &recorder,
+        .try_reserve = Recorder.reserve,
+        .release = Recorder.release,
+    });
+    var lease = try controller.tryAcquire(.{}, .{
+        .host_weight_bytes = 64,
+        .host_scratch_bytes = 32,
+    }, false);
+    try std.testing.expectEqual(@as(usize, 64), recorder.current.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 32), recorder.current.host_scratch_bytes);
+
+    try lease.retain(.{ .host_weight_bytes = 64 });
+    try std.testing.expectEqual(@as(usize, 0), recorder.current.host_scratch_bytes);
+    lease.release();
+    try std.testing.expectEqual(AdmissionAmounts{}, recorder.current);
 }
 
 test "estimate reservations can be rolled back transactionally" {
