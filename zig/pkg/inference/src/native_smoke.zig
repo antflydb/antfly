@@ -610,9 +610,10 @@ fn estimateModelArtifactBytes(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
 ) !usize {
-    if (manifest.gguf_path) |path| return @intCast(try c_file.fileSize(allocator, path));
-    if (manifest.safetensors_path) |path| return @intCast(try c_file.fileSize(allocator, path));
-    return 0;
+    return std.math.cast(
+        usize,
+        try session_factory.estimateNativeWeightBytes(allocator, manifest.*),
+    ) orelse error.ResourceLimitExceeded;
 }
 
 fn estimatePreflightWeightBytes(
@@ -671,7 +672,7 @@ fn printGgufSummary(
     manifest: *const manifest_mod.ModelManifest,
     report: ?session_factory.GgufInspectionReport,
 ) !void {
-    if (manifest.gguf_path == null) return;
+    if (!manifest.usesGgufWeights()) return;
     const gguf_report = report orelse {
         print("gguf path={s} inspection=unavailable\n", .{manifest.gguf_path.?});
         return;

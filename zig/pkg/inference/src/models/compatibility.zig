@@ -84,7 +84,8 @@ pub fn inspectAlloc(
     };
     errdefer result.deinit(allocator);
 
-    const gguf_path = man.gguf_path orelse return result;
+    if (!man.usesGgufWeights()) return result;
+    const gguf_path = man.gguf_path.?;
     result.artifact_inspected = false;
     var region = c_file.MmapRegion.init(allocator, gguf_path) catch
         return result;
@@ -93,6 +94,22 @@ pub fn inspectAlloc(
     result.artifact_inspected = true;
     try applyArtifactMetadata(allocator, &result, metadata);
     return result;
+}
+
+test "compatibility inspection ignores an unselected colocated GGUF" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .config_model_arch = try allocator.dupe(u8, "bert"),
+        .safetensors_path = try allocator.dupe(u8, "model.safetensors"),
+        .gguf_path = try allocator.dupe(u8, "missing-export.gguf"),
+    };
+    defer manifest.deinit();
+
+    var inspection = try inspectAlloc(allocator, &manifest);
+    defer inspection.deinit(allocator);
+    try std.testing.expectEqualStrings("bert", inspection.architecture);
+    try std.testing.expect(inspection.artifact_inspected);
 }
 
 fn applyArtifactMetadata(

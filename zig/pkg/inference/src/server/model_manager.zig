@@ -3542,11 +3542,11 @@ test "hybrid artifact candidates are isolated by backend" {
         artifactCandidateForBackend(hybrid, .onnx).?,
     );
     try std.testing.expectEqual(
-        ArtifactCandidateKind.gguf,
+        ArtifactCandidateKind.safetensors,
         artifactCandidateForBackend(hybrid, .native).?,
     );
     try std.testing.expectEqual(
-        ArtifactCandidateKind.gguf,
+        ArtifactCandidateKind.safetensors,
         artifactCandidateForBackend(hybrid, .metal).?,
     );
 }

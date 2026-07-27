@@ -351,14 +351,16 @@ fn shouldPreferBlasBeforeGpu(allocator: std.mem.Allocator, manifest: ?manifest_m
     if (build_options.enable_wasm) return false;
     const man = manifest orelse return false;
     if (man.model_type == .generator) return false;
-    const gguf_path = man.gguf_path orelse return false;
+    if (!man.usesGgufWeights()) return false;
+    const gguf_path = man.gguf_path.?;
     const total_bytes = c_file.fileSize(allocator, gguf_path) catch return true;
     return shouldPreferBlasBeforeGpuForBytes(total_bytes, gpuEagerDenseMaxBytes());
 }
 
 fn shouldPreferNativeTextEncoder(man: manifest_mod.ModelManifest) bool {
     if (man.model_type != .embedder) return false;
-    if (man.safetensors_path == null and man.safetensors_index_path == null) return false;
+    const artifact = man.nativeWeightArtifactKind() orelse return false;
+    if (artifact != .safetensors and artifact != .sharded_safetensors) return false;
     return man.onnx_path != null and
         man.visual_model_path == null and
         man.audio_model_path == null and

@@ -139,6 +139,10 @@ const ExportSourceKind = enum {
     dense,
 };
 
+fn exportSourceKindForManifest(manifest: *const manifest_mod.ModelManifest) ExportSourceKind {
+    return if (manifest.usesGgufWeights()) .gguf else .dense;
+}
+
 const DenseDecoderExportSupport = enum {
     supported,
     unsupported_name_mapping,
@@ -1557,7 +1561,7 @@ fn buildPlannedExport(
     var access = try tensor_access_mod.openFromManifest(allocator, manifest);
     defer access.deinit();
     const source_metadata_file = if (parsed_source_gguf) |*source| &source.parsed else null;
-    const source_kind: ExportSourceKind = if (manifest.gguf_path != null and manifest.safetensors_path == null and manifest.safetensors_index_path == null) .gguf else .dense;
+    const source_kind = exportSourceKindForManifest(&manifest);
 
     if (export_arch == .bert) {
         var plan = try buildBertPlannedExport(
@@ -1773,7 +1777,7 @@ fn buildExportPlans(
     filter: QuantizationFilter,
     source_metadata_file: ?*const gguf_mod.format.File,
 ) !SplitExportPlans {
-    const source_is_gguf = manifest.safetensors_path == null and manifest.safetensors_index_path == null and manifest.gguf_path != null;
+    const source_is_gguf = exportSourceKindForManifest(&manifest) == .gguf;
     const keep_multimodal_aux_in_decoder = shouldKeepMultimodalAuxInDecoder(manifest, gpt_config);
     const names = try access.listNames(allocator);
     defer allocator.free(names);
@@ -3886,7 +3890,8 @@ fn resolveExportArchitecture(
         return .{ .gpt = config };
     } else |_| {}
 
-    if (manifest.gguf_path) |path| {
+    if (manifest.usesGgufWeights()) {
+        const path = manifest.gguf_path.?;
         parsed_source_gguf.* = try SourceGguf.init(allocator, path);
         const view = gguf_mod.metadata.View.init(&parsed_source_gguf.*.?.parsed);
         if (gpt_mod.parseGgufMetadata(view)) |config| return .{ .gpt = config };
@@ -3902,6 +3907,20 @@ fn resolveExportArchitecture(
     }
 
     return error.UnsupportedModelForGgufExport;
+}
+
+test "GGUF export source follows the runtime artifact route" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .gguf_path = try allocator.dupe(u8, "export.gguf"),
+    };
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ExportSourceKind.gguf, exportSourceKindForManifest(&manifest));
+
+    manifest.safetensors_path = try allocator.dupe(u8, "model.safetensors");
+    try std.testing.expectEqual(ExportSourceKind.dense, exportSourceKindForManifest(&manifest));
 }
 
 fn buildDebertaMetadataEntries(

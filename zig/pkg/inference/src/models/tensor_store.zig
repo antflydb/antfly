@@ -1182,15 +1182,22 @@ test "safetensors tensor store preserves f16 dtype" {
     const path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(path);
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = file.items });
+    const gguf_path = try std.fs.path.join(allocator, &.{ dir_path, "export.gguf" });
+    defer allocator.free(gguf_path);
+    // A default export is colocated with its safetensors source. Keep this
+    // deliberately invalid so the test proves the runtime never opens it.
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = gguf_path, .data = "stale export" });
 
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
         .safetensors_path = try allocator.dupe(u8, path),
+        .gguf_path = try allocator.dupe(u8, gguf_path),
     };
     defer manifest.deinit();
 
     const store = try openFromManifest(allocator, manifest);
     defer store.deinit();
+    try std.testing.expectEqual(StoreKind.safetensors, store.kind());
 
     var tensor_ref = try store.describeTensor(allocator, "weights");
     defer tensor_ref.deinit(allocator);
@@ -1272,9 +1279,6 @@ test "open gguf tensor store from manifest" {
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
         .gguf_path = try allocator.dupe(u8, path),
-        // A directory may contain exports in multiple formats. The centralized
-        // route must keep runtime loading aligned with compatibility/admission.
-        .safetensors_path = try allocator.dupe(u8, "unused-model.safetensors"),
     };
     defer manifest.deinit();
 

@@ -416,7 +416,7 @@ pub const GgufInspectionReport = struct {
 pub fn inspectGgufModel(allocator: std.mem.Allocator, model_path: []const u8) !?GgufInspectionReport {
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
     defer mf.deinit();
-    if (mf.gguf_path == null) return null;
+    if (!mf.usesGgufWeights()) return null;
 
     const arch_config = try detectArchitecture(allocator, model_path, mf);
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
@@ -431,7 +431,8 @@ pub fn inspectGgufModelForListing(
     model_path: []const u8,
     mf: manifest_mod.ModelManifest,
 ) !?GgufInspectionReport {
-    const gguf_path = mf.gguf_path orelse return null;
+    if (!mf.usesGgufWeights()) return null;
+    const gguf_path = mf.gguf_path.?;
     var mapped = try c_file.MmapRegion.init(allocator, gguf_path);
     defer mapped.deinit();
 
@@ -459,12 +460,14 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     var arch_config = try detectArchitecture(allocator, model_path, mf);
     // Determine weight prefix for the native backend (strip from source tensor names)
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
-    if (try buildGgufInspectionReport(allocator, arch_config, store)) |report| {
-        defer {
-            var r = report;
-            r.deinit();
+    if (mf.usesGgufWeights()) {
+        if (try buildGgufInspectionReport(allocator, arch_config, store)) |report| {
+            defer {
+                var r = report;
+                r.deinit();
+            }
+            try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
         }
-        try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
     }
     const source = (try store.weightSource()) orelse return error.NoDenseWeightSource;
 
@@ -721,12 +724,14 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
-    if (try buildGgufInspectionReport(allocator, arch_config, store)) |report| {
-        defer {
-            var r = report;
-            r.deinit();
+    if (mf.usesGgufWeights()) {
+        if (try buildGgufInspectionReport(allocator, arch_config, store)) |report| {
+            defer {
+                var r = report;
+                r.deinit();
+            }
+            try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
         }
-        try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
     }
     const source = (try store.weightSource()) orelse return error.NoDenseWeightSource;
 
@@ -1190,7 +1195,7 @@ fn createGpuHostedSessionWithTaskOverride(
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
-    if (mf.gguf_path) |_| {
+    if (mf.usesGgufWeights()) {
         var report_opt = try inspectGgufModel(allocator, model_path);
         defer if (report_opt) |*report| report.deinit();
         if (report_opt) |report| {
@@ -1413,7 +1418,8 @@ fn detectArchitectureWithGgufFile(
                 std.mem.eql(u8, model_type, "jina_embeddings_v5"))
             {
                 var cfg = try gpt_mod.parseConfig(allocator, config_bytes);
-                if (mf.gguf_path) |gguf_path| {
+                if (mf.usesGgufWeights()) {
+                    const gguf_path = mf.gguf_path.?;
                     if (try detectArchitectureFromOptionalGgufFile(allocator, gguf_path, parsed_gguf)) |gguf_config| {
                         switch (gguf_config) {
                             .gpt => |gguf_cfg| overlayGptStructuralConfig(&cfg, gguf_cfg),
@@ -1441,7 +1447,8 @@ fn detectArchitectureWithGgufFile(
         }
     } else |_| {}
 
-    if (mf.gguf_path) |gguf_path| {
+    if (mf.usesGgufWeights()) {
+        const gguf_path = mf.gguf_path.?;
         if (try detectArchitectureFromOptionalGgufFile(allocator, gguf_path, parsed_gguf)) |gguf_config| {
             return gguf_config;
         }
@@ -1458,6 +1465,26 @@ fn detectArchitectureFromOptionalGgufFile(
 ) !?ArchConfig {
     if (parsed_gguf) |file| return detectArchitectureFromGgufFile(file);
     return detectArchitectureFromGguf(allocator, gguf_path);
+}
+
+test "architecture detection ignores an unselected colocated GGUF" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .safetensors_path = try allocator.dupe(u8, "model.safetensors"),
+        // If architecture detection attempts to inspect this optional export,
+        // the deliberately missing path makes the regression fail immediately.
+        .gguf_path = try allocator.dupe(u8, "missing-export.gguf"),
+    };
+    defer manifest.deinit();
+
+    const detected = try detectArchitectureWithGgufFile(
+        allocator,
+        "missing-model-directory",
+        manifest,
+        null,
+    );
+    try std.testing.expect(detected == .bert);
 }
 
 fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8, mf: manifest_mod.ModelManifest, cfg: *deberta_mod.Config) !void {
@@ -3179,7 +3206,7 @@ fn shouldUseLargeGpuHostedLazyQuantBudgets(
     quant_mode: GpuHostedQuantExecutionMode,
     eager_dense: bool,
 ) bool {
-    return manifest.gguf_path != null and
+    return manifest.usesGgufWeights() and
         !eager_dense and
         quant_mode == .device_native and
         model_weight_bytes > gpuHostedEagerDenseMaxBytes();

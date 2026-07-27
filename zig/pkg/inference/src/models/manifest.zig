@@ -109,9 +109,10 @@ pub const NativeArchHint = enum {
 };
 
 /// Primary native weight source selected consistently by compatibility,
-/// admission, and runtime loading. GGUF is preferred when a model directory
-/// contains multiple export formats; the remaining ordering matches the
-/// canonical single-file and sharded safetensors names.
+/// admission, export, and runtime loading. Explicit GGUF bundles retain their
+/// declared route. Otherwise the canonical safetensors artifacts take
+/// precedence over colocated GGUF exports, so writing `export.gguf` into a
+/// model directory cannot silently change the model loaded on the next run.
 pub const NativeWeightArtifactKind = enum {
     gguf,
     safetensors,
@@ -298,10 +299,23 @@ pub const ModelManifest = struct {
     }
 
     pub fn nativeWeightArtifactKind(self: *const ModelManifest) ?NativeWeightArtifactKind {
-        if (self.gguf_path != null) return .gguf;
+        if (self.gguf_path != null and self.hasExplicitGgufBundleRoute()) return .gguf;
         if (self.safetensors_path != null) return .safetensors;
         if (self.safetensors_index_path != null) return .sharded_safetensors;
+        if (self.gguf_path != null) return .gguf;
         return null;
+    }
+
+    pub fn usesGgufWeights(self: *const ModelManifest) bool {
+        const artifact = self.nativeWeightArtifactKind() orelse return false;
+        return artifact == .gguf;
+    }
+
+    fn hasExplicitGgufBundleRoute(self: *const ModelManifest) bool {
+        return self.isSplitGlinerBundle() or
+            std.mem.eql(u8, self.inference_bundle_family, "colqwen2_gguf_bundle/v1") or
+            self.isClipclapGgufBundle() or
+            self.isFlorence2GgufBundle();
     }
 
     pub fn prefersGenerationEncodingForLateInteraction(self: *const ModelManifest) bool {
@@ -1916,21 +1930,42 @@ test "native weight artifact selection has one deterministic precedence" {
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
 
+    manifest.gguf_path = try allocator.dupe(u8, "export.gguf");
+    try std.testing.expectEqual(
+        NativeWeightArtifactKind.gguf,
+        manifest.nativeWeightArtifactKind().?,
+    );
+    try std.testing.expect(manifest.usesGgufWeights());
+
     manifest.safetensors_index_path = try allocator.dupe(u8, "model.safetensors.index.json");
     try std.testing.expectEqual(
         NativeWeightArtifactKind.sharded_safetensors,
         manifest.nativeWeightArtifactKind().?,
     );
+    try std.testing.expect(!manifest.usesGgufWeights());
+
     manifest.safetensors_path = try allocator.dupe(u8, "model.safetensors");
     try std.testing.expectEqual(
         NativeWeightArtifactKind.safetensors,
         manifest.nativeWeightArtifactKind().?,
     );
-    manifest.gguf_path = try allocator.dupe(u8, "model.gguf");
+}
+
+test "explicit GGUF bundles retain their declared artifact route" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{
+        .allocator = allocator,
+        .inference_bundle_family = try allocator.dupe(u8, "florence2_gguf_bundle/v1"),
+        .gguf_path = try allocator.dupe(u8, "model.gguf"),
+        .safetensors_path = try allocator.dupe(u8, "model.safetensors"),
+    };
+    defer manifest.deinit();
+
     try std.testing.expectEqual(
         NativeWeightArtifactKind.gguf,
         manifest.nativeWeightArtifactKind().?,
     );
+    try std.testing.expect(manifest.usesGgufWeights());
 }
 
 test "inferModelTypeFromPath detects classifier directory" {
