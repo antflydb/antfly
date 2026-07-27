@@ -574,33 +574,58 @@ fn isOpenAiListTask(task: []const u8) bool {
 }
 
 const CompatibilitySummary = model_manager_mod.CompatibilitySummary;
+const CompatibilitySignature = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+const compatibility_sidecar_hash_limit: u64 = 4 * 1024 * 1024;
 
 const CachedCompatibility = struct {
-    signature: u64,
+    signature: CompatibilitySignature,
     summary: CompatibilitySummary,
 };
 
-fn addArtifactStatToSignature(
-    io: std.Io,
-    signature: *std.hash.Wyhash,
-    path: ?[]const u8,
+fn updateCompatibilitySignatureSlice(
+    signature: *std.crypto.hash.sha2.Sha256,
+    value: []const u8,
 ) void {
+    const len: u64 = @intCast(value.len);
+    signature.update(std.mem.asBytes(&len));
+    signature.update(value);
+}
+
+fn addArtifactIdentityToSignature(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    signature: *std.crypto.hash.sha2.Sha256,
+    path: ?[]const u8,
+    hash_small_contents: bool,
+) !void {
     const artifact_path = path orelse return;
-    signature.update(artifact_path);
+    updateCompatibilitySignatureSlice(signature, artifact_path);
     const stat = std.Io.Dir.cwd().statFile(io, artifact_path, .{}) catch {
         signature.update("missing");
         return;
     };
+    signature.update(std.mem.asBytes(&stat.inode));
     signature.update(std.mem.asBytes(&stat.size));
-    signature.update(std.mem.asBytes(&stat.mtime));
+    const mtime_ns = stat.mtime.toNanoseconds();
+    signature.update(std.mem.asBytes(&mtime_ns));
+    if (!hash_small_contents or stat.size > compatibility_sidecar_hash_limit) return;
+
+    const bytes = c_file.readFile(allocator, artifact_path) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        signature.update("content-unreadable");
+        return;
+    };
+    defer allocator.free(bytes);
+    updateCompatibilitySignatureSlice(signature, bytes);
 }
 
-fn addModelSidecarStatToSignature(
+fn addModelSidecarToSignature(
+    allocator: std.mem.Allocator,
     io: std.Io,
-    signature: *std.hash.Wyhash,
+    signature: *std.crypto.hash.sha2.Sha256,
     model_path: []const u8,
     sidecar_name: []const u8,
-) void {
+) !void {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const separator = if (std.mem.endsWith(u8, model_path, "/")) "" else "/";
     const path = std.fmt.bufPrint(
@@ -615,13 +640,13 @@ fn addModelSidecarStatToSignature(
         signature.update("sidecar-path-too-long");
         return;
     };
-    addArtifactStatToSignature(io, signature, path);
+    try addArtifactIdentityToSignature(allocator, io, signature, path, true);
 }
 
 fn addShardedArtifactStatsToSignature(
     allocator: std.mem.Allocator,
     io: std.Io,
-    signature: *std.hash.Wyhash,
+    signature: *std.crypto.hash.sha2.Sha256,
     index_path: ?[]const u8,
 ) !void {
     const path = index_path orelse return;
@@ -639,8 +664,87 @@ fn addShardedArtifactStatsToSignature(
         try seen.put(allocator, shard, {});
         const shard_path = try std.fs.path.join(allocator, &.{ model_dir, shard });
         defer allocator.free(shard_path);
-        addArtifactStatToSignature(io, signature, shard_path);
+        try addArtifactIdentityToSignature(
+            allocator,
+            io,
+            signature,
+            shard_path,
+            false,
+        );
     }
+}
+
+fn addCompatibilityManifestFacts(
+    signature: *std.crypto.hash.sha2.Sha256,
+    man: *const manifest_mod.ModelManifest,
+) void {
+    const model_type: u8 = @intFromEnum(man.model_type);
+    const native_arch_hint: u8 = @intFromEnum(man.native_arch_hint);
+    signature.update(&.{ model_type, native_arch_hint });
+    updateCompatibilitySignatureSlice(signature, man.config_model_arch);
+    updateCompatibilitySignatureSlice(signature, man.gliner_model_type);
+    updateCompatibilitySignatureSlice(signature, man.inference_bundle_family);
+    signature.update(&.{
+        @intFromBool(man.hasIncompleteGlinerBundle()),
+        @intFromBool(man.hasIncompleteColqwenBundle()),
+        @intFromBool(man.hasIncompleteClipclapGgufBundle()),
+        @intFromBool(man.hasIncompleteFlorence2GgufBundle()),
+        @intFromBool(man.isClipclapGgufBundle()),
+    });
+}
+
+fn computeCompatibilitySignature(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+    man: *const manifest_mod.ModelManifest,
+) !CompatibilitySignature {
+    var signature = std.crypto.hash.sha2.Sha256.init(.{});
+    addCompatibilityManifestFacts(&signature, man);
+
+    // Hash every small metadata input parsed by loadListingFromDir. Content
+    // hashing avoids stale policy decisions when deployment tools preserve
+    // size and timestamps during an in-place replacement.
+    for (manifest_mod.listing_compatibility_sidecars) |sidecar_name| {
+        try addModelSidecarToSignature(
+            allocator,
+            io,
+            &signature,
+            model_path,
+            sidecar_name,
+        );
+    }
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.model_manifest_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.gguf_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.gguf_projector_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.safetensors_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.safetensors_index_path, true);
+    addShardedArtifactStatsToSignature(
+        allocator,
+        io,
+        &signature,
+        man.safetensors_index_path,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        signature.update("invalid-sharded-index");
+    };
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.onnx_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.gliner_head_gguf_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.gliner_head_safetensors_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.visual_model_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.audio_model_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.text_projection_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.visual_projection_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.audio_projection_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.tokenizer_json_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.tokenizer_config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.preprocessor_config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.processor_config_path, true);
+
+    var digest: CompatibilitySignature = undefined;
+    signature.final(&digest);
+    return digest;
 }
 
 test "compatibility signature tracks implicit GLiNER classification sidecar" {
@@ -653,8 +757,9 @@ test "compatibility signature tracks implicit GLiNER classification sidecar" {
     );
     defer allocator.free(model_dir);
 
-    var missing = std.hash.Wyhash.init(0);
-    addModelSidecarStatToSignature(
+    var missing = std.crypto.hash.sha2.Sha256.init(.{});
+    try addModelSidecarToSignature(
+        allocator,
         std.testing.io,
         &missing,
         model_dir,
@@ -665,14 +770,69 @@ test "compatibility signature tracks implicit GLiNER classification sidecar" {
         .sub_path = "special_tokens_map.json",
         .data = "{\"additional_special_tokens\":[\"[P]\",\"[C]\",\"[E]\",\"[R]\",\"[SEP_TEXT]\"]}",
     });
-    var present = std.hash.Wyhash.init(0);
-    addModelSidecarStatToSignature(
+    var present = std.crypto.hash.sha2.Sha256.init(.{});
+    try addModelSidecarToSignature(
+        allocator,
         std.testing.io,
         &present,
         model_dir,
         "special_tokens_map.json",
     );
-    try std.testing.expect(missing.final() != present.final());
+    var missing_digest: CompatibilitySignature = undefined;
+    var present_digest: CompatibilitySignature = undefined;
+    missing.final(&missing_digest);
+    present.final(&present_digest);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        missing_digest[0..],
+        present_digest[0..],
+    ));
+}
+
+test "compatibility signature hashes same-size sidecar replacements" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const model_dir = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", tmp.sub_path[0..] },
+    );
+    defer allocator.free(model_dir);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"bert\"}",
+    });
+    var first = std.crypto.hash.sha2.Sha256.init(.{});
+    try addModelSidecarToSignature(
+        allocator,
+        std.testing.io,
+        &first,
+        model_dir,
+        "config.json",
+    );
+    var first_digest: CompatibilitySignature = undefined;
+    first.final(&first_digest);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"bart\"}",
+    });
+    var second = std.crypto.hash.sha2.Sha256.init(.{});
+    try addModelSidecarToSignature(
+        allocator,
+        std.testing.io,
+        &second,
+        model_dir,
+        "config.json",
+    );
+    var second_digest: CompatibilitySignature = undefined;
+    second.final(&second_digest);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first_digest[0..],
+        second_digest[0..],
+    ));
 }
 
 /// Apply the serving policy before model loading. `ModelManager` repeats this check as a
@@ -1065,89 +1225,81 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !CompatibilitySummary {
-        var man = try manifest_mod.loadListingFromDir(allocator, model_path);
-        defer man.deinit();
-
         var io_impl: ?std.Io.Threaded = null;
         defer if (io_impl) |*threaded| threaded.deinit();
         const io = self.session_manager.io orelse blk: {
             io_impl = std.Io.Threaded.init(allocator, .{});
             break :blk io_impl.?.io();
         };
-        var signature = std.hash.Wyhash.init(0);
-        // These small sidecars change model type, canonical bundle identity, and
-        // completeness without necessarily changing an artifact path. Include
-        // their stats explicitly so a hot compatibility cache cannot retain the
-        // prior policy decision after an in-place model update.
-        for (manifest_mod.listing_compatibility_sidecars) |sidecar_name| {
-            addModelSidecarStatToSignature(
+
+        // A deployment can replace several sidecars and artifacts without an
+        // atomic directory snapshot. Derive and validate the manifest twice so
+        // the cached assessment is published only when both parsed facts and
+        // artifact identities describe the same stable generation.
+        const max_snapshot_attempts = 3;
+        var attempt: usize = 0;
+        while (attempt < max_snapshot_attempts) : (attempt += 1) {
+            var man = try manifest_mod.loadListingFromDir(allocator, model_path);
+            defer man.deinit();
+            const artifact_signature = try computeCompatibilitySignature(
+                allocator,
                 io,
-                &signature,
                 model_path,
-                sidecar_name,
+                &man,
             );
-        }
-        addArtifactStatToSignature(io, &signature, man.model_manifest_path);
-        addArtifactStatToSignature(io, &signature, man.config_path);
-        addArtifactStatToSignature(io, &signature, man.gguf_path);
-        addArtifactStatToSignature(io, &signature, man.gguf_projector_path);
-        addArtifactStatToSignature(io, &signature, man.safetensors_path);
-        addArtifactStatToSignature(io, &signature, man.safetensors_index_path);
-        addShardedArtifactStatsToSignature(
-            allocator,
-            io,
-            &signature,
-            man.safetensors_index_path,
-        ) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            // The index's own stat is already part of the signature. Preserve a
-            // stable cache key for malformed optional indexes and let
-            // per-backend compatibility decide whether another route is usable.
-            signature.update("invalid-sharded-index");
-        };
-        addArtifactStatToSignature(io, &signature, man.onnx_path);
-        addArtifactStatToSignature(io, &signature, man.gliner_head_gguf_path);
-        addArtifactStatToSignature(io, &signature, man.gliner_head_safetensors_path);
-        addArtifactStatToSignature(io, &signature, man.visual_model_path);
-        addArtifactStatToSignature(io, &signature, man.audio_model_path);
-        addArtifactStatToSignature(io, &signature, man.text_projection_path);
-        addArtifactStatToSignature(io, &signature, man.visual_projection_path);
-        addArtifactStatToSignature(io, &signature, man.audio_projection_path);
-        addArtifactStatToSignature(io, &signature, man.tokenizer_json_path);
-        addArtifactStatToSignature(io, &signature, man.tokenizer_config_path);
-        addArtifactStatToSignature(io, &signature, man.preprocessor_config_path);
-        addArtifactStatToSignature(io, &signature, man.processor_config_path);
-        const artifact_signature = signature.final();
 
-        spinLock(&self.compatibility_cache_lock);
-        if (self.compatibility_cache.get(model_path)) |cached| {
-            if (cached.signature == artifact_signature) {
-                self.compatibility_cache_lock.unlock();
-                return cached.summary;
+            spinLock(&self.compatibility_cache_lock);
+            if (self.compatibility_cache.get(model_path)) |cached| {
+                if (std.mem.eql(
+                    u8,
+                    cached.signature[0..],
+                    artifact_signature[0..],
+                )) {
+                    self.compatibility_cache_lock.unlock();
+                    return cached.summary;
+                }
             }
-        }
-        self.compatibility_cache_lock.unlock();
+            self.compatibility_cache_lock.unlock();
 
-        const summary = try model_manager_mod.compatibilitySummaryForBackends(
-            allocator,
-            model_path,
-            &man,
-            self.session_manager.preferred_backends,
-        );
+            const summary = try model_manager_mod.compatibilitySummaryForBackends(
+                allocator,
+                model_path,
+                &man,
+                self.session_manager.preferred_backends,
+            );
 
-        spinLock(&self.compatibility_cache_lock);
-        defer self.compatibility_cache_lock.unlock();
-        if (self.compatibility_cache.getPtr(model_path)) |cached| {
-            cached.* = .{ .signature = artifact_signature, .summary = summary };
-        } else {
-            const owned_path = try self.allocator.dupe(u8, model_path);
-            errdefer self.allocator.free(owned_path);
-            try self.compatibility_cache.put(self.allocator, owned_path, .{
-                .signature = artifact_signature,
-                .summary = summary,
-            });
+            var verification_manifest = try manifest_mod.loadListingFromDir(
+                allocator,
+                model_path,
+            );
+            defer verification_manifest.deinit();
+            const verification_signature = try computeCompatibilitySignature(
+                allocator,
+                io,
+                model_path,
+                &verification_manifest,
+            );
+            if (!std.mem.eql(
+                u8,
+                artifact_signature[0..],
+                verification_signature[0..],
+            )) continue;
+
+            spinLock(&self.compatibility_cache_lock);
+            defer self.compatibility_cache_lock.unlock();
+            if (self.compatibility_cache.getPtr(model_path)) |cached| {
+                cached.* = .{ .signature = artifact_signature, .summary = summary };
+            } else {
+                const owned_path = try self.allocator.dupe(u8, model_path);
+                errdefer self.allocator.free(owned_path);
+                try self.compatibility_cache.put(self.allocator, owned_path, .{
+                    .signature = artifact_signature,
+                    .summary = summary,
+                });
+            }
+            return summary;
         }
-        return summary;
+        return error.ModelArtifactsChanging;
     }
 
     pub fn attachIo(self: *Node, io: std.Io) void {

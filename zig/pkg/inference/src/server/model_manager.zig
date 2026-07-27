@@ -917,6 +917,7 @@ pub const LoadedModel = struct {
     sp_tok: ?*sentencepiece.Processor,
     session: backends.Session,
     session_manager: *backends.SessionManager,
+    model_manager: *ModelManager,
     model_dir: []const u8,
     allocator: std.mem.Allocator,
     chat_tmpl: ?*ChatTemplate = null,
@@ -938,6 +939,11 @@ pub const LoadedModel = struct {
     text_projection: ?backends.Session = null,
     visual_projection: ?backends.Session = null,
     audio_projection: ?backends.Session = null,
+    vision_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    audio_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    text_projection_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    visual_projection_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    audio_projection_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
     resident_projection_stats: embedding_mod.AtomicResidentProjectionStats = .{},
     cleanup_head: ?*cleanup_model_mod.CleanupHead = null,
     cleanup_head_loaded: bool = false,
@@ -987,17 +993,33 @@ pub const LoadedModel = struct {
         );
     }
 
-    fn ensureOptionalSession(self: *LoadedModel, slot: *?backends.Session, path: ?[]const u8) !void {
+    fn ensureOptionalSession(
+        self: *LoadedModel,
+        slot: *?backends.Session,
+        lease_slot: *?runtime.tier.memory.AdmissionLease,
+        path: ?[]const u8,
+    ) !void {
         if (slot.* != null) return;
         const session_path = path orelse return;
         const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
-        slot.* = try self.session_manager.loadModelWithImportedOnnxContext(session_path, shared_ctx);
+        var loaded = try self.model_manager.loadOptionalSessionWithAdmission(
+            session_path,
+            self.session.backend(),
+            shared_ctx,
+        );
+        slot.* = loaded.session;
+        lease_slot.* = loaded.resource_lease;
+        loaded.resource_lease = null;
     }
 
     pub fn ensureVisionSession(self: *LoadedModel) !void {
         spinLock(&self.embedding_session_lock);
         defer self.embedding_session_lock.unlock();
-        try self.ensureOptionalSession(&self.vision_session, self.manifest.visual_model_path);
+        try self.ensureOptionalSession(
+            &self.vision_session,
+            &self.vision_resource_lease,
+            self.manifest.visual_model_path,
+        );
     }
 
     pub fn ensureEmbeddingAssets(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
@@ -1005,15 +1027,35 @@ pub const LoadedModel = struct {
         defer self.embedding_session_lock.unlock();
 
         if (include_text) {
-            try self.ensureOptionalSession(&self.text_projection, self.manifest.text_projection_path);
+            try self.ensureOptionalSession(
+                &self.text_projection,
+                &self.text_projection_resource_lease,
+                self.manifest.text_projection_path,
+            );
         }
         if (include_image) {
-            try self.ensureOptionalSession(&self.vision_session, self.manifest.visual_model_path);
-            try self.ensureOptionalSession(&self.visual_projection, self.manifest.visual_projection_path);
+            try self.ensureOptionalSession(
+                &self.vision_session,
+                &self.vision_resource_lease,
+                self.manifest.visual_model_path,
+            );
+            try self.ensureOptionalSession(
+                &self.visual_projection,
+                &self.visual_projection_resource_lease,
+                self.manifest.visual_projection_path,
+            );
         }
         if (include_audio) {
-            try self.ensureOptionalSession(&self.audio_session, self.manifest.audio_model_path);
-            try self.ensureOptionalSession(&self.audio_projection, self.manifest.audio_projection_path);
+            try self.ensureOptionalSession(
+                &self.audio_session,
+                &self.audio_resource_lease,
+                self.manifest.audio_model_path,
+            );
+            try self.ensureOptionalSession(
+                &self.audio_projection,
+                &self.audio_projection_resource_lease,
+                self.manifest.audio_projection_path,
+            );
         }
     }
 
@@ -1176,6 +1218,11 @@ pub const LoadedModel = struct {
         if (self.text_projection) |tp| tp.close();
         if (self.visual_projection) |vp| vp.close();
         if (self.audio_projection) |ap| ap.close();
+        if (self.vision_resource_lease) |*lease| lease.release();
+        if (self.audio_resource_lease) |*lease| lease.release();
+        if (self.text_projection_resource_lease) |*lease| lease.release();
+        if (self.visual_projection_resource_lease) |*lease| lease.release();
+        if (self.audio_projection_resource_lease) |*lease| lease.release();
         if (self.hf_tok) |ht| ht.deinitSelf();
         if (self.sp_tok) |sp| {
             sp.deinit();
@@ -1307,6 +1354,104 @@ pub const ModelManager = struct {
         if (overrides.kv_limit_bytes > 0) limits.kv_limit_bytes = overrides.kv_limit_bytes;
         if (overrides.scratch_limit_bytes > 0) limits.scratch_limit_bytes = overrides.scratch_limit_bytes;
         return limits;
+    }
+
+    /// Lazily loaded composite-model components participate in the same
+    /// process-wide admission accounting as the primary session. Reserve their
+    /// construction peak immediately before import, then retain only completed
+    /// residency for the component lifetime.
+    fn loadOptionalSessionWithAdmission(
+        self: *ModelManager,
+        model_path: []const u8,
+        primary_backend: backends.BackendType,
+        shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
+    ) !LoadedSessionPlan {
+        var first_err: ?anyerror = null;
+        const is_onnx = std.mem.endsWith(u8, model_path, ".onnx");
+        const artifact_bytes = if (self.admission_enabled)
+            std.math.cast(usize, try c_file.fileSize(self.allocator, model_path)) orelse
+                return error.ResourceLimitExceeded
+        else
+            0;
+
+        // At most one entry per backend enum value can survive deduplication.
+        // Deriving the capacity keeps this safe when a backend is added later.
+        var backend_scratch: [std.meta.fields(backends.BackendType).len]backends.BackendType = undefined;
+        var backend_count: usize = 0;
+        backend_scratch[backend_count] = if (shared_backend_ctx) |shared|
+            shared.backendType()
+        else
+            primary_backend;
+        backend_count += 1;
+        for (self.session_manager.preferred_backends) |backend| {
+            var duplicate = false;
+            for (backend_scratch[0..backend_count]) |existing| {
+                if (existing == backend) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                backend_scratch[backend_count] = backend;
+                backend_count += 1;
+            }
+        }
+
+        for (backend_scratch[0..backend_count]) |backend| {
+            if (!backend.supportsDirectSessionLoad()) continue;
+            if (shared_backend_ctx) |shared| {
+                if (shared.backendType() != backend) continue;
+            }
+
+            var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
+            var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
+            if (self.admission_enabled) {
+                const plan = if (is_onnx)
+                    onnxModelLoadAdmission(artifact_bytes, backend)
+                else
+                    nativeModelLoadAdmission(artifact_bytes, backend);
+                const admission_plan = plan catch |err| {
+                    if (first_err == null) first_err = err;
+                    continue;
+                };
+                resident_amounts = admission_plan.resident;
+                resource_lease = self.admission.tryAcquire(
+                    self.admissionLimitsForBackend(backend),
+                    admission_plan.peak,
+                    true,
+                ) catch |err| {
+                    if (first_err == null) first_err = err;
+                    continue;
+                };
+            }
+
+            var single_backend = [_]backends.BackendType{backend};
+            var session_manager = sessionManagerForPreferredBackends(
+                self.allocator,
+                single_backend[0..],
+                &self.session_manager,
+            );
+            if (session_manager.loadModelWithImportedOnnxContext(
+                model_path,
+                shared_backend_ctx,
+            )) |session| {
+                if (resource_lease) |*lease| {
+                    lease.retain(resident_amounts) catch |err| {
+                        session.close();
+                        lease.release();
+                        return err;
+                    };
+                }
+                return .{
+                    .session = session,
+                    .resource_lease = resource_lease,
+                };
+            } else |err| {
+                if (resource_lease) |*lease| lease.release();
+                if (first_err == null) first_err = err;
+            }
+        }
+        return first_err orelse error.NoBackendAvailable;
     }
 
     pub fn lockLoadedModels(self: *ModelManager) void {
@@ -1585,7 +1730,8 @@ pub const ModelManager = struct {
 
         // Load manifest
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
-        errdefer man.deinit();
+        var man_owned = true;
+        errdefer if (man_owned) man.deinit();
         var policy_backend_scratch: [7]backends.BackendType = undefined;
         if (self.serving_policy) |policy| {
             sm.preferred_backends = try policyAllowedBackends(
@@ -1628,6 +1774,10 @@ pub const ModelManager = struct {
             },
             .sentencepiece => {
                 const sp = try loadSentencePieceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
+                errdefer {
+                    sp.deinit();
+                    self.allocator.destroy(sp);
+                }
                 if (shouldEnableGemmaSentencePieceCompat(man, model_dir, self.allocator)) {
                     sp.setPreserveInlineSpecialsAfterLiteralBos(true);
                 }
@@ -1640,10 +1790,12 @@ pub const ModelManager = struct {
         var loaded_session = try loadSessionForPreferredBackends(self, sm.preferred_backends, model_dir, man, sm);
         errdefer if (loaded_session.resource_lease) |*lease| lease.release();
         const session = loaded_session.session;
+        var session_owned = true;
+        errdefer if (session_owned) session.close();
 
         // Load chat template if available (for generator models)
         var chat_template_failed = false;
-        const chat_tmpl: ?*ChatTemplate = if (man.chat_template) |ct_source| blk2: {
+        var chat_tmpl: ?*ChatTemplate = if (man.chat_template) |ct_source| blk2: {
             const ct = self.allocator.create(ChatTemplate) catch {
                 chat_template_failed = true;
                 break :blk2 null;
@@ -1665,9 +1817,13 @@ pub const ModelManager = struct {
             };
             break :blk2 ct;
         } else null;
+        errdefer if (chat_tmpl) |ct| {
+            ct.deinit();
+            self.allocator.destroy(ct);
+        };
 
         // Create loaded model
-        const shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = blk: {
+        var shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = blk: {
             if (session_factory.getGptConfig(session)) |cfg| {
                 if (cfg.usesMoe()) {
                     const cache = try self.allocator.create(runtime.moe.shared.SharedExpertCache);
@@ -1681,9 +1837,11 @@ pub const ModelManager = struct {
             cache.deinit();
             self.allocator.destroy(cache);
         };
-        const shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = if (session_factory.getGptConfig(session)) |_| blk: {
+        var shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = if (session_factory.getGptConfig(session)) |_| blk: {
             const state = try self.allocator.create(runtime.tier.shared.SharedPrefetchState);
+            errdefer self.allocator.destroy(state);
             state.* = runtime.tier.shared.SharedPrefetchState.init(self.allocator);
+            errdefer state.deinit();
             try session_factory.attachSharedPrefetchState(session, state);
             break :blk state;
         } else null;
@@ -1691,20 +1849,26 @@ pub const ModelManager = struct {
             state.deinit();
             self.allocator.destroy(state);
         };
-        const native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = if (session_factory.getGptConfig(session)) |_| blk: {
+        var native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = if (session_factory.getGptConfig(session)) |_| blk: {
             const coordinator = try self.allocator.create(runtime.scheduler.native_generate.NativeGenerateCoordinator);
             coordinator.* = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(self.allocator);
             break :blk coordinator;
         } else null;
         errdefer if (native_generate_coordinator) |coordinator| self.allocator.destroy(coordinator);
+        const owned_model_dir = try self.allocator.dupe(u8, model_dir);
+        var owned_model_dir_owned = true;
+        errdefer if (owned_model_dir_owned) self.allocator.free(owned_model_dir);
         const model = try self.allocator.create(LoadedModel);
+        var model_storage_owned = true;
+        errdefer if (model_storage_owned) self.allocator.destroy(model);
         model.* = .{
             .manifest = man,
             .hf_tok = hf_tok,
             .sp_tok = sp_tok,
             .session = session,
             .session_manager = &self.session_manager,
-            .model_dir = try self.allocator.dupe(u8, model_dir),
+            .model_manager = self,
+            .model_dir = owned_model_dir,
             .allocator = self.allocator,
             .chat_tmpl = chat_tmpl,
             .chat_template_failed = chat_template_failed,
@@ -1720,6 +1884,20 @@ pub const ModelManager = struct {
             .audio_projection = null,
             .resource_lease = loaded_session.resource_lease,
         };
+
+        // The fully initialized model is now the sole owner. Disarm every
+        // construction errdefer before publishLoadedModel takes responsibility
+        // for cleanup on either publication failure or duplicate convergence.
+        man_owned = false;
+        hf_tok = null;
+        sp_tok = null;
+        session_owned = false;
+        chat_tmpl = null;
+        shared_moe_cache = null;
+        shared_prefetch = null;
+        native_generate_coordinator = null;
+        owned_model_dir_owned = false;
+        model_storage_owned = false;
         loaded_session.resource_lease = null;
 
         if (build_options.enable_metal and shouldUseMetalWholeModelExecutor(session)) {
@@ -1877,6 +2055,13 @@ const LoadedSessionPlan = struct {
     resource_lease: ?runtime.tier.memory.AdmissionLease = null,
 };
 
+const ModelLoadAdmissionPlan = struct {
+    /// Maximum simultaneous bytes while parsing/importing/repacking.
+    peak: runtime.tier.memory.AdmissionAmounts,
+    /// Bytes retained by the completed backend session.
+    resident: runtime.tier.memory.AdmissionAmounts,
+};
+
 fn addArtifactBytes(total: *usize, allocator: std.mem.Allocator, maybe_path: ?[]const u8) !void {
     const path = maybe_path orelse return;
     const size = std.math.cast(usize, try c_file.fileSize(allocator, path)) orelse
@@ -1902,27 +2087,6 @@ fn estimateModelArtifactBytes(
         try addArtifactBytes(&total, man.allocator, man.onnx_path);
     }
 
-    // Composite bundles load these alongside the selected primary artifact.
-    const component_paths = [_]?[]const u8{
-        man.visual_model_path,
-        man.audio_model_path,
-        man.text_projection_path,
-        man.visual_projection_path,
-        man.audio_projection_path,
-    };
-    for (component_paths, 0..) |maybe_path, index| {
-        const path = maybe_path orelse continue;
-        if (!uses_native_weights and man.onnx_path != null and
-            std.mem.eql(u8, path, man.onnx_path.?)) continue;
-        var duplicate = false;
-        for (component_paths[0..index]) |prior| {
-            if (prior != null and std.mem.eql(u8, path, prior.?)) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) try addArtifactBytes(&total, man.allocator, path);
-    }
     if (total == 0) return error.NoModelFileFound;
     return total;
 }
@@ -1930,52 +2094,74 @@ fn estimateModelArtifactBytes(
 fn estimateModelLoadAdmission(
     man: manifest_mod.ModelManifest,
     backend: backends.BackendType,
-) !runtime.tier.memory.AdmissionAmounts {
+) !ModelLoadAdmissionPlan {
     const weights = try estimateModelArtifactBytes(man, backend);
     const uses_onnx_artifact = backend == .onnx or !manifestHasNativeAssets(man);
-    if (uses_onnx_artifact) {
-        return switch (backend) {
-            .metal, .cuda => .{
+    if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend);
+    return nativeModelLoadAdmission(weights, backend);
+}
+
+fn onnxModelLoadAdmission(
+    weights: usize,
+    backend: backends.BackendType,
+) !ModelLoadAdmissionPlan {
+    return switch (backend) {
+        .metal, .cuda => .{
+            .peak = .{
                 // The importer retains encoded host bytes while constructing device
                 // parameters and graph metadata.
                 .backend_weight_bytes = weights,
                 .host_weight_bytes = weights,
             },
-            .native, .onnx, .wasm => .{
+            .resident = .{ .backend_weight_bytes = weights },
+        },
+        .native, .onnx, .wasm => .{
+            .peak = .{
                 // The current ONNX path reads the encoded protobuf and then owns the
                 // converted parameter storage, so reserve both copies.
                 .host_weight_bytes = std.math.mul(usize, weights, 2) catch
                     return error.ResourceLimitExceeded,
             },
-            .pjrt => return error.UnsupportedBackend,
-        };
-    }
-    return nativeModelLoadAdmission(weights, backend);
+            .resident = .{ .host_weight_bytes = weights },
+        },
+        .pjrt => return error.UnsupportedBackend,
+    };
 }
 
 fn nativeModelLoadAdmission(
     weights: usize,
     backend: backends.BackendType,
-) !runtime.tier.memory.AdmissionAmounts {
+) !ModelLoadAdmissionPlan {
     return switch (backend) {
         .metal => .{
-            // Device weights plus conservative host-side import/repacking staging.
-            .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.metal, weights),
-            .host_weight_bytes = weights / 4,
+            .peak = .{
+                // Device weights plus conservative host-side import/repacking staging.
+                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.metal, weights),
+                .host_weight_bytes = weights / 4,
+            },
+            .resident = .{
+                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.metal, weights),
+            },
         },
         .cuda => .{
-            // CUDA construction currently builds a complete native session first,
-            // then uploads every resident weight before releasing the native copy.
-            // Admit that full host peak as well as device residency; charging only
-            // a repacking fraction allows large cold loads to pass and be OOM-killed.
-            .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
-            .host_weight_bytes = weights,
+            .peak = .{
+                // CUDA construction currently builds a complete native session first,
+                // then uploads every resident weight before releasing the native copy.
+                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
+                .host_weight_bytes = weights,
+            },
+            .resident = .{
+                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
+            },
         },
         .native, .onnx, .wasm => .{
-            // Native and ONNX importers may retain a source mapping while materializing
-            // or repacking weights, so account for 25% above the encoded artifact size.
-            .host_weight_bytes = std.math.add(usize, weights, weights / 4) catch
-                return error.ResourceLimitExceeded,
+            .peak = .{
+                // Native import may retain a source mapping while materializing or
+                // repacking resident weights.
+                .host_weight_bytes = std.math.add(usize, weights, weights / 4) catch
+                    return error.ResourceLimitExceeded,
+            },
+            .resident = .{ .host_weight_bytes = weights },
         },
         .pjrt => return error.UnsupportedBackend,
     };
@@ -2000,14 +2186,16 @@ fn loadSessionForPreferredBackends(
         var single_backend = [_]backends.BackendType{backend};
         var backend_session_manager = sessionManagerForPreferredBackends(manager.allocator, single_backend[0..], source_session_manager);
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
+        var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         if (manager.admission_enabled) {
-            const amounts = estimateModelLoadAdmission(man, backend) catch |err| {
+            const admission_plan = estimateModelLoadAdmission(man, backend) catch |err| {
                 if (first_err == null) first_err = err;
                 continue;
             };
+            resident_amounts = admission_plan.resident;
             resource_lease = manager.admission.tryAcquire(
                 manager.admissionLimitsForBackend(backend),
-                amounts,
+                admission_plan.peak,
                 true,
             ) catch |err| {
                 if (first_err == null) first_err = err;
@@ -2015,6 +2203,13 @@ fn loadSessionForPreferredBackends(
             };
         }
         if (backend_session_manager.loadModel(candidate_path)) |session| {
+            if (resource_lease) |*lease| {
+                lease.retain(resident_amounts) catch |err| {
+                    session.close();
+                    lease.release();
+                    return err;
+                };
+            }
             return .{ .session = session, .resource_lease = resource_lease };
         } else |err| {
             if (resource_lease) |*lease| lease.release();
@@ -2242,12 +2437,32 @@ test "compatible artifact candidate wins aggregate compatibility" {
 test "cuda model admission includes full native staging peak" {
     const weights: usize = 1024 * 1024;
     const cuda = try nativeModelLoadAdmission(weights, .cuda);
-    try std.testing.expectEqual(weights, cuda.host_weight_bytes);
-    try std.testing.expect(cuda.backend_weight_bytes >= weights);
+    try std.testing.expectEqual(weights, cuda.peak.host_weight_bytes);
+    try std.testing.expect(cuda.peak.backend_weight_bytes >= weights);
+    try std.testing.expectEqual(@as(usize, 0), cuda.resident.host_weight_bytes);
+    try std.testing.expectEqual(
+        cuda.peak.backend_weight_bytes,
+        cuda.resident.backend_weight_bytes,
+    );
 
     const metal = try nativeModelLoadAdmission(weights, .metal);
-    try std.testing.expectEqual(weights / 4, metal.host_weight_bytes);
-    try std.testing.expectEqual(weights, metal.backend_weight_bytes);
+    try std.testing.expectEqual(weights / 4, metal.peak.host_weight_bytes);
+    try std.testing.expectEqual(weights, metal.peak.backend_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), metal.resident.host_weight_bytes);
+    try std.testing.expectEqual(weights, metal.resident.backend_weight_bytes);
+}
+
+test "onnx admission separates encoded staging from completed residency" {
+    const weights: usize = 1024 * 1024;
+    const cpu = try onnxModelLoadAdmission(weights, .native);
+    try std.testing.expectEqual(weights * 2, cpu.peak.host_weight_bytes);
+    try std.testing.expectEqual(weights, cpu.resident.host_weight_bytes);
+
+    const gpu = try onnxModelLoadAdmission(weights, .cuda);
+    try std.testing.expectEqual(weights, gpu.peak.host_weight_bytes);
+    try std.testing.expectEqual(weights, gpu.peak.backend_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), gpu.resident.host_weight_bytes);
+    try std.testing.expectEqual(weights, gpu.resident.backend_weight_bytes);
 }
 
 test "isManifestPotentiallyLoadableInCurrentBuild hides incomplete colqwen bundles" {

@@ -440,6 +440,42 @@ const StreamingTextState = struct {
     saw_final_channel: bool = false,
 };
 
+const gemma4_thought_channel_prompt_suffix = "<|channel>thought\n<channel|>";
+const gemma4_final_channel_prompt_suffix = "<|channel>final\n<channel|>";
+
+/// Grammar-constrained generation must start in a public channel because the
+/// grammar applies to the first generated token. Leaving the normal private
+/// `thought` channel open would make the grammar reject the final-channel
+/// transition and the fail-closed response projection would correctly withhold
+/// the entire result.
+fn openGemma4FinalChannelForGrammar(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, prompt, &std.ascii.whitespace);
+    const trailing = prompt[trimmed.len..];
+    if (std.mem.endsWith(u8, trimmed, gemma4_final_channel_prompt_suffix)) {
+        return allocator.dupe(u8, prompt);
+    }
+    if (!std.mem.endsWith(u8, trimmed, gemma4_thought_channel_prompt_suffix)) {
+        return error.GrammarRequiresGemma4ChannelPrompt;
+    }
+
+    const prefix_len = trimmed.len - gemma4_thought_channel_prompt_suffix.len;
+    const result = try allocator.alloc(
+        u8,
+        prefix_len + gemma4_final_channel_prompt_suffix.len + trailing.len,
+    );
+    errdefer allocator.free(result);
+    @memcpy(result[0..prefix_len], trimmed[0..prefix_len]);
+    @memcpy(
+        result[prefix_len .. prefix_len + gemma4_final_channel_prompt_suffix.len],
+        gemma4_final_channel_prompt_suffix,
+    );
+    @memcpy(result[result.len - trailing.len ..], trailing);
+    return result;
+}
+
 fn finalChannelContentStart(token_ids: []const i64, marker_id: ?i32) ?usize {
     const marker = marker_id orelse return null;
     var start: ?usize = null;
@@ -2417,6 +2453,10 @@ pub const NativeGenerationPipeline = struct {
     ) !GenerationResult {
         const allocator = self.allocator;
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        const grammar_opens_public_final_channel =
+            config.grammar != null and
+            self.gpt_config.family == .gemma and
+            self.gpt_config.hasPle();
         var fallback_decode_state = NativeDecodeState.initContiguous(allocator);
         defer fallback_decode_state.deinit();
         const decode_state = self.decode_state orelse &fallback_decode_state;
@@ -2431,14 +2471,19 @@ pub const NativeGenerationPipeline = struct {
         }
 
         // Format prompt
-        const prompt = if (self.prompt_override) |override|
+        var prompt = if (self.prompt_override) |override|
             try allocator.dupe(u8, override)
         else if (self.chat_template) |ct|
             try ct.apply(allocator, messages, true)
         else
             try formatMessages(allocator, messages);
-        const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         defer allocator.free(prompt);
+        if (grammar_opens_public_final_channel) {
+            const public_prompt = try openGemma4FinalChannelForGrammar(allocator, prompt);
+            allocator.free(prompt);
+            prompt = public_prompt;
+        }
+        const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
 
         // Tokenize
         var encoded = try encodePromptForGeneration(self.tokenizer, allocator, prompt, 2048, self.add_bos_token, self.bos_token);
@@ -2767,12 +2812,17 @@ pub const NativeGenerationPipeline = struct {
         }
         const stream_enabled = on_token_fn != null and on_token_ctx != null;
         const final_channel_required =
-            self.gpt_config.family == .gemma and self.gpt_config.hasPle();
+            self.gpt_config.family == .gemma and
+            self.gpt_config.hasPle() and
+            !grammar_opens_public_final_channel;
         // Resolve the channel protocol once for the whole request. Buffered and
         // streaming callers must use the same exact final-header projection;
         // resolving only the generic terminator at completion can expose a
         // malformed trailing private channel.
-        const final_channel_end = try self.resolveFinalChannelEndTokenId();
+        const final_channel_end = if (final_channel_required)
+            try self.resolveFinalChannelEndTokenId()
+        else
+            null;
         const turn_end = if (final_channel_end != null)
             try self.resolveTurnEndTokenId()
         else
@@ -8085,6 +8135,28 @@ test "encodePromptForGeneration does not duplicate literal bos prefix" {
     try std.testing.expectEqual(@as(i32, 2), encoded.ids[0]);
     try std.testing.expectEqual(@as(i32, 3), encoded.ids[1]);
     try std.testing.expectEqual(@as(i32, 0), encoded.attention_mask[2]);
+}
+
+test "grammar prompt opens Gemma4 public final channel" {
+    const allocator = std.testing.allocator;
+    const thought_prompt =
+        "<bos><|turn>user\nReturn JSON<turn|>\n<|turn>model\n" ++
+        gemma4_thought_channel_prompt_suffix ++ "\n";
+    const expected =
+        "<bos><|turn>user\nReturn JSON<turn|>\n<|turn>model\n" ++
+        gemma4_final_channel_prompt_suffix ++ "\n";
+    const opened = try openGemma4FinalChannelForGrammar(allocator, thought_prompt);
+    defer allocator.free(opened);
+    try std.testing.expectEqualStrings(expected, opened);
+
+    const already_open = try openGemma4FinalChannelForGrammar(allocator, expected);
+    defer allocator.free(already_open);
+    try std.testing.expectEqualStrings(expected, already_open);
+
+    try std.testing.expectError(
+        error.GrammarRequiresGemma4ChannelPrompt,
+        openGemma4FinalChannelForGrammar(allocator, "<bos>raw prompt"),
+    );
 }
 
 test "final channel projection requires exact header and stops before trailing channels" {
