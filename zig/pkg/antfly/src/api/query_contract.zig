@@ -1268,6 +1268,10 @@ fn appendAlgebraicVectorWorkerQuery(
             try appendJsonFieldUsize(alloc, out, &first, "k", dense.k);
             try appendJsonFieldName(alloc, out, &first, "vector");
             try appendF32Array(alloc, out, dense.vector);
+            if (dense.coordinate_fingerprint) |fingerprint| {
+                const hex = std.fmt.bytesToHex(fingerprint, .lower);
+                try appendJsonFieldString(alloc, out, &first, "coordinate_fingerprint", &hex);
+            }
         },
         .sparse => |sparse| {
             try appendJsonFieldString(alloc, out, &first, "kind", "sparse");
@@ -1457,9 +1461,19 @@ fn parseAlgebraicVectorWorkerQueryAlloc(
     const k = try parseOptionalU32Json(value.object.get("k"), 10);
     if (std.mem.eql(u8, kind_value.string, "dense")) {
         if (layout != .dense_vector) return error.InvalidQueryRequest;
+        const coordinate_fingerprint = if (value.object.get("coordinate_fingerprint")) |fingerprint_value| blk: {
+            if (fingerprint_value != .string or fingerprint_value.string.len != 64) {
+                return error.InvalidQueryRequest;
+            }
+            var fingerprint: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&fingerprint, fingerprint_value.string) catch
+                return error.InvalidQueryRequest;
+            break :blk fingerprint;
+        } else null;
         return .{ .dense = .{
             .vector = try parseF32JsonArrayAlloc(alloc, value.object.get("vector") orelse return error.InvalidQueryRequest),
             .k = k,
+            .coordinate_fingerprint = coordinate_fingerprint,
         } };
     }
     if (std.mem.eql(u8, kind_value.string, "sparse")) {
@@ -1913,6 +1927,7 @@ pub const SemanticResolver = struct {
             index_name: []const u8,
             semantic_search: []const u8,
             embedding_template: ?[]const u8,
+            hypervector_associations_json: ?[]const u8,
             limit: u32,
         ) anyerror!db_mod.types.DenseKnnQuery,
     };
@@ -1924,9 +1939,19 @@ pub const SemanticResolver = struct {
         index_name: []const u8,
         semantic_search: []const u8,
         embedding_template: ?[]const u8,
+        hypervector_associations_json: ?[]const u8,
         limit: u32,
     ) !db_mod.types.DenseKnnQuery {
-        return try self.vtable.resolve_dense_query(self.ptr, alloc, table_name, index_name, semantic_search, embedding_template, limit);
+        return try self.vtable.resolve_dense_query(
+            self.ptr,
+            alloc,
+            table_name,
+            index_name,
+            semantic_search,
+            embedding_template,
+            hypervector_associations_json,
+            limit,
+        );
     }
 };
 
@@ -2208,6 +2233,7 @@ pub fn parseQueryRequest(
     errdefer vector_queries.deinit(alloc);
     req.dense_queries = vector_queries.dense;
     req.sparse_queries = vector_queries.sparse;
+    try applyInternalHypervectorIdentities(alloc, body, req.dense_queries);
     req.graph_queries = try buildGraphQueries(alloc, request);
     if (request.expand_strategy) |expand_strategy| {
         req.expand_strategy = try parseExpandStrategy(expand_strategy);
@@ -2473,6 +2499,7 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"hierarchy\"",
         "\"_filter_query_json\"",
         "\"_exclusion_query_json\"",
+        "\"_hypervector_identities\"",
         db_mod.doc_filter_wire.field_name,
     };
     for (disallowed) |needle| {
@@ -5774,7 +5801,9 @@ fn buildSemanticVectorQueries(
     request: metadata_openapi.QueryRequest,
     limit: u32,
 ) !NamedVectorQueries {
-    if (request.semantic_search == null and request.embeddings == null) return .{};
+    if (request.semantic_search == null and request.embeddings == null and request.hypervector_queries == null) return .{};
+    if (request.hypervector_queries != null and request.semantic_search == null) return error.UnsupportedQueryRequest;
+    if (request.hypervector_queries != null and request.embeddings != null) return error.UnsupportedQueryRequest;
 
     var parsed_embeddings = try public_search_request_mod.parseEmbeddingsAlloc(alloc, request, limit);
     defer parsed_embeddings.deinit(alloc);
@@ -5786,6 +5815,19 @@ fn buildSemanticVectorQueries(
     }
 
     if (index_names.len == 0) return error.UnsupportedQueryRequest;
+    if (request.hypervector_queries) |queries| {
+        var query_iterator = queries.map.iterator();
+        while (query_iterator.next()) |entry| {
+            var found = false;
+            for (index_names) |index_name| {
+                if (std.mem.eql(u8, index_name, entry.key_ptr.*)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnsupportedQueryRequest;
+        }
+    }
 
     var dense_queries = std.ArrayListUnmanaged(db_mod.types.NamedDenseQuery).empty;
     errdefer freeNamedDenseQueries(alloc, dense_queries.items);
@@ -5817,10 +5859,24 @@ fn buildSemanticVectorQueries(
         }
         if (request.semantic_search) |semantic_search| {
             const resolver = semantic_resolver orelse return error.UnsupportedQueryRequest;
+            const hypervector_associations_json = if (request.hypervector_queries) |queries| blk: {
+                const associations = queries.map.get(index_name) orelse break :blk null;
+                if (associations != .object) return error.UnsupportedQueryRequest;
+                break :blk try std.json.Stringify.valueAlloc(alloc, associations, .{});
+            } else null;
+            defer if (hypervector_associations_json) |raw| alloc.free(raw);
             try dense_queries.append(alloc, .{
                 .name = try alloc.dupe(u8, index_name),
                 .index_name = try alloc.dupe(u8, index_name),
-                .query = try resolver.resolveDenseQuery(alloc, table_name, index_name, semantic_search, request.embedding_template, limit),
+                .query = try resolver.resolveDenseQuery(
+                    alloc,
+                    table_name,
+                    index_name,
+                    semantic_search,
+                    request.embedding_template,
+                    hypervector_associations_json,
+                    limit,
+                ),
             });
             continue;
         }
@@ -5838,7 +5894,9 @@ fn buildPreflightSemanticVectorQueries(
     request: metadata_openapi.QueryRequest,
     limit: u32,
 ) !NamedVectorQueries {
-    if (request.semantic_search == null and request.embeddings == null) return .{};
+    if (request.semantic_search == null and request.embeddings == null and request.hypervector_queries == null) return .{};
+    if (request.hypervector_queries != null and request.semantic_search == null) return error.UnsupportedQueryRequest;
+    if (request.hypervector_queries != null and request.embeddings != null) return error.UnsupportedQueryRequest;
 
     var parsed_embeddings = try public_search_request_mod.parseEmbeddingsAlloc(alloc, request, limit);
     defer parsed_embeddings.deinit(alloc);
@@ -6302,6 +6360,7 @@ fn objectHasInternalShardField(object: std.json.ObjectMap) bool {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_hypervector_identities",
         db_mod.doc_filter_wire.field_name,
         "_filter_doc_ids",
         "_filter_doc_ids_positive",
@@ -6418,6 +6477,7 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_hypervector_identities",
         db_mod.doc_filter_wire.field_name,
         "_filter_doc_ids",
         "_filter_doc_ids_positive",
@@ -6538,6 +6598,37 @@ fn parseInternalDocIdConstraintsAlloc(
             if (generation == null or generation.? != ctx.identity_read_generation) return error.InvalidQueryRequest;
         }
         req.identity_read_generation = generation;
+    }
+}
+
+fn applyInternalHypervectorIdentities(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    dense_queries: []const db_mod.types.NamedDenseQuery,
+) !void {
+    if (std.mem.indexOf(u8, body, "\"_hypervector_identities\"") == null) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const identities = parsed.value.object.get("_hypervector_identities") orelse return;
+    if (identities != .object) return error.InvalidQueryRequest;
+
+    var iterator = identities.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != .string or entry.value_ptr.string.len != 64) {
+            return error.InvalidQueryRequest;
+        }
+        var fingerprint: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&fingerprint, entry.value_ptr.string) catch return error.InvalidQueryRequest;
+        var found = false;
+        for (@constCast(dense_queries)) |*dense_query| {
+            if (!std.mem.eql(u8, dense_query.index_name, entry.key_ptr.*)) continue;
+            if (dense_query.query.coordinate_fingerprint != null) return error.InvalidQueryRequest;
+            dense_query.query.coordinate_fingerprint = fingerprint;
+            found = true;
+            break;
+        }
+        if (!found) return error.InvalidQueryRequest;
     }
 }
 

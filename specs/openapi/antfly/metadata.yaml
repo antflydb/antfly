@@ -6032,6 +6032,25 @@ components:
             for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for
             multimodal queries.
           example: "artificial intelligence and machine learning applications"
+        hypervector_queries:
+          type: object
+          description: |
+            Optional structured associations for logical hypervector indexes,
+            keyed by index name. Each inner key must exactly match a configured
+            `structural.paths` entry. Values use the same typed canonicalization
+            as indexed documents.
+
+            The natural-language channel still comes from `semantic_search`.
+            Antfly composes the projected semantic query and these structural
+            associations in the index's persisted coordinate system. Supplying
+            an entry for an ordinary embeddings index is rejected.
+          additionalProperties:
+            type: object
+            additionalProperties: true
+          example:
+            locations:
+              region: us-west
+              features: ["coastal", "transit"]
         embedding_template:
           type: string
           x-antfly-max-utf8-bytes: 65536

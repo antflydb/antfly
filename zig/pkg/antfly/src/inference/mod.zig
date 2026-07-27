@@ -90,6 +90,14 @@ test "managed embedder artifact backed embedding translation" {
     try managed_embedder.testArtifactBackedEmbeddingTranslation();
 }
 
+test "managed embedder hypervector index and structured query" {
+    try managed_embedder.testManagedHypervectorIndexAndStructuredQuery();
+}
+
+test "managed embedder hypervector validation" {
+    try managed_embedder.testManagedHypervectorValidation();
+}
+
 test "query embedding cache owns results and coalesces misses" {
     try query_embedding_cache.testOwnedValuesAndHits();
     try query_embedding_cache.testConcurrentCoalescing();

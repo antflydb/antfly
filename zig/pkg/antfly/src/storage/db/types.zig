@@ -850,6 +850,9 @@ pub const TextQuery = union(enum) {
 pub const DenseKnnQuery = struct {
     vector: []const f32,
     k: u32 = 10,
+    /// Full HDC coordinate-system identity for generated hypervector queries.
+    /// Ordinary dense queries leave this null.
+    coordinate_fingerprint: ?[32]u8 = null,
 };
 
 pub const SparseKnnQuery = struct {

@@ -4584,6 +4584,10 @@ pub fn build(b: *std.Build) void {
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
             "provisioned local query reuses resident generation without readonly open",
             "catalog backed router skips non-serving relocation placements",
+            "encode query request carries full hypervector coordinate identity",
+            "query parser forwards structured hypervector associations by index",
+            "query parser rejects orphaned hypervector associations",
+            "internal query parser carries hypervector identity and public parser rejects it",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

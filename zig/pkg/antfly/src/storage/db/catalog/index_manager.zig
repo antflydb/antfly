@@ -14373,6 +14373,27 @@ pub fn denseConfigArtifactNameAlloc(alloc: Allocator, cfg: types.IndexConfig) ![
     return try alloc.dupe(u8, dense_cfg.embedding_name orelse cfg.name);
 }
 
+pub fn denseConfigCoordinateFingerprint(
+    alloc: Allocator,
+    cfg: types.IndexConfig,
+) !?[32]u8 {
+    if (cfg.kind != .dense_vector) return error.InvalidIndexConfiguration;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cfg.config_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidIndexConfiguration;
+    const hdc_value = parsed.value.object.get("hdc") orelse return null;
+    if (hdc_value != .object) return error.InvalidIndexConfiguration;
+    const fingerprint_value = hdc_value.object.get("identity_fingerprint") orelse
+        return error.InvalidIndexConfiguration;
+    if (fingerprint_value != .string or fingerprint_value.string.len != 64) {
+        return error.InvalidIndexConfiguration;
+    }
+    var fingerprint: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&fingerprint, fingerprint_value.string) catch
+        return error.InvalidIndexConfiguration;
+    return fingerprint;
+}
+
 const TextConfig = struct {
     source_artifact_name: ?[]u8 = null,
 

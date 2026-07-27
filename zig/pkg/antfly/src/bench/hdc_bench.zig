@@ -381,7 +381,7 @@ fn parseArgs(args_in: std.process.Args) !Config {
         config.recall_k == 0 or
         config.recall_candidates < config.recall_k or
         !std.math.isFinite(config.semantic_weight) or
-        config.semantic_weight < 0)
+        config.semantic_weight <= 0)
     {
         return error.InvalidArgument;
     }

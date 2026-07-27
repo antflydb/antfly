@@ -193,6 +193,25 @@ const TemplateQueryComputeContext = struct {
     }
 };
 
+const HypervectorQueryComputeContext = struct {
+    runtime: *const managed_embedder.ManagedEmbedder,
+    index_name: []const u8,
+    text: []const u8,
+    associations_json: []const u8,
+
+    fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
+        defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
+        return try self.runtime.embedHypervectorQuery(
+            alloc,
+            self.index_name,
+            self.text,
+            self.associations_json,
+        );
+    }
+};
+
 fn embedInteractive(
     runtime: *const managed_embedder.ManagedEmbedder,
     alloc: std.mem.Allocator,
@@ -227,11 +246,15 @@ pub fn planSemanticQuery(
     index_name: []const u8,
     semantic_search: []const u8,
     embedding_template: ?[]const u8,
+    hypervector_associations_json: ?[]const u8,
     limit: u32,
 ) !db_mod.types.DenseKnnQuery {
     if (semantic_search.len > max_query_embedding_input_bytes) return error.QueryEmbeddingInputTooLarge;
     if (embedding_template) |value| {
         if (value.len > max_query_embedding_template_bytes) return error.QueryEmbeddingInputTooLarge;
+    }
+    if (embedding_template != null and hypervector_associations_json != null) {
+        return error.UnsupportedQueryRequest;
     }
     const now_ns = platform_time.monotonicNs();
     const embedding_deadline_ns = effectiveQueryEmbeddingDeadlineNs(planning.query_embedding_deadline_ns, now_ns);
@@ -253,7 +276,22 @@ pub fn planSemanticQuery(
     defer runtime.deinit();
 
     return .{
-        .vector = if (embedding_template) |value| blk: {
+        .vector = if (hypervector_associations_json) |associations_json| blk: {
+            var compute_context = HypervectorQueryComputeContext{
+                .runtime = &runtime,
+                .index_name = index_name,
+                .text = semantic_search,
+                .associations_json = associations_json,
+            };
+            const cache = planning.query_embedding_cache orelse
+                break :blk try HypervectorQueryComputeContext.run(&compute_context, alloc);
+            break :blk try cache.computeUncached(
+                alloc,
+                embedding_deadline_ns,
+                &compute_context,
+                HypervectorQueryComputeContext.run,
+            );
+        } else if (embedding_template) |value| blk: {
             var compute_context = TemplateQueryComputeContext{
                 .runtime = &runtime,
                 .index_name = index_name,
@@ -280,6 +318,7 @@ pub fn planSemanticQuery(
             break :blk try cache.getOrCompute(budget, alloc, key, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
         },
         .k = limit,
+        .coordinate_fingerprint = try runtime.coordinateFingerprint(index_name),
     };
 }
 
@@ -290,6 +329,7 @@ pub fn resolveDenseQuery(
     index_name: []const u8,
     semantic_search: []const u8,
     embedding_template: ?[]const u8,
+    hypervector_associations_json: ?[]const u8,
     limit: u32,
 ) !db_mod.types.DenseKnnQuery {
     return try planSemanticQuery(
@@ -299,6 +339,7 @@ pub fn resolveDenseQuery(
         index_name,
         semantic_search,
         embedding_template,
+        hypervector_associations_json,
         limit,
     );
 }
@@ -374,22 +415,22 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
         .query_embedding_security_scope = "alice",
     };
 
-    const first = try planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", null, 5);
+    const first = try planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", null, null, 5);
     defer alloc.free(first.vector);
-    const equivalent = try planSemanticQuery(base, alloc, "docs_b", "semantic_idx", "same query", null, 5);
+    const equivalent = try planSemanticQuery(base, alloc, "docs_b", "semantic_idx", "same query", null, null, 5);
     defer alloc.free(equivalent.vector);
     try std.testing.expectEqual(@as(usize, 1), provider.calls);
     try std.testing.expectEqualSlices(f32, first.vector, equivalent.vector);
 
     var other_principal = base;
     other_principal.query_embedding_security_scope = "bob";
-    const isolated = try planSemanticQuery(other_principal, alloc, "docs_b", "semantic_idx", "same query", null, 5);
+    const isolated = try planSemanticQuery(other_principal, alloc, "docs_b", "semantic_idx", "same query", null, null, 5);
     defer alloc.free(isolated.vector);
     try std.testing.expectEqual(@as(usize, 2), provider.calls);
 
-    const templated = try planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", "{{this}}", 5);
+    const templated = try planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", "{{this}}", null, 5);
     defer alloc.free(templated.vector);
-    const templated_again = try planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", "{{this}}", 5);
+    const templated_again = try planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", "{{this}}", null, 5);
     defer alloc.free(templated_again.vector);
     try std.testing.expectEqual(@as(usize, 4), provider.calls);
     try std.testing.expectEqual(@as(u64, 2), cache.stats(&budget).uncached_computations);
@@ -399,7 +440,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
     @memset(oversized, 'x');
     try std.testing.expectError(
         error.QueryEmbeddingInputTooLarge,
-        planSemanticQuery(base, alloc, "docs_a", "semantic_idx", oversized, null, 5),
+        planSemanticQuery(base, alloc, "docs_a", "semantic_idx", oversized, null, null, 5),
     );
     try std.testing.expectEqual(@as(usize, 4), provider.calls);
 
@@ -408,7 +449,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
     @memset(oversized_template, 'x');
     try std.testing.expectError(
         error.QueryEmbeddingInputTooLarge,
-        planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", oversized_template, 5),
+        planSemanticQuery(base, alloc, "docs_a", "semantic_idx", "same query", oversized_template, null, 5),
     );
     try std.testing.expectEqual(@as(usize, 4), provider.calls);
 
@@ -416,7 +457,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
     expired.query_embedding_deadline_ns = 1;
     try std.testing.expectError(
         error.Timeout,
-        planSemanticQuery(expired, alloc, "docs_a", "semantic_idx", "same query", null, 5),
+        planSemanticQuery(expired, alloc, "docs_a", "semantic_idx", "same query", null, null, 5),
     );
     try std.testing.expectEqual(@as(usize, 4), provider.calls);
 }
@@ -440,10 +481,20 @@ const SemanticStatusResolver = struct {
         index_name: []const u8,
         semantic_search: []const u8,
         embedding_template: ?[]const u8,
+        hypervector_associations_json: ?[]const u8,
         limit: u32,
     ) !db_mod.types.DenseKnnQuery {
         const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
-        return try planSemanticQuery(self.planning orelse return error.UnsupportedQueryRequest, alloc, table_name, index_name, semantic_search, embedding_template, limit);
+        return try planSemanticQuery(
+            self.planning orelse return error.UnsupportedQueryRequest,
+            alloc,
+            table_name,
+            index_name,
+            semantic_search,
+            embedding_template,
+            hypervector_associations_json,
+            limit,
+        );
     }
 };
 

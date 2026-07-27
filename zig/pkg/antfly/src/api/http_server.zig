@@ -359,6 +359,7 @@ pub const SemanticStatusResolver = struct {
         index_name: []const u8,
         semantic_search: []const u8,
         embedding_template: ?[]const u8,
+        hypervector_associations_json: ?[]const u8,
         limit: u32,
     ) !db_mod.types.DenseKnnQuery {
         const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
@@ -377,7 +378,7 @@ pub const SemanticStatusResolver = struct {
             .query_embedding_security_domain = self.query_embedding_security_domain,
             .query_embedding_security_scope = self.query_embedding_security_scope,
             .query_embedding_deadline_ns = self.query_embedding_deadline_ns,
-        }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
+        }, alloc, table_name, index_name, semantic_search, embedding_template, hypervector_associations_json, limit);
     }
 };
 

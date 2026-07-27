@@ -68,6 +68,7 @@ pub const UserConfig = struct {
     projection_seed: u64 = default_atomic_seed,
     semantic_weight: f32 = 8,
     structural_paths: []const []const u8 = &.{},
+    identity_fingerprint: ?[32]u8 = null,
 
     pub fn parseValue(alloc: std.mem.Allocator, value: std.json.Value) !UserConfig {
         if (value != .object) return error.InvalidHdcConfig;
@@ -91,6 +92,11 @@ pub const UserConfig = struct {
                 config.semantic_weight = try jsonF32(field);
             } else if (std.mem.eql(u8, name, "structural_paths")) {
                 paths_value = field;
+            } else if (std.mem.eql(u8, name, "identity_fingerprint")) {
+                if (field != .string or field.string.len != 64) return error.InvalidHdcConfig;
+                var fingerprint: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&fingerprint, field.string) catch return error.InvalidHdcConfig;
+                config.identity_fingerprint = fingerprint;
             } else {
                 return error.InvalidHdcConfig;
             }
@@ -99,7 +105,7 @@ pub const UserConfig = struct {
         if (config.dimensions == 0 or config.dimensions > max_dimensions) {
             return error.InvalidHypervectorDimensions;
         }
-        if (!std.math.isFinite(config.semantic_weight) or config.semantic_weight < 0) {
+        if (!std.math.isFinite(config.semantic_weight) or config.semantic_weight <= 0) {
             return error.InvalidSemanticWeight;
         }
 
@@ -146,6 +152,7 @@ pub const UserConfig = struct {
             left.atomic_seed != right.atomic_seed or
             left.projection_seed != right.projection_seed or
             @as(u32, @bitCast(left.semantic_weight)) != @as(u32, @bitCast(right.semantic_weight)) or
+            !std.meta.eql(left.identity_fingerprint, right.identity_fingerprint) or
             left.structural_paths.len != right.structural_paths.len)
         {
             return false;
@@ -184,25 +191,51 @@ pub const UserConfig = struct {
             defer alloc.free(encoded);
             try out.appendSlice(alloc, encoded);
         }
-        try out.appendSlice(alloc, "]}");
+        try out.append(alloc, ']');
+        if (self.identity_fingerprint) |fingerprint| {
+            try out.appendSlice(alloc, ",\"identity_fingerprint\":\"");
+            const hex = std.fmt.bytesToHex(fingerprint, .lower);
+            try out.appendSlice(alloc, &hex);
+            try out.append(alloc, '"');
+        }
+        try out.append(alloc, '}');
         return try out.toOwnedSlice(alloc);
     }
 
     /// Hashes the source inputs that can affect a complete node vector.
     ///
-    /// Including the normalized HDC config and source document makes ordinary
-    /// enrichment skip/rebuild logic invalidate stale structural vectors. The
-    /// selected-path-only optimization can be added after churn is measured.
-    pub fn sourceHash(self: UserConfig, raw_document: []const u8, semantic_text: []const u8) u64 {
-        var hasher = std.hash.Wyhash.init(0x4844_435f_5352_4331);
-        hashWyBytes(&hasher, raw_document);
-        hashWyBytes(&hasher, semantic_text);
-        hashWyU32(&hasher, self.dimensions);
-        hashWyU64(&hasher, self.atomic_seed);
-        hashWyU64(&hasher, self.projection_seed);
-        hashWyU32(&hasher, @bitCast(self.semantic_weight));
-        for (self.structural_paths) |path| hashWyBytes(&hasher, path);
-        return hasher.final();
+    /// Only the semantic source text, canonical selected structural values, and
+    /// complete encoder identity participate. Reordered keys and unrelated
+    /// document changes therefore do not create avoidable re-embedding work.
+    pub fn sourceHash(self: UserConfig, raw_document: []const u8, semantic_text: []const u8) !u64 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, raw_document, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidHdcDocument;
+
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hashBytes(&hasher, "antfly-hypervector-source-v2");
+        hashBytes(&hasher, semantic_text);
+        if (self.identity_fingerprint) |fingerprint| {
+            hashBytes(&hasher, &fingerprint);
+        } else {
+            hashU32(&hasher, self.dimensions);
+            hashU64(&hasher, self.atomic_seed);
+            hashU64(&hasher, self.projection_seed);
+            hashU32(&hasher, @bitCast(self.semantic_weight));
+        }
+        for (self.structural_paths) |path| {
+            hashBytes(&hasher, path);
+            if (valueAtDotPath(parsed.value, path)) |selected| {
+                hashU8(&hasher, 1);
+                const digest = try canonicalJsonDigest(self.alloc, selected);
+                hashBytes(&hasher, &digest);
+            } else {
+                hashU8(&hasher, 0);
+            }
+        }
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        return std.mem.readInt(u64, digest[0..8], .little);
     }
 };
 
@@ -272,7 +305,7 @@ pub const Identity = struct {
             {
                 return error.InvalidEmbeddingDimensions;
             }
-            if (!std.math.isFinite(semantic.semantic_weight) or semantic.semantic_weight < 0) {
+            if (!std.math.isFinite(semantic.semantic_weight) or semantic.semantic_weight <= 0) {
                 return error.InvalidSemanticWeight;
             }
 
@@ -602,10 +635,63 @@ pub fn composeJsonDocument(
     const scratch = try alloc.alloc(f32, config.dimensions);
     defer alloc.free(scratch);
 
+    var association_count: usize = 0;
     for (config.structural_paths) |path| {
         const selected = valueAtDotPath(parsed.value, path) orelse continue;
-        try addJsonValue(alloc, encoder, out, scratch, path, selected);
+        association_count += try addJsonValue(alloc, encoder, out, scratch, path, selected);
     }
+    try normalizeStructuralBundle(out, association_count);
+    for (out, semantic) |*coordinate, semantic_coordinate| {
+        if (!std.math.isFinite(semantic_coordinate)) return error.NonFiniteHypervector;
+        coordinate.* += config.semantic_weight * semantic_coordinate;
+    }
+    return out;
+}
+
+/// Composes a structured query with a projected semantic query.
+///
+/// The JSON object is an exact path-to-value map, not a document-shaped object.
+/// Every key must be one of the index's configured structural paths. This makes
+/// typos fail closed and allows dot-separated paths to be supplied directly.
+pub fn composeJsonQuery(
+    alloc: std.mem.Allocator,
+    config: UserConfig,
+    raw_associations: []const u8,
+    semantic: []const f32,
+) ![]f32 {
+    if (semantic.len != config.dimensions) return error.InvalidHypervectorDimensions;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_associations, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidHdcQuery;
+
+    const identity = Identity{
+        .dimensions = config.dimensions,
+        .atomic_seed = config.atomic_seed,
+        .structural_paths = config.structural_paths,
+    };
+    const encoder = try Encoder.init(identity);
+    const out = try alloc.alloc(f32, config.dimensions);
+    errdefer alloc.free(out);
+    @memset(out, 0);
+    const scratch = try alloc.alloc(f32, config.dimensions);
+    defer alloc.free(scratch);
+
+    var association_count: usize = 0;
+    var iterator = parsed.value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (!containsStructuralPath(config.structural_paths, entry.key_ptr.*)) {
+            return error.UnknownStructuralQueryPath;
+        }
+        association_count += try addJsonValue(
+            alloc,
+            encoder,
+            out,
+            scratch,
+            entry.key_ptr.*,
+            entry.value_ptr.*,
+        );
+    }
+    try normalizeStructuralBundle(out, association_count);
     for (out, semantic) |*coordinate, semantic_coordinate| {
         if (!std.math.isFinite(semantic_coordinate)) return error.NonFiniteHypervector;
         coordinate.* += config.semantic_weight * semantic_coordinate;
@@ -620,42 +706,49 @@ fn addJsonValue(
     scratch: []f32,
     path: []const u8,
     value: std.json.Value,
-) !void {
-    switch (value) {
-        .null => try encoder.addAssociation(accumulator, scratch, path, .{ .kind = .null, .bytes = "" }),
-        .bool => |item| try encoder.addAssociation(
-            accumulator,
-            scratch,
-            path,
-            .{ .kind = .boolean, .bytes = if (item) "true" else "false" },
-        ),
-        .integer => |item| {
+) !usize {
+    return switch (value) {
+        .null => blk: {
+            try encoder.addAssociation(accumulator, scratch, path, .{ .kind = .null, .bytes = "" });
+            break :blk 1;
+        },
+        .bool => |item| blk: {
+            try encoder.addAssociation(
+                accumulator,
+                scratch,
+                path,
+                .{ .kind = .boolean, .bytes = if (item) "true" else "false" },
+            );
+            break :blk 1;
+        },
+        .integer => |item| blk: {
             const encoded = try std.fmt.allocPrint(alloc, "{d}", .{item});
             defer alloc.free(encoded);
             try encoder.addAssociation(accumulator, scratch, path, .{ .kind = .integer, .bytes = encoded });
+            break :blk 1;
         },
-        .float => |item| {
+        .float => |item| blk: {
             if (!std.math.isFinite(item)) return error.NonFiniteStructuralValue;
             const encoded = try std.json.Stringify.valueAlloc(alloc, item, .{});
             defer alloc.free(encoded);
             try encoder.addAssociation(accumulator, scratch, path, .{ .kind = .number, .bytes = encoded });
+            break :blk 1;
         },
-        .number_string => |item| try encoder.addAssociation(
-            accumulator,
-            scratch,
-            path,
-            .{ .kind = .number, .bytes = item },
-        ),
-        .string => |item| try encoder.addAssociation(
-            accumulator,
-            scratch,
-            path,
-            .{ .kind = .string, .bytes = item },
-        ),
-        .array => |array| {
-            for (array.items) |item| try addJsonValue(alloc, encoder, accumulator, scratch, path, item);
+        .number_string => |item| blk: {
+            try encoder.addAssociation(accumulator, scratch, path, .{ .kind = .number, .bytes = item });
+            break :blk 1;
         },
-        .object => |object| {
+        .string => |item| blk: {
+            try encoder.addAssociation(accumulator, scratch, path, .{ .kind = .string, .bytes = item });
+            break :blk 1;
+        },
+        .array => |array| blk: {
+            var count: usize = 0;
+            for (array.items) |item| count += try addJsonValue(alloc, encoder, accumulator, scratch, path, item);
+            break :blk count;
+        },
+        .object => |object| blk: {
+            var count: usize = 0;
             var iterator = object.iterator();
             while (iterator.next()) |entry| {
                 const child_path = try std.fmt.allocPrint(
@@ -664,10 +757,27 @@ fn addJsonValue(
                     .{ path, entry.key_ptr.* },
                 );
                 defer alloc.free(child_path);
-                try addJsonValue(alloc, encoder, accumulator, scratch, child_path, entry.value_ptr.*);
+                count += try addJsonValue(alloc, encoder, accumulator, scratch, child_path, entry.value_ptr.*);
             }
+            break :blk count;
         },
+    };
+}
+
+fn normalizeStructuralBundle(vector: []f32, association_count: usize) !void {
+    if (association_count == 0) return;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(association_count)));
+    for (vector) |*coordinate| {
+        if (!std.math.isFinite(coordinate.*)) return error.NonFiniteHypervector;
+        coordinate.* *= scale;
     }
+}
+
+fn containsStructuralPath(paths: []const []const u8, candidate: []const u8) bool {
+    for (paths) |path| {
+        if (std.mem.eql(u8, path, candidate)) return true;
+    }
+    return false;
 }
 
 fn valueAtDotPath(root: std.json.Value, path: []const u8) ?std.json.Value {
@@ -712,6 +822,82 @@ fn jsonF32(value: std.json.Value) !f32 {
         .number_string => |text| std.fmt.parseFloat(f32, text) catch return error.InvalidHdcConfig,
         else => error.InvalidHdcConfig,
     };
+}
+
+fn canonicalJsonDigest(alloc: std.mem.Allocator, value: std.json.Value) ![32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    switch (value) {
+        .null => hashU8(&hasher, @intFromEnum(ValueKind.null)),
+        .bool => |item| {
+            hashU8(&hasher, @intFromEnum(ValueKind.boolean));
+            hashU8(&hasher, @intFromBool(item));
+        },
+        .integer => |item| {
+            hashU8(&hasher, @intFromEnum(ValueKind.integer));
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(i64, &bytes, item, .little);
+            hashBytes(&hasher, &bytes);
+        },
+        .float => |item| {
+            if (!std.math.isFinite(item)) return error.NonFiniteStructuralValue;
+            hashU8(&hasher, @intFromEnum(ValueKind.number));
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, @bitCast(item), .little);
+            hashBytes(&hasher, &bytes);
+        },
+        .number_string => |item| {
+            hashU8(&hasher, @intFromEnum(ValueKind.number));
+            hashBytes(&hasher, item);
+        },
+        .string => |item| {
+            hashU8(&hasher, @intFromEnum(ValueKind.string));
+            hashBytes(&hasher, item);
+        },
+        .array => |array| {
+            hashBytes(&hasher, "array-multiset-v1");
+            const digests = try alloc.alloc([32]u8, array.items.len);
+            defer alloc.free(digests);
+            for (array.items, digests) |item, *digest| digest.* = try canonicalJsonDigest(alloc, item);
+            std.mem.sort([32]u8, digests, {}, lessThanDigest);
+            hashU64(&hasher, digests.len);
+            for (digests) |digest| hashBytes(&hasher, &digest);
+        },
+        .object => |object| {
+            hashBytes(&hasher, "object-v1");
+            const entries = try alloc.alloc(CanonicalObjectEntry, object.count());
+            defer alloc.free(entries);
+            var iterator = object.iterator();
+            var index: usize = 0;
+            while (iterator.next()) |entry| : (index += 1) {
+                entries[index] = .{
+                    .key = entry.key_ptr.*,
+                    .digest = try canonicalJsonDigest(alloc, entry.value_ptr.*),
+                };
+            }
+            std.mem.sort(CanonicalObjectEntry, entries, {}, lessThanObjectEntry);
+            hashU64(&hasher, entries.len);
+            for (entries) |entry| {
+                hashBytes(&hasher, entry.key);
+                hashBytes(&hasher, &entry.digest);
+            }
+        },
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+const CanonicalObjectEntry = struct {
+    key: []const u8,
+    digest: [32]u8,
+};
+
+fn lessThanDigest(_: void, left: [32]u8, right: [32]u8) bool {
+    return std.mem.order(u8, &left, &right) == .lt;
+}
+
+fn lessThanObjectEntry(_: void, left: CanonicalObjectEntry, right: CanonicalObjectEntry) bool {
+    return std.mem.order(u8, left.key, right.key) == .lt;
 }
 
 fn appendUnsigned(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: anytype) !void {

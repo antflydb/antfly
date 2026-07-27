@@ -644,6 +644,7 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
     if (std.mem.eql(u8, type_value.string, "full_text")) return .full_text;
     if (std.mem.eql(u8, type_value.string, "graph")) return .graph;
     if (std.mem.eql(u8, type_value.string, "algebraic")) return .algebraic;
+    if (std.mem.eql(u8, type_value.string, "hypervector")) return .dense_vector;
     if (std.mem.eql(u8, type_value.string, "embeddings")) {
         const sparse = if (value.object.get("sparse")) |sparse_value| switch (sparse_value) {
             .bool => sparse_value.bool,

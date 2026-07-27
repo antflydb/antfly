@@ -47,12 +47,16 @@ const FakeSemanticResolver = struct {
         index_name: []const u8,
         semantic_search: []const u8,
         embedding_template: ?[]const u8,
+        hypervector_associations_json: ?[]const u8,
         limit: u32,
     ) !db_mod.types.DenseKnnQuery {
         try std.testing.expectEqualStrings("docs", table_name);
         try std.testing.expectEqualStrings("semantic_idx", index_name);
         try std.testing.expectEqualStrings("alpha concept", semantic_search);
         try std.testing.expect(embedding_template == null or std.mem.eql(u8, embedding_template.?, "{{remotePDF url=this}}"));
+        if (hypervector_associations_json) |raw| {
+            try std.testing.expectEqualStrings("{\"region\":\"west\"}", raw);
+        }
         const vector = try alloc.alloc(f32, 3);
         vector[0] = 0.25;
         vector[1] = 0.5;
@@ -909,6 +913,22 @@ test "query parser resolves semantic search into dense query" {
     try std.testing.expectEqual(@as(usize, 3), owned.req.dense_queries[0].query.vector.len);
 }
 
+test "query parser forwards structured hypervector associations by index" {
+    var owned = try parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"hypervector_queries":{"semantic_idx":{"region":"west"}},"limit":4}
+    );
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
+    try std.testing.expectEqualStrings("semantic_idx", owned.req.dense_queries[0].index_name);
+}
+
+test "query parser rejects orphaned hypervector associations" {
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"hypervector_queries":{"other_idx":{"region":"west"}},"limit":4}
+    ));
+}
+
 test "query parser preserves search effort for semantic search" {
     var owned = try parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
         \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":4,"search_effort":0.3}
@@ -940,6 +960,23 @@ test "query parser accepts precomputed embedding payload" {
     try std.testing.expectEqual(@as(u32, 6), owned.req.dense_queries[0].query.k);
     try std.testing.expectEqual(@as(usize, 3), owned.req.dense_queries[0].query.vector.len);
     try std.testing.expectEqual(@as(f32, 1.5), owned.req.dense_queries[0].query.vector[1]);
+}
+
+test "internal query parser carries hypervector identity and public parser rejects it" {
+    const raw =
+        \\{"embeddings":{"semantic_idx":[0.5,1.5,2.5]},"indexes":["semantic_idx"],"_hypervector_identities":{"semantic_idx":"abababababababababababababababababababababababababababababababab"},"limit":6}
+    ;
+    var owned = try parseQueryRequest(std.testing.allocator, null, "docs", raw);
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(
+        u8,
+        &([_]u8{0xab} ** 32),
+        &owned.req.dense_queries[0].query.coordinate_fingerprint.?,
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parsePublicQueryRequest(std.testing.allocator, null, "docs", raw),
+    );
 }
 
 test "query parser accepts packed dense embedding payload" {

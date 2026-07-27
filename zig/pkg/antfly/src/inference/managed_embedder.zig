@@ -711,6 +711,29 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntry(alloc, entry, text, entry.dimensions);
     }
 
+    pub fn embedHypervectorQuery(
+        self: *const ManagedEmbedder,
+        alloc: std.mem.Allocator,
+        index_name: []const u8,
+        text: []const u8,
+        raw_associations: []const u8,
+    ) ![]f32 {
+        const entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        const config = entry.hdc_config orelse return error.HypervectorQueryRequiresHypervectorIndex;
+        const semantic = try embedWithEntry(alloc, entry, text, entry.dimensions);
+        defer alloc.free(semantic);
+        return try hdc.composeJsonQuery(alloc, config, raw_associations, semantic);
+    }
+
+    pub fn coordinateFingerprint(
+        self: *const ManagedEmbedder,
+        index_name: []const u8,
+    ) !?[32]u8 {
+        const entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        const config = entry.hdc_config orelse return null;
+        return config.identity_fingerprint orelse error.InvalidManagedEmbeddingIndex;
+    }
+
     /// Digest the effective dense-text embedding operation. Table and index
     /// names are intentionally excluded so equivalent configurations share
     /// results; the server-derived scope prevents cross-principal reuse.
@@ -740,12 +763,11 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheU64(&hasher, entry.dimensions);
         hashQueryCacheU64(&hasher, entry.provider_dimensions);
         if (entry.hdc_config) |config| {
-            hashQueryCacheField(&hasher, "hdc-v1");
-            hashQueryCacheU64(&hasher, config.dimensions);
-            hashQueryCacheU64(&hasher, config.atomic_seed);
-            hashQueryCacheU64(&hasher, config.projection_seed);
-            hashQueryCacheU64(&hasher, @as(u32, @bitCast(config.semantic_weight)));
-            for (config.structural_paths) |path| hashQueryCacheField(&hasher, path);
+            hashQueryCacheField(&hasher, "hypervector-v2");
+            hashQueryCacheField(
+                &hasher,
+                &(config.identity_fingerprint orelse return error.InvalidManagedEmbeddingIndex),
+            );
         }
         hashQueryCacheSecretIdentity(&hasher, entry.api_key);
         hashQueryCacheU64(&hasher, if (entry.secret_store) |store| store.generationFast() else 0);
@@ -1026,7 +1048,182 @@ pub fn translateEmbeddingsIndexConfigJson(
     return try translateEmbeddingsIndexConfigJsonWithOptions(alloc, index_name, value, .{});
 }
 
+/// Lowers the public logical hypervector shape to the private managed
+/// embeddings representation consumed by the existing dense index lifecycle.
+fn lowerHypervectorIndexConfigJsonAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]u8 {
+    const root = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+    const dimensions_value = root.get("dimensions") orelse return error.InvalidCreateTableRequest;
+    const dimensions = switch (dimensions_value) {
+        .integer => |item| std.math.cast(u32, item) orelse return error.InvalidCreateTableRequest,
+        else => return error.InvalidCreateTableRequest,
+    };
+    if (dimensions == 0 or dimensions > hdc.max_dimensions) return error.InvalidCreateTableRequest;
+
+    const semantic_value = root.get("semantic") orelse return error.InvalidCreateTableRequest;
+    const semantic = switch (semantic_value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+    const field_value = semantic.get("field") orelse return error.InvalidCreateTableRequest;
+    if (field_value != .string or field_value.string.len == 0) return error.InvalidCreateTableRequest;
+    const embedder_value = semantic.get("embedder") orelse return error.InvalidCreateTableRequest;
+    if (embedder_value != .object) return error.InvalidCreateTableRequest;
+    const model_digest_value = semantic.get("model_digest") orelse return error.InvalidCreateTableRequest;
+    if (model_digest_value != .string or model_digest_value.string.len == 0 or model_digest_value.string.len > 256) {
+        return error.InvalidCreateTableRequest;
+    }
+    const semantic_weight = if (semantic.get("weight")) |weight| try jsonPositiveF32(weight) else 8;
+    var semantic_iterator = semantic.iterator();
+    while (semantic_iterator.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "field") and
+            !std.mem.eql(u8, entry.key_ptr.*, "weight") and
+            !std.mem.eql(u8, entry.key_ptr.*, "model_digest") and
+            !std.mem.eql(u8, entry.key_ptr.*, "embedder"))
+        {
+            return error.InvalidCreateTableRequest;
+        }
+    }
+
+    var seed: u64 = hdc.default_atomic_seed;
+    var projection_seed: ?u64 = null;
+    if (root.get("encoding")) |encoding_value| {
+        const encoding = switch (encoding_value) {
+            .object => |object| object,
+            else => return error.InvalidCreateTableRequest,
+        };
+        if (encoding.get("type")) |encoding_type| {
+            if (encoding_type != .string or !std.mem.eql(u8, encoding_type.string, "map")) {
+                return error.UnsupportedCreateTableRequest;
+            }
+        }
+        if (encoding.get("seed")) |seed_value| seed = try jsonNonNegativeU64(seed_value);
+        if (encoding.get("projection_seed")) |seed_value| projection_seed = try jsonNonNegativeU64(seed_value);
+        var iterator = encoding.iterator();
+        while (iterator.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "type") and
+                !std.mem.eql(u8, entry.key_ptr.*, "seed") and
+                !std.mem.eql(u8, entry.key_ptr.*, "projection_seed"))
+            {
+                return error.InvalidCreateTableRequest;
+            }
+        }
+    }
+
+    var structural_paths: ?std.json.Value = null;
+    if (root.get("structural")) |structural_value| {
+        const structural = switch (structural_value) {
+            .object => |object| object,
+            else => return error.InvalidCreateTableRequest,
+        };
+        if (structural.get("paths")) |paths| structural_paths = paths;
+        var iterator = structural.iterator();
+        while (iterator.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "paths")) return error.InvalidCreateTableRequest;
+        }
+    }
+
+    var hdc_out = std.ArrayListUnmanaged(u8).empty;
+    defer hdc_out.deinit(alloc);
+    try hdc_out.appendSlice(alloc, "{\"dimensions\":");
+    try appendJsonInteger(alloc, &hdc_out, dimensions);
+    try hdc_out.appendSlice(alloc, ",\"seed\":");
+    try appendJsonInteger(alloc, &hdc_out, seed);
+    try hdc_out.appendSlice(alloc, ",\"projection_seed\":");
+    try appendJsonInteger(alloc, &hdc_out, projection_seed orelse seed);
+    try hdc_out.appendSlice(alloc, ",\"semantic_weight\":");
+    try appendJsonFloat(alloc, &hdc_out, semantic_weight);
+    try hdc_out.appendSlice(alloc, ",\"structural_paths\":");
+    if (structural_paths) |paths| {
+        try appendJsonValueCompact(alloc, &hdc_out, paths);
+    } else {
+        try hdc_out.appendSlice(alloc, "[]");
+    }
+    try hdc_out.append(alloc, '}');
+
+    var parsed_hdc = try std.json.parseFromSlice(std.json.Value, alloc, hdc_out.items, .{});
+    defer parsed_hdc.deinit();
+    var canonical_hdc = hdc.UserConfig.parseValue(alloc, parsed_hdc.value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateTableRequest,
+    };
+    defer canonical_hdc.deinit();
+    const canonical_hdc_json = try canonical_hdc.stringifyAlloc(alloc);
+    defer alloc.free(canonical_hdc_json);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"type\":\"embeddings\",\"field\":");
+    try appendJsonString(alloc, &out, field_value.string);
+    try out.appendSlice(alloc, ",\"embedder\":");
+    try appendJsonValueCompact(alloc, &out, embedder_value);
+    try out.appendSlice(alloc, ",\"hdc\":");
+    try out.appendSlice(alloc, canonical_hdc_json);
+    try out.appendSlice(alloc, ",\"hdc_model_digest\":");
+    try appendJsonString(alloc, &out, model_digest_value.string);
+
+    inline for (.{ "coverage_policy", "mem_only", "execution" }) |field_name| {
+        if (root.get(field_name)) |field| {
+            try out.append(alloc, ',');
+            try appendJsonString(alloc, &out, field_name);
+            try out.append(alloc, ':');
+            try appendJsonValueCompact(alloc, &out, field);
+        }
+    }
+    var root_iterator = root.iterator();
+    while (root_iterator.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (!std.mem.eql(u8, name, "type") and
+            !std.mem.eql(u8, name, "name") and
+            !std.mem.eql(u8, name, "description") and
+            !std.mem.eql(u8, name, "version") and
+            !std.mem.eql(u8, name, "enrichments") and
+            !std.mem.eql(u8, name, "dimensions") and
+            !std.mem.eql(u8, name, "encoding") and
+            !std.mem.eql(u8, name, "semantic") and
+            !std.mem.eql(u8, name, "structural") and
+            !std.mem.eql(u8, name, "coverage_policy") and
+            !std.mem.eql(u8, name, "mem_only") and
+            !std.mem.eql(u8, name, "execution"))
+        {
+            return error.InvalidCreateTableRequest;
+        }
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
 pub fn translateEmbeddingsIndexConfigJsonWithOptions(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    value: std.json.Value,
+    options: InitOptions,
+) ![]u8 {
+    const root = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+    const type_value = root.get("type") orelse return error.InvalidCreateTableRequest;
+    if (type_value != .string) return error.InvalidCreateTableRequest;
+    if (std.mem.eql(u8, type_value.string, "hypervector")) {
+        const lowered_json = try lowerHypervectorIndexConfigJsonAlloc(alloc, value);
+        defer alloc.free(lowered_json);
+        var lowered = try std.json.parseFromSlice(std.json.Value, alloc, lowered_json, .{});
+        defer lowered.deinit();
+        return try translateDenseIndexConfigJsonWithOptions(alloc, index_name, lowered.value, options);
+    }
+    if (!std.mem.eql(u8, type_value.string, "embeddings") or root.get("hdc") != null) {
+        return error.UnsupportedCreateTableRequest;
+    }
+    return try translateDenseIndexConfigJsonWithOptions(alloc, index_name, value, options);
+}
+
+fn translateDenseIndexConfigJsonWithOptions(
     alloc: std.mem.Allocator,
     index_name: []const u8,
     value: std.json.Value,
@@ -1185,22 +1382,22 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         return error.UnsupportedCreateTableRequest;
     }
 
+    if (hdc_config) |*config| {
+        try assignHdcIdentity(
+            alloc,
+            config,
+            root,
+            embedder_value orelse return error.InvalidCreateTableRequest,
+            source_field,
+            provider_dims,
+        );
+    }
     const hdc_json = if (hdc_config) |config| try config.stringifyAlloc(alloc) else null;
     defer if (hdc_json) |raw| alloc.free(raw);
-    const hdc_embedder_identity_json = if (hdc_config != null) blk: {
-        const raw_embedder = embedder_value orelse return error.InvalidCreateTableRequest;
-        var identity_config = try parseEmbedderConfigFromValue(alloc, raw_embedder);
-        defer identity_config.deinit(alloc);
-        break :blk try stringifyManagedEmbedderConfigAlloc(alloc, identity_config, raw_embedder, null);
-    } else null;
-    defer if (hdc_embedder_identity_json) |raw| alloc.free(raw);
-    const generated_embedding_name = if (hdc_json) |raw| try hdcEmbeddingNameAlloc(
+    const generated_embedding_name = if (hdc_config) |config| try hdcEmbeddingNameAlloc(
         alloc,
         index_name,
-        raw,
-        source_field,
-        provider_dims,
-        hdc_embedder_identity_json.?,
+        config.identity_fingerprint orelse return error.InvalidCreateTableRequest,
     ) else null;
     defer if (generated_embedding_name) |name| alloc.free(name);
     const effective_embedding_name = artifact_embedding_name orelse generated_embedding_name orelse index_name;
@@ -1272,7 +1469,14 @@ pub fn normalizeEmbeddingsIndexDimensionJsonWithOptions(
         else => return null,
     };
     const type_value = root.get("type") orelse return null;
-    if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) return null;
+    if (type_value != .string) return null;
+    if (std.mem.eql(u8, type_value.string, "hypervector")) {
+        // Stored dimensions are already explicit in the logical public shape.
+        // Provider dimensions are resolved from semantic.embedder during
+        // validation/lowering and never overwrite the public field.
+        return null;
+    }
+    if (!std.mem.eql(u8, type_value.string, "embeddings")) return null;
 
     var parsed_cfg = try parseEmbeddingsIndexConfigFromValue(alloc, value);
     defer parsed_cfg.deinit();
@@ -1338,7 +1542,15 @@ fn parseManagedEmbeddingEntry(
     };
 
     const type_value = root.get("type") orelse return null;
-    if (type_value != .string or !std.mem.eql(u8, type_value.string, "embeddings")) return null;
+    if (type_value != .string) return null;
+    if (std.mem.eql(u8, type_value.string, "hypervector")) {
+        const lowered_json = try lowerHypervectorIndexConfigJsonAlloc(alloc, value);
+        defer alloc.free(lowered_json);
+        var lowered = try std.json.parseFromSlice(std.json.Value, alloc, lowered_json, .{});
+        defer lowered.deinit();
+        return try parseManagedEmbeddingEntry(alloc, index_name, lowered.value, options);
+    }
+    if (!std.mem.eql(u8, type_value.string, "embeddings")) return null;
 
     var parsed_cfg = try parseEmbeddingsIndexConfigFromValue(alloc, value);
     defer parsed_cfg.deinit();
@@ -1378,6 +1590,19 @@ fn parseManagedEmbeddingEntry(
     }
     if (hdc_config) |config| {
         config.projection(provider_dimensions).validate() catch return error.InvalidManagedEmbeddingIndex;
+    }
+    if (hdc_config) |*config| {
+        assignHdcIdentity(
+            alloc,
+            config,
+            root,
+            embedder,
+            cfg.field orelse return error.InvalidManagedEmbeddingIndex,
+            provider_dimensions,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidManagedEmbeddingIndex,
+        };
     }
     const dimensions = if (hdc_config) |config| config.dimensions else provider_dimensions;
     const result = try buildManagedEmbeddingEntry(
@@ -1431,21 +1656,11 @@ fn buildManagedEmbeddingEntry(
         null;
     const owned_index_name = try alloc.dupe(u8, index_name);
     errdefer alloc.free(owned_index_name);
-    const hdc_json = if (hdc_config) |config| try config.stringifyAlloc(alloc) else null;
-    defer if (hdc_json) |raw| alloc.free(raw);
-    const hdc_embedder_identity_json = if (hdc_config != null)
-        try stringifyManagedEmbedderConfigAlloc(alloc, embedder_cfg, embedder, null)
-    else
-        null;
-    defer if (hdc_embedder_identity_json) |raw| alloc.free(raw);
-    const owned_embedding_name: []u8 = if (hdc_json) |raw|
+    const owned_embedding_name: []u8 = if (hdc_config) |config|
         try hdcEmbeddingNameAlloc(
             alloc,
             index_name,
-            raw,
-            cfg.field orelse return error.InvalidManagedEmbeddingIndex,
-            provider_dimensions,
-            hdc_embedder_identity_json.?,
+            config.identity_fingerprint orelse return error.InvalidManagedEmbeddingIndex,
         )
     else if (cfg.embedding_name) |embedding_name|
         try alloc.dupe(u8, embedding_name)
@@ -1508,25 +1723,49 @@ fn buildManagedEmbeddingEntry(
     };
 }
 
+fn assignHdcIdentity(
+    alloc: std.mem.Allocator,
+    config: *hdc.UserConfig,
+    root: std.json.ObjectMap,
+    embedder: std.json.Value,
+    source_field: []const u8,
+    provider_dimensions: u32,
+) !void {
+    const model_digest_value = root.get("hdc_model_digest") orelse return error.InvalidManagedEmbeddingIndex;
+    if (model_digest_value != .string or model_digest_value.string.len == 0) {
+        return error.InvalidManagedEmbeddingIndex;
+    }
+    var embedder_config = try parseEmbedderConfigFromValue(alloc, embedder);
+    defer embedder_config.deinit(alloc);
+    const provider = try parseEmbedderProvider(embedder_config);
+    if (embedder_config.model.len == 0) return error.InvalidManagedEmbeddingIndex;
+    const projection = config.projection(provider_dimensions);
+    try projection.validate();
+    const identity = hdc.Identity{
+        .dimensions = config.dimensions,
+        .atomic_seed = config.atomic_seed,
+        .structural_paths = config.structural_paths,
+        .semantic = .{
+            .source_path = source_field,
+            .embedding_provider = @tagName(provider),
+            .embedding_model = embedder_config.model,
+            .embedding_model_digest = model_digest_value.string,
+            .embedding_dimensions = provider_dimensions,
+            .projection_seed = config.projection_seed,
+            .projection_checksum = projection.checksum(),
+            .semantic_weight = config.semantic_weight,
+        },
+    };
+    config.identity_fingerprint = try identity.fingerprint();
+}
+
 fn hdcEmbeddingNameAlloc(
     alloc: std.mem.Allocator,
     index_name: []const u8,
-    canonical_hdc_json: []const u8,
-    source_field: []const u8,
-    provider_dimensions: u32,
-    canonical_embedder_json: []const u8,
+    identity_fingerprint: [32]u8,
 ) ![]u8 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("antfly-hdc-artifact-name-v1");
-    hashQueryCacheField(&hasher, index_name);
-    hashQueryCacheField(&hasher, canonical_hdc_json);
-    hashQueryCacheField(&hasher, source_field);
-    hashQueryCacheU64(&hasher, provider_dimensions);
-    hashQueryCacheField(&hasher, canonical_embedder_json);
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
-    const hex = std.fmt.bytesToHex(digest[0..8].*, .lower);
-    return try std.fmt.allocPrint(alloc, "{s}@hdc-{s}", .{ index_name, &hex });
+    const hex = std.fmt.bytesToHex(identity_fingerprint, .lower);
+    return try std.fmt.allocPrint(alloc, "{s}@hypervector-{s}", .{ index_name, &hex });
 }
 
 fn isAntflyProvider(provider: ProviderKind) bool {
@@ -2604,6 +2843,52 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, encoded);
 }
 
+fn appendJsonValueCompact(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
+fn appendJsonInteger(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: anytype,
+) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
+fn appendJsonFloat(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: f32,
+) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
+fn jsonPositiveF32(value: std.json.Value) !f32 {
+    const parsed: f32 = switch (value) {
+        .integer => |item| @floatFromInt(item),
+        .float => |item| @floatCast(item),
+        .number_string => |item| std.fmt.parseFloat(f32, item) catch return error.InvalidCreateTableRequest,
+        else => return error.InvalidCreateTableRequest,
+    };
+    if (!std.math.isFinite(parsed) or parsed <= 0) return error.InvalidCreateTableRequest;
+    return parsed;
+}
+
+fn jsonNonNegativeU64(value: std.json.Value) !u64 {
+    if (value != .integer or value.integer < 0) return error.InvalidCreateTableRequest;
+    return std.math.cast(u64, value.integer) orelse error.InvalidCreateTableRequest;
+}
+
 fn appendExecutionObjectIfPresent(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -2833,10 +3118,10 @@ test "managed embedder translates managed embeddings config into db generator co
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding\":{\"batch_items\":16,\"batch_bytes\":262144}") != null);
 }
 
-test "managed embedder projects HDC queries and translates canonical lifecycle config" {
+pub fn testManagedHypervectorIndexAndStructuredQuery() !void {
     var local = TestLocalDenseProvider{ .dimensions = 3 };
     const public_json =
-        \\{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"hdc":{"dimensions":64,"seed":17,"semantic_weight":4,"structural_paths":["region","name"]}}
+        \\{"type":"hypervector","dimensions":64,"encoding":{"type":"map","seed":17},"semantic":{"field":"body","weight":4,"model_digest":"sha256:clipclap-v1","embedder":{"provider":"antfly","model":"antflydb/clipclap","dimension":3}},"structural":{"paths":["region","name"]}}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, public_json, .{});
     defer parsed.deinit();
@@ -2844,22 +3129,7 @@ test "managed embedder projects HDC queries and translates canonical lifecycle c
     const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() });
     defer std.testing.allocator.free(config_json);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"dims\":64") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"hdc\":{\"dimensions\":64,\"seed\":17,\"projection_seed\":17,\"semantic_weight\":4,\"structural_paths\":[\"name\",\"region\"]}") != null);
-    const raw_embedder = parsed.value.object.get("embedder").?;
-    var identity_config = try parseEmbedderConfigFromValue(std.testing.allocator, raw_embedder);
-    defer identity_config.deinit(std.testing.allocator);
-    const identity_json = try stringifyManagedEmbedderConfigAlloc(std.testing.allocator, identity_config, raw_embedder, null);
-    defer std.testing.allocator.free(identity_json);
-    const artifact_name = try hdcEmbeddingNameAlloc(
-        std.testing.allocator,
-        "semantic_idx",
-        "{\"dimensions\":64,\"seed\":17,\"projection_seed\":17,\"semantic_weight\":4,\"structural_paths\":[\"name\",\"region\"]}",
-        "body",
-        3,
-        identity_json,
-    );
-    defer std.testing.allocator.free(artifact_name);
-    try std.testing.expect(std.mem.count(u8, config_json, artifact_name) == 2);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"hdc\":{\"dimensions\":64,\"seed\":17,\"projection_seed\":17,\"semantic_weight\":4,\"structural_paths\":[\"name\",\"region\"],\"identity_fingerprint\":\"") != null);
 
     const indexes_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"semantic_idx\":{s}}}", .{public_json});
     defer std.testing.allocator.free(indexes_json);
@@ -2868,6 +3138,10 @@ test "managed embedder projects HDC queries and translates canonical lifecycle c
 
     try std.testing.expectEqual(@as(u32, 3), managed.entries[0].provider_dimensions);
     try std.testing.expectEqual(@as(u32, 64), managed.entries[0].dimensions);
+    const artifact_name = managed.entries[0].embedding_name;
+    try std.testing.expect(std.mem.startsWith(u8, artifact_name, "semantic_idx@hypervector-"));
+    try std.testing.expectEqual(@as(usize, "semantic_idx@hypervector-".len + 64), artifact_name.len);
+    try std.testing.expect(std.mem.count(u8, config_json, artifact_name) == 2);
     try std.testing.expect(managed.findEntry(artifact_name) != null);
     const vector = try managed.embedQuery(std.testing.allocator, "semantic_idx", "graph databases");
     defer std.testing.allocator.free(vector);
@@ -2875,11 +3149,28 @@ test "managed embedder projects HDC queries and translates canonical lifecycle c
     for (vector) |coordinate| {
         try std.testing.expect(coordinate == -1 or coordinate == 1);
     }
+    const structured = try managed.embedHypervectorQuery(
+        std.testing.allocator,
+        "semantic_idx",
+        "graph databases",
+        "{\"region\":\"west\"}",
+    );
+    defer std.testing.allocator.free(structured);
+    try std.testing.expect(!std.mem.eql(f32, vector, structured));
+    try std.testing.expectError(
+        error.UnknownStructuralQueryPath,
+        managed.embedHypervectorQuery(
+            std.testing.allocator,
+            "semantic_idx",
+            "graph databases",
+            "{\"typo\":\"west\"}",
+        ),
+    );
 
     const first_cache_key = try managed.queryCacheKey("semantic_idx", .anonymous, "", "graph databases");
     var changed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(
         std.testing.allocator,
-        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"hdc":{"dimensions":64,"seed":18,"semantic_weight":4,"structural_paths":["name","region"]}}}
+        \\{"semantic_idx":{"type":"hypervector","dimensions":64,"encoding":{"seed":18},"semantic":{"field":"body","weight":4,"model_digest":"sha256:clipclap-v1","embedder":{"provider":"antfly","model":"antflydb/clipclap","dimension":3}},"structural":{"paths":["name","region"]}}}
     ,
         local.provider(),
     );
@@ -2890,7 +3181,7 @@ test "managed embedder projects HDC queries and translates canonical lifecycle c
 
     var changed_model = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(
         std.testing.allocator,
-        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap-v2"},"hdc":{"dimensions":64,"seed":17,"semantic_weight":4,"structural_paths":["name","region"]}}}
+        \\{"semantic_idx":{"type":"hypervector","dimensions":64,"encoding":{"seed":17},"semantic":{"field":"body","weight":4,"model_digest":"sha256:clipclap-v2","embedder":{"provider":"antfly","model":"antflydb/clipclap-v2","dimension":3}},"structural":{"paths":["name","region"]}}}
     ,
         local.provider(),
     );
@@ -2900,9 +3191,9 @@ test "managed embedder projects HDC queries and translates canonical lifecycle c
     try std.testing.expect(!std.mem.eql(u8, artifact_name, changed_model.entries[0].embedding_name));
 }
 
-test "managed embedder rejects incompatible HDC index modes" {
+pub fn testManagedHypervectorValidation() !void {
     var local = TestLocalDenseProvider{ .dimensions = 3 };
-    const invalid_configs = [_][]const u8{
+    const unsupported_configs = [_][]const u8{
         \\{"type":"embeddings","field":"body","dimension":3,"sparse":true,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"hdc":{"dimensions":64}}
         ,
         \\{"type":"embeddings","field":"body","dimension":3,"distance_metric":"l2_squared","embedder":{"provider":"antfly","model":"antflydb/clipclap"},"hdc":{"dimensions":64}}
@@ -2910,7 +3201,7 @@ test "managed embedder rejects incompatible HDC index modes" {
         \\{"type":"embeddings","template":"{{body}}","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"hdc":{"dimensions":64}}
         ,
     };
-    for (invalid_configs) |raw| {
+    for (unsupported_configs) |raw| {
         var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
         defer parsed.deinit();
         try std.testing.expectError(
@@ -2918,6 +3209,28 @@ test "managed embedder rejects incompatible HDC index modes" {
             translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() }),
         );
     }
+    const invalid_configs = [_][]const u8{
+        \\{"type":"hypervector","dimensions":64,"semantic":{"field":"body","weight":0,"model_digest":"sha256:v1","embedder":{"provider":"antfly","model":"antflydb/clipclap","dimension":3}}}
+        ,
+        \\{"type":"hypervector","dimensions":64,"semantic":{"field":"body","weight":4,"embedder":{"provider":"antfly","model":"antflydb/clipclap","dimension":3}}}
+        ,
+    };
+    for (invalid_configs) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(
+            error.InvalidCreateTableRequest,
+            translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() }),
+        );
+    }
+}
+
+test "managed embedder lowers hypervector indexes and composes structured queries" {
+    try testManagedHypervectorIndexAndStructuredQuery();
+}
+
+test "managed embedder rejects legacy HDC fields and invalid hypervector semantics" {
+    try testManagedHypervectorValidation();
 }
 
 test "managed embedder rejects invalid execution batch policy" {

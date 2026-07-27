@@ -2514,7 +2514,7 @@ pub const EmbeddingsIndexConfig = struct {
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
     sparse: ?bool = null,
-    /// Provider embedding dimension for managed dense indexes, or stored vector dimension for ordinary/external dense indexes. When hdc is configured, the stored vector dimension is hdc.dimensions. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    /// Stored vector dimension for dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
@@ -2529,8 +2529,6 @@ pub const EmbeddingsIndexConfig = struct {
     mem_only: ?bool = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
     embedder: ?EmbedderConfig = null,
-    /// Deterministically projects semantic embeddings into a hypervector and binds selected document fields into the same stored dense vector. HDC indexes are managed dense cosine indexes and currently cannot be combined with external vectors, sparse mode, templates, chunking, or artifact-backed embedding enrichments.
-    hdc: ?HdcIndexConfig = null,
     /// Configuration for the summarizer plugin (dense managed indexes only)
     summarizer: ?GeneratorConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
@@ -3890,18 +3888,46 @@ pub const GroundTruth = struct {
     expectations: ?[]const u8 = null,
 };
 
-/// Hyperdimensional-computing transform for a managed dense embeddings index. Defaults are canonicalized into the index identity so changes automatically trigger the ordinary managed-index rebuild lifecycle.
-pub const HdcIndexConfig = struct {
-    /// Stored HDC vector dimensions.
-    dimensions: ?i64 = null,
+/// Deterministic hypervector encoding configuration.
+pub const HypervectorEncodingConfig = struct {
+    /// Encoding algorithm. MAP is the only supported algorithm.
+    type: ?[]const u8 = null,
     /// Seed for deterministic typed structural symbols.
     seed: ?i64 = null,
     /// Seed for deterministic semantic projection. Defaults to seed.
     projection_seed: ?i64 = null,
-    /// Relative contribution of the projected semantic vector to each document hypervector.
-    semantic_weight: ?f32 = null,
+};
+
+/// Logical hypervector index. Antfly deterministically combines a projected semantic embedding with typed structural associations, then lowers the result to the existing dense-vector storage, HBC/RaBitQ, coverage, and rebuild machinery. This does not create a graph index.
+pub const HypervectorIndexConfig = struct {
+    /// Stored hypervector dimensions. This never means provider embedding dimensions.
+    dimensions: i64,
+    encoding: ?HypervectorEncodingConfig = null,
+    semantic: HypervectorSemanticConfig,
+    structural: ?HypervectorStructuralConfig = null,
+    coverage_policy: ?DerivedCoveragePolicy = null,
+    /// Whether to use in-memory-only dense-vector storage.
+    mem_only: ?bool = null,
+    /// Non-semantic execution policy for managed hypervector enrichment.
+    execution: ?IndexExecutionConfig = null,
+};
+
+/// Semantic channel projected into the hypervector coordinate system.
+pub const HypervectorSemanticConfig = struct {
+    /// Document field embedded for both document and natural-language query encoding.
+    field: []const u8,
+    /// Positive contribution of the semantic channel. Zero is rejected so text queries cannot produce useless vectors.
+    weight: ?f32 = null,
+    /// Immutable provider model revision or content digest included in the persisted encoder identity. Mutable aliases must be resolved before index creation.
+    model_digest: []const u8,
+    /// Managed embedding provider configuration. Its dimension is the provider embedding dimension, distinct from the stored hypervector dimensions.
+    embedder: EmbedderConfig,
+};
+
+/// Typed document paths that can participate in document and structured-query composition.
+pub const HypervectorStructuralConfig = struct {
     /// Dot-separated document paths bound into the vector. Paths are canonicalized in sorted order; arrays are encoded as order-independent multisets.
-    structural_paths: ?[]const []const u8 = null,
+    paths: ?[]const []const u8 = null,
 };
 
 pub const IPRangeQuery = struct {
@@ -3947,7 +3973,7 @@ pub const IndexConfig = struct {
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
     sparse: ?bool = null,
-    /// Provider embedding dimension for managed dense indexes, or stored vector dimension for ordinary/external dense indexes. When hdc is configured, the stored vector dimension is hdc.dimensions. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    /// Stored vector dimension for dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
@@ -3960,8 +3986,6 @@ pub const IndexConfig = struct {
     distance_metric: ?DistanceMetric = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
     embedder: ?EmbedderConfig = null,
-    /// Deterministically projects semantic embeddings into a hypervector and binds selected document fields into the same stored dense vector. HDC indexes are managed dense cosine indexes and currently cannot be combined with external vectors, sparse mode, templates, chunking, or artifact-backed embedding enrichments.
-    hdc: ?HdcIndexConfig = null,
     /// Configuration for the summarizer plugin (dense managed indexes only)
     summarizer: ?GeneratorConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
@@ -3974,6 +3998,11 @@ pub const IndexConfig = struct {
     chunk_size: ?i64 = null,
     /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
+    /// Stored hypervector dimensions. This never means provider embedding dimensions.
+    dimensions: ?i64 = null,
+    encoding: ?HypervectorEncodingConfig = null,
+    semantic: ?HypervectorSemanticConfig = null,
+    structural: ?HypervectorStructuralConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
@@ -4043,10 +4072,6 @@ pub const IndexConfig = struct {
             try jw.objectField("embedder");
             try jw.write(value);
         }
-        if (self.hdc) |value| {
-            try jw.objectField("hdc");
-            try jw.write(value);
-        }
         if (self.summarizer) |value| {
             try jw.objectField("summarizer");
             try jw.write(value);
@@ -4069,6 +4094,22 @@ pub const IndexConfig = struct {
         }
         if (self.execution) |value| {
             try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.encoding) |value| {
+            try jw.objectField("encoding");
+            try jw.write(value);
+        }
+        if (self.semantic) |value| {
+            try jw.objectField("semantic");
+            try jw.write(value);
+        }
+        if (self.structural) |value| {
+            try jw.objectField("structural");
             try jw.write(value);
         }
         if (self.edge_types) |value| {
@@ -4157,6 +4198,7 @@ pub const IndexStatus = struct {
 pub const IndexType = enum {
     full_text,
     embeddings,
+    hypervector,
     graph,
     algebraic,
 
@@ -4164,6 +4206,7 @@ pub const IndexType = enum {
         const s = switch (self) {
             .full_text => "full_text",
             .embeddings => "embeddings",
+            .hypervector => "hypervector",
             .graph => "graph",
             .algebraic => "algebraic",
         };
@@ -4178,6 +4221,7 @@ pub const IndexType = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "full_text", .full_text },
             .{ "embeddings", .embeddings },
+            .{ "hypervector", .hypervector },
             .{ "graph", .graph },
             .{ "algebraic", .algebraic },
         });
@@ -6607,6 +6651,8 @@ pub const QueryRequest = struct {
     full_text_search: ?std.json.Value = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
+    /// Optional structured associations for logical hypervector indexes, keyed by index name. Each inner key must exactly match a configured `structural.paths` entry. Values use the same typed canonicalization as indexed documents. The natural-language channel still comes from `semantic_search`. Antfly composes the projected semantic query and these structural associations in the index's persisted coordinate system. Supplying an entry for an ordinary embeddings index is rejected.
+    hypervector_queries: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
     /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
@@ -7145,6 +7191,8 @@ pub const RetrievalQueryRequest = struct {
     full_text_search: ?std.json.Value = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
+    /// Optional structured associations for logical hypervector indexes, keyed by index name. Each inner key must exactly match a configured `structural.paths` entry. Values use the same typed canonicalization as indexed documents. The natural-language channel still comes from `semantic_search`. Antfly composes the projected semantic query and these structural associations in the index's persisted coordinate system. Supplying an entry for an ordinary embeddings index is rejected.
+    hypervector_queries: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
     /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.

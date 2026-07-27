@@ -18454,6 +18454,7 @@ pub const DB = struct {
         const algebraic_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
+        try self.validateDenseCoordinateFingerprint(algebraic_filter.req.index_name, dense);
         if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
         const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
@@ -18507,6 +18508,7 @@ pub const DB = struct {
     fn searchDenseProfiledAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
+        try self.validateDenseCoordinateFingerprint(algebraic_filter.req.index_name, dense);
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
         const profiled = db_query_search.searchDenseProfiled(alloc, algebraic_filter.req, dense, .{
             .ctx = self,
@@ -18552,6 +18554,22 @@ pub const DB = struct {
             }
             return err;
         };
+    }
+
+    fn validateDenseCoordinateFingerprint(
+        self: *DB,
+        index_name: ?[]const u8,
+        dense: types.DenseKnnQuery,
+    ) !void {
+        const entry = self.core.index_manager.denseIndex(index_name) orelse return error.IndexNotFound;
+        const expected = try index_manager_mod.denseConfigCoordinateFingerprint(self.alloc, entry.config);
+        if (expected == null and dense.coordinate_fingerprint == null) return;
+        if (expected == null or dense.coordinate_fingerprint == null) {
+            return error.HypervectorCoordinateSystemMismatch;
+        }
+        if (!std.mem.eql(u8, &expected.?, &dense.coordinate_fingerprint.?)) {
+            return error.HypervectorCoordinateSystemMismatch;
+        }
     }
 
     fn searchSparse(self: *DB, alloc: Allocator, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
@@ -50978,8 +50996,9 @@ const TestHdcProjectedDenseEmbedder = struct {
 
 test "db HDC managed enrichment backfills and seeds exact graph traversal" {
     const alloc = std.testing.allocator;
+    const coordinate_fingerprint = [_]u8{0x11} ** 32;
     const config_json =
-        \\{"field":"embedding","dims":64,"metric":"cosine","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"location_hdc","hdc":{"dimensions":64,"seed":17,"projection_seed":17,"semantic_weight":4,"structural_paths":["region"]}}}
+        \\{"field":"embedding","dims":64,"metric":"cosine","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"location_hdc","hdc":{"dimensions":64,"seed":17,"projection_seed":17,"semantic_weight":4,"structural_paths":["region"],"identity_fingerprint":"1111111111111111111111111111111111111111111111111111111111111111"}},"hdc":{"dimensions":64,"seed":17,"projection_seed":17,"semantic_weight":4,"structural_paths":["region"],"identity_fingerprint":"1111111111111111111111111111111111111111111111111111111111111111"}}
     ;
     const first_document = "{\"body\":\"cities on the Pacific coast\",\"region\":\"west\"}";
 
@@ -51043,7 +51062,7 @@ test "db HDC managed enrichment backfills and seeds exact graph traversal" {
     var parsed_config = try std.json.parseFromSlice(
         std.json.Value,
         alloc,
-        "{\"dimensions\":64,\"seed\":17,\"projection_seed\":17,\"semantic_weight\":4,\"structural_paths\":[\"region\"]}",
+        "{\"dimensions\":64,\"seed\":17,\"projection_seed\":17,\"semantic_weight\":4,\"structural_paths\":[\"region\"],\"identity_fingerprint\":\"1111111111111111111111111111111111111111111111111111111111111111\"}",
         .{},
     );
     defer parsed_config.deinit();
@@ -51053,10 +51072,21 @@ test "db HDC managed enrichment backfills and seeds exact graph traversal" {
     defer alloc.free(expected_vector);
     try std.testing.expectEqualSlices(f32, expected_vector, stored_vector);
 
+    try std.testing.expectError(error.HypervectorCoordinateSystemMismatch, db.search(alloc, .{
+        .index_name = "location_hdc",
+        .dense = .{ .vector = query_vector, .k = 1 },
+    }));
+    var wrong_fingerprint = coordinate_fingerprint;
+    wrong_fingerprint[0] ^= 1;
+    try std.testing.expectError(error.HypervectorCoordinateSystemMismatch, db.search(alloc, .{
+        .index_name = "location_hdc",
+        .dense = .{ .vector = query_vector, .k = 1, .coordinate_fingerprint = wrong_fingerprint },
+    }));
+
     {
         var result = try db.search(alloc, .{
             .index_name = "location_hdc",
-            .dense = .{ .vector = query_vector, .k = 1 },
+            .dense = .{ .vector = query_vector, .k = 1, .coordinate_fingerprint = coordinate_fingerprint },
             .graph_queries = &.{
                 .{
                     .name = "visitors",
@@ -51091,7 +51121,7 @@ test "db HDC managed enrichment backfills and seeds exact graph traversal" {
 
     var reopened_result = try reopened.search(alloc, .{
         .index_name = "location_hdc",
-        .dense = .{ .vector = query_vector, .k = 1 },
+        .dense = .{ .vector = query_vector, .k = 1, .coordinate_fingerprint = coordinate_fingerprint },
         .graph_queries = &.{
             .{
                 .name = "visitors",

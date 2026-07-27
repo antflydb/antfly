@@ -2685,6 +2685,7 @@ export interface components {
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
             secret_store?: components["schemas"]["SecretStoreStatus"];
+            runtime_config?: components["schemas"]["RuntimeConfigStatus"];
             storage?: components["schemas"]["StorageRuntimeStatus"];
         } & {
             [key: string]: unknown;
@@ -2701,6 +2702,7 @@ export interface components {
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
             secret_store?: components["schemas"]["SecretStoreStatus"];
+            runtime_config?: components["schemas"]["RuntimeConfigStatus"];
             storage?: components["schemas"]["StorageRuntimeStatus"];
             data: components["schemas"]["ClusterDataStatus"];
         } & {
@@ -3617,8 +3619,41 @@ export interface components {
         };
         /** @description Non-secret status for the local secrets file store, when one is available. */
         SecretStoreStatus: {
+            /**
+             * Format: uint64
+             * @description Generation of the currently published secret-store snapshot.
+             */
+            generation?: number;
+            /** @description Whether this store can expose one exact opaque source-generation acknowledgement. This remains true when a single loaded file predates the generation field, and is false for layered stores whose served snapshot has multiple publication sources. */
+            supports_source_generation?: boolean;
+            /** @description Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values. */
+            source_generation?: string | null;
+            /** @description Whether the latest observed replacement failed to load. */
+            last_reload_failed?: boolean;
             /** @description Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh. */
             stale?: boolean;
+            /** Format: uint64 */
+            reload_successes?: number;
+            /** Format: uint64 */
+            reload_failures?: number;
+        };
+        /** @description Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only changes; startup-only changes remain stale until restart. */
+        RuntimeConfigStatus: {
+            /**
+             * Format: uint64
+             * @description Generation of the fully validated and atomically published configuration.
+             */
+            generation?: number;
+            /** @description Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters match the operator config-hash annotation. */
+            hash?: string;
+            /** @description Whether the latest observed replacement failed loading, semantic validation, or requires restart because startup-only fields changed. */
+            last_reload_failed?: boolean;
+            /** @description Whether requests are using the last-known-good snapshot after a failed reload. */
+            stale?: boolean;
+            /** Format: uint64 */
+            reload_successes?: number;
+            /** Format: uint64 */
+            reload_failures?: number;
         };
         /**
          * @description Source of the secret configuration
@@ -5817,6 +5852,31 @@ export interface components {
              * @example artificial intelligence and machine learning applications
              */
             semantic_search?: string;
+            /**
+             * @description Optional structured associations for logical hypervector indexes,
+             *     keyed by index name. Each inner key must exactly match a configured
+             *     `structural.paths` entry. Values use the same typed canonicalization
+             *     as indexed documents.
+             *
+             *     The natural-language channel still comes from `semantic_search`.
+             *     Antfly composes the projected semantic query and these structural
+             *     associations in the index's persisted coordinate system. Supplying
+             *     an entry for an ordinary embeddings index is rejected.
+             * @example {
+             *       "locations": {
+             *         "region": "us-west",
+             *         "features": [
+             *           "coastal",
+             *           "transit"
+             *         ]
+             *       }
+             *     }
+             */
+            hypervector_queries?: {
+                [key: string]: {
+                    [key: string]: unknown;
+                };
+            };
             /**
              * @description Optional Handlebars template for multimodal embedding of the semantic_search query.
              *     The template has access to `this` which contains the semantic_search string value.
@@ -8485,7 +8545,7 @@ export interface components {
              * @default false
              */
             sparse?: boolean;
-            /** @description Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
+            /** @description Stored vector dimension for dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
             dimension?: number;
             /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
             field?: string;
@@ -8524,6 +8584,65 @@ export interface components {
              */
             chunk_size?: number;
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
+            execution?: components["schemas"]["IndexExecutionConfig"];
+        };
+        /** @description Deterministic hypervector encoding configuration. */
+        HypervectorEncodingConfig: {
+            /**
+             * @description Encoding algorithm. MAP is the only supported algorithm.
+             * @default map
+             * @enum {string}
+             */
+            type?: "map";
+            /**
+             * Format: uint64
+             * @description Seed for deterministic typed structural symbols.
+             * @default 13
+             */
+            seed?: number;
+            /**
+             * Format: uint64
+             * @description Seed for deterministic semantic projection. Defaults to seed.
+             */
+            projection_seed?: number;
+        };
+        /** @description Semantic channel projected into the hypervector coordinate system. */
+        HypervectorSemanticConfig: {
+            /** @description Document field embedded for both document and natural-language query encoding. */
+            field: string;
+            /**
+             * Format: float
+             * @description Positive contribution of the semantic channel. Zero is rejected so text queries cannot produce useless vectors.
+             * @default 8
+             */
+            weight?: number;
+            /** @description Immutable provider model revision or content digest included in the persisted encoder identity. Mutable aliases must be resolved before index creation. */
+            model_digest: string;
+            /** @description Managed embedding provider configuration. Its dimension is the provider embedding dimension, distinct from the stored hypervector dimensions. */
+            embedder: components["schemas"]["EmbedderConfig"];
+        };
+        /** @description Typed document paths that can participate in document and structured-query composition. */
+        HypervectorStructuralConfig: {
+            /**
+             * @description Dot-separated document paths bound into the vector. Paths are canonicalized in sorted order; arrays are encoded as order-independent multisets.
+             * @default []
+             */
+            paths?: string[];
+        };
+        /** @description Logical hypervector index. Antfly deterministically combines a projected semantic embedding with typed structural associations, then lowers the result to the existing dense-vector storage, HBC/RaBitQ, coverage, and rebuild machinery. This does not create a graph index. */
+        HypervectorIndexConfig: {
+            /**
+             * @description Stored hypervector dimensions. This never means provider embedding dimensions.
+             * @default 10000
+             */
+            dimensions: number;
+            encoding?: components["schemas"]["HypervectorEncodingConfig"];
+            semantic: components["schemas"]["HypervectorSemanticConfig"];
+            structural?: components["schemas"]["HypervectorStructuralConfig"];
+            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
+            /** @description Whether to use in-memory-only dense-vector storage. */
+            mem_only?: boolean;
+            /** @description Non-semantic execution policy for managed hypervector enrichment. */
             execution?: components["schemas"]["IndexExecutionConfig"];
         };
         /** @description Configuration for a specific edge type */
@@ -8590,7 +8709,7 @@ export interface components {
          * @description The type of the index.
          * @enum {string}
          */
-        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
+        IndexType: "full_text" | "embeddings" | "hypervector" | "graph" | "algebraic";
         /** @description Configuration for an index */
         IndexConfig: {
             /** @description Name of the index */
@@ -8623,7 +8742,7 @@ export interface components {
              *     ]
              */
             enrichments?: components["schemas"]["EnrichmentConfig"][];
-        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["HypervectorIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
         /** @description Defines the structure of a document type */
         DocumentSchema: {
             /** @description A description of the document type. */

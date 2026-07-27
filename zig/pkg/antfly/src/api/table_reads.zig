@@ -13475,6 +13475,7 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     }
     if (req.dense_queries.len > 0 or req.sparse_queries.len > 0) {
         try appendEmbeddingsField(alloc, &out, &first, req.dense_queries, req.sparse_queries);
+        try appendHypervectorIdentityField(alloc, &out, &first, req.dense_queries);
     }
     if (req.full_text) |full_text| {
         try appendTextQueryField(alloc, &out, &first, "full_text_search", full_text);
@@ -13738,6 +13739,34 @@ fn appendEmbeddingsField(
         }
         try out.appendSlice(alloc, "]}");
         entry_index += 1;
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendHypervectorIdentityField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    dense_queries: []const db_mod.types.NamedDenseQuery,
+) !void {
+    var count: usize = 0;
+    for (dense_queries) |dense_query| {
+        if (dense_query.query.coordinate_fingerprint != null) count += 1;
+    }
+    if (count == 0) return;
+
+    try appendJsonFieldName(alloc, out, first, "_hypervector_identities");
+    try out.append(alloc, '{');
+    var index: usize = 0;
+    for (dense_queries) |dense_query| {
+        const fingerprint = dense_query.query.coordinate_fingerprint orelse continue;
+        if (index > 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, dense_query.index_name);
+        try out.appendSlice(alloc, ":\"");
+        const hex = std.fmt.bytesToHex(fingerprint, .lower);
+        try out.appendSlice(alloc, &hex);
+        try out.append(alloc, '"');
+        index += 1;
     }
     try out.append(alloc, '}');
 }
@@ -16480,6 +16509,29 @@ test "encode query request round-trips composed bleve full_text queries" {
     var parsed_fuzzy = try parseJsonTestBody(std.json.Value, alloc, fuzzy);
     defer parsed_fuzzy.deinit();
     try std.testing.expectEqual(@as(i64, 1), parsed_fuzzy.value.object.get("full_text_search").?.object.get("fuzziness").?.integer);
+}
+
+test "encode query request carries full hypervector coordinate identity" {
+    const alloc = std.testing.allocator;
+    const fingerprint = [_]u8{0xab} ** 32;
+    const encoded = try encodeQueryRequest(alloc, .{
+        .dense_queries = &.{.{
+            .name = "locations",
+            .index_name = "locations",
+            .query = .{
+                .vector = &.{ 1, -1, 1 },
+                .k = 5,
+                .coordinate_fingerprint = fingerprint,
+            },
+        }},
+    });
+    defer alloc.free(encoded);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        encoded,
+        "\"_hypervector_identities\":{\"locations\":\"abababababababababababababababababababababababababababababababab\"}",
+    ) != null);
 }
 
 test "encode query request includes named vector embeddings for routed semantic search" {

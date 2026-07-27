@@ -5001,13 +5001,16 @@ test "enrichment HDC request identity and structural composition are determinist
     };
     const first_doc = "{\"body\":\"graph database\",\"region\":\"west\"}";
     const reordered_doc = "{\"region\":\"west\",\"body\":\"graph database\"}";
+    const unrelated_doc = "{\"body\":\"graph database\",\"region\":\"west\",\"ignored\":42}";
     const changed_doc = "{\"body\":\"graph database\",\"region\":\"east\"}";
     const semantic = [_]f32{ 1, -1, 1, -1, 1, -1, 1, -1 };
 
     const first_hash = try denseRequestSourceHash(std.testing.allocator, request, first_doc, "graph database");
     const reordered_hash = try denseRequestSourceHash(std.testing.allocator, request, reordered_doc, "graph database");
+    const unrelated_hash = try denseRequestSourceHash(std.testing.allocator, request, unrelated_doc, "graph database");
     const changed_hash = try denseRequestSourceHash(std.testing.allocator, request, changed_doc, "graph database");
-    try std.testing.expect(first_hash != reordered_hash);
+    try std.testing.expectEqual(first_hash, reordered_hash);
+    try std.testing.expectEqual(first_hash, unrelated_hash);
     try std.testing.expect(first_hash != changed_hash);
 
     const first = (try composeDenseRequestVectorAlloc(std.testing.allocator, request, first_doc, &semantic)).?;
