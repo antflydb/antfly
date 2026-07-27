@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const contract = @import("pattern_filter_contract.zig");
 const regex_mod = @import("regex.zig");
 const levenshtein_mod = @import("levenshtein.zig");
 
@@ -27,7 +28,7 @@ pub fn storedDocMatchesPatternFilter(alloc: Allocator, key: []const u8, stored: 
 }
 
 pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.json.Value, filter_query: std.json.Value) !bool {
-    if (filter_query != .object) return error.InvalidArgument;
+    _ = try contract.requireSingleRoot(filter_query);
 
     if (filter_query.object.get("match_all") != null) return true;
     if (filter_query.object.get("match_none") != null) return false;
@@ -51,7 +52,10 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
 
     if (filter_query.object.get("bool")) |bool_query| {
         if (bool_query != .object) return error.InvalidArgument;
+        try contract.validateBool(bool_query.object);
 
+        const has_required = bool_query.object.get("must") != null or
+            bool_query.object.get("filter") != null;
         if (bool_query.object.get("must")) |must| {
             if (must != .array or must.array.items.len == 0) return error.InvalidArgument;
             for (must.array.items) |item| {
@@ -65,18 +69,26 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
             }
         }
 
-        var saw_should = false;
-        if (bool_query.object.get("should")) |should| {
-            if (should != .array or should.array.items.len == 0) return error.InvalidArgument;
-            saw_should = true;
-            var matched = false;
-            for (should.array.items) |item| {
+        const should_items = if (bool_query.object.get("should")) |should| blk: {
+            if (should != .array or should.array.items.len == 0) {
+                return error.InvalidArgument;
+            }
+            break :blk should.array.items;
+        } else &.{};
+        const min_should = try contract.minimumShould(
+            bool_query.object,
+            should_items.len,
+            has_required,
+        );
+        if (min_should > 0) {
+            var matched: usize = 0;
+            for (should_items) |item| {
                 if (try jsonDocMatchesPatternFilter(alloc, key, doc, item)) {
-                    matched = true;
-                    break;
+                    matched += 1;
+                    if (matched >= min_should) break;
                 }
             }
-            if (!matched) return false;
+            if (matched < min_should) return false;
         }
 
         if (bool_query.object.get("must_not")) |must_not| {
@@ -86,10 +98,6 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
             }
         }
 
-        if (bool_query.object.count() == 0) return error.InvalidArgument;
-        if (!saw_should and bool_query.object.get("must") == null and bool_query.object.get("filter") == null and bool_query.object.get("must_not") == null) {
-            return error.InvalidArgument;
-        }
         return true;
     }
 
@@ -319,6 +327,7 @@ fn jsonValuesContainFuzzy(alloc: Allocator, values: []const std.json.Value, fuzz
                     },
                     else => return error.InvalidArgument,
                 };
+                if (max_edits > contract.max_fuzzy_edits) return error.InvalidArgument;
             }
             if (object.get("prefix_length")) |prefix| {
                 prefix_len = switch (prefix) {
@@ -618,4 +627,40 @@ test "stored doc bool filter clauses are required with must clauses" {
         "{\"tenant\":\"acme\",\"tier\":\"silver\"}",
         "{\"bool\":{\"must\":[{\"term\":{\"tenant\":\"acme\"}}],\"filter\":[{\"term\":{\"tier\":\"gold\"}}]}}",
     )));
+}
+
+test "row filters enforce bool thresholds and fuzzy complexity bounds" {
+    const alloc = std.testing.allocator;
+    const stored = "{\"tenant\":\"acme\",\"tier\":\"gold\",\"region\":\"west\"}";
+
+    try std.testing.expect(try storedDocMatchesPatternFilter(
+        alloc,
+        "doc:gold",
+        stored,
+        "{\"bool\":{\"should\":[{\"term\":{\"tier\":\"gold\"}},{\"term\":{\"region\":\"west\"}},{\"term\":{\"tenant\":\"other\"}}],\"minimum_should_match\":2}}",
+    ));
+    try std.testing.expect(try storedDocMatchesPatternFilter(
+        alloc,
+        "doc:gold",
+        stored,
+        "{\"bool\":{\"must\":[{\"term\":{\"tenant\":\"acme\"}}],\"should\":[{\"term\":{\"tier\":\"missing\"}}]}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidArgument,
+        storedDocMatchesPatternFilter(
+            alloc,
+            "doc:gold",
+            stored,
+            "{\"fuzzy\":{\"tier\":{\"query\":\"gold\",\"max_edits\":3}}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidArgument,
+        storedDocMatchesPatternFilter(
+            alloc,
+            "doc:gold",
+            stored,
+            "{\"term\":{\"tier\":\"gold\"},\"prefix\":{\"tier\":\"g\"}}",
+        ),
+    );
 }

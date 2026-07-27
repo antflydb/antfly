@@ -20,6 +20,7 @@ const graph_pattern_mod = @import("../../../graph/pattern.zig");
 const fusion_mod = @import("../../../search/fusion.zig");
 const geo_mod = @import("../../../search/geo.zig");
 const levenshtein_mod = @import("../../../search/levenshtein.zig");
+const pattern_filter_contract = @import("../../../search/pattern_filter_contract.zig");
 const regex_mod = @import("../../../search/regex.zig");
 const doc_set = @import("../doc_set.zig");
 
@@ -1294,7 +1295,7 @@ pub fn storedDocMatchesPatternFilter(alloc: Allocator, key: []const u8, stored: 
 }
 
 pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.json.Value, filter_query: std.json.Value) !bool {
-    if (filter_query != .object) return error.InvalidArgument;
+    _ = try pattern_filter_contract.requireSingleRoot(filter_query);
 
     if (filter_query.object.get("match_all") != null) return true;
     if (filter_query.object.get("match_none") != null) return false;
@@ -1318,7 +1319,10 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
 
     if (filter_query.object.get("bool")) |bool_query| {
         if (bool_query != .object) return error.InvalidArgument;
+        try pattern_filter_contract.validateBool(bool_query.object);
 
+        const has_required = bool_query.object.get("must") != null or
+            bool_query.object.get("filter") != null;
         if (bool_query.object.get("must")) |must| {
             if (must != .array or must.array.items.len == 0) return error.InvalidArgument;
             for (must.array.items) |item| {
@@ -1332,18 +1336,26 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
             }
         }
 
-        var saw_should = false;
-        if (bool_query.object.get("should")) |should| {
-            if (should != .array or should.array.items.len == 0) return error.InvalidArgument;
-            saw_should = true;
-            var matched = false;
-            for (should.array.items) |item| {
+        const should_items = if (bool_query.object.get("should")) |should| blk: {
+            if (should != .array or should.array.items.len == 0) {
+                return error.InvalidArgument;
+            }
+            break :blk should.array.items;
+        } else &.{};
+        const min_should = try pattern_filter_contract.minimumShould(
+            bool_query.object,
+            should_items.len,
+            has_required,
+        );
+        if (min_should > 0) {
+            var matched: usize = 0;
+            for (should_items) |item| {
                 if (try jsonDocMatchesPatternFilter(alloc, key, doc, item)) {
-                    matched = true;
-                    break;
+                    matched += 1;
+                    if (matched >= min_should) break;
                 }
             }
-            if (!matched) return false;
+            if (matched < min_should) return false;
         }
 
         if (bool_query.object.get("must_not")) |must_not| {
@@ -1353,10 +1365,6 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
             }
         }
 
-        if (bool_query.object.count() == 0) return error.InvalidArgument;
-        if (!saw_should and bool_query.object.get("must") == null and bool_query.object.get("filter") == null and bool_query.object.get("must_not") == null) {
-            return error.InvalidArgument;
-        }
         return true;
     }
 
@@ -1398,7 +1406,7 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
 }
 
 pub fn patternFilterNeedsStoredDoc(filter_query: std.json.Value) !bool {
-    if (filter_query != .object) return error.InvalidArgument;
+    _ = try pattern_filter_contract.requireSingleRoot(filter_query);
 
     if (filter_query.object.get("match_all") != null) return false;
     if (filter_query.object.get("match_none") != null) return false;
@@ -1422,7 +1430,10 @@ pub fn patternFilterNeedsStoredDoc(filter_query: std.json.Value) !bool {
 
     if (filter_query.object.get("bool")) |bool_query| {
         if (bool_query != .object) return error.InvalidArgument;
+        try pattern_filter_contract.validateBool(bool_query.object);
 
+        const has_required = bool_query.object.get("must") != null or
+            bool_query.object.get("filter") != null;
         if (bool_query.object.get("must")) |must| {
             if (must != .array or must.array.items.len == 0) return error.InvalidArgument;
             for (must.array.items) |item| {
@@ -1436,14 +1447,15 @@ pub fn patternFilterNeedsStoredDoc(filter_query: std.json.Value) !bool {
             }
         }
 
-        var saw_should = false;
+        var should_len: usize = 0;
         if (bool_query.object.get("should")) |should| {
             if (should != .array or should.array.items.len == 0) return error.InvalidArgument;
-            saw_should = true;
+            should_len = should.array.items.len;
             for (should.array.items) |item| {
                 if (try patternFilterNeedsStoredDoc(item)) return true;
             }
         }
+        _ = try pattern_filter_contract.minimumShould(bool_query.object, should_len, has_required);
 
         if (bool_query.object.get("must_not")) |must_not| {
             if (must_not != .array or must_not.array.items.len == 0) return error.InvalidArgument;
@@ -1452,10 +1464,6 @@ pub fn patternFilterNeedsStoredDoc(filter_query: std.json.Value) !bool {
             }
         }
 
-        if (bool_query.object.count() == 0) return error.InvalidArgument;
-        if (!saw_should and bool_query.object.get("must") == null and bool_query.object.get("filter") == null and bool_query.object.get("must_not") == null) {
-            return error.InvalidArgument;
-        }
         return false;
     }
 
@@ -1475,6 +1483,7 @@ pub const CompiledPatternFilter = union(enum) {
         must: []CompiledPatternFilter = &.{},
         should: []CompiledPatternFilter = &.{},
         must_not: []CompiledPatternFilter = &.{},
+        min_should: usize = 0,
     };
 
     pub const FieldPath = union(enum) {
@@ -1588,15 +1597,15 @@ pub const CompiledPatternFilter = union(enum) {
                 for (bool_query.must) |item| {
                     if (!(try item.matches(alloc, key, doc))) break :blk false;
                 }
-                if (bool_query.should.len > 0) {
-                    var matched = false;
+                if (bool_query.min_should > 0) {
+                    var matched: usize = 0;
                     for (bool_query.should) |item| {
                         if (try item.matches(alloc, key, doc)) {
-                            matched = true;
-                            break;
+                            matched += 1;
+                            if (matched >= bool_query.min_should) break;
                         }
                     }
-                    if (!matched) break :blk false;
+                    if (matched < bool_query.min_should) break :blk false;
                 }
                 for (bool_query.must_not) |item| {
                     if (try item.matches(alloc, key, doc)) break :blk false;
@@ -1614,7 +1623,7 @@ pub const CompiledPatternFilter = union(enum) {
 };
 
 pub fn compilePatternFilter(alloc: Allocator, filter_query: std.json.Value) anyerror!CompiledPatternFilter {
-    if (filter_query != .object) return error.InvalidArgument;
+    _ = try pattern_filter_contract.requireSingleRoot(filter_query);
 
     if (filter_query.object.get("match_all") != null) return .match_all;
     if (filter_query.object.get("match_none") != null) return .match_none;
@@ -1629,6 +1638,7 @@ pub fn compilePatternFilter(alloc: Allocator, filter_query: std.json.Value) anye
     }
     if (filter_query.object.get("bool")) |bool_query| {
         if (bool_query != .object) return error.InvalidArgument;
+        try pattern_filter_contract.validateBool(bool_query.object);
         var compiled = CompiledPatternFilter.BoolQuery{};
         var must = std.ArrayListUnmanaged(CompiledPatternFilter).empty;
         errdefer must.deinit(alloc);
@@ -1637,8 +1647,11 @@ pub fn compilePatternFilter(alloc: Allocator, filter_query: std.json.Value) anye
         if (must.items.len > 0) compiled.must = try must.toOwnedSlice(alloc);
         if (bool_query.object.get("should")) |should| compiled.should = try compilePatternFilterArray(alloc, should);
         if (bool_query.object.get("must_not")) |must_not| compiled.must_not = try compilePatternFilterArray(alloc, must_not);
-        if (bool_query.object.count() == 0) return error.InvalidArgument;
-        if (compiled.should.len == 0 and compiled.must.len == 0 and compiled.must_not.len == 0) return error.InvalidArgument;
+        compiled.min_should = try pattern_filter_contract.minimumShould(
+            bool_query.object,
+            compiled.should.len,
+            compiled.must.len > 0,
+        );
         return .{ .bool_query = compiled };
     }
 
@@ -1937,6 +1950,9 @@ fn compilePatternFieldPredicate(alloc: Allocator, filter_query: std.json.Value) 
         return .{ .terms = (try extractPatternFieldTerms(alloc, terms)).terms };
     }
     if (filter_query.object.get("match")) |match| {
+        if (match == .object and match.object.get("analyzer") != null) {
+            return error.UnsupportedQueryRequest;
+        }
         return .{ .match = (try extractPatternFieldString(alloc, match, "text")).value };
     }
     if (filter_query.object.get("prefix")) |prefix| {
@@ -1952,7 +1968,13 @@ fn compilePatternFieldPredicate(alloc: Allocator, filter_query: std.json.Value) 
         return .{ .fuzzy = try compileFuzzyPredicate(alloc, try extractPatternFuzzyPredicate(fuzzy)) };
     }
     if (filter_query.object.get("numeric_range")) |range_query| return .{ .numeric_range = range_query };
-    if (filter_query.object.get("range")) |range_query| return .{ .standard_range = try extractStandardRangePredicate(range_query) };
+    if (filter_query.object.get("range")) |range_query| {
+        const predicate = try extractStandardRangePredicate(range_query);
+        const lower = try standardPatternRangeLowerBound(predicate);
+        const upper = try standardPatternRangeUpperBound(predicate);
+        if (lower == null and upper == null) return error.InvalidArgument;
+        return .{ .standard_range = predicate };
+    }
     if (filter_query.object.get("date_range")) |range_query| return .{ .date_range = range_query };
     if (filter_query.object.get("bool_field")) |bool_query| return .{ .bool_field = bool_query };
     if (filter_query.object.get("term_range")) |range_query| return .{ .term_range = range_query };
@@ -2160,6 +2182,9 @@ fn compileFuzzyPredicate(alloc: Allocator, fuzzy_query: std.json.Value) !Compile
                     },
                     else => return error.InvalidArgument,
                 };
+                if (max_edits > pattern_filter_contract.max_fuzzy_edits) {
+                    return error.InvalidArgument;
+                }
             }
             if (object.get("prefix_length")) |prefix| {
                 prefix_len = switch (prefix) {
@@ -2305,7 +2330,7 @@ fn standardPatternRangeUpperBound(range_query: std.json.Value) !?PatternJsonRang
 }
 
 fn setPatternJsonRangeBound(found: *?PatternJsonRangeBound, value: std.json.Value, inclusive: bool) !void {
-    if (found.* != null) return error.InvalidArgument;
+    if (found.* != null or value == .null) return error.InvalidArgument;
     found.* = .{ .value = value, .inclusive = inclusive };
 }
 
@@ -2984,6 +3009,89 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     try std.testing.expect(compiled == .bool_query);
     try std.testing.expectEqual(@as(usize, 2), compiled.bool_query.must.len);
     try std.testing.expect(try compiled.matches(alloc, "doc:b", parsed_geo_doc.value));
+}
+
+test "compiled stored filters preserve bool thresholds and reject unsafe leaves" {
+    const alloc = std.testing.allocator;
+    var doc = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"tenant":"acme","tier":"gold","region":"west","score":5}
+    ,
+        .{},
+    );
+    defer doc.deinit();
+
+    var threshold = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"bool":{"should":[{"term":{"tier":"gold"}},{"term":{"region":"west"}},{"term":{"tenant":"other"}}],"minimum_should_match":2}}
+    ,
+        .{},
+    );
+    defer threshold.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const compiled_threshold = try compilePatternFilter(arena.allocator(), threshold.value);
+    try std.testing.expectEqual(@as(usize, 2), compiled_threshold.bool_query.min_should);
+    try std.testing.expect(try compiled_threshold.matches(alloc, "doc:a", doc.value));
+
+    var required_with_optional_should = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"bool":{"must":[{"term":{"tenant":"acme"}}],"should":[{"term":{"tier":"missing"}}]}}
+    ,
+        .{},
+    );
+    defer required_with_optional_should.deinit();
+    const compiled_optional = try compilePatternFilter(
+        arena.allocator(),
+        required_with_optional_should.value,
+    );
+    try std.testing.expectEqual(@as(usize, 0), compiled_optional.bool_query.min_should);
+    try std.testing.expect(try compiled_optional.matches(alloc, "doc:a", doc.value));
+
+    inline for ([_]struct {
+        encoded: []const u8,
+        expected: anyerror,
+    }{
+        .{
+            .encoded =
+            \\{"term":{"tier":"gold"},"range":{"score":{"gte":1}}}
+            ,
+            .expected = error.InvalidArgument,
+        },
+        .{
+            .encoded =
+            \\{"range":{"score":{"gte":null}}}
+            ,
+            .expected = error.InvalidArgument,
+        },
+        .{
+            .encoded =
+            \\{"fuzzy":{"field":"tier","query":"gold","max_edits":3}}
+            ,
+            .expected = error.InvalidArgument,
+        },
+        .{
+            .encoded =
+            \\{"match":{"path":"tier","text":"gold","analyzer":"keyword"}}
+            ,
+            .expected = error.UnsupportedQueryRequest,
+        },
+    }) |case| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            case.encoded,
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectError(
+            case.expected,
+            compilePatternFilter(arena.allocator(), parsed.value),
+        );
+    }
 }
 
 test "stored structured filters preserve one-key field name collisions" {

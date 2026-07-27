@@ -5070,10 +5070,10 @@ fn appendCanonicalPublicQueryAlloc(
                 try appendScoringQueryClausesAlloc(alloc, scoring_should, should_value, limit);
             }
             if (bool_value.object.get("filter")) |filter_value| {
-                try appendRawStructuredFilterClausesAlloc(alloc, filter_clauses, filter_value);
+                try appendPublicFilterClausesAlloc(alloc, filter_clauses, filter_value, limit);
             }
             if (bool_value.object.get("must_not")) |must_not_value| {
-                try appendRawStructuredFilterClausesAlloc(alloc, exclusion_clauses, must_not_value);
+                try appendPublicFilterClausesAlloc(alloc, exclusion_clauses, must_not_value, limit);
             }
             return;
         }
@@ -5274,6 +5274,13 @@ fn appendRawStructuredFilterClausesAlloc(
         return;
     }
     if (!isStructuredFilterValue(query_or_queries)) return error.UnsupportedQueryRequest;
+    db_mod.validateStructuredFilterValueAlloc(alloc, query_or_queries) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.UnsupportedQueryRequest => error.UnsupportedQueryRequest,
+            else => error.InvalidQueryRequest,
+        };
+    };
     const encoded = try jsonStringifyAlloc(alloc, query_or_queries);
     errdefer alloc.free(encoded);
     try list.append(alloc, encoded);
@@ -8318,12 +8325,12 @@ test "api query contract preserves supported match options and rejects semantic 
         alloc,
         null,
         "files",
-        \\{"filter_query":{"match":"active user","field":"status","analyzer":"keyword"}}
+        \\{"filter_query":{"match":"active user","field":"status","analyzer":"tenant_search"}}
         ,
     );
     defer filtered.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "{\"match\":{\"path\":\"status\",\"text\":\"active user\",\"analyzer\":\"keyword\"}}",
+        "{\"match\":{\"path\":\"status\",\"text\":\"active user\",\"analyzer\":\"tenant_search\"}}",
         filtered.req.filter_query_json,
     );
 
@@ -8331,12 +8338,12 @@ test "api query contract preserves supported match options and rejects semantic 
         alloc,
         null,
         "files",
-        \\{"full_text_search":{"match":"active user","field":"status","analyzer":"keyword","boost":2}}
+        \\{"full_text_search":{"match":"active user","field":"status","analyzer":"tenant_search","boost":2}}
         ,
     );
     defer scored.deinit(alloc);
     try std.testing.expect(scored.req.full_text.? == .match);
-    try std.testing.expectEqualStrings("keyword", scored.req.full_text.?.match.analyzer.?);
+    try std.testing.expectEqualStrings("tenant_search", scored.req.full_text.?.match.analyzer.?);
     try std.testing.expectEqual(@as(f32, 2), scored.req.full_text.?.match.boost);
 
     inline for ([_][]const u8{
@@ -8422,6 +8429,18 @@ test "api query contract preserves schema-dependent canonical ranges" {
         "{\"range\":{\"price\":{\"gte\":10,\"lt\":20}}}",
         parsed.req.filter_query_json,
     );
+
+    inline for ([_][]const u8{
+        \\{"filter_query":{"range":{"price":{"gte":null}}}}
+        ,
+        \\{"filter_query":{"range":{"price":{"gte":10}},"term":{"path":"status","term":"active"}}}
+        ,
+    }) |invalid_body| {
+        try std.testing.expectError(
+            error.InvalidFilterQueryRequest,
+            parsePublicQueryRequest(alloc, null, "products", invalid_body),
+        );
+    }
 }
 
 test "api query contract classifies public phrase variants as unsupported" {
