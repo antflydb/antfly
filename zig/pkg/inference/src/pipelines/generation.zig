@@ -452,20 +452,25 @@ const FinalChannelRange = struct {
 
 fn completeFinalChannelRange(
     token_ids: []const i64,
-    marker_id: ?i32,
+    final_header_token_ids: []const i32,
+    channel_start_id: ?i32,
     turn_end_id: ?i32,
 ) ?FinalChannelRange {
-    const marker = marker_id orelse return null;
-    const turn_end = turn_end_id orelse return null;
-    var start: ?usize = null;
-    for (token_ids, 0..) |token_id, idx| {
-        if (token_id == marker) {
-            start = idx + 1;
-        } else if (token_id == turn_end) {
-            if (start) |channel_start| return .{ .start = channel_start, .end = idx };
+    const start = findTokenSequenceEndingAtOrAfter(
+        token_ids,
+        final_header_token_ids,
+        0,
+    ) orelse return null;
+    var end = token_ids.len;
+    for (token_ids[start..], start..) |token_id, idx| {
+        if ((turn_end_id != null and token_id == turn_end_id.?) or
+            (channel_start_id != null and token_id == channel_start_id.?))
+        {
+            end = idx;
+            break;
         }
     }
-    return null;
+    return .{ .start = start, .end = end };
 }
 
 fn finalChannelTokenSlice(token_ids: []const i64, marker_id: ?i32) []const i64 {
@@ -476,23 +481,31 @@ fn finalChannelTokenSlice(token_ids: []const i64, marker_id: ?i32) []const i64 {
 fn finalResponseTokenSlice(
     token_ids: []const i64,
     marker_id: ?i32,
+    final_header_token_ids: []const i32,
+    channel_start_id: ?i32,
     turn_end_id: ?i32,
     finish_reason: []const u8,
 ) []const i64 {
     if (marker_id == null or turn_end_id == null) return token_ids;
-    if (completeFinalChannelRange(token_ids, marker_id, turn_end_id)) |range| {
+    if (completeFinalChannelRange(
+        token_ids,
+        final_header_token_ids,
+        channel_start_id,
+        turn_end_id,
+    )) |range| {
         return token_ids[range.start..range.end];
     }
-    // Stop tokens are intentionally not appended to the generated sequence.
-    // A channel-aware completion can therefore contain the channel marker and
-    // final content without the sampled <turn|>. The same projection also
-    // preserves a partial final answer when the output budget is exhausted.
-    if (finalChannelContentStart(token_ids, marker_id)) |start| return token_ids[start..];
-    // If a channel-aware model exhausts its output budget before closing the
-    // reasoning channel, there is no final answer to expose. Fail closed rather
-    // than returning a private/incomplete reasoning trace. A normal EOS without
-    // a channel marker remains a valid direct-answer fallback.
-    if (std.mem.eql(u8, finish_reason, "length")) return token_ids[0..0];
+    // A channel boundary without the exact final-channel header is private or
+    // malformed protocol output. Fail closed rather than treating the last
+    // generic boundary as public content. This keeps buffered and streaming
+    // projections identical when a model emits another channel after `final`.
+    if (finalChannelContentStart(token_ids, marker_id) != null or
+        std.mem.eql(u8, finish_reason, "length"))
+    {
+        return token_ids[0..0];
+    }
+    // A normal EOS without any channel protocol remains a valid direct-answer
+    // fallback for compatible checkpoints that do not emit PLE channels.
     return token_ids;
 }
 
@@ -2747,29 +2760,30 @@ pub const NativeGenerationPipeline = struct {
             }
         }
         const stream_enabled = on_token_fn != null and on_token_ctx != null;
-        const streaming_final_channel_end = if (stream_enabled)
-            try self.resolveFinalChannelEndTokenId()
-        else
-            null;
-        const streaming_turn_end = if (stream_enabled)
+        // Resolve the channel protocol once for the whole request. Buffered and
+        // streaming callers must use the same exact final-header projection;
+        // resolving only the generic terminator at completion can expose a
+        // malformed trailing private channel.
+        const final_channel_end = try self.resolveFinalChannelEndTokenId();
+        const turn_end = if (final_channel_end != null)
             try self.resolveTurnEndTokenId()
         else
             null;
-        const streaming_channel_start = if (streaming_final_channel_end != null)
+        const channel_start = if (final_channel_end != null)
             try self.resolveChannelStartTokenId()
         else
             null;
-        const owned_final_channel_header = if (streaming_final_channel_end) |marker|
+        const owned_final_channel_header = if (final_channel_end) |marker|
             try self.resolveFinalChannelHeaderTokenIds(marker)
         else
             null;
         defer if (owned_final_channel_header) |ids| allocator.free(ids);
         var streaming_text = StreamingTextState{
             .emitted_text = if (stream_enabled) try allocator.dupe(u8, "") else &.{},
-            .final_channel_end_token_id = streaming_final_channel_end,
+            .final_channel_end_token_id = final_channel_end,
             .final_channel_header_token_ids = owned_final_channel_header orelse &.{},
-            .channel_start_token_id = streaming_channel_start,
-            .turn_end_token_id = streaming_turn_end,
+            .channel_start_token_id = channel_start,
+            .turn_end_token_id = turn_end,
         };
         defer if (stream_enabled) allocator.free(streaming_text.emitted_text);
         var penalty_state = SamplingPenaltyState.init(hasSamplingPenalties(config));
@@ -3290,17 +3304,13 @@ pub const NativeGenerationPipeline = struct {
         // public text and public token IDs from the same slice so callers cannot
         // reconstruct a withheld reasoning channel from GenerationResult.token_ids.
         const gen_start = prompt_token_count;
-        const final_channel_end_token_id = if (stream_enabled)
-            streaming_text.final_channel_end_token_id
-        else
-            try self.resolveFinalChannelEndTokenId();
-        const turn_end_token_id = if (stream_enabled)
-            streaming_text.turn_end_token_id
-        else
-            try self.resolveTurnEndTokenId();
+        const final_channel_end_token_id = streaming_text.final_channel_end_token_id;
+        const turn_end_token_id = streaming_text.turn_end_token_id;
         const projected_gen_token_ids = finalResponseTokenSlice(
             token_ids[gen_start..seq_len],
             final_channel_end_token_id,
+            streaming_text.final_channel_header_token_ids,
+            streaming_text.channel_start_token_id,
             turn_end_token_id,
             finish_reason,
         );
@@ -8077,20 +8087,47 @@ test "encodePromptForGeneration does not duplicate literal bos prefix" {
     try std.testing.expectEqual(@as(i32, 0), encoded.attention_mask[2]);
 }
 
-test "final channel projection keeps only tokens after the last channel boundary" {
-    const ids = [_]i64{ 7, 8, 101, 9, 101, 10, 106 };
-    try std.testing.expectEqual(@as(?usize, 5), finalChannelContentStart(&ids, 101));
+test "final channel projection requires exact header and stops before trailing channels" {
+    const header = [_]i32{ 102, 103, 104, 101 };
+    const ids = [_]i64{ 7, 101, 9, 102, 103, 104, 101, 10, 106 };
+    try std.testing.expectEqual(@as(?usize, 7), finalChannelContentStart(&ids, 101));
     try std.testing.expectEqualSlices(i64, &.{ 10, 106 }, finalChannelTokenSlice(&ids, 101));
     try std.testing.expectEqualSlices(i64, &ids, finalChannelTokenSlice(&ids, null));
     try std.testing.expectEqualSlices(i64, &ids, finalChannelTokenSlice(&ids, 999));
-    const range = completeFinalChannelRange(&ids, 101, 106) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(usize, 5), range.start);
-    try std.testing.expectEqual(@as(usize, 6), range.end);
-    try std.testing.expectEqualSlices(i64, &.{10}, finalResponseTokenSlice(&ids, 101, 106, "stop"));
-    try std.testing.expectEqualSlices(i64, &.{10}, finalResponseTokenSlice(&.{ 7, 101, 10 }, 101, 106, "stop"));
-    try std.testing.expectEqualSlices(i64, &.{10}, finalResponseTokenSlice(&.{ 7, 101, 10 }, 101, 106, "length"));
-    try std.testing.expectEqualSlices(i64, &.{}, finalResponseTokenSlice(&ids, 999, 106, "length"));
-    try std.testing.expectEqualSlices(i64, &ids, finalResponseTokenSlice(&ids, 999, 106, "stop"));
+    const range = completeFinalChannelRange(&ids, &header, 102, 106) orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 7), range.start);
+    try std.testing.expectEqual(@as(usize, 8), range.end);
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{10},
+        finalResponseTokenSlice(&ids, 101, &header, 102, 106, "stop"),
+    );
+
+    const malformed_trailing = [_]i64{
+        7,   101, 9,   102, 103, 104, 101, 10,
+        102, 103, 104, 101, 7,   106,
+    };
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{10},
+        finalResponseTokenSlice(&malformed_trailing, 101, &header, 102, 106, "stop"),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        finalResponseTokenSlice(&.{ 7, 101, 10 }, 101, &header, 102, 106, "stop"),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        finalResponseTokenSlice(&.{ 7, 8 }, 101, &header, 102, 106, "length"),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        finalResponseTokenSlice(&.{ 7, 8 }, 101, &header, 102, 106, "stop"),
+    );
 }
 
 test "streaming final channel projection ignores intermediate boundaries and streams final text" {

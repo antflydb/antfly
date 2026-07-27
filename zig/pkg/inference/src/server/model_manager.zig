@@ -1950,11 +1950,26 @@ fn estimateModelLoadAdmission(
             .pjrt => return error.UnsupportedBackend,
         };
     }
+    return nativeModelLoadAdmission(weights, backend);
+}
+
+fn nativeModelLoadAdmission(
+    weights: usize,
+    backend: backends.BackendType,
+) !runtime.tier.memory.AdmissionAmounts {
     return switch (backend) {
-        .metal, .cuda => .{
+        .metal => .{
             // Device weights plus conservative host-side import/repacking staging.
             .backend_weight_bytes = weights,
             .host_weight_bytes = weights / 4,
+        },
+        .cuda => .{
+            // CUDA construction currently builds a complete native session first,
+            // then uploads every resident weight before releasing the native copy.
+            // Admit that full host peak as well as device residency; charging only
+            // a repacking fraction allows large cold loads to pass and be OOM-killed.
+            .backend_weight_bytes = weights,
+            .host_weight_bytes = weights,
         },
         .native, .onnx, .wasm => .{
             // Native and ONNX importers may retain a source mapping while materializing
@@ -2222,6 +2237,17 @@ test "compatible artifact candidate wins aggregate compatibility" {
         model_compatibility.Level.compatible,
         selectBetterCompatibility(incompatible, compatible).level,
     );
+}
+
+test "cuda model admission includes full native staging peak" {
+    const weights: usize = 1024 * 1024;
+    const cuda = try nativeModelLoadAdmission(weights, .cuda);
+    try std.testing.expectEqual(weights, cuda.host_weight_bytes);
+    try std.testing.expectEqual(weights, cuda.backend_weight_bytes);
+
+    const metal = try nativeModelLoadAdmission(weights, .metal);
+    try std.testing.expectEqual(weights / 4, metal.host_weight_bytes);
+    try std.testing.expectEqual(weights, metal.backend_weight_bytes);
 }
 
 test "isManifestPotentiallyLoadableInCurrentBuild hides incomplete colqwen bundles" {

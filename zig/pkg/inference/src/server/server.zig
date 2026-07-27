@@ -595,6 +595,29 @@ fn addArtifactStatToSignature(
     signature.update(std.mem.asBytes(&stat.mtime));
 }
 
+fn addModelSidecarStatToSignature(
+    io: std.Io,
+    signature: *std.hash.Wyhash,
+    model_path: []const u8,
+    sidecar_name: []const u8,
+) void {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const separator = if (std.mem.endsWith(u8, model_path, "/")) "" else "/";
+    const path = std.fmt.bufPrint(
+        &path_buffer,
+        "{s}{s}{s}",
+        .{ model_path, separator, sidecar_name },
+    ) catch {
+        // Keep overlong paths distinct and deterministically uncacheable from a
+        // shorter valid sidecar path.
+        signature.update(model_path);
+        signature.update(sidecar_name);
+        signature.update("sidecar-path-too-long");
+        return;
+    };
+    addArtifactStatToSignature(io, signature, path);
+}
+
 fn addShardedArtifactStatsToSignature(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -618,6 +641,38 @@ fn addShardedArtifactStatsToSignature(
         defer allocator.free(shard_path);
         addArtifactStatToSignature(io, signature, shard_path);
     }
+}
+
+test "compatibility signature tracks classification sidecars" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const model_dir = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", tmp.sub_path[0..] },
+    );
+    defer allocator.free(model_dir);
+
+    var missing = std.hash.Wyhash.init(0);
+    addModelSidecarStatToSignature(
+        std.testing.io,
+        &missing,
+        model_dir,
+        "antfly_inference_bundle.json",
+    );
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "antfly_inference_bundle.json",
+        .data = "{\"family\":\"clipclap_gguf_bundle/v1\"}",
+    });
+    var present = std.hash.Wyhash.init(0);
+    addModelSidecarStatToSignature(
+        std.testing.io,
+        &present,
+        model_dir,
+        "antfly_inference_bundle.json",
+    );
+    try std.testing.expect(missing.final() != present.final());
 }
 
 /// Apply the serving policy before model loading. `ModelManager` repeats this check as a
@@ -1020,6 +1075,24 @@ pub const Node = struct {
             break :blk io_impl.?.io();
         };
         var signature = std.hash.Wyhash.init(0);
+        // These small sidecars change model type, canonical bundle identity, and
+        // completeness without necessarily changing an artifact path. Include
+        // their stats explicitly so a hot compatibility cache cannot retain the
+        // prior policy decision after an in-place model update.
+        for ([_][]const u8{
+            "antfly_inference_bundle.json",
+            "antfly_inference_variants.json",
+            "gliner_config.json",
+            "added_tokens.json",
+            "clip_config.json",
+        }) |sidecar_name| {
+            addModelSidecarStatToSignature(
+                io,
+                &signature,
+                model_path,
+                sidecar_name,
+            );
+        }
         addArtifactStatToSignature(io, &signature, man.model_manifest_path);
         addArtifactStatToSignature(io, &signature, man.config_path);
         addArtifactStatToSignature(io, &signature, man.gguf_path);

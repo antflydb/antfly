@@ -623,26 +623,57 @@ pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
 fn deriveLimitsForBackend(backend: BackendClass, info: SystemMemoryInfo) Limits {
     const total = info.total_bytes;
     const available = info.available_bytes orelse total;
-    const reserve_headroom = clampBytes(@max(total / 4, gib(6)), gib(4), gib(24));
+    const reserve_headroom = liveHostMemoryHeadroom(total);
     const safe_pool = available -| @min(available, reserve_headroom);
-    const usable = @max(safe_pool, gib(2));
 
     return switch (backend) {
-        .cpu => .{
-            .host_limit_bytes = clampBytes(usable / 2, gib(2), gib(8)),
-            .backend_limit_bytes = 0,
-            .combined_limit_bytes = clampBytes(usable / 2, gib(2), gib(8)),
-            .kv_limit_bytes = clampBytes(usable / 6, mib(512), gib(2)),
-            .scratch_limit_bytes = clampBytes(usable / 12, mib(256), gib(1)),
+        .cpu => blk: {
+            // Never let minimum tuning floors exceed the memory left after
+            // headroom. The live pressure check sees only materialized bytes;
+            // this stable cap also protects concurrent reservations that have
+            // not reached memory.current/MemAvailable yet.
+            const host_limit = @min(
+                clampBytes(safe_pool / 2, gib(2), gib(8)),
+                safe_pool,
+            );
+            break :blk .{
+                .host_limit_bytes = host_limit,
+                .backend_limit_bytes = 0,
+                .combined_limit_bytes = host_limit,
+                .kv_limit_bytes = @min(
+                    clampBytes(safe_pool / 6, mib(512), gib(2)),
+                    host_limit,
+                ),
+                .scratch_limit_bytes = @min(
+                    clampBytes(safe_pool / 12, mib(256), gib(1)),
+                    host_limit,
+                ),
+            };
         },
         .gpu => blk: {
-            const combined = clampBytes(usable / 2, gib(6), gib(12));
+            var combined = clampBytes(safe_pool / 2, gib(6), gib(12));
+            // Metal uses unified memory; discrete Linux GPU residency is not
+            // constrained by the process cgroup's host-memory limit.
+            if (builtin.os.tag == .macos) combined = @min(combined, safe_pool);
+            const host_limit = @min(
+                clampBytes(combined / 4, gib(1), gib(3)),
+                safe_pool,
+            );
             break :blk .{
-                .host_limit_bytes = clampBytes(combined / 4, gib(1), gib(3)),
-                .backend_limit_bytes = clampBytes((combined * 3) / 4, gib(4), gib(9)),
+                .host_limit_bytes = host_limit,
+                .backend_limit_bytes = @min(
+                    clampBytes((combined * 3) / 4, gib(4), gib(9)),
+                    combined,
+                ),
                 .combined_limit_bytes = combined,
-                .kv_limit_bytes = clampBytes(combined / 4, mib(768), gib(3)),
-                .scratch_limit_bytes = clampBytes(combined / 8, mib(384), gib(2)),
+                .kv_limit_bytes = @min(
+                    clampBytes(combined / 4, mib(768), gib(3)),
+                    combined,
+                ),
+                .scratch_limit_bytes = @min(
+                    clampBytes(combined / 8, mib(384), gib(2)),
+                    combined,
+                ),
             };
         },
     };
@@ -696,6 +727,15 @@ const CgroupMemoryInfo = struct {
     limit_bytes: ?usize = null,
     current_bytes: ?usize = null,
     available_bytes: ?usize = null,
+};
+
+const CgroupHierarchyProbe = struct {
+    info: CgroupMemoryInfo = .{},
+    /// True when the initially addressed process directory contained at least
+    /// one memory controller file. A finite ancestor alone is insufficient:
+    /// with a subtree bind mount it can be the mount root reached through an
+    /// incorrectly untrimmed host-side process path.
+    leaf_present: bool = false,
 };
 
 const CgroupPaths = struct {
@@ -1008,7 +1048,7 @@ fn readCgroupHierarchy(
     process_path: []const u8,
     limit_filename: []const u8,
     current_filename: []const u8,
-) CgroupMemoryInfo {
+) CgroupHierarchyProbe {
     const relative = cgroupPathRelativeToMount(process_path, mount_root) orelse return .{};
     var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
     var directory = cgroupDirectoryPath(
@@ -1016,12 +1056,13 @@ fn readCgroupHierarchy(
         mount_point,
         relative,
     ) orelse return .{};
+    const leaf_directory_len = directory.len;
     const hierarchy_root_len = if (std.mem.eql(u8, mount_point, "/"))
         @as(usize, 1)
     else
         std.mem.trimEnd(u8, mount_point, "/").len;
 
-    var result = CgroupMemoryInfo{};
+    var result = CgroupHierarchyProbe{};
     var limit_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     var current_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     while (directory.len >= hierarchy_root_len) {
@@ -1035,11 +1076,12 @@ fn readCgroupHierarchy(
             "{s}/{s}",
             .{ directory, current_filename },
         ) catch break;
-        accumulateCgroupLevel(
-            &result,
-            readLinuxUnsignedFile(limit_path),
-            readLinuxUnsignedFile(current_path),
-        );
+        const limit = readLinuxUnsignedFile(limit_path);
+        const current = readLinuxUnsignedFile(current_path);
+        if (directory.len == leaf_directory_len) {
+            result.leaf_present = limit != null or current != null;
+        }
+        accumulateCgroupLevel(&result.info, limit, current);
         if (directory.len == hierarchy_root_len) break;
         const parent = std.fs.path.dirname(directory) orelse break;
         if (parent.len < hierarchy_root_len) break;
@@ -1048,61 +1090,70 @@ fn readCgroupHierarchy(
     return result;
 }
 
+fn canonicalCgroupProbeIsAuthoritative(probe: CgroupHierarchyProbe) bool {
+    return probe.leaf_present and probe.info.limit_bytes != null;
+}
+
 fn probeCgroupMemoryInfoLinux() CgroupMemoryInfo {
     var cgroup_buffer: [4096]u8 = undefined;
     const cgroup_bytes = readSmallLinuxFile("/proc/self/cgroup", &cgroup_buffer) orelse
         return .{};
     const paths = parseCgroupPaths(cgroup_bytes);
+    var canonical_fallback = CgroupMemoryInfo{};
     if (paths.v2) |path| {
-        const info = readCgroupHierarchy(
+        const probe = readCgroupHierarchy(
             "/sys/fs/cgroup",
             "/",
             path,
             "memory.max",
             "memory.current",
         );
-        if (info.limit_bytes != null) return info;
+        if (canonicalCgroupProbeIsAuthoritative(probe)) return probe.info;
+        if (probe.info.limit_bytes != null) canonical_fallback = probe.info;
     }
     if (paths.v1_memory) |path| {
-        const info = readCgroupHierarchy(
+        const probe = readCgroupHierarchy(
             "/sys/fs/cgroup/memory",
             "/",
             path,
             "memory.limit_in_bytes",
             "memory.usage_in_bytes",
         );
-        if (info.limit_bytes != null) return info;
+        if (canonicalCgroupProbeIsAuthoritative(probe)) return probe.info;
+        if (canonical_fallback.limit_bytes == null and probe.info.limit_bytes != null)
+            canonical_fallback = probe.info;
     }
 
     // Canonical mounts cover the common container path without reparsing
-    // mountinfo on every admission. Resolve mount roots only for nonstandard
-    // or namespaced layouts.
+    // mountinfo on every admission. A finite ancestor is accepted on this fast
+    // path only when the addressed leaf itself exists; otherwise a subtree bind
+    // mount can make the canonical walk land on a looser mount-root limit.
     const mounts = probeCgroupMountsLinux();
     if (paths.v2) |path| {
         if (mounts.v2.valid()) {
-            const info = readCgroupHierarchy(
+            const probe = readCgroupHierarchy(
                 mounts.v2.mountPoint(),
                 mounts.v2.root(),
                 path,
                 "memory.max",
                 "memory.current",
             );
-            if (info.limit_bytes != null) return info;
+            if (probe.info.limit_bytes != null) return probe.info;
         }
     }
     if (paths.v1_memory) |path| {
         if (mounts.v1_memory.valid()) {
-            const info = readCgroupHierarchy(
+            const probe = readCgroupHierarchy(
                 mounts.v1_memory.mountPoint(),
                 mounts.v1_memory.root(),
                 path,
                 "memory.limit_in_bytes",
                 "memory.usage_in_bytes",
             );
-            if (info.limit_bytes != null) return info;
+            if (probe.info.limit_bytes != null) return probe.info;
         }
     }
-    return .{};
+    return canonical_fallback;
 }
 
 fn applyCgroupMemoryInfo(
@@ -1355,6 +1406,17 @@ test "cgroup mountinfo resolves controller roots and escaped mount paths" {
     );
 }
 
+test "canonical cgroup probe rejects ancestor-only subtree matches" {
+    try std.testing.expect(!canonicalCgroupProbeIsAuthoritative(.{
+        .info = .{ .limit_bytes = gib(8), .current_bytes = gib(6) },
+        .leaf_present = false,
+    }));
+    try std.testing.expect(canonicalCgroupProbeIsAuthoritative(.{
+        .info = .{ .limit_bytes = gib(2), .current_bytes = gib(1) },
+        .leaf_present = true,
+    }));
+}
+
 test "cgroup hierarchy uses finite parent limit beneath unlimited leaf" {
     var hierarchy = CgroupMemoryInfo{};
     // A v2 "max" leaf is represented as null and must not stop the ancestor walk.
@@ -1391,6 +1453,38 @@ test "live memory headroom scales down for constrained containers" {
             mib(128),
         ),
     );
+}
+
+test "derived host limits stay within constrained container safe pool" {
+    const cpu = deriveLimitsForBackend(.cpu, .{
+        .total_bytes = gib(2),
+        .available_bytes = gib(2),
+    });
+    try std.testing.expectEqual(gib(1), cpu.host_limit_bytes);
+    try std.testing.expectEqual(cpu.host_limit_bytes, cpu.combined_limit_bytes);
+    try std.testing.expect(cpu.kv_limit_bytes <= cpu.host_limit_bytes);
+    try std.testing.expect(cpu.scratch_limit_bytes <= cpu.host_limit_bytes);
+    var controller = AdmissionController{};
+    var first = try controller.tryAcquire(
+        cpu,
+        .{ .host_weight_bytes = mib(600) },
+        false,
+    );
+    defer first.release();
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        controller.tryAcquire(
+            cpu,
+            .{ .host_weight_bytes = mib(600) },
+            false,
+        ),
+    );
+
+    const gpu = deriveLimitsForBackend(.gpu, .{
+        .total_bytes = gib(2),
+        .available_bytes = gib(2),
+    });
+    try std.testing.expect(gpu.host_limit_bytes <= gib(1));
 }
 
 test "shared admission accounts for concurrent leases and releases capacity" {
