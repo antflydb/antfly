@@ -1074,51 +1074,51 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
             };
         }
 
-        fn observeSplit(_: *anyopaque, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
+        fn observeSplit(_: *anyopaque, _: u64, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
             return error.DocIdentityNamespaceMismatch;
         }
 
-        fn observeMerge(_: *anyopaque, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
+        fn observeMerge(_: *anyopaque, _: u64, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
             return error.DocIdentityNamespaceMismatch;
         }
 
-        fn prepareSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
+        fn prepareSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
             unreachable;
         }
 
-        fn startSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
+        fn startSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
             unreachable;
         }
 
-        fn bootstrapSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
+        fn bootstrapSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
             unreachable;
         }
 
-        fn catchUpSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
+        fn catchUpSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
             unreachable;
         }
 
-        fn finalizeSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
+        fn finalizeSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
             unreachable;
         }
 
-        fn rollbackSplit(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
+        fn rollbackSplit(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
             unreachable;
         }
 
-        fn acceptMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
+        fn acceptMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
             unreachable;
         }
 
-        fn catchUpMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
+        fn catchUpMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
             unreachable;
         }
 
-        fn finalizeMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
+        fn finalizeMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
             return error.DocIdentityNamespaceMismatch;
         }
 
-        fn rollbackMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
+        fn rollbackMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
             unreachable;
         }
     };
@@ -1281,51 +1281,51 @@ const TestShardOps = struct {
         };
     }
 
-    fn observeSplit(_: *anyopaque, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
+    fn observeSplit(_: *anyopaque, _: u64, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
         unreachable;
     }
 
-    fn observeMerge(_: *anyopaque, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
+    fn observeMerge(_: *anyopaque, _: u64, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
         unreachable;
     }
 
-    fn prepareSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
+    fn prepareSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
         unreachable;
     }
 
-    fn startSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
+    fn startSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
         unreachable;
     }
 
-    fn bootstrapSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
+    fn bootstrapSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
         unreachable;
     }
 
-    fn catchUpSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
+    fn catchUpSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
         unreachable;
     }
 
-    fn finalizeSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
+    fn finalizeSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
         unreachable;
     }
 
-    fn rollbackSplit(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
+    fn rollbackSplit(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
         unreachable;
     }
 
-    fn acceptMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
+    fn acceptMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
         unreachable;
     }
 
-    fn catchUpMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
+    fn catchUpMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
         unreachable;
     }
 
-    fn finalizeMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
+    fn finalizeMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
         unreachable;
     }
 
-    fn rollbackMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
+    fn rollbackMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
         unreachable;
     }
 };

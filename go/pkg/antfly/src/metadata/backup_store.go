@@ -17,6 +17,7 @@ package metadata
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	stdjson "encoding/json"
@@ -299,12 +300,20 @@ func decodeBackupMetadata(data []byte) (*backupMetadata, error) {
 }
 
 func writeJSONFileAtomically(ctx context.Context, filePath string, value any) error {
+	body, err := encodeBoundedJSON(value)
+	if err != nil {
+		return err
+	}
+	return writeBytesFileAtomically(ctx, filePath, body, false)
+}
+
+func encodeBoundedJSON(value any) ([]byte, error) {
 	var body bytes.Buffer
 	writer := &boundedWriter{writer: &body, remaining: maxBackupMetadataBytes}
 	if err := json.NewEncoder(writer).Encode(value); err != nil {
-		return fmt.Errorf("encoding metadata to JSON: %w", err)
+		return nil, fmt.Errorf("encoding metadata to JSON: %w", err)
 	}
-	return writeBytesFileAtomically(ctx, filePath, body.Bytes(), false)
+	return body.Bytes(), nil
 }
 
 // writeBytesFileAtomically publishes an exact byte sequence after fsyncing it.
@@ -359,6 +368,7 @@ func writeBytesFileAtomically(
 			}
 			return fmt.Errorf("publishing metadata file: %w", err)
 		}
+		_ = os.Remove(tempPath)
 	}
 	dirHandle, err := os.Open(dir) //#nosec G304 -- caller validates the destination directory
 	if err != nil {
@@ -368,7 +378,117 @@ func writeBytesFileAtomically(
 	if err := dirHandle.Sync(); err != nil {
 		return fmt.Errorf("syncing metadata directory: %w", err)
 	}
+	// The immutable destination is committed once the directory sync
+	// succeeds. A failed alias cleanup must not turn that durable success into
+	// an ambiguous client-visible failure; the deferred removal retries it.
 	return nil
+}
+
+func validateRepositoryRelativePath(name string) error {
+	if name == "" ||
+		filepath.IsAbs(name) ||
+		filepath.Clean(name) != name ||
+		name == ".." ||
+		strings.HasPrefix(name, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("invalid backup repository path %q", name)
+	}
+	return nil
+}
+
+func syncRepositoryDirectory(root *os.Root, name string) error {
+	dirName := filepath.Dir(name)
+	dir, err := root.Open(dirName)
+	if err != nil {
+		return fmt.Errorf("opening backup repository directory for sync: %w", err)
+	}
+	defer func() { _ = dir.Close() }()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("syncing backup repository directory: %w", err)
+	}
+	return nil
+}
+
+func writeBytesRootAtomically(
+	ctx context.Context,
+	root *os.Root,
+	name string,
+	body []byte,
+	replace bool,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validateRepositoryRelativePath(name); err != nil {
+		return err
+	}
+	if len(body) > maxBackupMetadataBytes {
+		return ErrBackupMetadataTooLarge
+	}
+
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return fmt.Errorf("generating temporary metadata name: %w", err)
+	}
+	tempName := filepath.Join(
+		filepath.Dir(name),
+		"."+filepath.Base(name)+".tmp-"+hex.EncodeToString(random[:]),
+	)
+	file, err := root.OpenFile(tempName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("creating temporary metadata file: %w", err)
+	}
+	defer func() {
+		_ = file.Close()
+		_ = root.Remove(tempName)
+	}()
+	if _, err := file.Write(body); err != nil {
+		return fmt.Errorf("writing metadata: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("syncing metadata file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("closing metadata file: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if replace {
+		if err := root.Rename(tempName, name); err != nil {
+			return fmt.Errorf("replacing metadata file: %w", err)
+		}
+	} else {
+		if err := root.Link(tempName, name); err != nil {
+			if os.IsExist(err) {
+				return fmt.Errorf("%w: %s", ErrBackupAlreadyExists, filepath.Base(name))
+			}
+			return fmt.Errorf("publishing metadata file: %w", err)
+		}
+		_ = root.Remove(tempName)
+	}
+	if err := syncRepositoryDirectory(root, name); err != nil {
+		return err
+	}
+	// The destination is durable now. Temporary-alias cleanup is best effort
+	// and cannot change the publication outcome.
+	return nil
+}
+
+func removeRootFileAndSyncDirectory(
+	ctx context.Context,
+	root *os.Root,
+	name string,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validateRepositoryRelativePath(name); err != nil {
+		return err
+	}
+	if err := root.Remove(name); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return syncRepositoryDirectory(root, name)
 }
 
 // newBackupStore authorizes a location against a named external_io connection
@@ -390,17 +510,25 @@ func newBackupStore(
 		return &s3BackupStore{s3Config: s3Config}, nil
 	}
 	store := &fileBackupStore{location: resolvedLocation}
-	if capability == "restore.read" {
-		root, err := config.OpenFilesystemPath(
+	var root *os.Root
+	if capability == "backup.write" {
+		root, err = config.OpenOrCreateFilesystemPath(
+			connection,
+			capability,
+			location,
+			0o750,
+		)
+	} else {
+		root, err = config.OpenFilesystemPath(
 			connection,
 			capability,
 			location,
 		)
-		if err != nil {
-			return nil, fmt.Errorf("anchoring filesystem backup location: %w", err)
-		}
-		store.root = root
 	}
+	if err != nil {
+		return nil, fmt.Errorf("anchoring filesystem backup location: %w", err)
+	}
+	store.root = root
 	return store, nil
 }
 
@@ -503,6 +631,20 @@ func (s *fileBackupStore) resolveAndValidate(id string) (string, error) {
 	return filePath, nil
 }
 
+func backupMetadataName(id string) (string, error) {
+	if err := common.ValidateBackupID(id); err != nil {
+		return "", err
+	}
+	return filepath.Base(id) + "-metadata.json", nil
+}
+
+func backupReservationName(id string) (string, error) {
+	if err := common.ValidateBackupID(id); err != nil {
+		return "", err
+	}
+	return filepath.Base(id) + "-reservation", nil
+}
+
 func (s *fileBackupStore) ResolvedLocation() string {
 	if strings.HasPrefix(s.location, "file://") {
 		return s.location
@@ -513,6 +655,18 @@ func (s *fileBackupStore) ResolvedLocation() string {
 func (s *fileBackupStore) EnsureMetadataAbsent(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if s.root != nil {
+		name, err := backupMetadataName(id)
+		if err != nil {
+			return err
+		}
+		if _, err := s.root.Stat(name); err == nil {
+			return fmt.Errorf("%w: %s", ErrBackupAlreadyExists, id)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("checking backup metadata %s: %w", name, err)
+		}
+		return nil
 	}
 	filePath, err := s.resolveAndValidate(id)
 	if err != nil {
@@ -559,11 +713,80 @@ func readFileBackupReservation(reservationPath string) (*backupReservation, erro
 	return decodeBackupReservation(body)
 }
 
+func readRootBackupReservation(
+	root *os.Root,
+	name string,
+) (*backupReservation, error) {
+	file, err := root.Open(name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() ||
+		info.Size() <= 0 ||
+		info.Size() > maxBackupReservationBytes {
+		return nil, errors.New("invalid backup reservation file identity")
+	}
+	body, err := io.ReadAll(io.LimitReader(file, maxBackupReservationBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	return decodeBackupReservation(body)
+}
+
+func (s *fileBackupStore) mutateRootBackupReservation(
+	ctx context.Context,
+	id string,
+	mutate backupReservationMutation,
+) (bool, error) {
+	name, err := backupReservationName(id)
+	if err != nil {
+		return false, err
+	}
+	lock, err := lockRepositoryFile(ctx, s.root, name+".lock")
+	if err != nil {
+		return false, fmt.Errorf("locking backup reservation: %w", err)
+	}
+	defer func() { _ = lock.Close() }()
+	current, err := readRootBackupReservation(s.root, name)
+	if err != nil {
+		return false, err
+	}
+	next, result, err := mutate(current)
+	if err != nil || next == nil {
+		return result, err
+	}
+	body, err := encodeBackupReservation(next)
+	if err != nil {
+		return false, err
+	}
+	if err := writeBytesRootAtomically(
+		ctx,
+		s.root,
+		name,
+		body,
+		current != nil,
+	); err != nil {
+		return false, err
+	}
+	return result, nil
+}
+
 func (s *fileBackupStore) mutateBackupReservation(
 	ctx context.Context,
 	id string,
 	mutate backupReservationMutation,
 ) (bool, error) {
+	if s.root != nil {
+		return s.mutateRootBackupReservation(ctx, id, mutate)
+	}
 	reservationPath, err := s.reservationPath(id)
 	if err != nil {
 		return false, err
@@ -688,6 +911,13 @@ func removeFileAndSyncDirectory(ctx context.Context, filePath string) error {
 }
 
 func (s *fileBackupStore) DeleteMetadata(ctx context.Context, id string) error {
+	if s.root != nil {
+		name, err := backupMetadataName(id)
+		if err != nil {
+			return err
+		}
+		return removeRootFileAndSyncDirectory(ctx, s.root, name)
+	}
 	filePath, err := s.resolveAndValidate(id)
 	if err != nil {
 		return err
@@ -698,6 +928,9 @@ func (s *fileBackupStore) DeleteMetadata(ctx context.Context, id string) error {
 func (s *fileBackupStore) DeleteArtifact(ctx context.Context, name string) error {
 	if name == "" || filepath.Base(name) != name {
 		return fmt.Errorf("invalid backup artifact name %q", name)
+	}
+	if s.root != nil {
+		return removeRootFileAndSyncDirectory(ctx, s.root, name)
 	}
 	root := strings.TrimPrefix(s.location, "file://")
 	return removeFileAndSyncDirectory(ctx, filepath.Join(root, name))
@@ -838,6 +1071,19 @@ func (s *fileBackupStore) WriteMetadata(
 	filePath, err := s.resolveAndValidate(id)
 	if err != nil {
 		return err
+	}
+	if s.root != nil {
+		body, err := encodeBoundedJSON(metadata)
+		if err != nil {
+			return err
+		}
+		return writeBytesRootAtomically(
+			ctx,
+			s.root,
+			filepath.Base(filePath),
+			body,
+			false,
+		)
 	}
 	return writeJSONFileAtomically(ctx, filePath, metadata)
 }

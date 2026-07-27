@@ -31,43 +31,44 @@ const RollbackMerge = std.meta.fieldInfo(metadata_actions.TransitionAction, .rol
 pub const ShardOperationAdapter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    context_id: u64 = 0,
 
     pub const VTable = struct {
-        observe_split: *const fn (ptr: *anyopaque, record: metadata_state.SplitTransitionRecord) anyerror!metadata_state.SplitObservation,
-        observe_merge: *const fn (ptr: *anyopaque, record: metadata_state.MergeTransitionRecord) anyerror!metadata_state.MergeObservation,
-        prepare_split_source: *const fn (ptr: *anyopaque, op: PrepareSplitSource) anyerror!void,
-        start_split_source: *const fn (ptr: *anyopaque, op: StartSplitSource) anyerror!void,
-        bootstrap_split_destination: *const fn (ptr: *anyopaque, op: BootstrapSplitDestination) anyerror!void,
-        catch_up_split_destination: *const fn (ptr: *anyopaque, op: CatchUpSplitDestination) anyerror!void,
-        finalize_split_source: *const fn (ptr: *anyopaque, op: FinalizeSplitSource) anyerror!void,
-        rollback_split: *const fn (ptr: *anyopaque, op: RollbackSplit) anyerror!void,
-        accept_merge_receiver: *const fn (ptr: *anyopaque, op: AcceptMergeReceiver) anyerror!void,
-        catch_up_merge_receiver: *const fn (ptr: *anyopaque, op: CatchUpMergeReceiver) anyerror!void,
-        finalize_merge: *const fn (ptr: *anyopaque, op: FinalizeMerge) anyerror!void,
-        rollback_merge: *const fn (ptr: *anyopaque, op: RollbackMerge) anyerror!void,
+        observe_split: *const fn (ptr: *anyopaque, context_id: u64, record: metadata_state.SplitTransitionRecord) anyerror!metadata_state.SplitObservation,
+        observe_merge: *const fn (ptr: *anyopaque, context_id: u64, record: metadata_state.MergeTransitionRecord) anyerror!metadata_state.MergeObservation,
+        prepare_split_source: *const fn (ptr: *anyopaque, context_id: u64, op: PrepareSplitSource) anyerror!void,
+        start_split_source: *const fn (ptr: *anyopaque, context_id: u64, op: StartSplitSource) anyerror!void,
+        bootstrap_split_destination: *const fn (ptr: *anyopaque, context_id: u64, op: BootstrapSplitDestination) anyerror!void,
+        catch_up_split_destination: *const fn (ptr: *anyopaque, context_id: u64, op: CatchUpSplitDestination) anyerror!void,
+        finalize_split_source: *const fn (ptr: *anyopaque, context_id: u64, op: FinalizeSplitSource) anyerror!void,
+        rollback_split: *const fn (ptr: *anyopaque, context_id: u64, op: RollbackSplit) anyerror!void,
+        accept_merge_receiver: *const fn (ptr: *anyopaque, context_id: u64, op: AcceptMergeReceiver) anyerror!void,
+        catch_up_merge_receiver: *const fn (ptr: *anyopaque, context_id: u64, op: CatchUpMergeReceiver) anyerror!void,
+        finalize_merge: *const fn (ptr: *anyopaque, context_id: u64, op: FinalizeMerge) anyerror!void,
+        rollback_merge: *const fn (ptr: *anyopaque, context_id: u64, op: RollbackMerge) anyerror!void,
     };
 
     pub fn observeSplit(self: ShardOperationAdapter, record: metadata_state.SplitTransitionRecord) !metadata_state.SplitObservation {
-        return try self.vtable.observe_split(self.ptr, record);
+        return try self.vtable.observe_split(self.ptr, self.context_id, record);
     }
 
     pub fn observeMerge(self: ShardOperationAdapter, record: metadata_state.MergeTransitionRecord) !metadata_state.MergeObservation {
-        return try self.vtable.observe_merge(self.ptr, record);
+        return try self.vtable.observe_merge(self.ptr, self.context_id, record);
     }
 
     pub fn execute(self: ShardOperationAdapter, action: metadata_actions.TransitionAction) !void {
         switch (action) {
             .none => {},
-            .prepare_split_source => |op| try self.vtable.prepare_split_source(self.ptr, op),
-            .start_split_source => |op| try self.vtable.start_split_source(self.ptr, op),
-            .bootstrap_split_destination => |op| try self.vtable.bootstrap_split_destination(self.ptr, op),
-            .catch_up_split_destination => |op| try self.vtable.catch_up_split_destination(self.ptr, op),
-            .finalize_split_source => |op| try self.vtable.finalize_split_source(self.ptr, op),
-            .rollback_split => |op| try self.vtable.rollback_split(self.ptr, op),
-            .accept_merge_receiver => |op| try self.vtable.accept_merge_receiver(self.ptr, op),
-            .catch_up_merge_receiver => |op| try self.vtable.catch_up_merge_receiver(self.ptr, op),
-            .finalize_merge => |op| try self.vtable.finalize_merge(self.ptr, op),
-            .rollback_merge => |op| try self.vtable.rollback_merge(self.ptr, op),
+            .prepare_split_source => |op| try self.vtable.prepare_split_source(self.ptr, self.context_id, op),
+            .start_split_source => |op| try self.vtable.start_split_source(self.ptr, self.context_id, op),
+            .bootstrap_split_destination => |op| try self.vtable.bootstrap_split_destination(self.ptr, self.context_id, op),
+            .catch_up_split_destination => |op| try self.vtable.catch_up_split_destination(self.ptr, self.context_id, op),
+            .finalize_split_source => |op| try self.vtable.finalize_split_source(self.ptr, self.context_id, op),
+            .rollback_split => |op| try self.vtable.rollback_split(self.ptr, self.context_id, op),
+            .accept_merge_receiver => |op| try self.vtable.accept_merge_receiver(self.ptr, self.context_id, op),
+            .catch_up_merge_receiver => |op| try self.vtable.catch_up_merge_receiver(self.ptr, self.context_id, op),
+            .finalize_merge => |op| try self.vtable.finalize_merge(self.ptr, self.context_id, op),
+            .rollback_merge => |op| try self.vtable.rollback_merge(self.ptr, self.context_id, op),
         }
     }
 
@@ -103,9 +104,14 @@ pub const ShardOperationAdapter = struct {
 /// callback state is alive; retiring that registration closes admission and
 /// waits for callbacks already in flight.
 pub const OwnedShardOperationAdapter = struct {
+    const registry_bucket_count = 64;
+
     const State = struct {
         alloc: std.mem.Allocator,
         downstream: ShardOperationAdapter,
+        context_id: u64,
+        registry_next: ?*State = null,
+        registered: bool = false,
         mutex: std.Io.Mutex = .init,
         drained: std.Io.Condition = .init,
         accepting: bool = true,
@@ -140,24 +146,51 @@ pub const OwnedShardOperationAdapter = struct {
             }
         }
 
-        fn acquire(self: *State) !CallLease {
-            self.lock();
-            defer self.unlock();
-            if (!self.accepting) return error.TransitionOperationsRetired;
-            self.active_calls = std.math.add(usize, self.active_calls, 1) catch
-                return error.TransitionOperationLeaseOverflow;
-            return .{ .state = self };
-        }
-
         fn retireAndDrain(self: *State) void {
+            const bucket = registryBucket(self.context_id);
+            bucket.lock();
             self.lock();
-            defer self.unlock();
+            if (self.registered) {
+                var link = &bucket.head;
+                while (link.*) |candidate| {
+                    if (candidate == self) {
+                        link.* = candidate.registry_next;
+                        break;
+                    }
+                    link = &candidate.registry_next;
+                }
+                self.registry_next = null;
+                self.registered = false;
+            }
+            // Removing the state from the registry closes admission before the
+            // active-call drain. A callback that was dispatched but had not yet
+            // acquired its lease now fails through the registry without ever
+            // dereferencing this state.
             self.accepting = false;
+            bucket.unlock();
+            defer self.unlock();
             while (self.active_calls != 0) {
                 self.drained.waitUncancelable(std.Options.debug_io, &self.mutex);
             }
         }
     };
+
+    const RegistryBucket = struct {
+        mutex: std.Io.Mutex = .init,
+        head: ?*State = null,
+
+        fn lock(self: *RegistryBucket) void {
+            self.mutex.lockUncancelable(std.Options.debug_io);
+        }
+
+        fn unlock(self: *RegistryBucket) void {
+            self.mutex.unlock(std.Options.debug_io);
+        }
+    };
+
+    var registry_buckets: [registry_bucket_count]RegistryBucket =
+        [_]RegistryBucket{.{}} ** registry_bucket_count;
+    var next_context_id: std.atomic.Value(u64) = .init(1);
 
     const CallLease = struct {
         state: *State,
@@ -172,6 +205,47 @@ pub const OwnedShardOperationAdapter = struct {
             self.* = undefined;
         }
     };
+
+    fn registryBucket(context_id: u64) *RegistryBucket {
+        return &registry_buckets[@intCast(context_id % registry_bucket_count)];
+    }
+
+    fn allocateContextId() u64 {
+        const context_id = next_context_id.fetchAdd(1, .monotonic);
+        if (context_id == 0 or context_id == std.math.maxInt(u64)) {
+            @panic("shard operation adapter context id exhausted");
+        }
+        return context_id;
+    }
+
+    fn registerState(state: *State) void {
+        const bucket = registryBucket(state.context_id);
+        bucket.lock();
+        defer bucket.unlock();
+        state.registry_next = bucket.head;
+        state.registered = true;
+        bucket.head = state;
+    }
+
+    fn acquireRegistered(ptr: *anyopaque, context_id: u64) !CallLease {
+        if (context_id == 0) return error.TransitionOperationsRetired;
+        const bucket = registryBucket(context_id);
+        bucket.lock();
+        defer bucket.unlock();
+
+        const target_address = @intFromPtr(ptr);
+        var candidate = bucket.head;
+        while (candidate) |state| : (candidate = state.registry_next) {
+            if (state.context_id != context_id or @intFromPtr(state) != target_address) continue;
+            state.lock();
+            defer state.unlock();
+            if (!state.accepting) return error.TransitionOperationsRetired;
+            state.active_calls = std.math.add(usize, state.active_calls, 1) catch
+                return error.TransitionOperationLeaseOverflow;
+            return .{ .state = state };
+        }
+        return error.TransitionOperationsRetired;
+    }
 
     pub const Registration = struct {
         state: ?*State,
@@ -194,7 +268,9 @@ pub const OwnedShardOperationAdapter = struct {
         state.* = .{
             .alloc = alloc,
             .downstream = downstream,
+            .context_id = allocateContextId(),
         };
+        registerState(state);
         return .{ .state = state };
     }
 
@@ -215,6 +291,7 @@ pub const OwnedShardOperationAdapter = struct {
         const state = self.state orelse @panic("retired shard operation adapter");
         return .{
             .ptr = state,
+            .context_id = state.context_id,
             .vtable = &.{
                 .observe_split = observeSplit,
                 .observe_merge = observeMerge,
@@ -234,92 +311,92 @@ pub const OwnedShardOperationAdapter = struct {
 
     fn observeSplit(
         ptr: *anyopaque,
+        context_id: u64,
         record: metadata_state.SplitTransitionRecord,
     ) !metadata_state.SplitObservation {
-        const state: *State = @ptrCast(@alignCast(ptr));
-        var lease = try state.acquire();
+        var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
-        return try state.downstream.observeSplit(record);
+        return try lease.state.downstream.observeSplit(record);
     }
 
     fn observeMerge(
         ptr: *anyopaque,
+        context_id: u64,
         record: metadata_state.MergeTransitionRecord,
     ) !metadata_state.MergeObservation {
-        const state: *State = @ptrCast(@alignCast(ptr));
-        var lease = try state.acquire();
+        var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
-        return try state.downstream.observeMerge(record);
+        return try lease.state.downstream.observeMerge(record);
     }
 
-    fn prepareSplitSource(ptr: *anyopaque, op: PrepareSplitSource) !void {
-        const state: *State = @ptrCast(@alignCast(ptr));
-        var lease = try state.acquire();
+    fn prepareSplitSource(ptr: *anyopaque, context_id: u64, op: PrepareSplitSource) !void {
+        var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
-        try state.downstream.vtable.prepare_split_source(state.downstream.ptr, op);
+        const downstream = lease.state.downstream;
+        try downstream.vtable.prepare_split_source(downstream.ptr, downstream.context_id, op);
     }
 
-    fn startSplitSource(ptr: *anyopaque, op: StartSplitSource) !void {
-        const state: *State = @ptrCast(@alignCast(ptr));
-        var lease = try state.acquire();
+    fn startSplitSource(ptr: *anyopaque, context_id: u64, op: StartSplitSource) !void {
+        var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
-        try state.downstream.vtable.start_split_source(state.downstream.ptr, op);
+        const downstream = lease.state.downstream;
+        try downstream.vtable.start_split_source(downstream.ptr, downstream.context_id, op);
     }
 
-    fn bootstrapSplitDestination(ptr: *anyopaque, op: BootstrapSplitDestination) !void {
-        const state: *State = @ptrCast(@alignCast(ptr));
-        var lease = try state.acquire();
+    fn bootstrapSplitDestination(ptr: *anyopaque, context_id: u64, op: BootstrapSplitDestination) !void {
+        var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
-        try state.downstream.vtable.bootstrap_split_destination(state.downstream.ptr, op);
+        const downstream = lease.state.downstream;
+        try downstream.vtable.bootstrap_split_destination(downstream.ptr, downstream.context_id, op);
     }
 
-    fn catchUpSplitDestination(ptr: *anyopaque, op: CatchUpSplitDestination) !void {
-        const state: *State = @ptrCast(@alignCast(ptr));
-        var lease = try state.acquire();
+    fn catchUpSplitDestination(ptr: *anyopaque, context_id: u64, op: CatchUpSplitDestination) !void {
+        var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
-        try state.downstream.vtable.catch_up_split_destination(state.downstream.ptr, op);
+        const downstream = lease.state.downstream;
+        try downstream.vtable.catch_up_split_destination(downstream.ptr, downstream.context_id, op);
     }
 
-    fn finalizeSplitSource(ptr: *anyopaque, op: FinalizeSplitSource) !void {
-        const state: *State = @ptrCast(@alignCast(ptr));
-        var lease = try state.acquire();
+    fn finalizeSplitSource(ptr: *anyopaque, context_id: u64, op: FinalizeSplitSource) !void {
+        var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
-        try state.downstream.vtable.finalize_split_source(state.downstream.ptr, op);
+        const downstream = lease.state.downstream;
+        try downstream.vtable.finalize_split_source(downstream.ptr, downstream.context_id, op);
     }
 
-    fn rollbackSplit(ptr: *anyopaque, op: RollbackSplit) !void {
-        const state: *State = @ptrCast(@alignCast(ptr));
-        var lease = try state.acquire();
+    fn rollbackSplit(ptr: *anyopaque, context_id: u64, op: RollbackSplit) !void {
+        var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
-        try state.downstream.vtable.rollback_split(state.downstream.ptr, op);
+        const downstream = lease.state.downstream;
+        try downstream.vtable.rollback_split(downstream.ptr, downstream.context_id, op);
     }
 
-    fn acceptMergeReceiver(ptr: *anyopaque, op: AcceptMergeReceiver) !void {
-        const state: *State = @ptrCast(@alignCast(ptr));
-        var lease = try state.acquire();
+    fn acceptMergeReceiver(ptr: *anyopaque, context_id: u64, op: AcceptMergeReceiver) !void {
+        var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
-        try state.downstream.vtable.accept_merge_receiver(state.downstream.ptr, op);
+        const downstream = lease.state.downstream;
+        try downstream.vtable.accept_merge_receiver(downstream.ptr, downstream.context_id, op);
     }
 
-    fn catchUpMergeReceiver(ptr: *anyopaque, op: CatchUpMergeReceiver) !void {
-        const state: *State = @ptrCast(@alignCast(ptr));
-        var lease = try state.acquire();
+    fn catchUpMergeReceiver(ptr: *anyopaque, context_id: u64, op: CatchUpMergeReceiver) !void {
+        var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
-        try state.downstream.vtable.catch_up_merge_receiver(state.downstream.ptr, op);
+        const downstream = lease.state.downstream;
+        try downstream.vtable.catch_up_merge_receiver(downstream.ptr, downstream.context_id, op);
     }
 
-    fn finalizeMerge(ptr: *anyopaque, op: FinalizeMerge) !void {
-        const state: *State = @ptrCast(@alignCast(ptr));
-        var lease = try state.acquire();
+    fn finalizeMerge(ptr: *anyopaque, context_id: u64, op: FinalizeMerge) !void {
+        var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
-        try state.downstream.vtable.finalize_merge(state.downstream.ptr, op);
+        const downstream = lease.state.downstream;
+        try downstream.vtable.finalize_merge(downstream.ptr, downstream.context_id, op);
     }
 
-    fn rollbackMerge(ptr: *anyopaque, op: RollbackMerge) !void {
-        const state: *State = @ptrCast(@alignCast(ptr));
-        var lease = try state.acquire();
+    fn rollbackMerge(ptr: *anyopaque, context_id: u64, op: RollbackMerge) !void {
+        var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
-        try state.downstream.vtable.rollback_merge(state.downstream.ptr, op);
+        const downstream = lease.state.downstream;
+        try downstream.vtable.rollback_merge(downstream.ptr, downstream.context_id, op);
     }
 };
 
@@ -347,7 +424,7 @@ test "shard operation adapter metadata runtime dispatches actions" {
             };
         }
 
-        fn observeSplit(_: *anyopaque, _: metadata_state.SplitTransitionRecord) !metadata_state.SplitObservation {
+        fn observeSplit(_: *anyopaque, _: u64, _: metadata_state.SplitTransitionRecord) !metadata_state.SplitObservation {
             return .{
                 .status = .{
                     .phase = .prepare,
@@ -363,7 +440,7 @@ test "shard operation adapter metadata runtime dispatches actions" {
             };
         }
 
-        fn observeMerge(_: *anyopaque, record: metadata_state.MergeTransitionRecord) !metadata_state.MergeObservation {
+        fn observeMerge(_: *anyopaque, _: u64, record: metadata_state.MergeTransitionRecord) !metadata_state.MergeObservation {
             const status = @import("../data/mod.zig").MergeTransitionStatus{
                 .phase = .prepare,
                 .donor_group_id = record.donor_group_id,
@@ -380,20 +457,20 @@ test "shard operation adapter metadata runtime dispatches actions" {
             return .{ .donor = status, .receiver = status };
         }
 
-        fn prepareSplitSource(ptr: *anyopaque, _: PrepareSplitSource) !void {
+        fn prepareSplitSource(ptr: *anyopaque, _: u64, _: PrepareSplitSource) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.split_prepared = true;
         }
 
-        fn noopStartSplitSource(_: *anyopaque, _: StartSplitSource) !void {}
-        fn noopBootstrapSplitDestination(_: *anyopaque, _: BootstrapSplitDestination) !void {}
-        fn noopCatchUpSplitDestination(_: *anyopaque, _: CatchUpSplitDestination) !void {}
-        fn noopFinalizeSplitSource(_: *anyopaque, _: FinalizeSplitSource) !void {}
-        fn noopRollbackSplit(_: *anyopaque, _: RollbackSplit) !void {}
-        fn noopAcceptMergeReceiver(_: *anyopaque, _: AcceptMergeReceiver) !void {}
-        fn noopCatchUpMergeReceiver(_: *anyopaque, _: CatchUpMergeReceiver) !void {}
-        fn noopFinalizeMerge(_: *anyopaque, _: FinalizeMerge) !void {}
-        fn noopRollbackMerge(_: *anyopaque, _: RollbackMerge) !void {}
+        fn noopStartSplitSource(_: *anyopaque, _: u64, _: StartSplitSource) !void {}
+        fn noopBootstrapSplitDestination(_: *anyopaque, _: u64, _: BootstrapSplitDestination) !void {}
+        fn noopCatchUpSplitDestination(_: *anyopaque, _: u64, _: CatchUpSplitDestination) !void {}
+        fn noopFinalizeSplitSource(_: *anyopaque, _: u64, _: FinalizeSplitSource) !void {}
+        fn noopRollbackSplit(_: *anyopaque, _: u64, _: RollbackSplit) !void {}
+        fn noopAcceptMergeReceiver(_: *anyopaque, _: u64, _: AcceptMergeReceiver) !void {}
+        fn noopCatchUpMergeReceiver(_: *anyopaque, _: u64, _: CatchUpMergeReceiver) !void {}
+        fn noopFinalizeMerge(_: *anyopaque, _: u64, _: FinalizeMerge) !void {}
+        fn noopRollbackMerge(_: *anyopaque, _: u64, _: RollbackMerge) !void {}
     };
 
     var fake = Fake{};
@@ -428,6 +505,22 @@ test "shard operation adapter metadata runtime dispatches actions" {
         .destination_group_id = 21,
     });
     registration.deinit();
+    try std.testing.expectError(
+        error.TransitionOperationsRetired,
+        guarded.observeSplit(.{
+            .transition_id = 2,
+            .attempt_epoch = 1,
+            .source_group_id = 20,
+            .destination_group_id = 21,
+        }),
+    );
+
+    // Plain adapter values may outlive their owner. They must fail through the
+    // registry without dereferencing state that has already been destroyed.
+    owned.deinit();
+    var replacement = try OwnedShardOperationAdapter.init(std.testing.allocator, fake.adapter());
+    defer replacement.deinit();
+    try std.testing.expect(guarded.context_id != replacement.adapter().context_id);
     try std.testing.expectError(
         error.TransitionOperationsRetired,
         guarded.observeSplit(.{

@@ -5983,7 +5983,7 @@ pub const DataServer = struct {
         return try fallback.adapter().schemaIndexReady(alloc, table_name, group_id, schema_version, read_schema_version);
     }
 
-    fn localObserveSplit(ptr: *anyopaque, record: antfly.metadata.SplitTransitionRecord) !antfly.metadata.transition_state.SplitObservation {
+    fn localObserveSplit(ptr: *anyopaque, _: u64, record: antfly.metadata.SplitTransitionRecord) !antfly.metadata.transition_state.SplitObservation {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.local_transition_runtime) |runtime| return try runtime.shardOperationAdapter().observeSplit(record);
         if (self.data_raft != null) {
@@ -6059,7 +6059,7 @@ pub const DataServer = struct {
         self.local_transition_mutex.unlock();
     }
 
-    fn localObserveMerge(ptr: *anyopaque, record: antfly.metadata.MergeTransitionRecord) !antfly.metadata.transition_state.MergeObservation {
+    fn localObserveMerge(ptr: *anyopaque, _: u64, record: antfly.metadata.MergeTransitionRecord) !antfly.metadata.transition_state.MergeObservation {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.local_transition_runtime) |runtime| return try runtime.shardOperationAdapter().observeMerge(record);
         self.lockLocalTransition();
@@ -6070,7 +6070,7 @@ pub const DataServer = struct {
         return .{ .donor = status, .receiver = status };
     }
 
-    fn localPrepareSplitSource(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "prepare_split_source")) !void {
+    fn localPrepareSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "prepare_split_source")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
@@ -6090,7 +6090,7 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
     }
 
-    fn localStartSplitSource(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "start_split_source")) !void {
+    fn localStartSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "start_split_source")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
@@ -6110,7 +6110,7 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
     }
 
-    fn localBootstrapSplitDestination(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "bootstrap_split_destination")) !void {
+    fn localBootstrapSplitDestination(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "bootstrap_split_destination")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
@@ -6128,7 +6128,7 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
     }
 
-    fn localCatchUpSplitDestination(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "catch_up_split_destination")) !void {
+    fn localCatchUpSplitDestination(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "catch_up_split_destination")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
@@ -6660,7 +6660,7 @@ pub const DataServer = struct {
         };
     }
 
-    fn localFinalizeSplitSource(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "finalize_split_source")) !void {
+    fn localFinalizeSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "finalize_split_source")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
@@ -6680,7 +6680,7 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
     }
 
-    fn localRollbackSplit(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "rollback_split")) !void {
+    fn localRollbackSplit(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "rollback_split")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft != null) {
             try self.requireLocalDataRaftLeader(op.source_group_id);
@@ -7143,7 +7143,7 @@ pub const DataServer = struct {
         )) .reconciled else .advanced;
     }
 
-    fn localAcceptMergeReceiver(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "accept_merge_receiver")) !void {
+    fn localAcceptMergeReceiver(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "accept_merge_receiver")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .accept_merge_receiver = op });
@@ -7161,7 +7161,7 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
     }
 
-    fn localCatchUpMergeReceiver(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "catch_up_merge_receiver")) !void {
+    fn localCatchUpMergeReceiver(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "catch_up_merge_receiver")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .catch_up_merge_receiver = op });
@@ -7179,7 +7179,7 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
     }
 
-    fn localFinalizeMerge(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge")) !void {
+    fn localFinalizeMerge(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "finalize_merge")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
@@ -7197,7 +7197,7 @@ pub const DataServer = struct {
         self.invalidateLocalGroupStatusCache();
     }
 
-    fn localRollbackMerge(ptr: *anyopaque, op: @FieldType(antfly.metadata.TransitionAction, "rollback_merge")) !void {
+    fn localRollbackMerge(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "rollback_merge")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .rollback_merge = op });

@@ -24,7 +24,29 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker run --rm --detach \
+# Registry availability is outside the test's control. Pull explicitly with a
+# bounded retry, then disable implicit pulls so `docker run` cannot reintroduce
+# a one-shot network failure after the image is ready.
+if ! docker image inspect "${minio_image}" >/dev/null 2>&1; then
+  pulled=false
+  for attempt in 1 2 3 4; do
+    if docker pull "${minio_image}"; then
+      pulled=true
+      break
+    fi
+    if ((attempt < 4)); then
+      delay_seconds=$((attempt * 2))
+      echo "MinIO image pull failed (attempt ${attempt}/4); retrying in ${delay_seconds}s" >&2
+      sleep "${delay_seconds}"
+    fi
+  done
+  if [[ "${pulled}" != true ]]; then
+    echo "failed to pull MinIO image after 4 attempts: ${minio_image}" >&2
+    exit 1
+  fi
+fi
+
+docker run --pull=never --rm --detach \
   --name "${container_name}" \
   --publish 127.0.0.1::9000 \
   --env "MINIO_ROOT_USER=${access_key}" \

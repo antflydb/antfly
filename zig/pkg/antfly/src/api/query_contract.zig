@@ -8099,7 +8099,7 @@ test "api query contract keeps compact ref fields distinct from binding referenc
     try std.testing.expectEqual(@as(usize, 1), parsed.req.doc_filter_bindings.len);
     try std.testing.expectEqualStrings("literal_ref", parsed.req.doc_filter_bindings[0].name);
     try std.testing.expectEqualStrings(
-        "{\"term\":{\"ref\":\"published\"}}",
+        "{\"term\":{\"path\":\"ref\",\"term\":\"published\"}}",
         parsed.req.doc_filter_bindings[0].filter_query_json,
     );
 }

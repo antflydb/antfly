@@ -105,64 +105,64 @@ pub const HostedShardOperationAdapter = struct {
         };
     }
 
-    fn observeSplit(ptr: *anyopaque, record: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
+    fn observeSplit(ptr: *anyopaque, _: u64, record: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         return try self.observeSplitRouted(record);
     }
 
-    fn observeMerge(ptr: *anyopaque, record: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
+    fn observeMerge(ptr: *anyopaque, _: u64, record: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         return try self.observeMergeRouted(record);
     }
 
-    fn prepareSplitSource(ptr: *anyopaque, op: PrepareSplitSource) !void {
+    fn prepareSplitSource(ptr: *anyopaque, _: u64, op: PrepareSplitSource) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.source_group_id, .{ .prepare_split_source = op });
     }
 
-    fn startSplitSource(ptr: *anyopaque, op: StartSplitSource) !void {
+    fn startSplitSource(ptr: *anyopaque, _: u64, op: StartSplitSource) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.source_group_id, .{ .start_split_source = op });
     }
 
-    fn bootstrapSplitDestination(ptr: *anyopaque, op: BootstrapSplitDestination) !void {
+    fn bootstrapSplitDestination(ptr: *anyopaque, _: u64, op: BootstrapSplitDestination) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.requireGroupReadyForTransition(op.destination_group_id);
         try self.executeRouted(self.data_router, op.source_group_id, .{ .bootstrap_split_destination = op });
     }
 
-    fn catchUpSplitDestination(ptr: *anyopaque, op: CatchUpSplitDestination) !void {
+    fn catchUpSplitDestination(ptr: *anyopaque, _: u64, op: CatchUpSplitDestination) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.requireGroupReadyForTransition(op.destination_group_id);
         try self.executeRouted(self.data_router, op.source_group_id, .{ .catch_up_split_destination = op });
     }
 
-    fn finalizeSplitSource(ptr: *anyopaque, op: FinalizeSplitSource) !void {
+    fn finalizeSplitSource(ptr: *anyopaque, _: u64, op: FinalizeSplitSource) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.source_group_id, .{ .finalize_split_source = op });
     }
 
-    fn rollbackSplit(ptr: *anyopaque, op: RollbackSplit) !void {
+    fn rollbackSplit(ptr: *anyopaque, _: u64, op: RollbackSplit) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.source_group_id, .{ .rollback_split = op });
     }
 
-    fn acceptMergeReceiver(ptr: *anyopaque, op: AcceptMergeReceiver) !void {
+    fn acceptMergeReceiver(ptr: *anyopaque, _: u64, op: AcceptMergeReceiver) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.receiver_group_id, .{ .accept_merge_receiver = op });
     }
 
-    fn catchUpMergeReceiver(ptr: *anyopaque, op: CatchUpMergeReceiver) !void {
+    fn catchUpMergeReceiver(ptr: *anyopaque, _: u64, op: CatchUpMergeReceiver) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.receiver_group_id, .{ .catch_up_merge_receiver = op });
     }
 
-    fn finalizeMerge(ptr: *anyopaque, op: FinalizeMerge) !void {
+    fn finalizeMerge(ptr: *anyopaque, _: u64, op: FinalizeMerge) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.receiver_group_id, .{ .finalize_merge = op });
     }
 
-    fn rollbackMerge(ptr: *anyopaque, op: RollbackMerge) !void {
+    fn rollbackMerge(ptr: *anyopaque, _: u64, op: RollbackMerge) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.receiver_group_id, .{ .rollback_merge = op });
     }
@@ -655,7 +655,7 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
             };
         }
 
-        fn observeSplit(_: *anyopaque, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
+        fn observeSplit(_: *anyopaque, _: u64, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
             return .{
                 .status = .{
                     .phase = .cutover_ready,
@@ -671,7 +671,7 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
             };
         }
 
-        fn observeMerge(_: *anyopaque, record: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
+        fn observeMerge(_: *anyopaque, _: u64, record: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
             const status = @import("../data/mod.zig").MergeTransitionStatus{
                 .phase = .replay_deltas,
                 .donor_group_id = record.donor_group_id,
@@ -688,19 +688,19 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
             return .{ .donor = status, .receiver = status };
         }
 
-        fn prepareSplitSource(ptr: *anyopaque, _: PrepareSplitSource) !void {
+        fn prepareSplitSource(ptr: *anyopaque, _: u64, _: PrepareSplitSource) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.execute_called = true;
         }
-        fn noopStartSplitSource(_: *anyopaque, _: StartSplitSource) !void {}
-        fn noopBootstrapSplitDestination(_: *anyopaque, _: BootstrapSplitDestination) !void {}
-        fn noopCatchUpSplitDestination(_: *anyopaque, _: CatchUpSplitDestination) !void {}
-        fn noopFinalizeSplitSource(_: *anyopaque, _: FinalizeSplitSource) !void {}
-        fn noopRollbackSplit(_: *anyopaque, _: RollbackSplit) !void {}
-        fn noopAcceptMergeReceiver(_: *anyopaque, _: AcceptMergeReceiver) !void {}
-        fn noopCatchUpMergeReceiver(_: *anyopaque, _: CatchUpMergeReceiver) !void {}
-        fn noopFinalizeMerge(_: *anyopaque, _: FinalizeMerge) !void {}
-        fn noopRollbackMerge(_: *anyopaque, _: RollbackMerge) !void {}
+        fn noopStartSplitSource(_: *anyopaque, _: u64, _: StartSplitSource) !void {}
+        fn noopBootstrapSplitDestination(_: *anyopaque, _: u64, _: BootstrapSplitDestination) !void {}
+        fn noopCatchUpSplitDestination(_: *anyopaque, _: u64, _: CatchUpSplitDestination) !void {}
+        fn noopFinalizeSplitSource(_: *anyopaque, _: u64, _: FinalizeSplitSource) !void {}
+        fn noopRollbackSplit(_: *anyopaque, _: u64, _: RollbackSplit) !void {}
+        fn noopAcceptMergeReceiver(_: *anyopaque, _: u64, _: AcceptMergeReceiver) !void {}
+        fn noopCatchUpMergeReceiver(_: *anyopaque, _: u64, _: CatchUpMergeReceiver) !void {}
+        fn noopFinalizeMerge(_: *anyopaque, _: u64, _: FinalizeMerge) !void {}
+        fn noopRollbackMerge(_: *anyopaque, _: u64, _: RollbackMerge) !void {}
     };
 
     var fake_ops = FakeShardOps{};

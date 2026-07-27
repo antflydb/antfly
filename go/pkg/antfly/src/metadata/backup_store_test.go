@@ -331,6 +331,58 @@ func TestReadOnlyFileBackupStoreRetainsAuthorizedRepositoryRoot(t *testing.T) {
 	))
 }
 
+func TestWritableFileBackupStoreRetainsAuthorizedRepositoryRoot(t *testing.T) {
+	connectionRoot := t.TempDir()
+	var filesystemConnection common.ConnectionConfig
+	require.NoError(t, filesystemConnection.UnmarshalJSON([]byte(fmt.Sprintf(`{
+		"kind":"external_io",
+		"capabilities":["backup.write"],
+		"external_io":{"protocol":"filesystem","root":%q}
+	}`, connectionRoot))))
+	config := &common.Config{Connections: map[string]common.ConnectionConfig{
+		"filesystem": filesystemConnection,
+	}}
+	metadataStore, err := newBackupStore(
+		config,
+		"filesystem",
+		"backup.write",
+		"file:///repository",
+	)
+	require.NoError(t, err)
+	defer closeBackupStore(metadataStore)
+
+	repositoryPath := filepath.Join(connectionRoot, "repository")
+	movedPath := filepath.Join(connectionRoot, "repository-moved")
+	require.NoError(t, os.Rename(repositoryPath, movedPath))
+	outsidePath := t.TempDir()
+	if err := os.Symlink(outsidePath, repositoryPath); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+
+	const backupID = "backup-1"
+	require.NoError(t, metadataStore.ReserveBackupID(
+		context.Background(),
+		backupID,
+		testReservationOwner,
+	))
+	require.NoError(t, metadataStore.WriteMetadata(
+		context.Background(),
+		backupID,
+		&store.Table{Name: "authorized"},
+		common.BackupFormatNative,
+		nil,
+	))
+
+	metadata, err := metadataStore.ReadMetadata(context.Background(), backupID)
+	require.NoError(t, err)
+	require.Equal(t, "authorized", metadata.Table.Name)
+	require.FileExists(t, filepath.Join(movedPath, backupID+"-metadata.json"))
+	require.FileExists(t, filepath.Join(movedPath, backupID+"-reservation"))
+	outsideEntries, err := os.ReadDir(outsidePath)
+	require.NoError(t, err)
+	require.Empty(t, outsideEntries)
+}
+
 func TestFileBackupStorePersistsPortableArtifactIntegrity(t *testing.T) {
 	root := t.TempDir()
 	backupStore := &fileBackupStore{location: root}

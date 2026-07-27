@@ -859,6 +859,49 @@ func (c *Config) OpenFilesystemPath(
 	return logicalRoot, nil
 }
 
+// OpenOrCreateFilesystemPath authorizes and creates a logical file URI beneath
+// a named filesystem connection. Creation and the final open are both rooted
+// at the administrator-owned connection descriptor, so a concurrent rename or
+// symlink swap cannot redirect either operation outside that root.
+func (c *Config) OpenOrCreateFilesystemPath(
+	connectionID, requiredCapability, location string,
+	perm os.FileMode,
+) (*os.Root, error) {
+	rootPath, cleanLogical, err := c.filesystemConnectionRootAndLogicalPath(
+		connectionID,
+		requiredCapability,
+		location,
+	)
+	if err != nil {
+		return nil, err
+	}
+	connectionRoot, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"opening filesystem connection %q root: %w",
+			connectionID,
+			err,
+		)
+	}
+	defer func() { _ = connectionRoot.Close() }()
+	if err := connectionRoot.MkdirAll(cleanLogical, perm); err != nil {
+		return nil, fmt.Errorf(
+			"creating filesystem location for connection %q: %w",
+			connectionID,
+			err,
+		)
+	}
+	logicalRoot, err := connectionRoot.OpenRoot(cleanLogical)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"opening filesystem location for connection %q: %w",
+			connectionID,
+			err,
+		)
+	}
+	return logicalRoot, nil
+}
+
 // ResolveObjectStorageS3 resolves one object-engine durability lane. An empty
 // lane resolves the root location.
 func (c *Config) ResolveObjectStorageS3(lane string) (S3Info, error) {

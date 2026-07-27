@@ -909,73 +909,73 @@ fn schemaIndexReady(
     return try shard_db.adapter().schemaIndexReady(alloc, table_name, group_id, schema_version, read_schema_version);
 }
 
-fn observeSplit(ptr: *anyopaque, record: transition_state.SplitTransitionRecord) !transition_state.SplitObservation {
+fn observeSplit(ptr: *anyopaque, _: u64, record: transition_state.SplitTransitionRecord) !transition_state.SplitObservation {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     return try runtime.shardOperationAdapter().observeSplit(record);
 }
 
-fn observeMerge(ptr: *anyopaque, record: transition_state.MergeTransitionRecord) !transition_state.MergeObservation {
+fn observeMerge(ptr: *anyopaque, _: u64, record: transition_state.MergeTransitionRecord) !transition_state.MergeObservation {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     return try runtime.shardOperationAdapter().observeMerge(record);
 }
 
-fn prepareSplitSource(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "prepare_split_source")) !void {
+fn prepareSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "prepare_split_source")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .prepare_split_source = op });
 }
 
-fn startSplitSource(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "start_split_source")) !void {
+fn startSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "start_split_source")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .start_split_source = op });
 }
 
-fn bootstrapSplitDestination(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "bootstrap_split_destination")) !void {
+fn bootstrapSplitDestination(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "bootstrap_split_destination")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .bootstrap_split_destination = op });
 }
 
-fn catchUpSplitDestination(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "catch_up_split_destination")) !void {
+fn catchUpSplitDestination(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "catch_up_split_destination")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .catch_up_split_destination = op });
 }
 
-fn finalizeSplitSource(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "finalize_split_source")) !void {
+fn finalizeSplitSource(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "finalize_split_source")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .finalize_split_source = op });
 }
 
-fn rollbackSplit(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "rollback_split")) !void {
+fn rollbackSplit(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "rollback_split")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .rollback_split = op });
 }
 
-fn acceptMergeReceiver(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "accept_merge_receiver")) !void {
+fn acceptMergeReceiver(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "accept_merge_receiver")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .accept_merge_receiver = op });
 }
 
-fn catchUpMergeReceiver(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "catch_up_merge_receiver")) !void {
+fn catchUpMergeReceiver(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "catch_up_merge_receiver")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .catch_up_merge_receiver = op });
 }
 
-fn finalizeMerge(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "finalize_merge")) !void {
+fn finalizeMerge(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "finalize_merge")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
 }
 
-fn rollbackMerge(ptr: *anyopaque, op: @FieldType(metadata_mod.TransitionAction, "rollback_merge")) !void {
+fn rollbackMerge(ptr: *anyopaque, _: u64, op: @FieldType(metadata_mod.TransitionAction, "rollback_merge")) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const runtime = svc.raft.local_transition_runtime orelse return error.UnsupportedOperation;
     try runtime.shardOperationAdapter().execute(.{ .rollback_merge = op });

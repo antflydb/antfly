@@ -10,6 +10,7 @@ import type { components } from "./public-api.js";
 type Query = components["schemas"]["Query"];
 type ConjunctionQuery = components["schemas"]["ConjunctionQuery"];
 type DisjunctionQuery = components["schemas"]["DisjunctionQuery"];
+type MatchQuery = components["schemas"]["MatchQuery"];
 
 /**
  * Create a QueryString query - uses Bleve's query string syntax
@@ -45,7 +46,7 @@ export function term(term: string, field?: string, boost?: number): Query {
  *
  * @example
  * match("golang tutorial")
- * match("computer science", "title", { fuzziness: "auto" })
+ * match("computer science", "title", { analyzer: "standard", boost: 1.5 })
  */
 export function match(
   match: string,
@@ -53,20 +54,14 @@ export function match(
   options?: {
     analyzer?: string;
     boost?: number;
-    prefix_length?: number;
-    fuzziness?: number | "auto";
-    operator?: "or" | "and";
   }
-): Query {
+): MatchQuery {
   return {
     match,
     field,
     analyzer: options?.analyzer,
     boost: options?.boost,
-    prefix_length: options?.prefix_length,
-    fuzziness: options?.fuzziness,
-    operator: options?.operator,
-  } as Query;
+  };
 }
 
 /**

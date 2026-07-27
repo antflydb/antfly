@@ -585,62 +585,62 @@ pub const TransitionRuntime = struct {
         try self.execute(action);
     }
 
-    fn observeSplitAdapter(ptr: *anyopaque, record: metadata.SplitTransitionRecord) !metadata.SplitObservation {
+    fn observeSplitAdapter(ptr: *anyopaque, _: u64, record: metadata.SplitTransitionRecord) !metadata.SplitObservation {
         const self: *const TransitionRuntime = @ptrCast(@alignCast(ptr));
         return .{ .status = try self.observeSplit(record) };
     }
 
-    fn observeMergeAdapter(ptr: *anyopaque, record: metadata.MergeTransitionRecord) !metadata.MergeObservation {
+    fn observeMergeAdapter(ptr: *anyopaque, _: u64, record: metadata.MergeTransitionRecord) !metadata.MergeObservation {
         const self: *const TransitionRuntime = @ptrCast(@alignCast(ptr));
         return try self.observeMerge(record);
     }
 
-    fn prepareSplitSourceAdapter(ptr: *anyopaque, op: PrepareSplitSource) !void {
+    fn prepareSplitSourceAdapter(ptr: *anyopaque, _: u64, op: PrepareSplitSource) !void {
         const self: *TransitionRuntime = @ptrCast(@alignCast(ptr));
         try self.execute(.{ .prepare_split_source = op });
     }
 
-    fn startSplitSourceAdapter(ptr: *anyopaque, op: StartSplitSource) !void {
+    fn startSplitSourceAdapter(ptr: *anyopaque, _: u64, op: StartSplitSource) !void {
         const self: *TransitionRuntime = @ptrCast(@alignCast(ptr));
         try self.execute(.{ .start_split_source = op });
     }
 
-    fn bootstrapSplitDestinationAdapter(ptr: *anyopaque, op: BootstrapSplitDestination) !void {
+    fn bootstrapSplitDestinationAdapter(ptr: *anyopaque, _: u64, op: BootstrapSplitDestination) !void {
         const self: *TransitionRuntime = @ptrCast(@alignCast(ptr));
         try self.execute(.{ .bootstrap_split_destination = op });
     }
 
-    fn catchUpSplitDestinationAdapter(ptr: *anyopaque, op: CatchUpSplitDestination) !void {
+    fn catchUpSplitDestinationAdapter(ptr: *anyopaque, _: u64, op: CatchUpSplitDestination) !void {
         const self: *TransitionRuntime = @ptrCast(@alignCast(ptr));
         try self.execute(.{ .catch_up_split_destination = op });
     }
 
-    fn finalizeSplitSourceAdapter(ptr: *anyopaque, op: FinalizeSplitSource) !void {
+    fn finalizeSplitSourceAdapter(ptr: *anyopaque, _: u64, op: FinalizeSplitSource) !void {
         const self: *TransitionRuntime = @ptrCast(@alignCast(ptr));
         try self.execute(.{ .finalize_split_source = op });
     }
 
-    fn rollbackSplitAdapter(ptr: *anyopaque, op: RollbackSplit) !void {
+    fn rollbackSplitAdapter(ptr: *anyopaque, _: u64, op: RollbackSplit) !void {
         const self: *TransitionRuntime = @ptrCast(@alignCast(ptr));
         try self.execute(.{ .rollback_split = op });
     }
 
-    fn acceptMergeReceiverAdapter(ptr: *anyopaque, op: AcceptMergeReceiver) !void {
+    fn acceptMergeReceiverAdapter(ptr: *anyopaque, _: u64, op: AcceptMergeReceiver) !void {
         const self: *TransitionRuntime = @ptrCast(@alignCast(ptr));
         try self.execute(.{ .accept_merge_receiver = op });
     }
 
-    fn catchUpMergeReceiverAdapter(ptr: *anyopaque, op: CatchUpMergeReceiver) !void {
+    fn catchUpMergeReceiverAdapter(ptr: *anyopaque, _: u64, op: CatchUpMergeReceiver) !void {
         const self: *TransitionRuntime = @ptrCast(@alignCast(ptr));
         try self.execute(.{ .catch_up_merge_receiver = op });
     }
 
-    fn finalizeMergeAdapter(ptr: *anyopaque, op: FinalizeMerge) !void {
+    fn finalizeMergeAdapter(ptr: *anyopaque, _: u64, op: FinalizeMerge) !void {
         const self: *TransitionRuntime = @ptrCast(@alignCast(ptr));
         try self.execute(.{ .finalize_merge = op });
     }
 
-    fn rollbackMergeAdapter(ptr: *anyopaque, op: RollbackMerge) !void {
+    fn rollbackMergeAdapter(ptr: *anyopaque, _: u64, op: RollbackMerge) !void {
         const self: *TransitionRuntime = @ptrCast(@alignCast(ptr));
         try self.execute(.{ .rollback_merge = op });
     }
