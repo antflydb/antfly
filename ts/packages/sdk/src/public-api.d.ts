@@ -8801,18 +8801,11 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
-        /** @description The fuzziness of the query. Can be an integer or "auto". */
-        Fuzziness: number | "auto";
         MatchQuery: {
             match: string;
             field?: string;
             analyzer?: string;
             boost?: components["schemas"]["Boost"];
-            /** Format: int32 */
-            prefix_length?: number;
-            fuzziness?: components["schemas"]["Fuzziness"];
-            /** @enum {string} */
-            operator?: "or" | "and";
         };
         MultiMatchBody: {
             query: string;
@@ -8824,6 +8817,8 @@ export interface components {
         MultiMatchQuery: {
             multi_match: components["schemas"]["MultiMatchBody"];
         };
+        /** @description The fuzziness of the query. Can be an integer or "auto". */
+        Fuzziness: number | "auto";
         MatchPhraseQuery: {
             match_phrase: string;
             field?: string;

@@ -457,7 +457,6 @@ from .match_none_query import MatchNoneQuery
 from .match_none_query_match_none import MatchNoneQueryMatchNone
 from .match_phrase_query import MatchPhraseQuery
 from .match_query import MatchQuery
-from .match_query_operator import MatchQueryOperator
 from .media_content_part import MediaContentPart
 from .media_content_part_type import MediaContentPartType
 from .merge_config import MergeConfig
@@ -1131,7 +1130,6 @@ __all__ = (
     "MatchNoneQueryMatchNone",
     "MatchPhraseQuery",
     "MatchQuery",
-    "MatchQueryOperator",
     "MediaContentPart",
     "MediaContentPartType",
     "MergeConfig",
