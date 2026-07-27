@@ -385,6 +385,7 @@ test "metadata control loop installs service median key lookup for automatic spl
         tables: []const metadata_table_manager.TableRecord,
         ranges: []const metadata_table_manager.RangeRecord,
         stores: []const metadata_table_manager.StoreRecord,
+        placements: []const raft_reconciler.PlacementIntent,
         planned_split_key: ?[]u8 = null,
 
         pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -446,11 +447,24 @@ test "metadata control loop installs service median key lookup for automatic spl
             alloc.free(records);
         }
 
-        pub fn listProjectedPlacementIntents(_: *@This(), alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
-            return try alloc.alloc(raft_reconciler.PlacementIntent, 0);
+        pub fn listProjectedPlacementIntents(self: *@This(), alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
+            const out = try alloc.alloc(raft_reconciler.PlacementIntent, self.placements.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |intent| {
+                    raft_reconciler.freeIntentOwned(alloc, intent);
+                }
+                alloc.free(out);
+            }
+            for (self.placements, 0..) |record, i| {
+                out[i] = try raft_reconciler.cloneIntentOwned(alloc, record);
+                initialized += 1;
+            }
+            return out;
         }
 
         pub fn freeProjectedPlacementIntents(_: *@This(), alloc: std.mem.Allocator, intents: []raft_reconciler.PlacementIntent) void {
+            for (intents) |intent| raft_reconciler.freeIntentOwned(alloc, intent);
             alloc.free(intents);
         }
 
@@ -517,6 +531,12 @@ test "metadata control loop installs service median key lookup for automatic spl
     const ranges = [_]metadata_table_manager.RangeRecord{
         .{ .group_id = 4901, .table_id = 49, .start_key = "doc:a", .end_key = "doc:z" },
     };
+    const voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(&.{1}, null);
+    const placements = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{ .group_id = 4901, .replica_id = 1, .local_node_id = 1 },
+        .store_id = 1,
+        .peer_node_ids = &.{1},
+    }};
     const stores = [_]metadata_table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -533,6 +553,10 @@ test "metadata control loop installs service median key lookup for automatic spl
                     .empty = false,
                     .updated_at_millis = now_realtime_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -543,6 +567,7 @@ test "metadata control loop installs service median key lookup for automatic spl
         .tables = &tables,
         .ranges = &ranges,
         .stores = &stores,
+        .placements = &placements,
     };
     defer fake.deinit(std.testing.allocator);
 

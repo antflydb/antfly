@@ -51,6 +51,7 @@ pub const MetadataServer = struct {
     alloc: std.mem.Allocator,
     svc: *service.MetadataHttpService,
     control_loop: metadata_mod.MetadataControlLoop,
+    transition_ops_registration: ?raft_shard_ops.OwnedShardOperationAdapter.Registration = null,
     owned_hosted_shard_ops: ?*raft_hosted_shard_ops.HostedShardOperationAdapter = null,
     owned_hosted_shard_db: ?*raft_hosted_shard_ops.HostedShardDbAdapter = null,
     owned_admin_http_server: ?*metadata_http_server.MetadataHttpServer = null,
@@ -76,6 +77,8 @@ pub const MetadataServer = struct {
         errdefer if (owned_hosted_shard_ops) |ops| alloc.destroy(ops);
         var owned_hosted_shard_db: ?*raft_hosted_shard_ops.HostedShardDbAdapter = null;
         errdefer if (owned_hosted_shard_db) |adapter| alloc.destroy(adapter);
+        var transition_ops_registration: ?raft_shard_ops.OwnedShardOperationAdapter.Registration = null;
+        errdefer if (transition_ops_registration) |*registration| registration.deinit();
 
         if (deps.http.raft.transition_ops == null) {
             const local_ops = metadataLocalShardOperationAdapter(svc);
@@ -92,7 +95,7 @@ pub const MetadataServer = struct {
                 },
                 local_ops,
             );
-            try svc.raft.replaceTransitionOps(hosted_ops.adapter());
+            transition_ops_registration = try svc.raft.replaceTransitionOps(hosted_ops.adapter());
             owned_hosted_shard_ops = hosted_ops;
         }
         {
@@ -211,6 +214,7 @@ pub const MetadataServer = struct {
             .alloc = alloc,
             .svc = svc,
             .control_loop = metadata_mod.MetadataControlLoop.initWithConfig(alloc, cfg.reconciler_config),
+            .transition_ops_registration = transition_ops_registration,
             .owned_hosted_shard_ops = owned_hosted_shard_ops,
             .owned_hosted_shard_db = owned_hosted_shard_db,
             .owned_admin_http_server = owned_admin_http_server,
@@ -232,6 +236,8 @@ pub const MetadataServer = struct {
 
     pub fn deinit(self: *MetadataServer) void {
         self.stopRestoreSupervisor();
+        if (self.transition_ops_registration) |*registration| registration.deinit();
+        self.transition_ops_registration = null;
         if (self.owned_admin_listener) |listener| {
             listener.deinit();
             self.alloc.destroy(listener);

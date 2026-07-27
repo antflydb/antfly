@@ -127,7 +127,9 @@ const replicated_apply_writer_open_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const replicated_apply_writer_open_retry_ns: u64 = 10 * std.time.ns_per_ms;
 
 fn isTransientReplayVisibilityError(err: anyerror) bool {
-    return err == error.WriterLocked or err == error.ReplayDocumentNotVisible;
+    return err == error.WriterLocked or
+        err == error.ReplayDocumentNotVisible or
+        err == error.AutoBulkIngestBusy;
 }
 
 fn isTransientWriterOpenConflict(err: anyerror) bool {
@@ -699,6 +701,7 @@ pub const ProvisionedTableWriteCache = struct {
     /// cannot silently continue without primary-side replication.
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror = null,
     table_eviction_hook: ?TableEvictionHook = null,
+    state_mutex: ?*std.atomic.Mutex = null,
     open_mutex: std.atomic.Mutex = .unlocked,
     entry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     hit_count: std.atomic.Value(u64) = .init(0),
@@ -813,6 +816,7 @@ pub const ProvisionedTableWriteCache = struct {
         auto_bulk_ingest_started_ns: u64 = 0,
         auto_bulk_ingest_last_ns: u64 = 0,
         auto_bulk_ingest_finish_requested: bool = false,
+        auto_bulk_ingest_finishing: bool = false,
 
         fn detachRuntimeHooks(self: *Entry) void {
             self.db.setQueryVisibilityHook(null);
@@ -868,6 +872,19 @@ pub const ProvisionedTableWriteCache = struct {
         var fingerprint: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(indexes_json orelse "", &fingerprint, .{});
         return fingerprint;
+    }
+
+    fn bindStateMutex(
+        self: *ProvisionedTableWriteCache,
+        state_mutex: *std.atomic.Mutex,
+    ) void {
+        if (self.state_mutex) |existing| {
+            if (existing != state_mutex) {
+                @panic("writer cache cannot be rebound to a different state mutex");
+            }
+            return;
+        }
+        self.state_mutex = state_mutex;
     }
 
     fn entryManagedConfigMatches(entry: *const Entry, indexes_json: ?[]const u8) bool {
@@ -1576,6 +1593,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
                 if (!self.entryHAWriteGateCurrent(entry)) continue;
+                if (entry.auto_bulk_ingest_finishing) return error.LsmRootWriterAlreadyOpen;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
                 lockAtomic(&self.entry_lifecycle_mutex);
                 defer self.entry_lifecycle_mutex.unlock();
@@ -1681,6 +1699,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
                 if (!self.entryHAWriteGateCurrent(entry)) continue;
                 if (!entryMatchesExpectedIdentityNamespace(entry, expected_identity_namespace)) continue;
+                if (entry.auto_bulk_ingest_finishing) return error.LsmRootWriterAlreadyOpen;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
                 lockAtomic(&self.entry_lifecycle_mutex);
                 defer self.entry_lifecycle_mutex.unlock();
@@ -1773,6 +1792,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.lsm_root_generation != lsm_root_generation) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (!self.entryHAWriteGateCurrent(entry)) continue;
+            if (entry.auto_bulk_ingest_finishing) return null;
             return self.leaseEntryLocked(entry);
         }
         return null;
@@ -1789,6 +1809,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id != group_id) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (!self.entryHAWriteGateCurrent(entry)) continue;
+            if (entry.auto_bulk_ingest_finishing) return null;
             if (!self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) continue;
             return self.leaseEntryLocked(entry);
         }
@@ -1803,6 +1824,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id) continue;
             if (!self.entryHAWriteGateCurrent(entry)) continue;
+            if (entry.auto_bulk_ingest_finishing) return null;
             if (entry.lsm_root_generation != lsm_root_generation and
                 !self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) continue;
             return self.leaseEntryLocked(entry);
@@ -1832,6 +1854,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.auto_bulk_ingest_finishing) return null;
             if (!allow_bulk_session and (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open)) return null;
             if (!self.entryHAWriteGateCurrent(entry)) continue;
             return self.leaseEntryLocked(entry);
@@ -1886,6 +1909,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
                 if (!self.entryHAWriteGateCurrent(entry)) continue;
+                if (entry.auto_bulk_ingest_finishing) return error.LsmRootWriterAlreadyOpen;
                 if (opened.*) |*db| db.close();
                 opened.* = null;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
@@ -2214,7 +2238,9 @@ pub const ProvisionedTableWriteCache = struct {
             }
         };
         for (self.entries.items) |entry| {
-            if (!std.mem.eql(u8, entry.table_name, table_name) or entry.bulk_ingest_session_open) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.auto_bulk_ingest_finishing) return error.LsmRootWriterAlreadyOpen;
+            if (entry.bulk_ingest_session_open) continue;
             try entry.db.beginBulkIngestSession();
             entry.bulk_ingest_session_open = true;
             entry.auto_bulk_ingest_session_open = false;
@@ -2276,6 +2302,7 @@ pub const ProvisionedTableWriteCache = struct {
         if (self.bulkIngestSessionActiveForTable(table_name)) return;
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.auto_bulk_ingest_finishing) return error.LsmRootWriterAlreadyOpen;
             if (!entry.bulk_ingest_session_open) {
                 try entry.db.beginPrimaryStoreAutoBulkIngestSession();
                 entry.bulk_ingest_session_open = true;
@@ -2292,6 +2319,7 @@ pub const ProvisionedTableWriteCache = struct {
         var should_finish = false;
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name) or !entry.auto_bulk_ingest_session_open) continue;
+            if (entry.auto_bulk_ingest_finishing) return error.AutoBulkIngestBusy;
             entry.auto_bulk_ingest_ops +|= ops;
             entry.auto_bulk_ingest_last_ns = now_ns;
             should_finish = should_finish or entry.auto_bulk_ingest_ops >= auto_bulk_ingest_max_window_ops;
@@ -2302,6 +2330,7 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn rollRequestedAutoBulkIngestLocked(self: *ProvisionedTableWriteCache, group_id: u64, table_name: []const u8, now_ns: u64) !bool {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.auto_bulk_ingest_finishing) return false;
             if (!entry.auto_bulk_ingest_session_open or !entry.auto_bulk_ingest_finish_requested) return false;
             if (self.entryActiveLeasesLocked(entry) > 1) return false;
             try entry.db.rollPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
@@ -2566,6 +2595,7 @@ pub const ProvisionedTableWriteCache = struct {
         entry.auto_bulk_ingest_started_ns = 0;
         entry.auto_bulk_ingest_last_ns = 0;
         entry.auto_bulk_ingest_finish_requested = false;
+        entry.auto_bulk_ingest_finishing = false;
     }
 
     fn evictOldestTable(self: *ProvisionedTableWriteCache) void {
@@ -5010,6 +5040,9 @@ pub const ProvisionedTableWriteSource = struct {
         write_cache: ?*ProvisionedTableWriteCache,
         startup_write_cache: ?*ProvisionedTableWriteCache,
     ) void {
+        const state_mutex = self.local_db_mutex.atomicMutex();
+        if (write_cache) |cache| cache.bindStateMutex(state_mutex);
+        if (startup_write_cache) |cache| cache.bindStateMutex(state_mutex);
         self.write_cache = write_cache;
         self.startup_write_cache = startup_write_cache;
         const hook = ProvisionedTableWriteCache.TableEvictionHook{
@@ -6586,6 +6619,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (entry.group_id != group_id) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (!cache.entryHAWriteGateCurrent(entry)) continue;
+            if (entry.auto_bulk_ingest_finishing) return error.LsmRootWriterAlreadyOpen;
             if (entry.auto_bulk_ingest_session_open) {
                 try self.finishEntryAutoBulkIngestForForegroundVisibility(cache, entry);
                 return cache.leaseEntryLocked(entry);
@@ -7366,6 +7400,7 @@ pub const ProvisionedTableWriteSource = struct {
         entry: *ProvisionedTableWriteCache.Entry,
     ) !void {
         if (!entry.auto_bulk_ingest_session_open) return;
+        if (entry.auto_bulk_ingest_finishing) return error.AutoBulkIngestBusy;
         try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
         entry.bulk_ingest_session_open = false;
         entry.auto_bulk_ingest_session_open = false;
@@ -8279,23 +8314,96 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !void {
+        const FinishLease = struct {
+            cached: ProvisionedTableWriteCache.CachedDb,
+            finished: bool = false,
+        };
+        var leases = std.ArrayListUnmanaged(FinishLease).empty;
+        defer {
+            for (leases.items) |*item| {
+                const alloc = item.cached.cache.?.alloc;
+                item.cached.deinit(alloc);
+            }
+            leases.deinit(std.heap.page_allocator);
+        }
+
         lockAtomic(&self.local_db_mutex);
-        defer self.local_db_mutex.unlock();
-        // CachedDb.deinit() takes local_db_mutex before dropping its cache
-        // lease. Waiting for DB publication while a lease is active would
-        // therefore deadlock the transition against the lease release. Fail
-        // closed and let the metadata transition retry after writers drain.
-        if (self.write_cache) |cache| {
-            if (!cache.autoBulkIngestIdleLocked(group_id, table_name)) return error.AutoBulkIngestBusy;
-        }
-        if (self.startup_write_cache) |cache| {
-            if (cache != self.write_cache and !cache.autoBulkIngestIdleLocked(group_id, table_name))
+        var state_locked = true;
+        defer if (state_locked) self.local_db_mutex.unlock();
+
+        const caches = [_]?*ProvisionedTableWriteCache{
+            self.write_cache,
+            if (self.startup_write_cache != self.write_cache)
+                self.startup_write_cache
+            else
+                null,
+        };
+        var matching_entries: usize = 0;
+        for (caches) |maybe_cache| {
+            const cache = maybe_cache orelse continue;
+            // An explicit table-scoped session may have adopted an automatic
+            // session. It owns publication until its matching finish/abort.
+            if (cache.findActiveBulkIngestSession(table_name) != null)
                 return error.AutoBulkIngestBusy;
+            for (cache.entries.items) |entry| {
+                if (entry.group_id != group_id or
+                    !std.mem.eql(u8, entry.table_name, table_name))
+                {
+                    continue;
+                }
+                if (entry.auto_bulk_ingest_finishing)
+                    return error.AutoBulkIngestBusy;
+                if (!entry.auto_bulk_ingest_session_open) continue;
+                if (cache.entryActiveLeasesLocked(entry) != 0)
+                    return error.AutoBulkIngestBusy;
+                matching_entries += 1;
+            }
         }
-        if (self.write_cache) |cache| try cache.finishAutoBulkIngestLocked(group_id, table_name);
-        if (self.startup_write_cache) |cache| {
-            if (cache != self.write_cache) try cache.finishAutoBulkIngestLocked(group_id, table_name);
+        try leases.ensureTotalCapacity(std.heap.page_allocator, matching_entries);
+        for (caches) |maybe_cache| {
+            const cache = maybe_cache orelse continue;
+            for (cache.entries.items) |entry| {
+                if (entry.group_id != group_id or
+                    !std.mem.eql(u8, entry.table_name, table_name) or
+                    !entry.auto_bulk_ingest_session_open)
+                {
+                    continue;
+                }
+                entry.auto_bulk_ingest_finishing = true;
+                leases.appendAssumeCapacity(.{
+                    .cached = cache.leaseEntryLocked(entry),
+                });
+            }
         }
+        self.local_db_mutex.unlock();
+        state_locked = false;
+
+        var first_err: ?anyerror = null;
+        for (leases.items) |*item| {
+            item.cached.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(
+                auto_bulk_ingest_finish_options,
+            ) catch |err| {
+                if (first_err == null) first_err = err;
+                continue;
+            };
+            item.finished = true;
+        }
+
+        lockAtomic(&self.local_db_mutex);
+        state_locked = true;
+        for (leases.items) |*item| {
+            const entry = item.cached.entry orelse continue;
+            if (item.finished) {
+                ProvisionedTableWriteCache.clearEntryBulkIngestState(entry);
+            } else {
+                entry.auto_bulk_ingest_finishing = false;
+            }
+        }
+        for (caches) |maybe_cache| {
+            const cache = maybe_cache orelse continue;
+            cache.removeInactiveBulkIngestSessionLocked(table_name);
+        }
+        if (first_err) |err| return err;
     }
 
     fn finishExpiredAutoBulkIngestLocked(self: *ProvisionedTableWriteSource) bool {
@@ -10705,6 +10813,13 @@ pub const ProvisionedTableWriteSource = struct {
             session.depth = std.math.add(usize, session.depth, 1) catch
                 return error.BulkIngestDepthOverflow;
             return {};
+        }
+        for (cache.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.table_name, table_name) and
+                entry.auto_bulk_ingest_finishing)
+            {
+                return error.LsmRootWriterAlreadyOpen;
+            }
         }
 
         try cache.active_bulk_ingest_sessions.ensureUnusedCapacity(cache.alloc, 1);
@@ -18939,7 +19054,12 @@ const SourceStateMutex = struct {
     shared: ?*std.atomic.Mutex = null,
 
     fn bind(self: *SourceStateMutex, shared: *std.atomic.Mutex) void {
-        if (self.shared) |existing| std.debug.assert(existing == shared);
+        if (self.shared) |existing| {
+            if (existing != shared) {
+                @panic("writer source cannot be rebound to a different state mutex");
+            }
+            return;
+        }
         self.shared = shared;
     }
 
@@ -31458,8 +31578,33 @@ test "split transition auto bulk publication retries while a writer lease is act
     );
     try std.testing.expect(write_cache.entries.items[0].auto_bulk_ingest_session_open);
 
+    write_cache.entries.items[0].auto_bulk_ingest_finishing = true;
+    try std.testing.expectError(
+        error.LsmRootWriterAlreadyOpen,
+        ProvisionedTableWriteSource.beginBulkIngest(&source, alloc, "docs"),
+    );
+    try std.testing.expectError(
+        error.AutoBulkIngestBusy,
+        source.finishEntryAutoBulkIngestForForegroundVisibility(
+            &write_cache,
+            write_cache.entries.items[0],
+        ),
+    );
+    write_cache.entries.items[0].auto_bulk_ingest_finishing = false;
+
     writer.deinit(alloc);
     try source.finishManagedWriterAutoBulkForTransition(7001, "docs");
+    try std.testing.expect(!write_cache.entries.items[0].auto_bulk_ingest_session_open);
+
+    try write_cache.ensureAutoBulkIngestLocked(7001, "docs", platform_time.monotonicNs());
+    _ = try source.source().beginBulkIngest(alloc, "docs");
+    try std.testing.expect(write_cache.entries.items[0].auto_bulk_ingest_session_open);
+    try std.testing.expectError(
+        error.AutoBulkIngestBusy,
+        source.finishManagedWriterAutoBulkForTransition(7001, "docs"),
+    );
+    try std.testing.expect(write_cache.entries.items[0].auto_bulk_ingest_session_open);
+    _ = try source.source().finishBulkIngest(alloc, "docs", .{});
     try std.testing.expect(!write_cache.entries.items[0].auto_bulk_ingest_session_open);
 }
 

@@ -5561,7 +5561,13 @@ test "cluster simulation resumes queued split transitions after node restart wit
         try cluster.stepAll();
     }
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_split_transitions);
-    const resumed = (try cluster.node(0).describeSplitTransition(9401)) orelse return error.TestExpectedEqual;
+    var resumed_observation: ?metadata_mod.SplitExecutionState = null;
+    rounds = 0;
+    while (rounds < 16 and resumed_observation == null) : (rounds += 1) {
+        try cluster.stepAll();
+        resumed_observation = try cluster.node(0).describeSplitTransition(9401);
+    }
+    const resumed = resumed_observation orelse return error.TestExpectedEqual;
     try std.testing.expect(resumed.tag == .bootstrapping_destination or resumed.tag == .ready_to_finalize);
 
     rounds = 0;
@@ -6684,7 +6690,7 @@ test "http host simulation rolls back and retries queued merge transitions throu
     merge.reset();
     try sim.apply(.{
         .upsert_merge_transition = .{
-            .transition_id = 9251,
+            .transition_id = 9252,
             .donor_group_id = 251,
             .receiver_group_id = 252,
         },
@@ -7184,7 +7190,13 @@ test "cluster simulation resumes queued merge transitions after node restart wit
         try cluster.stepAll();
     }
     try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().queued_merge_transitions);
-    const resumed = (try cluster.node(0).describeMergeTransition(9402)) orelse return error.TestExpectedEqual;
+    var resumed_observation: ?metadata_mod.MergeExecutionState = null;
+    rounds = 0;
+    while (rounds < 16 and resumed_observation == null) : (rounds += 1) {
+        try cluster.stepAll();
+        resumed_observation = try cluster.node(0).describeMergeTransition(9402);
+    }
+    const resumed = resumed_observation orelse return error.TestExpectedEqual;
     try std.testing.expect(resumed.tag == .bootstrapping_receiver or resumed.tag == .ready_to_finalize);
 
     rounds = 0;
@@ -7392,7 +7404,7 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
 
     try cluster.node(0).applyCommittedTransitionCommands(1300, 5, &.{
         .{ .upsert_merge_transition = .{
-            .transition_id = 9601,
+            .transition_id = 9602,
             .donor_group_id = 1951,
             .receiver_group_id = 1952,
             .phase = .prepare,
@@ -7402,12 +7414,12 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
     rounds = 0;
     while (rounds < 16) : (rounds += 1) {
         try cluster.stepAll();
-        if (try cluster.node(0).describeMergeTransition(9601)) |state| {
+        if (try cluster.node(0).describeMergeTransition(9602)) |state| {
             try std.testing.expect(state.tag == .awaiting_receiver_acceptance or state.tag == .bootstrapping_receiver or state.tag == .ready_to_finalize);
             if (state.tag != .awaiting_receiver_acceptance) break;
         }
     }
-    const retried_merge = (try cluster.node(0).describeMergeTransition(9601)) orelse return error.TestExpectedEqual;
+    const retried_merge = (try cluster.node(0).describeMergeTransition(9602)) orelse return error.TestExpectedEqual;
     try std.testing.expect(retried_merge.tag == .bootstrapping_receiver or retried_merge.tag == .ready_to_finalize);
 }
 

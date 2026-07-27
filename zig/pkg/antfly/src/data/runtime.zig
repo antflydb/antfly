@@ -5814,20 +5814,36 @@ pub const DataServer = struct {
         primary: *antfly.public_api.ProvisionedTableWriteSource,
         secondary: *antfly.public_api.ProvisionedTableWriteSource,
     ) void {
-        if (primary == secondary or writeSourcesShareCaches(primary, secondary)) {
-            // When foreground calls delegate to a Raft apply owner, both
-            // sources intentionally reference the same storage-owned caches.
-            // The owner carries the authoritative generation source; pruning
-            // twice under unrelated source mutexes can race an apply/open and
-            // retire the writer that the other source just published.
-            lockAtomic(secondary.localDbMutex());
-            defer secondary.localDbMutex().unlock();
-            secondary.pruneStaleWriteCacheLocked();
+        if (primary == secondary) {
+            lockAtomic(primary.localDbMutex());
+            defer primary.localDbMutex().unlock();
+            primary.pruneStaleWriteCacheLocked();
             return;
         }
 
         const primary_mutex = primary.localDbMutex();
         const secondary_mutex = secondary.localDbMutex();
+        if (writeSourcesShareCaches(primary, secondary)) {
+            // When foreground calls delegate to a Raft apply owner, both
+            // sources intentionally reference the same storage-owned caches.
+            // Their cache binding requires one shared state mutex.
+            if (primary_mutex != secondary_mutex) {
+                @panic("shared writer caches require one state mutex");
+            }
+            lockAtomic(secondary_mutex);
+            defer secondary_mutex.unlock();
+            secondary.pruneStaleWriteCacheLocked();
+            return;
+        }
+
+        if (primary_mutex == secondary_mutex) {
+            lockAtomic(primary_mutex);
+            defer primary_mutex.unlock();
+            primary.pruneStaleWriteCacheLocked();
+            secondary.pruneStaleWriteCacheLocked();
+            return;
+        }
+
         const first_mutex = if (@intFromPtr(primary_mutex) < @intFromPtr(secondary_mutex)) primary_mutex else secondary_mutex;
         const second_mutex = if (first_mutex == primary_mutex) secondary_mutex else primary_mutex;
 
@@ -5844,7 +5860,8 @@ pub const DataServer = struct {
         a: *const antfly.public_api.ProvisionedTableWriteSource,
         b: *const antfly.public_api.ProvisionedTableWriteSource,
     ) bool {
-        return a.write_cache == b.write_cache and
+        return (a.write_cache != null or a.startup_write_cache != null) and
+            a.write_cache == b.write_cache and
             a.startup_write_cache == b.startup_write_cache;
     }
 

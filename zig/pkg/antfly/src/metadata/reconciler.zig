@@ -75,6 +75,8 @@ pub const MergedGroupStatus = struct {
     leader_store_id: u64 = 0,
     voter_count_known: bool = false,
     voter_count: u16 = 0,
+    voter_set_known: bool = false,
+    voter_set_fingerprint: table_manager.VoterSetFingerprint = [_]u8{0} ** table_manager.voter_set_fingerprint_len,
     healthy_voter_reports: u16 = 0,
     joint_consensus: bool = false,
     readiness_from_leader: bool = false,
@@ -369,7 +371,10 @@ pub const Reconciler = struct {
                 const effective = effectivePlacementIntent(current, desired_tables, desired_ranges, &evidence, transition_intent);
                 const existing = membership_index.currentIntent(effective.record.group_id, effective.record.local_node_id);
                 if (existing == null or !placementIntentsEqual(existing.?, effective)) {
-                    try placement_upserts.append(self.alloc, try clonePlacementIntent(self.alloc, effective));
+                    try placement_upserts.ensureUnusedCapacity(self.alloc, 1);
+                    placement_upserts.appendAssumeCapacity(
+                        try clonePlacementIntent(self.alloc, effective),
+                    );
                 }
             }
         }
@@ -377,14 +382,20 @@ pub const Reconciler = struct {
             try maybeFinalizeSchemaMigration(self.alloc, current, desired);
             const existing = findTableRecord(current.tables, desired.table_id);
             if (existing == null or !tableRecordsEqual(existing.?, desired.*)) {
-                try table_upserts.append(self.alloc, try table_manager.cloneTable(self.alloc, desired.*));
+                try table_upserts.ensureUnusedCapacity(self.alloc, 1);
+                table_upserts.appendAssumeCapacity(
+                    try table_manager.cloneTable(self.alloc, desired.*),
+                );
             }
         }
         for (desired_ranges) |desired| {
             const existing = findRangeRecord(current.ranges, desired.group_id);
             if (existing == null or !rangeRecordsEqual(existing.?, desired)) {
                 if (rangeEpochPublishedBySplitAdmission(current, desired_splits, desired)) continue;
-                try range_upserts.append(self.alloc, try table_manager.cloneRange(self.alloc, desired));
+                try range_upserts.ensureUnusedCapacity(self.alloc, 1);
+                range_upserts.appendAssumeCapacity(
+                    try table_manager.cloneRange(self.alloc, desired),
+                );
             }
         }
         for (desired_splits) |desired| {
@@ -392,13 +403,17 @@ pub const Reconciler = struct {
             if (existing == null) {
                 if (!splitTransitionDocIdentityCompatibleIndexed(current, &evidence, desired)) continue;
                 if (splitAdmissionExpectedEpoch(current, desired)) |expected_source_epoch| {
-                    try split_admissions.append(self.alloc, .{
+                    try split_admissions.ensureUnusedCapacity(self.alloc, 1);
+                    split_admissions.appendAssumeCapacity(.{
                         .expected_source_epoch = expected_source_epoch,
                         .record = try cloneSplitRecord(self.alloc, desired),
                     });
                     continue;
                 }
-                try split_upserts.append(self.alloc, try cloneSplitRecord(self.alloc, desired));
+                try split_upserts.ensureUnusedCapacity(self.alloc, 1);
+                split_upserts.appendAssumeCapacity(
+                    try cloneSplitRecord(self.alloc, desired),
+                );
                 continue;
             }
 
@@ -425,9 +440,9 @@ pub const Reconciler = struct {
             effective_record_owned = false;
 
             const observation = findSplitObservation(current.split_observations, desired.transition_id) orelse defaultSplitObservation();
+            try split_steps.ensureUnusedCapacity(self.alloc, 1);
             const planned_record = try cloneSplitRecord(self.alloc, existing.?);
-            errdefer table_manager.freeSplitTransitionRecord(self.alloc, planned_record);
-            try split_steps.append(self.alloc, .{
+            split_steps.appendAssumeCapacity(.{
                 .record = planned_record,
                 .execution = transition_controller.TransitionController.describeSplit(planned_record, observation),
             });
@@ -437,7 +452,10 @@ pub const Reconciler = struct {
             const existing = findMergeRecord(current.merge_transitions, desired.transition_id);
             if (existing == null) {
                 if (!mergeTransitionDocIdentityCompatibleIndexed(current, &evidence, desired, .disallow_active)) continue;
-                try merge_upserts.append(self.alloc, try cloneMergeRecord(self.alloc, desired));
+                try merge_upserts.ensureUnusedCapacity(self.alloc, 1);
+                merge_upserts.appendAssumeCapacity(
+                    try cloneMergeRecord(self.alloc, desired),
+                );
                 continue;
             }
 
@@ -462,9 +480,9 @@ pub const Reconciler = struct {
             effective_record_owned = false;
 
             const observation = findMergeObservation(current.merge_observations, desired.transition_id) orelse defaultMergeObservation(existing.?);
+            try merge_steps.ensureUnusedCapacity(self.alloc, 1);
             const planned_record = try cloneMergeRecord(self.alloc, existing.?);
-            errdefer table_manager.freeMergeTransitionRecord(self.alloc, planned_record);
-            try merge_steps.append(self.alloc, .{
+            merge_steps.appendAssumeCapacity(.{
                 .record = planned_record,
                 .execution = transition_controller.TransitionController.describeMerge(planned_record, observation),
             });
@@ -501,7 +519,10 @@ pub const Reconciler = struct {
                     if (draining.relocation_generation == 0) draining.relocation_generation = intent.record.metadata_version + 1;
                     applyRelocationWatermark(&draining, watermark);
                     if (!placementIntentsEqual(intent, draining)) {
-                        try placement_upserts.append(self.alloc, try clonePlacementIntent(self.alloc, draining));
+                        try placement_upserts.ensureUnusedCapacity(self.alloc, 1);
+                        placement_upserts.appendAssumeCapacity(
+                            try clonePlacementIntent(self.alloc, draining),
+                        );
                     }
                 }
             }
@@ -518,13 +539,14 @@ pub const Reconciler = struct {
             if (!splitTransitionCanRollback(record)) {
                 try split_removals.append(self.alloc, record.transition_id);
             } else if (terminalSplitObservationPhase(observation)) |phase| {
+                try split_upserts.ensureUnusedCapacity(self.alloc, 1);
                 var terminal_record = try cloneSplitRecord(self.alloc, record);
                 terminal_record.phase = phase;
-                try split_upserts.append(self.alloc, terminal_record);
+                split_upserts.appendAssumeCapacity(terminal_record);
             } else {
+                try split_steps.ensureUnusedCapacity(self.alloc, 1);
                 const planned_record = try cloneSplitRecord(self.alloc, record);
-                errdefer table_manager.freeSplitTransitionRecord(self.alloc, planned_record);
-                try split_steps.append(self.alloc, .{
+                split_steps.appendAssumeCapacity(.{
                     .record = planned_record,
                     .execution = transition_controller.TransitionController.describeSplit(planned_record, observation),
                 });
@@ -536,13 +558,14 @@ pub const Reconciler = struct {
             if (!mergeTransitionCanRollback(record)) {
                 try merge_removals.append(self.alloc, record.transition_id);
             } else if (terminalMergeObservationPhase(observation)) |phase| {
+                try merge_upserts.ensureUnusedCapacity(self.alloc, 1);
                 var terminal_record = try cloneMergeRecord(self.alloc, record);
                 terminal_record.phase = phase;
-                try merge_upserts.append(self.alloc, terminal_record);
+                merge_upserts.appendAssumeCapacity(terminal_record);
             } else {
+                try merge_steps.ensureUnusedCapacity(self.alloc, 1);
                 const planned_record = try cloneMergeRecord(self.alloc, record);
-                errdefer table_manager.freeMergeTransitionRecord(self.alloc, planned_record);
-                try merge_steps.append(self.alloc, .{
+                merge_steps.appendAssumeCapacity(.{
                     .record = planned_record,
                     .execution = transition_controller.TransitionController.describeMerge(planned_record, observation),
                 });
@@ -559,25 +582,30 @@ pub const Reconciler = struct {
             }
         }
 
-        return .{
-            .placement_upserts = try placement_upserts.toOwnedSlice(self.alloc),
-            .table_upserts = try table_upserts.toOwnedSlice(self.alloc),
-            .range_upserts = try range_upserts.toOwnedSlice(self.alloc),
-            .split_admissions = try split_admissions.toOwnedSlice(self.alloc),
-            .split_upserts = try split_upserts.toOwnedSlice(self.alloc),
-            .merge_upserts = try merge_upserts.toOwnedSlice(self.alloc),
-            .placement_removals = try placement_removals.toOwnedSlice(self.alloc),
-            .table_removals = try table_removals.toOwnedSlice(self.alloc),
-            .range_removals = try range_removals.toOwnedSlice(self.alloc),
-            .split_removals = try split_removals.toOwnedSlice(self.alloc),
-            .merge_removals = try merge_removals.toOwnedSlice(self.alloc),
-            .split_steps = try split_steps.toOwnedSlice(self.alloc),
-            .merge_steps = try merge_steps.toOwnedSlice(self.alloc),
-            .repair_placement_groups = repair_placement_groups,
-            .rebalance_placement_groups = rebalance_placement_groups,
-            .forced_reallocation = current.reallocate_requested,
-            .clear_reallocation_request = current.reallocate_requested,
-        };
+        // Transfer each list independently so an allocation failure while
+        // shrinking a later list can release every slice already transferred.
+        // `toOwnedSlice` empties its source, keeping the list errdefers from
+        // double-freeing records now owned by the partially built plan.
+        var plan = ReconciliationPlan.empty();
+        errdefer plan.deinit(self.alloc);
+        plan.placement_upserts = try placement_upserts.toOwnedSlice(self.alloc);
+        plan.table_upserts = try table_upserts.toOwnedSlice(self.alloc);
+        plan.range_upserts = try range_upserts.toOwnedSlice(self.alloc);
+        plan.split_admissions = try split_admissions.toOwnedSlice(self.alloc);
+        plan.split_upserts = try split_upserts.toOwnedSlice(self.alloc);
+        plan.merge_upserts = try merge_upserts.toOwnedSlice(self.alloc);
+        plan.placement_removals = try placement_removals.toOwnedSlice(self.alloc);
+        plan.table_removals = try table_removals.toOwnedSlice(self.alloc);
+        plan.range_removals = try range_removals.toOwnedSlice(self.alloc);
+        plan.split_removals = try split_removals.toOwnedSlice(self.alloc);
+        plan.merge_removals = try merge_removals.toOwnedSlice(self.alloc);
+        plan.split_steps = try split_steps.toOwnedSlice(self.alloc);
+        plan.merge_steps = try merge_steps.toOwnedSlice(self.alloc);
+        plan.repair_placement_groups = repair_placement_groups;
+        plan.rebalance_placement_groups = rebalance_placement_groups;
+        plan.forced_reallocation = current.reallocate_requested;
+        plan.clear_reallocation_request = current.reallocate_requested;
+        return plan;
     }
 
     fn syncAutomaticShardIntents(
@@ -651,6 +679,12 @@ pub const Reconciler = struct {
                 return std.mem.order(u8, a.start_key, b.start_key) == .lt;
             }
         }.lessThan);
+        var planning_index = try AutomaticPlanningIndex.init(
+            self.alloc,
+            current,
+            sorted_ranges,
+        );
+        defer planning_index.deinit();
 
         var split_intents = std.ArrayListUnmanaged(table_manager.SplitIntent).empty;
         errdefer {
@@ -667,24 +701,29 @@ pub const Reconciler = struct {
             if (remaining_cluster_budget == 0) break;
 
             var table_budget = per_table_limit;
-            const active_table = activeRangeTransitionCountForTable(current, table.table_id);
+            const active_table = planning_index.activeTransitionCount(table.table_id);
             if (active_table >= table_budget) continue;
             table_budget -= active_table;
 
-            var planned_shards = countRangesForTable(current.ranges, table.table_id);
+            const table_ranges = planning_index.rangesForTable(table.table_id);
+            var planned_shards = std.math.cast(u32, table_ranges.len) orelse
+                continue;
 
             if (planned_shards > min_shards_per_table and table_budget > 0 and remaining_cluster_budget > 0) {
                 var i: usize = 0;
-                while (i + 1 < sorted_ranges.len and table_budget > 0 and remaining_cluster_budget > 0) : (i += 1) {
-                    const left = sorted_ranges[i];
-                    const right = sorted_ranges[i + 1];
-                    if (left.table_id != table.table_id or right.table_id != table.table_id) continue;
+                while (i + 1 < table_ranges.len and table_budget > 0 and remaining_cluster_budget > 0) : (i += 1) {
+                    const left = table_ranges[i];
+                    const right = table_ranges[i + 1];
                     if (!rangesAdjacent(left, right)) continue;
-                    if (groupBusy(current, left.group_id) or groupBusy(current, right.group_id)) continue;
+                    if (planning_index.groupBusy(left.group_id) or planning_index.groupBusy(right.group_id)) continue;
                     if (self.isShardInCooldown(left.group_id, now_monotonic_ms) or self.isShardInCooldown(right.group_id, now_monotonic_ms)) continue;
                     const left_status = evidence.mergedStatus(current, left.group_id) orelse continue;
                     const right_status = evidence.mergedStatus(current, right.group_id) orelse continue;
-                    if (!groupHasFullHealthyPlacement(current, left.group_id, left_status) or !groupHasFullHealthyPlacement(current, right.group_id, right_status)) continue;
+                    if (!evidence.hasFullHealthyPlacement(left.group_id, left_status) or
+                        !evidence.hasFullHealthyPlacement(right.group_id, right_status))
+                    {
+                        continue;
+                    }
                     if (!groupStatusFresh(self.config, left_status, now_realtime_ms) or !groupStatusFresh(self.config, right_status, now_realtime_ms)) continue;
                     if (!groupStatusReadyForAutomaticPlanning(left_status) or !groupStatusReadyForAutomaticPlanning(right_status)) continue;
                     if (!self.groupOldEnoughForMerge(left_status, now_realtime_ms) or !self.groupOldEnoughForMerge(right_status, now_realtime_ms)) continue;
@@ -693,7 +732,8 @@ pub const Reconciler = struct {
                     const left_size = left_status.disk_bytes;
                     const right_size = right_status.disk_bytes;
                     if (!(left_size < min_shard_size_bytes or right_size < min_shard_size_bytes)) continue;
-                    const combined = left_size + right_size;
+                    const combined = std.math.add(u64, left_size, right_size) catch
+                        continue;
                     if (combined >= self.config.max_shard_size_bytes) continue;
 
                     const transition_id = deriveAutomaticTransitionId("merge", left.group_id, right.group_id, null);
@@ -705,6 +745,7 @@ pub const Reconciler = struct {
                         .automatic = true,
                     };
                     try merge_intents.append(self.alloc, intent);
+                    try planning_index.markBusy(left.group_id, right.group_id);
                     planned_shards -= 1;
                     table_budget -= 1;
                     remaining_cluster_budget -= 1;
@@ -713,27 +754,36 @@ pub const Reconciler = struct {
 
             if (planned_shards >= max_shards_per_table or table_budget == 0 or remaining_cluster_budget == 0) continue;
 
-            for (sorted_ranges) |range| {
-                if (range.table_id != table.table_id) continue;
+            for (table_ranges) |range| {
                 if (planned_shards >= max_shards_per_table or table_budget == 0 or remaining_cluster_budget == 0) break;
-                if (groupBusy(current, range.group_id)) continue;
+                if (planning_index.groupBusy(range.group_id)) continue;
                 if (self.isShardInCooldown(range.group_id, now_monotonic_ms)) continue;
                 const status = evidence.mergedStatus(current, range.group_id) orelse continue;
-                if (!groupHasFullHealthyPlacement(current, range.group_id, status)) continue;
+                if (!evidence.hasFullHealthyPlacement(range.group_id, status)) continue;
                 if (!groupStatusFresh(self.config, status, now_realtime_ms)) continue;
                 if (!groupStatusReadyForAutomaticPlanning(status)) continue;
                 if (!docIdentityNamespaceReadyForAutomaticSplit(status)) continue;
                 if (status.disk_bytes <= self.config.max_shard_size_bytes) continue;
                 const lookup = self.config.median_key_lookup orelse continue;
-                const owned_split_key = (lookup.fetchMedianKey(self.alloc, range.group_id) catch continue) orelse continue;
+                const owned_split_key = (lookup.fetchMedianKey(
+                    self.alloc,
+                    range.group_id,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => continue,
+                }) orelse continue;
                 var split_key_consumed = false;
                 defer if (!split_key_consumed) self.alloc.free(owned_split_key);
                 if (status.doc_count > 0 and status.doc_count < 2) continue;
                 if (owned_split_key.len == 0) continue;
                 if (!keyStrictlyInsideRange(owned_split_key, range.start_key, range.end_key)) continue;
 
-                const destination_group_id = deriveAutomaticSplitDestinationId(current, range.group_id, owned_split_key);
-                if (destination_group_id == 0 or groupIdExists(current, destination_group_id)) continue;
+                const destination_group_id = deriveAutomaticSplitDestinationId(
+                    &planning_index,
+                    range.group_id,
+                    owned_split_key,
+                );
+                if (destination_group_id == 0) continue;
                 const transition_id = deriveAutomaticTransitionId("split", range.group_id, destination_group_id, owned_split_key);
                 const intent: table_manager.SplitIntent = .{
                     .transition_id = transition_id,
@@ -743,7 +793,8 @@ pub const Reconciler = struct {
                     .split_key = owned_split_key,
                     .automatic = true,
                 };
-                errdefer freeSplitIntentOwned(self.alloc, intent);
+                try planning_index.reserveGroup(destination_group_id);
+                try planning_index.markBusy(range.group_id, destination_group_id);
                 try split_intents.append(self.alloc, intent);
                 split_key_consumed = true;
                 planned_shards += 1;
@@ -752,10 +803,11 @@ pub const Reconciler = struct {
             }
         }
 
-        return .{
-            .splits = try split_intents.toOwnedSlice(self.alloc),
-            .merges = try merge_intents.toOwnedSlice(self.alloc),
-        };
+        var transitions = AutomaticTransitions.empty();
+        errdefer transitions.deinit(self.alloc);
+        transitions.splits = try split_intents.toOwnedSlice(self.alloc);
+        transitions.merges = try merge_intents.toOwnedSlice(self.alloc);
+        return transitions;
     }
 
     fn effectiveMinShardSizeBytes(self: *const Reconciler) u64 {
@@ -831,6 +883,13 @@ const AutomaticTransitions = struct {
     splits: []table_manager.SplitIntent,
     merges: []table_manager.MergeIntent,
 
+    fn empty() AutomaticTransitions {
+        return .{
+            .splits = &.{},
+            .merges = &.{},
+        };
+    }
+
     fn deinit(self: *AutomaticTransitions, alloc: std.mem.Allocator) void {
         for (self.splits) |intent| freeSplitIntentOwned(alloc, intent);
         if (self.splits.len > 0) alloc.free(self.splits);
@@ -861,7 +920,20 @@ fn placementIntentsEqual(a: raft_reconciler.PlacementIntent, b: raft_reconciler.
         a.relocation_disk_bytes_watermark == b.relocation_disk_bytes_watermark and
         a.relocation_target_sequence == b.relocation_target_sequence and
         a.relocation_applied_sequence == b.relocation_applied_sequence and
-        std.mem.eql(u64, a.peer_node_ids, b.peer_node_ids);
+        std.mem.eql(u64, a.peer_node_ids, b.peer_node_ids) and
+        std.mem.eql(u64, a.learner_node_ids, b.learner_node_ids);
+}
+
+test "metadata reconciler detects learner membership changes" {
+    const current: raft_reconciler.PlacementIntent = .{
+        .record = .{ .group_id = 31, .replica_id = 1, .local_node_id = 1 },
+        .peer_node_ids = &.{ 1, 2 },
+        .learner_node_ids = &.{3},
+    };
+    var desired = current;
+    desired.learner_node_ids = &.{4};
+
+    try std.testing.expect(!placementIntentsEqual(current, desired));
 }
 
 fn snapshotBootstrapEqual(
@@ -1080,6 +1152,14 @@ const StoreEvidenceIndex = struct {
         runtime_reported: bool = false,
     };
 
+    const PlacementTopology = struct {
+        member_count: usize = 0,
+        voter_count: usize = 0,
+        voter_set_fingerprint: table_manager.VoterSetFingerprint = [_]u8{0} ** table_manager.voter_set_fingerprint_len,
+        initialized: bool = false,
+        ambiguous: bool = false,
+    };
+
     alloc: std.mem.Allocator,
     stores_by_id: std.AutoHashMapUnmanaged(u64, ?*const table_manager.StoreRecord) = .empty,
     stores_by_node: std.AutoHashMapUnmanaged(u64, ?*const table_manager.StoreRecord) = .empty,
@@ -1087,6 +1167,7 @@ const StoreEvidenceIndex = struct {
     merged_status_by_group: std.AutoHashMapUnmanaged(u64, *const MergedGroupStatus) = .empty,
     placement_by_member: std.AutoHashMapUnmanaged(u128, ?*const raft_reconciler.PlacementIntent) = .empty,
     placement_count_by_group: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    placement_topology_by_group: std.AutoHashMapUnmanaged(u64, PlacementTopology) = .empty,
     relocation_source_by_group: std.AutoHashMapUnmanaged(u64, *const raft_reconciler.PlacementIntent) = .empty,
     relocation_watermark_by_group: std.AutoHashMapUnmanaged(u64, RelocationWatermark) = .empty,
 
@@ -1130,6 +1211,36 @@ const StoreEvidenceIndex = struct {
             if (!count.found_existing) count.value_ptr.* = 0;
             count.value_ptr.* += 1;
 
+            const topology_entry = try self.placement_topology_by_group.getOrPut(
+                alloc,
+                intent.record.group_id,
+            );
+            if (!topology_entry.found_existing) topology_entry.value_ptr.* = .{};
+            const topology = topology_entry.value_ptr;
+            topology.member_count += 1;
+            if (member.found_existing) topology.ambiguous = true;
+            const voter_count = table_manager.normalizedVoterCount(
+                intent.peer_node_ids,
+                intent.record.local_node_id,
+            );
+            const fingerprint = table_manager.voterSetFingerprint(
+                intent.peer_node_ids,
+                intent.record.local_node_id,
+            );
+            if (!topology.initialized) {
+                topology.initialized = true;
+                topology.voter_count = voter_count;
+                topology.voter_set_fingerprint = fingerprint;
+            } else if (topology.voter_count != voter_count or
+                !std.mem.eql(
+                    u8,
+                    &topology.voter_set_fingerprint,
+                    &fingerprint,
+                ))
+            {
+                topology.ambiguous = true;
+            }
+
             const source = try self.relocation_source_by_group.getOrPut(alloc, intent.record.group_id);
             if (!source.found_existing or relocationSourceRank(intent.serving_state) > relocationSourceRank(source.value_ptr.*.serving_state)) {
                 source.value_ptr.* = intent;
@@ -1149,6 +1260,7 @@ const StoreEvidenceIndex = struct {
         self.merged_status_by_group.deinit(self.alloc);
         self.placement_by_member.deinit(self.alloc);
         self.placement_count_by_group.deinit(self.alloc);
+        self.placement_topology_by_group.deinit(self.alloc);
         self.relocation_source_by_group.deinit(self.alloc);
         self.relocation_watermark_by_group.deinit(self.alloc);
         self.* = undefined;
@@ -1193,6 +1305,32 @@ const StoreEvidenceIndex = struct {
 
     fn placementCount(self: *const StoreEvidenceIndex, group_id: u64) usize {
         return self.placement_count_by_group.get(group_id) orelse 0;
+    }
+
+    fn hasFullHealthyPlacement(
+        self: *const StoreEvidenceIndex,
+        group_id: u64,
+        status: MergedGroupStatus,
+    ) bool {
+        const topology = self.placement_topology_by_group.get(group_id) orelse return false;
+        if (!topology.initialized or topology.ambiguous or topology.member_count == 0) return false;
+        if (topology.voter_count != topology.member_count or
+            topology.voter_count > std.math.maxInt(u16))
+        {
+            return false;
+        }
+        const expected_count: u16 = @intCast(topology.voter_count);
+        return status.leader_known and
+            status.readiness_from_leader and
+            status.voter_count_known and
+            status.voter_set_known and
+            status.voter_count == expected_count and
+            status.healthy_voter_reports == expected_count and
+            std.mem.eql(
+                u8,
+                &status.voter_set_fingerprint,
+                &topology.voter_set_fingerprint,
+            );
     }
 
     fn relocationSource(self: *const StoreEvidenceIndex, group_id: u64) ?raft_reconciler.PlacementIntent {
@@ -1925,21 +2063,136 @@ fn automaticMergeIntentStillValid(manager: *table_manager.TableManager, intent: 
 }
 
 fn activeRangeTransitionCount(current: CurrentMetadataState) u32 {
-    return @intCast(current.split_transitions.len + current.merge_transitions.len);
+    const total = current.split_transitions.len +| current.merge_transitions.len;
+    return std.math.cast(u32, total) orelse std.math.maxInt(u32);
 }
 
-fn activeRangeTransitionCountForTable(current: CurrentMetadataState, table_id: u64) u32 {
-    var total: u32 = 0;
-    for (current.split_transitions) |record| {
-        const range = findRangeRecord(current.ranges, record.source_group_id) orelse continue;
-        if (range.table_id == table_id) total += 1;
+const AutomaticPlanningIndex = struct {
+    const RangeSpan = struct {
+        start: usize,
+        len: usize,
+    };
+
+    alloc: std.mem.Allocator,
+    sorted_ranges: []const table_manager.RangeRecord,
+    range_spans_by_table: std.AutoHashMapUnmanaged(u64, RangeSpan) = .empty,
+    table_by_group: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    active_transitions_by_table: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    busy_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    occupied_group_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    fn init(
+        alloc: std.mem.Allocator,
+        current: CurrentMetadataState,
+        sorted_ranges: []const table_manager.RangeRecord,
+    ) !AutomaticPlanningIndex {
+        var self: AutomaticPlanningIndex = .{
+            .alloc = alloc,
+            .sorted_ranges = sorted_ranges,
+        };
+        errdefer self.deinit();
+
+        try self.table_by_group.ensureTotalCapacity(alloc, @intCast(sorted_ranges.len));
+        try self.occupied_group_ids.ensureTotalCapacity(
+            alloc,
+            @intCast(sorted_ranges.len +
+                current.split_transitions.len * 2 +
+                current.merge_transitions.len * 2),
+        );
+        var start: usize = 0;
+        while (start < sorted_ranges.len) {
+            const table_id = sorted_ranges[start].table_id;
+            var end = start;
+            while (end < sorted_ranges.len and sorted_ranges[end].table_id == table_id) : (end += 1) {
+                const range = sorted_ranges[end];
+                const table_entry = self.table_by_group.getOrPutAssumeCapacity(range.group_id);
+                if (table_entry.found_existing) return error.DuplicateRangeGroup;
+                table_entry.value_ptr.* = table_id;
+                try self.occupied_group_ids.put(alloc, range.group_id, {});
+            }
+            try self.range_spans_by_table.put(alloc, table_id, .{
+                .start = start,
+                .len = end - start,
+            });
+            start = end;
+        }
+
+        for (current.split_transitions) |record| {
+            try self.markExistingTransition(
+                record.source_group_id,
+                record.destination_group_id,
+            );
+        }
+        for (current.merge_transitions) |record| {
+            try self.markExistingTransition(
+                record.donor_group_id,
+                record.receiver_group_id,
+            );
+        }
+        return self;
     }
-    for (current.merge_transitions) |record| {
-        const range = findRangeRecord(current.ranges, record.receiver_group_id) orelse continue;
-        if (range.table_id == table_id) total += 1;
+
+    fn deinit(self: *AutomaticPlanningIndex) void {
+        self.range_spans_by_table.deinit(self.alloc);
+        self.table_by_group.deinit(self.alloc);
+        self.active_transitions_by_table.deinit(self.alloc);
+        self.busy_groups.deinit(self.alloc);
+        self.occupied_group_ids.deinit(self.alloc);
+        self.* = undefined;
     }
-    return total;
-}
+
+    fn rangesForTable(
+        self: *const AutomaticPlanningIndex,
+        table_id: u64,
+    ) []const table_manager.RangeRecord {
+        const span = self.range_spans_by_table.get(table_id) orelse return &.{};
+        return self.sorted_ranges[span.start..][0..span.len];
+    }
+
+    fn activeTransitionCount(self: *const AutomaticPlanningIndex, table_id: u64) u32 {
+        return self.active_transitions_by_table.get(table_id) orelse 0;
+    }
+
+    fn groupBusy(self: *const AutomaticPlanningIndex, group_id: u64) bool {
+        return self.busy_groups.contains(group_id);
+    }
+
+    fn groupExists(self: *const AutomaticPlanningIndex, group_id: u64) bool {
+        return !group_ids.isDataGroupId(group_id) or
+            self.occupied_group_ids.contains(group_id);
+    }
+
+    fn reserveGroup(self: *AutomaticPlanningIndex, group_id: u64) !void {
+        if (self.groupExists(group_id)) return error.AutomaticGroupIdCollision;
+        try self.occupied_group_ids.put(self.alloc, group_id, {});
+    }
+
+    fn markBusy(
+        self: *AutomaticPlanningIndex,
+        first_group_id: u64,
+        second_group_id: u64,
+    ) !void {
+        try self.busy_groups.put(self.alloc, first_group_id, {});
+        try self.busy_groups.put(self.alloc, second_group_id, {});
+    }
+
+    fn markExistingTransition(
+        self: *AutomaticPlanningIndex,
+        first_group_id: u64,
+        second_group_id: u64,
+    ) !void {
+        try self.markBusy(first_group_id, second_group_id);
+        try self.occupied_group_ids.put(self.alloc, first_group_id, {});
+        try self.occupied_group_ids.put(self.alloc, second_group_id, {});
+        const table_id = self.table_by_group.get(first_group_id) orelse
+            self.table_by_group.get(second_group_id) orelse
+            return;
+        const entry = try self.active_transitions_by_table.getOrPut(self.alloc, table_id);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* = std.math.add(u32, entry.value_ptr.*, 1) catch
+            return error.TooManyActiveRangeTransitions;
+    }
+};
 
 fn mergedGroupStatus(current: CurrentMetadataState, group_id: u64) ?MergedGroupStatus {
     if (current.merged_group_statuses.len > 0) {
@@ -2393,6 +2646,8 @@ fn mergeHealthyGroupStatusFallback(
         .leader_store_id = 0,
         .voter_count_known = voter_set.voter_count_known,
         .voter_count = voter_set.voter_count,
+        .voter_set_known = voter_set.voter_set_known,
+        .voter_set_fingerprint = voter_set.voter_set_fingerprint,
         .healthy_voter_reports = healthy_voter_reports,
         .joint_consensus = joint_consensus,
         .readiness_from_leader = false,
@@ -2418,32 +2673,60 @@ fn mergeHealthyGroupStatusFallback(
     return merged;
 }
 
-fn groupHasFullHealthyPlacement(current: CurrentMetadataState, group_id: u64, status: MergedGroupStatus) bool {
-    const expected = countPlacementIntents(current.placement_intents, group_id);
-    if (status.voter_count_known) {
-        if (expected > 0 and status.voter_count != expected) return false;
-        return status.healthy_voter_reports >= status.voter_count;
-    }
-    if (expected == 0) return true;
-    return status.healthy_voter_reports >= expected;
-}
-
-test "metadata reconciler never counts non-voter group reports as placement readiness" {
+test "metadata reconciler requires exact leader voter evidence for placement readiness" {
     const placements = [_]raft_reconciler.PlacementIntent{
-        .{ .record = .{ .group_id = 7001, .replica_id = 1, .local_node_id = 1 } },
-        .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 2 } },
+        .{
+            .record = .{ .group_id = 7001, .replica_id = 1, .local_node_id = 1 },
+            .peer_node_ids = &.{ 1, 2 },
+        },
+        .{
+            .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 2 },
+            .peer_node_ids = &.{ 1, 2 },
+        },
     };
     const current = CurrentMetadataState{ .placement_intents = &placements };
+    var evidence = try StoreEvidenceIndex.init(std.testing.allocator, current);
+    defer evidence.deinit();
+    const fingerprint = table_manager.voterSetFingerprint(&.{ 1, 2 }, null);
 
-    try std.testing.expect(!groupHasFullHealthyPlacement(
-        current,
+    try std.testing.expect(!evidence.hasFullHealthyPlacement(
         7001,
-        .{ .group_id = 7001, .healthy_voter_reports = 1 },
+        .{
+            .group_id = 7001,
+            .leader_known = true,
+            .readiness_from_leader = true,
+            .voter_count_known = true,
+            .voter_set_known = true,
+            .voter_set_fingerprint = fingerprint,
+            .voter_count = 2,
+            .healthy_voter_reports = 1,
+        },
     ));
-    try std.testing.expect(groupHasFullHealthyPlacement(
-        current,
+    try std.testing.expect(evidence.hasFullHealthyPlacement(
         7001,
-        .{ .group_id = 7001, .healthy_voter_reports = 2 },
+        .{
+            .group_id = 7001,
+            .leader_known = true,
+            .readiness_from_leader = true,
+            .voter_count_known = true,
+            .voter_set_known = true,
+            .voter_set_fingerprint = fingerprint,
+            .voter_count = 2,
+            .healthy_voter_reports = 2,
+        },
+    ));
+    try std.testing.expect(!evidence.hasFullHealthyPlacement(
+        7001,
+        .{
+            .group_id = 7001,
+            .leader_known = true,
+            .readiness_from_leader = true,
+            .voter_count_known = true,
+            .voter_set_known = true,
+            .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 1, 3 }, null),
+            .voter_count = 2,
+            .healthy_voter_reports = 2,
+        },
     ));
 }
 
@@ -2504,31 +2787,17 @@ test "metadata reconciler bounds future-skewed group status freshness" {
 }
 
 fn groupStatusReadyForAutomaticPlanning(status: MergedGroupStatus) bool {
-    return !status.joint_consensus and
+    return status.leader_known and
+        status.readiness_from_leader and
+        status.voter_count_known and
+        status.voter_set_known and
+        !status.joint_consensus and
         !status.transition_pending and
         !status.replay_required and
         !status.replay_caught_up and
         !status.cutover_ready and
         !status.reads_ready_after_cutover and
         !status.restore_pending;
-}
-
-fn countRangesForTable(ranges: []const table_manager.RangeRecord, table_id: u64) u32 {
-    var count: u32 = 0;
-    for (ranges) |range| {
-        if (range.table_id == table_id) count += 1;
-    }
-    return count;
-}
-
-fn groupBusy(current: CurrentMetadataState, group_id: u64) bool {
-    for (current.split_transitions) |record| {
-        if (record.source_group_id == group_id or record.destination_group_id == group_id) return true;
-    }
-    for (current.merge_transitions) |record| {
-        if (record.donor_group_id == group_id or record.receiver_group_id == group_id) return true;
-    }
-    return false;
 }
 
 fn managerGroupBusy(
@@ -2565,7 +2834,7 @@ fn deriveAutomaticTransitionId(prefix: []const u8, first: u64, second: u64, key:
 }
 
 fn deriveAutomaticSplitDestinationId(
-    current: CurrentMetadataState,
+    planning_index: *const AutomaticPlanningIndex,
     source_group_id: u64,
     split_key: []const u8,
 ) u64 {
@@ -2576,21 +2845,9 @@ fn deriveAutomaticSplitDestinationId(
         hasher.update(split_key);
         const candidate = group_ids.dataGroupIdFromHash(hasher.final());
         if (candidate == 0) continue;
-        if (!groupIdExists(current, candidate)) return candidate;
+        if (!planning_index.groupExists(candidate)) return candidate;
     }
     return 0;
-}
-
-fn groupIdExists(current: CurrentMetadataState, group_id: u64) bool {
-    if (!group_ids.isDataGroupId(group_id)) return true;
-    if (findRangeRecord(current.ranges, group_id) != null) return true;
-    for (current.split_transitions) |record| {
-        if (record.source_group_id == group_id or record.destination_group_id == group_id) return true;
-    }
-    for (current.merge_transitions) |record| {
-        if (record.donor_group_id == group_id or record.receiver_group_id == group_id) return true;
-    }
-    return false;
 }
 
 fn containsU64(values: []const u64, needle: u64) bool {
@@ -2643,15 +2900,34 @@ fn hasExcludedCurrentPeer(
 }
 
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: transition_state.SplitTransitionRecord) !transition_state.SplitTransitionRecord {
+    const split_key = if (record.split_key) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    const source_range_end = if (record.source_range_end) |value|
+        alloc.dupe(u8, value) catch |err| {
+            if (split_key) |owned| alloc.free(owned);
+            return err;
+        }
+    else
+        null;
+    const rollback_reason = if (record.rollback_reason) |value|
+        alloc.dupe(u8, value) catch |err| {
+            if (source_range_end) |owned| alloc.free(owned);
+            if (split_key) |owned| alloc.free(owned);
+            return err;
+        }
+    else
+        null;
     return .{
         .transition_id = record.transition_id,
         .attempt_epoch = record.attempt_epoch,
         .source_group_id = record.source_group_id,
         .destination_group_id = record.destination_group_id,
         .phase = record.phase,
-        .split_key = if (record.split_key) |value| try alloc.dupe(u8, value) else null,
-        .source_range_end = if (record.source_range_end) |value| try alloc.dupe(u8, value) else null,
-        .rollback_reason = if (record.rollback_reason) |value| try alloc.dupe(u8, value) else null,
+        .split_key = split_key,
+        .source_range_end = source_range_end,
+        .rollback_reason = rollback_reason,
     };
 }
 
@@ -5014,6 +5290,17 @@ test "metadata reconciler plans an automatic split from fresh group status" {
     defer manager.freeRanges(std.testing.allocator, ranges);
 
     const now_ms = platform_clock.Clock.real().nowRealtimeMs();
+    const voter_set_fingerprint = table_manager.voterSetFingerprint(&.{1}, null);
+    const placements = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{
+            .group_id = 4001,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .bootstrap_mode = .persisted,
+        },
+        .store_id = 1,
+        .peer_node_ids = &.{1},
+    }};
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -5030,6 +5317,10 @@ test "metadata reconciler plans an automatic split from fresh group status" {
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -5044,6 +5335,7 @@ test "metadata reconciler plans an automatic split from fresh group status" {
     var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
         .tables = tables,
         .ranges = ranges,
+        .placement_intents = &placements,
         .stores = &stores,
     });
     defer plan.deinit(std.testing.allocator);
@@ -5052,6 +5344,83 @@ test "metadata reconciler plans an automatic split from fresh group status" {
     try std.testing.expectEqual(@as(u64, 4001), plan.split_admissions[0].record.source_group_id);
     try std.testing.expect(plan.split_admissions[0].record.destination_group_id != 0);
     try std.testing.expectEqualStrings("doc:m", plan.split_admissions[0].record.split_key.?);
+}
+
+test "metadata reconciler automatic split planning cleans up every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var manager = table_manager.TableManager.init(alloc);
+            defer manager.deinit();
+
+            try manager.upsertTable(.{ .table_id = 40, .name = "docs" });
+            try manager.upsertRange(.{
+                .group_id = 4001,
+                .table_id = 40,
+                .start_key = "doc:a",
+                .end_key = "doc:z",
+            });
+
+            const tables = try manager.listTables(alloc);
+            defer manager.freeTables(alloc, tables);
+            const ranges = try manager.listRanges(alloc);
+            defer manager.freeRanges(alloc, ranges);
+
+            const voter_set_fingerprint = table_manager.voterSetFingerprint(
+                &.{1},
+                null,
+            );
+            const placements = [_]raft_reconciler.PlacementIntent{.{
+                .record = .{
+                    .group_id = 4001,
+                    .replica_id = 1,
+                    .local_node_id = 1,
+                    .bootstrap_mode = .persisted,
+                },
+                .store_id = 1,
+                .peer_node_ids = &.{1},
+            }};
+            const stores = [_]table_manager.StoreRecord{.{
+                .store_id = 1,
+                .node_id = 1,
+                .role = "data",
+                .health_class = "healthy",
+                .failure_domain = "rack-a",
+                .live = true,
+                .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                    .group_id = 4001,
+                    .doc_count = 200,
+                    .disk_bytes = 200,
+                    .empty = false,
+                    .updated_at_millis = platform_clock.Clock.real().nowRealtimeMs(),
+                    .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
+                }})[0..]),
+            }};
+
+            var lookup = TestMedianKeyLookup{ .median_key = "doc:m" };
+            var reconciler = Reconciler.initWithConfig(alloc, .{
+                .max_shard_size_bytes = 100,
+                .max_shards_per_table = 8,
+                .median_key_lookup = lookup.iface(),
+            });
+            var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+                .tables = tables,
+                .ranges = ranges,
+                .placement_intents = &placements,
+                .stores = &stores,
+            });
+            defer plan.deinit(alloc);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        Runner.run,
+        .{},
+    );
 }
 
 test "metadata reconciler plans an automatic split from disk size when doc count is stale" {
@@ -5072,6 +5441,17 @@ test "metadata reconciler plans an automatic split from disk size when doc count
     defer manager.freeRanges(std.testing.allocator, ranges);
 
     const now_ms = platform_clock.Clock.real().nowRealtimeMs();
+    const voter_set_fingerprint = table_manager.voterSetFingerprint(&.{1}, null);
+    const placements = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{
+            .group_id = 4101,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .bootstrap_mode = .persisted,
+        },
+        .store_id = 1,
+        .peer_node_ids = &.{1},
+    }};
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -5088,6 +5468,10 @@ test "metadata reconciler plans an automatic split from disk size when doc count
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -5102,6 +5486,7 @@ test "metadata reconciler plans an automatic split from disk size when doc count
     var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
         .tables = tables,
         .ranges = ranges,
+        .placement_intents = &placements,
         .stores = &stores,
     });
     defer plan.deinit(std.testing.allocator);
@@ -5561,6 +5946,29 @@ test "metadata reconciler plans an automatic merge from adjacent small fresh gro
     defer manager.freeRanges(std.testing.allocator, ranges);
 
     const now_ms = platform_clock.Clock.real().nowRealtimeMs();
+    const voter_set_fingerprint = table_manager.voterSetFingerprint(&.{1}, null);
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{
+                .group_id = 4101,
+                .replica_id = 1,
+                .local_node_id = 1,
+                .bootstrap_mode = .persisted,
+            },
+            .store_id = 1,
+            .peer_node_ids = &.{1},
+        },
+        .{
+            .record = .{
+                .group_id = 4102,
+                .replica_id = 1,
+                .local_node_id = 1,
+                .bootstrap_mode = .persisted,
+            },
+            .store_id = 1,
+            .peer_node_ids = &.{1},
+        },
+    };
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -5577,6 +5985,10 @@ test "metadata reconciler plans an automatic merge from adjacent small fresh gro
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
                 .{
                     .group_id = 4102,
@@ -5585,6 +5997,10 @@ test "metadata reconciler plans an automatic merge from adjacent small fresh gro
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -5599,6 +6015,7 @@ test "metadata reconciler plans an automatic merge from adjacent small fresh gro
     var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
         .tables = tables,
         .ranges = ranges,
+        .placement_intents = &placements,
         .stores = &stores,
     });
     defer plan.deinit(std.testing.allocator);
@@ -6431,6 +6848,11 @@ test "metadata reconciler does not merge shards that are younger than the merge 
     var manual_clock = platform_clock.ManualClock{};
     manual_clock.setRealtimeNs(10 * 60 * std.time.ns_per_s);
     const now_realtime_ms = manual_clock.clock().nowRealtimeMs();
+    const voter_set_fingerprint = table_manager.voterSetFingerprint(&.{1}, null);
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 41111, .replica_id = 1, .local_node_id = 1 }, .store_id = 1, .peer_node_ids = &.{1} },
+        .{ .record = .{ .group_id = 41112, .replica_id = 2, .local_node_id = 1 }, .store_id = 1, .peer_node_ids = &.{1} },
+    };
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6448,6 +6870,10 @@ test "metadata reconciler does not merge shards that are younger than the merge 
                     .created_at_millis = now_realtime_ms - 30 * std.time.ms_per_s,
                     .updated_at_millis = now_realtime_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
                 .{
                     .group_id = 41012,
@@ -6457,6 +6883,10 @@ test "metadata reconciler does not merge shards that are younger than the merge 
                     .created_at_millis = now_realtime_ms - 30 * std.time.ms_per_s,
                     .updated_at_millis = now_realtime_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -6473,6 +6903,7 @@ test "metadata reconciler does not merge shards that are younger than the merge 
     var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
         .tables = tables,
         .ranges = ranges,
+        .placement_intents = &placements,
         .stores = &stores,
     });
     defer plan.deinit(std.testing.allocator);
@@ -6506,6 +6937,11 @@ test "metadata reconciler merges shards once they are older than the merge age t
     var manual_clock = platform_clock.ManualClock{};
     manual_clock.setRealtimeNs(10 * 60 * std.time.ns_per_s);
     const now_realtime_ms = manual_clock.clock().nowRealtimeMs();
+    const voter_set_fingerprint = table_manager.voterSetFingerprint(&.{1}, null);
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 41111, .replica_id = 1, .local_node_id = 1 }, .store_id = 1, .peer_node_ids = &.{1} },
+        .{ .record = .{ .group_id = 41112, .replica_id = 2, .local_node_id = 1 }, .store_id = 1, .peer_node_ids = &.{1} },
+    };
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6523,6 +6959,10 @@ test "metadata reconciler merges shards once they are older than the merge age t
                     .created_at_millis = now_realtime_ms - 2 * 60 * std.time.ms_per_s,
                     .updated_at_millis = now_realtime_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
                 .{
                     .group_id = 41112,
@@ -6532,6 +6972,10 @@ test "metadata reconciler merges shards once they are older than the merge age t
                     .created_at_millis = now_realtime_ms - 2 * 60 * std.time.ms_per_s,
                     .updated_at_millis = now_realtime_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -6548,6 +6992,7 @@ test "metadata reconciler merges shards once they are older than the merge age t
     var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
         .tables = tables,
         .ranges = ranges,
+        .placement_intents = &placements,
         .stores = &stores,
     });
     defer plan.deinit(std.testing.allocator);
@@ -6703,6 +7148,11 @@ test "metadata reconciler enforces per-table automatic transition budget" {
     defer manager.freeRanges(std.testing.allocator, ranges);
 
     const now_ms = platform_clock.Clock.real().nowRealtimeMs();
+    const voter_set_fingerprint = table_manager.voterSetFingerprint(&.{1}, null);
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 4131, .replica_id = 1, .local_node_id = 1 }, .store_id = 1, .peer_node_ids = &.{1} },
+        .{ .record = .{ .group_id = 4132, .replica_id = 2, .local_node_id = 1 }, .store_id = 1, .peer_node_ids = &.{1} },
+    };
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6719,6 +7169,10 @@ test "metadata reconciler enforces per-table automatic transition budget" {
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
                 .{
                     .group_id = 4132,
@@ -6727,6 +7181,10 @@ test "metadata reconciler enforces per-table automatic transition budget" {
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -6743,6 +7201,7 @@ test "metadata reconciler enforces per-table automatic transition budget" {
     var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
         .tables = tables,
         .ranges = ranges,
+        .placement_intents = &placements,
         .stores = &stores,
     });
     defer plan.deinit(std.testing.allocator);
@@ -6775,6 +7234,11 @@ test "metadata reconciler enforces cluster automatic transition budget" {
     defer manager.freeRanges(std.testing.allocator, ranges);
 
     const now_ms = platform_clock.Clock.real().nowRealtimeMs();
+    const voter_set_fingerprint = table_manager.voterSetFingerprint(&.{1}, null);
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 4141, .replica_id = 1, .local_node_id = 1 }, .store_id = 1, .peer_node_ids = &.{1} },
+        .{ .record = .{ .group_id = 4151, .replica_id = 2, .local_node_id = 1 }, .store_id = 1, .peer_node_ids = &.{1} },
+    };
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6791,6 +7255,10 @@ test "metadata reconciler enforces cluster automatic transition budget" {
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
                 .{
                     .group_id = 4151,
@@ -6799,6 +7267,10 @@ test "metadata reconciler enforces cluster automatic transition budget" {
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -6815,6 +7287,7 @@ test "metadata reconciler enforces cluster automatic transition budget" {
     var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
         .tables = tables,
         .ranges = ranges,
+        .placement_intents = &placements,
         .stores = &stores,
     });
     defer plan.deinit(std.testing.allocator);
@@ -6840,6 +7313,12 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
     defer manager.freeRanges(std.testing.allocator, ranges);
 
     const now_ms = platform_clock.Clock.real().nowRealtimeMs();
+    const voter_set_fingerprint = table_manager.voterSetFingerprint(&.{1}, null);
+    const placements = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{ .group_id = 4201, .replica_id = 1, .local_node_id = 1 },
+        .store_id = 1,
+        .peer_node_ids = &.{1},
+    }};
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -6856,6 +7335,10 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -6872,6 +7355,7 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
     var blocked_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
         .tables = tables,
         .ranges = ranges,
+        .placement_intents = &placements,
         .stores = &stores,
         .reallocate_requested = false,
     });
@@ -6882,6 +7366,7 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
     var forced_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
         .tables = tables,
         .ranges = ranges,
+        .placement_intents = &placements,
         .stores = &stores,
         .reallocate_requested = true,
     });
@@ -7269,6 +7754,11 @@ test "metadata reconciler uses live median key lookup for split planning" {
     defer manager.freeRanges(std.testing.allocator, ranges);
 
     const now_ms = platform_clock.Clock.real().nowRealtimeMs();
+    const voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 1, 2 }, null);
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 4701, .replica_id = 1, .local_node_id = 1 }, .store_id = 1, .peer_node_ids = &.{ 1, 2 } },
+        .{ .record = .{ .group_id = 4701, .replica_id = 2, .local_node_id = 2 }, .store_id = 2, .peer_node_ids = &.{ 1, 2 } },
+    };
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -7285,6 +7775,10 @@ test "metadata reconciler uses live median key lookup for split planning" {
                     .empty = false,
                     .updated_at_millis = now_ms - 5,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 2,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -7303,6 +7797,10 @@ test "metadata reconciler uses live median key lookup for split planning" {
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = false,
+                    .local_voter = true,
+                    .voter_count = 2,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -7317,6 +7815,7 @@ test "metadata reconciler uses live median key lookup for split planning" {
     var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
         .tables = tables,
         .ranges = ranges,
+        .placement_intents = &placements,
         .stores = &stores,
     });
     defer plan.deinit(std.testing.allocator);
@@ -7494,6 +7993,12 @@ test "metadata reconciler prefers live median key lookup for automatic split" {
     defer manager.freeRanges(std.testing.allocator, ranges);
 
     const now_ms = platform_clock.Clock.real().nowRealtimeMs();
+    const voter_set_fingerprint = table_manager.voterSetFingerprint(&.{1}, null);
+    const placements = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{ .group_id = 4811, .replica_id = 1, .local_node_id = 1 },
+        .store_id = 1,
+        .peer_node_ids = &.{1},
+    }};
     const stores = [_]table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -7510,6 +8015,10 @@ test "metadata reconciler prefers live median key lookup for automatic split" {
                     .empty = false,
                     .updated_at_millis = now_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -7542,6 +8051,7 @@ test "metadata reconciler prefers live median key lookup for automatic split" {
     var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
         .tables = tables,
         .ranges = ranges,
+        .placement_intents = &placements,
         .stores = &stores,
     });
     defer plan.deinit(std.testing.allocator);

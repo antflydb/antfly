@@ -98,6 +98,231 @@ pub const ShardOperationAdapter = struct {
     }
 };
 
+/// Retains and drains a borrowed shard-operation adapter. The adapter's
+/// concrete owner must retain a Registration for exactly as long as its
+/// callback state is alive; retiring that registration closes admission and
+/// waits for callbacks already in flight.
+pub const OwnedShardOperationAdapter = struct {
+    const State = struct {
+        alloc: std.mem.Allocator,
+        downstream: ShardOperationAdapter,
+        mutex: std.Io.Mutex = .init,
+        drained: std.Io.Condition = .init,
+        accepting: bool = true,
+        active_calls: usize = 0,
+        references: usize = 1,
+
+        fn lock(self: *State) void {
+            self.mutex.lockUncancelable(std.Options.debug_io);
+        }
+
+        fn unlock(self: *State) void {
+            self.mutex.unlock(std.Options.debug_io);
+        }
+
+        fn retain(self: *State) void {
+            self.lock();
+            defer self.unlock();
+            self.references = std.math.add(usize, self.references, 1) catch
+                @panic("shard operation adapter reference overflow");
+        }
+
+        fn release(self: *State) void {
+            self.lock();
+            std.debug.assert(self.references > 0);
+            self.references -= 1;
+            const destroy = self.references == 0;
+            self.unlock();
+            if (destroy) {
+                const alloc = self.alloc;
+                self.* = undefined;
+                alloc.destroy(self);
+            }
+        }
+
+        fn acquire(self: *State) !CallLease {
+            self.lock();
+            defer self.unlock();
+            if (!self.accepting) return error.TransitionOperationsRetired;
+            self.active_calls = std.math.add(usize, self.active_calls, 1) catch
+                return error.TransitionOperationLeaseOverflow;
+            return .{ .state = self };
+        }
+
+        fn retireAndDrain(self: *State) void {
+            self.lock();
+            defer self.unlock();
+            self.accepting = false;
+            while (self.active_calls != 0) {
+                self.drained.waitUncancelable(std.Options.debug_io, &self.mutex);
+            }
+        }
+    };
+
+    const CallLease = struct {
+        state: *State,
+
+        fn deinit(self: *CallLease) void {
+            const state = self.state;
+            state.lock();
+            std.debug.assert(state.active_calls > 0);
+            state.active_calls -= 1;
+            if (state.active_calls == 0) state.drained.broadcast(std.Options.debug_io);
+            state.unlock();
+            self.* = undefined;
+        }
+    };
+
+    pub const Registration = struct {
+        state: ?*State,
+
+        pub fn deinit(self: *Registration) void {
+            const state = self.state orelse return;
+            self.state = null;
+            state.retireAndDrain();
+            state.release();
+        }
+    };
+
+    state: ?*State,
+
+    pub fn init(
+        alloc: std.mem.Allocator,
+        downstream: ShardOperationAdapter,
+    ) !OwnedShardOperationAdapter {
+        const state = try alloc.create(State);
+        state.* = .{
+            .alloc = alloc,
+            .downstream = downstream,
+        };
+        return .{ .state = state };
+    }
+
+    pub fn deinit(self: *OwnedShardOperationAdapter) void {
+        const state = self.state orelse return;
+        self.state = null;
+        state.retireAndDrain();
+        state.release();
+    }
+
+    pub fn registration(self: *OwnedShardOperationAdapter) Registration {
+        const state = self.state orelse @panic("retired shard operation adapter");
+        state.retain();
+        return .{ .state = state };
+    }
+
+    pub fn adapter(self: *OwnedShardOperationAdapter) ShardOperationAdapter {
+        const state = self.state orelse @panic("retired shard operation adapter");
+        return .{
+            .ptr = state,
+            .vtable = &.{
+                .observe_split = observeSplit,
+                .observe_merge = observeMerge,
+                .prepare_split_source = prepareSplitSource,
+                .start_split_source = startSplitSource,
+                .bootstrap_split_destination = bootstrapSplitDestination,
+                .catch_up_split_destination = catchUpSplitDestination,
+                .finalize_split_source = finalizeSplitSource,
+                .rollback_split = rollbackSplit,
+                .accept_merge_receiver = acceptMergeReceiver,
+                .catch_up_merge_receiver = catchUpMergeReceiver,
+                .finalize_merge = finalizeMerge,
+                .rollback_merge = rollbackMerge,
+            },
+        };
+    }
+
+    fn observeSplit(
+        ptr: *anyopaque,
+        record: metadata_state.SplitTransitionRecord,
+    ) !metadata_state.SplitObservation {
+        const state: *State = @ptrCast(@alignCast(ptr));
+        var lease = try state.acquire();
+        defer lease.deinit();
+        return try state.downstream.observeSplit(record);
+    }
+
+    fn observeMerge(
+        ptr: *anyopaque,
+        record: metadata_state.MergeTransitionRecord,
+    ) !metadata_state.MergeObservation {
+        const state: *State = @ptrCast(@alignCast(ptr));
+        var lease = try state.acquire();
+        defer lease.deinit();
+        return try state.downstream.observeMerge(record);
+    }
+
+    fn prepareSplitSource(ptr: *anyopaque, op: PrepareSplitSource) !void {
+        const state: *State = @ptrCast(@alignCast(ptr));
+        var lease = try state.acquire();
+        defer lease.deinit();
+        try state.downstream.vtable.prepare_split_source(state.downstream.ptr, op);
+    }
+
+    fn startSplitSource(ptr: *anyopaque, op: StartSplitSource) !void {
+        const state: *State = @ptrCast(@alignCast(ptr));
+        var lease = try state.acquire();
+        defer lease.deinit();
+        try state.downstream.vtable.start_split_source(state.downstream.ptr, op);
+    }
+
+    fn bootstrapSplitDestination(ptr: *anyopaque, op: BootstrapSplitDestination) !void {
+        const state: *State = @ptrCast(@alignCast(ptr));
+        var lease = try state.acquire();
+        defer lease.deinit();
+        try state.downstream.vtable.bootstrap_split_destination(state.downstream.ptr, op);
+    }
+
+    fn catchUpSplitDestination(ptr: *anyopaque, op: CatchUpSplitDestination) !void {
+        const state: *State = @ptrCast(@alignCast(ptr));
+        var lease = try state.acquire();
+        defer lease.deinit();
+        try state.downstream.vtable.catch_up_split_destination(state.downstream.ptr, op);
+    }
+
+    fn finalizeSplitSource(ptr: *anyopaque, op: FinalizeSplitSource) !void {
+        const state: *State = @ptrCast(@alignCast(ptr));
+        var lease = try state.acquire();
+        defer lease.deinit();
+        try state.downstream.vtable.finalize_split_source(state.downstream.ptr, op);
+    }
+
+    fn rollbackSplit(ptr: *anyopaque, op: RollbackSplit) !void {
+        const state: *State = @ptrCast(@alignCast(ptr));
+        var lease = try state.acquire();
+        defer lease.deinit();
+        try state.downstream.vtable.rollback_split(state.downstream.ptr, op);
+    }
+
+    fn acceptMergeReceiver(ptr: *anyopaque, op: AcceptMergeReceiver) !void {
+        const state: *State = @ptrCast(@alignCast(ptr));
+        var lease = try state.acquire();
+        defer lease.deinit();
+        try state.downstream.vtable.accept_merge_receiver(state.downstream.ptr, op);
+    }
+
+    fn catchUpMergeReceiver(ptr: *anyopaque, op: CatchUpMergeReceiver) !void {
+        const state: *State = @ptrCast(@alignCast(ptr));
+        var lease = try state.acquire();
+        defer lease.deinit();
+        try state.downstream.vtable.catch_up_merge_receiver(state.downstream.ptr, op);
+    }
+
+    fn finalizeMerge(ptr: *anyopaque, op: FinalizeMerge) !void {
+        const state: *State = @ptrCast(@alignCast(ptr));
+        var lease = try state.acquire();
+        defer lease.deinit();
+        try state.downstream.vtable.finalize_merge(state.downstream.ptr, op);
+    }
+
+    fn rollbackMerge(ptr: *anyopaque, op: RollbackMerge) !void {
+        const state: *State = @ptrCast(@alignCast(ptr));
+        var lease = try state.acquire();
+        defer lease.deinit();
+        try state.downstream.vtable.rollback_merge(state.downstream.ptr, op);
+    }
+};
+
 test "shard operation adapter metadata runtime dispatches actions" {
     const Fake = struct {
         split_prepared: bool = false,
@@ -191,4 +416,25 @@ test "shard operation adapter metadata runtime dispatches actions" {
         },
     });
     try std.testing.expect(fake.split_prepared);
+
+    var owned = try OwnedShardOperationAdapter.init(std.testing.allocator, fake.adapter());
+    defer owned.deinit();
+    var registration = owned.registration();
+    const guarded = owned.adapter();
+    _ = try guarded.observeSplit(.{
+        .transition_id = 2,
+        .attempt_epoch = 1,
+        .source_group_id = 20,
+        .destination_group_id = 21,
+    });
+    registration.deinit();
+    try std.testing.expectError(
+        error.TransitionOperationsRetired,
+        guarded.observeSplit(.{
+            .transition_id = 2,
+            .attempt_epoch = 1,
+            .source_group_id = 20,
+            .destination_group_id = 21,
+        }),
+    );
 }

@@ -404,6 +404,9 @@ pub const ResolvedVoterSetEvidence = struct {
     voter_count_known: bool,
     voter_count: u16,
     from_leader: bool,
+    voter_set_known: bool = false,
+    voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
+    membership_index: u64 = 0,
 };
 
 pub const GroupLeaderCandidate = struct {
@@ -544,6 +547,9 @@ pub const VoterSetEvidence = struct {
                     .voter_count_known = true,
                     .voter_count = leader.voter_count,
                     .from_leader = true,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = leader.voter_set_fingerprint,
+                    .membership_index = leader.raft_membership_index,
                 };
             }
         }
@@ -554,6 +560,9 @@ pub const VoterSetEvidence = struct {
                 .voter_count_known = !self.ambiguous_known_voter_set,
                 .voter_count = self.known_voter_count.?,
                 .from_leader = false,
+                .voter_set_known = !self.ambiguous_known_voter_set,
+                .voter_set_fingerprint = self.known_voter_set_fingerprint,
+                .membership_index = self.known_membership_index,
             };
         }
         return .{
@@ -1039,7 +1048,11 @@ pub const TableManager = struct {
             out.deinit(alloc);
         }
         var it = self.tables.valueIterator();
-        while (it.next()) |record| try out.append(alloc, try cloneTable(alloc, record.*));
+        while (it.next()) |record| {
+            const owned = try cloneTable(alloc, record.*);
+            errdefer freeTable(alloc, owned);
+            try out.append(alloc, owned);
+        }
         return try out.toOwnedSlice(alloc);
     }
 
@@ -1055,7 +1068,11 @@ pub const TableManager = struct {
             out.deinit(alloc);
         }
         var it = self.ranges.valueIterator();
-        while (it.next()) |record| try out.append(alloc, try cloneRange(alloc, record.*));
+        while (it.next()) |record| {
+            const owned = try cloneRange(alloc, record.*);
+            errdefer freeRange(alloc, owned);
+            try out.append(alloc, owned);
+        }
         return try out.toOwnedSlice(alloc);
     }
 
@@ -1338,7 +1355,9 @@ pub const TableManager = struct {
 
         var it = self.split_intents.valueIterator();
         while (it.next()) |intent| {
-            try out.append(alloc, try self.buildSplitTransition(intent.*));
+            const owned = try self.buildSplitTransition(alloc, intent.*);
+            errdefer freeSplitTransitionRecord(alloc, owned);
+            try out.append(alloc, owned);
         }
         return try out.toOwnedSlice(alloc);
     }
@@ -1352,14 +1371,16 @@ pub const TableManager = struct {
 
         var it = self.merge_intents.valueIterator();
         while (it.next()) |intent| {
-            try out.append(alloc, try cloneMergeTransitionRecord(alloc, .{
+            const owned = try cloneMergeTransitionRecord(alloc, .{
                 .transition_id = intent.transition_id,
                 .donor_group_id = intent.donor_group_id,
                 .receiver_group_id = intent.receiver_group_id,
                 .phase = .prepare,
                 .rollback_reason = intent.rollback_reason,
                 .allow_doc_identity_reassignment = intent.allow_doc_identity_reassignment,
-            }));
+            });
+            errdefer freeMergeTransitionRecord(alloc, owned);
+            try out.append(alloc, owned);
         }
         return try out.toOwnedSlice(alloc);
     }
@@ -1374,9 +1395,13 @@ pub const TableManager = struct {
         alloc.free(records);
     }
 
-    fn buildSplitTransition(self: *TableManager, intent: SplitIntent) !transition_state.SplitTransitionRecord {
+    fn buildSplitTransition(
+        self: *TableManager,
+        alloc: std.mem.Allocator,
+        intent: SplitIntent,
+    ) !transition_state.SplitTransitionRecord {
         const source = self.ranges.get(intent.source_group_id) orelse return error.UnknownSourceRange;
-        return try cloneSplitTransitionRecord(self.alloc, .{
+        return try cloneSplitTransitionRecord(alloc, .{
             .transition_id = intent.transition_id,
             .attempt_epoch = intent.attempt_epoch,
             .source_group_id = intent.source_group_id,

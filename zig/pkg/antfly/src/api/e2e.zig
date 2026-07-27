@@ -7071,7 +7071,10 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
         .vtable = &.{ .should_reconcile = DataWriterOwner.mayReconcile },
     });
     defer svc.setLocalReplicaRootReconcilePermitHook(null);
-    try svc.raft.replaceTransitionOps(data_server.localShardOperationAdapter());
+    var transition_ops_registration = try svc.raft.replaceTransitionOps(
+        data_server.localShardOperationAdapter(),
+    );
+    defer transition_ops_registration.deinit();
 
     const base_uri = try data_server.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(base_uri);

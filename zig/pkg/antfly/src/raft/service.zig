@@ -163,9 +163,9 @@ pub const ManagedHostService = struct {
             .transition_authority = deps.transition_authority,
             .local_transition_runtime = deps.transition_runtime,
             .transition_svc = if (deps.transition_ops) |ops|
-                transition_service.TransitionService.initWithRetryClock(alloc, ops, deps.transition_retry_clock)
+                try transition_service.TransitionService.initWithRetryClock(alloc, ops, deps.transition_retry_clock)
             else if (deps.transition_runtime) |runtime|
-                transition_service.TransitionService.initWithRetryClock(alloc, runtime, deps.transition_retry_clock)
+                try transition_service.TransitionService.initWithRetryClock(alloc, runtime, deps.transition_retry_clock)
             else
                 null,
         };
@@ -229,16 +229,24 @@ pub const ManagedHostService = struct {
         return null;
     }
 
-    pub fn replaceTransitionOps(self: *ManagedHostService, ops: shard_ops.ShardOperationAdapter) !void {
+    pub fn replaceTransitionOps(
+        self: *ManagedHostService,
+        ops: shard_ops.ShardOperationAdapter,
+    ) !shard_ops.OwnedShardOperationAdapter.Registration {
         if (self.transition_svc) |*transition_svc| transition_svc.deinit();
         self.transition_svc = null;
-        self.transition_svc = transition_service.TransitionService.initWithRetryClock(self.alloc, ops, self.transition_retry_clock);
+        self.transition_svc = try transition_service.TransitionService.initWithRetryClock(
+            self.alloc,
+            ops,
+            self.transition_retry_clock,
+        );
         errdefer {
             if (self.transition_svc) |*transition_svc| transition_svc.deinit();
             self.transition_svc = null;
         }
         try self.seedTransitionsFromMetadataStore(self.host.host.cfg.metadata_group_id);
         self.syncTransitionMetrics();
+        return self.transition_svc.?.operationRegistration() orelse unreachable;
     }
 
     pub fn prepareEnrichmentRead(
@@ -350,8 +358,11 @@ pub const ManagedHostService = struct {
     }
 
     pub fn stepTransitions(self: *ManagedHostService) !transition_service.TransitionStepResult {
-        if (!self.holdsTransitionAuthority()) return .{};
         if (self.transition_svc) |*transition_svc| {
+            if (!self.holdsTransitionAuthority()) {
+                try transition_svc.refreshPendingObservations();
+                return .{};
+            }
             const result = try transition_svc.stepPending();
             self.syncTransitionMetrics();
             return result;
@@ -367,7 +378,7 @@ pub const ManagedHostService = struct {
 
     pub fn observeSplitTransition(self: *ManagedHostService, transition_id: u64) !?metadata.SplitObservation {
         if (self.transition_svc) |*transition_svc| {
-            var observation = (try transition_svc.observeSplit(transition_id)) orelse return null;
+            var observation = transition_svc.observeSplit(transition_id) orelse return null;
             if (transition_svc.splitRecord(transition_id)) |record| {
                 observation.source_local_leader = observation.source_local_leader or self.host.host.isLocalLeader(record.source_group_id);
                 observation.destination_local_leader = observation.destination_local_leader or self.host.host.isLocalLeader(record.destination_group_id);
@@ -379,14 +390,14 @@ pub const ManagedHostService = struct {
 
     pub fn describeSplitTransition(self: *ManagedHostService, transition_id: u64) !?metadata.SplitExecutionState {
         if (self.transition_svc) |*transition_svc| {
-            return try transition_svc.describeSplit(transition_id);
+            return transition_svc.describeSplit(transition_id);
         }
         return null;
     }
 
     pub fn observeMergeTransition(self: *ManagedHostService, transition_id: u64) !?metadata.MergeObservation {
         if (self.transition_svc) |*transition_svc| {
-            var observation = (try transition_svc.observeMerge(transition_id)) orelse return null;
+            var observation = transition_svc.observeMerge(transition_id) orelse return null;
             if (transition_svc.mergeRecord(transition_id)) |record| {
                 observation.donor_local_leader = observation.donor_local_leader or self.host.host.isLocalLeader(record.donor_group_id);
                 observation.receiver_local_leader = observation.receiver_local_leader or self.host.host.isLocalLeader(record.receiver_group_id);
@@ -398,7 +409,7 @@ pub const ManagedHostService = struct {
 
     pub fn describeMergeTransition(self: *ManagedHostService, transition_id: u64) !?metadata.MergeExecutionState {
         if (self.transition_svc) |*transition_svc| {
-            return try transition_svc.describeMerge(transition_id);
+            return transition_svc.describeMerge(transition_id);
         }
         return null;
     }
@@ -499,9 +510,9 @@ pub const ManagedHttpHostService = struct {
             .transition_authority = deps.transition_authority,
             .local_transition_runtime = deps.transition_runtime,
             .transition_svc = if (deps.transition_ops) |ops|
-                transition_service.TransitionService.initWithRetryClock(alloc, ops, deps.transition_retry_clock)
+                try transition_service.TransitionService.initWithRetryClock(alloc, ops, deps.transition_retry_clock)
             else if (deps.transition_runtime) |runtime|
-                transition_service.TransitionService.initWithRetryClock(alloc, runtime, deps.transition_retry_clock)
+                try transition_service.TransitionService.initWithRetryClock(alloc, runtime, deps.transition_retry_clock)
             else
                 null,
         };
@@ -545,16 +556,24 @@ pub const ManagedHttpHostService = struct {
         return try self.host.beginDataApplyGroupTransition(group_ids);
     }
 
-    pub fn replaceTransitionOps(self: *ManagedHttpHostService, ops: shard_ops.ShardOperationAdapter) !void {
+    pub fn replaceTransitionOps(
+        self: *ManagedHttpHostService,
+        ops: shard_ops.ShardOperationAdapter,
+    ) !shard_ops.OwnedShardOperationAdapter.Registration {
         if (self.transition_svc) |*transition_svc| transition_svc.deinit();
         self.transition_svc = null;
-        self.transition_svc = transition_service.TransitionService.initWithRetryClock(self.alloc, ops, self.transition_retry_clock);
+        self.transition_svc = try transition_service.TransitionService.initWithRetryClock(
+            self.alloc,
+            ops,
+            self.transition_retry_clock,
+        );
         errdefer {
             if (self.transition_svc) |*transition_svc| transition_svc.deinit();
             self.transition_svc = null;
         }
         try self.seedTransitionsFromMetadataStore(self.host.http_host.host.cfg.metadata_group_id);
         self.syncTransitionMetrics();
+        return self.transition_svc.?.operationRegistration() orelse unreachable;
     }
 
     pub fn submit(self: *ManagedHttpHostService, update: metadata_view.MetadataUpdate) !void {
@@ -727,8 +746,11 @@ pub const ManagedHttpHostService = struct {
     }
 
     pub fn stepTransitions(self: *ManagedHttpHostService) !transition_service.TransitionStepResult {
-        if (!self.holdsTransitionAuthority()) return .{};
         if (self.transition_svc) |*transition_svc| {
+            if (!self.holdsTransitionAuthority()) {
+                try transition_svc.refreshPendingObservations();
+                return .{};
+            }
             const result = try transition_svc.stepPending();
             self.syncTransitionMetrics();
             return result;
@@ -744,7 +766,7 @@ pub const ManagedHttpHostService = struct {
 
     pub fn observeSplitTransition(self: *ManagedHttpHostService, transition_id: u64) !?metadata.SplitObservation {
         if (self.transition_svc) |*transition_svc| {
-            var observation = (try transition_svc.observeSplit(transition_id)) orelse return null;
+            var observation = transition_svc.observeSplit(transition_id) orelse return null;
             if (transition_svc.splitRecord(transition_id)) |record| {
                 observation.source_local_leader = observation.source_local_leader or self.host.http_host.host.isLocalLeader(record.source_group_id);
                 observation.destination_local_leader = observation.destination_local_leader or self.host.http_host.host.isLocalLeader(record.destination_group_id);
@@ -756,14 +778,14 @@ pub const ManagedHttpHostService = struct {
 
     pub fn describeSplitTransition(self: *ManagedHttpHostService, transition_id: u64) !?metadata.SplitExecutionState {
         if (self.transition_svc) |*transition_svc| {
-            return try transition_svc.describeSplit(transition_id);
+            return transition_svc.describeSplit(transition_id);
         }
         return null;
     }
 
     pub fn observeMergeTransition(self: *ManagedHttpHostService, transition_id: u64) !?metadata.MergeObservation {
         if (self.transition_svc) |*transition_svc| {
-            var observation = (try transition_svc.observeMerge(transition_id)) orelse return null;
+            var observation = transition_svc.observeMerge(transition_id) orelse return null;
             if (transition_svc.mergeRecord(transition_id)) |record| {
                 observation.donor_local_leader = observation.donor_local_leader or self.host.http_host.host.isLocalLeader(record.donor_group_id);
                 observation.receiver_local_leader = observation.receiver_local_leader or self.host.http_host.host.isLocalLeader(record.receiver_group_id);
@@ -775,7 +797,7 @@ pub const ManagedHttpHostService = struct {
 
     pub fn describeMergeTransition(self: *ManagedHttpHostService, transition_id: u64) !?metadata.MergeExecutionState {
         if (self.transition_svc) |*transition_svc| {
-            return try transition_svc.describeMerge(transition_id);
+            return transition_svc.describeMerge(transition_id);
         }
         return null;
     }
@@ -1865,6 +1887,7 @@ test "managed host service reports local leader roles in split observations" {
         .destination_group_id = 1702,
         .phase = .bootstrap_peer,
     });
+    _ = try svc.stepTransitions();
 
     const observation = (try svc.observeSplitTransition(2001)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(data.RangeTransitionPhase, .bootstrap_peer), observation.status.phase);
@@ -1963,6 +1986,7 @@ test "managed host service reports local leader roles in merge observations" {
         .receiver_group_id = 1802,
         .phase = .bootstrap_peer,
     });
+    _ = try svc.stepTransitions();
 
     const observation = (try svc.observeMergeTransition(2002)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(data.RangeTransitionPhase, .bootstrap_peer), observation.receiver.phase);
@@ -2083,6 +2107,7 @@ test "managed host service preserves leader-routed observation roles from transi
         .receiver_group_id = 2902,
         .phase = .bootstrap_peer,
     });
+    _ = try svc.stepTransitions();
 
     const split = (try svc.observeSplitTransition(3001)) orelse return error.TestExpectedEqual;
     try std.testing.expect(split.source_local_leader);
