@@ -19,6 +19,7 @@ const Config = struct {
     semantic_weights: []const f32 = &.{ 4, 8, 12, 16, 24, 32 },
     fusion_weight: f32 = 0.25,
     seed: u64 = 13,
+    ann_seed: u64 = 13,
     baseline_only: bool = false,
     ann_semantic_weight: ?f32 = null,
     ann_candidates: []const usize = &.{},
@@ -132,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
     defer alloc.free(fixture.qrels);
 
     std.debug.print(
-        "wands_fixture products={d} queries={d} qrels={d} embedding_dimensions={d} max_tokens={d} hdc_dimensions={d} seed={d} fusion_weight={d:.3}\n",
+        "wands_fixture products={d} queries={d} qrels={d} embedding_dimensions={d} max_tokens={d} hdc_dimensions={d} seed={d} ann_seed={d} fusion_weight={d:.3}\n",
         .{
             fixture.product_count,
             fixture.query_count,
@@ -141,6 +142,7 @@ pub fn main(init: std.process.Init) !void {
             fixture.max_tokens,
             config.hdc_dimensions,
             config.seed,
+            config.ann_seed,
             config.fusion_weight,
         },
     );
@@ -148,6 +150,20 @@ pub fn main(init: std.process.Init) !void {
     std.mem.sort(Qrel, fixture.qrels, {}, qrelLessThan);
     const qrel_offsets = try buildQrelOffsets(alloc, fixture.query_count, fixture.qrels);
     defer alloc.free(qrel_offsets);
+    const ann_quality_count = try std.math.mul(
+        usize,
+        fixture.query_count,
+        config.ann_candidates.len,
+    );
+    const fusion_ann_quality = try alloc.alloc(PerQueryQuality, ann_quality_count);
+    defer alloc.free(fusion_ann_quality);
+    const hdc_rabitq_quality = try alloc.alloc(PerQueryQuality, ann_quality_count);
+    defer alloc.free(hdc_rabitq_quality);
+    const hdc_bipolar_quality = try alloc.alloc(PerQueryQuality, ann_quality_count);
+    defer alloc.free(hdc_bipolar_quality);
+    for (fusion_ann_quality) |*quality| quality.* = .{};
+    for (hdc_rabitq_quality) |*quality| quality.* = .{};
+    for (hdc_bipolar_quality) |*quality| quality.* = .{};
 
     try evaluateMethod(
         alloc,
@@ -197,9 +213,10 @@ pub fn main(init: std.process.Init) !void {
             null,
             config.fusion_weight,
             config.ann_candidates,
-            config.seed,
+            config.ann_seed,
             true,
             "embedding_structured_fusion",
+            null,
         );
         try evaluateAnnMethod(
             alloc,
@@ -212,9 +229,10 @@ pub fn main(init: std.process.Init) !void {
             null,
             config.fusion_weight,
             config.ann_candidates,
-            config.seed,
+            config.ann_seed,
             false,
             "embedding_structured_fusion_post_candidates",
+            fusion_ann_quality,
         );
     }
     if (config.baseline_only) return;
@@ -377,10 +395,70 @@ pub fn main(init: std.process.Init) !void {
                     },
                     config.fusion_weight,
                     config.ann_candidates,
-                    config.seed,
+                    config.ann_seed,
                     true,
                     structured_label,
+                    hdc_rabitq_quality,
                 );
+                var bipolar_label_buffer: [128]u8 = undefined;
+                const bipolar_label = try std.fmt.bufPrint(
+                    &bipolar_label_buffer,
+                    "{s}_packed_bipolar",
+                    .{structured_label},
+                );
+                try evaluatePackedBipolarMethod(
+                    alloc,
+                    fixture,
+                    qrel_offsets,
+                    complete_products,
+                    projected_queries,
+                    config.hdc_dimensions,
+                    .{
+                        .vectors = structural_classes,
+                        .count = class_count,
+                        .semantic_weight = semantic_weight,
+                    },
+                    config.ann_candidates,
+                    bipolar_label,
+                    hdc_bipolar_quality,
+                );
+                for (config.ann_candidates, 0..) |candidate_budget, budget_index| {
+                    const offset = budget_index * fixture.query_count;
+                    const fusion_quality =
+                        fusion_ann_quality[offset..][0..fixture.query_count];
+                    const rabitq_quality =
+                        hdc_rabitq_quality[offset..][0..fixture.query_count];
+                    const bipolar_quality =
+                        hdc_bipolar_quality[offset..][0..fixture.query_count];
+                    inline for (.{ PairedMetric.ndcg10, PairedMetric.graph_answer_top1 }) |metric| {
+                        try printPairedBootstrap(
+                            alloc,
+                            fixture,
+                            candidate_budget,
+                            structured_label,
+                            "embedding_structured_fusion_post_candidates",
+                            rabitq_quality,
+                            fusion_quality,
+                            metric,
+                            config.seed ^ config.ann_seed ^
+                                @as(u64, @intCast(candidate_budget)) ^
+                                @as(u64, @intFromEnum(metric)),
+                        );
+                        try printPairedBootstrap(
+                            alloc,
+                            fixture,
+                            candidate_budget,
+                            bipolar_label,
+                            "embedding_structured_fusion_post_candidates",
+                            bipolar_quality,
+                            fusion_quality,
+                            metric,
+                            config.seed ^ config.ann_seed ^
+                                @as(u64, @intCast(candidate_budget)) ^
+                                @as(u64, @intFromEnum(metric)) ^ 0xb170_1a2,
+                        );
+                    }
+                }
             }
         }
     }
@@ -435,6 +513,11 @@ const AnnMetrics = struct {
     }
 };
 
+const PerQueryQuality = struct {
+    ndcg10: f64 = std.math.nan(f64),
+    graph_answer_top1: f64 = std.math.nan(f64),
+};
+
 fn evaluateAnnMethod(
     alloc: std.mem.Allocator,
     fixture: Fixture,
@@ -449,6 +532,7 @@ fn evaluateAnnMethod(
     seed: u64,
     apply_structure_during_candidate_selection: bool,
     label: []const u8,
+    per_query_quality: ?[]PerQueryQuality,
 ) !void {
     if (candidate_budgets.len == 0 or
         product_vectors.len != fixture.product_count * dimensions or
@@ -459,6 +543,11 @@ fn evaluateAnnMethod(
     const maximum_candidates = candidate_budgets[candidate_budgets.len - 1];
     if (maximum_candidates < top_k or maximum_candidates > fixture.product_count) {
         return error.InvalidArgument;
+    }
+    if (per_query_quality) |quality| {
+        if (quality.len != fixture.query_count * candidate_budgets.len) {
+            return error.InvalidArgument;
+        }
     }
 
     const centroid = try alloc.alloc(f32, dimensions);
@@ -609,6 +698,12 @@ fn evaluateAnnMethod(
                 .approximate_ns = approximate_elapsed,
                 .rerank_ns = rerank_elapsed,
             };
+            if (per_query_quality) |per_query| {
+                per_query[budget_index * fixture.query_count + query_index] = .{
+                    .ndcg10 = quality.ndcg_sum,
+                    .graph_answer_top1 = @floatFromInt(quality.graph_answer_top1),
+                };
+            }
             if (isValidationQuery(fixture.query_ids[query_index])) {
                 validation[budget_index].add(observed);
             } else {
@@ -644,6 +739,301 @@ fn evaluateAnnMethod(
         all.add(holdout[budget_index]);
         all.print(label, .all, dimensions, candidate_budget);
     }
+}
+
+/// Evaluates a one-bit sign sketch as candidate-selection state while retaining
+/// the complete f32 vectors as the authoritative exact-reranking state.
+fn evaluatePackedBipolarMethod(
+    alloc: std.mem.Allocator,
+    fixture: Fixture,
+    qrel_offsets: []const usize,
+    product_vectors: []const f32,
+    query_vectors: []const f32,
+    dimensions: usize,
+    structured_queries: StructuredQueries,
+    candidate_budgets: []const usize,
+    label: []const u8,
+    per_query_quality: ?[]PerQueryQuality,
+) !void {
+    if (candidate_budgets.len == 0 or
+        product_vectors.len != fixture.product_count * dimensions or
+        query_vectors.len != fixture.query_count * dimensions)
+    {
+        return error.InvalidArgument;
+    }
+    const maximum_candidates = candidate_budgets[candidate_budgets.len - 1];
+    if (maximum_candidates < top_k or maximum_candidates > fixture.product_count) {
+        return error.InvalidArgument;
+    }
+    if (per_query_quality) |quality| {
+        if (quality.len != fixture.query_count * candidate_budgets.len) {
+            return error.InvalidArgument;
+        }
+    }
+
+    const words_per_vector = packedWordCount(dimensions);
+    const packed_products = try alloc.alloc(
+        u64,
+        try std.math.mul(usize, fixture.product_count, words_per_vector),
+    );
+    defer alloc.free(packed_products);
+    const pack_started = antfly.platform_time.monotonicNs();
+    for (0..fixture.product_count) |product_index| {
+        try packBipolarSigns(
+            product_vectors[product_index * dimensions ..][0..dimensions],
+            packed_products[product_index * words_per_vector ..][0..words_per_vector],
+        );
+    }
+    const pack_elapsed = antfly.platform_time.monotonicNs() - pack_started;
+
+    const approximate_ranked = try alloc.alloc(Ranked, fixture.product_count);
+    defer alloc.free(approximate_ranked);
+    const reranked = try alloc.alloc(Ranked, maximum_candidates);
+    defer alloc.free(reranked);
+    const gains = try alloc.alloc(u8, fixture.product_count);
+    defer alloc.free(gains);
+    const query_scratch = try alloc.alloc(f32, dimensions);
+    defer alloc.free(query_scratch);
+    const packed_query = try alloc.alloc(u64, words_per_vector);
+    defer alloc.free(packed_query);
+    const validation = try alloc.alloc(AnnMetrics, candidate_budgets.len);
+    defer alloc.free(validation);
+    @memset(validation, .{});
+    const holdout = try alloc.alloc(AnnMetrics, candidate_budgets.len);
+    defer alloc.free(holdout);
+    @memset(holdout, .{});
+
+    for (0..fixture.query_count) |query_index| {
+        @memset(gains, 0);
+        const qrels = fixture.qrels[qrel_offsets[query_index]..qrel_offsets[query_index + 1]];
+        var relevant_count: usize = 0;
+        for (qrels) |qrel| {
+            gains[qrel.product_index] = @max(gains[qrel.product_index], qrel.gain);
+            if (qrel.gain > 0) relevant_count += 1;
+        }
+        if (relevant_count == 0) continue;
+
+        const raw_query = query_vectors[query_index * dimensions ..][0..dimensions];
+        const class_id = fixture.query_classes[query_index];
+        if (class_id >= structured_queries.count) return error.InvalidFixture;
+        const association =
+            structured_queries.vectors[@as(usize, class_id) * dimensions ..][0..dimensions];
+        for (query_scratch, association, raw_query) |*out, structural_coordinate, semantic_coordinate| {
+            out.* = structural_coordinate +
+                structured_queries.semantic_weight * semantic_coordinate;
+        }
+        _ = antfly.vector.normalize(query_scratch);
+
+        var exact_top: [top_k]Ranked = undefined;
+        var exact_count: usize = 0;
+        for (0..fixture.product_count) |product_index| {
+            const score = antfly.vector.dot(
+                query_scratch,
+                product_vectors[product_index * dimensions ..][0..dimensions],
+            );
+            insertTopK(&exact_top, &exact_count, .{ .index = product_index, .score = score });
+        }
+
+        const approximate_started = antfly.platform_time.monotonicNs();
+        try packBipolarSigns(query_scratch, packed_query);
+        for (0..fixture.product_count) |product_index| {
+            const packed_product =
+                packed_products[product_index * words_per_vector ..][0..words_per_vector];
+            approximate_ranked[product_index] = .{
+                .index = product_index,
+                .score = -@as(f32, @floatFromInt(hammingDistance(packed_query, packed_product))),
+            };
+        }
+        std.mem.sort(Ranked, approximate_ranked, {}, rankedGreaterThanContext);
+        const approximate_elapsed = antfly.platform_time.monotonicNs() - approximate_started;
+
+        for (candidate_budgets, 0..) |candidate_budget, budget_index| {
+            const rerank_started = antfly.platform_time.monotonicNs();
+            for (approximate_ranked[0..candidate_budget], 0..) |candidate, candidate_index| {
+                reranked[candidate_index] = .{
+                    .index = candidate.index,
+                    .score = antfly.vector.dot(
+                        query_scratch,
+                        product_vectors[candidate.index * dimensions ..][0..dimensions],
+                    ),
+                };
+            }
+            std.mem.sort(Ranked, reranked[0..candidate_budget], {}, rankedGreaterThanContext);
+            const rerank_elapsed = antfly.platform_time.monotonicNs() - rerank_started;
+
+            const quality = observeQuery(
+                fixture,
+                qrels,
+                gains,
+                reranked[0..top_k],
+                relevant_count,
+                approximate_elapsed + rerank_elapsed,
+            );
+            var exact_recalled: usize = 0;
+            for (reranked[0..top_k]) |candidate| {
+                for (exact_top[0..exact_count]) |truth| {
+                    if (candidate.index == truth.index) {
+                        exact_recalled += 1;
+                        break;
+                    }
+                }
+            }
+            const observed = AnnMetrics{
+                .quality = quality,
+                .exact_top10_recall_sum = @as(f64, @floatFromInt(exact_recalled)) / @as(f64, top_k),
+                .approximate_ns = approximate_elapsed,
+                .rerank_ns = rerank_elapsed,
+            };
+            if (per_query_quality) |per_query| {
+                per_query[budget_index * fixture.query_count + query_index] = .{
+                    .ndcg10 = quality.ndcg_sum,
+                    .graph_answer_top1 = @floatFromInt(quality.graph_answer_top1),
+                };
+            }
+            if (isValidationQuery(fixture.query_ids[query_index])) {
+                validation[budget_index].add(observed);
+            } else {
+                holdout[budget_index].add(observed);
+            }
+        }
+    }
+
+    const authoritative_bytes = product_vectors.len * @sizeOf(f32);
+    const packed_bytes = packed_products.len * @sizeOf(u64);
+    std.debug.print(
+        "wands_bipolar_index method={s} dimensions={d} vectors={d} words_per_vector={d} pack_ms={d:.3} authoritative_bytes={d} packed_bytes={d} compression_ratio={d:.3} mapping=sign_ge_zero_le_u64_v1\n",
+        .{
+            label,
+            dimensions,
+            fixture.product_count,
+            words_per_vector,
+            @as(f64, @floatFromInt(pack_elapsed)) / std.time.ns_per_ms,
+            authoritative_bytes,
+            packed_bytes,
+            @as(f64, @floatFromInt(authoritative_bytes)) /
+                @as(f64, @floatFromInt(packed_bytes)),
+        },
+    );
+    for (candidate_budgets, 0..) |candidate_budget, budget_index| {
+        validation[budget_index].print(label, .validation, dimensions, candidate_budget);
+        holdout[budget_index].print(label, .holdout, dimensions, candidate_budget);
+        var all = validation[budget_index];
+        all.add(holdout[budget_index]);
+        all.print(label, .all, dimensions, candidate_budget);
+    }
+}
+
+const PairedMetric = enum {
+    ndcg10,
+    graph_answer_top1,
+};
+
+fn printPairedBootstrap(
+    alloc: std.mem.Allocator,
+    fixture: Fixture,
+    candidate_budget: usize,
+    method: []const u8,
+    baseline: []const u8,
+    method_quality: []const PerQueryQuality,
+    baseline_quality: []const PerQueryQuality,
+    metric: PairedMetric,
+    seed: u64,
+) !void {
+    if (method_quality.len != fixture.query_count or
+        baseline_quality.len != fixture.query_count)
+    {
+        return error.InvalidArgument;
+    }
+    const deltas = try alloc.alloc(f64, fixture.query_count);
+    defer alloc.free(deltas);
+    var delta_count: usize = 0;
+    for (method_quality, baseline_quality, 0..) |method_query, baseline_query, query_index| {
+        if (isValidationQuery(fixture.query_ids[query_index])) continue;
+        const method_value = switch (metric) {
+            .ndcg10 => method_query.ndcg10,
+            .graph_answer_top1 => method_query.graph_answer_top1,
+        };
+        const baseline_value = switch (metric) {
+            .ndcg10 => baseline_query.ndcg10,
+            .graph_answer_top1 => baseline_query.graph_answer_top1,
+        };
+        if (!std.math.isFinite(method_value) or !std.math.isFinite(baseline_value)) continue;
+        deltas[delta_count] = method_value - baseline_value;
+        delta_count += 1;
+    }
+    if (delta_count == 0) return error.InvalidArgument;
+
+    var mean_delta: f64 = 0;
+    for (deltas[0..delta_count]) |delta| mean_delta += delta;
+    mean_delta /= @floatFromInt(delta_count);
+
+    const bootstrap_samples: usize = 10_000;
+    const sample_means = try alloc.alloc(f64, bootstrap_samples);
+    defer alloc.free(sample_means);
+    var random_state = seed;
+    for (sample_means) |*sample_mean| {
+        var total: f64 = 0;
+        for (0..delta_count) |_| {
+            const sampled_index = bootstrapNext(&random_state) % delta_count;
+            total += deltas[sampled_index];
+        }
+        sample_mean.* = total / @as(f64, @floatFromInt(delta_count));
+    }
+    std.mem.sort(f64, sample_means, {}, std.sort.asc(f64));
+    const ci_low = sample_means[@divFloor(bootstrap_samples * 25, 1000)];
+    const ci_high = sample_means[@divFloor(bootstrap_samples * 975, 1000) - 1];
+    std.debug.print(
+        "wands_paired method={s} baseline={s} split=holdout candidates={d} queries={d} metric={s} mean_delta={d:.6} ci95_low={d:.6} ci95_high={d:.6} significant_advantage={any} bootstrap_samples={d}\n",
+        .{
+            method,
+            baseline,
+            candidate_budget,
+            delta_count,
+            @tagName(metric),
+            mean_delta,
+            ci_low,
+            ci_high,
+            ci_low > 0,
+            bootstrap_samples,
+        },
+    );
+}
+
+fn bootstrapNext(state: *u64) u64 {
+    state.* +%= 0x9e3779b97f4a7c15;
+    var value = state.*;
+    value = (value ^ (value >> 30)) *% 0xbf58476d1ce4e5b9;
+    value = (value ^ (value >> 27)) *% 0x94d049bb133111eb;
+    return value ^ (value >> 31);
+}
+
+fn packedWordCount(dimensions: usize) usize {
+    std.debug.assert(dimensions > 0);
+    return 1 + (dimensions - 1) / 64;
+}
+
+/// Packs non-negative coordinates as one and negative coordinates as zero.
+/// Coordinates are ordered low-coordinate-first in little-endian u64 words.
+fn packBipolarSigns(vector: []const f32, sign_words: []u64) !void {
+    if (vector.len == 0 or sign_words.len != packedWordCount(vector.len)) {
+        return error.InvalidArgument;
+    }
+    @memset(sign_words, 0);
+    for (vector, 0..) |coordinate, index| {
+        if (!std.math.isFinite(coordinate)) return error.NonFiniteHypervector;
+        if (coordinate >= 0) {
+            sign_words[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+        }
+    }
+}
+
+fn hammingDistance(left: []const u64, right: []const u64) usize {
+    std.debug.assert(left.len == right.len);
+    var distance: usize = 0;
+    for (left, right) |left_word, right_word| {
+        distance += @popCount(left_word ^ right_word);
+    }
+    return distance;
 }
 
 fn exactScore(
@@ -983,6 +1373,7 @@ fn parseArgs(alloc: std.mem.Allocator, args_in: std.process.Args) !Config {
     var fixture_path: ?[]const u8 = null;
     var hdc_dimensions: usize = 10_000;
     var seed: u64 = 13;
+    var ann_seed: u64 = 13;
     var fusion_weight: f32 = 0.25;
     var baseline_only = false;
     var semantic_weights = std.ArrayListUnmanaged(f32).empty;
@@ -1009,6 +1400,8 @@ fn parseArgs(alloc: std.mem.Allocator, args_in: std.process.Args) !Config {
             fusion_weight = try std.fmt.parseFloat(f32, args.next() orelse return error.InvalidArgument);
         } else if (std.mem.eql(u8, argument, "--seed")) {
             seed = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArgument, 10);
+        } else if (std.mem.eql(u8, argument, "--ann-seed")) {
+            ann_seed = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArgument, 10);
         } else if (std.mem.eql(u8, argument, "--baseline-only")) {
             baseline_only = true;
         } else if (std.mem.eql(u8, argument, "--ann-semantic-weight")) {
@@ -1046,6 +1439,7 @@ fn parseArgs(alloc: std.mem.Allocator, args_in: std.process.Args) !Config {
         .semantic_weights = try semantic_weights.toOwnedSlice(alloc),
         .fusion_weight = fusion_weight,
         .seed = seed,
+        .ann_seed = ann_seed,
         .baseline_only = baseline_only,
         .ann_semantic_weight = ann_semantic_weight,
         .ann_candidates = try ann_candidates.toOwnedSlice(alloc),
@@ -1062,6 +1456,34 @@ test "top-k insertion is descending and deterministic on ties" {
     try std.testing.expectEqual(@as(usize, 9), ranked[0].index);
     try std.testing.expectEqual(@as(usize, 3), ranked[1].index);
     try std.testing.expectEqual(@as(usize, 7), ranked[2].index);
+}
+
+test "bipolar signs pack low-coordinate-first and preserve hamming similarity" {
+    var left_words: [2]u64 = undefined;
+    var right_words: [2]u64 = undefined;
+    var left = [_]f32{-1} ** 65;
+    left[0] = 1;
+    left[2] = 0;
+    left[64] = 1;
+    var right = left;
+    right[0] = -1;
+    right[64] = -1;
+
+    try packBipolarSigns(&left, &left_words);
+    try packBipolarSigns(&right, &right_words);
+
+    try std.testing.expectEqual(@as(usize, 2), packedWordCount(left.len));
+    try std.testing.expectEqual(@as(u64, 0b101), left_words[0]);
+    try std.testing.expectEqual(@as(u64, 1), left_words[1]);
+    try std.testing.expectEqual(@as(usize, 2), hammingDistance(&left_words, &right_words));
+}
+
+test "bipolar sign packing rejects non-finite coordinates" {
+    var sign_words: [1]u64 = undefined;
+    try std.testing.expectError(
+        error.NonFiniteHypervector,
+        packBipolarSigns(&.{ 1, std.math.nan(f32) }, &sign_words),
+    );
 }
 
 test "fixture parser validates and exposes the binary layout" {

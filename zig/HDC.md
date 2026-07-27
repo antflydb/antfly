@@ -954,6 +954,10 @@ The benchmark must measure:
 - whether random orthogonal transformation changes HDC recall or is redundant
   for already distributed coordinates.
 
+The pinned WANDS run below now measures the candidate-only packed-sign path.
+It is deliberately not an authoritative codec: exact reranking still reads the
+complete `f32` vector.
+
 ### Projection artifact
 
 For a 768-to-10,000 Rademacher projection, an `int8` matrix is approximately
@@ -1402,6 +1406,74 @@ approximate scoring time in this direct RaBitQ scan. At 100 candidates the
 baseline reaches 0.7700 NDCG@10 and 0.9765 graph-answer top-1, so the conclusion
 does not depend on a single narrow budget.
 
+The 2026-07-27 follow-up also thresholds each complete HDC coordinate at zero,
+packs the signs low-coordinate-first into little-endian `u64` words, selects
+candidates by Hamming distance, and exact-reranks from the unchanged complete
+`f32` vectors. At 10,000 dimensions the padded sketch occupies 157 words, or
+1,256 bytes per product:
+
+| 50-candidate representation | Candidate bytes | Build | Approximate ms/query | Exact top-10 recall | NDCG@10 | Graph answer top-1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| embedding RaBitQ, then structured rerank | **2,753,152** | 13.8 ms | **3.33** | 0.8825 | **0.7674** | **0.9739** |
+| complete HDC RaBitQ | 54,728,368 | **625.9 ms** | 7.69 | **0.9995** | 0.7643 | **0.9739** |
+| complete HDC packed bipolar | 54,000,464 | 1,587.6 ms | 5.25 | 0.9582 | 0.7651 | **0.9739** |
+
+Packed bipolar scanning is approximately 32% faster than HDC RaBitQ in this
+scalar full-corpus benchmark, but it gives up 4.13 percentage points of exact
+top-10 recall at 50 candidates. The packed index is only 1.3% smaller than HDC
+RaBitQ because RaBitQ already stores approximately one code bit per
+10,000-dimensional coordinate plus per-vector metadata. It remains about 20
+times larger and 58% slower to scan than the 384-dimensional embedding
+candidate index. Its marginal application-metric differences do not reverse
+the no-go: at 100 candidates the tuned baseline reaches 0.7700 NDCG@10 and
+0.9765 graph-answer top-1, versus 0.7647 and 0.9739 for packed HDC.
+
+A deterministic paired bootstrap over the 383 holdout queries confirms that
+neither HDC candidate representation has demonstrated an application-quality
+advantage. At 50 candidates, packed HDC minus the production-shaped baseline
+has mean NDCG@10 delta `-0.002342` with 95% interval
+`[-0.008816, 0.004046]`; the graph-answer delta and interval are exactly zero.
+Across 50, 100, and 200 candidates, every HDC NDCG interval includes zero and
+every graph-answer interval is either tied or includes zero on its upper bound.
+The experiment therefore provides no statistically significant evidence for
+graduating HDC.
+
+#### Dimension and seed robustness
+
+A follow-up selected the representation only by validation NDCG@10. At
+coordinate seed 13, semantic weight 4 won at every tested dimension:
+
+| HDC dimensions | Validation NDCG@10 |
+| ---: | ---: |
+| 2,000 | 0.7143 |
+| 4,000 | 0.7326 |
+| 8,000 | **0.7349** |
+| 10,000 | 0.7332 |
+
+At the selected 8,000 dimensions, coordinate seeds 13, 29, and 47 reached
+validation NDCG@10 of 0.7349, **0.7382**, and 0.7378 respectively. Seed 29 was
+therefore selected before examining its holdout result. The RaBitQ transform
+seed remains independently fixed at 13 so changing HDC coordinates does not
+move the baseline candidate index.
+
+The selected 8,000-dimensional, seed-29, weight-4 setting does not reverse the
+result. At 50 candidates:
+
+| Method | Candidate bytes | NDCG@10 | MRR@10 | Relevant top-1 | Graph answer top-1 | Approximate ms/query |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| embedding candidates + structured rerank | **2,753,152** | **0.7674** | **0.9299** | **0.9060** | **0.9739** | **3.46** |
+| selected HDC RaBitQ | 43,713,904 | 0.7642 | 0.9207 | 0.8903 | **0.9739** | 6.67 |
+| selected HDC packed bipolar | 42,994,000 | 0.7618 | 0.9189 | 0.8903 | **0.9739** | 4.61 |
+
+Relative to the baseline, HDC RaBitQ's paired NDCG delta is `-0.003185`
+with 95% interval `[-0.010541, 0.003904]`; packed HDC's delta is `-0.005667`
+with interval `[-0.012515, 0.000916]`. Both graph-answer intervals span zero.
+At 200 candidates packed HDC is significantly worse on NDCG
+(`-0.005429`, interval `[-0.010634, -0.000209]`). Dimension and seed tuning
+reduces the original HDC resource cost by 20%, but provides no significant
+quality advantage and leaves the candidate state about 16 times larger than
+the embedding baseline.
+
 The RaBitQ measurement deliberately isolates quantization, candidate selection,
 and exact reranking over the entire corpus. It is not an HBC tree-topology
 benchmark. Because the application result is already a no-go, building a
@@ -1434,6 +1506,18 @@ zig build hdc-wands-bench -- \
   --fusion-weight 0.075 \
   --ann-semantic-weight 4 \
   --ann-candidates 50,100,200
+
+# Validation-selected dimension/coordinate seed, with the ANN seed controlled
+# independently:
+zig build hdc-wands-bench -- \
+  --fixture /tmp/antfly-hdc-wands/wands-bge-small.afhw \
+  --hdc-dims 8000 \
+  --semantic-weights 4 \
+  --fusion-weight 0.075 \
+  --seed 29 \
+  --ann-seed 13 \
+  --ann-semantic-weight 4 \
+  --ann-candidates 50,100,200
 ```
 
 The benchmark implementation and fixture helper are:
@@ -1441,6 +1525,8 @@ The benchmark implementation and fixture helper are:
 - [WANDS quality and RaBitQ benchmark](pkg/antfly/src/bench/hdc_wands_bench.zig)
 - [pinned WANDS/BGE fixture generator](tools/prepare_hdc_wands_fixture.py)
 - [machine-readable WANDS result](bench/baselines/hdc-wands-bge-small-2026-07-26.json)
+- [machine-readable packed-bipolar follow-up](bench/baselines/hdc-wands-packed-bipolar-2026-07-27.json)
+- [machine-readable dimension/seed follow-up](bench/baselines/hdc-wands-tuned-representation-2026-07-27.json)
 
 ### Graduation criteria
 

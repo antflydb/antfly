@@ -1,0 +1,194 @@
+{
+  "schema_version": 1,
+  "decision": "no_go",
+  "recorded_at": "2026-07-27",
+  "host": {
+    "architecture": "arm64",
+    "optimize": "ReleaseFast"
+  },
+  "fixture": {
+    "baseline": "hdc-wands-bge-small-2026-07-26.json",
+    "products": 42994,
+    "queries_with_relevance": 479,
+    "validation_queries_with_relevance": 96,
+    "holdout_queries_with_relevance": 383
+  },
+  "selection_protocol": {
+    "primary_metric": "validation_ndcg10",
+    "semantic_weight_candidates": [
+      4,
+      8,
+      12,
+      16,
+      24,
+      32
+    ],
+    "dimension_candidates": [
+      2000,
+      4000,
+      8000,
+      10000
+    ],
+    "coordinate_seed_candidates_at_selected_dimension": [
+      13,
+      29,
+      47
+    ],
+    "ann_seed": 13,
+    "selected": {
+      "dimensions": 8000,
+      "coordinate_seed": 29,
+      "semantic_weight": 4
+    }
+  },
+  "validation": {
+    "best_by_dimensions_at_seed_13": {
+      "2000": {
+        "semantic_weight": 4,
+        "ndcg10": 0.7143
+      },
+      "4000": {
+        "semantic_weight": 4,
+        "ndcg10": 0.7326
+      },
+      "8000": {
+        "semantic_weight": 4,
+        "ndcg10": 0.7349
+      },
+      "10000": {
+        "semantic_weight": 4,
+        "ndcg10": 0.7332
+      }
+    },
+    "seed_sweep_at_8000_dimensions": {
+      "13": {
+        "ndcg10": 0.7349,
+        "mrr10": 0.8935,
+        "recall10": 0.0716,
+        "top1_relevant": 0.8646,
+        "graph_answer_top1": 0.9688
+      },
+      "29": {
+        "ndcg10": 0.7382,
+        "mrr10": 0.8801,
+        "recall10": 0.073,
+        "top1_relevant": 0.8229,
+        "graph_answer_top1": 0.9479
+      },
+      "47": {
+        "ndcg10": 0.7378,
+        "mrr10": 0.8933,
+        "recall10": 0.0713,
+        "top1_relevant": 0.8646,
+        "graph_answer_top1": 0.9583
+      }
+    },
+    "embedding_structured_fusion": {
+      "ndcg10": 0.736,
+      "mrr10": 0.8924,
+      "recall10": 0.0722,
+      "top1_relevant": 0.8542,
+      "graph_answer_top1": 0.9583
+    }
+  },
+  "selected_exact_holdout": {
+    "embedding_structured_fusion": {
+      "ndcg10": 0.7688,
+      "mrr10": 0.9256,
+      "recall10": 0.061,
+      "top1_relevant": 0.8982,
+      "graph_answer_top1": 0.9739,
+      "score_ms_per_query": 0.93
+    },
+    "complete_hdc_structured": {
+      "ndcg10": 0.7639,
+      "mrr10": 0.9207,
+      "recall10": 0.0604,
+      "top1_relevant": 0.8903,
+      "graph_answer_top1": 0.9739,
+      "score_ms_per_query": 19.761,
+      "projection_ms_per_query": 0.8726
+    }
+  },
+  "selected_index": {
+    "embedding_rabitq": {
+      "bytes": 2753152,
+      "build_ms": 13.681
+    },
+    "complete_hdc_rabitq": {
+      "authoritative_bytes": 1375808000,
+      "bytes": 43713904,
+      "build_ms": 314.114
+    },
+    "complete_hdc_packed_bipolar": {
+      "authoritative_bytes": 1375808000,
+      "bytes": 42994000,
+      "build_ms": 1244.14
+    }
+  },
+  "selected_holdout_50_candidates": {
+    "embedding_candidates_then_structured_rerank": {
+      "ndcg10": 0.7674,
+      "mrr10": 0.9299,
+      "recall10": 0.0597,
+      "top1_relevant": 0.906,
+      "graph_answer_top1": 0.9739,
+      "exact_top10_recall": 0.8825,
+      "approximate_ms_per_query": 3.4618,
+      "rerank_ms_per_query": 0.0074
+    },
+    "complete_hdc_rabitq_then_exact_rerank": {
+      "ndcg10": 0.7642,
+      "mrr10": 0.9207,
+      "recall10": 0.0605,
+      "top1_relevant": 0.8903,
+      "graph_answer_top1": 0.9739,
+      "exact_top10_recall": 0.9992,
+      "approximate_ms_per_query": 6.6745,
+      "rerank_ms_per_query": 0.0478,
+      "paired_ndcg10_delta": -0.003185,
+      "paired_ndcg10_ci95": [
+        -0.010541,
+        0.003904
+      ],
+      "paired_graph_answer_delta": 0,
+      "paired_graph_answer_ci95": [
+        -0.007833,
+        0.007833
+      ]
+    },
+    "complete_hdc_packed_bipolar_then_exact_rerank": {
+      "ndcg10": 0.7618,
+      "mrr10": 0.9189,
+      "recall10": 0.06,
+      "top1_relevant": 0.8903,
+      "graph_answer_top1": 0.9739,
+      "exact_top10_recall": 0.954,
+      "approximate_ms_per_query": 4.605,
+      "rerank_ms_per_query": 0.0468,
+      "paired_ndcg10_delta": -0.005667,
+      "paired_ndcg10_ci95": [
+        -0.012515,
+        0.000916
+      ],
+      "paired_graph_answer_delta": 0,
+      "paired_graph_answer_ci95": [
+        -0.007833,
+        0.007833
+      ]
+    }
+  },
+  "selected_holdout_200_candidate_significance": {
+    "complete_hdc_rabitq_ndcg10_delta": -0.00511,
+    "complete_hdc_rabitq_ndcg10_ci95": [
+      -0.010583,
+      0.00009
+    ],
+    "complete_hdc_packed_bipolar_ndcg10_delta": -0.005429,
+    "complete_hdc_packed_bipolar_ndcg10_ci95": [
+      -0.010634,
+      -0.000209
+    ]
+  },
+  "conclusion": "Validation selection prefers 8000 dimensions, coordinate seed 29, and semantic weight 4. The selected setting reduces HDC cost but does not produce a statistically significant holdout NDCG or graph-answer advantage at 50 candidates; packed HDC is significantly worse on NDCG at 200 candidates. The tuned representation does not reverse the no-go."
+}
