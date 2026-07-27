@@ -11,6 +11,9 @@ const fixture_magic = "AFHDCW01";
 const fixture_version: u32 = 1;
 const fixture_header_bytes: usize = 32;
 const qrel_bytes: usize = 12;
+const association_fixture_magic = "AFHDCAS1";
+const association_fixture_version: u32 = 1;
+const association_fixture_header_bytes: usize = 32;
 const top_k: usize = 10;
 
 const Config = struct {
@@ -23,6 +26,8 @@ const Config = struct {
     baseline_only: bool = false,
     ann_semantic_weight: ?f32 = null,
     ann_candidates: []const usize = &.{},
+    associations_path: ?[]const u8 = null,
+    compositional_only: bool = false,
 };
 
 const Fixture = struct {
@@ -38,6 +43,28 @@ const Fixture = struct {
     query_ids: []const u32,
     query_classes: []const u32,
     qrels: []Qrel,
+    associations: ?Associations = null,
+    compositional_only: bool = false,
+};
+
+const Associations = struct {
+    field_count: usize,
+    product_offsets: []const u32,
+    product_pairs: []const u32,
+    query_offsets: []const u32,
+    query_pairs: []const u32,
+
+    fn product(self: Associations, index: usize) []const u32 {
+        const start = @as(usize, self.product_offsets[index]) * 2;
+        const end = @as(usize, self.product_offsets[index + 1]) * 2;
+        return self.product_pairs[start..end];
+    }
+
+    fn query(self: Associations, index: usize) []const u32 {
+        const start = @as(usize, self.query_offsets[index]) * 2;
+        const end = @as(usize, self.query_offsets[index + 1]) * 2;
+        return self.query_pairs[start..end];
+    }
 };
 
 const Qrel = struct {
@@ -131,9 +158,30 @@ pub fn main(init: std.process.Init) !void {
     defer alloc.free(raw);
     var fixture = try parseFixture(alloc, raw);
     defer alloc.free(fixture.qrels);
+    const associations_raw = if (config.associations_path) |path|
+        try std.Io.Dir.cwd().readFileAlloc(
+            init.io,
+            path,
+            alloc,
+            .limited(64 * 1024 * 1024),
+        )
+    else
+        &.{};
+    defer if (config.associations_path != null) alloc.free(associations_raw);
+    if (config.associations_path != null) {
+        fixture.associations = try parseAssociationsFixture(
+            associations_raw,
+            fixture.product_count,
+            fixture.query_count,
+        );
+    }
+    if (config.compositional_only and fixture.associations == null) {
+        return error.CompositionalAssociationsRequired;
+    }
+    fixture.compositional_only = config.compositional_only;
 
     std.debug.print(
-        "wands_fixture products={d} queries={d} qrels={d} embedding_dimensions={d} max_tokens={d} hdc_dimensions={d} seed={d} ann_seed={d} fusion_weight={d:.3}\n",
+        "wands_fixture products={d} queries={d} qrels={d} embedding_dimensions={d} max_tokens={d} hdc_dimensions={d} seed={d} ann_seed={d} fusion_weight={d:.3} association_fields={d} product_associations={d} query_associations={d} compositional_only={any}\n",
         .{
             fixture.product_count,
             fixture.query_count,
@@ -144,6 +192,10 @@ pub fn main(init: std.process.Init) !void {
             config.seed,
             config.ann_seed,
             config.fusion_weight,
+            if (fixture.associations) |associations| associations.field_count else 0,
+            if (fixture.associations) |associations| associations.product_pairs.len / 2 else 0,
+            if (fixture.associations) |associations| associations.query_pairs.len / 2 else 0,
+            config.compositional_only,
         },
     );
 
@@ -157,11 +209,14 @@ pub fn main(init: std.process.Init) !void {
     );
     const fusion_ann_quality = try alloc.alloc(PerQueryQuality, ann_quality_count);
     defer alloc.free(fusion_ann_quality);
+    const fusion_candidate_quality = try alloc.alloc(PerQueryQuality, ann_quality_count);
+    defer alloc.free(fusion_candidate_quality);
     const hdc_rabitq_quality = try alloc.alloc(PerQueryQuality, ann_quality_count);
     defer alloc.free(hdc_rabitq_quality);
     const hdc_bipolar_quality = try alloc.alloc(PerQueryQuality, ann_quality_count);
     defer alloc.free(hdc_bipolar_quality);
     for (fusion_ann_quality) |*quality| quality.* = .{};
+    for (fusion_candidate_quality) |*quality| quality.* = .{};
     for (hdc_rabitq_quality) |*quality| quality.* = .{};
     for (hdc_bipolar_quality) |*quality| quality.* = .{};
 
@@ -216,7 +271,7 @@ pub fn main(init: std.process.Init) !void {
             config.ann_seed,
             true,
             "embedding_structured_fusion",
-            null,
+            fusion_candidate_quality,
         );
         try evaluateAnnMethod(
             alloc,
@@ -309,14 +364,57 @@ pub fn main(init: std.process.Init) !void {
         config.seed,
     );
 
+    const structural_products: []f32 = if (fixture.associations != null)
+        try alloc.alloc(
+            f32,
+            try std.math.mul(usize, fixture.product_count, config.hdc_dimensions),
+        )
+    else
+        &.{};
+    defer if (fixture.associations != null) alloc.free(structural_products);
+    const structural_queries: []f32 = if (fixture.associations != null)
+        try alloc.alloc(
+            f32,
+            try std.math.mul(usize, fixture.query_count, config.hdc_dimensions),
+        )
+    else
+        &.{};
+    defer if (fixture.associations != null) alloc.free(structural_queries);
+    if (fixture.associations != null) {
+        const structural_started = antfly.platform_time.monotonicNs();
+        try buildCompositionalStructuralVectors(
+            alloc,
+            fixture,
+            config.hdc_dimensions,
+            config.seed,
+            structural_products,
+            structural_queries,
+        );
+        const structural_elapsed = antfly.platform_time.monotonicNs() - structural_started;
+        std.debug.print(
+            "wands_compositional_structure products={d} queries={d} dimensions={d} total_ms={d:.3} bytes={d}\n",
+            .{
+                fixture.product_count,
+                fixture.query_count,
+                config.hdc_dimensions,
+                @as(f64, @floatFromInt(structural_elapsed)) / std.time.ns_per_ms,
+                (structural_products.len + structural_queries.len) * @sizeOf(f32),
+            },
+        );
+    }
+
     const complete_products = try alloc.alloc(f32, projected_products.len);
     defer alloc.free(complete_products);
     for (config.semantic_weights) |semantic_weight| {
         const compose_started = antfly.platform_time.monotonicNs();
         for (0..fixture.product_count) |product_index| {
             const projected = projected_products[product_index * config.hdc_dimensions ..][0..config.hdc_dimensions];
-            const class_id = fixture.product_classes[product_index];
-            const structured = structural_classes[@as(usize, class_id) * config.hdc_dimensions ..][0..config.hdc_dimensions];
+            const structured = if (fixture.associations != null)
+                structural_products[product_index * config.hdc_dimensions ..][0..config.hdc_dimensions]
+            else blk: {
+                const class_id = fixture.product_classes[product_index];
+                break :blk structural_classes[@as(usize, class_id) * config.hdc_dimensions ..][0..config.hdc_dimensions];
+            };
             const complete = complete_products[product_index * config.hdc_dimensions ..][0..config.hdc_dimensions];
             for (complete, structured, projected) |*out, structural_coordinate, semantic_coordinate| {
                 out.* = structural_coordinate + semantic_weight * semantic_coordinate;
@@ -362,6 +460,18 @@ pub fn main(init: std.process.Init) !void {
             "complete_hdc_structured_w{d}",
             .{semantic_weight},
         );
+        const structured_query_vectors = StructuredQueries{
+            .vectors = if (fixture.associations != null)
+                structural_queries
+            else
+                structural_classes,
+            .count = if (fixture.associations != null)
+                fixture.query_count
+            else
+                class_count,
+            .semantic_weight = semantic_weight,
+            .by_query = fixture.associations != null,
+        };
         try evaluateMethod(
             alloc,
             fixture,
@@ -370,11 +480,7 @@ pub fn main(init: std.process.Init) !void {
             complete_products,
             projected_queries,
             config.hdc_dimensions,
-            .{
-                .vectors = structural_classes,
-                .count = class_count,
-                .semantic_weight = semantic_weight,
-            },
+            structured_query_vectors,
             config.fusion_weight,
             structured_label,
         );
@@ -388,11 +494,7 @@ pub fn main(init: std.process.Init) !void {
                     complete_products,
                     projected_queries,
                     config.hdc_dimensions,
-                    .{
-                        .vectors = structural_classes,
-                        .count = class_count,
-                        .semantic_weight = semantic_weight,
-                    },
+                    structured_query_vectors,
                     config.fusion_weight,
                     config.ann_candidates,
                     config.ann_seed,
@@ -413,11 +515,7 @@ pub fn main(init: std.process.Init) !void {
                     complete_products,
                     projected_queries,
                     config.hdc_dimensions,
-                    .{
-                        .vectors = structural_classes,
-                        .count = class_count,
-                        .semantic_weight = semantic_weight,
-                    },
+                    structured_query_vectors,
                     config.ann_candidates,
                     bipolar_label,
                     hdc_bipolar_quality,
@@ -426,6 +524,8 @@ pub fn main(init: std.process.Init) !void {
                     const offset = budget_index * fixture.query_count;
                     const fusion_quality =
                         fusion_ann_quality[offset..][0..fixture.query_count];
+                    const candidate_fusion_quality =
+                        fusion_candidate_quality[offset..][0..fixture.query_count];
                     const rabitq_quality =
                         hdc_rabitq_quality[offset..][0..fixture.query_count];
                     const bipolar_quality =
@@ -457,6 +557,32 @@ pub fn main(init: std.process.Init) !void {
                                 @as(u64, @intCast(candidate_budget)) ^
                                 @as(u64, @intFromEnum(metric)) ^ 0xb170_1a2,
                         );
+                        try printPairedBootstrap(
+                            alloc,
+                            fixture,
+                            candidate_budget,
+                            structured_label,
+                            "embedding_structured_fusion",
+                            rabitq_quality,
+                            candidate_fusion_quality,
+                            metric,
+                            config.seed ^ config.ann_seed ^
+                                @as(u64, @intCast(candidate_budget)) ^
+                                @as(u64, @intFromEnum(metric)) ^ 0xca11_d1da,
+                        );
+                        try printPairedBootstrap(
+                            alloc,
+                            fixture,
+                            candidate_budget,
+                            bipolar_label,
+                            "embedding_structured_fusion",
+                            bipolar_quality,
+                            candidate_fusion_quality,
+                            metric,
+                            config.seed ^ config.ann_seed ^
+                                @as(u64, @intCast(candidate_budget)) ^
+                                @as(u64, @intFromEnum(metric)) ^ 0xca11_b170,
+                        );
                     }
                 }
             }
@@ -468,7 +594,22 @@ const StructuredQueries = struct {
     vectors: []const f32,
     count: usize,
     semantic_weight: f32,
+    by_query: bool = false,
 };
+
+fn structuredQueryVector(
+    fixture: Fixture,
+    structured: StructuredQueries,
+    query_index: usize,
+    dimensions: usize,
+) ![]const f32 {
+    const vector_index = if (structured.by_query)
+        query_index
+    else
+        @as(usize, fixture.query_classes[query_index]);
+    if (vector_index >= structured.count) return error.InvalidFixture;
+    return structured.vectors[vector_index * dimensions ..][0..dimensions];
+}
 
 const AnnMetrics = struct {
     quality: Metrics = .{},
@@ -593,6 +734,7 @@ fn evaluateAnnMethod(
     @memset(holdout, .{});
 
     for (0..fixture.query_count) |query_index| {
+        if (!queryIncluded(fixture, query_index)) continue;
         @memset(gains, 0);
         const qrels = fixture.qrels[qrel_offsets[query_index]..qrel_offsets[query_index + 1]];
         var relevant_count: usize = 0;
@@ -606,9 +748,12 @@ fn evaluateAnnMethod(
         const query = switch (method) {
             .complete_hdc_structured => blk: {
                 const structured = structured_queries orelse return error.InvalidArgument;
-                const class_id = fixture.query_classes[query_index];
-                if (class_id >= structured.count) return error.InvalidFixture;
-                const association = structured.vectors[@as(usize, class_id) * dimensions ..][0..dimensions];
+                const association = try structuredQueryVector(
+                    fixture,
+                    structured,
+                    query_index,
+                    dimensions,
+                );
                 for (query_scratch, association, raw_query) |*out, structural_coordinate, semantic_coordinate| {
                     out.* = structural_coordinate + structured.semantic_weight * semantic_coordinate;
                 }
@@ -645,10 +790,12 @@ fn evaluateAnnMethod(
         for (approximate_distances, 0..) |distance, product_index| {
             var score = 1 - distance;
             if (apply_structure_during_candidate_selection and
-                method == .embedding_structured_fusion and
-                fixture.product_classes[product_index] == fixture.query_classes[query_index])
+                method == .embedding_structured_fusion)
             {
-                score += fusion_weight;
+                score += fusion_weight * @as(
+                    f32,
+                    @floatFromInt(structuredMatchCount(fixture, query_index, product_index)),
+                );
             }
             approximate_ranked[product_index] = .{ .index = product_index, .score = score };
         }
@@ -804,6 +951,7 @@ fn evaluatePackedBipolarMethod(
     @memset(holdout, .{});
 
     for (0..fixture.query_count) |query_index| {
+        if (!queryIncluded(fixture, query_index)) continue;
         @memset(gains, 0);
         const qrels = fixture.qrels[qrel_offsets[query_index]..qrel_offsets[query_index + 1]];
         var relevant_count: usize = 0;
@@ -814,10 +962,12 @@ fn evaluatePackedBipolarMethod(
         if (relevant_count == 0) continue;
 
         const raw_query = query_vectors[query_index * dimensions ..][0..dimensions];
-        const class_id = fixture.query_classes[query_index];
-        if (class_id >= structured_queries.count) return error.InvalidFixture;
-        const association =
-            structured_queries.vectors[@as(usize, class_id) * dimensions ..][0..dimensions];
+        const association = try structuredQueryVector(
+            fixture,
+            structured_queries,
+            query_index,
+            dimensions,
+        );
         for (query_scratch, association, raw_query) |*out, structural_coordinate, semantic_coordinate| {
             out.* = structural_coordinate +
                 structured_queries.semantic_weight * semantic_coordinate;
@@ -1050,12 +1200,58 @@ fn exactScore(
         query,
         product_vectors[product_index * dimensions ..][0..dimensions],
     );
-    if (method == .embedding_structured_fusion and
-        fixture.product_classes[product_index] == fixture.query_classes[query_index])
-    {
-        score += fusion_weight;
+    if (method == .embedding_structured_fusion) {
+        score += fusion_weight * @as(
+            f32,
+            @floatFromInt(structuredMatchCount(fixture, query_index, product_index)),
+        );
     }
     return score;
+}
+
+fn queryIncluded(fixture: Fixture, query_index: usize) bool {
+    if (!fixture.compositional_only) return true;
+    const associations = fixture.associations orelse return false;
+    return associations.query(query_index).len > 0;
+}
+
+fn structuredMatchCount(
+    fixture: Fixture,
+    query_index: usize,
+    product_index: usize,
+) usize {
+    var matches: usize = @intFromBool(
+        fixture.product_classes[product_index] == fixture.query_classes[query_index],
+    );
+    const associations = fixture.associations orelse return matches;
+    const product = associations.product(product_index);
+    const query = associations.query(query_index);
+    var query_offset: usize = 0;
+    while (query_offset < query.len) : (query_offset += 2) {
+        var product_offset: usize = 0;
+        while (product_offset < product.len) : (product_offset += 2) {
+            if (query[query_offset] == product[product_offset] and
+                query[query_offset + 1] == product[product_offset + 1])
+            {
+                matches += 1;
+                break;
+            }
+        }
+    }
+    return matches;
+}
+
+fn allStructuredAssociationsMatch(
+    fixture: Fixture,
+    query_index: usize,
+    product_index: usize,
+) bool {
+    if (fixture.product_classes[product_index] != fixture.query_classes[query_index]) {
+        return false;
+    }
+    const associations = fixture.associations orelse return true;
+    return structuredMatchCount(fixture, query_index, product_index) ==
+        1 + associations.query(query_index).len / 2;
 }
 
 fn rankedGreaterThanContext(_: void, left: Ranked, right: Ranked) bool {
@@ -1088,6 +1284,7 @@ fn evaluateMethod(
     var validation = Metrics{};
     var test_metrics = Metrics{};
     for (0..fixture.query_count) |query_index| {
+        if (!queryIncluded(fixture, query_index)) continue;
         @memset(gains, 0);
         const qrels = fixture.qrels[qrel_offsets[query_index]..qrel_offsets[query_index + 1]];
         var relevant_count: usize = 0;
@@ -1101,9 +1298,12 @@ fn evaluateMethod(
         const query = switch (method) {
             .complete_hdc_structured => blk: {
                 const structured = structured_queries orelse return error.InvalidArgument;
-                const class_id = fixture.query_classes[query_index];
-                if (class_id >= structured.count) return error.InvalidFixture;
-                const association = structured.vectors[@as(usize, class_id) * dimensions ..][0..dimensions];
+                const association = try structuredQueryVector(
+                    fixture,
+                    structured,
+                    query_index,
+                    dimensions,
+                );
                 for (query_scratch, association, raw_query) |*out, structural_coordinate, semantic_coordinate| {
                     out.* = structural_coordinate + structured.semantic_weight * semantic_coordinate;
                 }
@@ -1123,7 +1323,7 @@ fn evaluateMethod(
         var ranked_count: usize = 0;
         for (0..fixture.product_count) |product_index| {
             if (method == .embedding_exact_filter and
-                fixture.product_classes[product_index] != fixture.query_classes[query_index])
+                !allStructuredAssociationsMatch(fixture, query_index, product_index))
             {
                 continue;
             }
@@ -1131,10 +1331,11 @@ fn evaluateMethod(
                 query,
                 product_vectors[product_index * dimensions ..][0..dimensions],
             );
-            if (method == .embedding_structured_fusion and
-                fixture.product_classes[product_index] == fixture.query_classes[query_index])
-            {
-                score += fusion_weight;
+            if (method == .embedding_structured_fusion) {
+                score += fusion_weight * @as(
+                    f32,
+                    @floatFromInt(structuredMatchCount(fixture, query_index, product_index)),
+                );
             }
             insertTopK(&ranked, &ranked_count, .{ .index = product_index, .score = score });
         }
@@ -1266,6 +1467,93 @@ fn buildStructuralClasses(
     }
 }
 
+fn buildCompositionalStructuralVectors(
+    alloc: std.mem.Allocator,
+    fixture: Fixture,
+    dimensions: usize,
+    seed: u64,
+    product_vectors: []f32,
+    query_vectors: []f32,
+) !void {
+    const associations = fixture.associations orelse return error.InvalidArgument;
+    if (product_vectors.len != fixture.product_count * dimensions or
+        query_vectors.len != fixture.query_count * dimensions)
+    {
+        return error.InvalidArgument;
+    }
+    const encoder = try hdc.Encoder.init(.{
+        .dimensions = @intCast(dimensions),
+        .atomic_seed = seed,
+    });
+    const scratch = try alloc.alloc(f32, dimensions);
+    defer alloc.free(scratch);
+
+    for (0..fixture.product_count) |product_index| {
+        try buildCompositionalStructuralVector(
+            encoder,
+            scratch,
+            product_vectors[product_index * dimensions ..][0..dimensions],
+            fixture.product_classes[product_index],
+            associations.product(product_index),
+        );
+    }
+    for (0..fixture.query_count) |query_index| {
+        try buildCompositionalStructuralVector(
+            encoder,
+            scratch,
+            query_vectors[query_index * dimensions ..][0..dimensions],
+            fixture.query_classes[query_index],
+            associations.query(query_index),
+        );
+    }
+}
+
+fn buildCompositionalStructuralVector(
+    encoder: hdc.Encoder,
+    scratch: []f32,
+    vector: []f32,
+    class_id: u32,
+    association_pairs: []const u32,
+) !void {
+    if (association_pairs.len % 2 != 0) return error.InvalidFixture;
+    @memset(vector, 0);
+    var class_value_buffer: [32]u8 = undefined;
+    const class_value = try std.fmt.bufPrint(&class_value_buffer, "{d}", .{class_id});
+    try encoder.addAssociation(
+        vector,
+        scratch,
+        "product_class",
+        .{ .kind = .string, .bytes = class_value },
+    );
+
+    var offset: usize = 0;
+    while (offset < association_pairs.len) : (offset += 2) {
+        var path_buffer: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(
+            &path_buffer,
+            "attribute_{d}",
+            .{association_pairs[offset]},
+        );
+        var value_buffer: [32]u8 = undefined;
+        const value = try std.fmt.bufPrint(
+            &value_buffer,
+            "{d}",
+            .{association_pairs[offset + 1]},
+        );
+        try encoder.addAssociation(
+            vector,
+            scratch,
+            path,
+            .{ .kind = .string, .bytes = value },
+        );
+    }
+    const scale = 1.0 / @sqrt(@as(
+        f32,
+        @floatFromInt(1 + association_pairs.len / 2),
+    ));
+    antfly.vector.scale(scale, vector);
+}
+
 fn classCount(fixture: Fixture) usize {
     var maximum: u32 = 0;
     for (fixture.product_classes) |value| maximum = @max(maximum, value);
@@ -1291,6 +1579,82 @@ fn buildQrelOffsets(
 fn qrelLessThan(_: void, left: Qrel, right: Qrel) bool {
     if (left.query_index != right.query_index) return left.query_index < right.query_index;
     return left.product_index < right.product_index;
+}
+
+fn parseAssociationsFixture(
+    raw: []const u8,
+    expected_products: usize,
+    expected_queries: usize,
+) !Associations {
+    if (raw.len < association_fixture_header_bytes or
+        !std.mem.eql(u8, raw[0..8], association_fixture_magic))
+    {
+        return error.InvalidAssociationsFixture;
+    }
+    const version = std.mem.readInt(u32, raw[8..12], .little);
+    if (version != association_fixture_version) {
+        return error.UnsupportedAssociationsFixtureVersion;
+    }
+    const product_count: usize = std.mem.readInt(u32, raw[12..16], .little);
+    const query_count: usize = std.mem.readInt(u32, raw[16..20], .little);
+    const field_count: usize = std.mem.readInt(u32, raw[20..24], .little);
+    const product_association_count: usize = std.mem.readInt(u32, raw[24..28], .little);
+    const query_association_count: usize = std.mem.readInt(u32, raw[28..32], .little);
+    if (product_count != expected_products or
+        query_count != expected_queries or
+        field_count == 0)
+    {
+        return error.InvalidAssociationsFixture;
+    }
+
+    var offset: usize = association_fixture_header_bytes;
+    const product_offsets = try takeAlignedSlice(u32, raw, &offset, product_count + 1);
+    const product_pairs = try takeAlignedSlice(
+        u32,
+        raw,
+        &offset,
+        try std.math.mul(usize, product_association_count, 2),
+    );
+    const query_offsets = try takeAlignedSlice(u32, raw, &offset, query_count + 1);
+    const query_pairs = try takeAlignedSlice(
+        u32,
+        raw,
+        &offset,
+        try std.math.mul(usize, query_association_count, 2),
+    );
+    if (offset != raw.len or
+        product_offsets[0] != 0 or
+        query_offsets[0] != 0 or
+        product_offsets[product_count] != product_association_count or
+        query_offsets[query_count] != query_association_count)
+    {
+        return error.InvalidAssociationsFixture;
+    }
+    try validateAssociationRows(product_offsets, product_pairs, field_count);
+    try validateAssociationRows(query_offsets, query_pairs, field_count);
+    return .{
+        .field_count = field_count,
+        .product_offsets = product_offsets,
+        .product_pairs = product_pairs,
+        .query_offsets = query_offsets,
+        .query_pairs = query_pairs,
+    };
+}
+
+fn validateAssociationRows(
+    offsets: []const u32,
+    pairs: []const u32,
+    field_count: usize,
+) !void {
+    for (offsets[1..], offsets[0 .. offsets.len - 1]) |end, start| {
+        if (end < start or @as(usize, end) * 2 > pairs.len) {
+            return error.InvalidAssociationsFixture;
+        }
+    }
+    var offset: usize = 0;
+    while (offset < pairs.len) : (offset += 2) {
+        if (pairs[offset] >= field_count) return error.InvalidAssociationsFixture;
+    }
 }
 
 fn parseFixture(alloc: std.mem.Allocator, raw: []const u8) !Fixture {
@@ -1376,6 +1740,8 @@ fn parseArgs(alloc: std.mem.Allocator, args_in: std.process.Args) !Config {
     var ann_seed: u64 = 13;
     var fusion_weight: f32 = 0.25;
     var baseline_only = false;
+    var associations_path: ?[]const u8 = null;
+    var compositional_only = false;
     var semantic_weights = std.ArrayListUnmanaged(f32).empty;
     errdefer semantic_weights.deinit(alloc);
     var ann_semantic_weight: ?f32 = null;
@@ -1402,6 +1768,10 @@ fn parseArgs(alloc: std.mem.Allocator, args_in: std.process.Args) !Config {
             seed = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArgument, 10);
         } else if (std.mem.eql(u8, argument, "--ann-seed")) {
             ann_seed = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArgument, 10);
+        } else if (std.mem.eql(u8, argument, "--associations")) {
+            associations_path = args.next() orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, argument, "--compositional-only")) {
+            compositional_only = true;
         } else if (std.mem.eql(u8, argument, "--baseline-only")) {
             baseline_only = true;
         } else if (std.mem.eql(u8, argument, "--ann-semantic-weight")) {
@@ -1422,7 +1792,8 @@ fn parseArgs(alloc: std.mem.Allocator, args_in: std.process.Args) !Config {
     if (fixture_path == null or
         hdc_dimensions == 0 or
         !std.math.isFinite(fusion_weight) or
-        fusion_weight < 0)
+        fusion_weight < 0 or
+        (compositional_only and associations_path == null))
     {
         return error.InvalidArgument;
     }
@@ -1443,6 +1814,8 @@ fn parseArgs(alloc: std.mem.Allocator, args_in: std.process.Args) !Config {
         .baseline_only = baseline_only,
         .ann_semantic_weight = ann_semantic_weight,
         .ann_candidates = try ann_candidates.toOwnedSlice(alloc),
+        .associations_path = associations_path,
+        .compositional_only = compositional_only,
     };
 }
 
@@ -1484,6 +1857,49 @@ test "bipolar sign packing rejects non-finite coordinates" {
         error.NonFiniteHypervector,
         packBipolarSigns(&.{ 1, std.math.nan(f32) }, &sign_words),
     );
+}
+
+test "association fixture exposes compositional rows and exact matching" {
+    var raw: [64]u8 align(4) = [_]u8{0} ** 64;
+    @memcpy(raw[0..8], association_fixture_magic);
+    std.mem.writeInt(u32, raw[8..12], association_fixture_version, .little);
+    std.mem.writeInt(u32, raw[12..16], 1, .little);
+    std.mem.writeInt(u32, raw[16..20], 1, .little);
+    std.mem.writeInt(u32, raw[20..24], 1, .little);
+    std.mem.writeInt(u32, raw[24..28], 1, .little);
+    std.mem.writeInt(u32, raw[28..32], 1, .little);
+    std.mem.writeInt(u32, raw[32..36], 0, .little);
+    std.mem.writeInt(u32, raw[36..40], 1, .little);
+    std.mem.writeInt(u32, raw[40..44], 0, .little);
+    std.mem.writeInt(u32, raw[44..48], 7, .little);
+    std.mem.writeInt(u32, raw[48..52], 0, .little);
+    std.mem.writeInt(u32, raw[52..56], 1, .little);
+    std.mem.writeInt(u32, raw[56..60], 0, .little);
+    std.mem.writeInt(u32, raw[60..64], 7, .little);
+
+    const associations = try parseAssociationsFixture(&raw, 1, 1);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 7 }, associations.product(0));
+    try std.testing.expectEqualSlices(u32, &.{ 0, 7 }, associations.query(0));
+
+    const fixture = Fixture{
+        .dimensions = 1,
+        .max_tokens = 1,
+        .product_count = 1,
+        .query_count = 1,
+        .product_embeddings = &.{0},
+        .query_embeddings = &.{0},
+        .product_ids = &.{1},
+        .product_classes = &.{2},
+        .product_categories = &.{3},
+        .query_ids = &.{4},
+        .query_classes = &.{2},
+        .qrels = &.{},
+        .associations = associations,
+        .compositional_only = true,
+    };
+    try std.testing.expect(queryIncluded(fixture, 0));
+    try std.testing.expectEqual(@as(usize, 2), structuredMatchCount(fixture, 0, 0));
+    try std.testing.expect(allStructuredAssociationsMatch(fixture, 0, 0));
 }
 
 test "fixture parser validates and exposes the binary layout" {

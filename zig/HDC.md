@@ -40,6 +40,10 @@ This worktree now contains the first engine-owned Phase 1 slice:
   and 233,448 human relevance judgments, with real BGE embeddings,
   validation-only weight selection, holdout quality, exact graph-answer
   scoring, and equal RaBitQ candidate budgets;
+- a deterministic WANDS association sidecar that extracts query-explicit
+  color, material, style, shape, finish, pattern, and size evidence without
+  consulting relevance labels, plus a 116-query real compositional slice,
+  packed-bipolar comparison, and paired holdout confidence intervals;
 - a managed backfill-to-retrieval fixture that uses natural-language HDC search
   to select a location and then follows only the exact stored graph edge, closes
   and reopens the database, repeats the query, and verifies resumed HDC
@@ -47,9 +51,9 @@ This worktree now contains the first engine-owned Phase 1 slice:
 
 This is not release-ready. The public shape and lifecycle semantics are now
 explicit, but interrupted-backfill fault injection, HDC-specific resource
-attribution, representative workload evidence against ordinary embeddings plus
-exact filters, a public HTTP query fixture, and a distributed
-fuzzy-seed-to-exact-graph fixture remain required.
+attribution, an additional external compositional domain, a public HTTP query
+fixture, and a distributed fuzzy-seed-to-exact-graph fixture remain required
+before any later attempt to reverse the no-go.
 
 | Production capability | State | Required evidence |
 | --- | --- | --- |
@@ -59,8 +63,8 @@ fuzzy-seed-to-exact-graph fixture remain required.
 | Canonical document-to-association projection | implemented for selected JSON paths | replay fixtures against stored typed/schema values |
 | Managed ingest, backfill, rebuild, and quarantine | ingest/backfill and close/reopen/resumed writes tested through existing dense lifecycle; HDC seed/model drift receives a distinct artifact namespace | interrupted-backfill and config-drift rebuild fault injection |
 | Text and structured query composition | implemented | managed local-provider projection, exact-path validation, and public query forwarding tests |
-| Dense HBC/RaBitQ retrieval quality | pinned WANDS exact and RaBitQ evaluation finds no quality/cost win over tuned embedding score fusion | HBC-tree confirmation only if a later workload reverses the no-go result |
-| Fuzzy seed to exact graph result | managed backfill/retrieval fixture implemented | distributed graph fixture and public HTTP contract |
+| Dense HBC/RaBitQ retrieval quality | pinned WANDS exact, RaBitQ, packed-bipolar, dimension/seed, and real compositional evaluations find no statistically significant quality/cost win over tuned embedding score fusion | HBC-tree confirmation only if a later workload reverses the no-go result |
+| Fuzzy seed to exact graph result | managed HDC backfill/retrieval fixture plus 23 generic fail-closed and cross-range distributed graph tests pass | combined distributed HDC seed fixture and public HTTP contract only if the experiment is revived |
 | Operational status and resource counters | normal index status exposes public hypervector config, semantic config fingerprint, coverage outcomes, replay target, backfill progress/state, cardinality, and disk use | HDC encode/query/resource/fallback counters and pressure tests |
 
 ## Product Goal
@@ -113,11 +117,12 @@ product experiment.
 ### Current decision
 
 The current experiment is a **no-go for productionizing HDC as a stable public
-index**. On the pinned human-labelled WANDS workload, validation-tuned complete
-HDC and validation-tuned embedding score fusion are effectively tied on
-application quality. The embedding baseline is materially smaller and faster,
-and its semantic ANN candidates can be reranked with the structured score
-without adding a new physical index.
+index**. On the pinned human-labelled WANDS workload, including its real
+class-plus-attribute compositional slice, validation-tuned complete HDC has not
+shown a statistically significant quality advantage over validation-tuned
+embedding score fusion. The embedding baseline is materially smaller and
+faster, and structured evidence can be applied during candidate scoring or
+reranking without adding a new physical index.
 
 This does not invalidate the deterministic HDC primitive or its lifecycle
 tests. It means the primitive has not earned the public API, dimensions, or
@@ -126,6 +131,22 @@ and must not be declared stable based on the GraphCon example, the controlled
 diagnostic, or WANDS. A later proposal must reverse this result on a workload
 whose composition cannot be reproduced by exact filtering or simple late
 fusion.
+
+The success conditions are conjunctive, so the experiment can reach a no-go
+without claiming that every production-hardening gate passed:
+
+| Graduation condition | Evidence | Verdict |
+| --- | --- | --- |
+| statistically significant retrieval or graph-answer advantage | full WANDS and real class-plus-attribute slice; paired 10,000-sample bootstrap at 50/100/200 candidates | **not demonstrated** |
+| competitive representation and query cost | tuned 8,000-dimensional HDC, RaBitQ and packed bipolar, equal candidate budgets | **failed**: about 16x candidate bytes; 1.3x–1.8x candidate-scan latency |
+| exact graph semantics | local managed HDC seed-to-edge fixture; generic distributed result-ref, identity, retry, cross-range, and fail-closed suites | preserved at the existing handoff boundary; combined distributed fixture remains unbuilt |
+| fail-closed lifecycle | full coordinate identity, mismatch rejection, backfill, close/reopen, resumed enrichment | prototype evidence passes; production fault injection and resource attribution remain unbuilt |
+| simple UX | logical `hypervector` configuration, normal document writes, text plus optional association query, explicit graph index | coherent experimental contract; not justified as a stable product |
+
+Because the first two mandatory gates fail, HBC-tree construction, combined
+multi-node HDC traversal, interrupted-backfill campaigns, and production SLO
+work cannot change the present decision. They are revival gates, not evidence
+needed to reject the current proposal.
 
 ## User Experience
 
@@ -1474,6 +1495,61 @@ reduces the original HDC resource cost by 20%, but provides no significant
 quality advantage and leaves the candidate state about 16 times larger than
 the embedding baseline.
 
+#### Real compositional WANDS slice
+
+The single-class experiment does not fully test HDC's claimed composition
+advantage. A pinned follow-up therefore reads WANDS `product_features` and
+creates a separate association fixture without consulting relevance labels:
+
+- product aliases are canonicalized into `color`, `material`, `style`, `shape`,
+  `finish`, `pattern`, and `size`;
+- a value must occur on at least 100 products;
+- a published query receives an association only when that value occurs as a
+  literal token-bounded phrase;
+- overlapping phrases are assigned once, longest first;
+- product bundles retain only coordinates explicitly used by some query;
+- the WANDS `query_class` remains a separate association.
+
+This yields 116 real class-plus-attribute queries: 23 validation and 93
+holdout. Thirteen state two or more extracted attributes in addition to class.
+The original human judgments remain the only relevance labels. Validation
+selects fusion boost 0.075 and, after sweeps over dimensions, seeds, and weights,
+HDC dimensions 8,000, coordinate seed 29, and semantic weight 3.
+
+The selected exact holdout result is:
+
+| Method | NDCG@10 | MRR@10 | Recall@10 | Relevant top-1 | Graph answer top-1 | Score ms/query |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| embedding + structured fusion | 0.7570 | 0.9427 | 0.0521 | **0.9247** | 0.9677 | **1.12** |
+| complete HDC | **0.7593** | **0.9435** | **0.0532** | 0.9140 | **0.9785** | 18.94 |
+
+This is the first representative slice with a positive HDC signal, but the
+signal is small and comes from one additional correct graph-category answer.
+At an equal 50-candidate budget, the stronger baseline applies the transparent
+structured score during candidate selection rather than waiting until rerank:
+
+| Candidate method | Candidate bytes | NDCG@10 | Graph answer top-1 | Exact top-10 recall | Approximate ms/query |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| embedding + structured candidate score | **2,753,152** | 0.7563 | 0.9677 | 0.9903 | **3.59** |
+| complete HDC RaBitQ | 43,713,904 | **0.7593** | **0.9785** | **1.0000** | 6.54 |
+| complete HDC packed bipolar | 42,994,000 | 0.7526 | **0.9785** | 0.9269 | 4.54 |
+
+Paired bootstrap intervals do not establish an advantage. HDC RaBitQ minus
+candidate-time fusion has NDCG delta `0.003059` with 95% interval
+`[-0.016155, 0.024012]`; graph-answer delta is `0.010753` with interval
+`[0, 0.032258]`. Packed bipolar has NDCG delta `-0.003619` with interval
+`[-0.022692, 0.015891]`. The lower graph bound of exactly zero reflects the
+chance that resampling omits the single improved query.
+
+The result is directionally interesting but fails the graduation rule: no
+statistically significant advantage, approximately 16 times the candidate
+bytes, 1.8 times the RaBitQ scan latency, 21 times the authoritative bytes, and
+17 times the exact scoring latency. It also does not cover inferred or
+contradictory associations, and only 13 queries contain more than one explicit
+attribute beyond class. A later revival should start by reproducing this signal
+on a larger external graph workload, not by building a specialized physical
+index first.
+
 The RaBitQ measurement deliberately isolates quantization, candidate selection,
 and exact reranking over the entire corpus. It is not an HBC tree-topology
 benchmark. Because the application result is already a no-go, building a
@@ -1499,12 +1575,30 @@ UV_CACHE_DIR=/tmp/uv-cache uv run --project e2e/inference \
   --max-tokens 128 \
   --threads 8
 
+python tools/prepare_hdc_wands_associations.py \
+  --dataset-dir /tmp/antfly-hdc-wands \
+  --output /tmp/antfly-hdc-wands/wands-associations.afha \
+  --min-products 100
+
 zig build hdc-wands-bench -- \
   --fixture /tmp/antfly-hdc-wands/wands-bge-small.afhw \
   --hdc-dims 10000 \
   --semantic-weights 4 \
   --fusion-weight 0.075 \
   --ann-semantic-weight 4 \
+  --ann-candidates 50,100,200
+
+# Validation-selected real compositional slice:
+zig build hdc-wands-bench -- \
+  --fixture /tmp/antfly-hdc-wands/wands-bge-small.afhw \
+  --associations /tmp/antfly-hdc-wands/wands-associations.afha \
+  --compositional-only \
+  --hdc-dims 8000 \
+  --semantic-weights 3 \
+  --fusion-weight 0.075 \
+  --seed 29 \
+  --ann-seed 13 \
+  --ann-semantic-weight 3 \
   --ann-candidates 50,100,200
 
 # Validation-selected dimension/coordinate seed, with the ANN seed controlled
@@ -1524,9 +1618,11 @@ The benchmark implementation and fixture helper are:
 
 - [WANDS quality and RaBitQ benchmark](pkg/antfly/src/bench/hdc_wands_bench.zig)
 - [pinned WANDS/BGE fixture generator](tools/prepare_hdc_wands_fixture.py)
+- [pinned WANDS association-sidecar generator](tools/prepare_hdc_wands_associations.py)
 - [machine-readable WANDS result](bench/baselines/hdc-wands-bge-small-2026-07-26.json)
 - [machine-readable packed-bipolar follow-up](bench/baselines/hdc-wands-packed-bipolar-2026-07-27.json)
 - [machine-readable dimension/seed follow-up](bench/baselines/hdc-wands-tuned-representation-2026-07-27.json)
+- [machine-readable compositional follow-up](bench/baselines/hdc-wands-compositional-2026-07-27.json)
 
 ### Graduation criteria
 
