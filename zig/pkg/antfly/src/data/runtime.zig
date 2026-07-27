@@ -3285,6 +3285,44 @@ const TransitionDbLeaseContext = struct {
     }
 };
 
+const TransitionTableMetadata = struct {
+    table_name: []u8,
+    indexes_json: ?[]u8,
+    schema_json: ?[]u8,
+    identity_namespace: antfly.db.DocIdentityNamespace,
+
+    fn clone(
+        alloc: std.mem.Allocator,
+        table: antfly.metadata.table_manager.TableRecord,
+        range: antfly.metadata.table_manager.RangeRecord,
+    ) !TransitionTableMetadata {
+        const table_name = try alloc.dupe(u8, table.name);
+        errdefer alloc.free(table_name);
+        const indexes_json = if (table.indexes_json.len == 0)
+            null
+        else
+            try alloc.dupe(u8, table.indexes_json);
+        errdefer if (indexes_json) |value| alloc.free(value);
+        const schema_json = if (table.schema_json.len == 0)
+            null
+        else
+            try alloc.dupe(u8, table.schema_json);
+        return .{
+            .table_name = table_name,
+            .indexes_json = indexes_json,
+            .schema_json = schema_json,
+            .identity_namespace = identityNamespaceFromRange(range),
+        };
+    }
+
+    fn deinit(self: *TransitionTableMetadata, alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        if (self.indexes_json) |value| alloc.free(value);
+        if (self.schema_json) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
 pub const DataServer = struct {
     const SplitProjectionReconcileResult = union(enum) {
         advanced,
@@ -4967,6 +5005,19 @@ pub const DataServer = struct {
         const remote_metadata = self.remote_metadata orelse return;
         var snapshot = try remote_metadata.fetchSnapshot();
         freeAdminSnapshotOwned(self.alloc, &snapshot);
+    }
+
+    pub fn setRemoteMetadataFetchErrorForTest(
+        self: *DataServer,
+        fetch_error: ?anyerror,
+    ) void {
+        comptime std.debug.assert(@import("builtin").is_test);
+        const remote_metadata = self.remote_metadata orelse
+            @panic("remote metadata is unavailable");
+        lockAtomic(&remote_metadata.cache_mutex);
+        defer remote_metadata.cache_mutex.unlock();
+        remote_metadata.test_faults.fetch_head_error = fetch_error;
+        remote_metadata.test_faults.force_snapshot_cache_miss = fetch_error != null;
     }
 
     pub fn localShardOperationAdapter(self: *DataServer) antfly.raft.ShardOperationAdapter {
@@ -6859,12 +6910,19 @@ pub const DataServer = struct {
             // open below retires it and installs the source namespace.
             cached.deinit(self.alloc);
         }
-        const table_name = (try self.tableNameForLocalGroupAlloc(table_group_id)) orelse return null;
-        defer self.alloc.free(table_name);
-        const cached = if (expected_identity_namespace) |namespace|
-            (try self.liveRuntimeWriteSource().leaseCachedTransitionGroupWriter(self.alloc, db_group_id, table_name, namespace)) orelse return null
-        else
-            (try self.liveRuntimeWriteSource().leaseCachedGroupWriter(self.alloc, db_group_id, table_name)) orelse return null;
+        var table_metadata = (try self.transitionTableMetadataForLocalGroupAlloc(table_group_id)) orelse
+            return null;
+        defer table_metadata.deinit(self.alloc);
+        const identity_namespace = expected_identity_namespace orelse
+            return error.DocIdentityNamespaceUnavailable;
+        const cached = (try self.liveRuntimeWriteSource().leaseCachedTransitionGroupWriterWithMetadata(
+            self.alloc,
+            db_group_id,
+            table_metadata.table_name,
+            table_metadata.indexes_json,
+            table_metadata.schema_json,
+            identity_namespace,
+        )) orelse return null;
         return try self.wrapTransitionDbLease(cached);
     }
 
@@ -6928,6 +6986,20 @@ pub const DataServer = struct {
         const range = findRangeByGroupId(snapshot.ranges, group_id) orelse return null;
         const table = findTableById(snapshot.tables, range.table_id) orelse return null;
         return try self.alloc.dupe(u8, table.name);
+    }
+
+    fn transitionTableMetadataForLocalGroupAlloc(
+        self: *DataServer,
+        group_id: u64,
+    ) !?TransitionTableMetadata {
+        if (self.remote_metadata) |remote_metadata| {
+            return try remote_metadata.cachedTransitionTableMetadataForGroupAlloc(group_id);
+        }
+        var snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
+        const range = findRangeByGroupId(snapshot.ranges, group_id) orelse return null;
+        const table = findTableById(snapshot.tables, range.table_id) orelse return null;
+        return try TransitionTableMetadata.clone(self.alloc, table, range);
     }
 
     fn ensureSplitSourceApplyStoreSeeded(self: *DataServer, source_root_dir: []const u8, source_group_id: u64) !void {
@@ -7028,9 +7100,10 @@ pub const DataServer = struct {
         watermark: ?antfly.data.AppliedDataBatch,
         capture_handoff: bool,
     ) !SplitProjectionReconcileResult {
-        const table_name = (try self.tableNameForLocalGroupAlloc(source_group_id)) orelse
+        var table_metadata = (try self.transitionTableMetadataForLocalGroupAlloc(source_group_id)) orelse
             return error.SplitSourceProjectionNotReady;
-        defer self.alloc.free(table_name);
+        defer table_metadata.deinit(self.alloc);
+        const table_name = table_metadata.table_name;
         const live_source = self.liveRuntimeWriteSource();
         var transition_activity = live_source.beginGroupTransitionActivity(table_name, source_group_id);
         defer transition_activity.deinit();
@@ -7048,6 +7121,11 @@ pub const DataServer = struct {
         var result: SplitProjectionReconcileResult = undefined;
         transition_activity.withWriter(
             self.alloc,
+            .{
+                .indexes_json = table_metadata.indexes_json,
+                .schema_json = table_metadata.schema_json,
+                .identity_namespace = table_metadata.identity_namespace,
+            },
             reconcileSplitSourceApplyStoreWithScopedDb,
             .{ work_alloc, source_store, source_group_id, watermark, capture_handoff, &result },
         ) catch |err| switch (err) {
@@ -11225,6 +11303,7 @@ fn appendOwnedPeerRouteUpsert(
 const RemoteMetadataSource = struct {
     const TestFaults = if (@import("builtin").is_test) struct {
         fetch_head_error: ?anyerror = null,
+        force_snapshot_cache_miss: bool = false,
     } else struct {};
 
     alloc: std.mem.Allocator,
@@ -11356,7 +11435,13 @@ const RemoteMetadataSource = struct {
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         lockAtomic(&self.cache_mutex);
         if (self.cached_snapshot) |snapshot| {
-            if (now_ms -| self.cached_snapshot_at_ms <= metadata_snapshot_cache_ttl_ms) {
+            const force_cache_miss = if (@import("builtin").is_test)
+                self.test_faults.force_snapshot_cache_miss
+            else
+                false;
+            if (!force_cache_miss and
+                now_ms -| self.cached_snapshot_at_ms <= metadata_snapshot_cache_ttl_ms)
+            {
                 defer self.cache_mutex.unlock();
                 return try cloneAdminSnapshotOwned(self.alloc, snapshot);
             }
@@ -11374,6 +11459,21 @@ const RemoteMetadataSource = struct {
             return try cloneAdminSnapshotOwned(self.alloc, snapshot);
         }
         return null;
+    }
+
+    fn cachedTransitionTableMetadataForGroupAlloc(
+        self: *RemoteMetadataSource,
+        group_id: u64,
+    ) !?TransitionTableMetadata {
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        const snapshot = self.cached_snapshot orelse
+            return error.MetadataSnapshotUnavailable;
+        const range = findRangeByGroupId(snapshot.ranges, group_id) orelse
+            return null;
+        const table = findTableById(snapshot.tables, range.table_id) orelse
+            return null;
+        return try TransitionTableMetadata.clone(self.alloc, table, range);
     }
 
     fn fetchSnapshotForHead(self: *RemoteMetadataSource, head: antfly.metadata_api.MetadataHead) !antfly.metadata_api.AdminSnapshot {

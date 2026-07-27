@@ -6129,18 +6129,38 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         /// Runs one operation against the authoritative writer while this
-        /// capability owns transition admission. The callback has no return
-        /// payload, so it cannot return the DB borrow to its caller; it must
-        /// copy any result into caller-owned output and must not retain `db`.
-        /// Cached and maintenance owners are both released before return.
+        /// capability owns transition admission. Metadata control loops can
+        /// synchronously wait for this callback, so writer acquisition must
+        /// consume a caller-pinned table contract and never re-enter the
+        /// catalog. The callback has no return payload and must not retain
+        /// `db`; cached and maintenance owners are released before return.
         pub fn withWriter(
             self: *GroupTransitionActivity,
             alloc: std.mem.Allocator,
+            metadata: StartupCatchUpMetadata,
             comptime operation: anytype,
             args: anytype,
         ) !void {
             if (!self.active) return error.InactiveGroupTransitionActivity;
-            if (try self.source.leaseCachedGroupWriter(alloc, self.group_id, self.table_name)) |cached_value| {
+            if (metadata.metadata_source != .supplied)
+                return error.InvalidTransitionMetadataSource;
+            const identity_namespace = metadata.identity_namespace orelse
+                return error.DocIdentityNamespaceUnavailable;
+            if (self.source.leaseManagedWriterGroupForTransition(self.group_id)) |cached_value| {
+                var cached = cached_value;
+                if (cached.db.core.identity_namespace.eql(identity_namespace)) {
+                    defer cached.deinit(alloc);
+                    try @call(.auto, operation, .{cached.db} ++ args);
+                    return;
+                }
+                cached.deinit(alloc);
+            }
+            if (try self.source.leaseCachedGroupWriterWithMetadata(
+                alloc,
+                self.group_id,
+                self.table_name,
+                metadata,
+            )) |cached_value| {
                 var cached = cached_value;
                 defer cached.deinit(alloc);
                 try @call(.auto, operation, .{cached.db} ++ args);
@@ -6148,19 +6168,11 @@ pub const ProvisionedTableWriteSource = struct {
             }
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.source.replica_root_dir, self.group_id);
             defer alloc.free(path);
-            var db = try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(
+            var db = try self.source.openGroupWriterWithMetadata(
                 alloc,
                 path,
-                self.source.catalog,
-                self.table_name,
                 self.group_id,
-                null,
-                null,
-                self.source.visibleRootGeneration(self.group_id),
-                null,
-                self.source.backend_runtime,
-                self.source.ha_write_gate,
-                self.source.ha_async_mirror,
+                metadata,
             );
             defer db.close();
             try @call(.auto, operation, .{&db} ++ args);
@@ -7648,6 +7660,37 @@ pub const ProvisionedTableWriteSource = struct {
         return try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
     }
 
+    /// Opens a managed writer from a table contract captured by the caller.
+    /// Transition callbacks use this path to avoid a lock inversion with the
+    /// metadata control loop that is synchronously waiting for them.
+    pub fn leaseCachedGroupWriterWithMetadata(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        metadata: StartupCatchUpMetadata,
+    ) !?ProvisionedTableWriteCache.CachedDb {
+        if (metadata.metadata_source != .supplied)
+            return error.InvalidTransitionMetadataSource;
+        if (metadata.identity_namespace == null)
+            return error.DocIdentityNamespaceUnavailable;
+        const cache = self.write_cache orelse return null;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        return try self.getOrOpenCachedDbModeAtGeneration(
+            alloc,
+            cache,
+            path,
+            group_id,
+            self.visibleRootGeneration(group_id),
+            table_name,
+            .default_async,
+            null,
+            null,
+            metadata,
+        );
+    }
+
     /// Opens a transition destination before it is published in the catalog.
     /// The caller supplies the identity namespace inherited from the source
     /// range; ordinary catalog-derived opens cannot discover it yet.
@@ -7667,22 +7710,90 @@ pub const ProvisionedTableWriteSource = struct {
             if (loaded_metadata.indexes_json) |value| cache.alloc.free(value);
             if (loaded_metadata.schema_json) |value| cache.alloc.free(value);
         }
-        return try self.getOrOpenCachedDbModeAtGeneration(
+        return try self.leaseCachedTransitionGroupWriterWithMetadata(
             alloc,
-            cache,
-            path,
             group_id,
-            self.visibleRootGeneration(group_id),
             table_name,
-            .default_async,
-            null,
-            null,
+            loaded_metadata.indexes_json,
+            loaded_metadata.schema_json,
+            identity_namespace,
+        );
+    }
+
+    /// Opens a transition destination from a caller-pinned table contract.
+    /// Metadata control loops may synchronously wait for this open, so their
+    /// shard callbacks must not re-enter the catalog over HTTP.
+    pub fn leaseCachedTransitionGroupWriterWithMetadata(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        indexes_json: ?[]const u8,
+        schema_json: ?[]const u8,
+        identity_namespace: doc_identity.Namespace,
+    ) !?ProvisionedTableWriteCache.CachedDb {
+        return try self.leaseCachedGroupWriterWithMetadata(
+            alloc,
+            group_id,
+            table_name,
             .{
-                .indexes_json = loaded_metadata.indexes_json,
-                .schema_json = loaded_metadata.schema_json,
+                .indexes_json = indexes_json,
+                .schema_json = schema_json,
                 .identity_namespace = identity_namespace,
             },
         );
+    }
+
+    fn openGroupWriterWithMetadata(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        path: []const u8,
+        group_id: u64,
+        metadata: StartupCatchUpMetadata,
+    ) !db_mod.DB {
+        const identity_namespace = metadata.identity_namespace orelse
+            return error.DocIdentityNamespaceUnavailable;
+        const lsm_root_generation = self.visibleRootGeneration(group_id);
+        const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default, self.ha_async_mirror);
+        var db = if (metadata.indexes_json) |indexes_json|
+            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+                alloc,
+                path,
+                indexes_json,
+                null,
+                null,
+                lsm_root_generation,
+                null,
+                .default,
+                self.backend_runtime,
+                self.antfly_provider,
+                self.secret_store,
+                self.remote_content,
+                identity_namespace,
+                .{
+                    .inference_api_url = self.inference_api_url,
+                    .ha_write_gate = self.ha_write_gate,
+                    .ha_async_effect_mirror = effective_ha_mirror,
+                    .ha_async_batch_mirror = effective_ha_mirror,
+                    .ha_async_metadata_mirror = effective_ha_mirror,
+                },
+            )
+        else
+            try db_mod.DB.open(alloc, path, .{
+                .lsm_root_generation = lsm_root_generation,
+                .backend_runtime = self.backend_runtime,
+                .secret_store = self.secret_store,
+                .remote_content = self.remote_content,
+                .identity_namespace = identity_namespace,
+                .prefer_existing_identity_namespace = true,
+                .ha_write_gate = self.ha_write_gate,
+                .ha_async_effect_mirror = effective_ha_mirror,
+                .ha_async_batch_mirror = effective_ha_mirror,
+                .ha_async_metadata_mirror = effective_ha_mirror,
+            });
+        errdefer db.close();
+        try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
+        return db;
     }
 
     /// Leases a destination generation from its durable local manifest. Raft

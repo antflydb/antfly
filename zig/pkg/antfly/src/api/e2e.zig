@@ -7127,6 +7127,13 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     defer std.testing.allocator.free(split_body);
     try metadata_client.requestTableSplit(metadata_api, "docs", split_body);
 
+    // Transition callbacks run while the metadata control round is waiting
+    // synchronously. Bypass the normal remote cache and reject any fetch to
+    // prove shard observation/open consumes the pinned snapshot instead of
+    // re-entering the metadata API and deadlocking behind that control round.
+    data_server.setRemoteMetadataFetchErrorForTest(error.NotLeader);
+    defer data_server.setRemoteMetadataFetchErrorForTest(null);
+
     var finalized = false;
     rounds = 0;
     // Advance the fixture's deterministic retry clock on every transition
@@ -7153,6 +7160,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
         }
     }
     try std.testing.expect(finalized);
+    data_server.setRemoteMetadataFetchErrorForTest(null);
 
     // MetadataServer owns this control loop in production. This fixture embeds
     // MetadataService directly, so apply the finalized observation through the
