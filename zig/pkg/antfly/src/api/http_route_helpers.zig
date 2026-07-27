@@ -186,7 +186,10 @@ test "lookup options decode generated SDK query values before splitting fields" 
 pub fn parseScanKeysRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedScanKeysRequest {
     if (body.len == 0) return .{};
 
-    var parsed = try metadata_openapi.server.parseScanKeysBody(alloc, body);
+    var parsed = metadata_openapi.server.parseScanKeysBody(alloc, body) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidQueryRequest,
+    };
     defer parsed.deinit();
 
     const fields: [][]const u8 = if (parsed.value.fields) |raw_fields|
@@ -222,6 +225,17 @@ pub fn parseScanKeysRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedSc
             .include_all_fields = false,
             .filter_query_json = filter_query_json,
         },
+    };
+}
+
+pub fn scanRequestErrorResponse(
+    alloc: std.mem.Allocator,
+    err: anyerror,
+) !?http_common.HttpResponse {
+    return switch (err) {
+        error.InvalidQueryRequest => try textResponse(alloc, 400, "invalid scan request"),
+        error.UnsupportedQueryRequest => try textResponse(alloc, 422, "unsupported scan filter query"),
+        else => null,
     };
 }
 
@@ -269,4 +283,19 @@ test "parse scan request rejects text-index-only filter clauses" {
             ,
         ),
     );
+}
+
+test "scan request errors map to stable client responses" {
+    const alloc = std.testing.allocator;
+    var invalid = (try scanRequestErrorResponse(alloc, error.InvalidQueryRequest)).?;
+    defer invalid.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid.status);
+    try std.testing.expectEqualStrings("invalid scan request", invalid.body);
+
+    var unsupported = (try scanRequestErrorResponse(alloc, error.UnsupportedQueryRequest)).?;
+    defer unsupported.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), unsupported.status);
+    try std.testing.expectEqualStrings("unsupported scan filter query", unsupported.body);
+
+    try std.testing.expect((try scanRequestErrorResponse(alloc, error.OutOfMemory)) == null);
 }

@@ -5942,7 +5942,12 @@ pub const ApiHttpServer = struct {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, scan.table_name);
                 defer self.alloc.free(table_name);
                 const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-                var scan_req = try http_route_helpers.parseScanKeysRequest(self.alloc, req.body);
+                var scan_req = http_route_helpers.parseScanKeysRequest(self.alloc, req.body) catch |err| {
+                    if (try http_route_helpers.scanRequestErrorResponse(self.alloc, err)) |response| {
+                        return response;
+                    }
+                    return err;
+                };
                 defer scan_req.deinit(self.alloc);
 
                 var result = (try source.scan(
@@ -21414,6 +21419,26 @@ test "api http server serves table scan as ndjson" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("doc:a", parsed.value._id);
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
+
+    var invalid_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/documents",
+        .content_type = "application/json",
+        .body = "{",
+    });
+    defer invalid_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+    try std.testing.expectEqualStrings("invalid scan request", invalid_resp.body);
+
+    var unsupported_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/documents",
+        .content_type = "application/json",
+        .body = "{\"filter_query\":{\"match_phrase\":\"paid receipt\",\"field\":\"body\"}}",
+    });
+    defer unsupported_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), unsupported_resp.status);
+    try std.testing.expectEqualStrings("unsupported scan filter query", unsupported_resp.body);
 }
 
 test "api http server serves table query response envelope" {

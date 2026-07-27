@@ -2068,7 +2068,13 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        var scan_req = try http_route_helpers.parseScanKeysRequest(alloc, body_data);
+        var scan_req = http_route_helpers.parseScanKeysRequest(alloc, body_data) catch |err| {
+            if (try http_route_helpers.scanRequestErrorResponse(alloc, err)) |response| {
+                var owned_response = response;
+                return respond(ctx, &owned_response);
+            }
+            return err;
+        };
         defer scan_req.deinit(alloc);
 
         var result = (try source.scan(

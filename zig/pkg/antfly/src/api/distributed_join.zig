@@ -311,8 +311,16 @@ fn combineFilterQueryValues(
     try conjuncts.append(row_filter_clone);
     row_filter_clone_owned = false;
 
+    var root = std.json.ObjectMap.empty;
+    errdefer {
+        var root_value: std.json.Value = .{ .object = root };
+        deinitJsonValue(alloc, &root_value);
+    }
+    const key = try alloc.dupe(u8, "conjuncts");
+    errdefer alloc.free(key);
+    try root.put(alloc, key, .{ .array = conjuncts });
     conjuncts_owned = false;
-    return .{ .array = conjuncts };
+    return .{ .object = root };
 }
 
 pub const JoinedQueryStats = struct {
@@ -5628,9 +5636,24 @@ test "distributed join applies auth row filter to right table filter query" {
     const json = try stringifyJsonValueAlloc(alloc, filter_query);
     defer alloc.free(json);
 
-    try std.testing.expect(filter_query == .array);
+    try std.testing.expect(filter_query == .object);
+    try std.testing.expect(filter_query.object.get("conjuncts") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tier\":\"premium\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tenant_id\":\"acme\"") != null);
+
+    const columns = [_]foreign_mod.Column{
+        .{ .name = @constCast("tier"), .data_type = @constCast("text"), .nullable = false },
+        .{ .name = @constCast("tenant_id"), .data_type = @constCast("text"), .nullable = false },
+    };
+    var translated = try foreign_mod.filter.translateAlloc(
+        alloc,
+        foreign_mod.postgresDialect(),
+        json,
+        &columns,
+    );
+    defer translated.deinit(alloc);
+    try std.testing.expectEqualStrings("(\"tier\" = $1) AND (\"tenant_id\" = $2)", translated.where_sql);
+    try std.testing.expectEqual(@as(usize, 2), translated.args.len);
 }
 
 test "distributed join preserves native public filters when adding join predicates" {
