@@ -608,10 +608,7 @@ pub fn mergeHealthyGroupStatuses(
         PlacementMemberEvidence,
     ).empty;
     defer placement_members.deinit(alloc);
-    var placement_counts = std.AutoHashMapUnmanaged(u64, u16).empty;
-    defer placement_counts.deinit(alloc);
     try placement_members.ensureTotalCapacity(alloc, @intCast(placement_intents.len));
-    try placement_counts.ensureTotalCapacity(alloc, @intCast(placement_intents.len));
     for (placement_intents) |intent| {
         const member = placement_members.getOrPutAssumeCapacity(.{
             .group_id = intent.record.group_id,
@@ -625,9 +622,6 @@ pub fn mergeHealthyGroupStatuses(
                 .relocation_generation = intent.relocation_generation,
             };
         }
-        const count = placement_counts.getOrPutAssumeCapacity(intent.record.group_id);
-        if (!count.found_existing) count.value_ptr.* = 0;
-        count.value_ptr.* +|= 1;
     }
 
     for (stores) |store| {
@@ -705,18 +699,11 @@ pub fn mergeHealthyGroupStatuses(
                     .empty = runtime_status.doc_count == 0 and runtime_status.disk_bytes == 0,
                     .created_at_millis = runtime_status.created_at_millis,
                     .updated_at_millis = updated_at_millis,
-                    .local_voter = true,
-                    .voter_count = placement_counts.get(runtime_status.group_id) orelse 0,
                 },
             };
             if (state.latest == null or moreCompleteGroupStatus(candidate.report, state.latest.?.report)) {
                 state.latest = candidate;
             }
-            if (state.last_voter_store_id != store.store_id) {
-                state.healthy_voter_reports +|= 1;
-                state.last_voter_store_id = store.store_id;
-            }
-            state.voter_set_evidence.observe(candidate.report);
             mergeRuntimeDocIdentity(state, runtime_status.doc_identity);
         }
     }
@@ -1547,6 +1534,57 @@ test "metadata state merges runtime document identity facts into group status" {
     try std.testing.expectEqual(@as(u64, 11), merged[0].doc_identity.allocated_ordinals);
     try std.testing.expect(!merged[0].doc_identity_namespace_conflict);
     try std.testing.expectEqualStrings(metadata_reconciler.doc_identity_lifecycle_ready, merged[0].doc_identity_lifecycle);
+    try std.testing.expect(!merged[0].voter_count_known);
+    try std.testing.expectEqual(@as(u16, 0), merged[0].healthy_voter_reports);
+}
+
+test "metadata state never promotes learner runtime telemetry to voter evidence" {
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 7022, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 11 },
+        .{ .record = .{ .group_id = 7022, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .fetch_snapshot }, .store_id = 12 },
+    };
+    const stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7022,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 1,
+            }})[0..]),
+        },
+        .{
+            .store_id = 12,
+            .node_id = 2,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]metadata_table_manager.GroupStatusReport{.{
+                .group_id = 7022,
+                .local_voter = false,
+                .voter_count = 1,
+            }})[0..]),
+            .runtime_statuses = @constCast((&[_]metadata_table_manager.RuntimeGroupStatusReport{.{
+                .table_id = 70,
+                .table_name = "docs",
+                .group_id = 7022,
+                .doc_count = 10,
+                .disk_bytes = 100,
+                .disk_bytes_known = true,
+            }})[0..]),
+        },
+    };
+
+    const merged = try mergeHealthyGroupStatuses(std.testing.allocator, &.{}, &.{}, &placements, &.{}, &stores, &.{}, &.{}, &.{}, &.{});
+    defer freeMergedGroupStatuses(std.testing.allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expectEqual(@as(u16, 1), merged[0].healthy_voter_reports);
+    try std.testing.expectEqual(@as(u64, 10), merged[0].doc_count);
 }
 
 test "metadata state marks doc identity rebuild required on range namespace mismatch" {

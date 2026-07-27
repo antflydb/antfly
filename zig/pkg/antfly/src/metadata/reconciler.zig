@@ -261,15 +261,21 @@ pub const Reconciler = struct {
                 .retain_current = if (current.reallocate_requested) false else candidate.retain_current,
             };
         }
-        try self.syncAutomaticShardIntents(manager, current, now_monotonic_ms, now_realtime_ms);
+        var evidence = try StoreEvidenceIndex.init(self.alloc, current);
+        defer evidence.deinit();
+        try self.syncAutomaticShardIntents(
+            manager,
+            current,
+            &evidence,
+            now_monotonic_ms,
+            now_realtime_ms,
+        );
         const desired_ranges = try manager.listRanges(self.alloc);
         defer manager.freeRanges(self.alloc, desired_ranges);
         const desired_splits = try manager.listDesiredSplitTransitions(self.alloc);
         defer manager.freeSplitTransitions(self.alloc, desired_splits);
         const desired_merges = try manager.listDesiredMergeTransitions(self.alloc);
         defer manager.freeMergeTransitions(self.alloc, desired_merges);
-        var evidence = try StoreEvidenceIndex.init(self.alloc, current);
-        defer evidence.deinit();
         const split_provisioning_ranges = try allocSplitProvisioningRanges(self.alloc, desired_ranges, desired_splits);
         defer self.alloc.free(split_provisioning_ranges);
         const protected_placement_groups = try allocUnconvergedPlacementGroups(
@@ -384,7 +390,7 @@ pub const Reconciler = struct {
         for (desired_splits) |desired| {
             const existing = findSplitRecord(current.split_transitions, desired.transition_id);
             if (existing == null) {
-                if (!splitTransitionDocIdentityCompatible(current, desired)) continue;
+                if (!splitTransitionDocIdentityCompatibleIndexed(current, &evidence, desired)) continue;
                 if (splitAdmissionExpectedEpoch(current, desired)) |expected_source_epoch| {
                     try split_admissions.append(self.alloc, .{
                         .expected_source_epoch = expected_source_epoch,
@@ -405,7 +411,7 @@ pub const Reconciler = struct {
             if (effective_record.rollback_reason == null and splitTransitionCanRollback(existing.?)) {
                 if (desired.rollback_reason) |reason| {
                     effective_record.rollback_reason = try self.alloc.dupe(u8, reason);
-                } else if (!splitTransitionDocIdentityCompatible(current, existing.?)) {
+                } else if (!splitTransitionDocIdentityCompatibleIndexed(current, &evidence, existing.?)) {
                     effective_record.rollback_reason = try self.alloc.dupe(u8, doc_identity_transition_rollback_reason);
                 }
             }
@@ -430,7 +436,7 @@ pub const Reconciler = struct {
         for (desired_merges) |desired| {
             const existing = findMergeRecord(current.merge_transitions, desired.transition_id);
             if (existing == null) {
-                if (!mergeTransitionDocIdentityCompatible(current, desired, .disallow_active)) continue;
+                if (!mergeTransitionDocIdentityCompatibleIndexed(current, &evidence, desired, .disallow_active)) continue;
                 try merge_upserts.append(self.alloc, try cloneMergeRecord(self.alloc, desired));
                 continue;
             }
@@ -442,7 +448,7 @@ pub const Reconciler = struct {
             if (effective_record.rollback_reason == null and mergeTransitionCanRollback(existing.?)) {
                 if (desired.rollback_reason) |reason| {
                     effective_record.rollback_reason = try self.alloc.dupe(u8, reason);
-                } else if (!mergeTransitionDocIdentityCompatible(current, existing.?, .allow_existing_active)) {
+                } else if (!mergeTransitionDocIdentityCompatibleIndexed(current, &evidence, existing.?, .allow_existing_active)) {
                     effective_record.rollback_reason = try self.alloc.dupe(u8, doc_identity_merge_rollback_reason);
                 }
             }
@@ -578,10 +584,16 @@ pub const Reconciler = struct {
         self: *Reconciler,
         manager: *table_manager.TableManager,
         current: CurrentMetadataState,
+        evidence: *const StoreEvidenceIndex,
         now_monotonic_ms: u64,
         now_realtime_ms: u64,
     ) !void {
-        var auto_transitions = try self.computeAutomaticShardTransitions(current, now_monotonic_ms, now_realtime_ms);
+        var auto_transitions = try self.computeAutomaticShardTransitions(
+            current,
+            evidence,
+            now_monotonic_ms,
+            now_realtime_ms,
+        );
         defer auto_transitions.deinit(self.alloc);
 
         var desired_split_ids = std.ArrayListUnmanaged(u64).empty;
@@ -606,6 +618,7 @@ pub const Reconciler = struct {
     fn computeAutomaticShardTransitions(
         self: *Reconciler,
         current: CurrentMetadataState,
+        evidence: *const StoreEvidenceIndex,
         now_monotonic_ms: u64,
         now_realtime_ms: u64,
     ) !AutomaticTransitions {
@@ -669,8 +682,8 @@ pub const Reconciler = struct {
                     if (!rangesAdjacent(left, right)) continue;
                     if (groupBusy(current, left.group_id) or groupBusy(current, right.group_id)) continue;
                     if (self.isShardInCooldown(left.group_id, now_monotonic_ms) or self.isShardInCooldown(right.group_id, now_monotonic_ms)) continue;
-                    const left_status = mergedGroupStatus(current, left.group_id) orelse continue;
-                    const right_status = mergedGroupStatus(current, right.group_id) orelse continue;
+                    const left_status = evidence.mergedStatus(current, left.group_id) orelse continue;
+                    const right_status = evidence.mergedStatus(current, right.group_id) orelse continue;
                     if (!groupHasFullHealthyPlacement(current, left.group_id, left_status) or !groupHasFullHealthyPlacement(current, right.group_id, right_status)) continue;
                     if (!groupStatusFresh(self.config, left_status, now_realtime_ms) or !groupStatusFresh(self.config, right_status, now_realtime_ms)) continue;
                     if (!groupStatusReadyForAutomaticPlanning(left_status) or !groupStatusReadyForAutomaticPlanning(right_status)) continue;
@@ -705,7 +718,7 @@ pub const Reconciler = struct {
                 if (planned_shards >= max_shards_per_table or table_budget == 0 or remaining_cluster_budget == 0) break;
                 if (groupBusy(current, range.group_id)) continue;
                 if (self.isShardInCooldown(range.group_id, now_monotonic_ms)) continue;
-                const status = mergedGroupStatus(current, range.group_id) orelse continue;
+                const status = evidence.mergedStatus(current, range.group_id) orelse continue;
                 if (!groupHasFullHealthyPlacement(current, range.group_id, status)) continue;
                 if (!groupStatusFresh(self.config, status, now_realtime_ms)) continue;
                 if (!groupStatusReadyForAutomaticPlanning(status)) continue;
@@ -1071,6 +1084,7 @@ const StoreEvidenceIndex = struct {
     stores_by_id: std.AutoHashMapUnmanaged(u64, ?*const table_manager.StoreRecord) = .empty,
     stores_by_node: std.AutoHashMapUnmanaged(u64, ?*const table_manager.StoreRecord) = .empty,
     reports_by_store_group: std.AutoHashMapUnmanaged(u128, StoreGroupEvidence) = .empty,
+    merged_status_by_group: std.AutoHashMapUnmanaged(u64, *const MergedGroupStatus) = .empty,
     placement_by_member: std.AutoHashMapUnmanaged(u128, ?*const raft_reconciler.PlacementIntent) = .empty,
     placement_count_by_group: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     relocation_source_by_group: std.AutoHashMapUnmanaged(u64, *const raft_reconciler.PlacementIntent) = .empty,
@@ -1079,6 +1093,15 @@ const StoreEvidenceIndex = struct {
     fn init(alloc: std.mem.Allocator, current: CurrentMetadataState) !StoreEvidenceIndex {
         var self = StoreEvidenceIndex{ .alloc = alloc };
         errdefer self.deinit();
+        try self.merged_status_by_group.ensureTotalCapacity(
+            alloc,
+            @intCast(current.merged_group_statuses.len),
+        );
+        for (current.merged_group_statuses) |*status| {
+            const entry = self.merged_status_by_group.getOrPutAssumeCapacity(status.group_id);
+            if (entry.found_existing) return error.DuplicateMergedGroupStatus;
+            entry.value_ptr.* = status;
+        }
         for (current.stores) |*store| {
             const by_id = try self.stores_by_id.getOrPut(alloc, store.store_id);
             by_id.value_ptr.* = if (by_id.found_existing) null else store;
@@ -1123,6 +1146,7 @@ const StoreEvidenceIndex = struct {
         self.stores_by_id.deinit(self.alloc);
         self.stores_by_node.deinit(self.alloc);
         self.reports_by_store_group.deinit(self.alloc);
+        self.merged_status_by_group.deinit(self.alloc);
         self.placement_by_member.deinit(self.alloc);
         self.placement_count_by_group.deinit(self.alloc);
         self.relocation_source_by_group.deinit(self.alloc);
@@ -1143,6 +1167,13 @@ const StoreEvidenceIndex = struct {
         const evidence = self.reports_by_store_group.get(placementStoreKey(group_id, store_id)) orelse return null;
         if (evidence.status_ambiguous) return null;
         return evidence.status;
+    }
+
+    fn mergedStatus(self: *const StoreEvidenceIndex, current: CurrentMetadataState, group_id: u64) ?MergedGroupStatus {
+        if (current.merged_group_statuses.len == 0) {
+            return mergedGroupStatus(current, group_id);
+        }
+        return (self.merged_status_by_group.get(group_id) orelse return null).*;
     }
 
     fn statusForIntent(self: *const StoreEvidenceIndex, intent: raft_reconciler.PlacementIntent) ?*const table_manager.GroupStatusReport {
@@ -1977,24 +2008,17 @@ fn mergeRuntimeGroupFacts(
             store,
         );
         if (placements.len > 0 and placement == null) continue;
-        var store_reports_group = false;
         var store_reports_voter = false;
-        var store_reports_runtime_facts = false;
         for (store.group_statuses) |status| {
             if (status.group_id != group_id) continue;
             if (placement) |intent| {
                 if (status.relocation_generation != intent.relocation_generation)
                     continue;
             }
-            store_reports_group = true;
             store_reports_voter = store_reports_voter or status.local_voter;
         }
         for (store.runtime_statuses) |status| {
             if (status.group_id != group_id) continue;
-            store_reports_runtime_facts = store_reports_runtime_facts or
-                status.doc_count > 0 or
-                status.disk_bytes_known or
-                runtimeDocIdentityHasFacts(status.doc_identity);
             if (status.doc_count > merged.doc_count) merged.doc_count = status.doc_count;
             if (status.disk_bytes_known and (!merged.disk_bytes_known or status.disk_bytes > merged.disk_bytes)) {
                 merged.disk_bytes = status.disk_bytes;
@@ -2005,9 +2029,7 @@ fn mergeRuntimeGroupFacts(
             if (updated_at_millis > merged.updated_at_millis) merged.updated_at_millis = updated_at_millis;
             mergeRuntimeDocIdentity(&merged, status.doc_identity);
         }
-        if (store_reports_voter or (!store_reports_group and store_reports_runtime_facts)) {
-            healthy_voter_reports +|= 1;
-        }
+        if (store_reports_voter) healthy_voter_reports +|= 1;
     }
     if (healthy_voter_reports > merged.healthy_voter_reports) merged.healthy_voter_reports = healthy_voter_reports;
     markDocIdentityRebuildRequiredOnNamespaceMismatch(&merged, ranges, group_id);
@@ -2086,6 +2108,18 @@ fn mergeTransitionDocIdentityCompatible(
     return docIdentityNamespacesCompatibleForAutomaticMerge(donor, receiver);
 }
 
+fn mergeTransitionDocIdentityCompatibleIndexed(
+    current: CurrentMetadataState,
+    evidence: *const StoreEvidenceIndex,
+    record: transition_state.MergeTransitionRecord,
+    activity_policy: ReassignmentActivityPolicy,
+) bool {
+    const donor = evidence.mergedStatus(current, record.donor_group_id) orelse return mergeTransitionMissingDocIdentityStatusCompatible(current, record);
+    const receiver = evidence.mergedStatus(current, record.receiver_group_id) orelse return mergeTransitionMissingDocIdentityStatusCompatible(current, record);
+    if (record.allow_doc_identity_reassignment) return docIdentityNamespacesCanReassign(donor, receiver, activity_policy);
+    return docIdentityNamespacesCompatibleForAutomaticMerge(donor, receiver);
+}
+
 fn mergeTransitionMissingDocIdentityStatusCompatible(
     current: CurrentMetadataState,
     record: transition_state.MergeTransitionRecord,
@@ -2096,6 +2130,15 @@ fn mergeTransitionMissingDocIdentityStatusCompatible(
 
 fn splitTransitionDocIdentityCompatible(current: CurrentMetadataState, record: transition_state.SplitTransitionRecord) bool {
     const source = mergedGroupStatus(current, record.source_group_id) orelse return !currentHasDocIdentityTelemetry(current);
+    return docIdentityNamespaceReadyForAutomaticSplit(source);
+}
+
+fn splitTransitionDocIdentityCompatibleIndexed(
+    current: CurrentMetadataState,
+    evidence: *const StoreEvidenceIndex,
+    record: transition_state.SplitTransitionRecord,
+) bool {
+    const source = evidence.mergedStatus(current, record.source_group_id) orelse return !currentHasDocIdentityTelemetry(current);
     return docIdentityNamespaceReadyForAutomaticSplit(source);
 }
 
@@ -2382,21 +2425,26 @@ fn groupHasFullHealthyPlacement(current: CurrentMetadataState, group_id: u64, st
         return status.healthy_voter_reports >= status.voter_count;
     }
     if (expected == 0) return true;
-    return countHealthyStoresReportingGroup(current.stores, group_id) >= expected;
+    return status.healthy_voter_reports >= expected;
 }
 
-fn countHealthyStoresReportingGroup(stores: []const table_manager.StoreRecord, group_id: u64) usize {
-    var count: usize = 0;
-    for (stores) |store| {
-        if (!store.live) continue;
-        if (!std.mem.eql(u8, store.health_class, "healthy")) continue;
-        for (store.group_statuses) |group_status| {
-            if (group_status.group_id != group_id) continue;
-            count += 1;
-            break;
-        }
-    }
-    return count;
+test "metadata reconciler never counts non-voter group reports as placement readiness" {
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 7001, .replica_id = 1, .local_node_id = 1 } },
+        .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 2 } },
+    };
+    const current = CurrentMetadataState{ .placement_intents = &placements };
+
+    try std.testing.expect(!groupHasFullHealthyPlacement(
+        current,
+        7001,
+        .{ .group_id = 7001, .healthy_voter_reports = 1 },
+    ));
+    try std.testing.expect(groupHasFullHealthyPlacement(
+        current,
+        7001,
+        .{ .group_id = 7001, .healthy_voter_reports = 2 },
+    ));
 }
 
 fn monotonicMillis() u64 {
