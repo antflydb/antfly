@@ -2875,7 +2875,25 @@ fn replaceLocalBackupAttemptReclaimTicketTimestamp(
 ) !void {
     var body_buf: [32]u8 = undefined;
     const body = try std.fmt.bufPrint(&body_buf, "{d}\n", .{timestamp_unix_ns});
-    try replaceFileAbsoluteUnderHeldLock(alloc, io, path, body);
+    const shard_dir = std.fs.path.dirname(path) orelse
+        return error.InvalidBackupRequest;
+    const state_dir = std.fs.path.dirname(shard_dir) orelse
+        return error.InvalidBackupRequest;
+    const reclaim_root = std.fs.path.dirname(state_dir) orelse
+        return error.InvalidBackupRequest;
+    const staging_dir = try std.fmt.allocPrint(alloc, "{s}/.staging/{s}/{s}", .{
+        reclaim_root,
+        std.fs.path.basename(state_dir),
+        std.fs.path.basename(shard_dir),
+    });
+    defer alloc.free(staging_dir);
+    try replaceFileAbsoluteFromStagingDirUnderHeldLock(
+        alloc,
+        io,
+        path,
+        staging_dir,
+        body,
+    );
 }
 
 fn renameLocalBackupAttemptReclaimTicket(
@@ -7645,6 +7663,60 @@ fn replaceFileAbsoluteUnderHeldLock(
     try syncPathAncestorsWithIo(io, std.fs.path.dirname(path) orelse ".");
 }
 
+/// Atomically replace an enumerated control record while keeping its temporary
+/// file outside the directory readers treat as committed namespace. The
+/// staging directory must share a filesystem with `path`.
+fn replaceFileAbsoluteFromStagingDirUnderHeldLock(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    staging_dir: []const u8,
+    data: []const u8,
+) !void {
+    const destination_dir = std.fs.path.dirname(path) orelse
+        return error.InvalidBackupRequest;
+    if (std.fs.path.isAbsolute(path) != std.fs.path.isAbsolute(staging_dir))
+        return error.InvalidBackupRequest;
+    try ensureDirPathWithIo(io, destination_dir);
+    try ensureDirPathWithIo(io, staging_dir);
+
+    // The caller holds the destination's publication lock, so one stable
+    // staging name is sufficient. A crash can leave at most one bounded
+    // orphan per control record, and the next replacement truncates it.
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}/{s}.replace.tmp", .{
+        staging_dir,
+        std.fs.path.basename(path),
+    });
+    defer alloc.free(tmp_path);
+    errdefer if (std.fs.path.isAbsolute(tmp_path))
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    var file = if (std.fs.path.isAbsolute(tmp_path))
+        try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true })
+    else
+        try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+    var file_open = true;
+    defer if (file_open) file.close(io);
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll(data);
+    try writer.end();
+    try file.sync(io);
+    file.close(io);
+    file_open = false;
+
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    // A cross-directory rename changes both directory entries. Sync both so a
+    // successful return durably publishes the destination and retires staging.
+    try fs_paths.syncDirPortable(io, staging_dir);
+    try syncPathAncestorsWithIo(io, destination_dir);
+}
+
 /// Replace a small mutable control record with an fsync + atomic rename. The
 /// sibling lock serializes writers that share a filesystem.
 fn writeFileAbsoluteAtomicallyWithIo(
@@ -10168,19 +10240,11 @@ test "filesystem attempt publication tolerates concurrent bounded maintenance" {
     defer alloc.free(root);
     try ensureDirPathWithIo(io, root);
 
-    var location: BackupLocation = .{ .file = root };
     const tables = [_]ClusterBackupAttemptTable{.{
         .name = "docs",
         .table_backup_id = "race-table",
         .artifact_backup_id = "race-artifact",
     }};
-    const marker: ClusterBackupAttemptMarker = .{
-        .attempt_id = "race-attempt",
-        .cluster_backup_id = "race-cluster",
-        .created_at_unix_ns = 1,
-        .format = .portable,
-        .tables = &tables,
-    };
 
     const Race = struct {
         start: std.atomic.Value(bool) = .init(false),
@@ -10220,30 +10284,55 @@ test "filesystem attempt publication tolerates concurrent bounded maintenance" {
         }
     };
 
-    var race: Race = .{
-        .io = io,
-        .location = &location,
-        .marker = &marker,
-    };
-    const publisher = try std.Thread.spawn(.{}, Race.publish, .{&race});
-    const maintenance = try std.Thread.spawn(.{}, Race.maintain, .{&race});
-    race.start.store(true, .release);
-    publisher.join();
-    maintenance.join();
+    // Each iteration uses a fresh repository so the maintenance cursor always
+    // examines the shard being published. This reliably exercises the window
+    // between staging the reclaim ticket and atomically publishing its name.
+    for (0..32) |iteration| {
+        const iteration_root = try std.fmt.allocPrint(
+            alloc,
+            "{s}/iteration-{d}",
+            .{ root, iteration },
+        );
+        defer alloc.free(iteration_root);
+        try ensureDirPathWithIo(io, iteration_root);
+        var location: BackupLocation = .{ .file = iteration_root };
+        const attempt_id = try std.fmt.allocPrint(alloc, "race-attempt-{d}", .{iteration});
+        defer alloc.free(attempt_id);
+        const cluster_backup_id = try std.fmt.allocPrint(alloc, "race-cluster-{d}", .{iteration});
+        defer alloc.free(cluster_backup_id);
+        const marker: ClusterBackupAttemptMarker = .{
+            .attempt_id = attempt_id,
+            .cluster_backup_id = cluster_backup_id,
+            .created_at_unix_ns = 1,
+            .format = .portable,
+            .tables = &tables,
+        };
 
-    if (race.publish_err) |err| return err;
-    if (race.maintenance_err) |err| return err;
-    var parsed = try readClusterBackupAttemptMarker(
-        alloc,
-        io,
-        &location,
-        marker.attempt_id,
-    );
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings(
-        marker.cluster_backup_id,
-        parsed.value.cluster_backup_id,
-    );
+        var race: Race = .{
+            .io = io,
+            .location = &location,
+            .marker = &marker,
+        };
+        const publisher = try std.Thread.spawn(.{}, Race.publish, .{&race});
+        const maintenance = try std.Thread.spawn(.{}, Race.maintain, .{&race});
+        race.start.store(true, .release);
+        publisher.join();
+        maintenance.join();
+
+        if (race.publish_err) |err| return err;
+        if (race.maintenance_err) |err| return err;
+        var parsed = try readClusterBackupAttemptMarker(
+            alloc,
+            io,
+            &location,
+            marker.attempt_id,
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(
+            marker.cluster_backup_id,
+            parsed.value.cluster_backup_id,
+        );
+    }
 }
 
 test "filesystem stale attempt reclamation recovers an abandoned claim" {
