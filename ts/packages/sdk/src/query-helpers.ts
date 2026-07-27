@@ -11,6 +11,7 @@ type Query = components["schemas"]["Query"];
 type ConjunctionQuery = components["schemas"]["ConjunctionQuery"];
 type DisjunctionQuery = components["schemas"]["DisjunctionQuery"];
 type MatchQuery = components["schemas"]["MatchQuery"];
+type MatchOptions = Pick<MatchQuery, "analyzer" | "boost">;
 
 /**
  * Create a QueryString query - uses Bleve's query string syntax
@@ -51,10 +52,7 @@ export function term(term: string, field?: string, boost?: number): Query {
 export function match(
   match: string,
   field?: string,
-  options?: {
-    analyzer?: string;
-    boost?: number;
-  }
+  options?: MatchOptions
 ): MatchQuery {
   return {
     match,

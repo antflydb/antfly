@@ -13,3 +13,6 @@ match("distributed systems", "title", { fuzziness: "auto" });
 
 // @ts-expect-error MatchQuery does not accept boolean operators.
 match("distributed systems", "title", { operator: "and" });
+
+// @ts-expect-error MatchQuery does not accept fuzzy prefix lengths.
+match("distributed systems", "title", { prefix_length: 2 });

@@ -206,7 +206,7 @@ fn parseStatefulDirectTextMultiMatchQueryAlloc(
     const fields_value = multi_match.object.get("fields") orelse return error.UnsupportedQueryRequest;
     if (fields_value != .array or fields_value.array.items.len == 0) return error.UnsupportedQueryRequest;
     const query_boost: f32 = if (multi_match.object.get("boost")) |boost_value|
-        @floatCast(try directNumber(boost_value))
+        try narrowDirectBoost(try directNumber(boost_value))
     else
         boost;
 
@@ -529,6 +529,14 @@ fn directNumber(value: std.json.Value) !f64 {
         .float => |item| item,
         else => error.UnsupportedQueryRequest,
     };
+}
+
+fn narrowDirectBoost(value: f64) !f32 {
+    const max_f32: f64 = std.math.floatMax(f32);
+    if (!std.math.isFinite(value) or value > max_f32 or value < -max_f32) {
+        return error.InvalidQueryRequest;
+    }
+    return @floatCast(value);
 }
 
 fn directStringAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {

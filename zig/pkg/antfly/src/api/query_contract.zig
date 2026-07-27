@@ -5156,6 +5156,14 @@ fn parseCanonicalBoolBoost(value: ?std.json.Value) !f32 {
             return error.InvalidQueryRequest,
         else => return error.InvalidQueryRequest,
     };
+    return try narrowPublicBoost(number);
+}
+
+fn parseGeneratedBoost(value: ?f64) !f32 {
+    return try narrowPublicBoost(value orelse 1.0);
+}
+
+fn narrowPublicBoost(number: f64) !f32 {
     const max_f32: f64 = std.math.floatMax(f32);
     if (!std.math.isFinite(number) or
         number > max_f32 or number < -max_f32)
@@ -5753,19 +5761,37 @@ fn parseSupportedTextQueryValue(
     return try parseGeneratedBleveTextQuery(alloc, query);
 }
 
+fn boostedMatchAllTextQueryAlloc(
+    alloc: std.mem.Allocator,
+    boost: f32,
+) !db_mod.types.TextQuery {
+    if (boost == 1.0) return .{ .match_all = {} };
+    const must = try alloc.alloc(db_mod.types.TextQuery, 1);
+    must[0] = .{ .match_all = {} };
+    return .{ .bool_query = .{
+        .must = must,
+        .boost = boost,
+    } };
+}
+
 fn parseDirectDslTextQuery(alloc: std.mem.Allocator, query: std.json.Value) anyerror!?db_mod.types.TextQuery {
     if (query != .object) return null;
 
     if (query.object.get("match_all") != null) {
-        return .{ .match_all = {} };
+        return try boostedMatchAllTextQueryAlloc(
+            alloc,
+            try parseCanonicalBoolBoost(query.object.get("boost")),
+        );
     }
 
     if (query.object.get("conjuncts")) |conjuncts| {
+        const boost = try parseCanonicalBoolBoost(query.object.get("boost"));
         if (conjuncts == .array and conjuncts.array.items.len == 0) {
-            return .{ .match_all = {} };
+            return try boostedMatchAllTextQueryAlloc(alloc, boost);
         }
         return .{ .bool_query = .{
             .must = try parseDirectDslTextQueryArrayAlloc(alloc, conjuncts),
+            .boost = boost,
         } };
     }
 
@@ -5784,6 +5810,7 @@ fn parseDirectDslTextQuery(alloc: std.mem.Allocator, query: std.json.Value) anye
             .should = should,
             .min_should = min_should,
             .pure_should_optional = raw_min != null and min_should == 0,
+            .boost = try parseCanonicalBoolBoost(query.object.get("boost")),
         } };
     }
 
@@ -6254,6 +6281,7 @@ fn appendPatternFilterQueryValue(
 fn parseGeneratedBleveBooleanQuery(
     alloc: std.mem.Allocator,
     boolean_query: *const query_openapi.BooleanQuery,
+    boost: f32,
 ) anyerror!db_mod.types.TextBoolQuery {
     var must = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
     errdefer deinitTextQueryArrayList(alloc, &must);
@@ -6300,7 +6328,7 @@ fn parseGeneratedBleveBooleanQuery(
         .must_not = must_not,
         .min_should = min_should,
         .pure_should_optional = pure_should_optional,
-        .boost = if (boolean_query.boost) |boost| @floatCast(boost) else 1.0,
+        .boost = boost,
     };
 }
 
@@ -6351,6 +6379,31 @@ fn parseGeneratedBleveQuerySlice(
     return out;
 }
 
+fn parseGeneratedBleveQueryBoost(query: query_openapi.Query) !f32 {
+    return switch (query) {
+        .match_all_query => |value| parseGeneratedBoost(value.boost),
+        .match_none_query => |value| parseGeneratedBoost(value.boost),
+        .query_string_query => |value| parseGeneratedBoost(value.boost),
+        .term_query => |value| parseGeneratedBoost(value.boost),
+        .match_query => |value| parseGeneratedBoost(value.boost),
+        .multi_match_query => |value| parseGeneratedBoost(value.multi_match.boost),
+        .match_phrase_query => |value| parseGeneratedBoost(value.boost),
+        .fuzzy_query => |value| parseGeneratedBoost(value.boost),
+        .prefix_query => |value| parseGeneratedBoost(value.boost),
+        .wildcard_query => |value| parseGeneratedBoost(value.boost),
+        .regexp_query => |value| parseGeneratedBoost(value.boost),
+        .numeric_range_query => |value| parseGeneratedBoost(value.boost),
+        .term_range_query => |value| parseGeneratedBoost(value.boost),
+        .date_range_string_query => |value| parseGeneratedBoost(value.boost),
+        .doc_id_query => |value| parseGeneratedBoost(value.boost),
+        .bool_field_query => |value| parseGeneratedBoost(value.boost),
+        .boolean_query => |value| parseGeneratedBoost(value.boost),
+        .conjunction_query => |value| parseGeneratedBoost(value.boost),
+        .disjunction_query => |value| parseGeneratedBoost(value.boost),
+        else => 1.0,
+    };
+}
+
 fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.Query) anyerror!db_mod.types.TextQuery {
     const query_string_has_default_operator = comptime blk: {
         const QueryStringType = @TypeOf((@as(query_openapi.Query, undefined)).query_string_query);
@@ -6359,14 +6412,15 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             else => @hasField(QueryStringType, "default_operator"),
         };
     };
+    const query_boost = try parseGeneratedBleveQueryBoost(query);
 
     return switch (query) {
-        .match_all_query => .{ .match_all = {} },
+        .match_all_query => try boostedMatchAllTextQueryAlloc(alloc, query_boost),
         .match_none_query => .{ .match_none = {} },
         .query_string_query => |query_string| try parseQueryStringTextQuery(
             alloc,
             query_string.query,
-            if (query_string.boost) |boost| @floatCast(boost) else 1.0,
+            query_boost,
             if (query_string_has_default_operator)
                 try normalizeQueryStringDefaultOperator(query_string.default_operator)
             else
@@ -6375,20 +6429,20 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
         .term_query => |term| .{ .term = .{
             .field = try alloc.dupe(u8, term.field orelse return error.UnsupportedQueryRequest),
             .term = try alloc.dupe(u8, term.term),
-            .boost = if (term.boost) |boost| @floatCast(boost) else 1.0,
+            .boost = query_boost,
         } },
         .match_query => |match| .{ .match = .{
             .field = try alloc.dupe(u8, match.field orelse return error.UnsupportedQueryRequest),
             .text = try alloc.dupe(u8, match.match),
             .analyzer = if (match.analyzer) |analyzer| try alloc.dupe(u8, analyzer) else null,
-            .boost = if (match.boost) |boost| @floatCast(boost) else 1.0,
+            .boost = query_boost,
         } },
         .multi_match_query => |multi_match| try public_text_query_mod.parseMultiMatchBoolPrefixQueryAlloc(
             alloc,
             multi_match.multi_match.query,
             multi_match.multi_match.type,
             multi_match.multi_match.fields,
-            if (multi_match.multi_match.boost) |boost| @floatCast(boost) else 1.0,
+            query_boost,
         ),
         .match_phrase_query => |phrase| blk: {
             const fuzziness = try parseBleveFuzziness(phrase.fuzziness, 0);
@@ -6398,7 +6452,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
                 .analyzer = if (phrase.analyzer) |analyzer| try alloc.dupe(u8, analyzer) else null,
                 .max_edits = fuzziness.max_edits,
                 .auto_fuzzy = fuzziness.auto_fuzzy,
-                .boost = if (phrase.boost) |boost| @floatCast(boost) else 1.0,
+                .boost = query_boost,
             } };
         },
         .fuzzy_query => |fuzzy| blk: {
@@ -6410,23 +6464,23 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
                 .max_edits = fuzziness.max_edits,
                 .prefix_len = prefix_len,
                 .auto_fuzzy = fuzziness.auto_fuzzy,
-                .boost = if (fuzzy.boost) |boost| @floatCast(boost) else 1.0,
+                .boost = query_boost,
             } };
         },
         .prefix_query => |prefix| .{ .prefix = .{
             .field = try alloc.dupe(u8, prefix.field orelse return error.UnsupportedQueryRequest),
             .prefix = try alloc.dupe(u8, prefix.prefix),
-            .boost = if (prefix.boost) |boost| @floatCast(boost) else 1.0,
+            .boost = query_boost,
         } },
         .wildcard_query => |wildcard| .{ .wildcard = .{
             .field = try alloc.dupe(u8, wildcard.field orelse return error.UnsupportedQueryRequest),
             .pattern = try alloc.dupe(u8, wildcard.wildcard),
-            .boost = if (wildcard.boost) |boost| @floatCast(boost) else 1.0,
+            .boost = query_boost,
         } },
         .regexp_query => |regexp| .{ .regexp = .{
             .field = try alloc.dupe(u8, regexp.field orelse return error.UnsupportedQueryRequest),
             .pattern = try alloc.dupe(u8, regexp.regexp),
-            .boost = if (regexp.boost) |boost| @floatCast(boost) else 1.0,
+            .boost = query_boost,
         } },
         .numeric_range_query => |range_query| .{ .numeric_range = .{
             .field = try alloc.dupe(u8, range_query.field orelse return error.UnsupportedQueryRequest),
@@ -6434,7 +6488,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             .max = range_query.max,
             .inclusive_min = range_query.inclusive_min orelse true,
             .inclusive_max = range_query.inclusive_max orelse false,
-            .boost = if (range_query.boost) |boost| @floatCast(boost) else 1.0,
+            .boost = query_boost,
         } },
         .term_range_query => |range_query| .{ .term_range = .{
             .field = try alloc.dupe(u8, range_query.field orelse return error.UnsupportedQueryRequest),
@@ -6442,7 +6496,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             .max = if (range_query.max) |max| try alloc.dupe(u8, max) else null,
             .inclusive_min = range_query.inclusive_min orelse true,
             .inclusive_max = range_query.inclusive_max orelse false,
-            .boost = if (range_query.boost) |boost| @floatCast(boost) else 1.0,
+            .boost = query_boost,
         } },
         .date_range_string_query => |range_query| blk: {
             if (range_query.datetime_parser != null) return error.UnsupportedQueryRequest;
@@ -6460,25 +6514,25 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
                     null,
                 .inclusive_start = range_query.inclusive_start orelse true,
                 .inclusive_end = range_query.inclusive_end orelse false,
-                .boost = if (range_query.boost) |boost| @floatCast(boost) else 1.0,
+                .boost = query_boost,
             } };
         },
         .doc_id_query => |doc_id| .{ .doc_id = .{
             .ids = try cloneFields(alloc, doc_id.ids),
-            .boost = if (doc_id.boost) |boost| @floatCast(boost) else 1.0,
+            .boost = query_boost,
         } },
         .bool_field_query => |bool_field| .{ .bool_field = .{
             .field = try alloc.dupe(u8, bool_field.field orelse return error.UnsupportedQueryRequest),
             .value = bool_field.bool,
-            .boost = if (bool_field.boost) |boost| @floatCast(boost) else 1.0,
+            .boost = query_boost,
         } },
         .boolean_query => |boolean_query| .{
-            .bool_query = try parseGeneratedBleveBooleanQuery(alloc, boolean_query),
+            .bool_query = try parseGeneratedBleveBooleanQuery(alloc, boolean_query, query_boost),
         },
         .conjunction_query => |conjunction| .{
             .bool_query = .{
                 .must = try parseGeneratedBleveQuerySlice(alloc, conjunction.conjuncts),
-                .boost = if (conjunction.boost) |boost| @floatCast(boost) else 1.0,
+                .boost = query_boost,
             },
         },
         .disjunction_query => |disjunction| blk: {
@@ -6492,7 +6546,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
                 .pure_should_optional = disjunction.min != null and
                     min_should == 0 and
                     disjunction.disjuncts.len > 0,
-                .boost = if (disjunction.boost) |boost| @floatCast(boost) else 1.0,
+                .boost = query_boost,
             } };
         },
         else => error.UnsupportedQueryRequest,
@@ -8441,7 +8495,7 @@ test "api query contract includes stored source when fields are omitted" {
 test "api query contract accepts multi_match bool_prefix full text" {
     const alloc = std.testing.allocator;
     const body =
-        \\{"full_text_search":{"multi_match":{"query":"quick brown f","type":"bool_prefix","fields":["title"]}}}
+        \\{"full_text_search":{"multi_match":{"query":"quick brown f","type":"bool_prefix","fields":["title"],"boost":2}}}
     ;
 
     var parsed = try parseQueryRequest(alloc, null, "docs", body);
@@ -8451,6 +8505,18 @@ test "api query contract accepts multi_match bool_prefix full text" {
     try std.testing.expectEqualStrings("quick brown f", parsed.req.full_text.?.multi_match_bool_prefix.query);
     try std.testing.expectEqual(@as(usize, 1), parsed.req.full_text.?.multi_match_bool_prefix.fields.len);
     try std.testing.expectEqualStrings("title", parsed.req.full_text.?.multi_match_bool_prefix.fields[0].field);
+    try std.testing.expectEqual(@as(f32, 2.0), parsed.req.full_text.?.multi_match_bool_prefix.boost);
+
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseQueryRequest(
+            alloc,
+            null,
+            "docs",
+            \\{"full_text_search":{"multi_match":{"query":"quick brown f","type":"bool_prefix","fields":["title"],"boost":1e100}}}
+            ,
+        ),
+    );
 }
 
 test "api query contract projects stored source when explicit fields are supplied" {
@@ -8969,6 +9035,7 @@ test "api query contract distinguishes explicit zero from implicit pure should m
     inline for ([_]struct {
         body: []const u8,
         optional: bool,
+        boost: f32 = 1.0,
     }{
         .{
             .body =
@@ -8984,9 +9051,10 @@ test "api query contract distinguishes explicit zero from implicit pure should m
         },
         .{
             .body =
-            \\{"full_text_search":{"disjuncts":[{"match":"computer","field":"body"}],"min":0}}
+            \\{"full_text_search":{"disjuncts":[{"match":"computer","field":"body"}],"min":0,"boost":2}}
             ,
             .optional = true,
+            .boost = 2.0,
         },
     }) |case| {
         var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
@@ -8996,9 +9064,42 @@ test "api query contract distinguishes explicit zero from implicit pure should m
         try std.testing.expect(full_text == .bool_query);
         try std.testing.expectEqual(@as(u32, 0), full_text.bool_query.min_should);
         try std.testing.expectEqual(case.optional, full_text.bool_query.pure_should_optional);
+        try std.testing.expectEqual(case.boost, full_text.bool_query.boost);
         try std.testing.expectEqual(@as(usize, 0), full_text.bool_query.must.len);
         try std.testing.expectEqual(@as(usize, 1), full_text.bool_query.should.len);
     }
+
+    var conjunction = try parsePublicQueryRequest(
+        alloc,
+        null,
+        "files",
+        \\{"full_text_search":{"conjuncts":[{"match":"computer","field":"body"}],"boost":3}}
+        ,
+    );
+    defer conjunction.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(f32, 3.0),
+        conjunction.req.full_text.?.bool_query.boost,
+    );
+
+    var match_all = try parsePublicQueryRequest(
+        alloc,
+        null,
+        "files",
+        \\{"full_text_search":{"match_all":{},"boost":4}}
+        ,
+    );
+    defer match_all.deinit(alloc);
+    try std.testing.expect(match_all.req.full_text.? == .bool_query);
+    try std.testing.expectEqual(
+        @as(f32, 4.0),
+        match_all.req.full_text.?.bool_query.boost,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        match_all.req.full_text.?.bool_query.must.len,
+    );
+    try std.testing.expect(match_all.req.full_text.?.bool_query.must[0] == .match_all);
 
     var optional_filter = try std.json.parseFromSlice(
         std.json.Value,
