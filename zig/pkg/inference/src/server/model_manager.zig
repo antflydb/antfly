@@ -86,6 +86,205 @@ fn manifestHasNativeAssets(man: manifest_mod.ModelManifest) bool {
     return man.gguf_path != null or man.safetensors_path != null or man.safetensors_index_path != null;
 }
 
+const ArtifactCandidateKind = enum {
+    gguf,
+    safetensors,
+    onnx,
+    component_bundle,
+};
+
+fn artifactCandidateForBackend(
+    man: manifest_mod.ModelManifest,
+    backend: backends.BackendType,
+) ?ArtifactCandidateKind {
+    if (backend == .pjrt) return null;
+    if (backend == .onnx) return if (man.onnx_path != null) .onnx else null;
+    if (manifestHasNativeAssets(man)) {
+        return if (man.gguf_path != null) .gguf else .safetensors;
+    }
+    if (man.onnx_path != null) return .onnx;
+    if (man.visual_model_path != null or
+        man.audio_model_path != null or
+        man.text_projection_path != null or
+        man.visual_projection_path != null or
+        man.audio_projection_path != null)
+    {
+        return .component_bundle;
+    }
+    return null;
+}
+
+pub const CompatibilitySummary = struct {
+    level: model_compatibility.Level,
+    code: model_compatibility.Code,
+    message: []const u8,
+};
+
+fn summaryFromAssessment(assessment: model_compatibility.Assessment) CompatibilitySummary {
+    return .{
+        .level = assessment.level,
+        .code = assessment.code,
+        .message = assessment.message,
+    };
+}
+
+/// Assess exactly the artifact route that `backend` would load. Optional
+/// artifacts for other backends must not poison this result.
+pub fn compatibilitySummaryForBackend(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    man: *const manifest_mod.ModelManifest,
+    backend: backends.BackendType,
+) !?CompatibilitySummary {
+    const candidate = artifactCandidateForBackend(man.*, backend) orelse return null;
+
+    // GGUF metadata is authoritative only when this route will consume GGUF.
+    // ONNX/safetensors routes use the manifest architecture rather than
+    // accidentally inheriting an unrelated optional GGUF's classification.
+    var candidate_manifest = man.*;
+    if (candidate != .gguf) candidate_manifest.gguf_path = null;
+    var inspection = try model_compatibility.inspectAlloc(allocator, &candidate_manifest);
+    defer inspection.deinit(allocator);
+    const assessment = model_compatibility.assessInspection(&candidate_manifest, inspection);
+    if (assessment.level == .incompatible) return summaryFromAssessment(assessment);
+
+    if (candidate == .gguf) {
+        var maybe_report = session_factory.inspectGgufModelForListing(
+            allocator,
+            model_dir,
+            candidate_manifest,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return .{
+                .level = .unknown,
+                .code = .artifact_unreadable,
+                .message = "GGUF tensor metadata could not be inspected",
+            };
+        };
+        if (maybe_report) |*report| {
+            defer report.deinit();
+            if (report.missing_required_tensors.len > 0) {
+                return .{
+                    .level = .incompatible,
+                    .code = .missing_required_tensor,
+                    .message = "GGUF is missing required normalized tensors",
+                };
+            }
+            if (!session_factory.ggufInspectionSupportsBackend(report.*, backend)) {
+                return .{
+                    .level = .incompatible,
+                    .code = .unsupported_tensor_type,
+                    .message = "the selected backend cannot materialize this GGUF tensor contract",
+                };
+            }
+        }
+    } else if (candidate == .onnx and
+        (backend != .onnx or !build_options.enable_onnx))
+    {
+        backends.imported_onnx_session.inspectGraphCompatibility(
+            allocator,
+            man.onnx_path.?,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return .{
+                .level = .incompatible,
+                .code = .invalid_graph,
+                .message = "ONNX graph cannot be converted and validated by the selected backend",
+            };
+        };
+    }
+    return summaryFromAssessment(assessment);
+}
+
+/// Aggregate candidate compatibility as an OR: a model bundle is usable when
+/// any configured backend has a compatible artifact. Unknown is returned only
+/// when no compatible route exists, and incompatible only when every candidate
+/// is known to be unusable.
+pub fn compatibilitySummaryForBackends(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    man: *const manifest_mod.ModelManifest,
+    preferred_backends: []const backends.BackendType,
+) !CompatibilitySummary {
+    var best: ?CompatibilitySummary = null;
+    for (preferred_backends) |backend| {
+        const summary = try compatibilitySummaryForBackend(
+            allocator,
+            model_dir,
+            man,
+            backend,
+        ) orelse continue;
+        best = selectBetterCompatibility(best, summary);
+        if (best.?.level == .compatible) return best.?;
+    }
+    return best orelse .{
+        .level = .incompatible,
+        .code = .unsupported_backend,
+        .message = "no configured backend accepts an artifact in this model bundle",
+    };
+}
+
+fn selectBetterCompatibility(
+    current: ?CompatibilitySummary,
+    candidate: CompatibilitySummary,
+) CompatibilitySummary {
+    const existing = current orelse return candidate;
+    const candidate_rank: u2 = switch (candidate.level) {
+        .incompatible => 0,
+        .unknown => 1,
+        .compatible => 2,
+    };
+    const existing_rank: u2 = switch (existing.level) {
+        .incompatible => 0,
+        .unknown => 1,
+        .compatible => 2,
+    };
+    return if (candidate_rank > existing_rank) candidate else existing;
+}
+
+fn policyAllowedBackends(
+    allocator: std.mem.Allocator,
+    scratch: *[7]backends.BackendType,
+    model_dir: []const u8,
+    man: *const manifest_mod.ModelManifest,
+    preferred_backends: []const backends.BackendType,
+    policy: model_compatibility.Policy,
+) ![]const backends.BackendType {
+    var count: usize = 0;
+    var first_policy_err: ?anyerror = null;
+    for (preferred_backends) |backend| {
+        if (!backend.supportsDirectSessionLoad()) continue;
+        const summary = try compatibilitySummaryForBackend(
+            allocator,
+            model_dir,
+            man,
+            backend,
+        ) orelse continue;
+        const allowed = switch (summary.level) {
+            .compatible => true,
+            .unknown => policy.allow_unknown,
+            .incompatible => false,
+        };
+        if (allowed) {
+            scratch[count] = backend;
+            count += 1;
+        } else if (first_policy_err == null) {
+            first_policy_err = if (summary.level == .unknown)
+                error.UnknownModelCompatibility
+            else
+                error.IncompatibleModel;
+        }
+    }
+    if (count > 0) return scratch[0..count];
+    if (first_policy_err) |err| return err;
+    var inspection = try model_compatibility.inspectAlloc(allocator, man);
+    defer inspection.deinit(allocator);
+    const bundle_assessment = model_compatibility.assessInspection(man, inspection);
+    if (bundle_assessment.level == .unknown and !policy.allow_unknown)
+        return error.UnknownModelCompatibility;
+    return error.IncompatibleModel;
+}
+
 fn shouldUseMetalWholeModelExecutor(session: backends.Session) bool {
     return session.backend() == .metal;
 }
@@ -1387,33 +1586,16 @@ pub const ModelManager = struct {
         // Load manifest
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         errdefer man.deinit();
+        var policy_backend_scratch: [7]backends.BackendType = undefined;
         if (self.serving_policy) |policy| {
-            var inspection = try model_compatibility.inspectAlloc(self.allocator, &man);
-            defer inspection.deinit(self.allocator);
-            const assessment = model_compatibility.assessInspection(&man, inspection);
-            switch (assessment.level) {
-                .compatible => {},
-                .unknown => if (!policy.allow_unknown)
-                    return error.UnknownModelCompatibility,
-                .incompatible => return error.IncompatibleModel,
-            }
-            // Preserve the compatibility classification before checking whether this
-            // particular bundle has an artifact usable by the current build. Unknown
-            // models require an explicit opt-in, but that opt-in must not make an
-            // incomplete or otherwise unloadable bundle servable.
-            if (!isManifestPotentiallyLoadableInCurrentBuild(man))
-                return error.IncompatibleModel;
-            if (man.gguf_path != null) {
-                var maybe_report = try session_factory.inspectGgufModel(self.allocator, model_dir);
-                if (maybe_report) |*report| {
-                    defer report.deinit();
-                    if (report.unsupported_tensor_types.len > 0 or
-                        report.missing_required_tensors.len > 0)
-                    {
-                        return error.IncompatibleModel;
-                    }
-                }
-            }
+            sm.preferred_backends = try policyAllowedBackends(
+                self.allocator,
+                &policy_backend_scratch,
+                model_dir,
+                &man,
+                sm.preferred_backends,
+                policy,
+            );
         }
         if (man.hasIncompleteGlinerBundle()) return error.IncompleteGlinerBundle;
         if (man.hasIncompleteColqwenBundle()) return error.IncompleteColqwenBundle;
@@ -1836,7 +2018,8 @@ fn loadSessionForPreferredBackends(
         man.audio_projection_path,
     });
     // NoModelFileFound only when nothing was even attempted.
-    return first_err orelse error.NoModelFileFound;
+    if (first_err) |err| return err;
+    return error.NoModelFileFound;
 }
 
 test "shouldPreferNativeSession prefers native GLiNER weights" {
@@ -1990,6 +2173,55 @@ test "isManifestPotentiallyLoadableInCurrentBuild accepts onnx-only models when 
     defer native_model.deinit();
     native_model.safetensors_path = try allocator.dupe(u8, "model.safetensors");
     try std.testing.expect(isManifestPotentiallyLoadableInCurrentBuild(native_model));
+}
+
+test "hybrid artifact candidates are isolated by backend" {
+    const allocator = std.testing.allocator;
+    var hybrid = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer hybrid.deinit();
+    hybrid.gguf_path = try allocator.dupe(u8, "optional.gguf");
+    hybrid.safetensors_path = try allocator.dupe(u8, "model.safetensors");
+    hybrid.onnx_path = try allocator.dupe(u8, "model.onnx");
+
+    try std.testing.expectEqual(
+        ArtifactCandidateKind.onnx,
+        artifactCandidateForBackend(hybrid, .onnx).?,
+    );
+    try std.testing.expectEqual(
+        ArtifactCandidateKind.gguf,
+        artifactCandidateForBackend(hybrid, .native).?,
+    );
+    try std.testing.expectEqual(
+        ArtifactCandidateKind.gguf,
+        artifactCandidateForBackend(hybrid, .metal).?,
+    );
+}
+
+test "compatible artifact candidate wins aggregate compatibility" {
+    const incompatible = CompatibilitySummary{
+        .level = .incompatible,
+        .code = .unsupported_tensor_type,
+        .message = "bad optional artifact",
+    };
+    const unknown = CompatibilitySummary{
+        .level = .unknown,
+        .code = .unknown_architecture,
+        .message = "unknown candidate",
+    };
+    const compatible = CompatibilitySummary{
+        .level = .compatible,
+        .code = .compatible,
+        .message = "valid selected artifact",
+    };
+
+    try std.testing.expectEqual(
+        model_compatibility.Level.unknown,
+        selectBetterCompatibility(incompatible, unknown).level,
+    );
+    try std.testing.expectEqual(
+        model_compatibility.Level.compatible,
+        selectBetterCompatibility(incompatible, compatible).level,
+    );
 }
 
 test "isManifestPotentiallyLoadableInCurrentBuild hides incomplete colqwen bundles" {

@@ -573,72 +573,12 @@ fn isOpenAiListTask(task: []const u8) bool {
     return std.mem.eql(u8, task, "generators") or std.mem.eql(u8, task, "embedders");
 }
 
-const CompatibilitySummary = struct {
-    level: model_compatibility.Level,
-    code: model_compatibility.Code,
-    message: []const u8,
-};
+const CompatibilitySummary = model_manager_mod.CompatibilitySummary;
 
 const CachedCompatibility = struct {
     signature: u64,
     summary: CompatibilitySummary,
 };
-
-fn compatibilitySummaryForManifest(
-    allocator: std.mem.Allocator,
-    man: *const manifest_mod.ModelManifest,
-) !CompatibilitySummary {
-    var inspection = try model_compatibility.inspectAlloc(allocator, man);
-    defer inspection.deinit(allocator);
-    const assessment = model_compatibility.assessInspection(man, inspection);
-    return .{ .level = assessment.level, .code = assessment.code, .message = assessment.message };
-}
-
-fn refineGgufCompatibility(
-    allocator: std.mem.Allocator,
-    model_path: []const u8,
-    man: *const manifest_mod.ModelManifest,
-    base: CompatibilitySummary,
-) !CompatibilitySummary {
-    if (man.gguf_path == null or base.level == .incompatible) return base;
-    var maybe_report = try session_factory.inspectGgufModelForListing(allocator, model_path, man.*);
-    if (maybe_report) |*report| {
-        defer report.deinit();
-        if (report.unsupported_tensor_types.len > 0) {
-            return .{
-                .level = .incompatible,
-                .code = .unsupported_tensor_type,
-                .message = "GGUF contains tensor types that no available runtime can materialize",
-            };
-        }
-        if (report.missing_required_tensors.len > 0) {
-            return .{
-                .level = .incompatible,
-                .code = .missing_required_tensor,
-                .message = "GGUF is missing required normalized tensors",
-            };
-        }
-    }
-    return base;
-}
-
-fn refineOnnxCompatibility(
-    allocator: std.mem.Allocator,
-    man: *const manifest_mod.ModelManifest,
-    base: CompatibilitySummary,
-) !CompatibilitySummary {
-    const onnx_path = man.onnx_path orelse return base;
-    if (base.level == .incompatible or build_options.enable_onnx) return base;
-    backends_mod.imported_onnx_session.inspectGraphCompatibility(allocator, onnx_path) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        return .{
-            .level = .incompatible,
-            .code = .invalid_graph,
-            .message = "ONNX graph cannot be converted and validated by any backend in this build",
-        };
-    };
-    return base;
-}
 
 fn addArtifactStatToSignature(
     io: std.Io,
@@ -739,6 +679,7 @@ fn rejectExplicitBackendIncompatibility(
     ctx: *httpx.Context,
     model_path: []const u8,
     choice: native_backend_choice.Choice,
+    allow_unknown: bool,
 ) !?httpx.Response {
     const backend: backends_mod.BackendType = switch (choice) {
         .auto => return null,
@@ -750,28 +691,27 @@ fn rejectExplicitBackendIncompatibility(
     };
     var man = try manifest_mod.loadListingFromDir(ctx.allocator, model_path);
     defer man.deinit();
-    const has_candidate = switch (backend) {
-        .onnx => man.onnx_path != null,
-        .native, .metal, .cuda, .wasm => model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(man),
-        .pjrt => false,
-    };
-    if (!has_candidate) {
+    const summary = try model_manager_mod.compatibilitySummaryForBackend(
+        ctx.allocator,
+        model_path,
+        &man,
+        backend,
+    ) orelse {
         return try ctx.status(400).json(.{
             .@"error" = "INCOMPATIBLE_MODEL",
             .message = "the selected backend has no compatible artifact in this model bundle",
         });
-    }
-    if (man.gguf_path) |_| {
-        var maybe_report = try session_factory.inspectGgufModel(ctx.allocator, model_path);
-        if (maybe_report) |*report| {
-            defer report.deinit();
-            if (!session_factory.ggufInspectionSupportsBackend(report.*, backend)) {
-                return try ctx.status(400).json(.{
-                    .@"error" = "INCOMPATIBLE_MODEL",
-                    .message = "the selected backend cannot materialize this GGUF tensor contract",
-                });
-            }
-        }
+    };
+    if (summary.level == .incompatible or
+        (summary.level == .unknown and !allow_unknown))
+    {
+        return try ctx.status(400).json(.{
+            .@"error" = if (summary.level == .unknown)
+                "UNKNOWN_MODEL_COMPATIBILITY"
+            else
+                "INCOMPATIBLE_MODEL",
+            .message = summary.message,
+        });
     }
     return null;
 }
@@ -1086,7 +1026,18 @@ pub const Node = struct {
         addArtifactStatToSignature(io, &signature, man.gguf_projector_path);
         addArtifactStatToSignature(io, &signature, man.safetensors_path);
         addArtifactStatToSignature(io, &signature, man.safetensors_index_path);
-        try addShardedArtifactStatsToSignature(allocator, io, &signature, man.safetensors_index_path);
+        addShardedArtifactStatsToSignature(
+            allocator,
+            io,
+            &signature,
+            man.safetensors_index_path,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            // The index's own stat is already part of the signature. Preserve a
+            // stable cache key for malformed optional indexes and let
+            // per-backend compatibility decide whether another route is usable.
+            signature.update("invalid-sharded-index");
+        };
         addArtifactStatToSignature(io, &signature, man.onnx_path);
         addArtifactStatToSignature(io, &signature, man.gliner_head_gguf_path);
         addArtifactStatToSignature(io, &signature, man.gliner_head_safetensors_path);
@@ -1110,16 +1061,12 @@ pub const Node = struct {
         }
         self.compatibility_cache_lock.unlock();
 
-        const base = if (model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(man))
-            try compatibilitySummaryForManifest(allocator, &man)
-        else
-            CompatibilitySummary{
-                .level = .incompatible,
-                .code = .unsupported_backend,
-                .message = "no backend in this build accepts the model bundle's artifact format",
-            };
-        const gguf_summary = try refineGgufCompatibility(allocator, model_path, &man, base);
-        const summary = try refineOnnxCompatibility(allocator, &man, gguf_summary);
+        const summary = try model_manager_mod.compatibilitySummaryForBackends(
+            allocator,
+            model_path,
+            &man,
+            self.session_manager.preferred_backends,
+        );
 
         spinLock(&self.compatibility_cache_lock);
         defer self.compatibility_cache_lock.unlock();
@@ -2817,7 +2764,12 @@ pub const Node = struct {
                 },
             });
         };
-        if (try rejectExplicitBackendIncompatibility(ctx, model_path, backend_selection.native_choice)) |response|
+        if (try rejectExplicitBackendIncompatibility(
+            ctx,
+            model_path,
+            backend_selection.native_choice,
+            self.config.allow_unknown_models,
+        )) |response|
             return response;
         const allow_onnx = effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
