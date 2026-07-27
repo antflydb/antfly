@@ -7,22 +7,59 @@ on:
     inputs:
       tag_name:
         description: "The release tag name (e.g., v1.0.0)"
-        required: true
+        required: false
+        type: string
+      source_sha:
+        description: "Exact 40-character source revision to build; defaults to the invoking revision"
+        required: false
+        default: ""
+        type: string
+      publish_mode:
+        description: "release publishes GAR and GHCR; development publishes an immutable GAR-only main-SHA image"
+        required: false
+        default: release
+        type: string
+      architectures:
+        description: "Comma-separated runtime architectures: amd64, arm64, or amd64,arm64"
+        required: false
+        default: amd64,arm64
         type: string
       artifact_source:
         description: "Where Linux runtime archives come from: build or github"
         required: false
         default: build
         type: string
+    outputs:
+      image:
+        description: "Digest-pinned GAR runtime image"
+        value: ${{ jobs.publish.outputs.image }}
+      manifest:
+        description: "Compact JSON build manifest"
+        value: ${{ jobs.publish.outputs.manifest }}
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "The release tag name (e.g., v1.0.0)"
-        required: true
+        description: "Release tag; omitted for development mode"
+        required: false
+        default: ""
       artifact_source:
         description: "Where Linux runtime archives come from: build or github"
         required: false
         default: build
+      source_sha:
+        description: "Exact 40-character source revision to build"
+        required: false
+        default: ""
+      publish_mode:
+        description: "release or development"
+        required: false
+        default: release
+        type: choice
+        options: [release, development]
+      architectures:
+        description: "amd64, arm64, or amd64,arm64"
+        required: false
+        default: amd64,arm64
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -33,10 +70,37 @@ env:
   CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
   ZIG_ARTIFACT_BUCKET: antfly-image-artifacts-zig-build-artifacts
   ZIG_VERSION: 0.16.0
+  SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Select runtime architectures
+        id: matrix
+        env:
+          ARCHITECTURES: ${{ inputs.architectures || 'amd64,arm64' }}
+        run: |
+          set -euo pipefail
+          case "$ARCHITECTURES" in
+            amd64)
+              matrix='{"include":[{"arch":"amd64","runner":"arc-antfly-publish","zig_arch":"x86_64","zig_target":"x86_64-linux-musl","zig_optimize":"ReleaseFast","zig_jobs":""}]}'
+              ;;
+            arm64)
+              matrix='{"include":[{"arch":"arm64","runner":"arc-antfly-publish-arm64","zig_arch":"aarch64","zig_target":"aarch64-linux-musl","zig_optimize":"ReleaseSmall","zig_jobs":"1"}]}'
+              ;;
+            amd64,arm64)
+              matrix='{"include":[{"arch":"amd64","runner":"arc-antfly-publish","zig_arch":"x86_64","zig_target":"x86_64-linux-musl","zig_optimize":"ReleaseFast","zig_jobs":""},{"arch":"arm64","runner":"arc-antfly-publish-arm64","zig_arch":"aarch64","zig_target":"aarch64-linux-musl","zig_optimize":"ReleaseSmall","zig_jobs":"1"}]}'
+              ;;
+            *) echo "architectures must be amd64, arm64, or amd64,arm64" >&2; exit 1 ;;
+          esac
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   build-artifact:
     name: Build ${{ matrix.arch }} artifact
+    needs: plan
     if: ${{ inputs.artifact_source != 'github' }}
     runs-on: ${{ matrix.runner }}
     environment: container-publish
@@ -45,23 +109,11 @@ jobs:
       id-token: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: arc-antfly-publish
-            zig_arch: x86_64
-            zig_target: x86_64-linux-musl
-            zig_optimize: ReleaseFast
-            zig_jobs: ""
-          - arch: arm64
-            runner: arc-antfly-publish-arm64
-            zig_arch: aarch64
-            zig_target: aarch64-linux-musl
-            zig_optimize: ReleaseSmall
-            zig_jobs: "1"
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ env.SOURCE_SHA }}
           submodules: true
 
       - name: Authenticate to Google Cloud
@@ -101,7 +153,21 @@ jobs:
 
       - name: Build runtime artifact
         run: |
-          VERSION="${{ inputs.tag_name || github.event.release.tag_name || github.event.inputs.tag_name }}"
+          set -euo pipefail
+          MODE="${{ inputs.publish_mode || 'release' }}"
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_sha must resolve to a 40-character lowercase commit SHA" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]]; then
+            echo "checkout did not resolve the requested source_sha" >&2
+            exit 1
+          fi
+          if [[ "$MODE" == development ]]; then
+            VERSION="main-${SOURCE_SHA}"
+          else
+            VERSION="${{ inputs.tag_name || github.event.release.tag_name || github.event.inputs.tag_name }}"
+          fi
           VERSION="${VERSION#v}"
           jobs_arg=()
           if [ -n "${{ matrix.zig_jobs }}" ]; then
@@ -121,9 +187,12 @@ jobs:
         run: |
           gsutil cp \
             "$RUNNER_TEMP/antfly-zig-${{ matrix.arch }}.tar.gz" \
-            "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${{ matrix.arch }}.tar.gz"
+            "gs://${ZIG_ARTIFACT_BUCKET}/zig/${SOURCE_SHA}/antfly-zig-${{ matrix.arch }}.tar.gz"
 
   publish:
+    outputs:
+      image: ${{ steps.manifest.outputs.image }}
+      manifest: ${{ steps.manifest.outputs.manifest }}
     runs-on: arc-antfly-publish
     needs: build-artifact
     if: ${{ always() && (inputs.artifact_source == 'github' || needs.build-artifact.result == 'success') }}
@@ -135,6 +204,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ env.SOURCE_SHA }}
           submodules: true
 
       - name: Authenticate to Google Cloud
@@ -166,14 +236,36 @@ jobs:
           for arch in amd64 arm64; do
             gsutil cp \
               "$RUNNER_TEMP/container-artifacts/antfly-zig-${arch}.tar.gz" \
-              "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}.tar.gz"
+              "gs://${ZIG_ARTIFACT_BUCKET}/zig/${SOURCE_SHA}/antfly-zig-${arch}.tar.gz"
           done
 
       - name: Extract version
         id: version
         run: |
-          VERSION="${{ inputs.tag_name || github.event.release.tag_name }}"
+          set -euo pipefail
+          MODE="${{ inputs.publish_mode || 'release' }}"
+          case "$MODE" in
+            release)
+              VERSION="${{ inputs.tag_name || github.event.release.tag_name || github.event.inputs.tag_name }}"
+              test -n "$VERSION"
+              ;;
+            development)
+              [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+              VERSION="main-${SOURCE_SHA}"
+              ;;
+            *)
+              echo "publish_mode must be release or development" >&2
+              exit 1
+              ;;
+          esac
+          ARCHITECTURES="${{ inputs.architectures || 'amd64,arm64' }}"
+          case "$ARCHITECTURES" in
+            amd64|arm64|amd64,arm64) ;;
+            *) echo "architectures must be amd64, arm64, or amd64,arm64" >&2; exit 1 ;;
+          esac
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "architectures=${ARCHITECTURES}" >> "$GITHUB_OUTPUT"
           echo "Extracted version: ${VERSION}"
 
       - name: Package GAR images with Cloud Build
@@ -193,13 +285,14 @@ jobs:
             done
           }
           VERSION="${{ steps.version.outputs.version }}"
-          for arch in amd64 arm64; do
+          IFS=, read -ra arches <<< "${{ steps.version.outputs.architectures }}"
+          for arch in "${arches[@]}"; do
             submit_cloud_build . \
               --project="${GCP_PROJECT}" \
               --region="${GCP_REGION}" \
               --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
               --config=zig/cloudbuild.runtime.yaml \
-              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-${arch}.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${VERSION}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
+              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${SOURCE_SHA}/antfly-zig-${arch}.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${VERSION}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
           done
 
       - name: Create GAR multi-arch manifest with Cloud Build
@@ -219,8 +312,13 @@ jobs:
             done
           }
           VERSION="${{ steps.version.outputs.version }}"
+          SOURCES=""
+          IFS=, read -ra arches <<< "${{ steps.version.outputs.architectures }}"
+          for arch in "${arches[@]}"; do
+            SOURCES="${SOURCES:+${SOURCES},}${VERSION}-${arch}"
+          done
           ALIAS_TAG=latest
-          if [[ "$VERSION" == *-* || "$VERSION" == v0.1.* ]]; then
+          if [[ "${{ inputs.publish_mode || 'release' }}" == development || "$VERSION" == *-* || "$VERSION" == v0.1.* ]]; then
             ALIAS_TAG=__skip_alias__
           fi
           submit_cloud_build . \
@@ -228,12 +326,13 @@ jobs:
             --region="${GCP_REGION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=zig/cloudbuild.manifest.yaml \
-            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${VERSION},_ALIAS_TAG=${ALIAS_TAG},_AMD64_TAG=${VERSION}-amd64,_ARM64_TAG=${VERSION}-arm64"
+            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${VERSION},_ALIAS_TAG=${ALIAS_TAG},_SOURCE_TAGS=${SOURCES}"
 
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4
 
       - name: Mirror image GAR -> GHCR
+        if: ${{ (inputs.publish_mode || 'release') == 'release' }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
@@ -251,6 +350,7 @@ jobs:
       - uses: sigstore/cosign-installer@v3
 
       - name: Sign GHCR images
+        if: ${{ (inputs.publish_mode || 'release') == 'release' }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           TAGS=("${VERSION}")
@@ -276,6 +376,45 @@ jobs:
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \
-              -a "ref=${{ github.sha }}" \
+              -a "ref=${SOURCE_SHA}" \
               "${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GCP_REPOSITORY }}/antfly:${tag}"
           done
+
+      - name: Resolve immutable image and emit build manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          REPOSITORY="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPOSITORY}/antfly"
+          DIGEST="$(crane digest "${REPOSITORY}:${VERSION}")"
+          IMAGE="${REPOSITORY}@${DIGEST}"
+          MANIFEST="$(jq -cn \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg image "$IMAGE" \
+            --arg tag "$VERSION" \
+            --arg mode "${{ inputs.publish_mode || 'release' }}" \
+            --arg architectures "${{ steps.version.outputs.architectures }}" \
+            '{schema_version:1,source_sha:$source_sha,image:$image,tag:$tag,publish_mode:$mode,architectures:($architectures|split(","))}')"
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/antfly-container.yml@" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            -a "repo=${{ github.repository }}" \
+            -a "ref=${SOURCE_SHA}" \
+            "$IMAGE" >/dev/null
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "manifest=${MANIFEST}" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$MANIFEST" > antfly-build-manifest.json
+          {
+            echo "## Runtime build"
+            echo "- Source: \`$SOURCE_SHA\`"
+            echo "- Image: \`$IMAGE\`"
+            echo "- Architectures: \`${{ steps.version.outputs.architectures }}\`"
+            echo "- Publication mode: \`${{ inputs.publish_mode || 'release' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build manifest
+        uses: actions/upload-artifact@v6
+        with:
+          name: antfly-build-manifest-${{ env.SOURCE_SHA }}
+          path: antfly-build-manifest.json
+          retention-days: 14
