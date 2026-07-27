@@ -13767,13 +13767,25 @@ fn appendDocFilterBindingsField(
         if (binding.name.len == 0 or binding.filter_query_json.len == 0) {
             return error.InvalidQueryRequest;
         }
+        const normalized_filter = std.mem.trim(
+            u8,
+            binding.filter_query_json,
+            &std.ascii.whitespace,
+        );
+        if (normalized_filter.len < 2 or
+            normalized_filter[0] != '{' or
+            normalized_filter[normalized_filter.len - 1] != '}' or
+            !(try std.json.validate(alloc, normalized_filter)))
+        {
+            return error.InvalidQueryRequest;
+        }
         const entry = try seen.getOrPut(binding.name);
         if (entry.found_existing) return error.InvalidQueryRequest;
 
         if (index > 0) try out.append(alloc, ',');
         try appendJsonString(alloc, out, binding.name);
         try out.append(alloc, ':');
-        try out.appendSlice(alloc, binding.filter_query_json);
+        try out.appendSlice(alloc, normalized_filter);
     }
     try out.append(alloc, '}');
 }
@@ -14043,27 +14055,6 @@ fn appendQueryField(
 ) !void {
     try appendJsonFieldName(alloc, out, first, "full_text_search");
     switch (query) {
-        .match_all => try out.appendSlice(alloc, "{\"match_all\":{}}"),
-        .term => |term| {
-            try out.appendSlice(alloc, "{\"term\":");
-            try appendJsonString(alloc, out, term.term);
-            try out.appendSlice(alloc, ",\"field\":");
-            try appendJsonString(alloc, out, term.field);
-            try appendTextQueryBoost(alloc, out, term.boost);
-            try out.append(alloc, '}');
-        },
-        .match => |match| {
-            try out.appendSlice(alloc, "{\"match\":");
-            try appendJsonString(alloc, out, match.text);
-            try out.appendSlice(alloc, ",\"field\":");
-            try appendJsonString(alloc, out, match.field);
-            if (match.analyzer) |analyzer| {
-                try out.appendSlice(alloc, ",\"analyzer\":");
-                try appendJsonString(alloc, out, analyzer);
-            }
-            try appendTextQueryBoost(alloc, out, match.boost);
-            try out.append(alloc, '}');
-        },
         .dense_knn => |dense| {
             try out.appendSlice(alloc, "{\"dense_knn\":{\"vector\":[");
             for (dense.vector, 0..) |value, i| {
@@ -14089,8 +14080,138 @@ fn appendQueryField(
             try out.print(alloc, "{d}", .{if (sparse.k == 0) default_k else sparse.k});
             try out.appendSlice(alloc, "}}");
         },
-        else => return error.UnsupportedQueryRequest,
+        .graph => return error.UnsupportedQueryRequest,
+        else => try appendTextQueryValue(
+            alloc,
+            out,
+            try borrowedTextQueryFromQuery(query),
+        ),
     }
+}
+
+fn borrowedTextQueryFromQuery(
+    query: db_mod.types.Query,
+) !db_mod.types.TextQuery {
+    return switch (query) {
+        .match_none => .{ .match_none = {} },
+        .match_all => .{ .match_all = {} },
+        .phrase => |value| .{ .phrase = .{
+            .field = value.field,
+            .terms = value.terms,
+            .max_edits = value.max_edits,
+            .auto_fuzzy = value.auto_fuzzy,
+            .boost = value.boost,
+        } },
+        .multi_phrase => |value| .{ .multi_phrase = .{
+            .field = value.field,
+            .terms = value.terms,
+            .max_edits = value.max_edits,
+            .auto_fuzzy = value.auto_fuzzy,
+            .boost = value.boost,
+        } },
+        .term => |value| .{ .term = .{
+            .field = value.field,
+            .term = value.term,
+            .boost = value.boost,
+        } },
+        .match => |value| .{ .match = .{
+            .field = value.field,
+            .text = value.text,
+            .analyzer = value.analyzer,
+            .boost = value.boost,
+        } },
+        .match_phrase => |value| .{ .match_phrase = .{
+            .field = value.field,
+            .text = value.text,
+            .analyzer = value.analyzer,
+            .max_edits = value.max_edits,
+            .auto_fuzzy = value.auto_fuzzy,
+            .boost = value.boost,
+        } },
+        .fuzzy => |value| .{ .fuzzy = .{
+            .field = value.field,
+            .term = value.term,
+            .max_edits = value.max_edits,
+            .prefix_len = value.prefix_len,
+            .auto_fuzzy = value.auto_fuzzy,
+            .boost = value.boost,
+        } },
+        .numeric_range => |value| .{ .numeric_range = .{
+            .field = value.field,
+            .min = value.min,
+            .max = value.max,
+            .inclusive_min = value.inclusive_min,
+            .inclusive_max = value.inclusive_max,
+            .boost = value.boost,
+        } },
+        .date_range => |value| .{ .date_range = .{
+            .field = value.field,
+            .start_ns = value.start_ns,
+            .end_ns = value.end_ns,
+            .inclusive_start = value.inclusive_start,
+            .inclusive_end = value.inclusive_end,
+            .boost = value.boost,
+        } },
+        .doc_id => |value| .{ .doc_id = .{
+            .ids = value.ids,
+            .boost = value.boost,
+        } },
+        .bool_field => |value| .{ .bool_field = .{
+            .field = value.field,
+            .value = value.value,
+            .boost = value.boost,
+        } },
+        .geo_distance => |value| .{ .geo_distance = .{
+            .field = value.field,
+            .lon = value.lon,
+            .lat = value.lat,
+            .radius_meters = value.radius_meters,
+            .boost = value.boost,
+        } },
+        .geo_bbox => |value| .{ .geo_bbox = .{
+            .field = value.field,
+            .min_lat = value.min_lat,
+            .min_lon = value.min_lon,
+            .max_lat = value.max_lat,
+            .max_lon = value.max_lon,
+            .boost = value.boost,
+        } },
+        .prefix => |value| .{ .prefix = .{
+            .field = value.field,
+            .prefix = value.prefix,
+            .boost = value.boost,
+        } },
+        .wildcard => |value| .{ .wildcard = .{
+            .field = value.field,
+            .pattern = value.pattern,
+            .boost = value.boost,
+        } },
+        .regexp => |value| .{ .regexp = .{
+            .field = value.field,
+            .pattern = value.pattern,
+            .boost = value.boost,
+        } },
+        .term_range => |value| .{ .term_range = .{
+            .field = value.field,
+            .min = value.min,
+            .max = value.max,
+            .inclusive_min = value.inclusive_min,
+            .inclusive_max = value.inclusive_max,
+            .boost = value.boost,
+        } },
+        .ip_range => |value| .{ .ip_range = .{
+            .field = value.field,
+            .cidr = value.cidr,
+            .boost = value.boost,
+        } },
+        .geo_shape => |value| .{ .geo_shape = .{
+            .field = value.field,
+            .relation = value.relation,
+            .polygons = value.polygons,
+            .boost = value.boost,
+        } },
+        .dense_knn, .sparse_knn, .graph => error.UnsupportedQueryRequest,
+    };
 }
 
 fn appendTextQueryField(
@@ -14112,6 +14233,8 @@ fn appendTextQueryValue(
     switch (query) {
         .match_all => try out.appendSlice(alloc, "{\"match_all\":{}}"),
         .match_none => try out.appendSlice(alloc, "{\"match_none\":{}}"),
+        .phrase => |phrase| try appendPhraseTextQueryValue(alloc, out, phrase),
+        .multi_phrase => |phrase| try appendMultiPhraseTextQueryValue(alloc, out, phrase),
         .term => |term| {
             try out.appendSlice(alloc, "{\"term\":");
             try appendJsonString(alloc, out, term.term);
@@ -14133,12 +14256,17 @@ fn appendTextQueryValue(
             try out.append(alloc, '}');
         },
         .multi_match_bool_prefix => |multi_match| {
+            if (!std.math.isFinite(multi_match.boost) or multi_match.boost <= 0) {
+                return error.InvalidQueryRequest;
+            }
             try out.appendSlice(alloc, "{\"multi_match\":{\"query\":");
             try appendJsonString(alloc, out, multi_match.query);
             try out.appendSlice(alloc, ",\"type\":\"bool_prefix\",\"fields\":[");
             for (multi_match.fields, 0..) |field, i| {
                 if (i > 0) try out.append(alloc, ',');
-                if (!std.math.isFinite(field.boost)) return error.InvalidQueryRequest;
+                if (!std.math.isFinite(field.boost) or field.boost <= 0) {
+                    return error.InvalidQueryRequest;
+                }
                 if (field.boost == 1.0) {
                     try appendJsonString(alloc, out, field.field);
                 } else {
@@ -14314,8 +14442,175 @@ fn appendTextQueryValue(
             try appendOptionalTextQueryBoostField(alloc, out, &first, bool_query.boost);
             try out.append(alloc, '}');
         },
-        else => return error.UnsupportedQueryRequest,
+        .geo_distance => |distance| try appendGeoDistanceTextQueryValue(alloc, out, distance),
+        .geo_bbox => |bbox| try appendGeoBBoxTextQueryValue(alloc, out, bbox),
+        .ip_range => |range| try appendIpRangeTextQueryValue(alloc, out, range),
+        .geo_shape => |shape| try appendGeoShapeTextQueryValue(alloc, out, shape),
     }
+}
+
+fn appendPhraseTextQueryValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    phrase: anytype,
+) !void {
+    if (phrase.field.len == 0 or phrase.terms.len == 0 or phrase.max_edits > 2) {
+        return error.InvalidQueryRequest;
+    }
+    try out.appendSlice(alloc, "{\"terms\":[");
+    for (phrase.terms, 0..) |term, index| {
+        if (term.len == 0) return error.InvalidQueryRequest;
+        if (index > 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, term);
+    }
+    try out.appendSlice(alloc, "],\"field\":");
+    try appendJsonString(alloc, out, phrase.field);
+    if (phrase.auto_fuzzy) {
+        try out.appendSlice(alloc, ",\"fuzziness\":\"auto\"");
+    } else if (phrase.max_edits > 0) {
+        try out.appendSlice(alloc, ",\"fuzziness\":");
+        try out.print(alloc, "{d}", .{phrase.max_edits});
+    }
+    try appendTextQueryBoost(alloc, out, phrase.boost);
+    try out.append(alloc, '}');
+}
+
+fn appendMultiPhraseTextQueryValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    phrase: anytype,
+) !void {
+    if (phrase.field.len == 0 or phrase.terms.len == 0 or phrase.max_edits > 2) {
+        return error.InvalidQueryRequest;
+    }
+    try out.appendSlice(alloc, "{\"terms\":[");
+    for (phrase.terms, 0..) |alternatives, position| {
+        if (alternatives.len == 0) return error.InvalidQueryRequest;
+        if (position > 0) try out.append(alloc, ',');
+        try out.append(alloc, '[');
+        for (alternatives, 0..) |term, alternative| {
+            if (term.len == 0) return error.InvalidQueryRequest;
+            if (alternative > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, term);
+        }
+        try out.append(alloc, ']');
+    }
+    try out.appendSlice(alloc, "],\"field\":");
+    try appendJsonString(alloc, out, phrase.field);
+    if (phrase.auto_fuzzy) {
+        try out.appendSlice(alloc, ",\"fuzziness\":\"auto\"");
+    } else if (phrase.max_edits > 0) {
+        try out.appendSlice(alloc, ",\"fuzziness\":");
+        try out.print(alloc, "{d}", .{phrase.max_edits});
+    }
+    try appendTextQueryBoost(alloc, out, phrase.boost);
+    try out.append(alloc, '}');
+}
+
+fn appendGeoDistanceTextQueryValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    distance: anytype,
+) !void {
+    if (distance.field.len == 0 or
+        !std.math.isFinite(distance.lon) or distance.lon < -180 or distance.lon > 180 or
+        !std.math.isFinite(distance.lat) or distance.lat < -90 or distance.lat > 90 or
+        !std.math.isFinite(distance.radius_meters) or distance.radius_meters < 0)
+    {
+        return error.InvalidQueryRequest;
+    }
+    try out.appendSlice(alloc, "{\"location\":[");
+    try out.print(alloc, "{d},{d}", .{ distance.lon, distance.lat });
+    try out.appendSlice(alloc, "],\"distance\":\"");
+    try out.print(alloc, "{d}m\",\"field\":", .{distance.radius_meters});
+    try appendJsonString(alloc, out, distance.field);
+    try appendTextQueryBoost(alloc, out, distance.boost);
+    try out.append(alloc, '}');
+}
+
+fn appendGeoBBoxTextQueryValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    bbox: anytype,
+) !void {
+    if (bbox.field.len == 0 or
+        !std.math.isFinite(bbox.min_lat) or bbox.min_lat < -90 or bbox.min_lat > 90 or
+        !std.math.isFinite(bbox.max_lat) or bbox.max_lat < -90 or bbox.max_lat > 90 or
+        bbox.min_lat > bbox.max_lat or
+        !std.math.isFinite(bbox.min_lon) or bbox.min_lon < -180 or bbox.min_lon > 180 or
+        !std.math.isFinite(bbox.max_lon) or bbox.max_lon < -180 or bbox.max_lon > 180)
+    {
+        return error.InvalidQueryRequest;
+    }
+    try out.appendSlice(alloc, "{\"field\":");
+    try appendJsonString(alloc, out, bbox.field);
+    try out.print(
+        alloc,
+        ",\"min_lat\":{d},\"min_lon\":{d},\"max_lat\":{d},\"max_lon\":{d}",
+        .{ bbox.min_lat, bbox.min_lon, bbox.max_lat, bbox.max_lon },
+    );
+    try appendTextQueryBoost(alloc, out, bbox.boost);
+    try out.append(alloc, '}');
+}
+
+fn appendIpRangeTextQueryValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    range: anytype,
+) !void {
+    if (range.field.len == 0 or !algebraicValidIpRange(range.cidr)) {
+        return error.InvalidQueryRequest;
+    }
+    try out.appendSlice(alloc, "{\"cidr\":");
+    try appendJsonString(alloc, out, range.cidr);
+    try out.appendSlice(alloc, ",\"field\":");
+    try appendJsonString(alloc, out, range.field);
+    try appendTextQueryBoost(alloc, out, range.boost);
+    try out.append(alloc, '}');
+}
+
+fn appendGeoShapeTextQueryValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    shape: anytype,
+) !void {
+    if (shape.field.len == 0 or shape.polygons.len == 0) {
+        return error.InvalidQueryRequest;
+    }
+    try out.appendSlice(
+        alloc,
+        "{\"geometry\":{\"shape\":{\"type\":\"MultiPolygon\",\"coordinates\":[",
+    );
+    for (shape.polygons, 0..) |polygon, polygon_index| {
+        if (polygon.len < 3) return error.InvalidQueryRequest;
+        if (polygon_index > 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "[[");
+        for (polygon, 0..) |point, point_index| {
+            if (!std.math.isFinite(point.lat) or point.lat < -90 or point.lat > 90 or
+                !std.math.isFinite(point.lon) or point.lon < -180 or point.lon > 180)
+            {
+                return error.InvalidQueryRequest;
+            }
+            if (point_index > 0) try out.append(alloc, ',');
+            try out.print(alloc, "[{d},{d}]", .{ point.lon, point.lat });
+        }
+        const first = polygon[0];
+        const last = polygon[polygon.len - 1];
+        if (first.lat != last.lat or first.lon != last.lon) {
+            try out.print(alloc, ",[{d},{d}]", .{ first.lon, first.lat });
+        }
+        try out.appendSlice(alloc, "]]");
+    }
+    try out.appendSlice(alloc, "]},\"relation\":");
+    try appendJsonString(alloc, out, switch (shape.relation) {
+        .intersects => "intersects",
+        .within => "within",
+        .contains => "contains",
+    });
+    try out.appendSlice(alloc, "},\"field\":");
+    try appendJsonString(alloc, out, shape.field);
+    try appendTextQueryBoost(alloc, out, shape.boost);
+    try out.append(alloc, '}');
 }
 
 fn appendTextQueryBoost(
@@ -16817,6 +17112,279 @@ test "encode query request round-trips composed bleve full_text queries" {
     try std.testing.expectEqual(@as(i64, 1), parsed_fuzzy.value.object.get("full_text_search").?.object.get("fuzziness").?.integer);
 }
 
+test "encode query request round-trips all public phrase geo and ip queries" {
+    const alloc = std.testing.allocator;
+    const phrase_terms = [_][]const u8{ "quick", "fox" };
+    const first_position = [_][]const u8{ "quick", "fast" };
+    const second_position = [_][]const u8{"fox"};
+    const multi_phrase_terms = [_][]const []const u8{
+        first_position[0..],
+        second_position[0..],
+    };
+    const polygon = [_]db_mod.types.GeoPoint{
+        .{ .lat = 37.70, .lon = -122.50 },
+        .{ .lat = 37.70, .lon = -122.30 },
+        .{ .lat = 37.85, .lon = -122.30 },
+        .{ .lat = 37.70, .lon = -122.50 },
+    };
+    const polygons = [_][]const db_mod.types.GeoPoint{polygon[0..]};
+    const should_queries = [_]db_mod.types.TextQuery{
+        .{ .phrase = .{
+            .field = "body",
+            .terms = phrase_terms[0..],
+            .max_edits = 1,
+            .boost = 2,
+        } },
+        .{ .multi_phrase = .{
+            .field = "body",
+            .terms = multi_phrase_terms[0..],
+            .auto_fuzzy = true,
+            .boost = 3,
+        } },
+        .{ .geo_distance = .{
+            .field = "location",
+            .lat = 37.7749,
+            .lon = -122.4194,
+            .radius_meters = 2_500,
+            .boost = 4,
+        } },
+        .{ .geo_bbox = .{
+            .field = "location",
+            .min_lat = 37.70,
+            .min_lon = 179.5,
+            .max_lat = 37.85,
+            .max_lon = -179.5,
+            .boost = 5,
+        } },
+        .{ .ip_range = .{
+            .field = "client_ip",
+            .cidr = "10.20.0.0/16",
+            .boost = 6,
+        } },
+        .{ .geo_shape = .{
+            .field = "location",
+            .relation = .within,
+            .polygons = polygons[0..],
+            .boost = 7,
+        } },
+    };
+
+    const encoded = try encodeQueryRequest(alloc, .{
+        .full_text = .{ .bool_query = .{
+            .should = should_queries[0..],
+            .min_should = 1,
+        } },
+    });
+    defer alloc.free(encoded);
+
+    var owned = try query_api.parseQueryRequest(alloc, null, "docs", encoded);
+    defer owned.deinit(alloc);
+    const full_text = owned.req.full_text orelse return error.TestExpectedEqual;
+    try std.testing.expect(full_text == .bool_query);
+    const should = full_text.bool_query.should;
+    try std.testing.expectEqual(@as(usize, should_queries.len), should.len);
+    try std.testing.expect(should[0] == .phrase);
+    try std.testing.expectEqual(@as(f32, 2), should[0].phrase.boost);
+    try std.testing.expectEqualStrings("quick", should[0].phrase.terms[0]);
+    try std.testing.expect(should[1] == .multi_phrase);
+    try std.testing.expectEqual(@as(f32, 3), should[1].multi_phrase.boost);
+    try std.testing.expectEqualStrings("fast", should[1].multi_phrase.terms[0][1]);
+    try std.testing.expect(should[2] == .geo_distance);
+    try std.testing.expectEqual(@as(f64, 2_500), should[2].geo_distance.radius_meters);
+    try std.testing.expect(should[3] == .geo_bbox);
+    try std.testing.expectEqual(@as(f64, 179.5), should[3].geo_bbox.min_lon);
+    try std.testing.expectEqual(@as(f64, -179.5), should[3].geo_bbox.max_lon);
+    try std.testing.expect(should[4] == .ip_range);
+    try std.testing.expectEqualStrings("10.20.0.0/16", should[4].ip_range.cidr);
+    try std.testing.expect(should[5] == .geo_shape);
+    try std.testing.expectEqual(db_mod.types.GeoShapeRelation.within, should[5].geo_shape.relation);
+    try std.testing.expectEqual(@as(usize, 1), should[5].geo_shape.polygons.len);
+    try std.testing.expectEqual(@as(usize, polygon.len), should[5].geo_shape.polygons[0].len);
+}
+
+test "encode query request round-trips every scalar Query text variant" {
+    const alloc = std.testing.allocator;
+    const phrase_terms = [_][]const u8{ "quick", "fox" };
+    const first_position = [_][]const u8{ "quick", "fast" };
+    const second_position = [_][]const u8{"fox"};
+    const multi_phrase_terms = [_][]const []const u8{
+        first_position[0..],
+        second_position[0..],
+    };
+    const ids = [_][]const u8{ "doc:a", "doc:b" };
+    const polygon = [_]db_mod.types.GeoPoint{
+        .{ .lat = 37.70, .lon = -122.50 },
+        .{ .lat = 37.70, .lon = -122.30 },
+        .{ .lat = 37.85, .lon = -122.30 },
+    };
+    const polygons = [_][]const db_mod.types.GeoPoint{polygon[0..]};
+    const cases = [_]struct {
+        query: db_mod.types.Query,
+        expected: std.meta.Tag(db_mod.types.TextQuery),
+    }{
+        .{ .query = .{ .match_none = {} }, .expected = .match_none },
+        .{ .query = .{ .match_all = {} }, .expected = .match_all },
+        .{ .query = .{ .phrase = .{
+            .field = "body",
+            .terms = phrase_terms[0..],
+        } }, .expected = .phrase },
+        .{ .query = .{ .multi_phrase = .{
+            .field = "body",
+            .terms = multi_phrase_terms[0..],
+        } }, .expected = .multi_phrase },
+        .{ .query = .{ .term = .{
+            .field = "status",
+            .term = "active",
+        } }, .expected = .term },
+        .{ .query = .{ .match = .{
+            .field = "body",
+            .text = "quick fox",
+        } }, .expected = .match },
+        .{ .query = .{ .match_phrase = .{
+            .field = "body",
+            .text = "quick fox",
+        } }, .expected = .match_phrase },
+        .{ .query = .{ .fuzzy = .{
+            .field = "body",
+            .term = "quik",
+        } }, .expected = .fuzzy },
+        .{ .query = .{ .numeric_range = .{
+            .field = "price",
+            .min = 10,
+            .max = 20,
+        } }, .expected = .numeric_range },
+        .{ .query = .{ .date_range = .{
+            .field = "created_at",
+            .start_ns = 1_772_323_200 * std.time.ns_per_s,
+        } }, .expected = .date_range },
+        .{ .query = .{ .doc_id = .{ .ids = ids[0..] } }, .expected = .doc_id },
+        .{ .query = .{ .bool_field = .{
+            .field = "published",
+            .value = true,
+        } }, .expected = .bool_field },
+        .{ .query = .{ .geo_distance = .{
+            .field = "location",
+            .lat = 37.7749,
+            .lon = -122.4194,
+            .radius_meters = 2_500,
+        } }, .expected = .geo_distance },
+        .{ .query = .{ .geo_bbox = .{
+            .field = "location",
+            .min_lat = 37.70,
+            .min_lon = -122.50,
+            .max_lat = 37.85,
+            .max_lon = -122.30,
+        } }, .expected = .geo_bbox },
+        .{ .query = .{ .prefix = .{
+            .field = "body",
+            .prefix = "qui",
+        } }, .expected = .prefix },
+        .{ .query = .{ .wildcard = .{
+            .field = "body",
+            .pattern = "qu*",
+        } }, .expected = .wildcard },
+        .{ .query = .{ .regexp = .{
+            .field = "body",
+            .pattern = "qu.*",
+        } }, .expected = .regexp },
+        .{ .query = .{ .term_range = .{
+            .field = "tier",
+            .min = "bronze",
+            .max = "gold",
+        } }, .expected = .term_range },
+        .{ .query = .{ .ip_range = .{
+            .field = "client_ip",
+            .cidr = "10.20.0.0/16",
+        } }, .expected = .ip_range },
+        .{ .query = .{ .geo_shape = .{
+            .field = "location",
+            .polygons = polygons[0..],
+        } }, .expected = .geo_shape },
+    };
+
+    for (cases) |case| {
+        const encoded = try encodeQueryRequest(alloc, .{ .query = case.query });
+        defer alloc.free(encoded);
+        var owned = try query_api.parseQueryRequest(
+            alloc,
+            null,
+            "docs",
+            encoded,
+        );
+        defer owned.deinit(alloc);
+        const full_text = owned.req.full_text orelse
+            return error.TestExpectedEqual;
+        try std.testing.expectEqual(
+            case.expected,
+            std.meta.activeTag(full_text),
+        );
+    }
+}
+
+test "encode query request rejects non-round-trippable multi match boosts" {
+    const alloc = std.testing.allocator;
+    inline for ([_]db_mod.types.TextQuery{
+        .{ .multi_match_bool_prefix = .{
+            .query = "quick fox",
+            .fields = &.{.{ .field = "body" }},
+            .boost = 0,
+        } },
+        .{ .multi_match_bool_prefix = .{
+            .query = "quick fox",
+            .fields = &.{.{ .field = "body", .boost = -1 }},
+        } },
+    }) |query| {
+        try std.testing.expectError(
+            error.InvalidQueryRequest,
+            encodeQueryRequest(alloc, .{ .full_text = query }),
+        );
+    }
+}
+
+test "encode query request rejects invalid public phrase geo and ip values" {
+    const alloc = std.testing.allocator;
+    const short_polygon = [_]db_mod.types.GeoPoint{
+        .{ .lat = 37.70, .lon = -122.50 },
+        .{ .lat = 37.85, .lon = -122.30 },
+    };
+    const short_polygons = [_][]const db_mod.types.GeoPoint{
+        short_polygon[0..],
+    };
+    inline for ([_]db_mod.types.TextQuery{
+        .{ .phrase = .{ .field = "body", .terms = &.{} } },
+        .{ .multi_phrase = .{
+            .field = "body",
+            .terms = &.{&.{}},
+        } },
+        .{ .geo_distance = .{
+            .field = "location",
+            .lat = 91,
+            .lon = 0,
+            .radius_meters = 10,
+        } },
+        .{ .geo_bbox = .{
+            .field = "location",
+            .min_lat = 40,
+            .min_lon = -130,
+            .max_lat = 30,
+            .max_lon = -120,
+        } },
+        .{ .ip_range = .{
+            .field = "client_ip",
+            .cidr = "10.999.0.0/16",
+        } },
+        .{ .geo_shape = .{
+            .field = "location",
+            .polygons = short_polygons[0..],
+        } },
+    }) |query| {
+        try std.testing.expectError(
+            error.InvalidQueryRequest,
+            encodeQueryRequest(alloc, .{ .full_text = query }),
+        );
+    }
+}
+
 test "encode query request includes named vector embeddings for routed semantic search" {
     const alloc = std.testing.allocator;
 
@@ -17195,6 +17763,23 @@ test "encode query request rejects duplicate named filter bindings" {
             .doc_filter_bindings = duplicate_bindings[0..],
         }),
     );
+
+    inline for ([_][]const u8{
+        "not-json",
+        "[]",
+        "{\"term\":",
+        "{\"term\":{}} trailing",
+    }) |invalid_filter| {
+        try std.testing.expectError(
+            error.InvalidQueryRequest,
+            encodeQueryRequest(alloc, .{
+                .doc_filter_bindings = &.{.{
+                    .name = "invalid",
+                    .filter_query_json = invalid_filter,
+                }},
+            }),
+        );
+    }
 }
 
 test "encode query request carries internal native doc id constraints through query contract" {

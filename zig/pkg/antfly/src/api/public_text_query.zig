@@ -79,10 +79,13 @@ pub fn parseStatefulDirectTextOperatorQueryAlloc(
     // silently changes the query semantics.
     if (!termQueryHasFuzzyOptions(value)) {
         if (try directStringOperatorValue(value, "term", &.{ "term", "value" }, true)) |parsed| {
+            const query_boost = try directOperatorBoost(value, "term", boost);
+            const field = try alloc.dupe(u8, parsed.field);
+            errdefer alloc.free(field);
             return .{ .term = .{
-                .field = try alloc.dupe(u8, parsed.field),
+                .field = field,
                 .term = try alloc.dupe(u8, parsed.value),
-                .boost = boost,
+                .boost = query_boost,
             } };
         }
     }
@@ -92,51 +95,69 @@ pub fn parseStatefulDirectTextOperatorQueryAlloc(
     // changing their semantics here.
     if (!matchQueryHasPublicOptions(value)) {
         if (try directStringOperatorValue(value, "match", &.{ "text", "match", "value" }, true)) |parsed| {
+            const query_boost = try directOperatorBoost(value, "match", boost);
+            const field = try alloc.dupe(u8, parsed.field);
+            errdefer alloc.free(field);
             return .{ .match = .{
-                .field = try alloc.dupe(u8, parsed.field),
+                .field = field,
                 .text = try alloc.dupe(u8, parsed.value),
-                .boost = boost,
+                .boost = query_boost,
             } };
         }
     }
     if (!matchPhraseQueryHasPublicOptions(value)) {
         if (try directStringOperatorValue(value, "match_phrase", &.{ "text", "match_phrase", "value" }, true)) |parsed| {
+            const query_boost = try directOperatorBoost(value, "match_phrase", boost);
+            const field = try alloc.dupe(u8, parsed.field);
+            errdefer alloc.free(field);
             return .{ .match_phrase = .{
-                .field = try alloc.dupe(u8, parsed.field),
+                .field = field,
                 .text = try alloc.dupe(u8, parsed.value),
-                .boost = boost,
+                .boost = query_boost,
             } };
         }
     }
     if (try directStringOperatorValue(value, "prefix", &.{ "prefix", "text", "value" }, true)) |parsed| {
+        const query_boost = try directOperatorBoost(value, "prefix", boost);
+        const field = try alloc.dupe(u8, parsed.field);
+        errdefer alloc.free(field);
         return .{ .prefix = .{
-            .field = try alloc.dupe(u8, parsed.field),
+            .field = field,
             .prefix = try alloc.dupe(u8, parsed.value),
-            .boost = boost,
+            .boost = query_boost,
         } };
     }
     if (try directStringOperatorValue(value, "wildcard", &.{ "pattern", "wildcard", "value" }, false)) |parsed| {
+        const query_boost = try directOperatorBoost(value, "wildcard", boost);
+        const field = try alloc.dupe(u8, parsed.field);
+        errdefer alloc.free(field);
         return .{ .wildcard = .{
-            .field = try alloc.dupe(u8, parsed.field),
+            .field = field,
             .pattern = try alloc.dupe(u8, parsed.value),
-            .boost = boost,
+            .boost = query_boost,
         } };
     }
     if (try directStringOperatorValue(value, "regexp", &.{ "pattern", "regexp", "value" }, false)) |parsed| {
+        const query_boost = try directOperatorBoost(value, "regexp", boost);
+        const field = try alloc.dupe(u8, parsed.field);
+        errdefer alloc.free(field);
         return .{ .regexp = .{
-            .field = try alloc.dupe(u8, parsed.field),
+            .field = field,
             .pattern = try alloc.dupe(u8, parsed.value),
-            .boost = boost,
+            .boost = query_boost,
         } };
     }
     if (try directFuzzyOperatorValue(value)) |parsed| {
+        const query_boost = try directOperatorBoost(value, "fuzzy", boost);
+        const field = try alloc.dupe(u8, parsed.field);
+        errdefer alloc.free(field);
         return .{ .fuzzy = .{
-            .field = try alloc.dupe(u8, parsed.field),
+            .field = field,
             .term = try alloc.dupe(u8, parsed.value),
             .max_edits = parsed.max_edits,
             .prefix_len = parsed.prefix_len,
             .auto_fuzzy = parsed.auto_fuzzy,
-            .boost = boost,
+            .boost = query_boost,
         } };
     }
     return null;
@@ -156,7 +177,6 @@ fn matchQueryHasPublicOptions(value: std.json.Value) bool {
     const options = if (match == .object) match.object else value.object;
     inline for ([_][]const u8{
         "analyzer",
-        "boost",
         "fuzziness",
         "prefix_length",
         "operator",
@@ -178,6 +198,19 @@ fn matchPhraseQueryHasPublicOptions(value: std.json.Value) bool {
         }
     }
     return false;
+}
+
+fn directOperatorBoost(
+    value: std.json.Value,
+    operator: []const u8,
+    fallback: f32,
+) !f32 {
+    if (value != .object) return fallback;
+    const operator_value = value.object.get(operator) orelse return fallback;
+    if (operator_value != .object) return fallback;
+    const boost = operator_value.object.get("boost") orelse return fallback;
+    if (boost == .null) return fallback;
+    return try narrowDirectBoost(try directNumber(boost));
 }
 
 pub fn parseStatefulDirectTextRangeQueryAlloc(
