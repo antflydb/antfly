@@ -1826,6 +1826,41 @@ fn releaseInferenceAdmissionResources(
     manager.releaseBatch(&slices);
 }
 
+test "inference admission bridge charges combined native residency to resource manager" {
+    var budgets = antfly.resource_manager.Options.defaultBudgets();
+    budgets[@intFromEnum(antfly.resource_manager.Slice.inference_model_residency)] =
+        .{ .hard_limit_bytes = 100 };
+    var manager = antfly.resource_manager.ResourceManager.init(.{ .budgets = budgets });
+    const budget = inferenceAdmissionResourceBudget(&manager);
+
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        budget.try_reserve(budget.context, .{
+            .host_weight_bytes = 80,
+            .backend_weight_bytes = 30,
+        }),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+
+    const admitted = inference.runtime.tier.memory.AdmissionAmounts{
+        .host_weight_bytes = 60,
+        .backend_weight_bytes = 30,
+    };
+    try budget.try_reserve(budget.context, admitted);
+    try std.testing.expectEqual(
+        @as(u64, 90),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+    budget.release(budget.context, admitted);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+}
+
 fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) void {
     const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
     manager.observeUsage(.inference_prompt_cache, current, next);

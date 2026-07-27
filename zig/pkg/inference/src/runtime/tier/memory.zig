@@ -1017,15 +1017,77 @@ fn parseCgroupMountInfoLine(line: []const u8, mounts: *CgroupMounts) void {
     mount.mount_point_len = mount_point_len;
 }
 
-fn probeCgroupMountsLinux() CgroupMounts {
+fn mergeCgroupMemoryInfo(
+    result: *CgroupMemoryInfo,
+    candidate: CgroupMemoryInfo,
+) void {
+    if (candidate.limit_bytes) |limit| {
+        if (result.limit_bytes == null or limit < result.limit_bytes.?) {
+            result.limit_bytes = limit;
+            result.current_bytes = candidate.current_bytes;
+        }
+    }
+    if (candidate.available_bytes) |available| {
+        result.available_bytes = if (result.available_bytes) |existing|
+            @min(existing, available)
+        else
+            available;
+    }
+}
+
+fn mergeAuthoritativeCgroupProbe(
+    result: *CgroupMemoryInfo,
+    probe: CgroupHierarchyProbe,
+) void {
+    if (!probe.leaf_present) return;
+    mergeCgroupMemoryInfo(result, probe.info);
+}
+
+fn probeCgroupMountInfoLine(
+    line: []const u8,
+    paths: CgroupPaths,
+    result: *CgroupMemoryInfo,
+) void {
+    // Parse one entry in isolation so every visible bind/controller mount is
+    // considered. Keeping only the last cgroup mount can select an unrelated
+    // subtree when containers expose multiple views of the hierarchy.
     var mounts = CgroupMounts{};
-    if (builtin.os.tag != .linux) return mounts;
+    parseCgroupMountInfoLine(line, &mounts);
+    if (paths.v2) |path| {
+        if (mounts.v2.valid()) {
+            const probe = readCgroupHierarchy(
+                mounts.v2.mountPoint(),
+                mounts.v2.root(),
+                path,
+                "memory.max",
+                "memory.current",
+            );
+            mergeAuthoritativeCgroupProbe(result, probe);
+        }
+    }
+    if (paths.v1_memory) |path| {
+        if (mounts.v1_memory.valid()) {
+            const probe = readCgroupHierarchy(
+                mounts.v1_memory.mountPoint(),
+                mounts.v1_memory.root(),
+                path,
+                "memory.limit_in_bytes",
+                "memory.usage_in_bytes",
+            );
+            mergeAuthoritativeCgroupProbe(result, probe);
+        }
+    }
+}
+
+fn probeCgroupMountHierarchyLinux(paths: CgroupPaths) CgroupMemoryInfo {
+    var result = CgroupMemoryInfo{};
+    if (builtin.os.tag != .linux) return result;
     const fd = std.posix.openat(
         std.posix.AT.FDCWD,
         "/proc/self/mountinfo",
         .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
         0,
-    ) catch return mounts;
+    ) catch return result;
     defer _ = std.posix.system.close(fd);
 
     var read_buffer: [4096]u8 = undefined;
@@ -1033,12 +1095,12 @@ fn probeCgroupMountsLinux() CgroupMounts {
     var line_len: usize = 0;
     var discard_line = false;
     while (true) {
-        const count = std.posix.read(fd, read_buffer[0..]) catch return mounts;
+        const count = std.posix.read(fd, read_buffer[0..]) catch return result;
         if (count == 0) break;
         for (read_buffer[0..count]) |byte| {
             if (byte == '\n') {
                 if (!discard_line and line_len > 0)
-                    parseCgroupMountInfoLine(line_buffer[0..line_len], &mounts);
+                    probeCgroupMountInfoLine(line_buffer[0..line_len], paths, &result);
                 line_len = 0;
                 discard_line = false;
                 continue;
@@ -1054,8 +1116,8 @@ fn probeCgroupMountsLinux() CgroupMounts {
         }
     }
     if (!discard_line and line_len > 0)
-        parseCgroupMountInfoLine(line_buffer[0..line_len], &mounts);
-    return mounts;
+        probeCgroupMountInfoLine(line_buffer[0..line_len], paths, &result);
+    return result;
 }
 
 fn cgroupPathRelativeToMount(
@@ -1185,7 +1247,6 @@ fn probeCgroupMemoryInfoLinux() CgroupMemoryInfo {
     const cgroup_bytes = readSmallLinuxFile("/proc/self/cgroup", &cgroup_buffer) orelse
         return .{};
     const paths = parseCgroupPaths(cgroup_bytes);
-    var canonical_fallback = CgroupMemoryInfo{};
     if (paths.v2) |path| {
         const probe = readCgroupHierarchy(
             "/sys/fs/cgroup",
@@ -1195,7 +1256,6 @@ fn probeCgroupMemoryInfoLinux() CgroupMemoryInfo {
             "memory.current",
         );
         if (canonicalCgroupProbeIsAuthoritative(probe)) return probe.info;
-        if (probe.info.limit_bytes != null) canonical_fallback = probe.info;
     }
     if (paths.v1_memory) |path| {
         const probe = readCgroupHierarchy(
@@ -1206,40 +1266,12 @@ fn probeCgroupMemoryInfoLinux() CgroupMemoryInfo {
             "memory.usage_in_bytes",
         );
         if (canonicalCgroupProbeIsAuthoritative(probe)) return probe.info;
-        if (canonical_fallback.limit_bytes == null and probe.info.limit_bytes != null)
-            canonical_fallback = probe.info;
     }
 
-    // Canonical mounts cover the common container path without reparsing
-    // mountinfo on every admission. A finite ancestor is accepted on this fast
-    // path only when the addressed leaf itself exists; otherwise a subtree bind
-    // mount can make the canonical walk land on a looser mount-root limit.
-    const mounts = probeCgroupMountsLinux();
-    if (paths.v2) |path| {
-        if (mounts.v2.valid()) {
-            const probe = readCgroupHierarchy(
-                mounts.v2.mountPoint(),
-                mounts.v2.root(),
-                path,
-                "memory.max",
-                "memory.current",
-            );
-            if (probe.info.limit_bytes != null) return probe.info;
-        }
-    }
-    if (paths.v1_memory) |path| {
-        if (mounts.v1_memory.valid()) {
-            const probe = readCgroupHierarchy(
-                mounts.v1_memory.mountPoint(),
-                mounts.v1_memory.root(),
-                path,
-                "memory.limit_in_bytes",
-                "memory.usage_in_bytes",
-            );
-            if (probe.info.limit_bytes != null) return probe.info;
-        }
-    }
-    return canonical_fallback;
+    // Canonical mounts cover the common path without parsing mountinfo. When
+    // they are not authoritative, inspect every visible controller mount and
+    // accept only candidates whose addressed process leaf actually exists.
+    return probeCgroupMountHierarchyLinux(paths);
 }
 
 fn applyCgroupMemoryInfo(
@@ -1505,6 +1537,34 @@ test "canonical cgroup probe rejects ancestor-only subtree matches" {
         .info = .{},
         .leaf_present = true,
     }));
+}
+
+test "cgroup mount candidates ignore ancestor-only probes" {
+    var result = CgroupMemoryInfo{};
+    const ancestor_only = CgroupHierarchyProbe{
+        .info = .{
+            .limit_bytes = gib(8),
+            .current_bytes = gib(6),
+            .available_bytes = gib(2),
+        },
+        .leaf_present = false,
+    };
+    mergeAuthoritativeCgroupProbe(&result, ancestor_only);
+    try std.testing.expectEqual(@as(?usize, null), result.limit_bytes);
+    try std.testing.expectEqual(@as(?usize, null), result.available_bytes);
+
+    mergeCgroupMemoryInfo(&result, .{
+        .limit_bytes = gib(2),
+        .current_bytes = gib(1),
+        .available_bytes = gib(1),
+    });
+    mergeCgroupMemoryInfo(&result, .{
+        .limit_bytes = gib(4),
+        .current_bytes = gib(1),
+        .available_bytes = gib(3),
+    });
+    try std.testing.expectEqual(@as(?usize, gib(2)), result.limit_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(1)), result.available_bytes);
 }
 
 test "cgroup hierarchy uses finite parent limit beneath unlimited leaf" {

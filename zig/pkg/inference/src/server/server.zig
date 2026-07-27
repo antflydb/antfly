@@ -579,8 +579,62 @@ const compatibility_sidecar_hash_limit: u64 = 4 * 1024 * 1024;
 const compatibility_artifact_sample_bytes: usize = 64 * 1024;
 
 const CachedCompatibility = struct {
+    allocator: std.mem.Allocator,
+    refs: std.atomic.Value(usize) = .init(1),
     signature: CompatibilitySignature,
     summary: CompatibilitySummary,
+    external_paths: [][]u8,
+    external_paths_valid: bool,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        signature: CompatibilitySignature,
+        summary: CompatibilitySummary,
+        dependencies: *OnnxDependencies,
+    ) !*CachedCompatibility {
+        const self = try allocator.create(CachedCompatibility);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .signature = signature,
+            .summary = summary,
+            .external_paths = try dependencies.paths.toOwnedSlice(allocator),
+            .external_paths_valid = dependencies.valid,
+        };
+        return self;
+    }
+
+    fn retain(self: *CachedCompatibility) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *CachedCompatibility) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        for (self.external_paths) |path| self.allocator.free(path);
+        self.allocator.free(self.external_paths);
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+};
+
+const OnnxDependencies = struct {
+    paths: std.ArrayListUnmanaged([]u8) = .empty,
+    valid: bool = true,
+
+    fn deinit(self: *OnnxDependencies, allocator: std.mem.Allocator) void {
+        for (self.paths.items) |path| allocator.free(path);
+        self.paths.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn append(self: *OnnxDependencies, allocator: std.mem.Allocator, path: []const u8) !void {
+        for (self.paths.items) |existing| {
+            if (std.mem.eql(u8, existing, path)) return;
+        }
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        try self.paths.append(allocator, owned_path);
+    }
 };
 
 fn updateCompatibilitySignatureSlice(
@@ -609,8 +663,12 @@ fn addArtifactIdentityToSignature(
     signature.update(std.mem.asBytes(&stat.size));
     const mtime_ns = stat.mtime.toNanoseconds();
     const ctime_ns = stat.ctime.toNanoseconds();
-    signature.update(std.mem.asBytes(&mtime_ns));
-    signature.update(std.mem.asBytes(&ctime_ns));
+    // std.Io.Timestamp uses i96, whose ABI representation can contain
+    // indeterminate padding. Hash a fully represented integer instead.
+    const canonical_mtime_ns: i128 = mtime_ns;
+    const canonical_ctime_ns: i128 = ctime_ns;
+    signature.update(std.mem.asBytes(&canonical_mtime_ns));
+    signature.update(std.mem.asBytes(&canonical_ctime_ns));
     if (hash_small_contents and stat.size <= compatibility_sidecar_hash_limit) {
         const bytes = c_file.readFileMax(
             allocator,
@@ -662,7 +720,7 @@ fn addArtifactIdentityToSignature(
         signature.update("changed-during-read");
 }
 
-fn addOnnxArtifactSetToSignature(
+fn addOnnxArtifactToSignature(
     allocator: std.mem.Allocator,
     io: std.Io,
     signature: *std.crypto.hash.sha2.Sha256,
@@ -670,25 +728,45 @@ fn addOnnxArtifactSetToSignature(
 ) !void {
     const path = maybe_path orelse return;
     try addArtifactIdentityToSignature(allocator, io, signature, path, false);
+}
+
+fn collectOnnxDependenciesForPath(
+    allocator: std.mem.Allocator,
+    dependencies: *OnnxDependencies,
+    maybe_path: ?[]const u8,
+) !void {
+    const path = maybe_path orelse return;
     if (!std.mem.endsWith(u8, path, ".onnx")) return;
     var artifacts = backends_mod.imported_onnx_session.inspectArtifactSet(
         allocator,
         path,
     ) catch |err| {
         if (err == error.OutOfMemory) return err;
-        signature.update("invalid-onnx-artifact-set");
+        dependencies.valid = false;
         return;
     };
     defer artifacts.deinit();
     for (artifacts.external_paths) |external_path| {
-        try addArtifactIdentityToSignature(
-            allocator,
-            io,
-            signature,
-            external_path,
-            false,
-        );
+        try dependencies.append(allocator, external_path);
     }
+}
+
+fn collectCompatibilityOnnxDependencies(
+    allocator: std.mem.Allocator,
+    man: *const manifest_mod.ModelManifest,
+) !OnnxDependencies {
+    var dependencies = OnnxDependencies{};
+    errdefer dependencies.deinit(allocator);
+    const paths = [_]?[]const u8{
+        man.onnx_path,
+        man.visual_model_path,
+        man.audio_model_path,
+        man.text_projection_path,
+        man.visual_projection_path,
+        man.audio_projection_path,
+    };
+    for (paths) |path| try collectOnnxDependenciesForPath(allocator, &dependencies, path);
+    return dependencies;
 }
 
 fn addModelSidecarToSignature(
@@ -765,11 +843,13 @@ fn addCompatibilityManifestFacts(
     });
 }
 
-fn computeCompatibilitySignature(
+fn computeCompatibilitySignatureWithDependencies(
     allocator: std.mem.Allocator,
     io: std.Io,
     model_path: []const u8,
     man: *const manifest_mod.ModelManifest,
+    external_paths: []const []const u8,
+    external_paths_valid: bool,
 ) !CompatibilitySignature {
     var signature = std.crypto.hash.sha2.Sha256.init(.{});
     addCompatibilityManifestFacts(&signature, man);
@@ -801,22 +881,50 @@ fn computeCompatibilitySignature(
         if (err == error.OutOfMemory) return err;
         signature.update("invalid-sharded-index");
     };
-    try addOnnxArtifactSetToSignature(allocator, io, &signature, man.onnx_path);
+    try addOnnxArtifactToSignature(allocator, io, &signature, man.onnx_path);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.gliner_head_gguf_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.gliner_head_safetensors_path, false);
-    try addOnnxArtifactSetToSignature(allocator, io, &signature, man.visual_model_path);
-    try addOnnxArtifactSetToSignature(allocator, io, &signature, man.audio_model_path);
-    try addOnnxArtifactSetToSignature(allocator, io, &signature, man.text_projection_path);
-    try addOnnxArtifactSetToSignature(allocator, io, &signature, man.visual_projection_path);
-    try addOnnxArtifactSetToSignature(allocator, io, &signature, man.audio_projection_path);
+    try addOnnxArtifactToSignature(allocator, io, &signature, man.visual_model_path);
+    try addOnnxArtifactToSignature(allocator, io, &signature, man.audio_model_path);
+    try addOnnxArtifactToSignature(allocator, io, &signature, man.text_projection_path);
+    try addOnnxArtifactToSignature(allocator, io, &signature, man.visual_projection_path);
+    try addOnnxArtifactToSignature(allocator, io, &signature, man.audio_projection_path);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.tokenizer_json_path, false);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.tokenizer_config_path, true);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.preprocessor_config_path, true);
     try addArtifactIdentityToSignature(allocator, io, &signature, man.processor_config_path, true);
+    if (!external_paths_valid) signature.update("invalid-onnx-artifact-set");
+    for (external_paths) |external_path| {
+        try addArtifactIdentityToSignature(
+            allocator,
+            io,
+            &signature,
+            external_path,
+            false,
+        );
+    }
 
     var digest: CompatibilitySignature = undefined;
     signature.final(&digest);
     return digest;
+}
+
+fn computeCompatibilitySignature(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+    man: *const manifest_mod.ModelManifest,
+) !CompatibilitySignature {
+    var dependencies = try collectCompatibilityOnnxDependencies(allocator, man);
+    defer dependencies.deinit(allocator);
+    return computeCompatibilitySignatureWithDependencies(
+        allocator,
+        io,
+        model_path,
+        man,
+        dependencies.paths.items,
+        dependencies.valid,
+    );
 }
 
 test "compatibility signature tracks implicit GLiNER classification sidecar" {
@@ -905,6 +1013,50 @@ test "compatibility signature hashes same-size sidecar replacements" {
         first_digest[0..],
         second_digest[0..],
     ));
+}
+
+test "cached compatibility signature tracks known ONNX external dependencies without reparsing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const model_dir = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", tmp.sub_path[0..] },
+    );
+    defer allocator.free(model_dir);
+    const external_path = try std.fs.path.join(
+        allocator,
+        &.{ model_dir, "weights.bin" },
+    );
+    defer allocator.free(external_path);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "weights.bin",
+        .data = "first-external-generation",
+    });
+
+    var man = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer man.deinit();
+    const first = try computeCompatibilitySignatureWithDependencies(
+        allocator,
+        std.testing.io,
+        model_dir,
+        &man,
+        &.{external_path},
+        true,
+    );
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "weights.bin",
+        .data = "second-external-generat",
+    });
+    const second = try computeCompatibilitySignatureWithDependencies(
+        allocator,
+        std.testing.io,
+        model_dir,
+        &man,
+        &.{external_path},
+        true,
+    );
+    try std.testing.expect(!std.mem.eql(u8, first[0..], second[0..]));
 }
 
 /// Apply the serving policy before model loading. `ModelManager` repeats this check as a
@@ -1224,7 +1376,7 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
     request_queue: request_queue_mod.RequestQueue,
-    compatibility_cache: std.StringHashMapUnmanaged(CachedCompatibility) = .empty,
+    compatibility_cache: std.StringHashMapUnmanaged(*CachedCompatibility) = .empty,
     compatibility_cache_lock: std.atomic.Mutex = .unlocked,
 
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
@@ -1292,7 +1444,10 @@ pub const Node = struct {
         self.tabular_registry.deinit();
         self.embed_cache.deinit();
         var compatibility_it = self.compatibility_cache.iterator();
-        while (compatibility_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        while (compatibility_it.next()) |entry| {
+            entry.value_ptr.*.release();
+            self.allocator.free(entry.key_ptr.*);
+        }
         self.compatibility_cache.deinit(self.allocator);
     }
 
@@ -1320,25 +1475,43 @@ pub const Node = struct {
         while (attempt < max_snapshot_attempts) : (attempt += 1) {
             var man = try manifest_mod.loadListingFromDir(allocator, model_path);
             defer man.deinit();
-            const artifact_signature = try computeCompatibilitySignature(
+
+            spinLock(&self.compatibility_cache_lock);
+            const cached = self.compatibility_cache.get(model_path);
+            if (cached) |entry| entry.retain();
+            self.compatibility_cache_lock.unlock();
+            if (cached) |entry| {
+                const cached_signature = computeCompatibilitySignatureWithDependencies(
+                    allocator,
+                    io,
+                    model_path,
+                    &man,
+                    entry.external_paths,
+                    entry.external_paths_valid,
+                ) catch |err| {
+                    entry.release();
+                    return err;
+                };
+                const cache_hit = std.mem.eql(
+                    u8,
+                    entry.signature[0..],
+                    cached_signature[0..],
+                );
+                const cached_summary = entry.summary;
+                entry.release();
+                if (cache_hit) return cached_summary;
+            }
+
+            var dependencies = try collectCompatibilityOnnxDependencies(allocator, &man);
+            defer dependencies.deinit(allocator);
+            const artifact_signature = try computeCompatibilitySignatureWithDependencies(
                 allocator,
                 io,
                 model_path,
                 &man,
+                dependencies.paths.items,
+                dependencies.valid,
             );
-
-            spinLock(&self.compatibility_cache_lock);
-            if (self.compatibility_cache.get(model_path)) |cached| {
-                if (std.mem.eql(
-                    u8,
-                    cached.signature[0..],
-                    artifact_signature[0..],
-                )) {
-                    self.compatibility_cache_lock.unlock();
-                    return cached.summary;
-                }
-            }
-            self.compatibility_cache_lock.unlock();
 
             const summary = try model_manager_mod.compatibilitySummaryForBackends(
                 allocator,
@@ -1352,11 +1525,18 @@ pub const Node = struct {
                 model_path,
             );
             defer verification_manifest.deinit();
-            const verification_signature = try computeCompatibilitySignature(
+            var verification_dependencies = try collectCompatibilityOnnxDependencies(
+                allocator,
+                &verification_manifest,
+            );
+            defer verification_dependencies.deinit(allocator);
+            const verification_signature = try computeCompatibilitySignatureWithDependencies(
                 allocator,
                 io,
                 model_path,
                 &verification_manifest,
+                verification_dependencies.paths.items,
+                verification_dependencies.valid,
             );
             if (!std.mem.eql(
                 u8,
@@ -1364,18 +1544,36 @@ pub const Node = struct {
                 verification_signature[0..],
             )) continue;
 
+            const new_cached = try CachedCompatibility.create(
+                self.allocator,
+                artifact_signature,
+                summary,
+                &verification_dependencies,
+            );
+            var replaced: ?*CachedCompatibility = null;
             spinLock(&self.compatibility_cache_lock);
-            defer self.compatibility_cache_lock.unlock();
-            if (self.compatibility_cache.getPtr(model_path)) |cached| {
-                cached.* = .{ .signature = artifact_signature, .summary = summary };
+            if (self.compatibility_cache.getPtr(model_path)) |cached_ptr| {
+                replaced = cached_ptr.*;
+                cached_ptr.* = new_cached;
             } else {
-                const owned_path = try self.allocator.dupe(u8, model_path);
-                errdefer self.allocator.free(owned_path);
-                try self.compatibility_cache.put(self.allocator, owned_path, .{
-                    .signature = artifact_signature,
-                    .summary = summary,
-                });
+                const owned_path = self.allocator.dupe(u8, model_path) catch |err| {
+                    self.compatibility_cache_lock.unlock();
+                    new_cached.release();
+                    return err;
+                };
+                self.compatibility_cache.put(
+                    self.allocator,
+                    owned_path,
+                    new_cached,
+                ) catch |err| {
+                    self.allocator.free(owned_path);
+                    self.compatibility_cache_lock.unlock();
+                    new_cached.release();
+                    return err;
+                };
             }
+            self.compatibility_cache_lock.unlock();
+            if (replaced) |old| old.release();
             return summary;
         }
         return error.ModelArtifactsChanging;

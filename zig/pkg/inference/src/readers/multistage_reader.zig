@@ -42,24 +42,19 @@ pub const LoadedMultiStageReader = struct {
             allocator.free(component_paths);
         }
 
-        for (session_manager.preferred_backends) |backend| {
-            if (!backend.supportsDirectSessionLoad()) continue;
-            var single_backend = [_]backends.BackendType{backend};
-            var stage_session_manager = session_manager.*;
-            stage_session_manager.preferred_backends = single_backend[0..];
-            var component_loader = model_manager.componentLoaderForPaths(
-                model_path,
-                stage_session_manager.preferred_backends,
-                component_paths,
-            ) catch |err| {
-                if (err == error.IncompatibleModel or err == error.UnknownModelCompatibility) return err;
-                continue;
-            };
+        var component_loader = try model_manager.componentLoaderForPathsWithContract(
+            model_path,
+            session_manager.preferred_backends,
+            component_paths,
+            .multistage_ocr,
+        );
+        for (component_loader.preferredBackends()) |backend| {
+            var backend_loader = try component_loader.restrictToBackend(backend);
             return loadFromDirWithSessionManager(
                 allocator,
                 model_path,
                 &metadata,
-                &component_loader,
+                &backend_loader,
             ) catch |err| {
                 if (err == error.MultiStageReaderNotYetSupported) return err;
                 std.log.err("multistage reader backend {s} failed for {s}: {s}", .{ @tagName(backend), model_path, @errorName(err) });

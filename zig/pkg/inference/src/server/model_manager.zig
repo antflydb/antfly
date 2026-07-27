@@ -122,6 +122,14 @@ pub const CompatibilitySummary = struct {
     message: []const u8,
 };
 
+/// Describes the runtime contract represented by a set of independently loaded
+/// model components. A component bundle must not inherit an incompatible
+/// whole-model classification when a dedicated pipeline owns its runtime.
+pub const ComponentContract = enum(u8) {
+    manifest,
+    multistage_ocr,
+};
+
 fn summaryFromAssessment(assessment: model_compatibility.Assessment) CompatibilitySummary {
     return .{
         .level = assessment.level,
@@ -327,12 +335,219 @@ fn policyAllowedBackends(
     return error.IncompatibleModel;
 }
 
-fn componentCompatibilityForBackend(
+const ComponentInspection = struct {
+    allocator: std.mem.Allocator,
+    base_summary: CompatibilitySummary,
+    invalid_summary: ?CompatibilitySummary = null,
+    has_onnx_component: bool = false,
+    has_native_component: bool = false,
+    imported_graph_compatible: bool = true,
+    dependencies: std.ArrayListUnmanaged([]u8) = .empty,
+
+    fn deinit(self: *ComponentInspection) void {
+        for (self.dependencies.items) |path| self.allocator.free(path);
+        self.dependencies.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn addDependency(self: *ComponentInspection, path: []const u8) !void {
+        for (self.dependencies.items) |existing| {
+            if (std.mem.eql(u8, existing, path)) return;
+        }
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        try self.dependencies.append(self.allocator, owned_path);
+    }
+
+    fn summaryForBackend(
+        self: *const ComponentInspection,
+        backend: backends.BackendType,
+    ) CompatibilitySummary {
+        if (self.invalid_summary) |summary| return summary;
+        if (backend == .onnx and self.has_native_component) {
+            return .{
+                .level = .incompatible,
+                .code = .unsupported_backend,
+                .message = "the ONNX Runtime backend cannot load a directory-backed component",
+            };
+        }
+        if (self.has_onnx_component and
+            (backend != .onnx or !build_options.enable_onnx) and
+            !self.imported_graph_compatible)
+        {
+            return .{
+                .level = .incompatible,
+                .code = .invalid_graph,
+                .message = "a component ONNX graph cannot be converted and validated by the selected backend",
+            };
+        }
+        return self.base_summary;
+    }
+};
+
+const ComponentPlanKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+const component_plan_cache_capacity = 256;
+const component_signature_sample_bytes: usize = 16 * 1024;
+
+fn updateComponentPlanKeySlice(
+    hash: *std.crypto.hash.sha2.Sha256,
+    value: []const u8,
+) void {
+    const len: u64 = @intCast(value.len);
+    hash.update(std.mem.asBytes(&len));
+    hash.update(value);
+}
+
+const ComponentPlanCacheEntry = struct {
+    allocator: std.mem.Allocator,
+    refs: std.atomic.Value(usize) = .init(1),
+    signature: ComponentPlanKey,
+    allowed_backends: [7]backends.BackendType = undefined,
+    allowed_backend_count: usize = 0,
+    dependencies: [][]u8,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        signature: ComponentPlanKey,
+        allowed: []const backends.BackendType,
+        dependencies: []const []const u8,
+    ) !*ComponentPlanCacheEntry {
+        const self = try allocator.create(ComponentPlanCacheEntry);
+        errdefer allocator.destroy(self);
+        const owned_dependencies = try allocator.alloc([]u8, dependencies.len);
+        errdefer allocator.free(owned_dependencies);
+        var initialized: usize = 0;
+        errdefer for (owned_dependencies[0..initialized]) |path| allocator.free(path);
+        for (dependencies, 0..) |path, index| {
+            owned_dependencies[index] = try allocator.dupe(u8, path);
+            initialized += 1;
+        }
+        self.* = .{
+            .allocator = allocator,
+            .signature = signature,
+            .dependencies = owned_dependencies,
+        };
+        @memcpy(self.allowed_backends[0..allowed.len], allowed);
+        self.allowed_backend_count = allowed.len;
+        return self;
+    }
+
+    fn retain(self: *ComponentPlanCacheEntry) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *ComponentPlanCacheEntry) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        for (self.dependencies) |path| self.allocator.free(path);
+        self.allocator.free(self.dependencies);
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+};
+
+fn componentPlanKey(
+    model_dir: []const u8,
+    man: *const manifest_mod.ModelManifest,
+    preferred_backends: []const backends.BackendType,
+    component_paths: []const []const u8,
+    policy: model_compatibility.Policy,
+    contract: ComponentContract,
+) ComponentPlanKey {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    updateComponentPlanKeySlice(&hash, model_dir);
+    hash.update(&.{
+        @intFromEnum(man.model_type),
+        @intFromEnum(man.native_arch_hint),
+        @intFromEnum(contract),
+        @intFromBool(policy.allow_unknown),
+        @intFromBool(manifestHasNativeAssets(man.*)),
+        @intFromBool(man.hasIncompleteGlinerBundle()),
+        @intFromBool(man.hasIncompleteColqwenBundle()),
+        @intFromBool(man.hasIncompleteClipclapGgufBundle()),
+        @intFromBool(man.hasIncompleteFlorence2GgufBundle()),
+    });
+    updateComponentPlanKeySlice(&hash, man.config_model_arch);
+    updateComponentPlanKeySlice(&hash, man.gliner_model_type);
+    updateComponentPlanKeySlice(&hash, man.inference_bundle_family);
+    const backend_count: u64 = @intCast(preferred_backends.len);
+    hash.update(std.mem.asBytes(&backend_count));
+    for (preferred_backends) |backend| hash.update(&.{@intFromEnum(backend)});
+    const component_count: u64 = @intCast(component_paths.len);
+    hash.update(std.mem.asBytes(&component_count));
+    for (component_paths) |path| {
+        updateComponentPlanKeySlice(&hash, path);
+    }
+    var digest: ComponentPlanKey = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+fn componentDependencySignature(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dependencies: []const []const u8,
+) !ComponentPlanKey {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (dependencies) |path| {
+        updateComponentPlanKeySlice(&hash, path);
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+            hash.update("missing");
+            continue;
+        };
+        hash.update(std.mem.asBytes(&stat.inode));
+        hash.update(std.mem.asBytes(&stat.size));
+        const mtime_ns = stat.mtime.toNanoseconds();
+        const ctime_ns = stat.ctime.toNanoseconds();
+        // std.Io.Timestamp uses i96, whose ABI storage contains padding on
+        // common targets. Widen before hashing so fingerprints never include
+        // indeterminate padding bytes.
+        const canonical_mtime_ns: i128 = mtime_ns;
+        const canonical_ctime_ns: i128 = ctime_ns;
+        hash.update(std.mem.asBytes(&canonical_mtime_ns));
+        hash.update(std.mem.asBytes(&canonical_ctime_ns));
+        if (stat.size > 0) {
+            const sample_len: usize = @intCast(@min(
+                stat.size,
+                component_signature_sample_bytes,
+            ));
+            const offsets = [_]u64{
+                0,
+                if (stat.size > sample_len) (stat.size - sample_len) / 2 else 0,
+                if (stat.size > sample_len) stat.size - sample_len else 0,
+            };
+            for (offsets, 0..) |offset, index| {
+                if (index > 0 and offset == offsets[index - 1]) continue;
+                const bytes = c_file.readRegion(allocator, path, offset, sample_len) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    hash.update("sample-unreadable");
+                    break;
+                };
+                defer allocator.free(bytes);
+                hash.update(std.mem.asBytes(&offset));
+                hash.update(bytes);
+            }
+        }
+        const final_stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+            hash.update("changed-during-read");
+            continue;
+        };
+        if (final_stat.inode != stat.inode or
+            final_stat.size != stat.size or
+            final_stat.mtime.toNanoseconds() != mtime_ns or
+            final_stat.ctime.toNanoseconds() != ctime_ns)
+            hash.update("changed-during-read");
+    }
+    var digest: ComponentPlanKey = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+fn inspectComponentArtifacts(
     allocator: std.mem.Allocator,
     man: *const manifest_mod.ModelManifest,
-    backend: backends.BackendType,
     component_paths: []const []const u8,
-) !CompatibilitySummary {
+    contract: ComponentContract,
+) !ComponentInspection {
     var component_manifest = man.*;
     // Component ONNX sessions do not consume an optional GGUF payload. Do not
     // let unrelated GGUF metadata classify the route selected below.
@@ -340,10 +555,24 @@ fn componentCompatibilityForBackend(
     var inspection = try model_compatibility.inspectAlloc(allocator, &component_manifest);
     defer inspection.deinit(allocator);
     const assessment = model_compatibility.assessInspection(&component_manifest, inspection);
-    if (assessment.level == .incompatible) return summaryFromAssessment(assessment);
+    const base_summary: CompatibilitySummary = switch (contract) {
+        .manifest => summaryFromAssessment(assessment),
+        // The multistage reader validates its metadata and every stage artifact
+        // before construction. Its parent directory is classified as a reader,
+        // but it does not use the single-model Florence reader runtime.
+        .multistage_ocr => .{
+            .level = .compatible,
+            .code = .compatible,
+            .message = "validated multistage OCR component pipeline",
+        },
+    };
+    var result = ComponentInspection{
+        .allocator = allocator,
+        .base_summary = base_summary,
+    };
+    errdefer result.deinit();
+    if (base_summary.level == .incompatible) return result;
 
-    var has_onnx_component = false;
-    var has_native_component = false;
     for (component_paths, 0..) |path, path_index| {
         var duplicate = false;
         for (component_paths[0..path_index]) |previous| {
@@ -353,77 +582,147 @@ fn componentCompatibilityForBackend(
             }
         }
         if (duplicate) continue;
+        try result.addDependency(path);
 
         if (!std.mem.endsWith(u8, path, ".onnx")) {
-            has_native_component = true;
+            result.has_native_component = true;
+            var native_manifest = manifest_mod.loadFromDir(allocator, path) catch {
+                result.invalid_summary = .{
+                    .level = .incompatible,
+                    .code = .artifact_unreadable,
+                    .message = "a directory-backed component manifest is invalid or unreadable",
+                };
+                continue;
+            };
+            defer native_manifest.deinit();
+            if (!manifestHasNativeAssets(native_manifest)) {
+                result.invalid_summary = .{
+                    .level = .incompatible,
+                    .code = .incomplete_bundle,
+                    .message = "a directory-backed component has no native model assets",
+                };
+                continue;
+            }
+            const native_paths = [_]?[]const u8{
+                native_manifest.gguf_path,
+                native_manifest.gguf_projector_path,
+                native_manifest.safetensors_path,
+                native_manifest.safetensors_index_path,
+                native_manifest.gliner_head_gguf_path,
+                native_manifest.gliner_head_safetensors_path,
+            };
+            for (native_paths) |maybe_native_path| {
+                if (maybe_native_path) |native_path| try result.addDependency(native_path);
+            }
             continue;
         }
-        has_onnx_component = true;
+        result.has_onnx_component = true;
         var artifacts = backends.imported_onnx_session.inspectArtifactSet(
             allocator,
             path,
         ) catch |err| {
             if (err == error.OutOfMemory) return err;
-            return .{
+            result.invalid_summary = .{
                 .level = .incompatible,
                 .code = .invalid_graph,
                 .message = "a component ONNX graph or its external tensor data is invalid or unreadable",
             };
+            continue;
         };
-        artifacts.deinit();
-
-        if (backend != .onnx or !build_options.enable_onnx) {
-            backends.imported_onnx_session.inspectGraphCompatibility(
-                allocator,
-                path,
-            ) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                return .{
-                    .level = .incompatible,
-                    .code = .invalid_graph,
-                    .message = "a component ONNX graph cannot be converted and validated by the selected backend",
-                };
-            };
-        }
+        defer artifacts.deinit();
+        for (artifacts.external_paths) |external_path| try result.addDependency(external_path);
     }
-
-    if (backend == .onnx and has_native_component) {
-        return .{
-            .level = .incompatible,
-            .code = .unsupported_backend,
-            .message = "the ONNX Runtime backend cannot load a directory-backed component",
-        };
-    }
-    if (!has_onnx_component and has_native_component and !manifestHasNativeAssets(man.*)) {
-        return .{
-            .level = .incompatible,
-            .code = .incomplete_bundle,
-            .message = "a directory-backed component has no native model assets",
-        };
-    }
-    return summaryFromAssessment(assessment);
+    return result;
 }
 
-fn policyAllowedComponentBackends(
+fn validateComponentImportedGraphs(
     allocator: std.mem.Allocator,
-    scratch: *[7]backends.BackendType,
-    man: *const manifest_mod.ModelManifest,
-    preferred_backends: []const backends.BackendType,
     component_paths: []const []const u8,
-    policy: model_compatibility.Policy,
-) ![]const backends.BackendType {
-    if (component_paths.len == 0) return error.IncompleteModelBundle;
+    preferred_backends: []const backends.BackendType,
+    inspection: *ComponentInspection,
+) !void {
+    var required = false;
+    for (preferred_backends) |backend| {
+        if (backend != .onnx or !build_options.enable_onnx) {
+            required = true;
+            break;
+        }
+    }
+    if (!required or !inspection.has_onnx_component or inspection.invalid_summary != null) return;
 
+    for (component_paths, 0..) |path, path_index| {
+        if (!std.mem.endsWith(u8, path, ".onnx")) continue;
+        var duplicate = false;
+        for (component_paths[0..path_index]) |previous| {
+            if (std.mem.eql(u8, previous, path)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        backends.imported_onnx_session.inspectGraphCompatibility(
+            allocator,
+            path,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            inspection.imported_graph_compatible = false;
+            return;
+        };
+    }
+}
+
+fn inspectComponentBundle(
+    allocator: std.mem.Allocator,
+    man: *const manifest_mod.ModelManifest,
+    component_paths: []const []const u8,
+    contract: ComponentContract,
+    preferred_backends: []const backends.BackendType,
+) !ComponentInspection {
+    var inspection = try inspectComponentArtifacts(
+        allocator,
+        man,
+        component_paths,
+        contract,
+    );
+    errdefer inspection.deinit();
+    try validateComponentImportedGraphs(
+        allocator,
+        component_paths,
+        preferred_backends,
+        &inspection,
+    );
+    return inspection;
+}
+
+fn componentCompatibilityForBackend(
+    allocator: std.mem.Allocator,
+    man: *const manifest_mod.ModelManifest,
+    backend: backends.BackendType,
+    component_paths: []const []const u8,
+    contract: ComponentContract,
+) !CompatibilitySummary {
+    var inspection = try inspectComponentBundle(
+        allocator,
+        man,
+        component_paths,
+        contract,
+        &.{backend},
+    );
+    defer inspection.deinit();
+    return inspection.summaryForBackend(backend);
+}
+
+fn policyAllowedComponentBackendsFromInspection(
+    scratch: *[7]backends.BackendType,
+    preferred_backends: []const backends.BackendType,
+    policy: model_compatibility.Policy,
+    inspection: *const ComponentInspection,
+) ![]const backends.BackendType {
     var count: usize = 0;
     var first_policy_err: ?anyerror = null;
     for (preferred_backends) |backend| {
         if (!backend.supportsDirectSessionLoad()) continue;
-        const summary = try componentCompatibilityForBackend(
-            allocator,
-            man,
-            backend,
-            component_paths,
-        );
+        const summary = inspection.summaryForBackend(backend);
         const allowed = switch (summary.level) {
             .compatible => true,
             .unknown => policy.allow_unknown,
@@ -1454,6 +1753,11 @@ pub const ModelManager = struct {
     /// weight, and backend initialization always runs outside this lock.
     load_lock: std.atomic.Mutex = .unlocked,
     in_flight_loads: std.StringHashMapUnmanaged(*LoadFlight) = .empty,
+    component_plan_cache: std.AutoHashMapUnmanaged(
+        ComponentPlanKey,
+        *ComponentPlanCacheEntry,
+    ) = .empty,
+    component_plan_cache_lock: std.atomic.Mutex = .unlocked,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe_config: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
 
@@ -1652,28 +1956,162 @@ pub const ModelManager = struct {
         };
     };
 
+    fn componentPlanIo(self: *ModelManager) std.Io {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        return self.session_manager.io orelse std.Io.Threaded.global_single_threaded.io();
+    }
+
+    fn applyCachedComponentPlan(
+        self: *ModelManager,
+        key: ComponentPlanKey,
+        loader: *ComponentLoader,
+    ) !bool {
+        spinLock(&self.component_plan_cache_lock);
+        const entry = self.component_plan_cache.get(key) orelse {
+            self.component_plan_cache_lock.unlock();
+            return false;
+        };
+        entry.retain();
+        self.component_plan_cache_lock.unlock();
+        defer entry.release();
+
+        const signature = try componentDependencySignature(
+            self.allocator,
+            self.componentPlanIo(),
+            entry.dependencies,
+        );
+        if (!std.mem.eql(u8, signature[0..], entry.signature[0..])) return false;
+        @memcpy(
+            loader.allowed_backends[0..entry.allowed_backend_count],
+            entry.allowed_backends[0..entry.allowed_backend_count],
+        );
+        loader.allowed_backend_count = entry.allowed_backend_count;
+        return true;
+    }
+
+    fn publishComponentPlan(
+        self: *ModelManager,
+        key: ComponentPlanKey,
+        signature: ComponentPlanKey,
+        allowed: []const backends.BackendType,
+        dependencies: []const []const u8,
+    ) !void {
+        const entry = try ComponentPlanCacheEntry.create(
+            self.allocator,
+            signature,
+            allowed,
+            dependencies,
+        );
+        var replaced: ?*ComponentPlanCacheEntry = null;
+        var evicted: ?*ComponentPlanCacheEntry = null;
+
+        spinLock(&self.component_plan_cache_lock);
+        if (!self.component_plan_cache.contains(key) and
+            self.component_plan_cache.count() >= component_plan_cache_capacity)
+        {
+            var it = self.component_plan_cache.iterator();
+            if (it.next()) |candidate| {
+                const removed = self.component_plan_cache.fetchRemove(candidate.key_ptr.*);
+                if (removed) |old| evicted = old.value;
+            }
+        }
+        const previous = self.component_plan_cache.fetchPut(
+            self.allocator,
+            key,
+            entry,
+        ) catch |err| {
+            self.component_plan_cache_lock.unlock();
+            entry.release();
+            if (evicted) |old| old.release();
+            return err;
+        };
+        if (previous) |old| replaced = old.value;
+        self.component_plan_cache_lock.unlock();
+        if (replaced) |old| old.release();
+        if (evicted) |old| old.release();
+    }
+
     pub fn componentLoaderForPaths(
         self: *ModelManager,
         model_dir: []const u8,
         preferred_backends: []const backends.BackendType,
         component_paths: []const []const u8,
     ) !ComponentLoader {
+        return self.componentLoaderForPathsWithContract(
+            model_dir,
+            preferred_backends,
+            component_paths,
+            .manifest,
+        );
+    }
+
+    pub fn componentLoaderForPathsWithContract(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        component_paths: []const []const u8,
+        contract: ComponentContract,
+    ) !ComponentLoader {
         var loader = ComponentLoader{ .manager = self };
         for (component_paths) |path| try loader.addComponentPath(path);
         if (loader.component_path_count == 0) return error.IncompleteModelBundle;
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         defer man.deinit();
-        const allowed = if (self.serving_policy) |policy|
-            try policyAllowedComponentBackends(
-                self.allocator,
-                &loader.allowed_backends,
+        const allowed = if (self.serving_policy) |policy| blk: {
+            const key = componentPlanKey(
+                model_dir,
                 &man,
                 preferred_backends,
                 component_paths,
                 policy,
-            )
-        else
-            preferred_backends;
+                contract,
+            );
+            if (try self.applyCachedComponentPlan(key, &loader))
+                return loader;
+
+            var inspection = try inspectComponentArtifacts(
+                self.allocator,
+                &man,
+                component_paths,
+                contract,
+            );
+            defer inspection.deinit();
+            const signature_before = try componentDependencySignature(
+                self.allocator,
+                self.componentPlanIo(),
+                inspection.dependencies.items,
+            );
+            try validateComponentImportedGraphs(
+                self.allocator,
+                component_paths,
+                preferred_backends,
+                &inspection,
+            );
+            const signature_after = try componentDependencySignature(
+                self.allocator,
+                self.componentPlanIo(),
+                inspection.dependencies.items,
+            );
+            if (!std.mem.eql(
+                u8,
+                signature_before[0..],
+                signature_after[0..],
+            )) return error.ModelArtifactsChanging;
+            const validated = try policyAllowedComponentBackendsFromInspection(
+                &loader.allowed_backends,
+                preferred_backends,
+                policy,
+                &inspection,
+            );
+            self.publishComponentPlan(
+                key,
+                signature_after,
+                validated,
+                inspection.dependencies.items,
+            ) catch {};
+            break :blk validated;
+        } else preferred_backends;
         for (allowed) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
             if (loader.allowed_backend_count == loader.allowed_backends.len) break;
@@ -1712,18 +2150,11 @@ pub const ModelManager = struct {
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
     ) !ManagedSession {
         var first_err: ?anyerror = null;
-        const is_onnx = std.mem.endsWith(u8, model_path, ".onnx");
-        const artifact_bytes = if (!self.admission_enabled)
-            0
-        else if (is_onnx) blk: {
-            var artifacts = try backends.imported_onnx_session.inspectArtifactSet(
-                self.allocator,
-                model_path,
-            );
-            defer artifacts.deinit();
-            break :blk artifacts.encoded_bytes;
-        } else std.math.cast(usize, try c_file.fileSize(self.allocator, model_path)) orelse
-            return error.ResourceLimitExceeded;
+        var artifact_estimate = if (self.admission_enabled)
+            try ComponentArtifactEstimate.init(self.allocator, model_path)
+        else
+            ComponentArtifactEstimate.disabled;
+        defer artifact_estimate.deinit();
 
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
@@ -1734,7 +2165,11 @@ pub const ModelManager = struct {
             var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
             var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
             if (self.admission_enabled) {
-                const plan = if (is_onnx)
+                const artifact_bytes = artifact_estimate.bytesForBackend(backend) catch |err| {
+                    if (first_err == null) first_err = err;
+                    continue;
+                };
+                const plan = if (artifact_estimate == .onnx)
                     onnxModelLoadAdmission(artifact_bytes, backend)
                 else
                     nativeModelLoadAdmission(artifact_bytes, backend);
@@ -1823,6 +2258,9 @@ pub const ModelManager = struct {
     pub fn deinit(self: *ModelManager) void {
         std.debug.assert(self.in_flight_loads.count() == 0);
         self.in_flight_loads.deinit(self.allocator);
+        var component_plan_it = self.component_plan_cache.iterator();
+        while (component_plan_it.next()) |entry| entry.value_ptr.*.release();
+        self.component_plan_cache.deinit(self.allocator);
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -2407,6 +2845,47 @@ const ModelLoadAdmissionPlan = struct {
     resident: runtime.tier.memory.AdmissionAmounts,
 };
 
+const ComponentArtifactEstimate = union(enum) {
+    disabled,
+    onnx: usize,
+    native: manifest_mod.ModelManifest,
+
+    fn init(allocator: std.mem.Allocator, model_path: []const u8) !ComponentArtifactEstimate {
+        if (std.mem.endsWith(u8, model_path, ".onnx")) {
+            var artifacts = try backends.imported_onnx_session.inspectArtifactSet(
+                allocator,
+                model_path,
+            );
+            defer artifacts.deinit();
+            return .{ .onnx = artifacts.encoded_bytes };
+        }
+
+        // Native sessions accept directories as well as direct GGUF paths.
+        // Loading the manifest is essential here: a directory's stat size only
+        // describes its entries and bears no relation to resident model bytes.
+        return .{ .native = try manifest_mod.loadFromDir(allocator, model_path) };
+    }
+
+    fn deinit(self: *ComponentArtifactEstimate) void {
+        switch (self.*) {
+            .native => |*man| man.deinit(),
+            .disabled, .onnx => {},
+        }
+        self.* = .disabled;
+    }
+
+    fn bytesForBackend(
+        self: *const ComponentArtifactEstimate,
+        backend: backends.BackendType,
+    ) !usize {
+        return switch (self.*) {
+            .disabled => 0,
+            .onnx => |bytes| bytes,
+            .native => |man| estimateModelArtifactBytes(man, backend),
+        };
+    }
+};
+
 fn addArtifactBytes(total: *usize, allocator: std.mem.Allocator, maybe_path: ?[]const u8) !void {
     const path = maybe_path orelse return;
     const size = if (std.mem.endsWith(u8, path, ".onnx")) blk: {
@@ -2830,8 +3309,62 @@ test "component compatibility validates explicit split ONNX graphs" {
         &man,
         .native,
         &.{ encoder, decoder },
+        .manifest,
     );
     try std.testing.expectEqual(model_compatibility.Level.compatible, summary.level);
+
+    man.model_type = .reader;
+    man.native_arch_hint = .none;
+    const whole_reader_summary = try componentCompatibilityForBackend(
+        allocator,
+        &man,
+        .native,
+        &.{ encoder, decoder },
+        .manifest,
+    );
+    try std.testing.expectEqual(
+        model_compatibility.Level.incompatible,
+        whole_reader_summary.level,
+    );
+    const multistage_summary = try componentCompatibilityForBackend(
+        allocator,
+        &man,
+        .native,
+        &.{ encoder, decoder },
+        .multistage_ocr,
+    );
+    try std.testing.expectEqual(model_compatibility.Level.compatible, multistage_summary.level);
+
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+    manager.configureServingPolicy(.{});
+    _ = try manager.componentLoaderForPathsWithContract(
+        root,
+        &.{.native},
+        &.{ encoder, decoder },
+        .multistage_ocr,
+    );
+    _ = try manager.componentLoaderForPathsWithContract(
+        root,
+        &.{.native},
+        &.{ encoder, decoder },
+        .multistage_ocr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), manager.component_plan_cache.count());
+
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "encoder_model.onnx",
+        .data = "invalidated",
+    });
+    try std.testing.expectError(
+        error.IncompatibleModel,
+        manager.componentLoaderForPathsWithContract(
+            root,
+            &.{.native},
+            &.{ encoder, decoder },
+            .multistage_ocr,
+        ),
+    );
 }
 
 test "component loader rejects paths outside its validated plan" {
@@ -2884,6 +3417,34 @@ test "onnx admission separates encoded staging from completed residency" {
     try std.testing.expectEqual(weights, gpu.peak.backend_weight_bytes);
     try std.testing.expectEqual(@as(usize, 0), gpu.resident.host_weight_bytes);
     try std.testing.expectEqual(weights, gpu.resident.backend_weight_bytes);
+}
+
+test "directory-backed component admission charges native model artifacts" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const weight_bytes = 8192;
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model.gguf",
+        .data = &([_]u8{0x5a} ** weight_bytes),
+    });
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var estimate = try ComponentArtifactEstimate.init(allocator, root);
+    defer estimate.deinit();
+    try std.testing.expectEqual(
+        @as(usize, weight_bytes),
+        try estimate.bytesForBackend(.native),
+    );
+    const plan = try nativeModelLoadAdmission(
+        try estimate.bytesForBackend(.native),
+        .native,
+    );
+    try std.testing.expectEqual(@as(usize, weight_bytes), plan.resident.host_weight_bytes);
 }
 
 test "isManifestPotentiallyLoadableInCurrentBuild hides incomplete colqwen bundles" {

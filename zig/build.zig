@@ -5852,6 +5852,7 @@ pub fn build(b: *std.Build) void {
             "standalone public listener lease is exclusive and immediately reusable",
             "parse cli accepts inference budget overrides",
             "inference config falls back to common config",
+            "inference admission bridge charges combined native residency to resource manager",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
