@@ -739,21 +739,19 @@ func resolvePathWithoutSymlinks(root, logical string) (string, error) {
 	return candidate, nil
 }
 
-// ResolveFilesystemPath authorizes a logical file URI against a named
-// filesystem connection and resolves it beneath the administrator-owned root.
-func (c *Config) ResolveFilesystemPath(
+func (c *Config) filesystemConnectionRootAndLogicalPath(
 	connectionID, requiredCapability, location string,
-) (string, error) {
+) (string, string, error) {
 	external, err := c.resolveExternalIOConnection(connectionID, requiredCapability)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	protocol, err := external.ExternalIo.Discriminator()
 	if err != nil {
-		return "", fmt.Errorf("reading connection %q protocol: %w", connectionID, err)
+		return "", "", fmt.Errorf("reading connection %q protocol: %w", connectionID, err)
 	}
 	if protocol != "filesystem" {
-		return "", fmt.Errorf(
+		return "", "", fmt.Errorf(
 			"connection %q uses protocol %q, want filesystem",
 			connectionID,
 			protocol,
@@ -761,42 +759,104 @@ func (c *Config) ResolveFilesystemPath(
 	}
 	config, err := external.ExternalIo.AsFilesystemExternalIoConfig()
 	if err != nil {
-		return "", fmt.Errorf("decoding filesystem connection %q: %w", connectionID, err)
+		return "", "", fmt.Errorf("decoding filesystem connection %q: %w", connectionID, err)
 	}
 	rootConfig := strings.TrimSpace(config.Root)
 	if !filepath.IsAbs(rootConfig) {
-		return "", fmt.Errorf("filesystem connection %q root must be absolute", connectionID)
+		return "", "", fmt.Errorf(
+			"filesystem connection %q root must be absolute",
+			connectionID,
+		)
 	}
 	root := filepath.Clean(rootConfig)
 	uri, err := url.Parse(location)
 	if err != nil {
-		return "", fmt.Errorf("parsing filesystem location: %w", err)
+		return "", "", fmt.Errorf("parsing filesystem location: %w", err)
 	}
 	if uri.Scheme != "file" {
-		return "", fmt.Errorf("expected file:// scheme, got %q", uri.Scheme)
+		return "", "", fmt.Errorf("expected file:// scheme, got %q", uri.Scheme)
 	}
 	if uri.Host != "" && uri.Host != "localhost" {
-		return "", fmt.Errorf("filesystem location host %q is not local", uri.Host)
+		return "", "", fmt.Errorf("filesystem location host %q is not local", uri.Host)
 	}
 	if uri.RawQuery != "" || uri.Fragment != "" {
-		return "", errors.New("filesystem location cannot include a query or fragment")
+		return "", "", errors.New(
+			"filesystem location cannot include a query or fragment",
+		)
 	}
 	logical := filepath.FromSlash(strings.TrimPrefix(uri.Path, "/"))
 	if logical == "" || logical == "." {
-		return resolvePathWithoutSymlinks(root, ".")
+		return root, ".", nil
 	}
 	if filepath.IsAbs(logical) {
-		return "", errors.New("filesystem location must be relative to the connection root")
+		return "", "", errors.New(
+			"filesystem location must be relative to the connection root",
+		)
 	}
 	cleanLogical := filepath.Clean(logical)
 	if cleanLogical == ".." || strings.HasPrefix(cleanLogical, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("filesystem location %q escapes connection %q root", location, connectionID)
+		return "", "", fmt.Errorf(
+			"filesystem location %q escapes connection %q root",
+			location,
+			connectionID,
+		)
+	}
+	return root, cleanLogical, nil
+}
+
+// ResolveFilesystemPath authorizes a logical file URI against a named
+// filesystem connection and resolves it beneath the administrator-owned root.
+func (c *Config) ResolveFilesystemPath(
+	connectionID, requiredCapability, location string,
+) (string, error) {
+	root, cleanLogical, err := c.filesystemConnectionRootAndLogicalPath(
+		connectionID,
+		requiredCapability,
+		location,
+	)
+	if err != nil {
+		return "", err
 	}
 	resolved, err := resolvePathWithoutSymlinks(root, cleanLogical)
 	if err != nil {
 		return "", fmt.Errorf("resolving filesystem location for connection %q: %w", connectionID, err)
 	}
 	return resolved, nil
+}
+
+// OpenFilesystemPath authorizes and opens a logical file URI beneath a named
+// filesystem connection. Both the connection root and logical subdirectory are
+// held by descriptors, so later renames or symlink swaps cannot redirect
+// operations outside the administrator-owned root.
+func (c *Config) OpenFilesystemPath(
+	connectionID, requiredCapability, location string,
+) (*os.Root, error) {
+	rootPath, cleanLogical, err := c.filesystemConnectionRootAndLogicalPath(
+		connectionID,
+		requiredCapability,
+		location,
+	)
+	if err != nil {
+		return nil, err
+	}
+	connectionRoot, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"opening filesystem connection %q root: %w",
+			connectionID,
+			err,
+		)
+	}
+	defer func() { _ = connectionRoot.Close() }()
+	logicalRoot, err := connectionRoot.OpenRoot(cleanLogical)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"opening filesystem location for connection %q: %w",
+			connectionID,
+			err,
+		)
+	}
+	return logicalRoot, nil
 }
 
 // ResolveObjectStorageS3 resolves one object-engine durability lane. An empty

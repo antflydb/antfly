@@ -755,10 +755,19 @@ func setupStoreAPI(t *testing.T, storeNodeID types.ID) (http.Handler, *MockStore
 	logger := zaptest.NewLogger(t)
 	mockStore := &MockStore{logger: logger, nodeID: storeNodeID}
 	baseDir := t.TempDir()
+	var filesystemConnection common.ConnectionConfig
+	require.NoError(t, filesystemConnection.UnmarshalJSON([]byte(fmt.Sprintf(`{
+		"kind":"external_io",
+		"capabilities":["backup.write","restore.read"],
+		"external_io":{"protocol":"filesystem","root":%q}
+	}`, baseDir))))
 	api := &StoreAPI{
 		logger: logger,
 		store:  mockStore,
 		antflyConfig: &common.Config{
+			Connections: map[string]common.ConnectionConfig{
+				"filesystem": filesystemConnection,
+			},
 			Storage: common.StorageConfig{
 				Local: common.LocalStorageConfig{
 					BaseDir: baseDir,
@@ -1260,9 +1269,22 @@ func TestOpenLocalRestoreArtifactIsRootedAndDescriptorValidated(t *testing.T) {
 		[]byte("portable artifact"),
 		0o600,
 	))
-	file, err := openLocalRestoreArtifact(root, artifactName)
+	restoreRoot, err := os.OpenRoot(root)
+	require.NoError(t, err)
+	defer func() { _ = restoreRoot.Close() }()
+	file, err := openLocalRestoreArtifact(restoreRoot, artifactName)
 	require.NoError(t, err)
 	require.NoError(t, file.Close())
+	for _, invalidName := range []string{
+		"../" + artifactName,
+		"nested/" + artifactName,
+		`nested\` + artifactName,
+		filepath.Join(string(filepath.Separator), artifactName),
+	} {
+		file, err = openLocalRestoreArtifact(restoreRoot, invalidName)
+		require.Nil(t, file)
+		require.Error(t, err)
+	}
 
 	outside := filepath.Join(t.TempDir(), artifactName)
 	require.NoError(t, os.WriteFile(outside, []byte("outside artifact"), 0o600))
@@ -1270,7 +1292,7 @@ func TestOpenLocalRestoreArtifactIsRootedAndDescriptorValidated(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(root, artifactName)); err != nil {
 		t.Skipf("symlinks are unavailable: %v", err)
 	}
-	file, err = openLocalRestoreArtifact(root, artifactName)
+	file, err = openLocalRestoreArtifact(restoreRoot, artifactName)
 	if file != nil {
 		_ = file.Close()
 	}
@@ -1391,6 +1413,36 @@ func TestHandleStartShard_RejectsS3RestoreWithoutAuthorizedConnection(t *testing
 	mockStore.AssertExpectations(t)
 }
 
+func TestHandleStartShard_RejectsLocalRestoreWithoutNamedConnection(t *testing.T) {
+	api, mockStore, _ := setupStoreAPI(t, types.ID(1))
+	newShardID := types.ID(0x103)
+	startReq := ShardStartRequest{
+		ShardConfig: ShardConfig{
+			ByteRange: types.Range{[]byte("g"), []byte("h")},
+			RestoreConfig: &common.BackupConfig{
+				BackupID: "local-backup",
+				Location: "file:///backups",
+				Format:   common.BackupFormatNative,
+			},
+		},
+		Peers: []common.Peer{{ID: 4}},
+	}
+	body, err := json.Marshal(startReq)
+	require.NoError(t, err)
+	mockStore.On("Shard", newShardID).Return(nil, false)
+
+	req := httptest.NewRequest(http.MethodPost, "/shard", bytes.NewReader(body))
+	req.Header.Set("X-Raft-Shard-Id", newShardID.String())
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, req)
+
+	require.Equal(t, http.StatusBadRequest, response.Code)
+	require.Contains(t, response.Body.String(), "named filesystem connection")
+	mockStore.AssertNotCalled(t, "StartRaftGroup")
+	mockStore.AssertExpectations(t)
+}
+
 func TestHandleStartShard_Success_RestoreConfig_File(t *testing.T) {
 	api, mockStore, baseDir := setupStoreAPI(t, types.ID(1))
 	newShardID := types.ID(104)
@@ -1406,7 +1458,7 @@ func TestHandleStartShard_Success_RestoreConfig_File(t *testing.T) {
 	err = os.WriteFile(srcBackupFilePath, []byte("local backup data"), 0o644)
 	require.NoError(t, err)
 
-	restoreLocation := "file://" + srcBackupDir
+	restoreLocation := "file:///restore-source-root/source_backups"
 
 	snapDir := common.SnapDir(baseDir, newShardID, mockStore.ID())
 
@@ -1414,9 +1466,10 @@ func TestHandleStartShard_Success_RestoreConfig_File(t *testing.T) {
 		ShardConfig: ShardConfig{
 			ByteRange: types.Range{[]byte("i"), []byte("j")},
 			RestoreConfig: &common.BackupConfig{
-				BackupID: backupID,
-				Location: restoreLocation,
-				Format:   common.BackupFormatNative,
+				BackupID:   backupID,
+				Connection: "filesystem",
+				Location:   restoreLocation,
+				Format:     common.BackupFormatNative,
 			},
 		},
 		Peers: []common.Peer{{ID: 5}},
@@ -1653,8 +1706,11 @@ func TestHandleStartShard_Failure_RestoreFromFile_SrcNotFound(t *testing.T) {
 	newShardID := types.ID(204)
 	backupID := "filenotfoundbackup"
 
-	nonExistentSrcDir := filepath.Join(baseDir, "non_existent_source_backups")
-	restoreLocation := "file://" + nonExistentSrcDir
+	require.NoError(t, os.Mkdir(
+		filepath.Join(baseDir, "non_existent_source_backups"),
+		0o750,
+	))
+	restoreLocation := "file:///non_existent_source_backups"
 
 	startReq := ShardStartRequest{
 		ShardConfig: ShardConfig{
@@ -1662,9 +1718,10 @@ func TestHandleStartShard_Failure_RestoreFromFile_SrcNotFound(t *testing.T) {
 			// FIXME (ajr) Why doesn't the below line work with the DeepEqual of assert.ObjectsAreEqual?
 			// ByteRange:     types.Range{[]byte{0x00}, []byte{0xFF}},
 			RestoreConfig: &common.BackupConfig{
-				BackupID: backupID,
-				Location: restoreLocation,
-				Format:   common.BackupFormatNative,
+				BackupID:   backupID,
+				Connection: "filesystem",
+				Location:   restoreLocation,
+				Format:     common.BackupFormatNative,
 			},
 		},
 		Peers: []common.Peer{{ID: 1}},

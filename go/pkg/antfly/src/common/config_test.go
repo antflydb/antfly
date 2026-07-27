@@ -16,6 +16,7 @@ package common
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -746,7 +747,17 @@ func TestValidateStorage(t *testing.T) {
 			"file:///daily/backup-1",
 		)
 		require.NoError(t, err)
-		assert.Equal(t, filepath.Join(root, "daily", "backup-1"), resolved)
+		canonicalRoot, err := filepath.EvalSymlinks(root)
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(canonicalRoot, "daily", "backup-1"), resolved)
+		require.NoError(t, os.MkdirAll(resolved, 0o750))
+		opened, err := config.OpenFilesystemPath(
+			"filesystem",
+			"restore.read",
+			"file:///daily/backup-1",
+		)
+		require.NoError(t, err)
+		require.NoError(t, opened.Close())
 
 		_, err = config.ResolveFilesystemPath(
 			"filesystem",
@@ -772,6 +783,36 @@ func TestValidateStorage(t *testing.T) {
 			"file:///escape/backup-1",
 		)
 		require.ErrorContains(t, err, "cannot traverse symlink")
+		_, err = config.OpenFilesystemPath(
+			"filesystem",
+			"restore.read",
+			"file:///escape",
+		)
+		require.Error(t, err)
+
+		heldDir := filepath.Join(root, "held")
+		require.NoError(t, os.Mkdir(heldDir, 0o750))
+		require.NoError(t, os.WriteFile(
+			filepath.Join(heldDir, "artifact"),
+			[]byte("authorized"),
+			0o600,
+		))
+		heldRoot, err := config.OpenFilesystemPath(
+			"filesystem",
+			"restore.read",
+			"file:///held",
+		)
+		require.NoError(t, err)
+		defer func() { _ = heldRoot.Close() }()
+		movedDir := filepath.Join(root, "held-moved")
+		require.NoError(t, os.Rename(heldDir, movedDir))
+		require.NoError(t, os.Symlink(outside, heldDir))
+		heldArtifact, err := heldRoot.Open("artifact")
+		require.NoError(t, err)
+		body, err := io.ReadAll(heldArtifact)
+		require.NoError(t, err)
+		require.NoError(t, heldArtifact.Close())
+		require.Equal(t, []byte("authorized"), body)
 
 		s3Info, err := config.ResolveS3Info(
 			"s3",

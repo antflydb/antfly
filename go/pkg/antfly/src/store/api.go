@@ -114,15 +114,15 @@ func safeJoinUnder(base, name string) (string, error) {
 	return joined, nil
 }
 
-func openLocalRestoreArtifact(base, name string) (*os.File, error) {
-	if _, err := safeJoinUnder(base, name); err != nil {
-		return nil, err
+func openLocalRestoreArtifact(root *os.Root, name string) (*os.File, error) {
+	if root == nil {
+		return nil, errors.New("local restore root is required")
 	}
-	root, err := os.OpenRoot(base)
-	if err != nil {
-		return nil, fmt.Errorf("opening local restore root: %w", err)
+	if filepath.IsAbs(name) ||
+		filepath.Base(name) != name ||
+		strings.ContainsAny(name, `/\`) {
+		return nil, fmt.Errorf("path component %q must be a file name", name)
 	}
-	defer func() { _ = root.Close() }()
 	file, err := root.OpenFile(name, os.O_RDONLY|localRestoreNonblockingFlag, 0)
 	if err != nil {
 		return nil, err
@@ -192,6 +192,17 @@ func (h *StoreAPI) authorizedLocalBackupDir(
 		return h.antflyConfig.ResolveFilesystemPath(connection, capability, location)
 	}
 	return h.localBackupDir(location)
+}
+
+func (h *StoreAPI) authorizedLocalRestoreRoot(
+	connection, capability, location string,
+) (*os.Root, error) {
+	if strings.TrimSpace(connection) == "" {
+		return nil, errors.New(
+			"local restores require a named filesystem connection",
+		)
+	}
+	return h.antflyConfig.OpenFilesystemPath(connection, capability, location)
 }
 
 func validateBackupIDForHTTP(w http.ResponseWriter, backupID string) bool {
@@ -635,7 +646,7 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 				// This case might occur if the leader specifies a local file path accessible to this node,
 				// though typically for file transfers it would use multipart. Restrict local filesystem
 				// restore sources to the configured Antfly base directory.
-				localBasePath, err := h.authorizedLocalBackupDir(
+				localRoot, err := h.authorizedLocalRestoreRoot(
 					restoreConf.Connection,
 					"restore.read",
 					restoreConf.Location,
@@ -643,17 +654,15 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 				if err != nil {
 					return fmt.Errorf("%w: invalid restore location: %v", ErrBadRequest, err)
 				}
-				srcPath, err := safeJoinUnder(localBasePath, backupFileName)
-				if err != nil {
-					return fmt.Errorf("%w: invalid restore path: %v", ErrBadRequest, err)
-				}
+				defer func() { _ = localRoot.Close() }()
+				srcPath := filepath.Join(localRoot.Name(), backupFileName)
 
 				destPath, err := safeJoinUnder(snapDir, backupFileName)
 				if err != nil {
 					return fmt.Errorf("%w: invalid destination backup path: %v", ErrBadRequest, err)
 				}
 
-				input, err := openLocalRestoreArtifact(localBasePath, backupFileName)
+				input, err := openLocalRestoreArtifact(localRoot, backupFileName)
 				if err != nil {
 					if errors.Is(err, os.ErrNotExist) {
 						return fmt.Errorf("local restore artifact %s does not exist", srcPath)

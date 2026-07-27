@@ -58,6 +58,19 @@ type cancelingIntegrityBackupStore struct {
 	canceled       atomic.Bool
 }
 
+type metadataOnlyHealthBackupStore struct {
+	*fileBackupStore
+	identityChecks atomic.Int32
+}
+
+func (s *metadataOnlyHealthBackupStore) ValidateArtifactIdentity(
+	context.Context,
+	common.BackupArtifactIntegrity,
+) error {
+	s.identityChecks.Add(1)
+	return errors.New("health validation must not read artifact bodies")
+}
+
 func (*cancelingIntegrityBackupStore) EnsureMetadataAbsent(context.Context, string) error {
 	return nil
 }
@@ -78,6 +91,13 @@ func (*cancelingIntegrityBackupStore) DeleteArtifact(context.Context, string) er
 	return nil
 }
 func (*cancelingIntegrityBackupStore) ValidateArtifact(context.Context, string) error {
+	return nil
+}
+func (*cancelingIntegrityBackupStore) ValidateArtifactMetadata(
+	context.Context,
+	string,
+	uint64,
+) error {
 	return nil
 }
 func (s *cancelingIntegrityBackupStore) ValidateArtifactIdentity(
@@ -144,6 +164,13 @@ func (s *cleanupOrderBackupStore) DeleteArtifact(context.Context, string) error 
 	return nil
 }
 func (*cleanupOrderBackupStore) ValidateArtifact(context.Context, string) error { return nil }
+func (*cleanupOrderBackupStore) ValidateArtifactMetadata(
+	context.Context,
+	string,
+	uint64,
+) error {
+	return nil
+}
 func (*cleanupOrderBackupStore) ValidateArtifactIdentity(
 	context.Context,
 	common.BackupArtifactIntegrity,
@@ -325,6 +352,16 @@ func TestFileBackupStoreValidatesPortableArtifactIdentity(t *testing.T) {
 		0o600,
 	))
 	backupStore := &fileBackupStore{location: root}
+	require.NoError(t, backupStore.ValidateArtifactMetadata(
+		context.Background(),
+		artifact.Name,
+		artifact.SizeBytes,
+	))
+	require.ErrorIs(t, backupStore.ValidateArtifactMetadata(
+		context.Background(),
+		artifact.Name,
+		artifact.SizeBytes+1,
+	), common.ErrBackupArtifactIntegrityMismatch)
 	require.NoError(t, backupStore.ValidateArtifactIdentity(
 		context.Background(),
 		artifact,
@@ -406,6 +443,16 @@ func TestS3BackupStoreArtifactValidationUsesReadOnlyObjectRequests(t *testing.T)
 		SecretAccessKey:  "secret",
 	}}
 	require.NoError(t, backupStore.ValidateArtifact(context.Background(), artifact.Name))
+	require.NoError(t, backupStore.ValidateArtifactMetadata(
+		context.Background(),
+		artifact.Name,
+		artifact.SizeBytes,
+	))
+	require.ErrorIs(t, backupStore.ValidateArtifactMetadata(
+		context.Background(),
+		artifact.Name,
+		artifact.SizeBytes+1,
+	), common.ErrBackupArtifactIntegrityMismatch)
 	require.NoError(t, backupStore.ValidateArtifactIdentity(context.Background(), artifact))
 	require.False(t, bucketAdmissionRequested.Load())
 }
@@ -1509,6 +1556,112 @@ func TestNewestClusterBackupAttemptMustBeCommittedAndRestorable(t *testing.T) {
 	require.NoError(t, validateNewestClusterBackupAttempt(
 		context.Background(), "file://"+root, nil, backupStore, attempt,
 	))
+
+	markerDigest, err := writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+	_, err = publishClusterBackupAttemptHead(
+		context.Background(),
+		"file://"+root,
+		nil,
+		ClusterBackupAttemptHead{
+			AttemptID:    attempt.AttemptID,
+			BackupID:     attempt.BackupID,
+			MarkerSHA256: hex.EncodeToString(markerDigest[:]),
+		},
+	)
+	require.NoError(t, err)
+	healthStore := &metadataOnlyHealthBackupStore{fileBackupStore: backupStore}
+	validatedMeta, err := validateNewestClusterBackupRepositoryMetadata(
+		context.Background(),
+		"file://"+root,
+		nil,
+		healthStore,
+	)
+	require.Nil(t, validatedMeta)
+	require.ErrorContains(t, err, clusterBackupAttemptStateActive)
+	owned, err := transitionClusterBackupAttemptHead(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt.AttemptID,
+		clusterBackupAttemptStateCommitted,
+	)
+	require.NoError(t, err)
+	require.True(t, owned)
+	validatedMeta, err = validateNewestClusterBackupRepositoryMetadata(
+		context.Background(),
+		"file://"+root,
+		nil,
+		healthStore,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, validatedMeta)
+	require.Equal(t, attempt.BackupID, validatedMeta.BackupID)
+	require.Zero(t, healthStore.identityChecks.Load())
+
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, artifactNames[0]),
+		[]byte("artifacU"),
+		0o600,
+	))
+	validatedMeta, err = validateNewestClusterBackupRepositoryMetadata(
+		context.Background(),
+		"file://"+root,
+		nil,
+		healthStore,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, validatedMeta)
+	require.Equal(t, attempt.BackupID, validatedMeta.BackupID)
+	require.Zero(t, healthStore.identityChecks.Load())
+
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, artifactNames[0]),
+		[]byte("short"),
+		0o600,
+	))
+	_, err = validateNewestClusterBackupRepositoryMetadata(
+		context.Background(),
+		"file://"+root,
+		nil,
+		healthStore,
+	)
+	require.ErrorIs(t, err, common.ErrBackupArtifactIntegrityMismatch)
+}
+
+func TestNewestClusterBackupRepositoryRejectsMarkerWithoutHead(t *testing.T) {
+	root := t.TempDir()
+	attempt := &ClusterBackupAttempt{
+		Version:            clusterBackupAttemptVersion,
+		AttemptID:          "afba-headless",
+		BackupID:           "backup-1",
+		CreatedAt:          time.Now().UTC(),
+		Format:             common.BackupFormatPortable,
+		ExpectedTableCount: 1,
+		TableNames:         []string{"documents"},
+		MetadataIDs:        []string{"documents-backup-1"},
+		ArtifactNames:      []string{"backup-1-1.afb"},
+	}
+	_, err := writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+	validatedMeta, err := validateNewestClusterBackupRepositoryMetadata(
+		context.Background(),
+		"file://"+root,
+		nil,
+		&fileBackupStore{location: root},
+	)
+	require.Nil(t, validatedMeta)
+	require.ErrorContains(t, err, "without an authoritative head")
 }
 
 func TestClusterBackupAttemptRejectsOverlappingIdentifiers(t *testing.T) {

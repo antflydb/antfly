@@ -17,6 +17,7 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -29,7 +30,10 @@ func TestOpenLocalRestoreArtifactRejectsFIFOWithoutBlocking(t *testing.T) {
 	const artifactName = "backup-1-1.afb"
 	require.NoError(t, syscall.Mkfifo(filepath.Join(root, artifactName), 0o600))
 
-	file, err := openLocalRestoreArtifact(root, artifactName)
+	restoreRoot, err := os.OpenRoot(root)
+	require.NoError(t, err)
+	defer func() { _ = restoreRoot.Close() }()
+	file, err := openLocalRestoreArtifact(restoreRoot, artifactName)
 	if file != nil {
 		_ = file.Close()
 	}

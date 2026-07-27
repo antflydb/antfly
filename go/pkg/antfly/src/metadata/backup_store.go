@@ -46,6 +46,7 @@ type backupStore interface {
 	DeleteMetadata(ctx context.Context, id string) error
 	DeleteArtifact(ctx context.Context, name string) error
 	ValidateArtifact(ctx context.Context, name string) error
+	ValidateArtifactMetadata(ctx context.Context, name string, expectedSize uint64) error
 	ValidateArtifactIdentity(
 		ctx context.Context,
 		artifact common.BackupArtifactIntegrity,
@@ -635,19 +636,44 @@ func (s *fileBackupStore) DeleteArtifact(ctx context.Context, name string) error
 }
 
 func (s *fileBackupStore) ValidateArtifact(ctx context.Context, name string) error {
+	return s.ValidateArtifactMetadata(ctx, name, 0)
+}
+
+func (s *fileBackupStore) ValidateArtifactMetadata(
+	ctx context.Context,
+	name string,
+	expectedSize uint64,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if name == "" || filepath.Base(name) != name {
 		return fmt.Errorf("invalid backup artifact name %q", name)
 	}
-	root := strings.TrimPrefix(s.location, "file://")
-	info, err := os.Stat(filepath.Join(root, name))
+	rootPath := strings.TrimPrefix(s.location, "file://")
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return fmt.Errorf("opening backup root: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	file, err := root.Open(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
 	if err != nil {
 		return err
 	}
 	if !info.Mode().IsRegular() || info.Size() <= 0 {
 		return fmt.Errorf("backup artifact %q is not a non-empty regular file", name)
+	}
+	if expectedSize != 0 && uint64(info.Size()) != expectedSize {
+		return fmt.Errorf(
+			"%w: %s has an unexpected file size",
+			common.ErrBackupArtifactIntegrityMismatch,
+			name,
+		)
 	}
 	return nil
 }
@@ -985,6 +1011,14 @@ func (s *s3BackupStore) DeleteArtifact(ctx context.Context, name string) error {
 }
 
 func (s *s3BackupStore) ValidateArtifact(ctx context.Context, name string) error {
+	return s.ValidateArtifactMetadata(ctx, name, 0)
+}
+
+func (s *s3BackupStore) ValidateArtifactMetadata(
+	ctx context.Context,
+	name string,
+	expectedSize uint64,
+) error {
 	key, err := s.artifactKey(name)
 	if err != nil {
 		return err
@@ -1004,6 +1038,13 @@ func (s *s3BackupStore) ValidateArtifact(ctx context.Context, name string) error
 	}
 	if info.Size <= 0 {
 		return fmt.Errorf("backup artifact %q is empty", name)
+	}
+	if expectedSize != 0 && uint64(info.Size) != expectedSize {
+		return fmt.Errorf(
+			"%w: %s has an unexpected object size",
+			common.ErrBackupArtifactIntegrityMismatch,
+			name,
+		)
 	}
 	return nil
 }
