@@ -4028,10 +4028,19 @@ pub const Node = struct {
                     runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
                 ));
                 var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-                var admission_leases = std.ArrayListUnmanaged(runtime.tier.memory.AdmissionLease).empty;
+                const BatchAdmission = struct {
+                    lease: runtime.tier.memory.AdmissionLease,
+                    estimate: runtime.tier.memory.Estimate,
+                };
+                // Allocate ownership slots before acquiring capacity. Once a
+                // process-wide lease is granted, publishing it here cannot fail.
+                const admissions = try ctx.allocator.alloc(?BatchAdmission, group_indices.items.len);
+                @memset(admissions, null);
                 defer {
-                    for (admission_leases.items) |*lease| lease.release();
-                    admission_leases.deinit(ctx.allocator);
+                    for (admissions) |*maybe_admission| {
+                        if (maybe_admission.*) |*admission| admission.lease.release();
+                    }
+                    ctx.allocator.free(admissions);
                 }
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
@@ -4063,10 +4072,14 @@ pub const Node = struct {
                             .message = @errorName(err),
                             .retryable = err == error.ResourceTemporarilyUnavailable,
                         };
+                        run_budget.releaseEstimate(resource_estimate);
                         pending[idx] = false;
                         continue;
                     };
-                    try admission_leases.append(ctx.allocator, lease);
+                    admissions[pos] = .{
+                        .lease = lease,
+                        .estimate = resource_estimate,
+                    };
                 }
 
                 var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
@@ -4181,6 +4194,11 @@ pub const Node = struct {
                             .prompt_bytes = prompt_bytes[pos],
                             .max_tokens = configs[pos].max_tokens,
                         }) catch |err| {
+                            if (admissions[pos]) |*admission| {
+                                admission.lease.release();
+                                run_budget.releaseEstimate(admission.estimate);
+                                admissions[pos] = null;
+                            }
                             results[idx].@"error" = .{ .code = "QUEUE_FULL", .message = @errorName(err), .retryable = true };
                             pending[idx] = false;
                             continue;
