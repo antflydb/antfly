@@ -619,31 +619,34 @@ func (h *StoreAPI) handleStartShard(w http.ResponseWriter, r *http.Request) {
 					return fmt.Errorf("%w: invalid destination backup path: %v", ErrBadRequest, err)
 				}
 
-				if _, err := os.Stat(srcPath); err == nil { //nolint:gosec // G703: path from internal config
-					input, err := os.Open(filepath.Clean(srcPath))
-					if err != nil {
-						return fmt.Errorf("opening local backup file %s: %w", srcPath, err)
+				info, err := os.Stat(srcPath) //nolint:gosec // G703: path from authorized internal config
+				if err != nil {
+					if os.IsNotExist(err) {
+						return fmt.Errorf("local restore artifact %s does not exist", srcPath)
 					}
-					defer func() { _ = input.Close() }()
-					if err := copyRestoreArtifactAtomically(
-						r.Context(),
-						input,
-						destPath,
-						artifact,
-					); err != nil {
-						return fmt.Errorf("copying local backup file from %s to %s: %w", srcPath, destPath, err)
-					}
-					h.logger.Info("Successfully copied local backup",
-						zap.String("backupFileName", backupFileName),
-						zap.String("destPath", destPath),
-						zap.Stringer("newShardID", newShardID))
-					initWithDBArchive = initArchiveFromBackupFile(backupFileName)
-				} else {
-					h.logger.Warn("RestoreConfig for shard specified local file, but it was not found",
-						zap.Stringer("newShardID", newShardID),
-						zap.String("srcPath", srcPath))
-					// Not necessarily a fatal error for the handler here, PebbleStorage will try to load this archive name.
+					return fmt.Errorf("stating local restore artifact %s: %w", srcPath, err)
 				}
+				if !info.Mode().IsRegular() {
+					return fmt.Errorf("local restore artifact %s is not a regular file", srcPath)
+				}
+				input, err := os.Open(filepath.Clean(srcPath))
+				if err != nil {
+					return fmt.Errorf("opening local backup file %s: %w", srcPath, err)
+				}
+				defer func() { _ = input.Close() }()
+				if err := copyRestoreArtifactAtomically(
+					r.Context(),
+					input,
+					destPath,
+					artifact,
+				); err != nil {
+					return fmt.Errorf("copying local backup file from %s to %s: %w", srcPath, destPath, err)
+				}
+				h.logger.Info("Successfully copied local backup",
+					zap.String("backupFileName", backupFileName),
+					zap.String("destPath", destPath),
+					zap.Stringer("newShardID", newShardID))
+				initWithDBArchive = initArchiveFromBackupFile(backupFileName)
 			}
 		}
 

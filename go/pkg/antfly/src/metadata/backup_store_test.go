@@ -18,6 +18,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +45,65 @@ type cleanupOrderBackupStore struct {
 	artifactsDeleted  atomic.Int32
 	phaseViolation    atomic.Bool
 }
+
+type cancelingIntegrityBackupStore struct {
+	metadata       map[string]*backupMetadata
+	blockedStarted chan struct{}
+	startOnce      sync.Once
+	canceled       atomic.Bool
+}
+
+func (*cancelingIntegrityBackupStore) EnsureMetadataAbsent(context.Context, string) error {
+	return nil
+}
+func (*cancelingIntegrityBackupStore) ReserveBackupID(context.Context, string) error {
+	return nil
+}
+func (*cancelingIntegrityBackupStore) DeleteMetadata(context.Context, string) error {
+	return nil
+}
+func (*cancelingIntegrityBackupStore) DeleteArtifact(context.Context, string) error {
+	return nil
+}
+func (*cancelingIntegrityBackupStore) ValidateArtifact(context.Context, string) error {
+	return nil
+}
+func (s *cancelingIntegrityBackupStore) ValidateArtifactIdentity(
+	ctx context.Context,
+	artifact common.BackupArtifactIntegrity,
+) error {
+	if artifact.Name == "backup-1-1.afb" {
+		<-s.blockedStarted
+		return errors.New("corrupt artifact")
+	}
+	s.startOnce.Do(func() { close(s.blockedStarted) })
+	<-ctx.Done()
+	s.canceled.Store(true)
+	return ctx.Err()
+}
+func (*cancelingIntegrityBackupStore) ReleaseBackupID(context.Context, string) error {
+	return nil
+}
+func (*cancelingIntegrityBackupStore) WriteMetadata(
+	context.Context,
+	string,
+	*store.Table,
+	common.BackupFormat,
+	[]common.BackupArtifactIntegrity,
+) error {
+	return nil
+}
+func (s *cancelingIntegrityBackupStore) ReadMetadata(
+	_ context.Context,
+	id string,
+) (*backupMetadata, error) {
+	metadata, ok := s.metadata[id]
+	if !ok {
+		return nil, errors.New("metadata not found")
+	}
+	return metadata, nil
+}
+func (*cancelingIntegrityBackupStore) ResolvedLocation() string { return "" }
 
 func (*cleanupOrderBackupStore) EnsureMetadataAbsent(context.Context, string) error { return nil }
 func (*cleanupOrderBackupStore) ReserveBackupID(context.Context, string) error      { return nil }
@@ -262,6 +324,122 @@ func TestFileBackupStoreValidatesPortableArtifactIdentity(t *testing.T) {
 		backupStore.ValidateArtifactIdentity(context.Background(), artifact),
 		common.ErrBackupArtifactIntegrityMismatch,
 	)
+}
+
+func TestS3BackupStoreArtifactValidationUsesReadOnlyObjectRequests(t *testing.T) {
+	body := []byte("portable-artifact")
+	digest := sha256.Sum256(body)
+	artifact := common.BackupArtifactIntegrity{
+		Name:      "backup-1-1.afb",
+		SizeBytes: uint64(len(body)),
+		SHA256:    hex.EncodeToString(digest[:]),
+	}
+	var bucketAdmissionRequested atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bucket" || r.URL.Path == "/bucket/" {
+			if r.Method == http.MethodHead {
+				bucketAdmissionRequested.Store(true)
+				http.Error(w, "bucket admission forbidden", http.StatusForbidden)
+				return
+			}
+			// MinIO may discover the bucket region before an object request.
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(
+				`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint></LocationConstraint>`,
+			))
+			return
+		}
+		if r.URL.Path != "/bucket/backups/"+artifact.Name {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("ETag", `"artifact-etag"`)
+		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		switch r.Method {
+		case http.MethodHead:
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			_, _ = w.Write(body)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	backupStore := &s3BackupStore{s3Config: &common.S3Info{
+		Endpoint:         server.URL,
+		Bucket:           "bucket",
+		Prefix:           "backups",
+		AddressingStyle:  common.S3ExternalIoConfigAddressingStylePath,
+		CredentialSource: common.AwsCredentialConfigSourceStatic,
+		AccessKeyId:      "access",
+		SecretAccessKey:  "secret",
+	}}
+	require.NoError(t, backupStore.ValidateArtifact(context.Background(), artifact.Name))
+	require.NoError(t, backupStore.ValidateArtifactIdentity(context.Background(), artifact))
+	require.False(t, bucketAdmissionRequested.Load())
+}
+
+func TestClusterBackupArtifactValidationCancelsSiblingTransfers(t *testing.T) {
+	const digest = "0000000000000000000000000000000000000000000000000000000000000000"
+	firstTable := &store.Table{
+		Name:   "first",
+		Shards: map[types.ID]*store.ShardConfig{1: {}},
+	}
+	secondTable := &store.Table{
+		Name:   "second",
+		Shards: map[types.ID]*store.ShardConfig{2: {}},
+	}
+	backupStore := &cancelingIntegrityBackupStore{
+		metadata: map[string]*backupMetadata{
+			tableBackupMetadataID(firstTable.Name, "backup-1"): {
+				Version: backupMetadataVersion,
+				Format:  common.BackupFormatPortable,
+				Table:   firstTable,
+				Artifacts: []common.BackupArtifactIntegrity{{
+					Name: "backup-1-1.afb", SizeBytes: 1, SHA256: digest,
+				}},
+			},
+			tableBackupMetadataID(secondTable.Name, "backup-1"): {
+				Version: backupMetadataVersion,
+				Format:  common.BackupFormatPortable,
+				Table:   secondTable,
+				Artifacts: []common.BackupArtifactIntegrity{{
+					Name: "backup-1-2.afb", SizeBytes: 1, SHA256: digest,
+				}},
+			},
+		},
+		blockedStarted: make(chan struct{}),
+	}
+	err := validateClusterBackupArtifacts(
+		context.Background(),
+		backupStore,
+		&ClusterBackupMetadata{
+			Version:             clusterBackupMetadataVersion,
+			State:               clusterBackupStateComplete,
+			BackupID:            "backup-1",
+			Format:              common.BackupFormatPortable,
+			ExpectedTableCount:  2,
+			CompletedTableCount: 2,
+			Tables: []ClusterBackupTableInfo{
+				{
+					Name:           firstTable.Name,
+					Status:         "completed",
+					ShardCount:     1,
+					BackupLocation: "file:///backups/first.json",
+				},
+				{
+					Name:           secondTable.Name,
+					Status:         "completed",
+					ShardCount:     1,
+					BackupLocation: "file:///backups/second.json",
+				},
+			},
+		},
+	)
+	require.ErrorContains(t, err, "corrupt artifact")
+	require.True(t, backupStore.canceled.Load())
 }
 
 func TestPortableArtifactIdentityValidationBindsRequestedBackupID(t *testing.T) {
@@ -1075,6 +1253,42 @@ func TestNewestClusterBackupAttemptMustBeCommittedAndRestorable(t *testing.T) {
 	require.NoError(t, validateNewestClusterBackupAttempt(
 		context.Background(), "file://"+root, nil, backupStore, attempt,
 	))
+	markerDigest, err := writeClusterBackupAttempt(
+		context.Background(),
+		"file://"+root,
+		nil,
+		attempt,
+	)
+	require.NoError(t, err)
+	_, err = publishClusterBackupAttemptHead(
+		context.Background(),
+		"file://"+root,
+		nil,
+		ClusterBackupAttemptHead{
+			AttemptID:    attempt.AttemptID,
+			BackupID:     attempt.BackupID,
+			MarkerSHA256: hex.EncodeToString(markerDigest[:]),
+		},
+	)
+	require.NoError(t, err)
+	require.NoError(t, validateNewestClusterBackupRepository(
+		context.Background(),
+		"file://"+root,
+		nil,
+		backupStore,
+	))
+
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, artifactNames[0]),
+		[]byte("artifacU"),
+		0o600,
+	))
+	require.Error(t, validateNewestClusterBackupRepository(
+		context.Background(),
+		"file://"+root,
+		nil,
+		backupStore,
+	))
 }
 
 func TestClusterBackupAttemptRejectsOverlappingIdentifiers(t *testing.T) {
@@ -1323,6 +1537,30 @@ func TestClusterBackupAttemptReclamationClaimIsExclusiveAndRecoverable(t *testin
 	require.NotNil(t, recovered)
 	require.Equal(t, uint64(3), recovered.Generation)
 	require.True(t, recovered.ExpiresAt.After(reclaiming.ExpiresAt))
+}
+
+func TestStaleClusterBackupAttemptReclamationHonorsParentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	reclaimed, err := reclaimStaleClusterBackupAttempt(
+		ctx,
+		&cleanupOrderBackupStore{},
+		"file://"+t.TempDir(),
+		nil,
+		&ClusterBackupAttempt{
+			Version:            clusterBackupAttemptVersion,
+			AttemptID:          "afba-canceled-reclaim",
+			BackupID:           "backup-1",
+			CreatedAt:          time.Now().UTC(),
+			Format:             common.BackupFormatPortable,
+			ExpectedTableCount: 1,
+			TableNames:         []string{"documents"},
+			MetadataIDs:        []string{"documents-backup-1"},
+			ArtifactNames:      []string{"backup-1-1.afb"},
+		},
+	)
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, reclaimed)
 }
 
 func TestClusterBackupAttemptProducerReprovesLeaseBeforeCleanup(t *testing.T) {

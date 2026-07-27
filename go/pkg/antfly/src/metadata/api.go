@@ -88,6 +88,7 @@ type TableApi struct {
 
 	backupTransferOnce sync.Once
 	backupTransfers    chan struct{}
+	backupMaintenance  sync.Map // repository identity -> struct{}
 }
 type ClusterApi struct {
 	ln     *MetadataStore

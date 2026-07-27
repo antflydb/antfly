@@ -726,7 +726,7 @@ func (s *s3BackupStore) ValidateArtifact(ctx context.Context, name string) error
 	if err != nil {
 		return err
 	}
-	client, err := s.s3Config.EnsureBucket(ctx)
+	client, err := s.s3Config.NewMinioClient()
 	if err != nil {
 		return err
 	}
@@ -756,7 +756,7 @@ func (s *s3BackupStore) ValidateArtifactIdentity(
 	if err != nil {
 		return err
 	}
-	client, err := s.s3Config.EnsureBucket(ctx)
+	client, err := s.s3Config.NewMinioClient()
 	if err != nil {
 		return err
 	}

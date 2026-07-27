@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/schema"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
@@ -1129,6 +1130,85 @@ func TestHandleStartShard_PortableMultipartVerifiesArtifactIntegrity(t *testing.
 	}
 }
 
+func TestDownloadFromS3VerifiesBeforeAtomicPublication(t *testing.T) {
+	validBody := []byte("portable-artifact")
+	corruptBody := append([]byte(nil), validBody...)
+	corruptBody[0] ^= 0xff
+	currentBody := validBody
+	digest := sha256.Sum256(validBody)
+	artifact := &common.BackupArtifactIntegrity{
+		Name:      "backup-1-1.afb",
+		SizeBytes: uint64(len(validBody)),
+		SHA256:    hex.EncodeToString(digest[:]),
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bucket" || r.URL.Path == "/bucket/" {
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(
+				`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint></LocationConstraint>`,
+			))
+			return
+		}
+		if r.URL.Path != "/bucket/backups/"+artifact.Name {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("ETag", `"artifact-etag"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(currentBody)))
+		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+		switch r.Method {
+		case http.MethodHead:
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.Header.Get("If-Match") != `"artifact-etag"` {
+				http.Error(w, "missing object identity precondition", http.StatusPreconditionFailed)
+				return
+			}
+			_, _ = w.Write(currentBody)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	s3Info := &common.S3Info{
+		Endpoint:           server.URL,
+		Bucket:             "bucket",
+		Prefix:             "backups",
+		AddressingStyle:    common.S3ExternalIoConfigAddressingStylePath,
+		CredentialSource:   common.AwsCredentialConfigSourceStatic,
+		AccessKeyId:        "access",
+		SecretAccessKey:    "secret",
+		BucketProvisioning: common.S3ExternalIoConfigBucketProvisioningRequireExisting,
+	}
+	destPath := filepath.Join(t.TempDir(), artifact.Name)
+	require.NoError(t, downloadFromS3(
+		context.Background(),
+		zaptest.NewLogger(t),
+		artifact.Name,
+		destPath,
+		s3Info,
+		artifact,
+	))
+	require.FileExists(t, destPath)
+	published, err := os.ReadFile(destPath)
+	require.NoError(t, err)
+	require.Equal(t, validBody, published)
+
+	currentBody = corruptBody
+	require.ErrorIs(t, downloadFromS3(
+		context.Background(),
+		zaptest.NewLogger(t),
+		artifact.Name,
+		destPath,
+		s3Info,
+		artifact,
+	), common.ErrBackupArtifactIntegrityMismatch)
+	published, err = os.ReadFile(destPath)
+	require.NoError(t, err)
+	require.Equal(t, validBody, published)
+}
+
 func TestCopyLocalBackupToSnapDirVerifiesBeforePublishing(t *testing.T) {
 	const backupID = "portable-local"
 	shardID := types.ID(0x302)
@@ -1507,7 +1587,6 @@ func TestHandleStartShard_Failure_RestoreFromFile_SrcNotFound(t *testing.T) {
 
 	nonExistentSrcDir := filepath.Join(baseDir, "non_existent_source_backups")
 	restoreLocation := "file://" + nonExistentSrcDir
-	expectedArchiveName := fmt.Sprintf("%s-%s.tar.zst", backupID, newShardID)
 
 	startReq := ShardStartRequest{
 		ShardConfig: ShardConfig{
@@ -1525,15 +1604,6 @@ func TestHandleStartShard_Failure_RestoreFromFile_SrcNotFound(t *testing.T) {
 	jsonBody, _ := json.Marshal(startReq)
 
 	mockStore.On("Shard", newShardID).Return(nil, false)
-	started := signalOnCall(mockStore.On("StartRaftGroup", newShardID, startReq.Peers, startReq.Join, mock.MatchedBy(func(ssc *ShardStartConfig) bool {
-		snapDir := common.SnapDir(baseDir, newShardID, mockStore.ID())
-		destPath := filepath.Join(snapDir, expectedArchiveName)
-		_, statErr := os.Stat(destPath)
-		assert.Error(t, statErr, "Backup file should NOT have been copied as source doesn't exist")
-		return ssc.InitWithDBArchive == "" &&
-			assert.ObjectsAreEqual(ssc.ShardConfig, startReq.ShardConfig)
-	})).
-		Return())
 
 	req := httptest.NewRequest(http.MethodPost, "/shard", bytes.NewReader(jsonBody))
 	req.Header.Set("X-Raft-Shard-Id", newShardID.String())
@@ -1542,8 +1612,16 @@ func TestHandleStartShard_Failure_RestoreFromFile_SrcNotFound(t *testing.T) {
 	rr := httptest.NewRecorder()
 	api.ServeHTTP(rr, req)
 
-	assert.Equal(t, http.StatusOK, rr.Code) // Handler proceeds with warning, Pebble will fail later
-	<-started
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	assert.Contains(t, rr.Body.String(), "local restore artifact")
+	mockStore.AssertNotCalled(
+		t,
+		"StartRaftGroup",
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+	)
 	mockStore.AssertExpectations(t)
 }
 

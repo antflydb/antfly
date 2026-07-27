@@ -520,6 +520,7 @@ const (
 	clusterBackupAttemptReclaimGrace = clusterBackupAttemptLeaseDuration +
 		clusterBackupAttemptLeaseSafetyMargin
 	clusterBackupCommitTimeout       = 2 * time.Minute
+	clusterBackupMaintenanceTimeout  = 30 * time.Second
 	clusterBackupAttemptScanLimit    = 64
 	clusterBackupHealthScanLimit     = 10_000
 	clusterBackupAttemptReclaimLimit = 2
@@ -1457,13 +1458,17 @@ func deleteClusterBackupAttempt(
 }
 
 func reclaimStaleClusterBackupAttempt(
+	parent context.Context,
 	metadataStore backupStore,
 	resolvedLocation string,
 	s3Info *common.S3Info,
 	attempt *ClusterBackupAttempt,
 ) (bool, error) {
+	if err := parent.Err(); err != nil {
+		return false, err
+	}
 	ctx, cancel := context.WithTimeout(
-		context.Background(),
+		parent,
 		clusterBackupAttemptCleanupTimeout,
 	)
 	defer cancel()
@@ -1473,6 +1478,9 @@ func reclaimStaleClusterBackupAttempt(
 		attempt.BackupID,
 		s3Info,
 	)
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	switch {
 	case errors.Is(availabilityErr, ErrBackupAlreadyExists):
 		// Retain committed attempt journals. They are the durable ordering
@@ -1594,6 +1602,72 @@ func currentClusterBackupAttemptHead(
 	))
 }
 
+func readClusterBackupAttemptForHead(
+	ctx context.Context,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+	head *ClusterBackupAttemptHead,
+) (*ClusterBackupAttempt, error) {
+	if err := validateClusterBackupAttemptHead(head); err != nil {
+		return nil, err
+	}
+	expectedDigest, err := hex.DecodeString(head.MarkerSHA256)
+	if err != nil {
+		return nil, err
+	}
+	var body []byte
+	if s3Info != nil {
+		client, err := s3Info.NewMinioClient()
+		if err != nil {
+			return nil, err
+		}
+		object, err := client.GetObject(
+			ctx,
+			s3Info.Bucket,
+			clusterAttemptObjectKey(s3Info.Prefix, head.AttemptID),
+			minio.GetObjectOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = object.Close() }()
+		body, err = readBackupMetadata(object)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		pathname := filepath.Join(
+			strings.TrimPrefix(resolvedLocation, "file://"),
+			clusterBackupAttemptDir,
+			head.AttemptID+".json",
+		)
+		file, err := os.Open(filepath.Clean(pathname))
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = file.Close() }()
+		body, err = readBackupMetadata(file)
+		if err != nil {
+			return nil, err
+		}
+	}
+	actualDigest := sha256.Sum256(body)
+	if !bytes.Equal(actualDigest[:], expectedDigest) {
+		return nil, errors.New("cluster backup attempt head marker digest mismatch")
+	}
+	var attempt ClusterBackupAttempt
+	if err := json.Unmarshal(body, &attempt); err != nil {
+		return nil, err
+	}
+	if err := validateClusterBackupAttempt(&attempt, head.AttemptID); err != nil {
+		return nil, err
+	}
+	if attempt.BackupID != head.BackupID {
+		return nil, errors.New("cluster backup attempt head backup ID mismatch")
+	}
+	return &attempt, nil
+}
+
 func latestClusterBackupAttempt(
 	ctx context.Context,
 	resolvedLocation string,
@@ -1699,6 +1773,7 @@ func latestClusterBackupAttempt(
 				}
 				{
 					didReclaim, err := reclaimStaleClusterBackupAttempt(
+						ctx,
 						metadataStore,
 						resolvedLocation,
 						s3Info,
@@ -1769,6 +1844,7 @@ func latestClusterBackupAttempt(
 				}
 				{
 					didReclaim, err := reclaimStaleClusterBackupAttempt(
+						ctx,
 						metadataStore,
 						resolvedLocation,
 						s3Info,
@@ -1797,13 +1873,13 @@ func validateClusterBackupArtifacts(
 	if err := validateClusterBackupMetadata(meta.BackupID, meta); err != nil {
 		return err
 	}
-	var group errgroup.Group
+	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(innerFanOutLimit)
 	for _, tableInfo := range meta.Tables {
 		tableInfo := tableInfo
 		group.Go(func() error {
 			metadataID := tableBackupMetadataID(tableInfo.Name, meta.BackupID)
-			metadata, err := metadataStore.ReadMetadata(ctx, metadataID)
+			metadata, err := metadataStore.ReadMetadata(groupCtx, metadataID)
 			if err != nil {
 				return err
 			}
@@ -1811,7 +1887,7 @@ func validateClusterBackupArtifacts(
 				return errors.New("cluster backup table metadata mismatch")
 			}
 			if err := validateBackupMetadataArtifactIdentities(
-				ctx,
+				groupCtx,
 				metadataStore,
 				meta.BackupID,
 				metadata,
@@ -1822,6 +1898,90 @@ func validateClusterBackupArtifacts(
 		})
 	}
 	return group.Wait()
+}
+
+func validateNewestClusterBackupRepository(
+	ctx context.Context,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+	metadataStore backupStore,
+) error {
+	head, err := currentClusterBackupAttemptHead(
+		ctx,
+		resolvedLocation,
+		s3Info,
+	)
+	if err != nil {
+		return err
+	}
+	if head == nil {
+		// A producer publishes the immutable marker before its authoritative
+		// head. Scan only in that crash window so an incomplete newest attempt
+		// cannot be hidden by an older aggregate.
+		latestAttempt, err := latestClusterBackupAttempt(
+			ctx,
+			resolvedLocation,
+			s3Info,
+			metadataStore,
+			clusterBackupHealthScanLimit,
+			true,
+		)
+		if err != nil || latestAttempt == nil {
+			return err
+		}
+		return validateNewestClusterBackupAttempt(
+			ctx,
+			resolvedLocation,
+			s3Info,
+			metadataStore,
+			latestAttempt,
+		)
+	}
+	latestAttempt, err := readClusterBackupAttemptForHead(
+		ctx,
+		resolvedLocation,
+		s3Info,
+		head,
+	)
+	if err != nil {
+		return err
+	}
+	return validateNewestClusterBackupAttempt(
+		ctx,
+		resolvedLocation,
+		s3Info,
+		metadataStore,
+		latestAttempt,
+	)
+}
+
+func (t *TableApi) scheduleClusterBackupMaintenance(
+	repositoryIdentity string,
+	resolvedLocation string,
+	s3Info *common.S3Info,
+	metadataStore backupStore,
+) {
+	if _, running := t.backupMaintenance.LoadOrStore(repositoryIdentity, struct{}{}); running {
+		return
+	}
+	go func() {
+		defer t.backupMaintenance.Delete(repositoryIdentity)
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			clusterBackupMaintenanceTimeout,
+		)
+		defer cancel()
+		if _, err := latestClusterBackupAttempt(
+			ctx,
+			resolvedLocation,
+			s3Info,
+			metadataStore,
+			clusterBackupAttemptScanLimit,
+			false,
+		); err != nil && t.logger != nil {
+			t.logger.Warn("Deferred stale Go backup attempt reclamation", zap.Error(err))
+		}
+	}()
 }
 
 func validateNewestClusterBackupAttempt(
@@ -1973,19 +2133,12 @@ func (t *TableApi) Backup(w http.ResponseWriter, r *http.Request) {
 		)
 		return
 	}
-	if _, err := latestClusterBackupAttempt(
-		ctx,
+	t.scheduleClusterBackupMaintenance(
+		req.Connection+"\x00"+metadataStore.ResolvedLocation(),
 		resolvedLocation,
 		s3Info,
 		metadataStore,
-		clusterBackupAttemptScanLimit,
-		false,
-	); err != nil {
-		// Reclamation is bounded maintenance. It must not make new, unrelated
-		// backup IDs unavailable when the repository itself is otherwise
-		// writable.
-		t.logger.Warn("Deferred stale Go backup attempt reclamation", zap.Error(err))
-	}
+	)
 
 	// Get list of tables to backup
 	var tableNames []string
@@ -2893,6 +3046,33 @@ func (t *TableApi) ListBackups(w http.ResponseWriter, r *http.Request, params Li
 	)
 	if err != nil {
 		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
+		return
+	}
+	metadataStore, err := newBackupStore(
+		t.ln.config,
+		params.Connection,
+		"restore.read",
+		location,
+	)
+	if err != nil {
+		errorResponse(w, fmt.Sprintf("Invalid backup location: %v", err), http.StatusBadRequest)
+		return
+	}
+	if err := validateNewestClusterBackupRepository(
+		ctx,
+		resolvedLocation,
+		s3Info,
+		metadataStore,
+	); err != nil {
+		t.logger.Error(
+			"Newest cluster backup attempt is unhealthy",
+			zap.String("class", sanitizedBackupFailure(err)),
+		)
+		errorResponse(
+			w,
+			"Newest cluster backup attempt is incomplete or not restorable",
+			http.StatusInternalServerError,
+		)
 		return
 	}
 	var backups []BackupInfo
