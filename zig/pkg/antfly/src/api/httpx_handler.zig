@@ -2064,10 +2064,9 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
-        const body_data = (try ctx.body()) orelse {
-            _ = ctx.status(400);
-            return ctx.text("missing body");
-        };
+        // The OpenAPI request body is optional; an absent body is the default
+        // unbounded-range scan, just like an explicitly empty legacy request.
+        const body_data = (try ctx.body()) orelse "";
         var scan_req = http_route_helpers.parseScanKeysRequest(alloc, body_data) catch |err| {
             if (try http_route_helpers.scanRequestErrorResponse(alloc, err)) |response| {
                 var owned_response = response;
@@ -3598,6 +3597,74 @@ test "httpx antfly lookup route preserves projection and headers" {
     var parsed = try std.json.parseFromSlice(LookupResponse, alloc, resp.body.?, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
+}
+
+test "httpx antfly scan honors optional body and documented bad requests" {
+    const alloc = std.testing.allocator;
+    const db_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-httpx-handler-scan-{d}", .{platform_time.monotonicNs()});
+    defer alloc.free(db_path);
+
+    var fs_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer fs_io.deinit();
+    std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
+
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
+    }
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value = "{\"title\":\"alpha\",\"body\":\"hello\"}",
+            },
+        },
+        .timestamp_ns = 4321,
+    });
+
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var source = LookupStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
+
+    var e2e_server: HttpxE2eServer = undefined;
+    e2e_server.init(alloc, &api_server) catch |err| switch (err) {
+        // Restricted test environments may forbid even loopback listeners.
+        // The same test runs normally in CI and release validation.
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const scan_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/documents", .{base_url});
+    defer alloc.free(scan_url);
+
+    var bodyless = try requestWithRetry(&client, client_io.io(), .POST, scan_url, null, null, 20);
+    defer bodyless.deinit();
+    try std.testing.expectEqual(@as(u16, 200), bodyless.status.code);
+    try std.testing.expectEqualStrings("application/x-ndjson", bodyless.contentType().?);
+    try std.testing.expect(std.mem.indexOf(u8, bodyless.body.?, "\"_id\":\"doc:a\"") != null);
+
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    var unsupported = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        scan_url,
+        "{\"filter_query\":{\"match_phrase\":\"paid receipt\",\"field\":\"body\"}}",
+        &headers,
+        20,
+    );
+    defer unsupported.deinit();
+    try std.testing.expectEqual(@as(u16, 400), unsupported.status.code);
+    try std.testing.expectEqualStrings("unsupported scan filter query", unsupported.body.?);
 }
 
 test "httpx antfly lookup decodes percent-encoded path keys" {

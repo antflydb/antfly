@@ -2129,10 +2129,6 @@ pub fn queryExecutionDeadlineNsFromBody(alloc: std.mem.Allocator, body: []const 
     return platform_time.monotonicNs() +| timeout_ms *| std.time.ns_per_ms;
 }
 
-fn applyQueryExecutionDeadline(alloc: std.mem.Allocator, body: []const u8, req: *db_mod.types.SearchRequest) !void {
-    req.execution_deadline_ns = (try queryExecutionDeadlineNsFromBody(alloc, body)) orelse return;
-}
-
 pub fn parseQueryRequest(
     alloc: std.mem.Allocator,
     semantic_resolver: ?SemanticResolver,
@@ -2140,6 +2136,13 @@ pub fn parseQueryRequest(
     body: []const u8,
 ) !OwnedQueryRequest {
     if (body.len == 0) return error.InvalidQueryRequest;
+    // Start the caller-visible query deadline before binding normalization.
+    // This uses the same single timeout parse that was previously performed
+    // after normalization, but now expensive expansion observes it.
+    const execution_deadline_ns = try queryExecutionDeadlineNsFromBody(alloc, body);
+    if (execution_deadline_ns) |deadline_ns| {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+    }
     if (try queryBodyHasForbiddenDocIdentityControlFields(alloc, body)) return error.InvalidQueryRequest;
 
     // Structured named filters stay in compact binding form so the algebraic
@@ -2147,7 +2150,11 @@ pub fn parseQueryRequest(
     // are expanded into their public query positions before contract parsing;
     // this preserves one public AST without teaching the storage-only binding
     // resolver a second text-query representation.
-    const expanded_binding_body = try maybeExpandPublicDocFilterBindingsAlloc(alloc, body);
+    const expanded_binding_body = try maybeExpandPublicDocFilterBindingsAlloc(
+        alloc,
+        body,
+        execution_deadline_ns,
+    );
     defer if (expanded_binding_body) |owned| alloc.free(owned);
     const effective_body = expanded_binding_body orelse body;
 
@@ -2157,7 +2164,7 @@ pub fn parseQueryRequest(
         if (try tryParseFastDensePublicQueryRequest(alloc, effective_body)) |fast| {
             var owned = fast;
             errdefer owned.deinit(alloc);
-            try applyQueryExecutionDeadline(alloc, effective_body, &owned.req);
+            owned.req.execution_deadline_ns = execution_deadline_ns;
             return owned;
         }
     }
@@ -2193,7 +2200,7 @@ pub fn parseQueryRequest(
     errdefer freeSearchRequest(alloc, &req);
 
     try applyCommonSearchRequestOptions(alloc, request, &req);
-    try applyQueryExecutionDeadline(alloc, effective_body, &req);
+    req.execution_deadline_ns = execution_deadline_ns;
     try applyPublicHierarchyControls(alloc, effective_body, &req);
     req.distributed_text_stats = try parseDistributedTextStatsAlloc(alloc, effective_body);
     try parseInternalDocIdConstraintsAlloc(alloc, effective_body, &req);
@@ -5191,6 +5198,13 @@ fn appendPublicFilterOrTextClausesAlloc(
         try appendPublicFilterOrTextClausesAlloc(alloc, structured, text, filter, limit);
         return;
     }
+    if (try appendPositiveMixedFilterConjunctionAlloc(
+        alloc,
+        structured,
+        text,
+        query_or_queries,
+        limit,
+    )) return;
 
     appendPublicFilterClausesAlloc(alloc, structured, query_or_queries, limit) catch |err| switch (err) {
         error.UnsupportedQueryRequest => {
@@ -5200,6 +5214,87 @@ fn appendPublicFilterOrTextClausesAlloc(
         },
         else => return err,
     };
+}
+
+/// Split only conjunctions, because the execution contract can preserve a
+/// heterogeneous AND as independent structured and text filters. Cross-engine
+/// disjunctions remain unsupported rather than being silently reinterpreted.
+fn appendPositiveMixedFilterConjunctionAlloc(
+    alloc: std.mem.Allocator,
+    structured: *std.ArrayListUnmanaged([]u8),
+    text: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
+    value: std.json.Value,
+    limit: u32,
+) anyerror!bool {
+    if (value != .object) return false;
+
+    var mixed_structured = std.ArrayListUnmanaged([]u8).empty;
+    defer deinitOwnedStringArrayList(alloc, &mixed_structured);
+    var mixed_text = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+    defer deinitTextQueryArrayList(alloc, &mixed_text);
+
+    if (value.object.get("conjuncts")) |children| {
+        var recognized: usize = 1;
+        if (value.object.get("boost") != null) recognized += 1;
+        if (recognized != value.object.count()) return false;
+        _ = try parseCanonicalBoolBoost(value.object.get("boost"));
+        try appendPublicFilterOrTextClausesAlloc(
+            alloc,
+            &mixed_structured,
+            &mixed_text,
+            children,
+            limit,
+        );
+    } else {
+        if (value.object.count() != 1) return false;
+        const bool_value = value.object.get("bool") orelse return false;
+        if (bool_value != .object) return false;
+        if (bool_value.object.get("should") != null or
+            bool_value.object.get("must_not") != null)
+        {
+            return false;
+        }
+        var recognized: usize = 0;
+        inline for ([_][]const u8{ "must", "filter", "boost" }) |key| {
+            if (bool_value.object.get(key) != null) recognized += 1;
+        }
+        if (recognized != bool_value.object.count()) return false;
+        const must = bool_value.object.get("must");
+        const filter = bool_value.object.get("filter");
+        if (must == null and filter == null) return false;
+        _ = try parseCanonicalBoolBoost(bool_value.object.get("boost"));
+        if (must) |children| {
+            try appendPublicFilterOrTextClausesAlloc(
+                alloc,
+                &mixed_structured,
+                &mixed_text,
+                children,
+                limit,
+            );
+        }
+        if (filter) |children| {
+            try appendPublicFilterOrTextClausesAlloc(
+                alloc,
+                &mixed_structured,
+                &mixed_text,
+                children,
+                limit,
+            );
+        }
+    }
+
+    // Preserve canonical pure-domain compounds intact. Only a heterogeneous
+    // conjunction needs lowering into independent execution buckets.
+    if (mixed_structured.items.len == 0 or mixed_text.items.len == 0) return false;
+    try structured.ensureUnusedCapacity(alloc, mixed_structured.items.len);
+    try text.ensureUnusedCapacity(alloc, mixed_text.items.len);
+    for (mixed_structured.items) |item| structured.appendAssumeCapacity(item);
+    for (mixed_text.items) |item| text.appendAssumeCapacity(item);
+    mixed_structured.deinit(alloc);
+    mixed_structured = .empty;
+    mixed_text.deinit(alloc);
+    mixed_text = .empty;
+    return true;
 }
 
 fn validatePublicFilterOrTextQueryAlloc(
@@ -7770,12 +7865,21 @@ fn putOwnedJsonValue(
 const PublicBindingExpansionBudget = struct {
     remaining_nodes: usize = public_query_max_tree_nodes,
     remaining_bytes: usize,
+    deadline_ns: ?u64 = null,
+    nodes_until_deadline_check: u8 = 1,
 
     fn consumeNode(self: *@This(), depth: usize) !void {
         if (depth > public_query_max_tree_depth or self.remaining_nodes == 0) {
             return error.InvalidQueryRequest;
         }
         self.remaining_nodes -= 1;
+        self.nodes_until_deadline_check -|= 1;
+        if (self.nodes_until_deadline_check == 0) {
+            self.nodes_until_deadline_check = 64;
+            if (self.deadline_ns) |deadline_ns| {
+                if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+            }
+        }
     }
 
     fn consumeBytes(self: *@This(), count: usize) !void {
@@ -8223,20 +8327,21 @@ fn publicBindingRequiresTextAlloc(
     if (active_entry.found_existing) return error.InvalidQueryRequest;
     defer _ = active.remove(name);
 
+    // Validate every definition, including unused definitions, against one of
+    // the actual execution paths. Unsupported structured syntax is not assumed
+    // to be text syntax: the text parser must accept it.
     var clauses = std.ArrayListUnmanaged([]u8).empty;
     defer deinitOwnedStringArrayList(alloc, &clauses);
-    const directly_requires_text = blk: {
-        appendPublicFilterClausesAlloc(
-            alloc,
-            &clauses,
-            binding,
-            std.math.maxInt(u32),
-        ) catch |err| switch (err) {
-            error.UnsupportedQueryRequest => break :blk true,
-            else => return err,
-        };
-        break :blk false;
-    };
+    var text_queries = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+    defer deinitTextQueryArrayList(alloc, &text_queries);
+    try appendPublicFilterOrTextClausesAlloc(
+        alloc,
+        &clauses,
+        &text_queries,
+        binding,
+        std.math.maxInt(u32),
+    );
+    const directly_requires_text = text_queries.items.len > 0;
     const requires_text = directly_requires_text or
         try publicBindingValueReferencesTextBindingAlloc(
             alloc,
@@ -8273,12 +8378,14 @@ fn classifyPublicTextBindingsAlloc(
 fn maybeExpandPublicDocFilterBindingsAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
+    deadline_ns: ?u64,
 ) !?[]u8 {
     if (std.mem.indexOf(u8, body, "\"with\"") == null) return null;
     return try maybeExpandPublicDocFilterBindingsWithLimitAlloc(
         alloc,
         body,
-        public_limits.max_request_body_bytes,
+        public_limits.max_normalized_query_body_bytes,
+        deadline_ns,
     );
 }
 
@@ -8291,6 +8398,7 @@ fn expandPublicDocFilterBindingsWithLimitAlloc(
         alloc,
         body,
         max_expanded_bytes,
+        null,
     )) orelse return error.InvalidQueryRequest;
 }
 
@@ -8298,6 +8406,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
     max_expanded_bytes: usize,
+    deadline_ns: ?u64,
 ) !?[]u8 {
     if (max_expanded_bytes == 0) return error.InvalidQueryRequest;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
@@ -8326,6 +8435,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     }
     var budget = PublicBindingExpansionBudget{
         .remaining_bytes = max_expanded_bytes,
+        .deadline_ns = deadline_ns,
     };
     try budget.consumeNode(0);
     const output_field_count = parsed.value.object.count() - 1;
@@ -9480,6 +9590,75 @@ test "api query contract classifies transitive text binding dependencies" {
     const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
     try std.testing.expect(filter_text == .match_phrase);
     try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
+}
+
+test "api query contract rejects unused bindings with unknown syntax" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseQueryRequest(
+            alloc,
+            null,
+            "docs",
+            \\{
+            \\  "with": {
+            \\    "invalid": {"unknown_operator":{"value":"silently discarded before validation"}}
+            \\  },
+            \\  "query": {"match_all":{}}
+            \\}
+            ,
+        ),
+    );
+}
+
+test "api query contract splits mixed structured and text binding conjunctions" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseQueryRequest(
+        alloc,
+        null,
+        "docs",
+        \\{
+        \\  "with": {
+        \\    "visible_receipt": {
+        \\      "bool": {
+        \\        "must": [
+        \\          {"term":{"path":"/tenant","value":"acme"}},
+        \\          {"match_phrase":"paid receipt","field":"body"}
+        \\        ]
+        \\      }
+        \\    }
+        \\  },
+        \\  "filter_query": {"ref":"visible_receipt"}
+        \\}
+        ,
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.req.doc_filter_bindings.len);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"/tenant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"value\":\"acme\"") != null);
+    const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
+    try std.testing.expect(filter_text == .match_phrase);
+    try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
+}
+
+test "api query contract binding expansion observes zero timeout" {
+    try std.testing.expectError(
+        error.Timeout,
+        parseQueryRequest(
+            std.testing.allocator,
+            null,
+            "docs",
+            \\{
+            \\  "timeout_ms": 0,
+            \\  "with": {
+            \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
+            \\  },
+            \\  "filter_query": {"ref":"receipt"}
+            \\}
+            ,
+        ),
+    );
 }
 
 test "api query contract bounds expanded binding output bytes" {

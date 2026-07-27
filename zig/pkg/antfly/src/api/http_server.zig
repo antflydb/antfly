@@ -21433,6 +21433,16 @@ test "api http server serves table scan as ndjson" {
     try std.testing.expectEqualStrings("doc:a", parsed.value._id);
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 
+    var empty_body_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/documents",
+        .content_type = null,
+        .body = "",
+    });
+    defer empty_body_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), empty_body_resp.status);
+    try std.testing.expectEqualStrings("application/x-ndjson", empty_body_resp.content_type.?);
+
     var invalid_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/docs/documents",
@@ -21450,7 +21460,7 @@ test "api http server serves table scan as ndjson" {
         .body = "{\"filter_query\":{\"match_phrase\":\"paid receipt\",\"field\":\"body\"}}",
     });
     defer unsupported_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 422), unsupported_resp.status);
+    try std.testing.expectEqual(@as(u16, 400), unsupported_resp.status);
     try std.testing.expectEqualStrings("unsupported scan filter query", unsupported_resp.body);
 }
 

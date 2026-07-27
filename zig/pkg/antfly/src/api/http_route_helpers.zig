@@ -234,7 +234,9 @@ pub fn scanRequestErrorResponse(
 ) !?http_common.HttpResponse {
     return switch (err) {
         error.InvalidQueryRequest => try textResponse(alloc, 400, "invalid scan request"),
-        error.UnsupportedQueryRequest => try textResponse(alloc, 422, "unsupported scan filter query"),
+        // scanKeys declares BadRequest, not an operation-specific 422, in the
+        // public OpenAPI contract. Keep every server and generated SDK aligned.
+        error.UnsupportedQueryRequest => try textResponse(alloc, 400, "unsupported scan filter query"),
         else => null,
     };
 }
@@ -294,7 +296,7 @@ test "scan request errors map to stable client responses" {
 
     var unsupported = (try scanRequestErrorResponse(alloc, error.UnsupportedQueryRequest)).?;
     defer unsupported.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 422), unsupported.status);
+    try std.testing.expectEqual(@as(u16, 400), unsupported.status);
     try std.testing.expectEqualStrings("unsupported scan filter query", unsupported.body);
 
     try std.testing.expect((try scanRequestErrorResponse(alloc, error.OutOfMemory)) == null);
