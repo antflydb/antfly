@@ -4809,7 +4809,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
-    local_db_mutex: std.atomic.Mutex = .unlocked,
+    local_db_mutex: SourceStateMutex = .{},
     table_activity_threaded: Io.Threaded,
     table_activity_mutex: Io.Mutex = .init,
     table_activity_ready: Io.Condition = .init,
@@ -5018,6 +5018,20 @@ pub const ProvisionedTableWriteSource = struct {
         };
         if (write_cache) |cache| cache.table_eviction_hook = hook;
         if (startup_write_cache) |cache| cache.table_eviction_hook = hook;
+    }
+
+    /// Bind every source that can mutate one storage owner's writer caches to
+    /// the same state lock. The source keeps an embedded fallback lock for
+    /// standalone use, while provisioned storage makes shared-cache
+    /// serialization an explicit ownership invariant.
+    pub fn bindWriteCachesWithStateMutex(
+        self: *ProvisionedTableWriteSource,
+        write_cache: ?*ProvisionedTableWriteCache,
+        startup_write_cache: ?*ProvisionedTableWriteCache,
+        state_mutex: *std.atomic.Mutex,
+    ) void {
+        self.local_db_mutex.bind(state_mutex);
+        self.bindWriteCaches(write_cache, startup_write_cache);
     }
 
     fn onWriteCacheTableEvicted(
@@ -5313,7 +5327,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn localDbMutex(self: *ProvisionedTableWriteSource) *std.atomic.Mutex {
-        return &self.local_db_mutex;
+        return self.local_db_mutex.atomicMutex();
     }
 
     fn freeWriteCoalesceQueues(self: *ProvisionedTableWriteSource) void {
@@ -7530,6 +7544,15 @@ pub const ProvisionedTableWriteSource = struct {
 
         const self_mutex = self.localDbMutex();
         const dest_mutex = dest.localDbMutex();
+        if (self_mutex == dest_mutex) {
+            lockAtomic(self_mutex);
+            defer self_mutex.unlock();
+            return try source_cache.transferAdoptableEntriesForTableLocked(
+                dest_cache,
+                table_name,
+                dest.groupVisibleRootGenerationSource(),
+            );
+        }
         if (@intFromPtr(self_mutex) < @intFromPtr(dest_mutex)) {
             lockAtomic(self_mutex);
             defer self_mutex.unlock();
@@ -18911,13 +18934,39 @@ fn sleepNs(duration_ns: u64) void {
     };
 }
 
-fn lockAtomic(mutex: *std.atomic.Mutex) void {
+const SourceStateMutex = struct {
+    owned: std.atomic.Mutex = .unlocked,
+    shared: ?*std.atomic.Mutex = null,
+
+    fn bind(self: *SourceStateMutex, shared: *std.atomic.Mutex) void {
+        if (self.shared) |existing| std.debug.assert(existing == shared);
+        self.shared = shared;
+    }
+
+    fn atomicMutex(self: *SourceStateMutex) *std.atomic.Mutex {
+        return self.shared orelse &self.owned;
+    }
+
+    fn tryLock(self: *SourceStateMutex) bool {
+        return self.atomicMutex().tryLock();
+    }
+
+    fn unlock(self: *SourceStateMutex) void {
+        self.atomicMutex().unlock();
+    }
+};
+
+fn lockAtomic(mutex: anytype) void {
     // Bounded spin, then yield (platform_sync): local_db_mutex guards cache
     // bookkeeping that can take a while under contention (opens,
     // invalidation), and a pure spin pins a core per waiter — on
     // CPU-constrained hosts (CI runners) that starves the very threads that
     // would release the lock.
-    platform_sync.lockYielding(mutex);
+    const atomic_mutex = if (comptime @TypeOf(mutex) == *SourceStateMutex)
+        mutex.atomicMutex()
+    else
+        mutex;
+    platform_sync.lockYielding(atomic_mutex);
 }
 
 fn recoverProvisionedTransactionsOnce(
@@ -37248,8 +37297,9 @@ test "write cache transfers adoptable provisioned db to raft apply source" {
     defer apply_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
     var apply_source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-    source.write_cache = &source_cache;
-    apply_source.write_cache = &apply_cache;
+    var shared_state_mutex: std.atomic.Mutex = .unlocked;
+    source.bindWriteCachesWithStateMutex(&source_cache, null, &shared_state_mutex);
+    apply_source.bindWriteCachesWithStateMutex(&apply_cache, null, &shared_state_mutex);
     _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
     _ = apply_source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 

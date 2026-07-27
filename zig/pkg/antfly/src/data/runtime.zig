@@ -883,7 +883,11 @@ const RaftTableApplyStateMachine = struct {
         storage.write_cache.secret_store = self.write_source.secret_store;
         storage.write_cache.remote_content = self.write_source.remote_content;
         self.write_source.read_cache = &storage.read_cache;
-        self.write_source.bindWriteCaches(&storage.write_cache, &storage.startup_write_cache);
+        self.write_source.bindWriteCachesWithStateMutex(
+            &storage.write_cache,
+            &storage.startup_write_cache,
+            &storage.write_cache_state_mutex,
+        );
         self.write_source.runtime_status_cache = &storage.runtime_status_cache;
         _ = self.write_source.withGroupVisibleRootGeneration(storage.groupVisibleRootGenerationSource());
         if (storage.backend_runtime) |runtime| self.write_source.backend_runtime = runtime;
@@ -14432,7 +14436,11 @@ test "data runtime live writer source follows raft apply ownership" {
 
     var storage = antfly.public_api.ProvisionedGroupStorage.init(std.testing.allocator);
     defer storage.deinit();
-    server.write_source.bindWriteCaches(&storage.write_cache, &storage.startup_write_cache);
+    server.write_source.bindWriteCachesWithStateMutex(
+        &storage.write_cache,
+        &storage.startup_write_cache,
+        &storage.write_cache_state_mutex,
+    );
 
     var apply_sm = RaftTableApplyStateMachine.init(std.testing.allocator, "/tmp/unused-antfly-live-writer-source", Catalog.iface(), null);
     defer apply_sm.deinit();
@@ -14441,6 +14449,10 @@ test "data runtime live writer source follows raft apply ownership" {
 
     try std.testing.expectEqual(&apply_sm.write_source, server.liveRuntimeWriteSource());
     try std.testing.expectEqual(&storage.write_cache, apply_sm.write_source.write_cache.?);
+    try std.testing.expectEqual(
+        server.write_source.localDbMutex(),
+        apply_sm.write_source.localDbMutex(),
+    );
 }
 
 test "data raft source split lifecycle commands bypass document db apply" {
