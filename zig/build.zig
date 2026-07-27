@@ -4604,6 +4604,7 @@ pub fn build(b: *std.Build) void {
             "filesystem cluster backup lease supports the maximum owner identity",
             "filesystem stale attempt reclamation index prevents directory-order starvation",
             "filesystem completed attempt tickets are deleted instead of durably rotated",
+            "filesystem attempt publication tolerates concurrent bounded maintenance",
             "filesystem stale attempt reclamation recovers an abandoned claim",
             "remote stale attempt reclamation cursor prevents prefix starvation",
             "stale cluster backup attempt preserves aggregate referenced artifacts",

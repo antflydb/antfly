@@ -7133,10 +7133,10 @@ pub const ApiHttpServer = struct {
         const Phase = enum {
             metadata_barrier,
             manifest_probe,
-            maintenance_schedule,
             table_selection,
             attempt_prepare,
             attempt_marker,
+            maintenance_schedule,
             mutation_lease,
             attempt_head,
             lease_heartbeat,
@@ -9288,14 +9288,6 @@ pub const ApiHttpServer = struct {
         if (backups_api.clusterManifestExistsAtLocationWithIo(alloc, backup_io, location, req.backup_id) catch |err| return trace.internal(err))
             return error.BackupAlreadyExists;
         const connection = req.connection orelse return error.InvalidRequest;
-        trace.enter(.maintenance_schedule);
-        self.scheduleClusterBackupMaintenance(req.location, connection) catch |err| {
-            if (err == error.BackupMaintenanceQueueFull)
-                return error.BackupRepositoryBusy;
-            // Exact same-ID lease recovery remains available if opportunistic
-            // global cleanup cannot be queued.
-            std.log.warn("cluster backup stale-attempt maintenance scheduling deferred class={s}", .{@errorName(err)});
-        };
 
         trace.enter(.table_selection);
         const table_names: [][]u8 = if (req.table_names) |values|
@@ -9387,6 +9379,27 @@ pub const ApiHttpServer = struct {
             location,
             &attempt_marker,
         ) catch |err| return trace.internal(err);
+        // Admission must establish the durable journal before this repository
+        // becomes visible to asynchronous maintenance. On a new filesystem
+        // repository, scheduling first lets the reclaimer and publisher race
+        // while creating the control tree. Existing repositories remain safe
+        // because marker and reclamation operations use the same per-attempt
+        // publication lock.
+        trace.enter(.maintenance_schedule);
+        self.scheduleClusterBackupMaintenance(req.location, connection) catch |err| {
+            if (err == error.BackupMaintenanceQueueFull) {
+                backups_api.deleteClusterBackupAttemptMarker(
+                    op_alloc,
+                    backup_io,
+                    location,
+                    &attempt_marker,
+                ) catch |cleanup_err| return trace.internal(cleanup_err);
+                return error.BackupRepositoryBusy;
+            }
+            // Exact same-ID lease recovery remains available if opportunistic
+            // global cleanup cannot be queued.
+            std.log.warn("cluster backup stale-attempt maintenance scheduling deferred class={s}", .{@errorName(err)});
+        };
         // The repository lease is the authoritative pre-execution conflict
         // check. One exact expired-owner recovery is bounded independently of
         // repository size; a live operation reports contention explicitly.

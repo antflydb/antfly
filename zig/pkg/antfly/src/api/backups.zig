@@ -3314,7 +3314,28 @@ pub fn writeClusterBackupAttemptMarker(
                 marker.attempt_id,
             );
             defer alloc.free(publication_lock_path);
+            const eligible_at_unix_ns =
+                marker.created_at_unix_ns +| backup_attempt_reclaim_age_ns;
+            const shard = localBackupAttemptReclaimShard(eligible_at_unix_ns);
+            const ticket_path = try localBackupAttemptReclaimTicketPath(
+                alloc,
+                backup_root,
+                .queued,
+                shard,
+                marker.attempt_id,
+            );
+            defer alloc.free(ticket_path);
+
+            // Establish every directory needed by the two-record publication
+            // before exposing the per-attempt lock. This keeps first-use
+            // repository initialization out of the critical section and
+            // prevents asynchronous maintenance from observing a partially
+            // prepared control layout.
             if (std.fs.path.dirname(publication_lock_path)) |dir_name|
+                try ensureDirPathWithIo(io, dir_name);
+            if (std.fs.path.dirname(ticket_path)) |dir_name|
+                try ensureDirPathWithIo(io, dir_name);
+            if (std.fs.path.dirname(path)) |dir_name|
                 try ensureDirPathWithIo(io, dir_name);
             var publication_lock = if (std.fs.path.isAbsolute(publication_lock_path))
                 try std.Io.Dir.createFileAbsolute(io, publication_lock_path, .{ .truncate = false })
@@ -3328,17 +3349,6 @@ pub fn writeClusterBackupAttemptMarker(
             // may leave an orphan ticket, which bounded maintenance removes.
             // The per-attempt lock closes that publication race without making
             // request admission wait behind unrelated directory enumeration.
-            const eligible_at_unix_ns =
-                marker.created_at_unix_ns +| backup_attempt_reclaim_age_ns;
-            const shard = localBackupAttemptReclaimShard(eligible_at_unix_ns);
-            const ticket_path = try localBackupAttemptReclaimTicketPath(
-                alloc,
-                backup_root,
-                .queued,
-                shard,
-                marker.attempt_id,
-            );
-            defer alloc.free(ticket_path);
             if (!(try pathExistsWithIo(io, ticket_path))) {
                 try replaceLocalBackupAttemptReclaimTicketTimestamp(
                     alloc,
@@ -10141,6 +10151,99 @@ test "filesystem completed attempt tickets are deleted instead of durably rotate
     );
     defer alloc.free(next_ticket);
     try std.testing.expect(!(try pathExistsWithIo(io, next_ticket)));
+}
+
+test "filesystem attempt publication tolerates concurrent bounded maintenance" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/publication-maintenance-race",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(root);
+    try ensureDirPathWithIo(io, root);
+
+    var location: BackupLocation = .{ .file = root };
+    const tables = [_]ClusterBackupAttemptTable{.{
+        .name = "docs",
+        .table_backup_id = "race-table",
+        .artifact_backup_id = "race-artifact",
+    }};
+    const marker: ClusterBackupAttemptMarker = .{
+        .attempt_id = "race-attempt",
+        .cluster_backup_id = "race-cluster",
+        .created_at_unix_ns = 1,
+        .format = .portable,
+        .tables = &tables,
+    };
+
+    const Race = struct {
+        start: std.atomic.Value(bool) = .init(false),
+        io: std.Io,
+        location: *BackupLocation,
+        marker: *const ClusterBackupAttemptMarker,
+        publish_err: ?anyerror = null,
+        maintenance_err: ?anyerror = null,
+
+        fn awaitStart(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+        }
+
+        fn publish(self: *@This()) void {
+            self.awaitStart();
+            writeClusterBackupAttemptMarker(
+                std.heap.page_allocator,
+                self.io,
+                self.location,
+                self.marker,
+            ) catch |err| {
+                self.publish_err = err;
+            };
+        }
+
+        fn maintain(self: *@This()) void {
+            self.awaitStart();
+            _ = reclaimStaleClusterBackupAttempts(
+                std.heap.page_allocator,
+                self.io,
+                self.location,
+                self.marker.created_at_unix_ns,
+            ) catch |err| {
+                self.maintenance_err = err;
+                return;
+            };
+        }
+    };
+
+    var race: Race = .{
+        .io = io,
+        .location = &location,
+        .marker = &marker,
+    };
+    const publisher = try std.Thread.spawn(.{}, Race.publish, .{&race});
+    const maintenance = try std.Thread.spawn(.{}, Race.maintain, .{&race});
+    race.start.store(true, .release);
+    publisher.join();
+    maintenance.join();
+
+    if (race.publish_err) |err| return err;
+    if (race.maintenance_err) |err| return err;
+    var parsed = try readClusterBackupAttemptMarker(
+        alloc,
+        io,
+        &location,
+        marker.attempt_id,
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        marker.cluster_backup_id,
+        parsed.value.cluster_backup_id,
+    );
 }
 
 test "filesystem stale attempt reclamation recovers an abandoned claim" {
