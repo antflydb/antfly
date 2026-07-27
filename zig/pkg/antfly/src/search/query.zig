@@ -765,6 +765,11 @@ pub const GeoShapeFilter = struct {
     polygons: []const []const geo.GeoPoint,
 
     pub fn execute(self: GeoShapeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        // Indexed geo values are points. A point cannot contain a non-empty
+        // polygon, so this relation has a known empty result and must not scan
+        // the segment or decode its typed doc values.
+        if (self.relation == .contains) return roaring.RoaringBitmap.init(alloc);
+
         const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
             return roaring.RoaringBitmap.init(alloc);
         var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
@@ -775,11 +780,6 @@ pub const GeoShapeFilter = struct {
 
         for (0..seg.reader.doc_count) |doc_id| {
             const point = (try reader.getGeoPoint(@intCast(doc_id))) orelse continue;
-            // Indexed geo values are points. A point can intersect or be
-            // within a query polygon, but it cannot contain a non-empty
-            // polygon. Keep that relation exact instead of silently treating
-            // `contains` as `within`.
-            if (self.relation == .contains) continue;
             for (self.polygons) |polygon| {
                 if (geo.pointInPolygon(.{ .lat = point.lat, .lon = point.lon }, polygon)) {
                     try result.add(@intCast(doc_id));

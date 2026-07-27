@@ -200,7 +200,7 @@ pub fn parseScanKeysRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedSc
     const to = if (parsed.value.to) |value| try alloc.dupe(u8, value) else "";
     errdefer if (to.len > 0) alloc.free(to);
     const filter_query_json = if (parsed.value.filter_query) |filter_query|
-        try query_contract.normalizePublicFilterQueryAlloc(alloc, filter_query)
+        try query_contract.normalizePublicStoredFilterQueryAlloc(alloc, filter_query)
     else
         "";
     errdefer if (filter_query_json.len > 0) alloc.free(filter_query_json);
@@ -258,4 +258,15 @@ test "parse scan request normalizes filter query" {
     try std.testing.expect(!parsed.opts.include_documents);
     try std.testing.expectEqualStrings(parsed.filter_query_json, parsed.opts.filter_query_json);
     try std.testing.expect(std.mem.indexOf(u8, parsed.filter_query_json, "\"tenant\"") != null);
+}
+
+test "parse scan request rejects text-index-only filter clauses" {
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseScanKeysRequest(
+            std.testing.allocator,
+            \\{"filter_query":{"match_phrase":"paid receipt","field":"body"}}
+            ,
+        ),
+    );
 }

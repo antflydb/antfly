@@ -1940,7 +1940,7 @@ pub const QueryProfile = struct {
 pub const QueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
@@ -2351,7 +2351,7 @@ pub const RetrievalAgentUsage = struct {
 pub const RetrievalQueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
@@ -2575,7 +2575,7 @@ pub const ScanKeysRequest = struct {
     exclusive_to: ?bool = null,
     /// List of fields to include in each result. If not specified, only returns the key. Supports: - Simple fields: "title", "author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings", "_summaries", "_chunks"
     fields: ?[]const []const u8 = null,
-    /// Antfly query to filter documents. Only documents matching this query are included in results. Uses the sear library for efficient per-document matching without requiring a full index. Examples: - Status filtering: `{"query": "status:published"}` - Date ranges: `{"query": "created_at:>2023-01-01"}` - Field matching: `{"query": "category:technology"}`
+    /// Structured subset of the Antfly query AST used to filter a primary-key scan. Only documents matching this query are included in results. Because scans do not open a text index, text-index-only variants such as phrase and multi-match queries are rejected with a validation error instead of being evaluated with slower stored-document semantics. Examples: - Status filtering: `{"term":{"path":"/status","value":"published"}}` - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}` - Field existence: `{"exists":{"path":"/category"}}`
     filter_query: ?std.json.Value = null,
     /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
     limit: ?i64 = null,

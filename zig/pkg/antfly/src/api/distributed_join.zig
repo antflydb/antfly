@@ -311,13 +311,8 @@ fn combineFilterQueryValues(
     try conjuncts.append(row_filter_clone);
     row_filter_clone_owned = false;
 
-    var root = std.json.Value{ .object = std.json.ObjectMap.empty };
-    errdefer deinitJsonValue(alloc, &root);
-    const key = try alloc.dupe(u8, "conjuncts");
-    errdefer alloc.free(key);
-    try root.object.put(alloc, key, .{ .array = conjuncts });
     conjuncts_owned = false;
-    return root;
+    return .{ .array = conjuncts };
 }
 
 pub const JoinedQueryStats = struct {
@@ -4853,7 +4848,7 @@ fn buildRightJoinQueryValue(
     const filter_query_value = blk: {
         if (join.join_type == .right) {
             if (join.right_filters) |filters| {
-                if (filters.filter_query) |filter_query| break :blk try normalizePublicJoinFilterValueAlloc(alloc, filter_query);
+                if (filters.filter_query) |filter_query| break :blk try cloneJsonValue(alloc, filter_query);
             }
             break :blk null;
         }
@@ -4966,22 +4961,16 @@ fn buildCombinedRightFilterQueryValue(
             for (conjuncts.items) |*item| deinitJsonValue(alloc, item);
             conjuncts.deinit();
         }
-        try conjuncts.append(try normalizePublicJoinFilterValueAlloc(alloc, filter_query));
+        // Preserve the public query AST. QueryRequest.filter_query accepts an
+        // array as an implicit conjunction and its normalizer chooses the
+        // structured fast path or text-index path for each clause. Rewriting
+        // here through the structured-only grammar rejects otherwise valid
+        // public query nodes such as phrase, prefix, and multi-match.
+        try conjuncts.append(try cloneJsonValue(alloc, filter_query));
         try conjuncts.append(join_filter);
-        var obj = std.json.ObjectMap.empty;
-        try obj.put(alloc, try alloc.dupe(u8, "conjuncts"), .{ .array = conjuncts });
-        return .{ .object = obj };
+        return .{ .array = conjuncts };
     }
     return join_filter;
-}
-
-fn normalizePublicJoinFilterValueAlloc(
-    alloc: std.mem.Allocator,
-    filter_query: std.json.Value,
-) !std.json.Value {
-    const normalized_json = try query_contract.normalizePublicFilterQueryJsonAlloc(alloc, filter_query, 10);
-    defer alloc.free(normalized_json);
-    return try json_helpers.parseOwnedJsonValueAlloc(alloc, normalized_json);
 }
 
 fn buildMatchAllQueryValue(alloc: std.mem.Allocator) !std.json.Value {
@@ -5639,9 +5628,43 @@ test "distributed join applies auth row filter to right table filter query" {
     const json = try stringifyJsonValueAlloc(alloc, filter_query);
     defer alloc.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"conjuncts\"") != null);
+    try std.testing.expect(filter_query == .array);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tier\":\"premium\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tenant_id\":\"acme\"") != null);
+}
+
+test "distributed join preserves native public filters when adding join predicates" {
+    const alloc = std.testing.allocator;
+    var public_filter = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"match_phrase":"paid receipt","field":"body"}
+    ,
+        .{},
+    );
+    defer public_filter.deinit();
+    var join_filter = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"term":{"customer_id":"cust:a"}}
+    ,
+        .{},
+    );
+    defer join_filter.deinit();
+
+    var combined = try buildCombinedRightFilterQueryValue(
+        alloc,
+        .{ .filter_query = public_filter.value },
+        try cloneJsonValue(alloc, join_filter.value),
+    );
+    defer deinitJsonValue(alloc, &combined);
+
+    try std.testing.expect(combined == .array);
+    try std.testing.expectEqual(@as(usize, 2), combined.array.items.len);
+    const json = try stringifyJsonValueAlloc(alloc, combined);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"match_phrase\":\"paid receipt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"customer_id\":\"cust:a\"") != null);
 }
 
 test "distributed join uses the native document identity query for _id equality" {
