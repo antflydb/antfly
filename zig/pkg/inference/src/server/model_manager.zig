@@ -1402,6 +1402,9 @@ pub const LoadedModel = struct {
     text_projection_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
     visual_projection_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
     audio_projection_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    /// Accounts for the tokenizer's resident vocabulary, maps, tries, and
+    /// parser-owned state independently of backend weight residency.
+    tokenizer_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
     resident_projection_stats: embedding_mod.AtomicResidentProjectionStats = .{},
     cleanup_head: ?*cleanup_model_mod.CleanupHead = null,
     cleanup_head_loaded: bool = false,
@@ -1691,6 +1694,7 @@ pub const LoadedModel = struct {
             sp.deinit();
             self.allocator.destroy(sp);
         }
+        if (self.tokenizer_resource_lease) |*lease| lease.release();
         if (self.chat_tmpl) |ct| {
             var ct_mut = @constCast(ct);
             ct_mut.deinit();
@@ -1892,6 +1896,15 @@ pub const ModelManager = struct {
                 self.preferredBackends(),
                 shared_backend_ctx,
             );
+        }
+
+        /// Load a composite-model tokenizer through ModelManager so it receives
+        /// the same admission, cache, and parallel-BPE policy as primary models.
+        pub fn loadHfTokenizerFile(
+            self: *const ComponentLoader,
+            tokenizer_path: []const u8,
+        ) !ManagedHfTokenizer {
+            return self.manager.loadManagedHfTokenizerFile(tokenizer_path);
         }
 
         /// Adapter for SessionPool's lazy factory. The pool takes ownership of
@@ -2217,6 +2230,47 @@ pub const ModelManager = struct {
         return first_err orelse error.NoBackendAvailable;
     }
 
+    fn loadManagedHfTokenizerFile(
+        self: *ModelManager,
+        tokenizer_path: []const u8,
+    ) !ManagedHfTokenizer {
+        const plan = try tokenizerFileAdmissionPlan(
+            self.allocator,
+            tokenizer_path,
+            .huggingface,
+        );
+        var resource_lease = try self.acquireTokenizerAdmission(plan);
+        errdefer if (resource_lease) |*lease| lease.release();
+
+        const tok_bytes = try c_file.readFile(self.allocator, tokenizer_path);
+        defer self.allocator.free(tok_bytes);
+        const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(
+            self.allocator,
+            tok_bytes,
+        );
+        errdefer tokenizer.deinitSelf();
+        try tokenizer.configureBpeCache(self.tokenizer_cache_config);
+        try tokenizer.configureParallelBpe(self.tokenizer_parallel_bpe_config);
+        if (resource_lease) |*lease| try lease.retain(plan.resident);
+
+        return .{
+            .tokenizer = tokenizer,
+            .resource_lease = resource_lease,
+        };
+    }
+
+    fn acquireTokenizerAdmission(
+        self: *ModelManager,
+        plan: ModelLoadAdmissionPlan,
+    ) !?runtime.tier.memory.AdmissionLease {
+        if (!self.admission_enabled) return null;
+        return try self.admission.tryAcquire(
+            self.admissionLimitsForBackend(.native),
+            plan.peak,
+            true,
+        );
+    }
+
     pub fn lockLoadedModels(self: *ModelManager) void {
         spinLock(&self.load_lock);
     }
@@ -2286,13 +2340,13 @@ pub const ModelManager = struct {
     /// Counts loaded models participating in the prompt-cache accounting target.
     /// Used to split that target evenly across active model caches.
     /// `include` is always counted even if its cache has not activated yet.
-    fn activePromptCacheCount(self: *ModelManager, include: *LoadedModel) usize {
+    fn participatingPromptCacheCount(self: *ModelManager, include: *LoadedModel) usize {
         var count: usize = 0;
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             const model = entry.value_ptr.*;
             if (model == include) continue;
-            if (model.prompt_prefix_cache.isActive()) count += 1;
+            if (model.prompt_prefix_cache.isParticipating()) count += 1;
         }
         return count + 1;
     }
@@ -2307,14 +2361,45 @@ pub const ModelManager = struct {
     ) void {
         self.lockLoadedModels();
         defer self.unlockLoadedModels();
+        include.prompt_prefix_cache.reserveActivation();
         var per_cache = node_config;
-        per_cache.max_bytes /= self.activePromptCacheCount(include);
+        per_cache.max_bytes /= self.participatingPromptCacheCount(include);
         include.prompt_prefix_cache.configure(per_cache);
 
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             const model = entry.value_ptr.*;
-            if (model != include and model.prompt_prefix_cache.isActive()) {
+            if (model != include and model.prompt_prefix_cache.isParticipating()) {
+                model.prompt_prefix_cache.configure(per_cache);
+            }
+        }
+    }
+
+    /// Remove a failed first-use reservation and restore the full node target
+    /// across the remaining caches. If a pool was already created, the cache
+    /// remains a participant and no rollback is needed.
+    pub fn cancelPromptCacheActivation(
+        self: *ModelManager,
+        include: *LoadedModel,
+        node_config: runtime.kv.prompt_cache.Config,
+    ) void {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        if (!include.prompt_prefix_cache.cancelPendingActivation()) return;
+
+        var count: usize = 0;
+        var it = self.loaded.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.*.prompt_prefix_cache.isParticipating()) count += 1;
+        }
+        if (count == 0) return;
+
+        var per_cache = node_config;
+        per_cache.max_bytes /= count;
+        var rebalance_it = self.loaded.iterator();
+        while (rebalance_it.next()) |entry| {
+            const model = entry.value_ptr.*;
+            if (model.prompt_prefix_cache.isParticipating()) {
                 model.prompt_prefix_cache.configure(per_cache);
             }
         }
@@ -2516,18 +2601,34 @@ pub const ModelManager = struct {
 
         // Load tokenizer
         var hf_tok: ?*hf_tokenizer.HfTokenizer = null;
-        errdefer if (hf_tok) |ht| ht.deinitSelf();
         var sp_tok: ?*sentencepiece.Processor = null;
-        errdefer if (sp_tok) |sp| {
-            sp.deinit();
-            self.allocator.destroy(sp);
-        };
 
         const tokenizer_type = blk: {
             if (shouldPreferSentencePieceOverride(man, model_dir, self.allocator)) {
                 break :blk manifest_mod.TokenizerType.sentencepiece;
             }
             break :blk man.tokenizer_type orelse return error.NoTokenizerFound;
+        };
+        const tokenizer_admission_plan: ?ModelLoadAdmissionPlan = if (self.admission_enabled)
+            try tokenizerLoadAdmissionPlan(
+                self.allocator,
+                model_dir,
+                man.gguf_path,
+                tokenizer_type,
+            )
+        else
+            null;
+        var tokenizer_resource_lease = if (tokenizer_admission_plan) |plan|
+            try self.acquireTokenizerAdmission(plan)
+        else
+            null;
+        errdefer if (tokenizer_resource_lease) |*lease| lease.release();
+        // Register these after the lease cleanup so LIFO unwinding frees the
+        // admitted memory before making its capacity visible to another load.
+        errdefer if (hf_tok) |ht| ht.deinitSelf();
+        errdefer if (sp_tok) |sp| {
+            sp.deinit();
+            self.allocator.destroy(sp);
         };
 
         switch (tokenizer_type) {
@@ -2550,6 +2651,9 @@ pub const ModelManager = struct {
                 try loadSentencePieceAddedTokens(model_dir, self.allocator, sp);
                 sp_tok = sp;
             },
+        }
+        if (tokenizer_resource_lease) |*lease| {
+            try lease.retain(tokenizer_admission_plan.?.resident);
         }
 
         // Plan and reserve resources before the backend begins allocating weights.
@@ -2648,6 +2752,7 @@ pub const ModelManager = struct {
             .text_projection = null,
             .visual_projection = null,
             .audio_projection = null,
+            .tokenizer_resource_lease = tokenizer_resource_lease,
             .resource_lease = loaded_session.resource_lease,
         };
 
@@ -2657,6 +2762,7 @@ pub const ModelManager = struct {
         man_owned = false;
         hf_tok = null;
         sp_tok = null;
+        tokenizer_resource_lease = null;
         session_owned = false;
         chat_tmpl = null;
         shared_moe_cache = null;
@@ -2836,6 +2942,26 @@ pub const ManagedSession = struct {
     }
 };
 
+pub const ManagedHfTokenizer = struct {
+    tokenizer: *hf_tokenizer.HfTokenizer,
+    resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    owns_tokenizer: bool = true,
+
+    pub fn deinit(self: *ManagedHfTokenizer) void {
+        if (self.owns_tokenizer) self.tokenizer.deinitSelf();
+        if (self.resource_lease) |*lease| lease.release();
+        self.resource_lease = null;
+        self.owns_tokenizer = false;
+    }
+
+    pub fn take(self: *ManagedHfTokenizer) ManagedHfTokenizer {
+        const owned = self.*;
+        self.resource_lease = null;
+        self.owns_tokenizer = false;
+        return owned;
+    }
+};
+
 const LoadedSessionPlan = ManagedSession;
 
 const ModelLoadAdmissionPlan = struct {
@@ -2844,6 +2970,164 @@ const ModelLoadAdmissionPlan = struct {
     /// Bytes retained by the completed backend session.
     resident: runtime.tier.memory.AdmissionAmounts,
 };
+
+const TokenizerArtifactKind = enum {
+    huggingface,
+    sentencepiece,
+    wordpiece,
+};
+
+const TokenizerArtifactCandidate = struct {
+    name: []const u8,
+    kind: TokenizerArtifactKind,
+};
+
+const tokenizer_fixed_resident_bytes = 16 * 1024 * 1024;
+const tokenizer_fixed_peak_bytes = 24 * 1024 * 1024;
+
+fn checkedScaledBytes(base: usize, multiplier: usize, fixed: usize) !usize {
+    return std.math.add(
+        usize,
+        std.math.mul(usize, base, multiplier) catch
+            return error.ResourceLimitExceeded,
+        fixed,
+    ) catch return error.ResourceLimitExceeded;
+}
+
+/// Tokenizer parsers expand compact JSON/protobuf vocabularies into multiple
+/// owned hash maps and tries. Reserve a deliberately conservative construction
+/// peak before reading the artifact, then retain the estimated live structures.
+fn tokenizerAdmissionPlan(encoded_bytes: usize, kind: TokenizerArtifactKind) !ModelLoadAdmissionPlan {
+    const factors: struct { resident: usize, peak: usize } = switch (kind) {
+        .huggingface => .{ .resident = 10, .peak = 13 },
+        .wordpiece => .{ .resident = 7, .peak = 9 },
+        .sentencepiece => .{ .resident = 5, .peak = 7 },
+    };
+    return .{
+        .peak = .{
+            .host_weight_bytes = try checkedScaledBytes(
+                encoded_bytes,
+                factors.peak,
+                tokenizer_fixed_peak_bytes,
+            ),
+        },
+        .resident = .{
+            .host_weight_bytes = try checkedScaledBytes(
+                encoded_bytes,
+                factors.resident,
+                tokenizer_fixed_resident_bytes,
+            ),
+        },
+    };
+}
+
+fn tokenizerFileAdmissionPlan(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    kind: TokenizerArtifactKind,
+) !ModelLoadAdmissionPlan {
+    const encoded_u64 = try c_file.fileSize(allocator, path);
+    const encoded = std.math.cast(usize, encoded_u64) orelse
+        return error.ResourceLimitExceeded;
+    return tokenizerAdmissionPlan(encoded, kind);
+}
+
+fn tokenizerLoadAdmissionPlan(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    gguf_path: ?[]const u8,
+    tokenizer_type: manifest_mod.TokenizerType,
+) !ModelLoadAdmissionPlan {
+    if (tokenizer_type == .huggingface) {
+        const candidates = [_]TokenizerArtifactCandidate{
+            .{ .name = "tokenizer.json", .kind = .huggingface },
+            .{ .name = "vocab.txt", .kind = .wordpiece },
+        };
+        for (candidates) |candidate| {
+            const path = try std.fs.path.join(allocator, &.{ model_dir, candidate.name });
+            defer allocator.free(path);
+            if (!c_file.fileExists(allocator, path)) continue;
+            var encoded = std.math.cast(
+                usize,
+                try c_file.fileSize(allocator, path),
+            ) orelse return error.ResourceLimitExceeded;
+            // Legacy WordPiece additionally parses these optional JSON maps.
+            if (candidate.kind == .wordpiece) {
+                const sidecars = [_][]const u8{
+                    "tokenizer_config.json",
+                    "special_tokens_map.json",
+                };
+                for (sidecars) |name| {
+                    const sidecar = try std.fs.path.join(allocator, &.{ model_dir, name });
+                    defer allocator.free(sidecar);
+                    if (!c_file.fileExists(allocator, sidecar)) continue;
+                    const size = std.math.cast(
+                        usize,
+                        try c_file.fileSize(allocator, sidecar),
+                    ) orelse return error.ResourceLimitExceeded;
+                    encoded = std.math.add(usize, encoded, size) catch
+                        return error.ResourceLimitExceeded;
+                }
+            }
+            return tokenizerAdmissionPlan(encoded, candidate.kind);
+        }
+    } else {
+        var encoded: usize = 0;
+        var found_sentencepiece = false;
+        const sidecars = [_][]const u8{
+            "tokenizer.model",
+            "tokenizer.json",
+            "added_tokens.json",
+        };
+        for (sidecars) |name| {
+            const path = try std.fs.path.join(allocator, &.{ model_dir, name });
+            defer allocator.free(path);
+            if (!c_file.fileExists(allocator, path)) continue;
+            const size = std.math.cast(
+                usize,
+                try c_file.fileSize(allocator, path),
+            ) orelse return error.ResourceLimitExceeded;
+            encoded = std.math.add(usize, encoded, size) catch
+                return error.ResourceLimitExceeded;
+            if (std.mem.eql(u8, name, "tokenizer.model")) {
+                found_sentencepiece = true;
+            }
+        }
+        if (found_sentencepiece) {
+            return tokenizerAdmissionPlan(encoded, .sentencepiece);
+        }
+    }
+    if (gguf_path) |path| {
+        var region = try c_file.MmapRegion.init(allocator, path);
+        defer region.deinit();
+        const encoded = try gguf_format.encodedMetadataBytesWithPrefix(
+            region.data,
+            "tokenizer.",
+        );
+        if (encoded == 0) return error.NoTokenizerFound;
+        var plan = try tokenizerAdmissionPlan(
+            encoded,
+            if (tokenizer_type == .huggingface)
+                .huggingface
+            else
+                .sentencepiece,
+        );
+        // The tokenizer loader currently parses the complete GGUF metadata and
+        // tensor-info header before extracting tokenizer arrays. Account for
+        // those temporary copied keys/names/dimensions in the construction peak.
+        const header_bytes = try gguf_format.encodedHeaderBytes(region.data);
+        if (header_bytes < encoded) return error.InvalidTokenizerMetadata;
+        const non_tokenizer_header = header_bytes - encoded;
+        plan.peak.host_weight_bytes = std.math.add(
+            usize,
+            plan.peak.host_weight_bytes,
+            std.math.mul(usize, non_tokenizer_header, 3) catch
+                return error.ResourceLimitExceeded,
+        ) catch return error.ResourceLimitExceeded;
+        return plan;
+    }
+    return error.NoTokenizerFound;
+}
 
 const ComponentArtifactEstimate = union(enum) {
     disabled,
@@ -2885,6 +3169,20 @@ const ComponentArtifactEstimate = union(enum) {
         };
     }
 };
+
+test "tokenizer admission reserves parse peak and retains live structures" {
+    const encoded: usize = 2 * 1024 * 1024;
+    const plan = try tokenizerAdmissionPlan(encoded, .huggingface);
+    try std.testing.expectEqual(
+        tokenizer_fixed_peak_bytes + 13 * encoded,
+        plan.peak.host_weight_bytes,
+    );
+    try std.testing.expectEqual(
+        tokenizer_fixed_resident_bytes + 10 * encoded,
+        plan.resident.host_weight_bytes,
+    );
+    try std.testing.expect(plan.peak.host_weight_bytes > plan.resident.host_weight_bytes);
+}
 
 fn addArtifactBytes(total: *usize, allocator: std.mem.Allocator, maybe_path: ?[]const u8) !void {
     const path = maybe_path orelse return;

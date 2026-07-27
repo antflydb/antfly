@@ -291,6 +291,27 @@ pub const Vision2SeqRecognizer = struct {
         };
     }
 
+    pub fn loadFromStagePathsWithTokenizer(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        encoder_path: []const u8,
+        decoder_path: []const u8,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        managed_tokenizer: *model_manager_mod.ManagedHfTokenizer,
+    ) !Vision2SeqRecognizer {
+        return .{
+            .allocator = allocator,
+            .reader = try vision_reader.LoadedVisionReader.loadFromStagePathsWithTokenizer(
+                allocator,
+                model_path,
+                encoder_path,
+                decoder_path,
+                component_loader,
+                managed_tokenizer,
+            ),
+        };
+    }
+
     pub fn deinit(self: *Vision2SeqRecognizer) void {
         self.reader.deinit();
     }

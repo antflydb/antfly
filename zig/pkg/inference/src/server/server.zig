@@ -184,6 +184,40 @@ test "model manager rebalances every active prompt cache" {
     try std.testing.expectEqual(@as(usize, 0), first.prompt_prefix_cache.stats().live_entries);
 }
 
+test "concurrent first prompt cache activations share the node budget" {
+    const allocator = std.testing.allocator;
+    var manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator));
+    defer manager.loaded.deinit(allocator);
+    defer manager.loaded_aliases.deinit(allocator);
+
+    var first: model_manager_mod.LoadedModel = undefined;
+    first.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer first.prompt_prefix_cache.deinit();
+    var second: model_manager_mod.LoadedModel = undefined;
+    second.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer second.prompt_prefix_cache.deinit();
+    try manager.loaded.put(allocator, "first", &first);
+    try manager.loaded.put(allocator, "second", &second);
+
+    const node_config = runtime.kv.prompt_cache.Config{
+        .enabled = true,
+        .max_bytes = 1024,
+    };
+    // Reproduce the production interleaving: both handlers rebalance before
+    // either has reached ensurePool().
+    manager.rebalancePromptCaches(&first, node_config);
+    manager.rebalancePromptCaches(&second, node_config);
+
+    try std.testing.expectEqual(@as(usize, 512), first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 512), second.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expect(first.prompt_prefix_cache.isParticipating());
+    try std.testing.expect(second.prompt_prefix_cache.isParticipating());
+
+    manager.cancelPromptCacheActivation(&second, node_config);
+    try std.testing.expectEqual(@as(usize, 1024), first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expect(!second.prompt_prefix_cache.isParticipating());
+}
+
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -3804,13 +3838,18 @@ pub const Node = struct {
             effective_draft_model_name == null and
             config.cache_compaction_ratio == null)
         {
+            const prompt_cache_config = self.config.prompt_cache.runtimeConfig(
+                self.config.prompt_cache_resource_usage_observer,
+            );
             self.model_manager.rebalancePromptCaches(
                 model,
-                self.config.prompt_cache.runtimeConfig(self.config.prompt_cache_resource_usage_observer),
+                prompt_cache_config,
             );
             const cache_ready = if (backend_kind == .metal or backend_kind == .cuda) blk: {
-                const ensured = model.prompt_prefix_cache.ensureStorage(pool_config) catch |err|
+                const ensured = model.prompt_prefix_cache.ensureStorage(pool_config) catch |err| {
+                    self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                };
                 const storage = if (ensured) |result| result.storage else break :blk false;
                 if (storage.device_write_hook == null) {
                     cb.provisionKvDeviceWriteHook(storage) catch |err|
@@ -3820,8 +3859,10 @@ pub const Node = struct {
                 active_kv_storage = storage;
                 break :blk true;
             } else blk: {
-                const maybe_cache_pool_id = model.prompt_prefix_cache.ensurePool(pool_config) catch |err|
+                const maybe_cache_pool_id = model.prompt_prefix_cache.ensurePool(pool_config) catch |err| {
+                    self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                };
                 break :blk maybe_cache_pool_id != null;
             };
 
@@ -3833,6 +3874,7 @@ pub const Node = struct {
                 pool_id = kv_manager.addPool(pool_config) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                 config.prompt_cache_enabled = false;
+                self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
             }
         } else {
             config.prompt_cache_enabled = false;

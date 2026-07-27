@@ -18,7 +18,6 @@ const manifest_mod = @import("../models/manifest.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
 const tokenizer_mod = @import("inference_tokenizer");
-const hf_tokenizer = @import("inference_hf_tokenizer");
 const reading_pipeline_mod = @import("../pipelines/reading.zig");
 const image = @import("../pipelines/image.zig");
 const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
@@ -44,7 +43,7 @@ pub const LoadedVisionReader = struct {
     dec_config: enc_dec_mod.DecoderConfig,
     preproc: PreprocessorConfig,
     loaded_model: ?*model_manager_mod.LoadedModel = null,
-    hf_tok: ?*hf_tokenizer.HfTokenizer = null,
+    managed_hf_tok: ?model_manager_mod.ManagedHfTokenizer = null,
     owns_sessions: bool = false,
     encoder_managed: ?model_manager_mod.ManagedSession = null,
     decoder_managed: ?model_manager_mod.ManagedSession = null,
@@ -67,7 +66,7 @@ pub const LoadedVisionReader = struct {
                 session_manager.preferred_backends,
                 &.{ paths.encoder, paths.decoder },
             );
-            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), &loader);
+            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), &loader, null);
         } else |_| {}
 
         const model = try model_manager.loadFromDir(model_path);
@@ -100,7 +99,29 @@ pub const LoadedVisionReader = struct {
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         const preproc = loadPreprocessorConfig(allocator, model_path);
 
-        return loadEncoderDecoderPaths(allocator, model_path, encoder_path, decoder_path, dec_config, preproc, component_loader);
+        return loadEncoderDecoderPaths(allocator, model_path, encoder_path, decoder_path, dec_config, preproc, component_loader, null);
+    }
+
+    pub fn loadFromStagePathsWithTokenizer(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        encoder_path: []const u8,
+        decoder_path: []const u8,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        managed_tokenizer: *model_manager_mod.ManagedHfTokenizer,
+    ) !LoadedVisionReader {
+        const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
+        const preproc = loadPreprocessorConfig(allocator, model_path);
+        return loadEncoderDecoderPaths(
+            allocator,
+            model_path,
+            encoder_path,
+            decoder_path,
+            dec_config,
+            preproc,
+            component_loader,
+            managed_tokenizer,
+        );
     }
 
     fn loadEncoderDecoderPaths(
@@ -111,6 +132,7 @@ pub const LoadedVisionReader = struct {
         dec_config: enc_dec_mod.DecoderConfig,
         preproc: PreprocessorConfig,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        preloaded_tokenizer: ?*model_manager_mod.ManagedHfTokenizer,
     ) !LoadedVisionReader {
         var encoder_managed = try component_loader.load(encoder_path);
         errdefer encoder_managed.deinit();
@@ -123,11 +145,11 @@ pub const LoadedVisionReader = struct {
 
         const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_path});
         defer allocator.free(tok_path);
-        const tok_bytes = try c_file.readFile(allocator, tok_path);
-        defer allocator.free(tok_bytes);
-
-        const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tok_bytes);
-        errdefer tok.deinitSelf();
+        var loaded_tokenizer = if (preloaded_tokenizer) |managed|
+            managed.take()
+        else
+            try component_loader.loadHfTokenizerFile(tok_path);
+        errdefer loaded_tokenizer.deinit();
 
         return .{
             .allocator = allocator,
@@ -135,7 +157,7 @@ pub const LoadedVisionReader = struct {
             .decoder_session = decoder_session,
             .dec_config = dec_config,
             .preproc = preproc,
-            .hf_tok = tok,
+            .managed_hf_tok = loaded_tokenizer,
             .owns_sessions = true,
             .encoder_managed = encoder_managed,
             .decoder_managed = decoder_managed,
@@ -143,7 +165,7 @@ pub const LoadedVisionReader = struct {
     }
 
     pub fn deinit(self: *LoadedVisionReader) void {
-        if (self.hf_tok) |tok| tok.deinitSelf();
+        if (self.managed_hf_tok) |*managed| managed.deinit();
         if (self.owns_sessions) {
             if (self.encoder_managed) |*managed| managed.deinit() else self.encoder_session.close();
             if (self.decoder_managed) |*managed| managed.deinit() else self.decoder_session.close();
@@ -197,7 +219,7 @@ pub const LoadedVisionReader = struct {
 
     fn tokenizer(self: *LoadedVisionReader) tokenizer_mod.Tokenizer {
         if (self.loaded_model) |model| return model.getTokenizer();
-        if (self.hf_tok) |tok| return tok.tokenizer();
+        if (self.managed_hf_tok) |*managed| return managed.tokenizer.tokenizer();
         unreachable;
     }
 };

@@ -121,6 +121,64 @@ pub fn parseStructure(allocator: std.mem.Allocator, bytes: []const u8) !File {
     return parseWithOptions(allocator, bytes, .{ .skip_tokenizer_metadata = true });
 }
 
+/// Return the encoded byte span of metadata entries whose keys share `prefix`
+/// without allocating or materializing arrays. Resource admission uses this to
+/// size embedded tokenizer state without treating the whole GGUF weight file as
+/// tokenizer input.
+pub fn encodedMetadataBytesWithPrefix(
+    bytes: []const u8,
+    prefix: []const u8,
+) !usize {
+    var cursor = Cursor{ .bytes = bytes };
+    const header = try parseHeader(&cursor);
+    var total: usize = 0;
+    for (0..try countToUsize(header.metadata_count)) |_| {
+        const entry_start = cursor.pos;
+        const key = try cursor.readBorrowedString();
+        const raw_type = try cursor.readInt(u32);
+        const value_type = metadataValueTypeFromRaw(raw_type) orelse
+            return error.UnsupportedMetadataType;
+        try cursor.skipMetadataValue(value_type);
+        if (std.mem.startsWith(u8, key, prefix)) {
+            total = std.math.add(
+                usize,
+                total,
+                cursor.pos - entry_start,
+            ) catch return error.InvalidMetadataCount;
+        }
+    }
+    return total;
+}
+
+/// Return the encoded GGUF header length through the tensor-info table without
+/// allocating names, dimensions, or metadata arrays.
+pub fn encodedHeaderBytes(bytes: []const u8) !usize {
+    var cursor = Cursor{ .bytes = bytes };
+    const header = try parseHeader(&cursor);
+    for (0..try countToUsize(header.metadata_count)) |_| {
+        _ = try cursor.readBorrowedString();
+        const raw_type = try cursor.readInt(u32);
+        const value_type = metadataValueTypeFromRaw(raw_type) orelse
+            return error.UnsupportedMetadataType;
+        try cursor.skipMetadataValue(value_type);
+    }
+
+    const tensor_count = try countToUsize(header.tensor_count);
+    if (tensor_count > cursor.remainingBytes() / 24)
+        return error.InvalidTensorCount;
+    for (0..tensor_count) |_| {
+        _ = try cursor.readBorrowedString();
+        const dimension_count = try cursor.readInt(u32);
+        try cursor.skipBytes(try std.math.mul(
+            u64,
+            dimension_count,
+            @sizeOf(u64),
+        ));
+        try cursor.skipBytes(@sizeOf(u32) + @sizeOf(u64));
+    }
+    return cursor.pos;
+}
+
 const ParseOptions = struct {
     skip_tokenizer_metadata: bool = false,
 };
@@ -497,6 +555,43 @@ test "readArchitecture skips past preceding metadata including token arrays" {
     const metadata = try readSupportMetadata(data.items);
     try std.testing.expectEqualStrings("gemma4", metadata.architecture.?);
     try std.testing.expectEqual(@as(u32, 128), metadata.expert_count);
+}
+
+test "encoded metadata prefix scan counts only matching entries" {
+    const allocator = std.testing.allocator;
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, magic);
+    try appendLe(u32, allocator, &data, 3);
+    try appendLe(u64, allocator, &data, 0);
+    try appendLe(u64, allocator, &data, 3);
+
+    const tokenizer_start = data.items.len;
+    try appendString(allocator, &data, "tokenizer.ggml.tokens");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.array));
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendLe(u64, allocator, &data, 2);
+    try appendString(allocator, &data, "hello");
+    try appendString(allocator, &data, "world");
+    const first_tokenizer_end = data.items.len;
+
+    try appendString(allocator, &data, "general.architecture");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
+    try appendString(allocator, &data, "llama");
+
+    const second_tokenizer_start = data.items.len;
+    try appendString(allocator, &data, "tokenizer.ggml.eos_token_id");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, 2);
+    const second_tokenizer_end = data.items.len;
+
+    try std.testing.expectEqual(
+        (first_tokenizer_end - tokenizer_start) +
+            (second_tokenizer_end - second_tokenizer_start),
+        try encodedMetadataBytesWithPrefix(data.items, "tokenizer."),
+    );
+    try std.testing.expectEqual(data.items.len, try encodedHeaderBytes(data.items));
 }
 
 test "readArchitecture returns null when the key is absent" {
