@@ -1,7 +1,9 @@
 # Hyperdimensional Computing in Antfly
 
-- Status: experimental managed-index implementation
-- Target: end-to-end retrieval, lifecycle, and quality validation before release
+- Status: experiment concluded no-go for a stable public index; prototype
+  retained for reproducibility
+- Target: do not release without new representative evidence that reverses the
+  quality/cost decision
 - Related design: [ALGEBRAIC.md](ALGEBRAIC.md)
 
 ## Implementation Status
