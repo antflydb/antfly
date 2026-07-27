@@ -1287,19 +1287,155 @@ pub fn resolveGraphSelector(alloc: Allocator, selector: graph_query_mod.NodeSele
 }
 
 pub fn storedDocMatchesPatternFilter(alloc: Allocator, key: []const u8, stored: []const u8, filter_query_json: []const u8) !bool {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
-    defer parsed.deinit();
-    var filter_query = try std.json.parseFromSlice(std.json.Value, alloc, filter_query_json, .{});
-    defer filter_query.deinit();
-    return try jsonDocMatchesPatternFilter(alloc, key, parsed.value, filter_query.value);
+    var prepared = try PreparedPatternFilter.init(alloc, filter_query_json);
+    defer prepared.deinit();
+    return try prepared.matchesStored(alloc, key, stored);
 }
 
 pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.json.Value, filter_query: std.json.Value) !bool {
-    var matcher_arena = std.heap.ArenaAllocator.init(alloc);
-    defer matcher_arena.deinit();
-    const compiled = try compilePatternFilter(matcher_arena.allocator(), filter_query);
-    return try compiled.matches(alloc, key, doc);
+    var prepared = try PreparedPatternFilter.initValue(alloc, filter_query);
+    defer prepared.deinit();
+    return try prepared.matchesJson(alloc, key, doc);
 }
+
+/// An immutable, request-scoped filter execution plan. The parsed query and all
+/// compiled automata share one arena, so setup is paid once and teardown remains
+/// constant-time. A plan may be reused for any number of documents while the
+/// caller provides per-document scratch allocation to `matches*`.
+pub const PreparedPatternFilter = struct {
+    arena: std.heap.ArenaAllocator,
+    compiled: CompiledPatternFilter,
+
+    pub fn init(backing_alloc: Allocator, filter_query_json: []const u8) !PreparedPatternFilter {
+        var out = PreparedPatternFilter{
+            .arena = std.heap.ArenaAllocator.init(backing_alloc),
+            .compiled = undefined,
+        };
+        errdefer out.arena.deinit();
+        const arena_alloc = out.arena.allocator();
+        const filter_query = try std.json.parseFromSliceLeaky(
+            std.json.Value,
+            arena_alloc,
+            filter_query_json,
+            .{ .allocate = .alloc_always },
+        );
+        out.compiled = try compilePatternFilter(arena_alloc, filter_query);
+        return out;
+    }
+
+    pub fn initValue(backing_alloc: Allocator, filter_query: std.json.Value) !PreparedPatternFilter {
+        var out = PreparedPatternFilter{
+            .arena = std.heap.ArenaAllocator.init(backing_alloc),
+            .compiled = undefined,
+        };
+        errdefer out.arena.deinit();
+        const arena_alloc = out.arena.allocator();
+        const owned_filter_query = try std.json.parseFromValueLeaky(
+            std.json.Value,
+            arena_alloc,
+            filter_query,
+            .{ .allocate = .alloc_always },
+        );
+        out.compiled = try compilePatternFilter(arena_alloc, owned_filter_query);
+        return out;
+    }
+
+    pub fn deinit(self: *PreparedPatternFilter) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn matchesStored(
+        self: *const PreparedPatternFilter,
+        scratch_alloc: Allocator,
+        key: []const u8,
+        stored: []const u8,
+    ) !bool {
+        var parsed = try std.json.parseFromSlice(std.json.Value, scratch_alloc, stored, .{});
+        defer parsed.deinit();
+        return try self.compiled.matches(scratch_alloc, key, parsed.value);
+    }
+
+    pub fn matchesJson(
+        self: *const PreparedPatternFilter,
+        scratch_alloc: Allocator,
+        key: []const u8,
+        doc: std.json.Value,
+    ) !bool {
+        return try self.compiled.matches(scratch_alloc, key, doc);
+    }
+};
+
+test "prepared pattern filters own source JSON" {
+    const alloc = std.testing.allocator;
+    const stored = "{\"tenant\":\"acme\"}";
+
+    const encoded = try alloc.dupe(u8, "{\"term\":{\"tenant\":\"acme\"}}");
+    var encoded_owned = true;
+    defer if (encoded_owned) alloc.free(encoded);
+    var encoded_prepared = try PreparedPatternFilter.init(alloc, encoded);
+    defer encoded_prepared.deinit();
+    @memset(encoded, 'x');
+    alloc.free(encoded);
+    encoded_owned = false;
+    try std.testing.expect(try encoded_prepared.matchesStored(
+        alloc,
+        "doc-1",
+        stored,
+    ));
+
+    var value_prepared = blk: {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            "{\"term\":{\"tenant\":\"acme\"}}",
+            .{ .allocate = .alloc_always },
+        );
+        defer parsed.deinit();
+        break :blk try PreparedPatternFilter.initValue(alloc, parsed.value);
+    };
+    defer value_prepared.deinit();
+    try std.testing.expect(try value_prepared.matchesStored(
+        alloc,
+        "doc-1",
+        stored,
+    ));
+}
+
+/// Lazily prepares each distinct graph-node filter at most once per traversal.
+/// Keys borrow the pattern request JSON and therefore must outlive the cache.
+pub const PreparedPatternFilterCache = struct {
+    alloc: Allocator,
+    entries: std.StringHashMapUnmanaged(*PreparedPatternFilter) = .empty,
+
+    pub fn init(alloc: Allocator) PreparedPatternFilterCache {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn deinit(self: *PreparedPatternFilterCache) void {
+        var it = self.entries.valueIterator();
+        while (it.next()) |prepared| {
+            prepared.*.deinit();
+            self.alloc.destroy(prepared.*);
+        }
+        self.entries.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn getOrPrepare(
+        self: *PreparedPatternFilterCache,
+        filter_query_json: []const u8,
+    ) !*const PreparedPatternFilter {
+        if (self.entries.get(filter_query_json)) |prepared| return prepared;
+
+        const prepared = try self.alloc.create(PreparedPatternFilter);
+        errdefer self.alloc.destroy(prepared);
+        prepared.* = try PreparedPatternFilter.init(self.alloc, filter_query_json);
+        errdefer prepared.deinit();
+        try self.entries.put(self.alloc, filter_query_json, prepared);
+        return prepared;
+    }
+};
 
 pub fn patternFilterNeedsStoredDoc(filter_query: std.json.Value) !bool {
     _ = try pattern_filter_contract.requireSingleRoot(filter_query);
@@ -1517,7 +1653,29 @@ pub const CompiledPatternFilter = union(enum) {
     }
 };
 
+const pattern_filter_max_tree_depth: u8 = 64;
+const pattern_filter_max_tree_nodes: usize = 16_384;
+
 pub fn compilePatternFilter(alloc: Allocator, filter_query: std.json.Value) anyerror!CompiledPatternFilter {
+    var remaining_nodes: usize = pattern_filter_max_tree_nodes;
+    return try compilePatternFilterBounded(
+        alloc,
+        filter_query,
+        0,
+        &remaining_nodes,
+    );
+}
+
+fn compilePatternFilterBounded(
+    alloc: Allocator,
+    filter_query: std.json.Value,
+    depth: u8,
+    remaining_nodes: *usize,
+) anyerror!CompiledPatternFilter {
+    if (depth >= pattern_filter_max_tree_depth or remaining_nodes.* == 0) {
+        return error.InvalidArgument;
+    }
+    remaining_nodes.* -= 1;
     _ = try pattern_filter_contract.requireSingleRoot(filter_query);
 
     if (filter_query.object.get("match_all") != null) return .match_all;
@@ -1526,10 +1684,20 @@ pub fn compilePatternFilter(alloc: Allocator, filter_query: std.json.Value) anye
         return .{ .doc_id = try compilePatternDocIds(alloc, doc_id) };
     }
     if (filter_query.object.get("conjuncts")) |conjuncts| {
-        return .{ .conjuncts = try compilePatternFilterArray(alloc, conjuncts) };
+        return .{ .conjuncts = try compilePatternFilterArray(
+            alloc,
+            conjuncts,
+            depth,
+            remaining_nodes,
+        ) };
     }
     if (filter_query.object.get("disjuncts")) |disjuncts| {
-        return .{ .disjuncts = try compilePatternFilterArray(alloc, disjuncts) };
+        return .{ .disjuncts = try compilePatternFilterArray(
+            alloc,
+            disjuncts,
+            depth,
+            remaining_nodes,
+        ) };
     }
     if (filter_query.object.get("match") != null) {
         return error.UnsupportedQueryRequest;
@@ -1540,11 +1708,37 @@ pub fn compilePatternFilter(alloc: Allocator, filter_query: std.json.Value) anye
         var compiled = CompiledPatternFilter.BoolQuery{};
         var must = std.ArrayListUnmanaged(CompiledPatternFilter).empty;
         errdefer must.deinit(alloc);
-        if (bool_query.object.get("filter")) |filter| try appendCompiledPatternFilterArray(alloc, &must, filter);
-        if (bool_query.object.get("must")) |must_value| try appendCompiledPatternFilterArray(alloc, &must, must_value);
+        if (bool_query.object.get("filter")) |filter| try appendCompiledPatternFilterArray(
+            alloc,
+            &must,
+            filter,
+            depth,
+            remaining_nodes,
+        );
+        if (bool_query.object.get("must")) |must_value| try appendCompiledPatternFilterArray(
+            alloc,
+            &must,
+            must_value,
+            depth,
+            remaining_nodes,
+        );
         if (must.items.len > 0) compiled.must = try must.toOwnedSlice(alloc);
-        if (bool_query.object.get("should")) |should| compiled.should = try compilePatternFilterArray(alloc, should);
-        if (bool_query.object.get("must_not")) |must_not| compiled.must_not = try compilePatternFilterArray(alloc, must_not);
+        if (bool_query.object.get("should")) |should| {
+            compiled.should = try compilePatternFilterArray(
+                alloc,
+                should,
+                depth,
+                remaining_nodes,
+            );
+        }
+        if (bool_query.object.get("must_not")) |must_not| {
+            compiled.must_not = try compilePatternFilterArray(
+                alloc,
+                must_not,
+                depth,
+                remaining_nodes,
+            );
+        }
         compiled.min_should = try pattern_filter_contract.minimumShould(
             bool_query.object,
             compiled.should.len,
@@ -1576,11 +1770,21 @@ fn compilePatternDocIds(alloc: Allocator, doc_id: std.json.Value) ![]const []con
     return compiled;
 }
 
-fn compilePatternFilterArray(alloc: Allocator, items: std.json.Value) anyerror![]CompiledPatternFilter {
+fn compilePatternFilterArray(
+    alloc: Allocator,
+    items: std.json.Value,
+    parent_depth: u8,
+    remaining_nodes: *usize,
+) anyerror![]CompiledPatternFilter {
     if (items != .array or items.array.items.len == 0) return error.InvalidArgument;
     const compiled = try alloc.alloc(CompiledPatternFilter, items.array.items.len);
     for (items.array.items, 0..) |item, i| {
-        compiled[i] = try compilePatternFilter(alloc, item);
+        compiled[i] = try compilePatternFilterBounded(
+            alloc,
+            item,
+            parent_depth + 1,
+            remaining_nodes,
+        );
     }
     return compiled;
 }
@@ -1589,11 +1793,18 @@ fn appendCompiledPatternFilterArray(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(CompiledPatternFilter),
     items: std.json.Value,
+    parent_depth: u8,
+    remaining_nodes: *usize,
 ) anyerror!void {
     if (items != .array or items.array.items.len == 0) return error.InvalidArgument;
     try out.ensureUnusedCapacity(alloc, items.array.items.len);
     for (items.array.items) |item| {
-        out.appendAssumeCapacity(try compilePatternFilter(alloc, item));
+        out.appendAssumeCapacity(try compilePatternFilterBounded(
+            alloc,
+            item,
+            parent_depth + 1,
+            remaining_nodes,
+        ));
     }
 }
 
@@ -1856,23 +2067,69 @@ fn compilePatternFieldPredicate(alloc: Allocator, filter_query: std.json.Value) 
     if (filter_query.object.get("fuzzy")) |fuzzy| {
         return .{ .fuzzy = try compileFuzzyPredicate(alloc, try extractPatternFuzzyPredicate(fuzzy)) };
     }
-    if (filter_query.object.get("numeric_range")) |range_query| return .{ .numeric_range = range_query };
+    if (filter_query.object.get("numeric_range")) |range_query| {
+        _ = try jsonValuesContainNumericRange(&.{}, range_query);
+        return .{ .numeric_range = range_query };
+    }
     if (filter_query.object.get("range")) |range_query| {
         const predicate = try extractStandardRangePredicate(range_query);
         const lower = try standardPatternRangeLowerBound(predicate);
         const upper = try standardPatternRangeUpperBound(predicate);
         if (lower == null and upper == null) return error.InvalidArgument;
+        if (lower) |bound| try validatePatternRangeBound(bound.value);
+        if (upper) |bound| try validatePatternRangeBound(bound.value);
         return .{ .standard_range = predicate };
     }
-    if (filter_query.object.get("date_range")) |range_query| return .{ .date_range = range_query };
-    if (filter_query.object.get("bool_field")) |bool_query| return .{ .bool_field = bool_query };
-    if (filter_query.object.get("term_range")) |range_query| return .{ .term_range = range_query };
-    if (filter_query.object.get("ip_range")) |range_query| return .{ .ip_range = range_query };
-    if (filter_query.object.get("geo_distance")) |geo_query| return .{ .geo_distance = geo_query };
-    if (filter_query.object.get("geo_bbox")) |geo_query| return .{ .geo_bbox = geo_query };
-    if (filter_query.object.get("geo_shape")) |geo_query| return .{ .geo_shape = geo_query };
+    if (filter_query.object.get("date_range")) |range_query| {
+        _ = try jsonValuesContainDateRange(&.{}, range_query);
+        return .{ .date_range = range_query };
+    }
+    if (filter_query.object.get("bool_field")) |bool_query| {
+        _ = try jsonValuesContainBoolField(&.{}, bool_query);
+        return .{ .bool_field = bool_query };
+    }
+    if (filter_query.object.get("term_range")) |range_query| {
+        try validatePatternTermRange(range_query);
+        return .{ .term_range = range_query };
+    }
+    if (filter_query.object.get("ip_range")) |range_query| {
+        _ = try jsonValuesContainIpRange(&.{}, range_query);
+        return .{ .ip_range = range_query };
+    }
+    if (filter_query.object.get("geo_distance")) |geo_query| {
+        _ = try jsonValuesContainGeoDistance(&.{}, geo_query);
+        return .{ .geo_distance = geo_query };
+    }
+    if (filter_query.object.get("geo_bbox")) |geo_query| {
+        _ = try jsonValuesContainGeoBBox(&.{}, geo_query);
+        return .{ .geo_bbox = geo_query };
+    }
+    if (filter_query.object.get("geo_shape")) |geo_query| {
+        _ = try jsonValuesContainGeoShape(alloc, &.{}, geo_query);
+        return .{ .geo_shape = geo_query };
+    }
     if (filter_query.object.get("exists") != null) return .exists;
     return error.InvalidArgument;
+}
+
+fn validatePatternRangeBound(value: std.json.Value) !void {
+    var buf: [64]u8 = undefined;
+    _ = try jsonScalarTermSlice(value, &buf);
+}
+
+fn validatePatternTermRange(range_query: std.json.Value) !void {
+    if (range_query != .object) return error.InvalidArgument;
+    const min_value = range_query.object.get("min");
+    const max_value = range_query.object.get("max");
+    if (min_value == null and max_value == null) return error.InvalidArgument;
+    if (min_value) |value| try validatePatternRangeBound(value);
+    if (max_value) |value| try validatePatternRangeBound(value);
+    if (range_query.object.get("inclusive_min")) |value| {
+        if (value != .bool) return error.InvalidArgument;
+    }
+    if (range_query.object.get("inclusive_max")) |value| {
+        if (value != .bool) return error.InvalidArgument;
+    }
 }
 
 fn collectJsonValuesAtSingleSegment(
@@ -1964,6 +2221,7 @@ fn jsonValuesContainTerm(values: []const std.json.Value, term: []const u8) bool 
                 if ((boolean and std.mem.eql(u8, term, "true")) or (!boolean and std.mem.eql(u8, term, "false"))) return true;
             },
             .null => if (std.mem.eql(u8, term, "null")) return true,
+            .array => |array| if (jsonValuesContainTerm(array.items, term)) return true,
             else => {},
         }
     }
@@ -1983,6 +2241,7 @@ fn jsonValuesContainPrefix(values: []const std.json.Value, prefix: []const u8) b
             .string => |candidate| {
                 if (std.mem.startsWith(u8, candidate, prefix)) return true;
             },
+            .array => |array| if (jsonValuesContainPrefix(array.items, prefix)) return true,
             else => {},
         }
     }
@@ -1995,6 +2254,7 @@ fn jsonValuesContainWildcard(values: []const std.json.Value, pattern: []const u8
             .string => |candidate| {
                 if (wildcardMatch(pattern, candidate)) return true;
             },
+            .array => |array| if (jsonValuesContainWildcard(array.items, pattern)) return true,
             else => {},
         }
     }
@@ -2007,6 +2267,7 @@ fn jsonValuesContainRegexp(alloc: Allocator, values: []const std.json.Value, pat
             .string => |candidate| {
                 if (try regexMatches(alloc, pattern, candidate)) return true;
             },
+            .array => |array| if (try jsonValuesContainRegexp(alloc, array.items, pattern)) return true,
             else => {},
         }
     }
@@ -2019,6 +2280,7 @@ fn jsonValuesContainCompiledRegexp(values: []const std.json.Value, compiled: *re
             .string => |candidate| {
                 if (regex_mod.matchesCompiled("", compiled, candidate)) return true;
             },
+            .array => |array| if (jsonValuesContainCompiledRegexp(array.items, compiled)) return true,
             else => {},
         }
     }
@@ -2032,6 +2294,7 @@ fn jsonValuesContainFuzzy(alloc: Allocator, values: []const std.json.Value, fuzz
                 if (!fuzzyPrefixMatches(fuzzy_query.term, candidate, fuzzy_query.prefix_len)) continue;
                 if (try fuzzyMatchString(alloc, candidate, fuzzy_query.folded_term, fuzzy_query.max_edits)) return true;
             },
+            .array => |array| if (try jsonValuesContainFuzzy(alloc, array.items, fuzzy_query)) return true,
             else => {},
         }
     }
@@ -2114,6 +2377,10 @@ fn jsonValuesContainNumericRange(values: []const std.json.Value, range_query: st
     } else false;
 
     for (values) |value| {
+        if (value == .array) {
+            if (try jsonValuesContainNumericRange(value.array.items, range_query)) return true;
+            continue;
+        }
         const candidate = jsonNumberFromValue(value) catch null orelse continue;
         if (min_value) |min| {
             if (candidate < min or (!inclusive_min and candidate == min)) continue;
@@ -2144,6 +2411,12 @@ fn jsonValuesContainStandardRange(values: []const std.json.Value, range_query: s
 }
 
 fn jsonValueMatchesStandardRange(value: std.json.Value, lower: ?PatternJsonRangeBound, upper: ?PatternJsonRangeBound) !bool {
+    if (value == .array) {
+        for (value.array.items) |item| {
+            if (try jsonValueMatchesStandardRange(item, lower, upper)) return true;
+        }
+        return false;
+    }
     if (value == .integer or value == .float) {
         const candidate = try jsonNumberFromValue(value);
         const min_value = if (lower) |bound| try jsonNumberFromValue(bound.value) else null;
@@ -2192,8 +2465,8 @@ fn standardPatternRangeLowerBound(range_query: std.json.Value) !?PatternJsonRang
     var found: ?PatternJsonRangeBound = null;
     if (range_query.object.get("gte")) |value| try setPatternJsonRangeBound(&found, value, true);
     if (range_query.object.get("gt")) |value| try setPatternJsonRangeBound(&found, value, false);
-    if (range_query.object.get("from")) |value| try setPatternJsonRangeBound(&found, value, jsonPatternBoolOrDefault(range_query.object.get("include_lower"), true));
-    if (range_query.object.get("min")) |value| try setPatternJsonRangeBound(&found, value, jsonPatternBoolOrDefault(range_query.object.get("inclusive_min"), true));
+    if (range_query.object.get("from")) |value| try setPatternJsonRangeBound(&found, value, try jsonPatternBoolOrDefault(range_query.object.get("include_lower"), true));
+    if (range_query.object.get("min")) |value| try setPatternJsonRangeBound(&found, value, try jsonPatternBoolOrDefault(range_query.object.get("inclusive_min"), true));
     return found;
 }
 
@@ -2201,8 +2474,8 @@ fn standardPatternRangeUpperBound(range_query: std.json.Value) !?PatternJsonRang
     var found: ?PatternJsonRangeBound = null;
     if (range_query.object.get("lte")) |value| try setPatternJsonRangeBound(&found, value, true);
     if (range_query.object.get("lt")) |value| try setPatternJsonRangeBound(&found, value, false);
-    if (range_query.object.get("to")) |value| try setPatternJsonRangeBound(&found, value, jsonPatternBoolOrDefault(range_query.object.get("include_upper"), true));
-    if (range_query.object.get("max")) |value| try setPatternJsonRangeBound(&found, value, jsonPatternBoolOrDefault(range_query.object.get("inclusive_max"), false));
+    if (range_query.object.get("to")) |value| try setPatternJsonRangeBound(&found, value, try jsonPatternBoolOrDefault(range_query.object.get("include_upper"), true));
+    if (range_query.object.get("max")) |value| try setPatternJsonRangeBound(&found, value, try jsonPatternBoolOrDefault(range_query.object.get("inclusive_max"), false));
     return found;
 }
 
@@ -2211,9 +2484,10 @@ fn setPatternJsonRangeBound(found: *?PatternJsonRangeBound, value: std.json.Valu
     found.* = .{ .value = value, .inclusive = inclusive };
 }
 
-fn jsonPatternBoolOrDefault(value: ?std.json.Value, default_value: bool) bool {
+fn jsonPatternBoolOrDefault(value: ?std.json.Value, default_value: bool) !bool {
     const actual = value orelse return default_value;
-    return if (actual == .bool) actual.bool else default_value;
+    if (actual != .bool) return error.InvalidArgument;
+    return actual.bool;
 }
 
 fn jsonValuesContainDateRange(values: []const std.json.Value, range_query: std.json.Value) !bool {
@@ -2237,6 +2511,10 @@ fn jsonValuesContainDateRange(values: []const std.json.Value, range_query: std.j
     } else false;
 
     for (values) |value| {
+        if (value == .array) {
+            if (try jsonValuesContainDateRange(value.array.items, range_query)) return true;
+            continue;
+        }
         const candidate = jsonDateNsFromValue(value) catch null orelse continue;
         if (start_ns) |start| {
             if (candidate < start or (!inclusive_start and candidate == start)) continue;
@@ -2254,6 +2532,10 @@ fn jsonValuesContainBoolField(values: []const std.json.Value, bool_query: std.js
     const expected = bool_query.object.get("value") orelse return error.InvalidArgument;
     if (expected != .bool) return error.InvalidArgument;
     for (values) |value| {
+        if (value == .array) {
+            if (try jsonValuesContainBoolField(value.array.items, bool_query)) return true;
+            continue;
+        }
         if (value == .bool and value.bool == expected.bool) return true;
     }
     return false;
@@ -2274,6 +2556,10 @@ fn jsonValuesContainTermRange(values: []const std.json.Value, range_query: std.j
     } else false;
 
     for (values) |value| {
+        if (value == .array) {
+            if (try jsonValuesContainTermRange(value.array.items, range_query)) return true;
+            continue;
+        }
         var candidate_buf: [64]u8 = undefined;
         const candidate = jsonScalarTermSlice(value, &candidate_buf) catch continue;
         if (min_value) |min_raw| {
@@ -2302,6 +2588,10 @@ fn jsonValuesContainIpRange(values: []const std.json.Value, ip_range: std.json.V
     if (parsed == null and exact_ip == null) return error.InvalidArgument;
 
     for (values) |value| {
+        if (value == .array) {
+            if (try jsonValuesContainIpRange(value.array.items, ip_range)) return true;
+            continue;
+        }
         if (value != .string) continue;
         const candidate = parsePatternIPv4(value.string) orelse continue;
         const matched = if (parsed) |cidr|
@@ -2332,6 +2622,14 @@ fn jsonValuesContainGeoDistance(values: []const std.json.Value, geo_query: std.j
         .float => |value| value,
         else => return error.InvalidArgument,
     };
+    if (!std.math.isFinite(lat) or !std.math.isFinite(lon) or
+        !std.math.isFinite(radius_meters) or
+        lat < -90.0 or lat > 90.0 or
+        lon < -180.0 or lon > 180.0 or
+        radius_meters < 0)
+    {
+        return error.InvalidArgument;
+    }
     const center = geo_mod.GeoPoint{ .lat = lat, .lon = lon };
     for (values) |value| {
         const point = jsonGeoPointFromValue(value) catch continue;
@@ -2943,6 +3241,12 @@ test "compiled stored filters preserve bool thresholds and reject unsafe leaves"
         },
         .{
             .encoded =
+            \\{"range":{"score":{"from":1,"include_lower":"yes"}}}
+            ,
+            .expected = error.InvalidArgument,
+        },
+        .{
+            .encoded =
             \\{"fuzzy":{"field":"tier","query":"gold","max_edits":3}}
             ,
             .expected = error.InvalidArgument,
@@ -2959,6 +3263,30 @@ test "compiled stored filters preserve bool thresholds and reject unsafe leaves"
             ,
             .expected = error.UnsupportedQueryRequest,
         },
+        .{
+            .encoded =
+            \\{"bool":{"must":[{"term":{"tenant":"acme"}}],"should":[{"numeric_range":{"min":1}}],"minimum_should_match":0}}
+            ,
+            .expected = error.InvalidArgument,
+        },
+        .{
+            .encoded =
+            \\{"bool":{"must":[{"term":{"tenant":"acme"}}],"should":[{"date_range":{"start_ns":1}}],"minimum_should_match":0}}
+            ,
+            .expected = error.InvalidArgument,
+        },
+        .{
+            .encoded =
+            \\{"bool":{"must":[{"term":{"tenant":"acme"}}],"should":[{"bool_field":{"path":"published","value":"true"}}],"minimum_should_match":0}}
+            ,
+            .expected = error.InvalidArgument,
+        },
+        .{
+            .encoded =
+            \\{"bool":{"must":[{"term":{"tenant":"acme"}}],"should":[{"geo_distance":{"path":"location","lat":91,"lon":0,"distance_m":100}}],"minimum_should_match":0}}
+            ,
+            .expected = error.InvalidArgument,
+        },
     }) |case| {
         var parsed = try std.json.parseFromSlice(
             std.json.Value,
@@ -2972,6 +3300,27 @@ test "compiled stored filters preserve bool thresholds and reject unsafe leaves"
             compilePatternFilter(arena.allocator(), parsed.value),
         );
     }
+
+    var deeply_nested = std.ArrayListUnmanaged(u8).empty;
+    defer deeply_nested.deinit(alloc);
+    for (0..pattern_filter_max_tree_depth) |_| {
+        try deeply_nested.appendSlice(alloc, "{\"conjuncts\":[");
+    }
+    try deeply_nested.appendSlice(alloc, "{\"match_all\":{}}");
+    for (0..pattern_filter_max_tree_depth) |_| {
+        try deeply_nested.appendSlice(alloc, "]}");
+    }
+    var parsed_deeply_nested = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        deeply_nested.items,
+        .{},
+    );
+    defer parsed_deeply_nested.deinit();
+    try std.testing.expectError(
+        error.InvalidArgument,
+        compilePatternFilter(arena.allocator(), parsed_deeply_nested.value),
+    );
 }
 
 test "stored structured filters preserve one-key field name collisions" {

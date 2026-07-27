@@ -5007,7 +5007,7 @@ fn normalizePublicQueryBucketsAlloc(
     errdefer deinitOwnedStringArrayList(alloc, &exclusion_clauses);
 
     if (request.query) |query| {
-        try appendCanonicalPublicQueryAlloc(alloc, query, limit, &scoring_must, &scoring_should, &filter_clauses, &exclusion_clauses);
+        try appendCanonicalPublicQueryAlloc(alloc, query, limit, &scoring_must, &filter_clauses, &exclusion_clauses);
     }
     if (request.full_text_search) |full_text_search| {
         try validatePublicQueryTraversalBudgetAlloc(alloc, full_text_search);
@@ -5028,7 +5028,12 @@ fn normalizePublicQueryBucketsAlloc(
         };
     }
 
-    var full_text = try buildScoringTextQueryAlloc(alloc, &scoring_must, &scoring_should);
+    var full_text = try buildScoringTextQueryAlloc(
+        alloc,
+        &scoring_must,
+        &scoring_should,
+        1.0,
+    );
     errdefer if (full_text) |query| freeTextQuery(alloc, query);
     deinitTextQueryArrayList(alloc, &scoring_must);
     deinitTextQueryArrayList(alloc, &scoring_should);
@@ -5055,7 +5060,6 @@ fn appendCanonicalPublicQueryAlloc(
     query: std.json.Value,
     limit: u32,
     scoring_must: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
-    scoring_should: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
     filter_clauses: *std.ArrayListUnmanaged([]u8),
     exclusion_clauses: *std.ArrayListUnmanaged([]u8),
 ) !void {
@@ -5068,23 +5072,48 @@ fn appendCanonicalPublicQueryAlloc(
             // silently selecting bool and dropping its siblings.
             if (query.object.count() != 1) return error.InvalidQueryRequest;
             var recognized: usize = 0;
-            inline for ([_][]const u8{ "must", "should", "filter", "must_not" }) |branch| {
+            inline for ([_][]const u8{ "must", "should", "filter", "must_not", "boost" }) |branch| {
                 if (bool_value.object.get(branch) != null) recognized += 1;
             }
             if (recognized != bool_value.object.count()) {
                 return error.InvalidQueryRequest;
             }
+
+            var bool_scoring_must = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+            defer deinitTextQueryArrayList(alloc, &bool_scoring_must);
+            var bool_scoring_should = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+            defer deinitTextQueryArrayList(alloc, &bool_scoring_should);
             if (bool_value.object.get("must")) |must_value| {
-                try appendBoolMustClausesAlloc(alloc, must_value, limit, scoring_must, filter_clauses);
+                try appendBoolMustClausesAlloc(
+                    alloc,
+                    must_value,
+                    limit,
+                    &bool_scoring_must,
+                    filter_clauses,
+                );
             }
             if (bool_value.object.get("should")) |should_value| {
-                try appendScoringQueryClausesAlloc(alloc, scoring_should, should_value, limit);
+                try appendScoringQueryClausesAlloc(
+                    alloc,
+                    &bool_scoring_should,
+                    should_value,
+                    limit,
+                );
             }
             if (bool_value.object.get("filter")) |filter_value| {
                 try appendPublicFilterClausesAlloc(alloc, filter_clauses, filter_value, limit);
             }
             if (bool_value.object.get("must_not")) |must_not_value| {
                 try appendPublicFilterClausesAlloc(alloc, exclusion_clauses, must_not_value, limit);
+            }
+            if (try buildScoringTextQueryAlloc(
+                alloc,
+                &bool_scoring_must,
+                &bool_scoring_should,
+                try parseCanonicalBoolBoost(bool_value.object.get("boost")),
+            )) |scoring_query| {
+                errdefer freeTextQuery(alloc, scoring_query);
+                try scoring_must.append(alloc, scoring_query);
             }
             return;
         }
@@ -5102,6 +5131,23 @@ fn appendCanonicalPublicQueryAlloc(
         },
         else => return err,
     };
+}
+
+fn parseCanonicalBoolBoost(value: ?std.json.Value) !f32 {
+    const raw = value orelse return 1.0;
+    const number: f64 = switch (raw) {
+        .integer => |item| @floatFromInt(item),
+        .float => |item| item,
+        .number_string => |item| std.fmt.parseFloat(f64, item) catch
+            return error.InvalidQueryRequest,
+        else => return error.InvalidQueryRequest,
+    };
+    if (!std.math.isFinite(number) or number <= 0 or
+        number > std.math.floatMax(f32))
+    {
+        return error.InvalidQueryRequest;
+    }
+    return @floatCast(number);
 }
 
 fn appendScoringQueryClausesAlloc(
@@ -5570,6 +5616,7 @@ fn buildScoringTextQueryAlloc(
     alloc: std.mem.Allocator,
     must: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
     should: *std.ArrayListUnmanaged(db_mod.types.TextQuery),
+    boost: f32,
 ) !?db_mod.types.TextQuery {
     if (must.items.len == 0 and should.items.len == 0) return null;
 
@@ -5584,7 +5631,7 @@ fn buildScoringTextQueryAlloc(
         freeTextQueryList(alloc, owned_should);
     }
 
-    if (owned_must.len == 1 and owned_should.len == 0) {
+    if (owned_must.len == 1 and owned_should.len == 0 and boost == 1.0) {
         const out = owned_must[0];
         alloc.free(owned_must);
         return out;
@@ -5594,6 +5641,7 @@ fn buildScoringTextQueryAlloc(
         .must = owned_must,
         .should = owned_should,
         .min_should = if (owned_should.len > 0 and owned_must.len == 0) 1 else 0,
+        .boost = boost,
     } };
 }
 
@@ -8460,6 +8508,46 @@ test "api query contract rejects ambiguous canonical query roots" {
         \\{"query":{"bool":{"filter":[{"term":{"path":"status","value":"active"}}]},"term":{"path":"tier","value":"gold"}}}
         ,
         \\{"query":{"bool":{"filter":[{"term":{"path":"status","value":"active"}}],"unknown":true}}}
+        ,
+    }) |body| {
+        try std.testing.expectError(
+            error.InvalidQueryRequest,
+            parsePublicQueryRequest(alloc, null, "files", body),
+        );
+    }
+}
+
+test "api query contract preserves canonical boolean boost scope" {
+    const alloc = std.testing.allocator;
+    var parsed = try parsePublicQueryRequest(
+        alloc,
+        null,
+        "files",
+        \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":2}},"full_text_search":{"match":"storage","field":"body"}}
+        ,
+    );
+    defer parsed.deinit(alloc);
+
+    const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
+    try std.testing.expect(full_text == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), full_text.bool_query.must.len);
+    try std.testing.expect(full_text.bool_query.must[0] == .bool_query);
+    try std.testing.expectEqual(@as(f32, 2), full_text.bool_query.must[0].bool_query.boost);
+    try std.testing.expectEqual(@as(usize, 1), full_text.bool_query.must[0].bool_query.must.len);
+    try std.testing.expect(full_text.bool_query.must[0].bool_query.must[0] == .match);
+    try std.testing.expect(full_text.bool_query.must[1] == .match);
+}
+
+test "api query contract rejects invalid canonical boolean boosts" {
+    const alloc = std.testing.allocator;
+    inline for ([_][]const u8{
+        \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":0}}}
+        ,
+        \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":-1}}}
+        ,
+        \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":"bad"}}}
+        ,
+        \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":1e100}}}
         ,
     }) |body| {
         try std.testing.expectError(

@@ -3264,7 +3264,9 @@ pub const HttpHandler = struct {
         var filter_ctx = PatternDocumentFilterContext{
             .alloc = self.alloc,
             .docs = docs,
+            .cache = db_query_graph.PreparedPatternFilterCache.init(self.alloc),
         };
+        defer filter_ctx.cache.deinit();
 
         const raw_matches = try graph_pattern_mod.matchPatternWithEdgeReader(
             self.alloc,
@@ -4585,6 +4587,7 @@ fn findMaterializedDocumentBody(docs: []const query_materializer.Document, doc_i
 const PatternDocumentFilterContext = struct {
     alloc: Allocator,
     docs: []const query_materializer.Document,
+    cache: db_query_graph.PreparedPatternFilterCache,
 };
 
 fn patternRequiresDocumentFilter(pattern: []const graph_pattern_mod.PatternStep) bool {
@@ -4598,7 +4601,8 @@ fn publishedPatternNodeFilterEvaluator(ctx: ?*anyopaque, key: []const u8, filter
     const active: *PatternDocumentFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
     if (filter.filter_query_json == null) return true;
     const body = findMaterializedDocumentBody(active.docs, key) orelse return false;
-    return try db_query_graph.storedDocMatchesPatternFilter(active.alloc, key, body, filter.filter_query_json.?);
+    const prepared = try active.cache.getOrPrepare(filter.filter_query_json.?);
+    return try prepared.matchesStored(active.alloc, key, body);
 }
 
 fn removeDocumentMutationById(

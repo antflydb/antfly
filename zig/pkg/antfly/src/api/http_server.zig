@@ -6257,9 +6257,24 @@ pub const ApiHttpServer = struct {
         key: []const u8,
         row_filter_json: []const u8,
     ) !bool {
+        var prepared = try search_pattern_filter.PreparedPatternFilter.init(
+            self.alloc,
+            row_filter_json,
+        );
+        defer prepared.deinit();
+        return try self.docMatchesPreparedRowFilter(source, table_name, key, &prepared);
+    }
+
+    fn docMatchesPreparedRowFilter(
+        self: *ApiHttpServer,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        key: []const u8,
+        prepared: *const search_pattern_filter.PreparedPatternFilter,
+    ) !bool {
         var response = (try source.lookup(self.alloc, table_name, key, .{}, .read_index)) orelse return false;
         defer response.deinit(self.alloc);
-        return try self.docJsonMatchesRowFilter(key, response.json, row_filter_json);
+        return try prepared.matchesStored(self.alloc, key, response.json);
     }
 
     pub fn docJsonMatchesRowFilter(
@@ -6294,13 +6309,18 @@ pub const ApiHttpServer = struct {
     ) ![]u8 {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(alloc);
+        var prepared = try search_pattern_filter.PreparedPatternFilter.init(
+            alloc,
+            row_filter_json,
+        );
+        defer prepared.deinit();
 
         var lines = std.mem.splitScalar(u8, ndjson, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
             const key = try scanLineKey(alloc, line);
             defer alloc.free(key);
-            if (!(try self.docMatchesRowFilter(source, table_name, key, row_filter_json))) continue;
+            if (!(try self.docMatchesPreparedRowFilter(source, table_name, key, &prepared))) continue;
             try out.appendSlice(alloc, line);
             try out.append(alloc, '\n');
         }
@@ -14514,6 +14534,156 @@ pub fn validateAuthRowFilterJson(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     try validateAuthRowFilterValue(parsed.value);
+
+    // Compile a type-correct representative of the policy before it can be
+    // persisted. Dynamic auth references are restricted to the documented
+    // scalar `term` and array `terms` positions; every other node is validated
+    // by the same prepared Zig filter plan used during execution.
+    var materialized = try materializeAuthFilterTemplateValue(
+        alloc,
+        parsed.value,
+        .filter,
+    );
+    defer json_helpers.deinitJsonValue(alloc, &materialized);
+    var prepared = try search_pattern_filter.PreparedPatternFilter.initValue(
+        alloc,
+        materialized,
+    );
+    prepared.deinit();
+}
+
+const AuthFilterTemplateExpectation = enum {
+    filter,
+    term_body,
+    terms_body,
+    scalar,
+    array,
+    static,
+};
+
+fn materializeAuthFilterTemplateValue(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    expectation: AuthFilterTemplateExpectation,
+) !std.json.Value {
+    return switch (value) {
+        .object => |object| blk: {
+            if (object.get("$auth")) |auth_ref| {
+                if (object.count() != 1 or
+                    (expectation != .scalar and expectation != .array))
+                {
+                    return error.InvalidQueryRequest;
+                }
+                const path = if (auth_ref == .string)
+                    auth_ref.string
+                else
+                    return error.InvalidQueryRequest;
+                if (!isSupportedAuthPath(path)) return error.InvalidQueryRequest;
+                if (std.mem.eql(u8, path, "roles") and expectation != .array) {
+                    return error.InvalidQueryRequest;
+                }
+                if (std.mem.eql(u8, path, "username") and expectation != .scalar) {
+                    return error.InvalidQueryRequest;
+                }
+                if (expectation == .scalar) {
+                    break :blk .{ .string = try alloc.dupe(u8, "__auth_validation__") };
+                }
+                var items = std.json.Array.init(alloc);
+                errdefer {
+                    for (items.items) |*item| json_helpers.deinitJsonValue(alloc, item);
+                    items.deinit();
+                }
+                const sentinel = try alloc.dupe(u8, "__auth_validation__");
+                errdefer alloc.free(sentinel);
+                try items.append(.{ .string = sentinel });
+                break :blk .{ .array = items };
+            }
+            if (expectation == .scalar or expectation == .array) {
+                return error.InvalidQueryRequest;
+            }
+
+            var out = std.json.ObjectMap.empty;
+            errdefer {
+                var it = out.iterator();
+                while (it.next()) |entry| {
+                    alloc.free(@constCast(entry.key_ptr.*));
+                    json_helpers.deinitJsonValue(alloc, entry.value_ptr);
+                }
+                out.deinit(alloc);
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                const child_expectation: AuthFilterTemplateExpectation = switch (expectation) {
+                    .filter => if (std.mem.eql(u8, entry.key_ptr.*, "term"))
+                        .term_body
+                    else if (std.mem.eql(u8, entry.key_ptr.*, "terms"))
+                        .terms_body
+                    else
+                        .filter,
+                    .term_body => if (object.count() == 1 or
+                        std.mem.eql(u8, entry.key_ptr.*, "term") or
+                        std.mem.eql(u8, entry.key_ptr.*, "value"))
+                        .scalar
+                    else
+                        .static,
+                    .terms_body => if (object.count() == 1 or
+                        std.mem.eql(u8, entry.key_ptr.*, "terms") or
+                        std.mem.eql(u8, entry.key_ptr.*, "values"))
+                        .array
+                    else
+                        .static,
+                    .static => .static,
+                    .scalar, .array => unreachable,
+                };
+                const key = try alloc.dupe(u8, entry.key_ptr.*);
+                var key_transferred = false;
+                errdefer if (!key_transferred) alloc.free(key);
+                var child = try materializeAuthFilterTemplateValue(
+                    alloc,
+                    entry.value_ptr.*,
+                    child_expectation,
+                );
+                var child_transferred = false;
+                errdefer if (!child_transferred) {
+                    json_helpers.deinitJsonValue(alloc, &child);
+                };
+                try out.put(alloc, key, child);
+                key_transferred = true;
+                child_transferred = true;
+            }
+            break :blk .{ .object = out };
+        },
+        .array => |array| blk: {
+            const child_expectation: AuthFilterTemplateExpectation = switch (expectation) {
+                .filter => .filter,
+                .array, .static => .static,
+                .term_body, .terms_body, .scalar => return error.InvalidQueryRequest,
+            };
+            var out = std.json.Array.init(alloc);
+            errdefer {
+                for (out.items) |*item| json_helpers.deinitJsonValue(alloc, item);
+                out.deinit();
+            }
+            for (array.items) |item| {
+                var child = try materializeAuthFilterTemplateValue(
+                    alloc,
+                    item,
+                    child_expectation,
+                );
+                var child_transferred = false;
+                errdefer if (!child_transferred) {
+                    json_helpers.deinitJsonValue(alloc, &child);
+                };
+                try out.append(child);
+                child_transferred = true;
+            }
+            break :blk .{ .array = out };
+        },
+        else => switch (expectation) {
+            .array, .term_body, .terms_body => error.InvalidQueryRequest,
+            .filter, .scalar, .static => try json_helpers.cloneJsonValue(alloc, value),
+        },
+    };
 }
 
 fn validateAuthRowFilterValue(value: std.json.Value) !void {
@@ -14719,6 +14889,74 @@ test "auth row filter validator accepts username references" {
     try validateAuthRowFilterJson(
         std.testing.allocator,
         "{\"conjuncts\":[{\"term\":{\"owner\":{\"$auth\":\"username\"}}},{\"term\":{\"tenant_id\":{\"$auth\":\"metadata.tenant_id\"}}},{\"terms\":{\"acl.roles\":{\"$auth\":\"roles\"}}}]}",
+    );
+}
+
+test "auth row filter admission requires executable Zig filter syntax" {
+    const alloc = std.testing.allocator;
+
+    inline for ([_][]const u8{
+        \\{"term":{"owner":{"$auth":"username"}}}
+        ,
+        \\{"terms":{"acl.roles":{"$auth":"roles"}}}
+        ,
+        \\{"terms":{"path":"acl.roles","values":{"$auth":"roles"}}}
+        ,
+        \\{"regexp":{"field":"tenant","pattern":"acme-[0-9]+"}}
+        ,
+        \\{"numeric_range":{"path":"score","min":1,"max":10}}
+        ,
+    }) |filter| {
+        try validateAuthRowFilterJson(alloc, filter);
+    }
+
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        validateAuthRowFilterJson(
+            alloc,
+            \\{"match":{"path":"owner","text":"alice"}}
+            ,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        validateAuthRowFilterJson(
+            alloc,
+            \\{"term":{"role":{"$auth":"roles"}}}
+            ,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        validateAuthRowFilterJson(
+            alloc,
+            \\{"terms":{"owners":{"$auth":"username"}}}
+            ,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        validateAuthRowFilterJson(
+            alloc,
+            \\{"term":{"path":{"$auth":"username"},"term":"acme"}}
+            ,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        validateAuthRowFilterJson(
+            alloc,
+            \\{"numeric_range":{"path":"score","min":{"$auth":"metadata.min_score"}}}
+            ,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidArgument,
+        validateAuthRowFilterJson(
+            alloc,
+            \\{"bool":{"must":[{"term":{"tenant":"acme"}}],"should":[{"numeric_range":{"min":1}}],"minimum_should_match":0}}
+            ,
+        ),
     );
 }
 

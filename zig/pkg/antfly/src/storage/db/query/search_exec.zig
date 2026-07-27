@@ -9405,15 +9405,8 @@ fn validateStructuredMatchGrammar(value: std.json.Value) !void {
             return error.InvalidArgument;
         }
     }
-    if (value.object.get("role")) |role| {
-        if (role != .string or role.string.len == 0) {
-            return error.InvalidArgument;
-        }
-    }
-
     var recognized: usize = 2;
     if (value.object.get("analyzer") != null) recognized += 1;
-    if (value.object.get("role") != null) recognized += 1;
     if (recognized != value.object.count()) return error.InvalidArgument;
 }
 
@@ -10069,8 +10062,6 @@ test "stored fallback rejects every analyzer-dependent match filter" {
         ,
         \\{"bool":{"must":[{"term":{"path":"tenant","term":"acme"}},{"match":{"path":"status","text":"active","analyzer":"keyword"}}]}}
         ,
-        \\{"match":{"path":"status","text":"active","role":"measure"}}
-        ,
     }) |encoded| {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
         defer parsed.deinit();
@@ -10080,6 +10071,19 @@ test "stored fallback rejects every analyzer-dependent match filter" {
             rejectStoredMatchFallback(parsed.value),
         );
     }
+
+    var role_match = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"match":{"path":"status","text":"active","role":"measure"}}
+    ,
+        .{},
+    );
+    defer role_match.deinit();
+    try std.testing.expectError(
+        error.InvalidArgument,
+        validateStructuredFilterValueAlloc(alloc, role_match.value),
+    );
 
     var exact = try std.json.parseFromSlice(
         std.json.Value,

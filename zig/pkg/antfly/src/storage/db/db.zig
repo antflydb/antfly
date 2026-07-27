@@ -13417,15 +13417,34 @@ pub const DB = struct {
         return_aliases: []const []const u8,
     ) ![]graph_pattern_mod.PatternMatch {
         if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
+        var filter_ctx = PatternNodeFilterContext.init(self, alloc);
+        defer filter_ctx.deinit();
         return try self.core.graphMatchPattern(alloc, index_name, start_keys, pattern, .{
             .max_results = max_results,
             .return_aliases = return_aliases,
             .evaluator = .{
-                .ctx = self,
+                .ctx = &filter_ctx,
                 .func = patternNodeFilterEvaluator,
             },
         });
     }
+
+    const PatternNodeFilterContext = struct {
+        db: *DB,
+        cache: db_query_graph.PreparedPatternFilterCache,
+
+        fn init(db: *DB, alloc: Allocator) PatternNodeFilterContext {
+            return .{
+                .db = db,
+                .cache = db_query_graph.PreparedPatternFilterCache.init(alloc),
+            };
+        }
+
+        fn deinit(self: *PatternNodeFilterContext) void {
+            self.cache.deinit();
+            self.* = undefined;
+        }
+    };
 
     fn graphInputSetHitsAlloc(
         self: *DB,
@@ -19192,6 +19211,12 @@ pub const DB = struct {
             documents.deinit(alloc);
         }
 
+        var prepared_filter = if (opts.filter_query_json.len > 0)
+            try db_query_graph.PreparedPatternFilter.init(alloc, opts.filter_query_json)
+        else
+            null;
+        defer if (prepared_filter) |*filter| filter.deinit();
+
         var count: u32 = 0;
         for (docs) |doc| {
             if (!isPrimaryDocumentStoreKey(doc.key)) continue;
@@ -19210,8 +19235,8 @@ pub const DB = struct {
             }
             if (try isExpiredDocumentKey(self, alloc, raw_key)) continue;
 
-            if (opts.filter_query_json.len > 0) {
-                if (!(try db_query_graph.storedDocMatchesPatternFilter(alloc, raw_key, doc.value, opts.filter_query_json))) continue;
+            if (prepared_filter) |*filter| {
+                if (!(try filter.matchesStored(alloc, raw_key, doc.value))) continue;
             }
 
             const hash = std.hash.Wyhash.hash(0, doc.value);
@@ -28232,23 +28257,16 @@ fn isExpiredDocumentKeyCallback(
 }
 
 fn patternNodeFilterEvaluator(ctx: ?*anyopaque, key: []const u8, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
-    const self: *DB = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
-    return try matchesPatternNodeFilter(self, key, filter);
+    const active: *DB.PatternNodeFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
+    return try matchesPatternNodeFilter(active, key, filter);
 }
 
-fn matchesPatternNodeFilter(self: *DB, key: []const u8, filter: graph_pattern_mod.NodeFilter) !bool {
+fn matchesPatternNodeFilter(active: *DB.PatternNodeFilterContext, key: []const u8, filter: graph_pattern_mod.NodeFilter) !bool {
     if (filter.filter_query_json == null) return true;
-    const stored = (try self.get(self.alloc, key)) orelse return false;
-    defer self.alloc.free(stored);
-    return try storedDocMatchesPatternFilter(self.alloc, key, stored, filter.filter_query_json.?);
-}
-
-fn storedDocMatchesPatternFilter(alloc: Allocator, key: []const u8, stored: []const u8, filter_query_json: []const u8) !bool {
-    return try db_query_graph.storedDocMatchesPatternFilter(alloc, key, stored, filter_query_json);
-}
-
-fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.json.Value, filter_query: std.json.Value) !bool {
-    return try db_query_graph.jsonDocMatchesPatternFilter(alloc, key, doc, filter_query);
+    const stored = (try active.db.get(active.db.alloc, key)) orelse return false;
+    defer active.db.alloc.free(stored);
+    const prepared = try active.cache.getOrPrepare(filter.filter_query_json.?);
+    return try prepared.matchesStored(active.db.alloc, key, stored);
 }
 
 fn parsePatternRfc3339ToNs(text: []const u8) !?u64 {
