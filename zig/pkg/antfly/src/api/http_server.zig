@@ -8605,7 +8605,13 @@ pub const ApiHttpServer = struct {
     ) !query_api.QueryResponse {
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
         semantic_resolver.query_embedding_deadline_ns = request_deadline_ns;
-        var query_req = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), table_name, body) catch |err| {
+        var query_req = query_api.parsePublicQueryRequestWithDeadline(
+            alloc,
+            semantic_resolver.iface(),
+            table_name,
+            body,
+            request_deadline_ns,
+        ) catch |err| {
             const normalized = normalizePublicQueryParseError(err);
             if (normalized == error.InvalidQueryRequest or
                 normalized == error.InvalidFilterQueryRequest or

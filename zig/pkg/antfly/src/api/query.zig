@@ -27,6 +27,7 @@ pub const PublicFilterQueryErrorKind = query_contract.PublicFilterQueryErrorKind
 
 pub const parseQueryRequest = query_contract.parseQueryRequest;
 pub const parsePublicQueryRequest = query_contract.parsePublicQueryRequest;
+pub const parsePublicQueryRequestWithDeadline = query_contract.parsePublicQueryRequestWithDeadline;
 pub const isPublicQueryValidationError = query_contract.isPublicQueryValidationError;
 pub const publicFilterQueryErrorStatus = query_contract.publicFilterQueryErrorStatus;
 pub const encodePublicFilterQueryErrorBodyAlloc = query_contract.encodePublicFilterQueryErrorBodyAlloc;

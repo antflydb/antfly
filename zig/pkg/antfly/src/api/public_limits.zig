@@ -16,13 +16,13 @@ const std = @import("std");
 
 pub const max_request_body_bytes: usize = 64 * 1024 * 1024;
 pub const max_json_value_len: usize = max_request_body_bytes;
-/// Named document filters may be referenced repeatedly. Keep their expanded
-/// representation substantially below the transport body limit so one request
-/// cannot retain multiple near-64 MiB copies while it is normalized.
-pub const max_normalized_query_body_bytes: usize = 8 * 1024 * 1024;
+/// Named document filters may be referenced repeatedly. Bound only the growth
+/// introduced by normalization so named and inline forms retain the same
+/// transport allowance while expansion amplification remains controlled.
+pub const max_query_binding_expansion_growth_bytes: usize = 8 * 1024 * 1024;
 
 test "public API request body limit matches Go linear merge contract" {
     try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), max_request_body_bytes);
     try std.testing.expectEqual(max_request_body_bytes, max_json_value_len);
-    try std.testing.expect(max_normalized_query_body_bytes < max_request_body_bytes);
+    try std.testing.expect(max_query_binding_expansion_growth_bytes < max_request_body_bytes);
 }
