@@ -122,6 +122,10 @@ class Spec:
                 if ident is not None and child.children:
                     self.defs[node_text(ident)] = child.children[-1]
 
+        # Display name: prefer the file stem when the module name is
+        # uninformative (occ-2pc.tla's module is literally named "model").
+        self.display_name = (self.name if self.name.lower() == path.stem.lower()
+                             else path.stem)
         self.var_set = set(self.variables)
         self.actions = self._next_actions()
         # Expected-failure mutants (this suite's convention: actions gated by
@@ -519,14 +523,17 @@ def render_spec(spec: Spec, out_path: Path) -> str:
         "(gated by `Buggy*` constants) omitted."
         if spec.mutant_actions else ""
     )
+    def n_of(n, noun):
+        return f"{n} {noun}{'' if n == 1 else 's'}"
+
     lines = [
         GENERATED_NOTE,
         "",
-        f"# {spec.name} — structural diagrams",
+        f"# {spec.display_name} — structural diagrams",
         "",
         f"Generated from [`{spec.path.name}`]({rel}). "
-        f"{len(spec.variables)} state variables, {len(spec.actions)} actions "
-        f"in `Next`.{mutant_note}",
+        f"{n_of(len(spec.variables), 'state variable')}, "
+        f"{n_of(len(spec.actions), 'action')} in `Next`.{mutant_note}",
         "",
     ]
 
@@ -573,7 +580,8 @@ def render_index(specs: list[Spec], specs_dir: Path) -> str:
     by_group: dict[str, list[Spec]] = {}
     for spec in specs:
         group = Path(os.path.relpath(spec.path.parent, specs_dir)).as_posix()
-        by_group.setdefault("(root)" if group == "." else group, []).append(spec)
+        by_group.setdefault("vendored / legacy (root)" if group == "."
+                            else group, []).append(spec)
     for group in sorted(by_group):
         lines.append(f"## {group}")
         lines.append("")
@@ -581,10 +589,15 @@ def render_index(specs: list[Spec], specs_dir: Path) -> str:
             rel_md = Path(os.path.relpath(spec.path.parent, specs_dir),
                           f"{spec.path.stem}.md").as_posix().removeprefix("./")
             phase_vars = [v for v in spec.variables if v in spec.phase_domains]
+
+            def n_of(n, noun):
+                return f"{n} {noun}{'' if n == 1 else 's'}"
+
             lines.append(
-                f"- [{spec.name}]({rel_md}) — {len(spec.actions)} actions, "
-                f"{len(spec.variables)} variables, "
-                f"{len(phase_vars)} phase state machine(s)"
+                f"- [{spec.display_name}]({rel_md}) — "
+                f"{n_of(len(spec.actions), 'action')}, "
+                f"{n_of(len(spec.variables), 'variable')}, "
+                f"{n_of(len(phase_vars), 'phase state machine')}"
             )
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"

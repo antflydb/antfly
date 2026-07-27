@@ -1,6 +1,6 @@
 <!-- GENERATED FILE: do not edit. Regenerate with `make -C zig tla-viz` (scripts/tla-viz/gen_structural.py). -->
 
-# model — structural diagrams
+# occ-2pc — structural diagrams
 
 Generated from [`occ-2pc.tla`](../occ-2pc.tla). 7 state variables, 13 actions in `Next`.
 

@@ -1,9 +1,10 @@
 {
-  "_comment": "Trace-family -> visualization archetype bindings for scripts/tla-viz/render_trace.py. Archetypes: consensus (node lanes + role bands + message arrows), dialogue (lanes from event-name rules + declarative causal pairs), narrative (single actor, per-event state diffs). bandField values get tenure washes; model+phaseVar link band colors to the spec's phase domain so diagrams and timelines share hues. Unbound tags fall back to narrative.",
+  "_comment": "Trace-family -> visualization archetype bindings for scripts/tla-viz/render_trace.py. Schema reference and agent workflow: scripts/tla-viz/BINDINGS.md. Archetypes: consensus (node lanes + role bands + message arrows), dialogue (lanes from event-name rules + declarative causal pairs), narrative (single actor replayed as a scene of stores/actors/lamps with per-step state diffs). bandField values get tenure washes; model+phaseVar link band colors to the spec's phase domain so diagrams and timelines share hues. traceFamily names the scripts/tla-check.sh trace family for the optional --tlc verdict overlay. Unknown tags fall back to narrative; bind them at render time with --binding <overlay.json>.",
 
   "trace": {
     "label": "raft",
     "archetype": "consensus",
+    "traceFamily": "raft",
     "laneField": "nid",
     "lanePrefix": "node ",
     "segmented": true,
@@ -26,18 +27,31 @@
   "antfly-trace": {
     "label": "transaction",
     "archetype": "narrative",
+    "traceFamily": "txn",
     "laneField": "shardId",
     "lanePrefix": "shard ",
     "categories": [
       {"label": "Writes / intents", "patterns": ["Write", "Intent"]},
       {"label": "Commit / abort", "patterns": ["Commit", "Abort", "Resolve"]},
       {"label": "Lifecycle", "patterns": ["Init", "Begin", "Recovery", "Cleanup", "Clock"]}
-    ]
+    ],
+    "scene": {
+      "stores": [
+        {"id": "writes", "label": "write intents", "listField": "state.writeKeys", "style": "durable"},
+        {"id": "deletes", "label": "delete intents", "listField": "state.deleteKeys", "style": "durable"},
+        {"id": "txn", "label": "transaction", "valueField": "txnId", "style": "record"}
+      ],
+      "flows": [
+        {"on": "WriteIntent", "from": "txn", "to": "writes", "label": "stage write intent"},
+        {"on": "Resolve", "from": "writes", "to": "txn", "label": "resolve intents"}
+      ]
+    }
   },
 
   "ha-trace": {
     "label": "HA replication",
     "archetype": "dialogue",
+    "traceFamily": "ha",
     "laneRules": [
       ["^Primary", "primary"],
       ["^(Standby|StatusAck)", "standby"],
@@ -63,6 +77,7 @@
   "split-bridge-trace": {
     "label": "shard split bridge",
     "archetype": "dialogue",
+    "traceFamily": "split-bridge",
     "laneRules": [
       ["^Parent", "parent shard"],
       ["^(Bootstrap|Replay|Build|PublishDb|ObserveDestination)", "child shard"],
@@ -88,6 +103,7 @@
   "txn-session-trace": {
     "label": "transaction session",
     "archetype": "narrative",
+    "traceFamily": "txn-session",
     "lane": "session",
     "bandField": "status",
     "bandQuiet": ["idle"],
@@ -97,17 +113,62 @@
       {"label": "Writes", "patterns": ["Stage"]},
       {"label": "2PC", "patterns": ["Prepare", "Resolve", "Commit", "Abort", "Finalize"]},
       {"label": "Lifecycle", "patterns": ["Begin", "Cleanup", "Savepoint", "Release", "Rollback"]}
+    ],
+    "scene": {
+      "stores": [
+        {"id": "staged", "label": "staged buffer", "countField": "staged", "style": "buffer"},
+        {"id": "intents", "label": "intent store (durable, invisible)", "countField": "intentCount", "style": "durable"},
+        {"id": "visible", "label": "visible store", "countField": "visible", "style": "public"},
+        {"id": "identity", "label": "identity rows", "countField": "identityRows", "style": "public"},
+        {"id": "record", "label": "txn record (decision)", "valueField": "status", "style": "record"}
+      ],
+      "actors": [
+        {"id": "local", "label": "local shard", "memberOf": {"prepared": "prepared", "resolved": "resolved"}},
+        {"id": "remote", "label": "remote shard", "memberOf": {"prepared": "prepared", "resolved": "resolved"}}
+      ],
+      "flows": [
+        {"on": "^BeginSession$", "from": "record", "to": "staged", "label": "session opens; snapshot baseVisible"},
+        {"on": "^StageWrite$", "from": "staged", "to": "intents", "label": "write intent: durable, not visible"},
+        {"on": "^PrepareParticipant$", "fromField": "participant", "to": "record", "label": "participant prepared"},
+        {"on": "^RecoverFinalizedIntents$", "from": "intents", "to": "visible", "when": {"status": "committed"}, "label": "recovery publishes docs + identity rows"},
+        {"on": "^RecoverFinalizedIntents$", "from": "intents", "to": "void", "when": {"status": "aborted"}, "label": "recovery discards intents"},
+        {"on": "^ResolveParticipant$", "from": "record", "toField": "participant", "label": "outcome delivered"},
+        {"on": "^Cleanup$", "from": "record", "to": "void", "label": "txn record cleaned"}
+      ]
+    },
+    "invariants": [
+      {"id": "IdentityLockstep", "expr": "identityRows == visible"},
+      {"id": "VisibleFromBase", "expr": "visible >= baseVisible"},
+      {"id": "NoNegativeIntents", "expr": "intentCount >= 0"}
     ]
   },
 
   "doc-identity-range-repair-trace": {
     "label": "doc identity range repair",
     "archetype": "narrative",
+    "traceFamily": "doc-identity-range-repair",
     "lane": "restore",
     "categories": [
       {"label": "Restore intent", "patterns": ["Intent"]},
       {"label": "Repair / recovery", "patterns": ["Repair", "Recover"]},
       {"label": "Restore", "patterns": ["Restore", "Import"]}
+    ],
+    "scene": {
+      "stores": [
+        {"id": "src", "label": "restore source ns", "valueField": "restoreSourceNamespace", "style": "record"},
+        {"id": "dst", "label": "restore target ns", "valueField": "restoreTargetNamespace", "style": "record"}
+      ],
+      "lamps": [
+        {"field": "strictRestoreAccepted", "label": "strict restore accepted"},
+        {"field": "importRecovered", "label": "import recovered"},
+        {"field": "runtimeRepairNeeded", "label": "repair needed"},
+        {"field": "runtimeRepairComplete", "label": "repair complete"},
+        {"field": "restoreIntentCleared", "label": "restore intent cleared"}
+      ]
+    },
+    "invariants": [
+      {"id": "RepairBeforeIntentClear", "expr": "!restoreIntentCleared || runtimeRepairComplete"},
+      {"id": "StrictNamespaceMatch", "expr": "!strictRestoreAccepted || restoreSourceNamespace == restoreTargetNamespace"}
     ]
   }
 }

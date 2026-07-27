@@ -397,9 +397,12 @@ is **assigned a visualization archetype** in
   (`PrimaryAppend → StandbyReceive` on timeline+lsn;
   `ParentRightWrite → ReplayDelta` on delta/replay seq). Used by `ha-trace`
   and `split-bridge-trace`.
-- `narrative` — a single progressing actor: taller rows where every event is
-  labeled with its name and the observable state fields it changed. Used by
-  `txn-session-trace`, `doc-identity-range-repair-trace`, `antfly-trace`,
+- `narrative` — a single progressing actor: gets the **Replay** view, a
+  frame-by-frame scene of the subsystem's stores/actors/lamps (declared in
+  the binding) with per-step state diffs, flow captions, and display-
+  invariant badges — step with ←/→ or autoplay, and watch e.g. a write move
+  staged → intent store → visible store through a crash and recovery. Used
+  by `txn-session-trace`, `doc-identity-range-repair-trace`, `antfly-trace`,
   and as the fallback for tags with no binding yet.
 
 Shared across archetypes: per-family category legends, and **fault emphasis**
@@ -411,13 +414,29 @@ coloring — a phase value like `"splitting"` gets the same hue in
 `diagrams/metadata/AntflySplitRefinementBridge.md` and in the timeline's
 phase strips.
 
-**To wire up a new trace family**: add its tag to `traces/viz.json`, pick an
-archetype, and declare lanes/band/pairs/categories (~15 lines; the raft and
-split-bridge entries are the reference examples). Until then it renders with
-the narrative fallback.
+**Invariant violations are first-class**: pass `TLC=1` (CLI: `--tlc`) to
+also replay the trace through the model with TLC and bake the verdict into
+the artifact — a banner naming the violated invariant (or the `TraceMatched`
+step the model refused) with the offending frame flagged in the replay rail.
+Try it on a deliberately broken fixture:
 
-Multi-run raft traces are split into segments with the same boundary rules as
-`../../scripts/tla-segment-raft-trace.py`.
+```bash
+make tla-viz-trace JSON=specs/tla/traces/negative/txn_session_bad_cleanup.ndjson TLC=1 OUT=/tmp/bad.html
+```
+
+If TLC/java is unavailable the render still succeeds without the verdict.
+Cheap per-step `invariants` in the binding additionally render as live
+green/red badges; TLC remains the authority.
+
+**To wire up a new trace family — including at render time, without touching
+the repo**: bindings can be supplied as an overlay
+(`make tla-viz-trace JSON=... BINDING=my-binding.json`), merged over
+`traces/viz.json` per tag. Full schema, worked example, and the
+bug-to-artifact agent workflow: **`../../scripts/tla-viz/BINDINGS.md`**.
+
+Each bound trace links to its model's generated state diagrams (the phase
+colors match across both). Multi-run raft traces are split into segments
+with the same boundary rules as `../../scripts/tla-segment-raft-trace.py`.
 
 ## Document Identity Range Repair Trace Fixture Validation
 

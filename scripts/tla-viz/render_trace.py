@@ -43,7 +43,10 @@ import argparse
 import html
 import json
 import os
+import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import archetypes
@@ -97,6 +100,10 @@ def fmt(val) -> str:
     if isinstance(val, str) and val[:1] in ("[", "{"):
         return val  # already a compact JSON literal from flatten_event
     return json.dumps(val) if isinstance(val, (bool, str)) or val is None else str(val)
+
+
+def replay_enabled(binding: Binding) -> bool:
+    return binding.scene is not None or binding.archetype == "narrative"
 
 
 def is_state_reset(seg_events: list[dict], ev: dict) -> bool:
@@ -169,6 +176,11 @@ def build_segments(objs, binding: Binding) -> list[list[dict]]:
             "flat": flat,
             "detail": json.dumps(ev, indent=1),
         }
+        if replay_enabled(binding):
+            # Replay frames need the carried-forward observable state and the
+            # display-invariant verdicts at this step.
+            rec["state"] = dict(lane_state[lane])
+            rec["inv"] = binding.eval_invariants(lane_state[lane])
         current.append(rec)
     if current:
         segments.append(current)
@@ -329,11 +341,94 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     font-variant-numeric: tabular-nums; color: var(--text-secondary);
   }
   table.events th { color: var(--text-primary); position: sticky; }
-  button.toggleview {
+  #viewbtns button, button.ctrl {
     border: 1px solid var(--border); background: var(--surface-1);
     color: var(--text-secondary); border-radius: 6px; padding: 2px 10px;
     font-size: 12px; cursor: pointer;
   }
+  #viewbtns button.active { color: var(--text-primary);
+    border-color: #2a78d6; }
+  /* ---- Replay view ---- */
+  .replay { display: flex; gap: 0; align-items: stretch; }
+  .rail { width: 240px; flex: none; overflow-y: auto; max-height: calc(100vh - 140px);
+    border-right: 1px solid var(--grid); padding: 4px 0; }
+  .rail .rentry { padding: 2px 10px; font-size: 12px; cursor: pointer;
+    color: var(--text-secondary); display: flex; gap: 6px; align-items: baseline;
+    border-left: 2px solid transparent; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
+  .rail .rentry .ridx { color: var(--text-muted); font-size: 10px;
+    font-variant-numeric: tabular-nums; min-width: 18px; }
+  .rail .rentry.active { color: var(--text-primary); background: var(--surface-1);
+    border-left-color: #2a78d6; }
+  .rail .rentry.invfail { border-left-color: #d03b3b; }
+  .rail .rentry .vmark { color: #d03b3b; font-weight: 600; }
+  .stage { flex: 1; min-width: 0; padding: 10px 18px 24px; }
+  .banner { border-radius: 6px; padding: 6px 12px; font-size: 12.5px;
+    margin-bottom: 10px; border: 1px solid var(--border); }
+  .banner.pass { border-color: #0ca30c; color: var(--text-primary); }
+  .banner.fail { border-color: #d03b3b; color: var(--text-primary);
+    background: #d03b3b18; }
+  .banner.unavailable { color: var(--text-muted); }
+  .rcontrols { display: flex; gap: 8px; align-items: center; margin-bottom: 12px;
+    font-size: 12.5px; color: var(--text-secondary); flex-wrap: wrap; }
+  .rcontrols .evname { font-weight: 600; color: var(--text-primary);
+    font-size: 14px; }
+  .rcontrols .evname.fault { color: #d03b3b; }
+  .scenebox { background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; }
+  .scenebox.fault { border-color: #d03b3b; box-shadow: 0 0 0 1px #d03b3b; }
+  .srow { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 10px;
+    align-items: stretch; }
+  .store { border: 1px solid var(--baseline); border-radius: 8px;
+    padding: 8px 12px; min-width: 96px; text-align: center;
+    background: var(--page); transition: box-shadow 0.2s; }
+  .store .slabel { font-size: 10.5px; color: var(--text-muted);
+    margin-bottom: 4px; max-width: 130px; }
+  .store .sval { font-size: 20px; font-variant-numeric: tabular-nums;
+    color: var(--text-primary); }
+  .store .sval .delta { font-size: 11px; margin-left: 4px; }
+  .store .schips { display: flex; gap: 4px; flex-wrap: wrap;
+    justify-content: center; min-height: 18px; }
+  .store .schips span { border: 1px solid var(--baseline); border-radius: 4px;
+    padding: 0 5px; font-size: 11px; color: var(--text-primary); }
+  .store.durable { border-style: dashed; }
+  .store.public { border-color: #0ca30c; }
+  .store.record .sval { font-size: 13px; padding: 2px 8px; border-radius: 999px;
+    display: inline-block; }
+  .store.pulse { box-shadow: 0 0 0 2px #2a78d6; }
+  .actor { border: 1px solid var(--baseline); border-radius: 8px;
+    padding: 6px 12px; background: var(--page); font-size: 12px;
+    color: var(--text-primary); }
+  .actor .dots { display: flex; gap: 10px; margin-top: 4px; }
+  .actor .dots span { font-size: 10.5px; color: var(--text-muted);
+    display: inline-flex; gap: 4px; align-items: center; }
+  .actor .dots i { width: 9px; height: 9px; border-radius: 50%;
+    border: 1px solid var(--text-muted); display: inline-block; }
+  .actor .dots i.on { background: #0ca30c; border-color: #0ca30c; }
+  .actor.pulse { box-shadow: 0 0 0 2px #2a78d6; }
+  .lamp { display: inline-flex; gap: 6px; align-items: center; font-size: 12px;
+    color: var(--text-secondary); margin-right: 14px; }
+  .lamp i { width: 11px; height: 11px; border-radius: 50%;
+    border: 1px solid var(--text-muted); display: inline-block; }
+  .lamp i.on { background: #0ca30c; border-color: #0ca30c; }
+  .flowcap { font-size: 12.5px; color: var(--text-primary); min-height: 18px; }
+  .flowcap .arrow { color: #2a78d6; font-weight: 600; }
+  .invbadges { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .invbadge { border-radius: 999px; padding: 1px 10px; font-size: 11.5px;
+    border: 1px solid var(--baseline); color: var(--text-muted); }
+  .invbadge.ok { border-color: #0ca30c; color: var(--text-primary); }
+  .invbadge.bad { border-color: #d03b3b; background: #d03b3b22;
+    color: var(--text-primary); font-weight: 600; }
+  .statecard { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 4px 16px; font-size: 12px; background: var(--surface-1);
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; }
+  .statecard div { color: var(--text-muted); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+  .statecard b { color: var(--text-primary); font-weight: 500;
+    font-variant-numeric: tabular-nums; }
+  .statecard div.chg b { color: #2a78d6; }
+  .pill { padding: 1px 10px; border-radius: 999px; font-size: 12px;
+    border: 1px solid var(--baseline); color: var(--text-primary); }
 </style>
 </head>
 <body class="viz-root">
@@ -347,9 +442,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="group" id="cat-filters"></div>
     <div class="group" id="lane-filters"></div>
     <div class="group bandlegend" id="band-legend"></div>
-    <div class="group"><button class="toggleview" id="viewbtn">Table view</button></div>
+    <div class="group" id="viewbtns"></div>
   </div>
 </header>
+<div id="replay" class="replay hidden"></div>
 <div id="charts"></div>
 </div>
 </div>
@@ -628,10 +724,21 @@ function buildUI(idx) {
     table: false,
   };
   document.getElementById("title").textContent = TRACES[idx].name;
-  document.getElementById("subtitle").textContent = TRACES[idx].subtitle;
-  document.getElementById("viewbtn").textContent = "Table view";
-  for (const id of ["cat-filters", "lane-filters", "band-legend", "charts"])
+  const sub = document.getElementById("subtitle");
+  sub.textContent = TRACES[idx].subtitle + " ";
+  if (TRACES[idx].data.modelDiagram) {
+    const md = TRACES[idx].data.modelDiagram;
+    const a = document.createElement("a");
+    a.textContent = `model diagram: ${md.model}`;
+    a.title = md.path;
+    a.style.color = "#2a78d6";
+    if (md.href) { a.href = md.href; a.target = "_blank"; }
+    sub.appendChild(a);
+  }
+  for (const id of ["cat-filters", "lane-filters", "band-legend", "charts",
+                    "replay", "viewbtns"])
     document.getElementById(id).replaceChildren();
+  if (PLAYING) { clearInterval(PLAYING); PLAYING = null; }
 
   const usedCats = new Set(CUR.segments.flatMap(s => s.events.map(e => e.cat)));
   const catBox = document.getElementById("cat-filters");
@@ -672,26 +779,313 @@ function buildUI(idx) {
   const charts = document.getElementById("charts");
   CUR.segments.forEach((seg, i) => charts.appendChild(renderSegment(seg, i)));
 
+  buildViews();
+  if (CUR.replay) buildReplay();
+  setView(CUR.replay ? "replay" : "timeline");
+
   for (const e of document.querySelectorAll("#sidebar .entry"))
     e.classList.toggle("active", Number(e.dataset.idx) === idx);
   document.getElementById("main").scrollTop = 0;
   syncHeaderHeight();
 }
 
+// ---- View switching (Replay | Timeline | Table) ----
+
+let VIEW = "timeline", FRAMES = [], FRAME = 0, PLAYING = null, SCENE_FLOWS = [];
+
+function setView(v) {
+  VIEW = v;
+  document.getElementById("replay").classList.toggle("hidden", v !== "replay");
+  document.getElementById("charts").classList.toggle("hidden", v === "replay");
+  for (const el2 of document.querySelectorAll("svg.timeline, .laneheads"))
+    el2.classList.toggle("hidden", v !== "timeline");
+  for (const t of document.querySelectorAll("table.events"))
+    t.classList.toggle("hidden", v !== "table");
+  for (const b of document.querySelectorAll("#viewbtns button"))
+    b.classList.toggle("active", b.dataset.view === v);
+  syncHeaderHeight();
+}
+
+function buildViews() {
+  const box = document.getElementById("viewbtns");
+  const views = (CUR.replay ? ["replay"] : []).concat(["timeline", "table"]);
+  for (const v of views) {
+    const b = document.createElement("button");
+    b.dataset.view = v;
+    b.textContent = v[0].toUpperCase() + v.slice(1);
+    b.addEventListener("click", () => setView(v));
+    box.appendChild(b);
+  }
+}
+
+// ---- Replay view: scene + state card, stepped frame by frame ----
+
+function parseList(v) {
+  if (Array.isArray(v)) return v;
+  if (typeof v === "string" && v.startsWith("[")) {
+    try { return JSON.parse(v); } catch { return []; }
+  }
+  return [];
+}
+
+function h(tag, cls, parent, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  if (parent) parent.appendChild(n);
+  return n;
+}
+
+function buildReplay() {
+  FRAMES = CUR.segments.flatMap(s => s.events);
+  const root = document.getElementById("replay");
+  const scene = CUR.scene || {};
+  SCENE_FLOWS = (scene.flows || []).map(f => ({...f, re: new RegExp(f.on)}));
+
+  const rail = h("div", "rail", root);
+  const verdict = CUR.verdict;
+  FRAMES.forEach((ev, i) => {
+    const e = h("div", "rentry", rail);
+    e.dataset.frame = i;
+    const invFail = (ev.inv || []).some(v => v === false);
+    if (invFail) e.classList.add("invfail");
+    h("span", "ridx", e, String(i));
+    if (verdict && verdict.step === i) h("span", "vmark", e, "⚑");
+    h("span", ev.cat === FAULT ? "vmark" : "", e,
+      (ev.cat === FAULT ? "⚠ " : "") + ev.name);
+    e.addEventListener("click", () => setFrame(i));
+  });
+
+  const stage = h("div", "stage", root);
+  if (verdict) {
+    const cls = verdict.status === "pass" ? "pass"
+              : verdict.status === "fail" ? "fail" : "unavailable";
+    h("div", `banner ${cls}`, stage,
+      (verdict.status === "fail" ? "✗ " : verdict.status === "pass" ? "✓ " : "") +
+      verdict.message);
+  }
+  const ctr = h("div", "rcontrols", stage);
+  for (const [label, d] of [["⏮", -Infinity], ["◀", -1], ["▶", 1], ["⏭", Infinity]]) {
+    const b = h("button", "ctrl", ctr, label);
+    b.addEventListener("click", () => stepFrame(d));
+  }
+  const playBtn = h("button", "ctrl", ctr, "▶ play");
+  playBtn.addEventListener("click", () => {
+    if (PLAYING) { clearInterval(PLAYING); PLAYING = null; playBtn.textContent = "▶ play"; }
+    else {
+      playBtn.textContent = "⏸ pause";
+      PLAYING = setInterval(() => {
+        if (FRAME >= FRAMES.length - 1) { clearInterval(PLAYING); PLAYING = null; playBtn.textContent = "▶ play"; }
+        else stepFrame(1);
+      }, 700);
+    }
+  });
+  h("span", "fcount", ctr, "");
+  h("span", "evname", ctr, "");
+  h("span", "pill statuspill hidden", ctr, "");
+  if (CUR.modelDiagram) {
+    const a = document.createElement("a");
+    a.textContent = `model: ${CUR.modelDiagram.model}`;
+    a.title = CUR.modelDiagram.path;
+    a.style.cssText = "font-size:12px;color:#2a78d6;margin-left:auto;";
+    if (CUR.modelDiagram.href) { a.href = CUR.modelDiagram.href; a.target = "_blank"; }
+    ctr.appendChild(a);
+  }
+
+  const box = h("div", "scenebox", stage);
+  if (scene.stores && scene.stores.length) {
+    const row = h("div", "srow", box);
+    for (const s of scene.stores) {
+      const d = h("div", `store ${s.style || ""}`, row);
+      d.dataset.store = s.id;
+      h("div", "slabel", d, s.label || s.id);
+      if (s.listField) h("div", "schips", d);
+      else h("div", "sval", d, "");
+    }
+  }
+  if (scene.actors && scene.actors.length) {
+    const row = h("div", "srow", box);
+    for (const a of scene.actors) {
+      const d = h("div", "actor", row, a.label || a.id);
+      d.dataset.store = a.id;
+      const dots = h("div", "dots", d);
+      for (const dotLabel of Object.keys(a.memberOf || {})) {
+        const sp = h("span", "", dots);
+        const i2 = h("i", "", sp);
+        i2.dataset.actor = a.id;
+        i2.dataset.dot = dotLabel;
+        sp.appendChild(document.createTextNode(dotLabel));
+      }
+    }
+  }
+  if (scene.lamps && scene.lamps.length) {
+    const row = h("div", "srow", box);
+    for (const l of scene.lamps) {
+      const sp = h("span", "lamp", row);
+      const i2 = h("i", "", sp);
+      i2.dataset.lamp = l.field;
+      sp.appendChild(document.createTextNode(l.label || l.field));
+    }
+  }
+  h("div", "flowcap", box, "");
+
+  if ((CUR.invariantIds || []).length) {
+    const badges = h("div", "invbadges", stage);
+    CUR.invariantIds.forEach((id, j) => {
+      const b = h("span", "invbadge", badges, id);
+      b.dataset.inv = j;
+    });
+  }
+  h("div", "statecard", stage);
+
+  setFrame(verdict && verdict.step != null && verdict.step >= 0
+           ? Math.min(verdict.step, FRAMES.length - 1) : 0);
+}
+
+function sceneFieldSet() {
+  const scene = CUR.scene || {};
+  const covered = new Set();
+  for (const s of scene.stores || [])
+    for (const k of [s.countField, s.listField, s.valueField]) if (k) covered.add(k);
+  for (const a of scene.actors || [])
+    for (const f of Object.values(a.memberOf || {})) covered.add(f);
+  for (const l of scene.lamps || []) covered.add(l.field);
+  if (CUR.bandField) covered.add(CUR.bandField);
+  return covered;
+}
+
+function setFrame(i) {
+  FRAME = Math.max(0, Math.min(i, FRAMES.length - 1));
+  const ev = FRAMES[FRAME];
+  const st = ev.state || {};
+  const prev = FRAME > 0 ? (FRAMES[FRAME - 1].state || {}) : {};
+  const root = document.getElementById("replay");
+
+  for (const e of root.querySelectorAll(".rentry"))
+    e.classList.toggle("active", Number(e.dataset.frame) === FRAME);
+  const active = root.querySelector(".rentry.active");
+  if (active) active.scrollIntoView({block: "nearest"});
+
+  root.querySelector(".fcount").textContent = `${FRAME + 1} / ${FRAMES.length}`;
+  const evname = root.querySelector(".evname");
+  evname.textContent = (ev.cat === FAULT ? "⚠ " : "") + ev.name;
+  evname.classList.toggle("fault", ev.cat === FAULT);
+
+  // Status pill from the band field + shared phase colors.
+  const pill = root.querySelector(".statuspill");
+  const status = CUR.bandField ? st[CUR.bandField] : null;
+  pill.classList.toggle("hidden", status == null);
+  if (status != null) {
+    pill.textContent = `${CUR.bandField}: ${status}`;
+    const c = CUR.bands[status] ? pick(CUR.bands[status]) : null;
+    pill.style.background = c ? c + WASH() : "transparent";
+    pill.style.borderColor = c || "var(--baseline)";
+  }
+
+  // Stores / actors / lamps.
+  const scene = CUR.scene || {};
+  for (const s of scene.stores || []) {
+    const d = root.querySelector(`.store[data-store="${s.id}"]`);
+    if (!d) continue;
+    d.classList.remove("pulse");
+    if (s.listField) {
+      const chips = d.querySelector(".schips");
+      chips.replaceChildren();
+      for (const item of parseList(st[s.listField]))
+        h("span", "", chips, String(item));
+      if (String(st[s.listField]) !== String(prev[s.listField])) d.classList.add("pulse");
+    } else {
+      const field = s.countField || s.valueField;
+      const val = st[field];
+      const sval = d.querySelector(".sval");
+      sval.textContent = val == null ? "–" : String(val);
+      if (s.valueField && CUR.bands[val]) {
+        const c = pick(CUR.bands[val]);
+        sval.style.background = c + WASH();
+        sval.style.borderRadius = "999px";
+      } else if (s.valueField) {
+        sval.style.background = "transparent";
+      }
+      if (st[field] !== prev[field]) {
+        d.classList.add("pulse");
+        if (s.countField && typeof val === "number" && typeof prev[field] === "number") {
+          const delta = val - prev[field];
+          const dspan = h("span", "delta", sval);
+          dspan.textContent = (delta > 0 ? "+" : "") + delta;
+          dspan.style.color = delta > 0 ? "#0ca30c" : "#d03b3b";
+        }
+      }
+    }
+  }
+  for (const a of scene.actors || []) {
+    const node = root.querySelector(`.actor[data-store="${a.id}"]`);
+    if (node) node.classList.remove("pulse");
+    for (const [dotLabel, field] of Object.entries(a.memberOf || {})) {
+      const dot = root.querySelector(`i[data-actor="${a.id}"][data-dot="${dotLabel}"]`);
+      if (dot) dot.classList.toggle("on", parseList(st[field]).includes(a.id));
+    }
+  }
+  for (const l of scene.lamps || []) {
+    const dot = root.querySelector(`i[data-lamp="${l.field}"]`);
+    if (dot) dot.classList.toggle("on", st[l.field] === true);
+  }
+
+  // Flow caption + pulses for flows fired by this event.
+  const cap = root.querySelector(".flowcap");
+  cap.replaceChildren();
+  for (const f of SCENE_FLOWS) {
+    if (!f.re.test(ev.name)) continue;
+    if (f.when && !Object.entries(f.when).every(([k, v]) => st[k] === v)) continue;
+    const from = f.fromField ? st[f.fromField] : f.from;
+    const to = f.toField ? st[f.toField] : f.to;
+    const line = h("div", "", cap);
+    h("span", "", line, `${from} `);
+    h("span", "arrow", line, "⟶");
+    h("span", "", line, ` ${to}` + (f.label ? ` — ${f.label}` : ""));
+    for (const id of [from, to]) {
+      const t = root.querySelector(`[data-store="${id}"]`);
+      if (t) t.classList.add("pulse");
+    }
+  }
+
+  root.querySelector(".scenebox").classList.toggle("fault", ev.cat === FAULT);
+
+  // Invariant badges.
+  for (const b of root.querySelectorAll(".invbadge")) {
+    const v = (ev.inv || [])[Number(b.dataset.inv)];
+    b.classList.toggle("ok", v === true);
+    b.classList.toggle("bad", v === false);
+  }
+
+  // State card: everything the scene doesn't already show.
+  const covered = sceneFieldSet();
+  const card = root.querySelector(".statecard");
+  card.replaceChildren();
+  for (const [k, v] of Object.entries(st)) {
+    if (covered.has(k)) continue;
+    const d = h("div", prev[k] !== v ? "chg" : "", card);
+    d.appendChild(document.createTextNode(k + ": "));
+    h("b", "", d, String(v));
+  }
+}
+
+function stepFrame(d) {
+  if (d === -Infinity) return setFrame(0);
+  if (d === Infinity) return setFrame(FRAMES.length - 1);
+  setFrame(FRAME + d);
+}
+
+document.addEventListener("keydown", (e) => {
+  if (VIEW !== "replay" || !FRAMES.length) return;
+  if (e.key === "ArrowRight") { stepFrame(1); e.preventDefault(); }
+  if (e.key === "ArrowLeft") { stepFrame(-1); e.preventDefault(); }
+});
+
 function syncHeaderHeight() {
-  const h = document.querySelector("header").offsetHeight;
-  document.documentElement.style.setProperty("--header-h", h + "px");
+  const h2 = document.querySelector("header").offsetHeight;
+  document.documentElement.style.setProperty("--header-h", h2 + "px");
 }
 window.addEventListener("resize", syncHeaderHeight);
-
-document.getElementById("viewbtn").addEventListener("click", (e) => {
-  state.table = !state.table;
-  e.target.textContent = state.table ? "Timeline view" : "Table view";
-  for (const svg of document.querySelectorAll("svg.timeline, .laneheads"))
-    svg.classList.toggle("hidden", state.table);
-  for (const t of document.querySelectorAll("table.events"))
-    t.classList.toggle("hidden", !state.table);
-});
 
 buildSidebar();
 buildUI(0);
@@ -701,8 +1095,77 @@ buildUI(0);
 """
 
 
+def run_tlc_verdict(trace_path: Path, binding: Binding,
+                    specs_dir: Path) -> dict:
+    """Optionally validate the trace with TLC via scripts/tla-check.sh and
+    distill a verdict for the artifact. Never raises: if TLC/java or the
+    runner is unavailable, the render proceeds with a neutral note."""
+    if not binding.trace_family:
+        return {"status": "unavailable",
+                "message": "no traceFamily in this tag's binding"}
+    zig_dir = specs_dir.parent.parent
+    script = zig_dir.parent / "scripts" / "tla-check.sh"
+    # On counterexamples TLC drops *_TTrace_* files next to the spec, which
+    # the suite's audit rightly flags; remove any this run creates.
+    pre_existing = set(specs_dir.rglob("*_TTrace_*"))
+    try:
+        with tempfile.TemporaryDirectory(prefix="tla-viz-tlc-") as statedir:
+            proc = subprocess.run(
+                ["bash", str(script), "trace", binding.trace_family],
+                cwd=zig_dir,
+                env={**os.environ, "STATEDIR": statedir,
+                     "TRACE_FILES": str(trace_path.resolve())},
+                capture_output=True, text=True, timeout=600)
+            logs = sorted(Path(statedir).glob("*/tlc.log"))
+            tlc_log = "\n".join(p.read_text() for p in logs)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"status": "unavailable", "message": f"TLC unavailable: {e}"}
+    finally:
+        for leftover in set(specs_dir.rglob("*_TTrace_*")) - pre_existing:
+            leftover.unlink(missing_ok=True)
+
+    if proc.returncode == 0:
+        return {"status": "pass",
+                "message": f"TLC trace validation passed "
+                           f"({binding.trace_family})"}
+
+    # Distill the counterexample: which invariant, and how far the replay got
+    # (`l` is the Trace specs' 1-based next-log-line index).
+    log_text = tlc_log or (proc.stdout + proc.stderr)
+    inv = re.search(r"Invariant (\w+) is violated", log_text)
+    prop = re.search(r"Temporal property (\w+)", log_text)
+    err = re.search(r"^Error: (.+)$", log_text, re.M)
+    l_values = [int(x) for x in re.findall(r"/\\ l = (\d+)", log_text)]
+    # `l` is the 1-based index of the NEXT log line to consume. An invariant
+    # violation happens in the post-state of the last consumed event
+    # (0-based: l-2); a TraceMatched failure means line l itself could not
+    # be matched to any model action (0-based: l-1).
+    if inv:
+        name = inv.group(1)
+        step = max(l_values) - 2 if l_values else None
+        message = f"TLC: invariant {name} violated"
+    elif "TraceMatched" in log_text:
+        name = "TraceMatched"
+        step = max(l_values) - 1 if l_values else None
+        message = ("TLC: implementation step not matched by any model "
+                   "action (TraceMatched)")
+    else:
+        name = prop.group(1) if prop else None
+        step = max(l_values) - 2 if l_values else None
+        message = (f"TLC: property {name} violated" if name else
+                   f"TLC validation failed: "
+                   f"{err.group(1) if err else 'see TLC log'}")
+    if step is not None and step >= 0:
+        message += f" at step {step}"
+    else:
+        step = None
+    return {"status": "fail", "invariant": name, "step": step,
+            "message": message}
+
+
 def prepare_trace(path: Path, bindings: dict[str, "Binding"],
-                  specs_dir: Path | None, max_events: int) -> dict | None:
+                  specs_dir: Path | None, max_events: int,
+                  tlc: bool = False) -> dict | None:
     """Parse and lay out one trace file into a sidebar entry, or None with a
     warning if it is empty or oversized."""
     objs = list(parse_lines(path))
@@ -742,6 +1205,19 @@ def prepare_trace(path: Path, bindings: dict[str, "Binding"],
            " No viz binding for this tag — rendered with the generic narrative "
            "preset; add one in specs/tla/traces/viz.json.")
     )
+    verdict = None
+    if tlc and specs_dir is not None:
+        verdict = run_tlc_verdict(path, binding, specs_dir)
+        mark = {"pass": "✓", "fail": "✗"}.get(verdict["status"], "•")
+        subtitle += f" {mark} {verdict['message']}."
+
+    model_diagram = None
+    if binding.model and specs_dir is not None:
+        md = (specs_dir / "diagrams" / f"{binding.model}.md").resolve()
+        model_diagram = {"model": binding.model,
+                         "path": f"specs/tla/diagrams/{binding.model}.md",
+                         "href": md.as_uri() if md.is_file() else None}
+
     return {
         "name": path.name,
         "label": binding.label,
@@ -755,6 +1231,11 @@ def prepare_trace(path: Path, bindings: dict[str, "Binding"],
             "bandGlobal": binding.band_global,
             "bands": band_colors,
             "bandQuiet": binding.band_quiet,
+            "replay": replay_enabled(binding),
+            "scene": binding.scene,
+            "invariantIds": binding.invariant_ids(),
+            "verdict": verdict,
+            "modelDiagram": model_diagram,
             "segments": seg_data,
         },
     }
@@ -780,6 +1261,14 @@ def main() -> int:
     ap.add_argument("--bindings", type=Path,
                     help="viz.json binding table (default: found next to the "
                          "first trace or under specs/tla/traces/)")
+    ap.add_argument("--binding", type=Path, action="append", default=[],
+                    help="overlay binding file(s) merged over the base table "
+                         "per tag — bind a new trace tag or override display "
+                         "of an existing one without editing the repo")
+    ap.add_argument("--tlc", action="store_true",
+                    help="also run TLC trace validation (scripts/tla-check.sh "
+                         "trace <family>) and bake the verdict into the "
+                         "artifact; skipped gracefully if TLC is unavailable")
     ap.add_argument("--max-events", type=int, default=20000,
                     help="skip traces with more events than this (default "
                          "20000); pre-split with scripts/tla-segment-*.py")
@@ -791,13 +1280,20 @@ def main() -> int:
         return 1
 
     bindings_path = archetypes.find_bindings_file(files[0], args.bindings)
+    binding_paths = ([bindings_path] if bindings_path else []) + args.binding
+    missing = [p for p in args.binding if not p.is_file()]
+    if missing:
+        print(f"binding overlay not found: {missing}", file=sys.stderr)
+        return 1
     bindings, specs_dir = {}, None
+    if binding_paths:
+        bindings = archetypes.load_bindings(binding_paths)
     if bindings_path is not None:
-        bindings = archetypes.load_bindings(bindings_path)
-        specs_dir = bindings_path.parent.parent
+        specs_dir = bindings_path.resolve().parent.parent
 
     pairs = [(f, e) for f in files
-             if (e := prepare_trace(f, bindings, specs_dir, args.max_events))]
+             if (e := prepare_trace(f, bindings, specs_dir, args.max_events,
+                                    tlc=args.tlc))]
     if not pairs:
         print("no renderable traces", file=sys.stderr)
         return 1

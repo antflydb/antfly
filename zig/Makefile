@@ -132,12 +132,14 @@ tla-viz: ## Regenerate structural Mermaid diagrams (specs/tla/diagrams/).
 tla-viz-check: ## Check the committed structural diagrams are up to date.
 	$(SCRIPTS_PY) ../scripts/tla-viz/gen_structural.py --check --specs-dir specs/tla --out-dir specs/tla/diagrams
 
-tla-viz-trace: ## Render NDJSON trace(s) to a self-contained HTML timeline: JSON="<files/dirs>" [OUT=<file.html>]
+tla-viz-trace: ## Render NDJSON trace(s) to a self-contained HTML artifact: JSON="<files/dirs>" [OUT=<file.html>] [BINDING=<overlay.json>] [TLC=1]
 ifndef JSON
 	$(error JSON is required, e.g. make tla-viz-trace JSON=specs/tla/traces/ha_rejoin.ndjson)
 endif
-	$(SCRIPTS_PY) ../scripts/tla-viz/render_trace.py $(JSON) $(if $(OUT),-o $(OUT),)
+	$(SCRIPTS_PY) ../scripts/tla-viz/render_trace.py $(JSON) $(if $(OUT),-o $(OUT),) \
+	  $(if $(BINDING),--binding $(BINDING),) $(if $(TLC),--tlc,)
 
-tla-viz-traces: ## Render every checked-in trace fixture into one browsable HTML file: [OUT=<file.html>]
+tla-viz-traces: ## Render every checked-in trace fixture into one browsable HTML file: [OUT=<file.html>] [BINDING=<overlay.json>] [TLC=1]
 	$(SCRIPTS_PY) ../scripts/tla-viz/render_trace.py specs/tla/example.ndjson specs/tla/traces \
+	  $(if $(BINDING),--binding $(BINDING),) $(if $(TLC),--tlc,) \
 	  -o $(if $(OUT),$(OUT),specs/tla/traces/all-traces.html)
