@@ -1043,6 +1043,8 @@ fn cloneReplicationPollParamsAlloc(
     var out = foreign_source.ReplicationPollParams{
         .table = try alloc.dupe(u8, params.table),
         .limit = params.limit,
+        .reclaim_exact_cutover_slot = params.reclaim_exact_cutover_slot,
+        .exact_cutover_intent = params.exact_cutover_intent,
     };
     errdefer out.deinit(alloc);
     out.slot_name = if (params.slot_name) |slot_name| try alloc.dupe(u8, slot_name) else null;

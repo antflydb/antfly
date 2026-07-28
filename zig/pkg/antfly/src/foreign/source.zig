@@ -183,6 +183,19 @@ pub const ReplicationChange = struct {
     }
 };
 
+/// Synchronous durability barrier invoked after the provider proves that the
+/// configured slot name is available, but before it creates a persistent
+/// exact-cutover slot. The callback lifetime is limited to the enclosing
+/// beginPreparedReplicationSnapshot call.
+pub const ExactCutoverIntent = struct {
+    ptr: *anyopaque,
+    persist_fn: *const fn (ptr: *anyopaque) anyerror!void,
+
+    pub fn persist(self: @This()) !void {
+        try self.persist_fn(self.ptr);
+    }
+};
+
 pub const ReplicationPollParams = struct {
     table: []u8,
     slot_name: ?[]u8 = null,
@@ -190,6 +203,11 @@ pub const ReplicationPollParams = struct {
     filter_query_json: ?[]u8 = null,
     checkpoint: ?[]u8 = null,
     limit: ?usize = null,
+    /// A replicated pending intent proves that an existing inactive slot with
+    /// this name belongs to an interrupted exact-cutover attempt and may be
+    /// reclaimed. Never set this based only on the slot naming convention.
+    reclaim_exact_cutover_slot: bool = false,
+    exact_cutover_intent: ?ExactCutoverIntent = null,
 
     pub fn deinit(self: *ReplicationPollParams, alloc: Allocator) void {
         alloc.free(self.table);

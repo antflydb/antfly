@@ -35,6 +35,8 @@ const Allocator = std.mem.Allocator;
 // the applied row is visible through query/index paths.
 const cdc_apply_sync_level = db_mod.types.SyncLevel.full_index;
 const default_prepared_snapshot_timeout_ns: u64 = 30 * std.time.ns_per_s;
+const cutover_mode_exported_snapshot = "exported_snapshot";
+const cutover_mode_exported_snapshot_pending = "exported_snapshot_pending";
 
 fn classifyReplicationError(err: anyerror) []const u8 {
     return switch (err) {
@@ -92,7 +94,25 @@ pub const SnapshotBackfillRunner = struct {
         existing_status: ?metadata_table_manager.ReplicationSourceStatusRecord,
     ) !BackfillSummary {
         var progress_offset = start_offset;
-        return self.runTableSourceInner(status_sink, table, source_ordinal, start_offset, existing_status, &progress_offset) catch |err| {
+        var progress_cutover_mode = std.ArrayListUnmanaged(u8).empty;
+        defer progress_cutover_mode.deinit(self.alloc);
+        var progress_prepared_checkpoint = std.ArrayListUnmanaged(u8).empty;
+        defer progress_prepared_checkpoint.deinit(self.alloc);
+        if (existing_status) |status| {
+            try progress_cutover_mode.appendSlice(self.alloc, status.cutover_mode);
+            try progress_prepared_checkpoint.appendSlice(self.alloc, status.prepared_checkpoint);
+        }
+
+        return self.runTableSourceInner(
+            status_sink,
+            table,
+            source_ordinal,
+            start_offset,
+            existing_status,
+            &progress_offset,
+            &progress_cutover_mode,
+            &progress_prepared_checkpoint,
+        ) catch |err| {
             var parsed = parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal) catch return err;
             defer parsed.deinit(self.alloc);
 
@@ -101,11 +121,13 @@ pub const SnapshotBackfillRunner = struct {
                 .source_ordinal = source_ordinal,
                 .source_kind = parsed.type_name,
                 .external_table = parsed.postgres_table,
+                .cutover_mode = progress_cutover_mode.items,
                 .slot_name = parsed.slot_name,
                 .publication_name = parsed.publication_name,
                 .phase = "failed",
                 .checkpoint = checkpointSlice(progress_offset),
                 .snapshot_offset = @intCast(progress_offset),
+                .prepared_checkpoint = progress_prepared_checkpoint.items,
                 .stream_checkpoint = "",
                 .last_error = @errorName(err),
                 .failure_class = classifyReplicationError(err),
@@ -125,6 +147,8 @@ pub const SnapshotBackfillRunner = struct {
         start_offset: usize,
         existing_status: ?metadata_table_manager.ReplicationSourceStatusRecord,
         progress_offset: *usize,
+        progress_cutover_mode: *std.ArrayListUnmanaged(u8),
+        progress_prepared_checkpoint: *std.ArrayListUnmanaged(u8),
     ) !BackfillSummary {
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal);
         defer parsed.deinit(self.alloc);
@@ -155,7 +179,9 @@ pub const SnapshotBackfillRunner = struct {
             null;
         if (parsed.require_exact_cutover) {
             if (persisted_cutover_mode) |mode| {
-                if (!std.mem.eql(u8, mode, "exported_snapshot")) return error.ReplicationExactCutoverRequired;
+                if (!std.mem.eql(u8, mode, cutover_mode_exported_snapshot) and
+                    !std.mem.eql(u8, mode, cutover_mode_exported_snapshot_pending))
+                    return error.ReplicationExactCutoverRequired;
             }
         }
 
@@ -164,9 +190,53 @@ pub const SnapshotBackfillRunner = struct {
             .slot_name = try self.alloc.dupe(u8, parsed.slot_name),
             .publication_name = try self.alloc.dupe(u8, parsed.publication_name),
             .filter_query_json = if (parsed.publication_filter_json) |value| try self.alloc.dupe(u8, value) else null,
+            .reclaim_exact_cutover_slot = if (persisted_cutover_mode) |mode|
+                std.mem.eql(u8, mode, cutover_mode_exported_snapshot_pending)
+            else
+                false,
         };
         defer prepare_params.deinit(self.alloc);
-        var exact_cutover_rejected = false;
+        const ExactCutoverIntentContext = struct {
+            alloc: Allocator,
+            status_sink: @TypeOf(status_sink),
+            record: metadata_table_manager.ReplicationSourceStatusRecord,
+            progress_cutover_mode: *std.ArrayListUnmanaged(u8),
+            progress_prepared_checkpoint: *std.ArrayListUnmanaged(u8),
+
+            fn persist(ptr: *anyopaque) !void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                try replaceProgressSlice(
+                    ctx.alloc,
+                    ctx.progress_cutover_mode,
+                    cutover_mode_exported_snapshot_pending,
+                );
+                ctx.progress_prepared_checkpoint.clearRetainingCapacity();
+                try callUpsertStatus(ctx.status_sink, ctx.record);
+            }
+        };
+        var exact_cutover_intent_context = ExactCutoverIntentContext{
+            .alloc = self.alloc,
+            .status_sink = status_sink,
+            .record = .{
+                .table_id = table.table_id,
+                .source_ordinal = source_ordinal,
+                .source_kind = parsed.type_name,
+                .external_table = parsed.postgres_table,
+                .cutover_mode = cutover_mode_exported_snapshot_pending,
+                .slot_name = parsed.slot_name,
+                .publication_name = parsed.publication_name,
+                .phase = "cutover_preparing",
+                .checkpoint = "snapshot_offset:0",
+                .snapshot_offset = 0,
+                .updated_at_ms = nowMillis(),
+            },
+            .progress_cutover_mode = progress_cutover_mode,
+            .progress_prepared_checkpoint = progress_prepared_checkpoint,
+        };
+        prepare_params.exact_cutover_intent = .{
+            .ptr = &exact_cutover_intent_context,
+            .persist_fn = ExactCutoverIntentContext.persist,
+        };
         const prepared_snapshot_deadline_ns =
             platform_time.monotonicNs() +| self.prepared_snapshot_timeout_ns;
         var prepared_snapshot = if (start_offset == 0 and persisted_prepared_checkpoint == null)
@@ -176,8 +246,9 @@ pub const SnapshotBackfillRunner = struct {
                 prepared_snapshot_deadline_ns,
             ) catch |err| switch (err) {
                 error.UnsupportedExactCutover => blk: {
+                    progress_cutover_mode.clearRetainingCapacity();
+                    progress_prepared_checkpoint.clearRetainingCapacity();
                     if (parsed.require_exact_cutover) return error.ReplicationExactCutoverRequired;
-                    exact_cutover_rejected = true;
                     break :blk null;
                 },
                 else => return err,
@@ -208,14 +279,23 @@ pub const SnapshotBackfillRunner = struct {
             prepared.checkpoint
         else
             prepare_result.checkpoint;
-        const cutover_mode = if (persisted_cutover_mode) |mode|
-            mode
-        else if (prepared_snapshot != null)
-            "exported_snapshot"
+        const cutover_mode = if (prepared_snapshot != null)
+            cutover_mode_exported_snapshot
+        else if (persisted_cutover_mode) |mode|
+            if (std.mem.eql(u8, mode, cutover_mode_exported_snapshot_pending))
+                if (prepare_result.slot_existed) "slot_resumed" else "slot_first"
+            else
+                mode
         else if (prepare_result.slot_existed)
             "slot_resumed"
         else
             "slot_first";
+        try replaceProgressSlice(self.alloc, progress_cutover_mode, cutover_mode);
+        try replaceProgressSlice(
+            self.alloc,
+            progress_prepared_checkpoint,
+            prepared_checkpoint,
+        );
 
         try callUpsertStatus(status_sink, .{
             .table_id = table.table_id,
@@ -1828,6 +1908,16 @@ fn callUpsertStatus(status_sink: anytype, record: metadata_table_manager.Replica
     try status_sink.upsertReplicationSourceStatus(record);
 }
 
+fn replaceProgressSlice(
+    alloc: Allocator,
+    progress: *std.ArrayListUnmanaged(u8),
+    value: []const u8,
+) !void {
+    try progress.ensureTotalCapacity(alloc, value.len);
+    progress.clearRetainingCapacity();
+    progress.appendSliceAssumeCapacity(value);
+}
+
 fn findReplicationSourceStatus(
     records: []const metadata_table_manager.ReplicationSourceStatusRecord,
     table_id: u64,
@@ -2206,11 +2296,12 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
             _: *anyopaque,
             inner_alloc: Allocator,
             _: []const u8,
-            _: foreign_mod.ReplicationPollParams,
+            params: foreign_mod.ReplicationPollParams,
             execution_deadline_ns: u64,
         ) !foreign_mod.PostgresQueryExecutor.PreparedReplicationSnapshot {
             if (platform_time.monotonicNs() >= execution_deadline_ns) return error.Timeout;
             Parent.exact_cutover_calls += 1;
+            if (params.exact_cutover_intent) |intent| try intent.persist();
             const session = try inner_alloc.create(SnapshotSession);
             session.* = .{};
             return .{
@@ -3041,6 +3132,117 @@ test "metadata replication backfill rejects existing-slot fallback when exact cu
     try std.testing.expectEqualStrings("failed", status_sink.latest().phase);
     try std.testing.expectEqualStrings("terminal", status_sink.latest().failure_class);
     try std.testing.expectEqualStrings("ReplicationExactCutoverRequired", status_sink.latest().last_error);
+    try std.testing.expectEqualStrings("", status_sink.latest().cutover_mode);
+}
+
+test "metadata replication backfill durably retries interrupted exact cutover ownership" {
+    const alloc = std.testing.allocator;
+
+    const FakeExecutor = struct {
+        var calls: usize = 0;
+        var reclaimed_on_retry: bool = false;
+
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64) !foreign_mod.QueryResult {
+            var owned = prepared;
+            defer owned.deinit(inner_alloc);
+            return .{ .rows = &.{}, .total = 0 };
+        }
+
+        fn statistics(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !foreign_mod.TableStatistics {
+            return .{};
+        }
+
+        fn beginPreparedReplicationSnapshot(
+            _: *anyopaque,
+            _: Allocator,
+            _: []const u8,
+            params: foreign_mod.ReplicationPollParams,
+            _: u64,
+        ) !foreign_mod.PostgresQueryExecutor.PreparedReplicationSnapshot {
+            calls += 1;
+            if (calls == 2) reclaimed_on_retry = params.reclaim_exact_cutover_slot;
+            if (params.exact_cutover_intent) |intent| try intent.persist();
+            return error.ForeignConnectionFailed;
+        }
+    };
+    FakeExecutor.calls = 0;
+    FakeExecutor.reclaimed_on_retry = false;
+
+    var registry = foreign_mod.Registry{};
+    defer registry.deinit(alloc);
+    try foreign_mod.registerPostgresExecutor(alloc, &registry, .{
+        .ptr = undefined,
+        .vtable = &.{
+            .query = FakeExecutor.query,
+            .statistics = FakeExecutor.statistics,
+            .begin_prepared_replication_snapshot = FakeExecutor.beginPreparedReplicationSnapshot,
+        },
+    });
+
+    const NullWriteSource = struct {
+        var sentinel: u8 = 0;
+
+        fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return {};
+        }
+    };
+
+    const StatusSink = struct {
+        alloc: Allocator,
+        records: std.ArrayListUnmanaged(metadata_table_manager.ReplicationSourceStatusRecord) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.records.items) |record| metadata_table_manager.freeReplicationSourceStatus(self.alloc, record);
+            self.records.deinit(self.alloc);
+        }
+
+        fn latest(self: *@This()) metadata_table_manager.ReplicationSourceStatusRecord {
+            return self.records.items[self.records.items.len - 1];
+        }
+
+        fn upsertReplicationSourceStatus(self: *@This(), record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+            try self.records.append(self.alloc, try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record));
+        }
+    };
+
+    var status_sink: StatusSink = .{ .alloc = alloc };
+    defer status_sink.deinit();
+    var runner = SnapshotBackfillRunner{
+        .alloc = alloc,
+        .registry = &registry,
+        .write_source = .{
+            .ptr = &NullWriteSource.sentinel,
+            .vtable = &.{ .batch = NullWriteSource.batch },
+        },
+    };
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 11,
+        .name = "docs",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\",\"require_exact_cutover\":true}]",
+    };
+
+    try std.testing.expectError(
+        error.ForeignConnectionFailed,
+        runner.runTableSource(&status_sink, table, 0),
+    );
+    try std.testing.expectEqualStrings("failed", status_sink.latest().phase);
+    try std.testing.expectEqualStrings("retryable", status_sink.latest().failure_class);
+    try std.testing.expectEqualStrings(
+        cutover_mode_exported_snapshot_pending,
+        status_sink.latest().cutover_mode,
+    );
+
+    const interrupted = status_sink.latest();
+    try std.testing.expectError(
+        error.ForeignConnectionFailed,
+        runner.runTableSourceFromStatus(&status_sink, table, 0, 0, interrupted),
+    );
+    try std.testing.expectEqual(@as(usize, 2), FakeExecutor.calls);
+    try std.testing.expect(FakeExecutor.reclaimed_on_retry);
+    try std.testing.expectEqualStrings(
+        cutover_mode_exported_snapshot_pending,
+        status_sink.latest().cutover_mode,
+    );
 }
 
 test "metadata replication stream applies insert update and delete through bound write source" {

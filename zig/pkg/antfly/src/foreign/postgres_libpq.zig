@@ -401,6 +401,39 @@ pub const Executor = struct {
         reclaiming: bool = false,
     };
 
+    const AsyncResultDriver = struct {
+        executor: *Executor,
+        conn: ?*PGconn,
+
+        fn flush(self: @This()) c_int {
+            return self.executor.pqflush(self.conn);
+        }
+
+        fn wait(self: @This(), events: i16, deadline_ns: u64) !i16 {
+            return try self.executor.waitForSocketEvents(self.conn, events, deadline_ns);
+        }
+
+        fn consumeInput(self: @This()) c_int {
+            return self.executor.pqconsumeInput(self.conn);
+        }
+
+        fn isBusy(self: @This()) c_int {
+            return self.executor.pqisBusy(self.conn);
+        }
+
+        fn getResult(self: @This()) ?*PGresult {
+            return self.executor.pqgetResult(self.conn);
+        }
+
+        fn clear(self: @This(), result: ?*PGresult) void {
+            self.executor.pqclear(result);
+        }
+
+        fn restoreBlocking(self: @This()) c_int {
+            return self.executor.pqsetnonblocking(self.conn, 0);
+        }
+    };
+
     const ConnectionLease = struct {
         executor: *Executor,
         pool: *ConnectionPool,
@@ -758,7 +791,30 @@ pub const Executor = struct {
             slot_name,
             execution_deadline_ns,
         )) {
-            return error.UnsupportedExactCutover;
+            if (!params.reclaim_exact_cutover_slot)
+                return error.UnsupportedExactCutover;
+            try self.dropInactiveLogicalReplicationSlotIfExistsAlloc(
+                alloc,
+                sql_conn,
+                slot_name,
+                execution_deadline_ns,
+            );
+            if (try self.logicalReplicationSlotExistsAlloc(
+                alloc,
+                sql_conn,
+                slot_name,
+                execution_deadline_ns,
+            )) return error.ExactCutoverCleanupPending;
+        }
+
+        // This is the ownership linearization point. The caller persists an
+        // intent only after the slot was proved absent (or a prior owned,
+        // inactive slot was reclaimed), and creation does not begin unless
+        // that replicated write succeeds.
+        if (params.exact_cutover_intent) |intent| {
+            try ensureDeadline(execution_deadline_ns);
+            try intent.persist();
+            try ensureDeadline(execution_deadline_ns);
         }
 
         var repl_conn: ?*PGconn = try self.connectReplicationFreshWithDeadline(
@@ -767,13 +823,14 @@ pub const Executor = struct {
             execution_deadline_ns,
         );
         errdefer if (repl_conn) |conn| self.pqfinish(conn);
-        var slot_may_exist = true;
-        errdefer if (slot_may_exist) {
-            // CREATE_REPLICATION_SLOT can commit server-side immediately
-            // before a socket timeout, and failures after export would
-            // otherwise poison every exact-cutover retry with an orphaned
-            // persistent slot. Close both possibly-busy sessions, then spend
-            // one already-reserved permit on a bounded idempotent cleanup.
+        var slot_created = false;
+        errdefer if (slot_created) {
+            // Clean up only a slot whose successful create response this
+            // attempt observed. A timeout is ambiguous and must be recovered
+            // through the durable pending intent: deleting by name here could
+            // otherwise remove a concurrently successful attempt's slot.
+            // Close both possibly-busy sessions, then spend one already-
+            // reserved permit on a bounded idempotent cleanup.
             if (repl_conn) |conn| {
                 self.pqfinish(conn);
                 repl_conn = null;
@@ -801,6 +858,7 @@ pub const Executor = struct {
             repl_conn,
             slot_name,
             execution_deadline_ns,
+            &slot_created,
         );
         defer exported.deinit(alloc);
 
@@ -840,7 +898,7 @@ pub const Executor = struct {
         repl_conn = null;
         self.releaseGlobalConnections(1);
         release_reserved_permits = false;
-        slot_may_exist = false;
+        slot_created = false;
         return .{
             .checkpoint = checkpoint,
             .snapshot_query = snapshot_query.asSnapshotQuery(),
@@ -1745,7 +1803,7 @@ pub const Executor = struct {
         self.pqfinish(conn);
     }
 
-    fn waitForSocket(self: *@This(), conn: ?*PGconn, events: i16, deadline_ns: u64) !void {
+    fn waitForSocketEvents(self: *@This(), conn: ?*PGconn, events: i16, deadline_ns: u64) !i16 {
         const socket = self.pqsocket(conn);
         if (socket < 0) return error.ForeignConnectionFailed;
         const now_ns = platform_time.monotonicNs();
@@ -1761,6 +1819,11 @@ pub const Executor = struct {
         if (try std.posix.poll(&poll_fds, timeout_ms) == 0) return error.Timeout;
         if (poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0)
             return error.ForeignConnectionFailed;
+        return poll_fds[0].revents;
+    }
+
+    fn waitForSocket(self: *@This(), conn: ?*PGconn, events: i16, deadline_ns: u64) !void {
+        _ = try self.waitForSocketEvents(conn, events, deadline_ns);
     }
 
     fn connectFresh(self: *@This(), alloc: Allocator, dsn: []const u8) !?*PGconn {
@@ -1871,32 +1934,10 @@ pub const Executor = struct {
         deadline_ns: u64,
         allow_command_ok: bool,
     ) !?*PGresult {
-        while (true) {
-            const flush_status = self.pqflush(conn);
-            if (flush_status == 0) break;
-            if (flush_status < 0) return error.ForeignQueryFailed;
-            try self.waitForSocket(conn, std.posix.POLL.OUT, deadline_ns);
-        }
-        while (self.pqisBusy(conn) != 0) {
-            try self.waitForSocket(conn, std.posix.POLL.IN, deadline_ns);
-            if (self.pqconsumeInput(conn) != 1) return error.ForeignQueryFailed;
-        }
-
-        try ensureDeadline(deadline_ns);
-        const result = self.pqgetResult(conn) orelse return error.ForeignQueryFailed;
-        var saw_extra_result = false;
-        while (self.pqgetResult(conn)) |extra_result| {
-            saw_extra_result = true;
-            self.pqclear(extra_result);
-        }
-        if (self.pqsetnonblocking(conn, 0) != 0) {
-            self.pqclear(result);
-            return error.ForeignQueryFailed;
-        }
-        if (saw_extra_result) {
-            self.pqclear(result);
-            return error.ForeignQueryFailed;
-        }
+        const result = try readSingleAsyncResultWithDeadline(
+            AsyncResultDriver{ .executor = self, .conn = conn },
+            deadline_ns,
+        );
         const status = self.pqresultStatus(result);
         if (status != PGRES_TUPLES_OK and !(allow_command_ok and status == PGRES_COMMAND_OK)) {
             defer self.pqclear(result);
@@ -2373,12 +2414,31 @@ pub const Executor = struct {
         return @as(usize, @intCast(self.pqntuples(result))) > 0;
     }
 
+    fn cloneCreatedReplicationSnapshotAlloc(
+        alloc: Allocator,
+        slot_created: *bool,
+        checkpoint: []const u8,
+        snapshot_name: []const u8,
+    ) !ExportedReplicationSnapshot {
+        // The caller invokes this only after validating a successful
+        // CREATE_REPLICATION_SLOT result. Mark ownership before allocation so
+        // later local failures still trigger cleanup of this attempt's slot.
+        slot_created.* = true;
+        const checkpoint_copy = try alloc.dupe(u8, checkpoint);
+        errdefer alloc.free(checkpoint_copy);
+        return .{
+            .checkpoint = checkpoint_copy,
+            .snapshot_name = try alloc.dupe(u8, snapshot_name),
+        };
+    }
+
     fn createLogicalReplicationSlotExportSnapshotAlloc(
         self: *@This(),
         alloc: Allocator,
         conn: ?*PGconn,
         slot_name: []const u8,
         execution_deadline_ns: u64,
+        slot_created: *bool,
     ) !ExportedReplicationSnapshot {
         const quoted_slot = try sql.postgresDialect().quote_identifier(alloc, slot_name);
         defer alloc.free(quoted_slot);
@@ -2398,10 +2458,34 @@ pub const Executor = struct {
         defer self.pqclear(result);
         if (self.pqntuples(result) == 0 or self.pqnfields(result) < 3) return error.ForeignQueryFailed;
         if (self.pqgetisnull(result, 0, 1) != 0 or self.pqgetisnull(result, 0, 2) != 0) return error.ForeignQueryFailed;
-        return .{
-            .checkpoint = try copyCellAlloc(alloc, self.pqgetvalue(result, 0, 1), @intCast(self.pqgetlength(result, 0, 1))),
-            .snapshot_name = try copyCellAlloc(alloc, self.pqgetvalue(result, 0, 2), @intCast(self.pqgetlength(result, 0, 2))),
-        };
+        return try cloneCreatedReplicationSnapshotAlloc(
+            alloc,
+            slot_created,
+            self.pqgetvalue(result, 0, 1)[0..@intCast(self.pqgetlength(result, 0, 1))],
+            self.pqgetvalue(result, 0, 2)[0..@intCast(self.pqgetlength(result, 0, 2))],
+        );
+    }
+
+    fn dropInactiveLogicalReplicationSlotIfExistsAlloc(
+        self: *@This(),
+        alloc: Allocator,
+        conn: ?*PGconn,
+        slot_name: []const u8,
+        execution_deadline_ns: u64,
+    ) !void {
+        var prepared = try tableNamePreparedQueryAlloc(
+            alloc,
+            "SELECT pg_drop_replication_slot($1) FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
+            slot_name,
+        );
+        defer prepared.deinit(alloc);
+        const result = try self.execPreparedWithDeadline(
+            conn,
+            alloc,
+            prepared,
+            execution_deadline_ns,
+        );
+        self.pqclear(result);
     }
 
     fn dropLogicalReplicationSlotIfExistsWithReservedPermit(
@@ -2413,26 +2497,59 @@ pub const Executor = struct {
     ) !void {
         const conn = try self.connectFreshWithDeadline(dsn, execution_deadline_ns);
         defer self.pqfinish(conn);
-
-        const args = try alloc.alloc(sql.ParameterValue, 1);
-        args[0] = .{ .string = try alloc.dupe(u8, slot_name) };
-        var prepared = sql.PreparedQuery{
-            .sql_text = try alloc.dupe(
-                u8,
-                "SELECT pg_drop_replication_slot($1) FROM pg_replication_slots WHERE slot_name = $1",
-            ),
-            .args = args,
-        };
-        defer prepared.deinit(alloc);
-        const result = try self.execPreparedWithDeadline(
-            conn,
+        try self.dropInactiveLogicalReplicationSlotIfExistsAlloc(
             alloc,
-            prepared,
+            conn,
+            slot_name,
             execution_deadline_ns,
         );
-        self.pqclear(result);
     }
 };
+
+/// Drive libpq's nonblocking command protocol without ever calling
+/// PQgetResult while libpq still needs socket input. In particular, flushing
+/// must service readable notices/errors as well as writable output, and every
+/// result (including the final null result) gets its own PQisBusy gate.
+fn readSingleAsyncResultWithDeadline(driver: anytype, deadline_ns: u64) !?*PGresult {
+    while (true) {
+        try ensureDeadline(deadline_ns);
+        const flush_status = driver.flush();
+        if (flush_status == 0) break;
+        if (flush_status < 0) return error.ForeignQueryFailed;
+
+        const ready = try driver.wait(
+            std.posix.POLL.IN | std.posix.POLL.OUT,
+            deadline_ns,
+        );
+        if (ready & std.posix.POLL.IN != 0 and driver.consumeInput() != 1)
+            return error.ForeignQueryFailed;
+    }
+
+    var first_result: ?*PGresult = null;
+    errdefer if (first_result) |result| driver.clear(result);
+    var saw_extra_result = false;
+    while (true) {
+        while (driver.isBusy() != 0) {
+            const ready = try driver.wait(std.posix.POLL.IN, deadline_ns);
+            if (ready & std.posix.POLL.IN == 0) continue;
+            if (driver.consumeInput() != 1) return error.ForeignQueryFailed;
+        }
+
+        try ensureDeadline(deadline_ns);
+        const next_result = driver.getResult() orelse break;
+        if (first_result == null) {
+            first_result = next_result;
+        } else {
+            saw_extra_result = true;
+            driver.clear(next_result);
+        }
+    }
+
+    const result = first_result orelse return error.ForeignQueryFailed;
+    if (driver.restoreBlocking() != 0) return error.ForeignQueryFailed;
+    if (saw_extra_result) return error.ForeignQueryFailed;
+    return result;
+}
 
 const LazyExecutor = struct {
     alloc: Allocator,
@@ -3228,6 +3345,127 @@ pub fn registerDefaultExecutor(alloc: Allocator, registry: *foreign_source.Regis
     try postgres_source.registerExecutor(alloc, registry, executor.asQueryExecutor());
 }
 
+test "postgres libpq async reader services input while flushing and between results" {
+    const Driver = struct {
+        flush_calls: usize = 0,
+        wait_events: [3]i16 = undefined,
+        wait_calls: usize = 0,
+        consume_calls: usize = 0,
+        busy_calls: usize = 0,
+        get_result_calls: usize = 0,
+        restored_blocking: bool = false,
+
+        fn flush(self: *@This()) c_int {
+            defer self.flush_calls += 1;
+            return if (self.flush_calls == 0) 1 else 0;
+        }
+
+        fn wait(self: *@This(), events: i16, _: u64) !i16 {
+            self.wait_events[self.wait_calls] = events;
+            self.wait_calls += 1;
+            return std.posix.POLL.IN;
+        }
+
+        fn consumeInput(self: *@This()) c_int {
+            self.consume_calls += 1;
+            return 1;
+        }
+
+        fn isBusy(self: *@This()) c_int {
+            const sequence = [_]c_int{ 1, 0, 1, 0 };
+            const result = sequence[self.busy_calls];
+            self.busy_calls += 1;
+            return result;
+        }
+
+        fn getResult(self: *@This()) ?*PGresult {
+            defer self.get_result_calls += 1;
+            return if (self.get_result_calls == 0) @ptrFromInt(16) else null;
+        }
+
+        fn clear(_: *@This(), _: ?*PGresult) void {
+            unreachable;
+        }
+
+        fn restoreBlocking(self: *@This()) c_int {
+            self.restored_blocking = true;
+            return 0;
+        }
+    };
+
+    var driver = Driver{};
+    const result = try readSingleAsyncResultWithDeadline(
+        &driver,
+        platform_time.monotonicNs() + std.time.ns_per_s,
+    );
+    try std.testing.expectEqual(@as(?*PGresult, @ptrFromInt(16)), result);
+    try std.testing.expectEqual(@as(usize, 3), driver.wait_calls);
+    try std.testing.expectEqual(
+        @as(i16, std.posix.POLL.IN | std.posix.POLL.OUT),
+        driver.wait_events[0],
+    );
+    try std.testing.expectEqual(@as(i16, std.posix.POLL.IN), driver.wait_events[1]);
+    try std.testing.expectEqual(@as(i16, std.posix.POLL.IN), driver.wait_events[2]);
+    try std.testing.expectEqual(@as(usize, 3), driver.consume_calls);
+    try std.testing.expectEqual(@as(usize, 4), driver.busy_calls);
+    try std.testing.expectEqual(@as(usize, 2), driver.get_result_calls);
+    try std.testing.expect(driver.restored_blocking);
+}
+
+test "postgres libpq async reader rejects and clears additional results" {
+    const Driver = struct {
+        get_result_calls: usize = 0,
+        clear_calls: usize = 0,
+        restored_blocking: bool = false,
+
+        fn flush(_: *@This()) c_int {
+            return 0;
+        }
+
+        fn wait(_: *@This(), _: i16, _: u64) !i16 {
+            unreachable;
+        }
+
+        fn consumeInput(_: *@This()) c_int {
+            unreachable;
+        }
+
+        fn isBusy(_: *@This()) c_int {
+            return 0;
+        }
+
+        fn getResult(self: *@This()) ?*PGresult {
+            defer self.get_result_calls += 1;
+            return switch (self.get_result_calls) {
+                0 => @ptrFromInt(16),
+                1 => @ptrFromInt(32),
+                else => null,
+            };
+        }
+
+        fn clear(self: *@This(), _: ?*PGresult) void {
+            self.clear_calls += 1;
+        }
+
+        fn restoreBlocking(self: *@This()) c_int {
+            self.restored_blocking = true;
+            return 0;
+        }
+    };
+
+    var driver = Driver{};
+    try std.testing.expectError(
+        error.ForeignQueryFailed,
+        readSingleAsyncResultWithDeadline(
+            &driver,
+            platform_time.monotonicNs() + std.time.ns_per_s,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 3), driver.get_result_calls);
+    try std.testing.expectEqual(@as(usize, 2), driver.clear_calls);
+    try std.testing.expect(driver.restored_blocking);
+}
+
 test "postgres libpq registration succeeds without libpq and fails on first use" {
     const alloc = std.testing.allocator;
     const c = struct {
@@ -3794,6 +4032,29 @@ test "postgres libpq clone helpers are allocation-failure safe" {
             defer prepared.deinit(alloc);
             var relation_prepared = try relationPreparedQueryAlloc(alloc, "SELECT to_regclass($1)", "public.users");
             defer relation_prepared.deinit(alloc);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "postgres libpq created replication snapshot cloning is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var slot_created = false;
+            var snapshot = Executor.cloneCreatedReplicationSnapshotAlloc(
+                alloc,
+                &slot_created,
+                "0/16B6C50",
+                "00000003-0000001B-1",
+            ) catch |err| {
+                // Ownership is recorded before either allocation, ensuring
+                // every post-create local failure selects bounded cleanup.
+                try std.testing.expect(slot_created);
+                return err;
+            };
+            defer snapshot.deinit(alloc);
+            try std.testing.expect(slot_created);
         }
     };
 
