@@ -1,0 +1,2 @@
+{"tag":"derived-replay-trace","family":"derived-replay","traceId":"1","seq":1,"event":{"name":"BeginCatchUp","facts":{"indexName":"dense_vector","appliedSequence":1,"targetSequence":3}}}
+{"tag":"derived-replay-trace","family":"derived-replay","traceId":"1","seq":2,"event":{"name":"FinishCatchUp","facts":{"indexName":"dense_vector","appliedSequence":4,"targetSequence":3,"lastSequence":4,"scannedEntries":3,"matchedEntries":1,"applied":true}}}

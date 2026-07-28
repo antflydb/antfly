@@ -1,0 +1,7 @@
+==== positive
+SPECIFICATION Spec
+CHECK_DEADLOCK FALSE
+INVARIANT TypeOK
+PROPERTIES
+    TraceMatched
+    EveryRequestedGenerationHasDurableWork

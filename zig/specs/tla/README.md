@@ -331,6 +331,45 @@ Validates checked-in split bridge fixtures against `AntflySplitRefinementBridge.
 - `traces/split_bridge_rollback.ndjson` -- Positive rollback fixture covering no child exposure after rollback
 - `traces/negative/split_bridge_route_before_db_serving.ndjson` -- Expected-failure fixture where metadata routes to the child before DB serving is published
 
+### Loading-Path Live Trace Validation
+
+With `-Dwith_tla=true`, metadata aggregation and managed index repair emit
+implementation observations for the July-25 B1 and B5 contracts. Ordinary
+builds compile the emitters out. `../../scripts/extract-protocol-traces.py`
+extracts per-group behaviors from mixed process logs before TLC replay.
+
+- `TraceAntflyPlacementReadiness.tla` checks qualified voter-set evidence,
+  unknown fallback reports, conflicting fingerprints, and exact stable
+  transition admission.
+- `TraceAntflyIndexLifecycle.tla` checks that every committed managed
+  generation publishes durable work, worker admission follows that work, and
+  replacement publication remains tied to the requested config generation.
+- `TraceAntflyDerivedReplay.tla` checks hint-lane and replay-all fallback scan
+  accounting plus catch-up watermark ordering.
+- `TraceAntflyEnrichmentLease.tla` checks the durable lease record—not only the
+  worker's cached ownership bit—at generated publication and checkpoint
+  advancement.
+- `traces/placement_readiness_b1_recovery.ndjson` and
+  `traces/index_lifecycle_two_generations.ndjson`,
+  `traces/derived_replay_hint_fallback.ndjson`, and
+  `traces/enrichment_lease_publish.ndjson` are positive fixtures.
+- `traces/negative/placement_readiness_unknown_latches_ambiguity.ndjson` and
+  `traces/negative/index_lifecycle_lost_second_wakeup.ndjson`,
+  `traces/negative/derived_replay_advance_beyond_target.ndjson`, and
+  `traces/negative/enrichment_stale_owner_publish.ndjson` prove that the
+  validators reject the corresponding failure shapes.
+
+```bash
+python3 ../scripts/extract-protocol-traces.py placement-readiness /tmp/placement /tmp/antfly.log
+python3 ../scripts/extract-protocol-traces.py index-lifecycle /tmp/index /tmp/antfly.log
+python3 ../scripts/extract-protocol-traces.py derived-replay /tmp/replay /tmp/antfly.log
+python3 ../scripts/extract-protocol-traces.py enrichment-lease /tmp/lease /tmp/antfly.log
+make tla-trace TRACE=placement-readiness TRACE_FILES="/tmp/placement/*.ndjson"
+make tla-trace TRACE=index-lifecycle TRACE_FILES="/tmp/index/*.ndjson"
+make tla-trace TRACE=derived-replay TRACE_FILES="/tmp/replay/*.ndjson"
+make tla-trace TRACE=enrichment-lease TRACE_FILES="/tmp/lease/*.ndjson"
+```
+
 ## Makefile Targets
 
 Four verification targets (everything else is a subcommand of
@@ -381,6 +420,8 @@ suite's NDJSON trace families as one self-contained HTML swimlane timeline
 ```bash
 make tla-viz-trace JSON=specs/tla/example.ndjson OUT=/tmp/raft.html
 make tla-viz-trace JSON=specs/tla/traces/split_bridge_cutover.ndjson OUT=/tmp/split.html
+make tla-viz-trace JSON=specs/tla/traces/placement_readiness_b1_recovery.ndjson TLC=1 OUT=/tmp/b1.html
+make tla-viz-trace JSON=specs/tla/traces/index_lifecycle_two_generations.ndjson TLC=1 OUT=/tmp/b5.html
 make tla-viz-traces   # every fixture in one browsable file (sidebar per family)
 ```
 
@@ -402,8 +443,10 @@ is **assigned a visualization archetype** in
   the binding) with per-step state diffs, flow captions, and display-
   invariant badges — step with ←/→ or autoplay, and watch e.g. a write move
   staged → intent store → visible store through a crash and recovery. Used
-  by `txn-session-trace`, `doc-identity-range-repair-trace`, `antfly-trace`,
-  and as the fallback for tags with no binding yet.
+  by `txn-session-trace`, `doc-identity-range-repair-trace`,
+  `index-lifecycle-trace`, `antfly-trace`, and as the fallback for tags with
+  no binding yet. Placement readiness uses a dialogue view so replica reports,
+  evidence resolution, and transition admission remain visually distinct.
 
 Shared across archetypes: per-family category legends, and **fault emphasis**
 (crash/corruption events always render in the reserved status-critical red

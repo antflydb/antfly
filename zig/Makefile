@@ -112,7 +112,7 @@ else
 	@bash ../scripts/tla-check.sh gate
 endif
 
-tla-trace: tla-tools ## Validate NDJSON traces: TRACE=<raft|txn|txn-session|ha|split-bridge|doc-identity-range-repair> TRACE_FILES=...
+tla-trace: tla-tools ## Validate NDJSON traces: TRACE=<raft|txn|txn-session|ha|split-bridge|doc-identity-range-repair|placement-readiness|index-lifecycle|derived-replay|enrichment-lease> TRACE_FILES=...
 ifndef TRACE
 	$(error TRACE is required, e.g. make tla-trace TRACE=ha TRACE_FILES="specs/tla/traces/ha_*.ndjson")
 endif

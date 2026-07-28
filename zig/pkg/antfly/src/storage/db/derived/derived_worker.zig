@@ -25,6 +25,7 @@ const docstore_mod = @import("../../docstore.zig");
 const mem_backend_mod = @import("../../mem_backend.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
+const derived_replay_trace = @import("derived_replay_trace.zig");
 
 pub const ApplyFn = batcher.ApplyFn;
 pub const PersistProgressFn = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64) anyerror!void;
@@ -202,6 +203,7 @@ fn catchUpIndexFromReplaySource(
     options: CatchUpOptions,
 ) !CatchUpStats {
     const hint = targetHintForManagedIndex(index_ref);
+    derived_replay_trace.begin(replay_source.ptr, hint, from_sequence, options.target_sequence);
     var stats = CatchUpStats{};
     const next_sequence = from_sequence;
     var catch_up_open = false;
@@ -234,6 +236,7 @@ fn catchUpIndexFromReplaySource(
             };
         }
     }
+    derived_replay_trace.finish(replay_source.ptr, hint, from_sequence, options.target_sequence, stats);
     return stats;
 }
 

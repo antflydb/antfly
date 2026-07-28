@@ -20,6 +20,7 @@ const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const mem_backend_mod = @import("../../mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
+const derived_replay_trace = @import("derived_replay_trace.zig");
 
 pub const TargetHint = change_journal_mod.TargetHint;
 
@@ -304,6 +305,7 @@ fn primaryStoreMatchingCursorForEachNext(
                 ctx,
                 consume,
             );
+            derived_replay_trace.scan(cursor.store, cursor.hint, "FallbackScan", cursor.next_sequence, stats, true);
             cursor.next_sequence = @max(cursor.next_sequence, stats.last_sequence);
             if (stats.matched_entries == 0 and stats.scanned_entries == 0) cursor.hint_exhausted = true;
             return stats;
@@ -314,6 +316,7 @@ fn primaryStoreMatchingCursorForEachNext(
         },
         else => return err,
     };
+    derived_replay_trace.scan(cursor.store, cursor.hint, "HintLaneScan", cursor.next_sequence, replay_stats, false);
     cursor.next_sequence = @max(cursor.next_sequence, replay_stats.last_sequence);
     if (replay_stats.matched_entries == 0) {
         const fallback_stats = try primaryStoreForEachMatchingRecordFallbackAll(
@@ -325,6 +328,7 @@ fn primaryStoreMatchingCursorForEachNext(
             ctx,
             consume,
         );
+        derived_replay_trace.scan(cursor.store, cursor.hint, "FallbackScan", cursor.next_sequence, fallback_stats, true);
         cursor.next_sequence = @max(cursor.next_sequence, fallback_stats.last_sequence);
         if (fallback_stats.matched_entries == 0 and fallback_stats.scanned_entries == 0) cursor.hint_exhausted = true;
         return fallback_stats;
@@ -523,20 +527,25 @@ fn primaryStoreForEachMatchingRecord(
         &callback_ctx,
         Context.handle,
     ) catch |err| switch (err) {
-        error.ReplayIndexUnavailable => return try primaryStoreForEachMatchingRecordFallbackAll(
-            store,
-            from_sequence,
-            hint,
-            max_matched_entries,
-            primaryStoreFallbackScanBudget(max_matched_entries),
-            ctx,
-            consume,
-        ),
+        error.ReplayIndexUnavailable => {
+            const stats = try primaryStoreForEachMatchingRecordFallbackAll(
+                store,
+                from_sequence,
+                hint,
+                max_matched_entries,
+                primaryStoreFallbackScanBudget(max_matched_entries),
+                ctx,
+                consume,
+            );
+            derived_replay_trace.scan(store, hint, "FallbackScan", from_sequence, stats, true);
+            return stats;
+        },
         StopReplayChunk.StopReplayChunk => return callback_ctx.stats,
         else => return err,
     };
+    derived_replay_trace.scan(store, hint, "HintLaneScan", from_sequence, replay_stats, false);
     if (replay_stats.matched_entries == 0) {
-        return try primaryStoreForEachMatchingRecordFallbackAll(
+        const stats = try primaryStoreForEachMatchingRecordFallbackAll(
             store,
             from_sequence,
             hint,
@@ -545,6 +554,8 @@ fn primaryStoreForEachMatchingRecord(
             ctx,
             consume,
         );
+        derived_replay_trace.scan(store, hint, "FallbackScan", from_sequence, stats, true);
+        return stats;
     }
     callback_ctx.stats.scanned_entries = @max(callback_ctx.stats.scanned_entries, replay_stats.scanned_entries);
     callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
@@ -561,7 +572,9 @@ fn primaryStoreLatestMatchingSequence(
 ) !u64 {
     _ = alloc;
     const store: *docstore_mod.DocStore = @ptrCast(@alignCast(ptr));
-    return try store.latestReplaySequenceForHint(hint, from_sequence);
+    const target_sequence = try store.latestReplaySequenceForHint(hint, from_sequence);
+    derived_replay_trace.target(store, hint, from_sequence, target_sequence);
+    return target_sequence;
 }
 
 fn primaryStoreCollectEnrichmentDocumentGroups(ptr: *anyopaque, alloc: Allocator, from_sequence: u64) ![]PendingDocumentGroup {

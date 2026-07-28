@@ -20,28 +20,30 @@
   - DocStore.writeReplayEntries writes the replay-all row and replay-all latest
     sequence, then writes per-hint lane rows and per-hint latest sequence keys
     only when a target hint is decoded for that record.
-  - replay_source.zig primaryStoreForEachMatchingRecord scans only the requested
-    hint lane. error.ReplayIndexUnavailable returns zero matches; there is no
-    replay-all fallback in the shipped primary-store path.
+  - replay_source.zig scans the requested hint lane first, then falls back to
+    the replay-all lane when the hint lane is unavailable or returns no match.
+    The fallback decodes target hints and is bounded per scan so sparse work
+    cannot monopolize a worker.
   - DocStore.latestReplaySequenceForHint reads the per-hint latest key. That
     key, not the replay-all latest key, defines a hinted derived worker target.
 
-  The previous model treated an empty/unavailable hint lane as requiring a
-  replay-all fallback. That verified a different design. This model instead
-  checks the safety boundary the code relies on: a hinted target may advance
-  only when every matching replay-all row up to the per-hint latest sequence has
-  a visible hint-lane row the worker can consume.
+  A hinted target may advance only after every matching replay-all row through
+  that target has been consumed. A visible hint-lane row is the fast path; the
+  replay-all fallback is the safety net when lane metadata is missing or
+  unavailable.
 
   Deliberate omissions:
   - payload bytes and hint-mask decoding are abstracted into atomic append modes.
   - retry/backoff and batch sizing are left to enrichment/runtime models.
   - all-lane-only rows with no per-hint latest are allowed; they are not part of
     the hinted worker target until a corresponding per-hint latest key exists.
+  - fallback scan budgets are abstracted as one matching-row step; the trace
+    binding checks real scan batches and progress.
 *)
 
 EXTENDS Naturals, TLC
 
-CONSTANTS BuggyEmptyHintAdvance, Indexes, MaxSeq
+CONSTANTS BuggyMissingHintPublication, Indexes, MaxSeq
 
 KnownIndexes == {"dense", "fulltext"}
 Seqs == 1..MaxSeq
@@ -134,11 +136,11 @@ AppendAllLaneOnly ==
                   applied, appliedRecords, target, queryTarget, catchupActive,
                   bulkSessionActive>>
 
-\* Expected-failure mutant: per-hint latest is advanced without the hinted row.
-\* A worker using latestReplaySequenceForHint will target work that the
-\* hint-lane-only scanner cannot see.
-BuggyAppendLatestWithoutHint(i) ==
-    /\ BuggyEmptyHintAdvance
+\* Represents an inconsistent/missing hint-lane row. The replay-all row and
+\* per-hint latest metadata still make this real work; the shipped fallback
+\* must find it.
+AppendLatestWithoutHint(i) ==
+    /\ BuggyMissingHintPublication
     /\ i \in Indexes
     /\ journalSeq < MaxSeq
     /\ journalSeq' = journalSeq + 1
@@ -203,14 +205,23 @@ ApplyHintMatch(i, s) ==
                   latestHintMeta, truncateFloor, target, queryTarget,
                   catchupActive, bulkSessionActive>>
 
-\* The shipped primary-store scanner returns no matches when the requested hint
-\* lane is unavailable or empty. This is safe only if per-hint latest metadata
-\* cannot point at hidden all-lane-only matching work.
+\* The replay-all fallback is used when the fast hint lane is unavailable or
+\* has no visible match in the remaining target range.
+ApplyFallbackMatch(i, s) ==
+    /\ i \in Indexes
+    /\ catchupActive[i]
+    /\ (~hintLaneAvailable[i] \/ MatchingHint(i, applied[i], target[i]) = {})
+    /\ Earliest(TargetedAllLane(i, applied[i], target[i]), s)
+    /\ applied' = [applied EXCEPT ![i] = s]
+    /\ appliedRecords' = [appliedRecords EXCEPT ![i] = @ \cup {s}]
+    /\ UNCHANGED <<journalSeq, replayAll, hintLane, hintLaneAvailable,
+                  latestHintMeta, truncateFloor, target, queryTarget,
+                  catchupActive, bulkSessionActive>>
+
 AdvanceWhenNoVisibleHintMatch(i) ==
     /\ i \in Indexes
     /\ catchupActive[i]
-    /\ hintLaneAvailable[i]
-    /\ MatchingHint(i, applied[i], target[i]) = {}
+    /\ TargetedAllLane(i, applied[i], target[i]) = {}
     /\ applied' = [applied EXCEPT ![i] = target[i]]
     /\ UNCHANGED <<journalSeq, replayAll, hintLane, hintLaneAvailable,
                   latestHintMeta, truncateFloor, appliedRecords, target,
@@ -249,7 +260,7 @@ Next ==
     \/ AppendAllLaneOnly
     \/ \E hints \in SUBSET Indexes: AppendHintedRecord(hints)
     \/ \E i \in Indexes:
-        \/ BuggyAppendLatestWithoutHint(i)
+        \/ AppendLatestWithoutHint(i)
         \/ ToggleHintLaneAvailability(i)
         \/ StartBulkSession(i)
         \/ FinishBulkSession(i)
@@ -259,6 +270,7 @@ Next ==
         \/ FinishCatchup(i)
         \/ AdvanceQueryTarget(i)
         \/ \E s \in Seqs: ApplyHintMatch(i, s)
+        \/ \E s \in Seqs: ApplyFallbackMatch(i, s)
 
 Spec == Init /\ [][Next]_vars
 
@@ -279,7 +291,9 @@ Fairness ==
         /\ SF_vars(AdvanceWhenNoVisibleHintMatch(i))
         /\ SF_vars(FinishCatchup(i))
         /\ SF_vars(FinishBulkSession(i))
-        /\ \A s \in Seqs: SF_vars(ApplyHintMatch(i, s))
+        /\ \A s \in Seqs:
+            /\ SF_vars(ApplyHintMatch(i, s))
+            /\ SF_vars(ApplyFallbackMatch(i, s))
 
 \* Liveness-checked spec used by the positive config; mutant and heavy configs
 \* check invariants only and use the unfair Spec.
@@ -290,7 +304,7 @@ CatchupEventuallyCompletes ==
         []<>(hintLaneAvailable[i]) => <>[](applied[i] = latestHintMeta[i])
 
 TypeOK ==
-    /\ BuggyEmptyHintAdvance \in BOOLEAN
+    /\ BuggyMissingHintPublication \in BOOLEAN
     /\ Indexes \in SUBSET KnownIndexes
     /\ Indexes # {}
     /\ MaxSeq \in 1..3
@@ -345,12 +359,9 @@ QueryTargetNeverObservesBeyondSafeApplied ==
 TruncationKeepsNeededReplay ==
     SafeToTruncate(truncateFloor)
 
-UnavailableHintLaneCannotBeTreatedAsApplied ==
+ReplayAllFallbackPreventsFalseEmptyAdvance ==
     \A i \in Indexes:
-        /\ catchupActive[i]
-        /\ ~hintLaneAvailable[i]
-        /\ TargetedAllLane(i, applied[i], target[i]) # {}
-        => applied[i] < target[i]
+        TargetedAllLane(i, 0, applied[i]) \subseteq appliedRecords[i]
 
 Safety ==
     /\ TypeOK
@@ -360,6 +371,6 @@ Safety ==
     /\ NoAppliedSkipsTargetedReplay
     /\ QueryTargetNeverObservesBeyondSafeApplied
     /\ TruncationKeepsNeededReplay
-    /\ UnavailableHintLaneCannotBeTreatedAsApplied
+    /\ ReplayAllFallbackPreventsFalseEmptyAdvance
 
 =============================================================================

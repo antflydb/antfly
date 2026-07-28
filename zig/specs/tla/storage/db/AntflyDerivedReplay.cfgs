@@ -8,7 +8,7 @@
 SPECIFICATION FairSpec
 
 CONSTANTS
-    BuggyEmptyHintAdvance = FALSE
+    BuggyMissingHintPublication = FALSE
     Indexes = {"dense"}
     MaxSeq = 2
 
@@ -20,7 +20,7 @@ INVARIANTS
     NoAppliedSkipsTargetedReplay
     QueryTargetNeverObservesBeyondSafeApplied
     TruncationKeepsNeededReplay
-    UnavailableHintLaneCannotBeTreatedAsApplied
+    ReplayAllFallbackPreventsFalseEmptyAdvance
     Safety
 
 PROPERTIES
@@ -29,21 +29,20 @@ PROPERTIES
 ==== Bad
 \* Expected-failure config for AntflyDerivedReplay.tla.
 \*
-\* Enables a mutant where per-hint latest metadata is advanced without the
-\* corresponding hint-lane row. The shipped primary-store reader requires the
-\* hint lane; replay-all rows alone are not treated as a fallback for hinted
-\* replay.
+\* Enables a mutant where one matching replay-all row is published without its
+\* hint-lane row. The fallback protects an entirely empty/unavailable lane, but
+\* a later hint-lane match can still advance past this hidden hole.
 \* Pinned to the specific semantic invariant this mutant must violate.
 
 SPECIFICATION Spec
 
 CONSTANTS
-    BuggyEmptyHintAdvance = TRUE
+    BuggyMissingHintPublication = TRUE
     Indexes = {"dense"}
     MaxSeq = 2
 
 INVARIANTS
-    LatestHintMetadataHasHintRows
+    NoAppliedSkipsTargetedReplay
 
 ==== heavy tier=manual
 \* Heavier config for AntflyDerivedReplay.tla.
@@ -53,7 +52,7 @@ INVARIANTS
 SPECIFICATION Spec
 
 CONSTANTS
-    BuggyEmptyHintAdvance = FALSE
+    BuggyMissingHintPublication = FALSE
     Indexes = {"dense", "fulltext"}
     MaxSeq = 3
 
@@ -70,7 +69,7 @@ INVARIANTS
 SPECIFICATION Spec
 
 CONSTANTS
-    BuggyEmptyHintAdvance = FALSE
+    BuggyMissingHintPublication = FALSE
     Indexes = {"dense"}
     MaxSeq = 3
 
@@ -87,7 +86,7 @@ INVARIANTS
 SPECIFICATION Spec
 
 CONSTANTS
-    BuggyEmptyHintAdvance = FALSE
+    BuggyMissingHintPublication = FALSE
     Indexes = {"dense", "fulltext"}
     MaxSeq = 2
 

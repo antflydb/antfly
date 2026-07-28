@@ -170,5 +170,57 @@
       {"id": "RepairBeforeIntentClear", "expr": "!restoreIntentCleared || runtimeRepairComplete"},
       {"id": "StrictNamespaceMatch", "expr": "!strictRestoreAccepted || restoreSourceNamespace == restoreTargetNamespace"}
     ]
+  },
+
+  "placement-readiness-trace": {
+    "label": "placement readiness",
+    "archetype": "dialogue",
+    "traceFamily": "placement-readiness",
+    "laneRules": [
+      ["^ObserveReport", "replica reports"],
+      ["^RecomputeEvidence", "evidence merge"],
+      ["Transition$", "transition admission"],
+      [".*", "metadata"]
+    ],
+    "laneOrder": ["replica reports", "evidence merge", "transition admission", "metadata"],
+    "milestones": ["^RecomputeEvidence", "^StartTransition"],
+    "faultPatterns": ["^RejectTransition$"],
+    "categories": [
+      {"label": "Observe", "patterns": ["^ObserveReport"]},
+      {"label": "Resolve", "patterns": ["^RecomputeEvidence"]},
+      {"label": "Admit / block", "patterns": ["Transition$"]}
+    ]
+  },
+
+  "index-lifecycle-trace": {
+    "label": "index generation lifecycle",
+    "archetype": "narrative",
+    "traceFamily": "index-lifecycle",
+    "laneField": "indexName",
+    "lanePrefix": "index ",
+    "bandField": "phase",
+    "bandQuiet": ["admitted"],
+    "milestones": ["^RequestGeneration$", "^SwapGeneration$", "^ObserveReady$"],
+    "faultPatterns": ["^FailBuild$", "^WorkerDeferred$"],
+    "categories": [
+      {"label": "Durable request", "patterns": ["RequestGeneration", "QueueDurableWork", "PersistIntent"]},
+      {"label": "Worker", "patterns": ["AdmitWorker", "WorkerDeferred", "FailBuild"]},
+      {"label": "Publication", "patterns": ["SwapGeneration", "ObserveReady"]}
+    ],
+    "scene": {
+      "stores": [
+        {"id": "generation", "label": "config generation", "valueField": "configHash", "style": "record"},
+        {"id": "intent", "label": "durable repair intent", "valueField": "phase", "style": "durable"}
+      ],
+      "lamps": [
+        {"field": "durableWork", "label": "durable work"},
+        {"field": "workerAdmitted", "label": "worker admitted"}
+      ],
+      "flows": [
+        {"on": "^QueueDurableWork$", "from": "generation", "to": "intent", "label": "publish durable wakeup"},
+        {"on": "^AdmitWorker$", "from": "intent", "to": "generation", "label": "admit rebuild"},
+        {"on": "^SwapGeneration$", "from": "generation", "to": "intent", "label": "activate replacement"}
+      ]
+    }
   }
 }

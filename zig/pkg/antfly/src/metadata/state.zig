@@ -18,6 +18,7 @@ const metadata_reconciler = @import("reconciler.zig");
 const reallocation_request = @import("reallocation_request.zig");
 const metadata_store_observer = @import("store_observer.zig");
 const metadata_table_manager = @import("table_manager.zig");
+const placement_trace = @import("placement_trace.zig");
 const transition_state = @import("transition_state.zig");
 const data = @import("../data/mod.zig");
 
@@ -671,6 +672,7 @@ pub fn mergeHealthyGroupStatuses(
                     state.healthy_voter_reports +|= 1;
                 }
             }
+            placement_trace.observeReport("ObserveReportState", store.store_id, group_status);
             state.leader_evidence.observe(store.store_id, group_status);
             state.voter_set_evidence.observe(group_status);
             state.joint_consensus = state.joint_consensus or group_status.joint_consensus;
@@ -768,6 +770,12 @@ pub fn mergeHealthyGroupStatuses(
             merged[i].cutover_ready = leader.report.cutover_ready;
             merged[i].reads_ready_after_cutover = leader.report.reads_ready_after_cutover;
         }
+        placement_trace.recomputeEvidence(
+            "RecomputeEvidenceState",
+            merged[i],
+            state.voter_set_evidence.ambiguous_known_voter_set or
+                state.voter_set_evidence.ambiguous_fallback_voter_count,
+        );
     }
     overlayDocIdentityNamespaceExpectations(merged, ranges);
     overlayTransitionObservationReadiness(merged, split_transitions, merge_transitions, split_observations, merge_observations);

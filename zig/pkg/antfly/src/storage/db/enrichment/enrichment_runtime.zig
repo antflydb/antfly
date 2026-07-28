@@ -32,6 +32,7 @@ const enrichment_artifact_codec = @import("artifact_codec.zig");
 const enrichment_worker = @import("enrichment_worker.zig");
 const enrichment_lease = @import("enrichment_lease.zig");
 const enrichment_state = @import("enrichment_state.zig");
+const enrichment_trace = @import("enrichment_trace.zig");
 const embedder_mod = @import("embedder.zig");
 const asset_producer_mod = @import("asset_producer.zig");
 const document_extraction_mod = @import("document_extraction.zig");
@@ -1662,6 +1663,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         saveRuntimeStatusWithRetry(self, scope_name, status) catch |save_err| {
             std.log.warn("failed to persist enrichment worker failure status: {s}", .{@errorName(save_err)});
         };
+        enrichment_trace.event(self, "FatalWorkerFailure", null, null, @errorName(err));
         self.notifyStatusHook();
     }
 
@@ -1678,6 +1680,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         saveRuntimeStatusWithRetry(self, scope_name, status) catch |save_err| {
             std.log.warn("failed to persist enrichment retry status: {s}", .{@errorName(save_err)});
         };
+        enrichment_trace.event(self, "RetryTransient", null, null, @errorName(err));
         self.notifyStatusHook();
     }
 };
@@ -1779,6 +1782,7 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
         runtime.worker_failed = false;
         markIsolatedFailedIndex(runtime, request.index_name);
     }
+    enrichment_trace.event(runtime, "IsolateRequestFailure", null, null, @errorName(err));
     runtime.notifyStatusHook();
 }
 
@@ -1861,9 +1865,11 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
         ) catch {};
         return;
     }
+    enrichment_trace.event(runtime, "AcquireLease", null, target_sequence, null);
 
     const pending = try enrichment_worker.collectPendingDocumentGroups(runtime.alloc, runtime.replay_source, runtime.applied_sequence);
     defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
+    enrichment_trace.event(runtime, "CollectPending", @intCast(pending.len), target_sequence, null);
 
     var processed_request_count: u64 = 0;
     var max_seen = runtime.applied_sequence;
@@ -1943,6 +1949,7 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
         runtime.mutex.unlock(io);
         try saveRuntimeStatusWithRetry(runtime, scope_name, status);
         runtime.notifyStatusHook();
+        enrichment_trace.event(runtime, "AdvanceApplied", @intCast(pending.len), max_seen, null);
     } else if (pending.len == 0) {
         var status: enrichment_state.RuntimeStatus = .{};
         runtime.mutex.lockUncancelable(io);
@@ -5336,11 +5343,13 @@ fn flushGeneratedReplayWindow(
         return;
     }
 
+    const pending_items: u64 = @intCast(window.itemCount());
     const artifact_delete_keys = try window.artifact_delete_keys.toOwnedSlice(runtime.alloc);
     errdefer freeKeyList(runtime.alloc, artifact_delete_keys);
     var batch = try window.toOwnedBatch();
     defer derived_types.deinitDerivedBatch(runtime.alloc, &batch);
     defer freeKeyList(runtime.alloc, artifact_delete_keys);
+    enrichment_trace.event(runtime, "PublishGenerated", pending_items, null, null);
     const sequence = try appendGeneratedBatchWithRetry(runtime, batch, artifact_delete_keys);
     try applyQueuedCoverageTransitionsAfterReplayAppend(runtime, window.coverage_transitions.items);
     clearQueuedCoverageTransitions(runtime.alloc, &window.coverage_transitions, &window.coverage_transition_keys);

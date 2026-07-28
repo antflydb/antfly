@@ -13,8 +13,10 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const raft_engine = @import("raft_engine");
 const antfly_trace_writer = @import("antfly_trace_writer.zig");
+const protocol_trace_writer = @import("protocol_trace_writer.zig");
 const raft_trace_logger = @import("raft_trace_logger.zig");
 
 /// A std.Io.Writer backed by libc write(2) to a trace output fd.
@@ -27,14 +29,25 @@ const trace_vtable: std.Io.Writer.VTable = .{
     .flush = flush,
 };
 
-var trace_buf: [4096]u8 = undefined;
+var antfly_trace_buf: [4096]u8 = undefined;
+var raft_trace_buf: [4096]u8 = undefined;
+var protocol_trace_buf: [4096]u8 = undefined;
 
-var trace_writer_instance: std.Io.Writer = .{
-    .buffer = &trace_buf,
+var antfly_trace_writer_instance: std.Io.Writer = .{
+    .buffer = &antfly_trace_buf,
+    .vtable = &trace_vtable,
+};
+var raft_trace_writer_instance: std.Io.Writer = .{
+    .buffer = &raft_trace_buf,
+    .vtable = &trace_vtable,
+};
+var protocol_trace_writer_instance: std.Io.Writer = .{
+    .buffer = &protocol_trace_buf,
     .vtable = &trace_vtable,
 };
 
 var trace_fd: std.c.fd_t = -1;
+var trace_output_mutex: std.atomic.Mutex = .unlocked;
 
 fn getTraceFd() std.c.fd_t {
     if (trace_fd >= 0) return trace_fd;
@@ -55,6 +68,8 @@ fn getTraceFd() std.c.fd_t {
 }
 
 fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    platform_sync.lockYielding(&trace_output_mutex);
+    defer trace_output_mutex.unlock();
     if (w.end > 0) {
         writeAllFd(w.buffer[0..w.end]);
         w.end = 0;
@@ -79,6 +94,8 @@ fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Write
 }
 
 fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    platform_sync.lockYielding(&trace_output_mutex);
+    defer trace_output_mutex.unlock();
     if (w.end > 0) {
         writeAllFd(w.buffer[0..w.end]);
         w.end = 0;
@@ -98,7 +115,7 @@ fn writeAllFd(data: []const u8) void {
 /// Module-level singleton trace writer for Antfly transaction events.
 pub fn stderrAntflyTraceWriter() antfly_trace_writer.AntflyTraceWriter {
     const S = struct {
-        var ndjson_writer: antfly_trace_writer.AntflyNdjsonTraceWriter = .{ .writer = &trace_writer_instance };
+        var ndjson_writer: antfly_trace_writer.AntflyNdjsonTraceWriter = .{ .writer = &antfly_trace_writer_instance };
     };
     return S.ndjson_writer.traceWriter();
 }
@@ -106,7 +123,15 @@ pub fn stderrAntflyTraceWriter() antfly_trace_writer.AntflyTraceWriter {
 /// Module-level singleton trace logger for Raft events.
 pub fn stderrRaftTraceLogger() raft_engine.core.TraceLogger {
     const S = struct {
-        var ndjson_logger: raft_trace_logger.RaftNdjsonTraceLogger = .{ .writer = &trace_writer_instance };
+        var ndjson_logger: raft_trace_logger.RaftNdjsonTraceLogger = .{ .writer = &raft_trace_writer_instance };
     };
     return S.ndjson_logger.traceLogger();
+}
+
+/// Module-level singleton writer for placement/index protocol events.
+pub fn stderrProtocolTraceWriter() protocol_trace_writer.ProtocolTraceWriter {
+    const S = struct {
+        var ndjson_writer: protocol_trace_writer.ProtocolNdjsonTraceWriter = .{ .writer = &protocol_trace_writer_instance };
+    };
+    return S.ndjson_writer.traceWriter();
 }

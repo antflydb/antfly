@@ -14,7 +14,9 @@
 #   tla-check.sh list               list all checks with tiers
 #   tla-check.sh trace <family>     validate NDJSON traces (TRACE_FILES=...)
 #                                   family: raft | txn | txn-session | ha |
-#                                   split-bridge | doc-identity-range-repair
+#                                   split-bridge | doc-identity-range-repair |
+#                                   placement-readiness | index-lifecycle |
+#                                   derived-replay | enrichment-lease
 #
 # Layout: each model <Model>.tla has a sibling <Model>.cfgs holding all of
 # its checks as named sections in verbatim TLC config syntax:
@@ -134,6 +136,10 @@ NEG_TRACE_FIXTURES=(
     "TraceAntflySplitRefinementBridge ${SPEC_ROOT}/traces/negative/split_bridge_route_before_db_serving.ndjson"
     "TraceAntflyDocumentIdentityRangeRepair ${SPEC_ROOT}/traces/negative/doc_identity_restore_accept_mismatch.ndjson"
     "TraceAntflyDocumentIdentityRangeRepair ${SPEC_ROOT}/traces/negative/doc_identity_restore_early_clear.ndjson"
+    "TraceAntflyPlacementReadiness ${SPEC_ROOT}/traces/negative/placement_readiness_unknown_latches_ambiguity.ndjson"
+    "TraceAntflyIndexLifecycle ${SPEC_ROOT}/traces/negative/index_lifecycle_lost_second_wakeup.ndjson"
+    "TraceAntflyDerivedReplay ${SPEC_ROOT}/traces/negative/derived_replay_advance_beyond_target.ndjson"
+    "TraceAntflyEnrichmentLease ${SPEC_ROOT}/traces/negative/enrichment_stale_owner_publish.ndjson"
 )
 
 run_negative() {
@@ -204,20 +210,24 @@ run_trace() { # $1 = family; TRACE_FILES env required
         done
         [ "$validated" -gt 0 ] || { echo "No spec-compatible transactions found after filtering"; return 1; }
         ;;
-    txn-session|ha|split-bridge|doc-identity-range-repair)
+    txn-session|ha|split-bridge|doc-identity-range-repair|placement-readiness|index-lifecycle|derived-replay|enrichment-lease)
         local model
         case "$family" in
         txn-session) model=TraceAntflyTransactionSession ;;
         ha) model=TraceAntflyHA ;;
         split-bridge) model=TraceAntflySplitRefinementBridge ;;
         doc-identity-range-repair) model=TraceAntflyDocumentIdentityRangeRepair ;;
+        placement-readiness) model=TraceAntflyPlacementReadiness ;;
+        index-lifecycle) model=TraceAntflyIndexLifecycle ;;
+        derived-replay) model=TraceAntflyDerivedReplay ;;
+        enrichment-lease) model=TraceAntflyEnrichmentLease ;;
         esac
         resolve_paths "$model" "$model" "$model" || return 1
         bash "${SCRIPT_DIR}/tla-validate-trace.sh" -S -p 1 \
             -s "$TLC_SPEC" -c "$TLC_CFG" $TRACE_FILES
         ;;
     *)
-        echo "tla-check: unknown trace family '$family' (raft|txn|txn-session|ha|split-bridge|doc-identity-range-repair)" >&2
+        echo "tla-check: unknown trace family '$family' (raft|txn|txn-session|ha|split-bridge|doc-identity-range-repair|placement-readiness|index-lifecycle|derived-replay|enrichment-lease)" >&2
         return 1
         ;;
     esac
