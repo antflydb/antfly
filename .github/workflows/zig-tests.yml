@@ -163,7 +163,9 @@ jobs:
   backup-s3-integration:
     name: backup-s3-integration
     needs: changes
-    if: needs.changes.outputs.backup_s3 == 'true'
+    # Opt in explicitly to avoid GitHub-hosted runner charges while this
+    # service-backed integration is temporarily disabled.
+    if: needs.changes.outputs.backup_s3 == 'true' && vars.ENABLE_BACKUP_S3_INTEGRATION == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
