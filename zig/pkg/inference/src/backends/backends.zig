@@ -17,6 +17,7 @@ const build_options = @import("build_options");
 const manifest_mod = @import("../models/manifest.zig");
 const c_file = @import("../util/c_file.zig");
 const graph_runtime_mod = @import("../graph/runtime.zig");
+const backend_runtime_mod = @import("backend_runtime.zig");
 
 pub const Session = @import("session.zig").Session;
 pub const Tensor = @import("tensor.zig").Tensor;
@@ -32,6 +33,7 @@ pub const onnx = if (build_options.enable_onnx) @import("onnx.zig") else struct 
 pub const ortgenai = if (build_options.enable_onnx) @import("ortgenai.zig") else struct {};
 pub const imported_onnx_session = @import("imported_onnx_session.zig");
 pub const metal_kv_storage = if (build_options.enable_metal) @import("metal_kv_storage.zig") else struct {};
+pub const OnnxExecutionProvider = backend_runtime_mod.OnnxExecutionProvider;
 
 const session_factory = @import("../architectures/session_factory.zig");
 
@@ -81,6 +83,33 @@ pub const BackendType = enum {
     }
 };
 
+/// A backend plus the concrete execution provider that determines its resource
+/// domain. In particular, external ONNX Runtime sessions are not inherently
+/// CPU: an automatically selected CUDA provider must be admitted as GPU work.
+pub const BackendRuntime = struct {
+    backend: BackendType,
+    onnx_execution_provider: OnnxExecutionProvider = .cpu,
+
+    pub fn usesGpuHostedSession(self: BackendRuntime) bool {
+        return switch (self.backend) {
+            .metal, .cuda => true,
+            .onnx => self.onnx_execution_provider == .cuda,
+            else => false,
+        };
+    }
+};
+
+test "backend runtime classifies external ONNX CUDA as GPU hosted" {
+    try std.testing.expect(!(BackendRuntime{
+        .backend = .onnx,
+        .onnx_execution_provider = .cpu,
+    }).usesGpuHostedSession());
+    try std.testing.expect((BackendRuntime{
+        .backend = .onnx,
+        .onnx_execution_provider = .cuda,
+    }).usesGpuHostedSession());
+}
+
 const backend_order_capacity = std.meta.fields(BackendType).len;
 
 /// SessionManager selects the best available backend and creates sessions.
@@ -88,6 +117,10 @@ pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     preferred_backends: []const BackendType,
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
+    /// Provider preference for the external ONNX Runtime backend. Automatic is
+    /// resolved before admission; candidate SessionManagers then carry only
+    /// the resolved CPU/CUDA value through construction.
+    onnx_execution_provider: OnnxExecutionProvider = .automatic,
     /// Optional Io runtime threaded into compute backends so parallel GEMM
     /// dispatch goes through the caller's thread pool (linalg.sgemm*Io).
     /// Null means backends use the process-wide futex pool inside lib/linalg.
@@ -138,6 +171,14 @@ pub const SessionManager = struct {
                 continue;
             }
             std.log.info("trying backend {s} for {s}", .{ @tagName(backend), model_path });
+            const backend_runtime = self.resolveBackendRuntime(backend) catch |err| {
+                std.log.err(
+                    "backend {s} runtime resolution failed: {s}",
+                    .{ @tagName(backend), @errorName(err) },
+                );
+                first_err = first_err orelse err;
+                continue;
+            };
             const effective_model_path = switch (backend) {
                 .onnx, .wasm => if (manifest) |m| m.onnx_path orelse model_path else model_path,
                 else => model_path,
@@ -146,7 +187,9 @@ pub const SessionManager = struct {
             const session = switch (backend) {
                 .onnx => if (comptime build_options.enable_onnx) blk: {
                     if (!isOnnxFilePath(effective_model_path)) continue;
-                    break :blk onnx.createSession(self.allocator, effective_model_path) catch |err| {
+                    break :blk onnx.createSessionWithOptions(self.allocator, effective_model_path, .{
+                        .execution_provider = backend_runtime.onnx_execution_provider,
+                    }) catch |err| {
                         std.log.err("onnx runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
@@ -250,6 +293,22 @@ pub const SessionManager = struct {
             if (backend.available() and backend.supportsDirectSessionLoad()) return backend;
         }
         return null;
+    }
+
+    pub fn resolveBackendRuntime(
+        self: *const SessionManager,
+        backend: BackendType,
+    ) !BackendRuntime {
+        return .{
+            .backend = backend,
+            .onnx_execution_provider = if (backend == .onnx)
+                if (comptime build_options.enable_onnx)
+                    try onnx.resolveExecutionProvider(self.onnx_execution_provider)
+                else
+                    return error.BackendUnavailable
+            else
+                .cpu,
+        };
     }
 };
 

@@ -2203,13 +2203,10 @@ const LoadFlight = struct {
     refs: usize = 1,
 };
 
-fn admissionBackendClassForBackend(
-    backend: backends.BackendType,
+fn admissionBackendClassForRuntime(
+    backend_runtime: backends.BackendRuntime,
 ) runtime.tier.memory.BackendClass {
-    return switch (backend) {
-        .metal, .cuda => .gpu,
-        else => .cpu,
-    };
+    return if (backend_runtime.usesGpuHostedSession()) .gpu else .cpu;
 }
 
 pub const ModelManager = struct {
@@ -2618,10 +2615,10 @@ pub const ModelManager = struct {
 
     fn admissionLimitsForBackend(
         self: *const ModelManager,
-        backend: backends.BackendType,
+        backend_runtime: backends.BackendRuntime,
     ) runtime.tier.memory.Limits {
         var limits = runtime.tier.memory.defaultLimitsForBackend(
-            admissionBackendClassForBackend(backend),
+            admissionBackendClassForRuntime(backend_runtime),
         );
         const overrides = self.admission_limit_overrides;
         if (overrides.host_limit_bytes > 0) limits.host_limit_bytes = overrides.host_limit_bytes;
@@ -2655,6 +2652,18 @@ pub const ModelManager = struct {
                 if (shared.backendType() != backend) continue;
             }
 
+            var single_backend = [_]backends.BackendType{backend};
+            var session_manager = sessionManagerForPreferredBackends(
+                self.allocator,
+                single_backend[0..],
+                &self.session_manager,
+            );
+            const backend_runtime = session_manager.resolveBackendRuntime(backend) catch |err| {
+                if (first_err == null) first_err = err;
+                continue;
+            };
+            session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
+
             var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
             var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
             if (self.admission_enabled) {
@@ -2663,17 +2672,17 @@ pub const ModelManager = struct {
                     continue;
                 };
                 const plan = if (artifact_estimate == .onnx)
-                    onnxModelLoadAdmission(artifact_bytes, backend)
+                    onnxModelLoadAdmission(artifact_bytes, backend_runtime)
                 else
-                    nativeModelLoadAdmission(artifact_bytes, backend);
+                    nativeModelLoadAdmission(artifact_bytes, backend_runtime.backend);
                 const admission_plan = plan catch |err| {
                     if (first_err == null) first_err = err;
                     continue;
                 };
                 resident_amounts = admission_plan.resident;
                 resource_lease = self.admission.tryAcquire(
-                    admissionBackendClassForBackend(backend),
-                    self.admissionLimitsForBackend(backend),
+                    admissionBackendClassForRuntime(backend_runtime),
+                    self.admissionLimitsForBackend(backend_runtime),
                     admission_plan.peak,
                     true,
                 ) catch |err| {
@@ -2682,12 +2691,6 @@ pub const ModelManager = struct {
                 };
             }
 
-            var single_backend = [_]backends.BackendType{backend};
-            var session_manager = sessionManagerForPreferredBackends(
-                self.allocator,
-                single_backend[0..],
-                &self.session_manager,
-            );
             if (session_manager.loadModelWithImportedOnnxContext(
                 model_path,
                 shared_backend_ctx,
@@ -2747,7 +2750,7 @@ pub const ModelManager = struct {
         if (!self.admission_enabled) return null;
         return try self.admission.tryAcquire(
             .cpu,
-            self.admissionLimitsForBackend(.native),
+            self.admissionLimitsForBackend(.{ .backend = .native }),
             plan.peak,
             true,
         );
@@ -3400,6 +3403,7 @@ fn sessionManagerForPreferredBackends(
         .allocator = allocator,
         .preferred_backends = preferred_backends,
         .graph_runtime_strategy = source.graph_runtime_strategy,
+        .onnx_execution_provider = source.onnx_execution_provider,
         .io = source.io,
     };
 }
@@ -3701,19 +3705,36 @@ fn estimateModelArtifactBytes(
 
 fn estimateModelLoadAdmission(
     man: manifest_mod.ModelManifest,
-    backend: backends.BackendType,
+    backend_runtime: backends.BackendRuntime,
 ) !ModelLoadAdmissionPlan {
-    const weights = try estimateModelArtifactBytes(man, backend);
-    const uses_onnx_artifact = backend == .onnx or !manifestHasNativeAssets(man);
-    if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend);
-    return nativeModelLoadAdmission(weights, backend);
+    const weights = try estimateModelArtifactBytes(man, backend_runtime.backend);
+    const uses_onnx_artifact = backend_runtime.backend == .onnx or !manifestHasNativeAssets(man);
+    if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend_runtime);
+    return nativeModelLoadAdmission(weights, backend_runtime.backend);
 }
 
 fn onnxModelLoadAdmission(
     weights: usize,
-    backend: backends.BackendType,
+    backend_runtime: backends.BackendRuntime,
 ) !ModelLoadAdmissionPlan {
-    return switch (backend) {
+    return switch (backend_runtime.backend) {
+        .onnx => if (backend_runtime.onnx_execution_provider == .cuda) .{
+            .peak = .{
+                // ORT parses and materializes the protobuf on the host before
+                // CUDA owns its device initializers. Charge the same two-copy
+                // host construction peak as ORT CPU plus device residency.
+                .host_weight_bytes = std.math.mul(usize, weights, 2) catch
+                    return error.ResourceLimitExceeded,
+                .backend_weight_bytes = weights,
+            },
+            .resident = .{ .backend_weight_bytes = weights },
+        } else .{
+            .peak = .{
+                .host_weight_bytes = std.math.mul(usize, weights, 2) catch
+                    return error.ResourceLimitExceeded,
+            },
+            .resident = .{ .host_weight_bytes = weights },
+        },
         .metal, .cuda => .{
             .peak = .{
                 // The importer retains encoded host bytes while constructing device
@@ -3723,7 +3744,7 @@ fn onnxModelLoadAdmission(
             },
             .resident = .{ .backend_weight_bytes = weights },
         },
-        .native, .onnx, .wasm => .{
+        .native, .wasm => .{
             .peak = .{
                 // The current ONNX path reads the encoded protobuf and then owns the
                 // converted parameter storage, so reserve both copies.
@@ -3793,17 +3814,22 @@ fn loadSessionForPreferredBackends(
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
         var single_backend = [_]backends.BackendType{backend};
         var backend_session_manager = sessionManagerForPreferredBackends(manager.allocator, single_backend[0..], source_session_manager);
+        const backend_runtime = backend_session_manager.resolveBackendRuntime(backend) catch |err| {
+            if (first_err == null) first_err = err;
+            continue;
+        };
+        backend_session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         if (manager.admission_enabled) {
-            const admission_plan = estimateModelLoadAdmission(man, backend) catch |err| {
+            const admission_plan = estimateModelLoadAdmission(man, backend_runtime) catch |err| {
                 if (first_err == null) first_err = err;
                 continue;
             };
             resident_amounts = admission_plan.resident;
             resource_lease = manager.admission.tryAcquire(
-                admissionBackendClassForBackend(backend),
-                manager.admissionLimitsForBackend(backend),
+                admissionBackendClassForRuntime(backend_runtime),
+                manager.admissionLimitsForBackend(backend_runtime),
                 admission_plan.peak,
                 true,
             ) catch |err| {
@@ -4794,15 +4820,25 @@ test "cuda model admission includes full native staging peak" {
 
 test "onnx admission separates encoded staging from completed residency" {
     const weights: usize = 1024 * 1024;
-    const cpu = try onnxModelLoadAdmission(weights, .native);
+    const cpu = try onnxModelLoadAdmission(weights, .{ .backend = .onnx });
     try std.testing.expectEqual(weights * 2, cpu.peak.host_weight_bytes);
     try std.testing.expectEqual(weights, cpu.resident.host_weight_bytes);
 
-    const gpu = try onnxModelLoadAdmission(weights, .cuda);
-    try std.testing.expectEqual(weights, gpu.peak.host_weight_bytes);
+    const gpu = try onnxModelLoadAdmission(weights, .{
+        .backend = .onnx,
+        .onnx_execution_provider = .cuda,
+    });
+    try std.testing.expectEqual(weights * 2, gpu.peak.host_weight_bytes);
     try std.testing.expectEqual(weights, gpu.peak.backend_weight_bytes);
     try std.testing.expectEqual(@as(usize, 0), gpu.resident.host_weight_bytes);
     try std.testing.expectEqual(weights, gpu.resident.backend_weight_bytes);
+    try std.testing.expectEqual(
+        runtime.tier.memory.BackendClass.gpu,
+        admissionBackendClassForRuntime(.{
+            .backend = .onnx,
+            .onnx_execution_provider = .cuda,
+        }),
+    );
 }
 
 test "directory-backed component admission charges native model artifacts" {

@@ -499,6 +499,10 @@ pub const AdmissionLease = struct {
     amounts: AdmissionAmounts,
     amounts_by_backend: [backend_class_count]AdmissionAmounts,
     retain_backend_class: ?BackendClass,
+    /// Bytes committed against the current live-memory pressure epoch. This is
+    /// deliberately separate from policy accounting: the kernel/cgroup probe
+    /// reflects physical pressure, while AdmissionAmounts tracks ownership.
+    live_reserved_bytes: usize,
 
     /// Reduce a peak reservation to the bytes that remain resident after a
     /// construction/import phase. This never acquires new capacity, so the
@@ -509,23 +513,38 @@ pub const AdmissionLease = struct {
             return error.InvalidAdmissionLeaseReduction;
         const released = subtractAdmissionAmounts(self.amounts, retained) orelse
             return error.InvalidAdmissionLeaseReduction;
+        const retained_live_bytes = liveHostBytes(retained) catch
+            return error.InvalidAdmissionLeaseReduction;
         controller.releaseSingle(backend_class, released);
+        controller.settleLiveReservation(
+            self.live_reserved_bytes,
+            retained_live_bytes,
+        );
         self.amounts = retained;
         self.amounts_by_backend[backendClassIndex(backend_class)] = retained;
+        self.live_reserved_bytes = 0;
     }
 
     pub fn release(self: *AdmissionLease) void {
         const controller = self.controller orelse return;
+        controller.releaseLiveReservation(self.live_reserved_bytes);
         controller.release(self.amounts_by_backend, self.amounts);
         self.controller = null;
         self.amounts = .{};
         self.amounts_by_backend = emptyAdmissionAmountsByBackend();
         self.retain_backend_class = null;
+        self.live_reserved_bytes = 0;
     }
 };
 
 pub const AdmissionController = struct {
     mutex: std.atomic.Mutex = .unlocked,
+    /// Serializes reservations against one sampled live-memory capacity. While
+    /// any lease is pending, every concurrent admission consumes the same
+    /// sample instead of independently spending MemAvailable.
+    live_mutex: std.atomic.Mutex = .unlocked,
+    live_capacity_bytes: usize = 0,
+    live_pending_bytes: usize = 0,
     /// Aggregate accounting is retained for observability and for the optional
     /// process-owner resource budget. Host memory is enforced against the
     /// shared physical domain, while workload/device policy is enforced against
@@ -692,16 +711,17 @@ pub const AdmissionController = struct {
             };
         }
 
+        var live_reserved_bytes: usize = 0;
         if (check_live_memory) {
             // Metal allocations consume unified system memory. CUDA allocations are
             // accounted against the backend budget and must not also be charged to
             // Linux MemAvailable, or a valid device-resident model is rejected merely
             // because its VRAM footprint exceeds free host RAM.
-            const live_host_incremental = if (builtin.os.tag == .macos)
-                request_combined
-            else
-                request_host;
-            checkLiveHostMemory(live_host_incremental) catch |err| {
+            const live_host_incremental = liveHostBytes(amounts) catch {
+                self.release(amounts_by_backend, amounts);
+                return error.ResourceLimitExceeded;
+            };
+            live_reserved_bytes = self.tryReserveLiveCapacity(live_host_incremental) catch |err| {
                 self.release(amounts_by_backend, amounts);
                 return err;
             };
@@ -720,6 +740,7 @@ pub const AdmissionController = struct {
             .amounts = amounts,
             .amounts_by_backend = amounts_by_backend,
             .retain_backend_class = retain_backend_class,
+            .live_reserved_bytes = live_reserved_bytes,
         };
     }
 
@@ -771,6 +792,91 @@ pub const AdmissionController = struct {
                 &self.admitted_by_backend[index],
                 amounts_by_backend[index],
             );
+    }
+
+    fn tryReserveLiveCapacity(
+        self: *AdmissionController,
+        incremental_bytes: usize,
+    ) !usize {
+        if (incremental_bytes == 0) return 0;
+        spinLockAdmission(&self.live_mutex);
+        defer self.live_mutex.unlock();
+
+        const info = if (self.live_pending_bytes == 0)
+            currentSystemMemoryInfo()
+        else
+            null;
+        return self.tryReserveLiveCapacityLocked(incremental_bytes, info);
+    }
+
+    fn tryReserveLiveCapacityWithInfo(
+        self: *AdmissionController,
+        incremental_bytes: usize,
+        info: SystemMemoryInfo,
+    ) !usize {
+        if (incremental_bytes == 0) return 0;
+        spinLockAdmission(&self.live_mutex);
+        defer self.live_mutex.unlock();
+        return self.tryReserveLiveCapacityLocked(incremental_bytes, info);
+    }
+
+    fn tryReserveLiveCapacityLocked(
+        self: *AdmissionController,
+        incremental_bytes: usize,
+        info: ?SystemMemoryInfo,
+    ) !usize {
+        std.debug.assert(incremental_bytes > 0);
+        if (self.live_pending_bytes == 0) {
+            const memory_info = info orelse return 0;
+            const available = memory_info.available_bytes orelse return 0;
+            const headroom = liveHostMemoryHeadroom(memory_info.total_bytes);
+            self.live_capacity_bytes = available -| headroom;
+        }
+
+        const next_pending = std.math.add(
+            usize,
+            self.live_pending_bytes,
+            incremental_bytes,
+        ) catch {
+            if (self.live_pending_bytes == 0) self.live_capacity_bytes = 0;
+            return error.ResourceTemporarilyUnavailable;
+        };
+        if (next_pending > self.live_capacity_bytes) {
+            if (self.live_pending_bytes == 0) self.live_capacity_bytes = 0;
+            return error.ResourceTemporarilyUnavailable;
+        }
+        self.live_pending_bytes = next_pending;
+        return incremental_bytes;
+    }
+
+    /// Construction/import peaks are no longer pending once the session is
+    /// live. Preserve the capacity consumed by resident physical memory until
+    /// the pressure epoch drains; a subsequent epoch re-samples the kernel.
+    fn settleLiveReservation(
+        self: *AdmissionController,
+        reserved_bytes: usize,
+        retained_bytes: usize,
+    ) void {
+        if (reserved_bytes == 0) return;
+        std.debug.assert(retained_bytes <= reserved_bytes);
+        spinLockAdmission(&self.live_mutex);
+        defer self.live_mutex.unlock();
+        std.debug.assert(reserved_bytes <= self.live_pending_bytes);
+        self.live_pending_bytes -= reserved_bytes;
+        self.live_capacity_bytes -|= retained_bytes;
+        if (self.live_pending_bytes == 0) self.live_capacity_bytes = 0;
+    }
+
+    fn releaseLiveReservation(
+        self: *AdmissionController,
+        reserved_bytes: usize,
+    ) void {
+        if (reserved_bytes == 0) return;
+        spinLockAdmission(&self.live_mutex);
+        defer self.live_mutex.unlock();
+        std.debug.assert(reserved_bytes <= self.live_pending_bytes);
+        self.live_pending_bytes -= reserved_bytes;
+        if (self.live_pending_bytes == 0) self.live_capacity_bytes = 0;
     }
 };
 
@@ -853,6 +959,16 @@ fn checkAdmissionLimit(request: usize, next: usize, limit: usize) !void {
 fn checkLiveHostMemory(incremental_bytes: usize) !void {
     const info = currentSystemMemoryInfo() orelse return;
     return checkLiveHostMemoryWithInfo(info, incremental_bytes);
+}
+
+fn liveHostBytes(amounts: AdmissionAmounts) !usize {
+    const host = try amounts.hostTotalBytesChecked();
+    if (builtin.os.tag != .macos) return host;
+    return std.math.add(
+        usize,
+        host,
+        try amounts.backendTotalBytesChecked(),
+    );
 }
 
 /// Preserve the release default on large hosts while guaranteeing that a
@@ -2027,6 +2143,51 @@ test "cpu and gpu admission share one physical host-memory domain" {
     defer gpu_lease.release();
     try std.testing.expectEqual(@as(usize, 60), controller.snapshot().hostTotalBytes());
     try std.testing.expectEqual(@as(usize, 800), controller.snapshot().backendTotalBytes());
+}
+
+test "live memory admissions share one sampled capacity epoch" {
+    var controller = AdmissionController{};
+    const info = SystemMemoryInfo{
+        .total_bytes = gib(64),
+        .available_bytes = gib(20),
+    };
+
+    _ = try controller.tryReserveLiveCapacityWithInfo(gib(3), info);
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        controller.tryReserveLiveCapacityWithInfo(gib(2), info),
+    );
+    try std.testing.expectEqual(gib(3), controller.live_pending_bytes);
+    try std.testing.expectEqual(gib(4), controller.live_capacity_bytes);
+
+    controller.releaseLiveReservation(gib(3));
+    _ = try controller.tryReserveLiveCapacityWithInfo(gib(2), info);
+    controller.releaseLiveReservation(gib(2));
+    try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.live_capacity_bytes);
+}
+
+test "settled live residency remains committed during pressure epoch" {
+    var controller = AdmissionController{};
+    const info = SystemMemoryInfo{
+        .total_bytes = gib(64),
+        .available_bytes = gib(20),
+    };
+
+    _ = try controller.tryReserveLiveCapacityWithInfo(gib(3), info);
+    _ = try controller.tryReserveLiveCapacityWithInfo(gib(1), info);
+    controller.settleLiveReservation(gib(3), gib(2));
+
+    try std.testing.expectEqual(gib(1), controller.live_pending_bytes);
+    try std.testing.expectEqual(gib(2), controller.live_capacity_bytes);
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        controller.tryReserveLiveCapacityWithInfo(gib(2), info),
+    );
+
+    controller.releaseLiveReservation(gib(1));
+    try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.live_capacity_bytes);
 }
 
 test "metal backend bytes share the unified system-memory domain" {
