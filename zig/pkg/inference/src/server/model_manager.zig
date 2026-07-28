@@ -1869,6 +1869,11 @@ pub const LoadedModel = struct {
     cleanup_head: ?*cleanup_model_mod.CleanupHead = null,
     cleanup_head_loaded: bool = false,
     resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    /// Protected by ModelManager.load_lock. A model can only be evicted while
+    /// it has no active handles and is not pinned by preload configuration.
+    active_handles: usize = 0,
+    last_used_ns: u64 = 0,
+    pinned: bool = false,
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
         if (self.hf_tok) |ht| return ht.tokenizer();
@@ -2227,7 +2232,7 @@ fn admittedSessionCudaLimit(
 
 fn attachSessionRunAdmission(
     session: *backends.Session,
-    controller: *runtime.tier.memory.AdmissionController,
+    manager: *ModelManager,
     backend_runtime: backends.BackendRuntime,
     limits: runtime.tier.memory.Limits,
     resident: runtime.tier.memory.AdmissionAmounts,
@@ -2238,7 +2243,8 @@ fn attachSessionRunAdmission(
         resident.backend_weight_bytes,
     ) catch std.math.maxInt(usize);
     session.run_admission = .{
-        .controller = controller,
+        .context = manager,
+        .acquire_fn = acquireSessionRunResources,
         .backend_class = admissionBackendClassForRuntime(backend_runtime),
         .limits = limits,
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
@@ -2247,7 +2253,48 @@ fn attachSessionRunAdmission(
     };
 }
 
+fn acquireSessionRunResources(
+    context: *anyopaque,
+    backend_class: runtime.tier.memory.BackendClass,
+    limits: runtime.tier.memory.Limits,
+    amounts: runtime.tier.memory.AdmissionAmounts,
+) !runtime.tier.memory.AdmissionLease {
+    const manager: *ModelManager = @ptrCast(@alignCast(context));
+    return manager.acquireAmountsWithEviction(backend_class, limits, amounts);
+}
+
+pub const ModelHandle = struct {
+    manager: *ModelManager,
+    model: ?*LoadedModel,
+
+    pub fn get(self: *const ModelHandle) *LoadedModel {
+        return self.model orelse unreachable;
+    }
+
+    pub fn pin(self: *ModelHandle) void {
+        const model = self.model orelse return;
+        self.manager.lockLoadedModels();
+        model.pinned = true;
+        self.manager.unlockLoadedModels();
+    }
+
+    pub fn release(self: *ModelHandle) void {
+        const model = self.model orelse return;
+        self.manager.lockLoadedModels();
+        std.debug.assert(model.active_handles > 0);
+        model.active_handles -= 1;
+        model.last_used_ns = platform.time.monotonicNs();
+        self.manager.unlockLoadedModels();
+        self.model = null;
+    }
+};
+
 pub const ModelManager = struct {
+    const EvictedModel = struct {
+        key: []const u8,
+        model: *LoadedModel,
+    };
+
     allocator: std.mem.Allocator,
     session_manager: backends.SessionManager,
     /// Null for diagnostic/offline CLIs. Serving Nodes set this before any model load.
@@ -2260,6 +2307,14 @@ pub const ModelManager = struct {
     /// Protects loaded-model maps and the in-flight registry. Expensive tokenizer,
     /// weight, and backend initialization always runs outside this lock.
     load_lock: std.atomic.Mutex = .unlocked,
+    /// Serializes selecting and destroying eviction victims. Destruction
+    /// releases admission leases outside load_lock and may be expensive.
+    eviction_lock: std.atomic.Mutex = .unlocked,
+    keep_alive_ms: u64 = 0,
+    max_loaded_models: usize = 0,
+    eviction_group: std.Io.Group = .init,
+    eviction_io: ?std.Io = null,
+    eviction_loop_started: bool = false,
     in_flight_loads: std.StringHashMapUnmanaged(*LoadFlight) = .empty,
     component_plan_cache: std.AutoHashMapUnmanaged(
         ComponentPlanKey,
@@ -2289,17 +2344,27 @@ pub const ModelManager = struct {
         );
     }
 
+    pub fn configureModelCache(
+        self: *ModelManager,
+        keep_alive_ms: u64,
+        max_loaded_models: usize,
+    ) void {
+        std.debug.assert(self.loaded.count() == 0);
+        std.debug.assert(!self.eviction_loop_started);
+        self.keep_alive_ms = keep_alive_ms;
+        self.max_loaded_models = max_loaded_models;
+    }
+
     pub fn acquireRunResources(
         self: *ModelManager,
         backend_class: runtime.tier.memory.BackendClass,
         limits: runtime.tier.memory.Limits,
         estimate: runtime.tier.memory.Estimate,
     ) !runtime.tier.memory.AdmissionLease {
-        return self.admission.tryAcquire(
+        return self.acquireAmountsWithEviction(
             backend_class,
             limits,
             .fromEstimate(estimate),
-            true,
         );
     }
 
@@ -2310,7 +2375,7 @@ pub const ModelManager = struct {
         self: *ModelManager,
         requests: []const runtime.tier.memory.AdmissionRequest,
     ) !runtime.tier.memory.AdmissionLease {
-        return self.admission.tryAcquireRequests(requests, true);
+        return self.acquireRequestsWithEviction(requests);
     }
 
     pub fn configureAdmissionLimits(
@@ -2330,6 +2395,180 @@ pub const ModelManager = struct {
     ) void {
         std.debug.assert(self.loaded.count() == 0);
         self.admission.configureResourceBudget(resource_budget);
+    }
+
+    fn modelIsInFlightLocked(self: *ModelManager, model: *LoadedModel) bool {
+        var it = self.in_flight_loads.valueIterator();
+        while (it.next()) |flight_ptr| {
+            if (flight_ptr.*.model == model) return true;
+        }
+        return false;
+    }
+
+    fn takeLruModelLocked(
+        self: *ModelManager,
+        now_ns: u64,
+        expired_only: bool,
+    ) ?EvictedModel {
+        const ttl_ns = std.math.mul(
+            u64,
+            self.keep_alive_ms,
+            std.time.ns_per_ms,
+        ) catch std.math.maxInt(u64);
+        var victim_key: ?[]const u8 = null;
+        var victim: ?*LoadedModel = null;
+        var oldest_ns: u64 = std.math.maxInt(u64);
+        var it = self.loaded.iterator();
+        while (it.next()) |entry| {
+            const model = entry.value_ptr.*;
+            if (model.active_handles != 0 or model.pinned or
+                self.modelIsInFlightLocked(model))
+            {
+                continue;
+            }
+            const age_ns = if (now_ns >= model.last_used_ns)
+                now_ns - model.last_used_ns
+            else
+                0;
+            if (expired_only and
+                (self.keep_alive_ms == 0 or age_ns < ttl_ns))
+            {
+                continue;
+            }
+            if (victim == null or model.last_used_ns < oldest_ns) {
+                victim_key = entry.key_ptr.*;
+                victim = model;
+                oldest_ns = model.last_used_ns;
+            }
+        }
+        const selected = victim orelse return null;
+        const removed = self.loaded.fetchRemove(victim_key.?) orelse unreachable;
+        std.debug.assert(removed.value == selected);
+
+        // Aliases never own the model, but every alias must disappear in the
+        // same map critical section as its canonical backend-variant key.
+        while (true) {
+            var alias_key: ?[]const u8 = null;
+            var alias_it = self.loaded_aliases.iterator();
+            while (alias_it.next()) |entry| {
+                if (entry.value_ptr.* == selected) {
+                    alias_key = entry.key_ptr.*;
+                    break;
+                }
+            }
+            const key = alias_key orelse break;
+            const alias = self.loaded_aliases.fetchRemove(key) orelse unreachable;
+            self.allocator.free(alias.key);
+        }
+        return .{ .key = removed.key, .model = selected };
+    }
+
+    fn destroyEvictedModel(self: *ModelManager, evicted: EvictedModel) void {
+        std.log.info("evicting inference model path={s} backend={s}", .{
+            evicted.model.model_dir,
+            @tagName(evicted.model.session.backend()),
+        });
+        evicted.model.deinit();
+        self.allocator.destroy(evicted.model);
+        self.allocator.free(evicted.key);
+    }
+
+    fn acquireAmountsWithEviction(
+        self: *ModelManager,
+        backend_class: runtime.tier.memory.BackendClass,
+        limits: runtime.tier.memory.Limits,
+        amounts: runtime.tier.memory.AdmissionAmounts,
+    ) !runtime.tier.memory.AdmissionLease {
+        return self.admission.tryAcquire(
+            backend_class,
+            limits,
+            amounts,
+            true,
+        ) catch |first_err| switch (first_err) {
+            error.ResourceTemporarilyUnavailable => {
+                spinLock(&self.eviction_lock);
+                defer self.eviction_lock.unlock();
+                while (true) {
+                    if (self.admission.tryAcquire(
+                        backend_class,
+                        limits,
+                        amounts,
+                        true,
+                    )) |lease| return lease else |retry_err| switch (retry_err) {
+                        error.ResourceTemporarilyUnavailable => {},
+                        else => return retry_err,
+                    }
+                    self.lockLoadedModels();
+                    const evicted = self.takeLruModelLocked(
+                        platform.time.monotonicNs(),
+                        false,
+                    );
+                    self.unlockLoadedModels();
+                    if (evicted == null) return error.ResourceTemporarilyUnavailable;
+                    self.destroyEvictedModel(evicted.?);
+                }
+            },
+            else => return first_err,
+        };
+    }
+
+    fn acquireRequestsWithEviction(
+        self: *ModelManager,
+        requests: []const runtime.tier.memory.AdmissionRequest,
+    ) !runtime.tier.memory.AdmissionLease {
+        return self.admission.tryAcquireRequests(requests, true) catch |first_err| switch (first_err) {
+            error.ResourceTemporarilyUnavailable => {
+                spinLock(&self.eviction_lock);
+                defer self.eviction_lock.unlock();
+                while (true) {
+                    if (self.admission.tryAcquireRequests(requests, true)) |lease|
+                        return lease
+                    else |retry_err| switch (retry_err) {
+                        error.ResourceTemporarilyUnavailable => {},
+                        else => return retry_err,
+                    }
+                    self.lockLoadedModels();
+                    const evicted = self.takeLruModelLocked(
+                        platform.time.monotonicNs(),
+                        false,
+                    );
+                    self.unlockLoadedModels();
+                    if (evicted == null) return error.ResourceTemporarilyUnavailable;
+                    self.destroyEvictedModel(evicted.?);
+                }
+            },
+            else => return first_err,
+        };
+    }
+
+    fn evictExpired(self: *ModelManager) void {
+        if (self.keep_alive_ms == 0) return;
+        spinLock(&self.eviction_lock);
+        defer self.eviction_lock.unlock();
+        while (true) {
+            self.lockLoadedModels();
+            const evicted = self.takeLruModelLocked(
+                platform.time.monotonicNs(),
+                true,
+            );
+            self.unlockLoadedModels();
+            if (evicted == null) return;
+            self.destroyEvictedModel(evicted.?);
+        }
+    }
+
+    fn evictionLoop(self: *ModelManager, io: std.Io) std.Io.Cancelable!void {
+        const interval_ms = @max(
+            @as(u64, 10),
+            @min(@max(self.keep_alive_ms / 4, 1), @as(u64, 30_000)),
+        );
+        while (true) {
+            try io.sleep(
+                std.Io.Duration.fromMilliseconds(@intCast(interval_ms)),
+                .awake,
+            );
+            self.evictExpired();
+        }
     }
 
     /// A short-lived, policy-validated handle for loading every graph in a
@@ -2726,11 +2965,10 @@ pub const ModelManager = struct {
                 )) |cuda_limit| {
                     session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
                 }
-                resource_lease = self.admission.tryAcquire(
+                resource_lease = self.acquireAmountsWithEviction(
                     admissionBackendClassForRuntime(backend_runtime),
                     admission_limits,
                     admission_plan.peak,
-                    true,
                 ) catch |err| {
                     if (first_err == null) first_err = err;
                     continue;
@@ -2752,7 +2990,7 @@ pub const ModelManager = struct {
                 if (self.admission_enabled) {
                     attachSessionRunAdmission(
                         &session,
-                        &self.admission,
+                        self,
                         backend_runtime,
                         admission_limits,
                         resident_amounts,
@@ -2804,11 +3042,10 @@ pub const ModelManager = struct {
         plan: ModelLoadAdmissionPlan,
     ) !?runtime.tier.memory.AdmissionLease {
         if (!self.admission_enabled) return null;
-        return try self.admission.tryAcquire(
+        return try self.acquireAmountsWithEviction(
             .cpu,
             self.admissionLimitsForBackend(.{ .backend = .native }),
             plan.peak,
-            true,
         );
     }
 
@@ -2820,10 +3057,24 @@ pub const ModelManager = struct {
         self.load_lock.unlock();
     }
 
-    pub fn getLoadedModel(self: *ModelManager, model_dir: []const u8) ?*LoadedModel {
+    pub fn acquireLoadedModel(self: *ModelManager, model_dir: []const u8) ?ModelHandle {
         self.lockLoadedModels();
         defer self.unlockLoadedModels();
-        return self.loaded.get(model_dir) orelse self.loaded_aliases.get(model_dir);
+        const model = self.loaded.get(model_dir) orelse
+            self.loaded_aliases.get(model_dir) orelse return null;
+        model.active_handles += 1;
+        return .{ .manager = self, .model = model };
+    }
+
+    pub fn loadedChatTemplateFailed(
+        self: *ModelManager,
+        model_dir: []const u8,
+    ) ?bool {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        const model = self.loaded.get(model_dir) orelse
+            self.loaded_aliases.get(model_dir) orelse return null;
+        return model.chat_template_failed;
     }
 
     /// Configure tokenizer-cache admission before any model is loaded. The
@@ -2851,6 +3102,7 @@ pub const ModelManager = struct {
     }
 
     pub fn deinit(self: *ModelManager) void {
+        if (self.eviction_io) |io| self.eviction_group.cancel(io);
         std.debug.assert(self.in_flight_loads.count() == 0);
         self.in_flight_loads.deinit(self.allocator);
         var component_plan_it = self.component_plan_cache.iterator();
@@ -2872,10 +3124,18 @@ pub const ModelManager = struct {
 
     pub fn attachIo(self: *ModelManager, io: std.Io) void {
         self.lockLoadedModels();
-        defer self.unlockLoadedModels();
         self.session_manager.io = io;
         var it = self.loaded.iterator();
         while (it.next()) |entry| entry.value_ptr.*.attachIo(io);
+        const start_eviction_loop = self.keep_alive_ms > 0 and
+            !self.eviction_loop_started;
+        if (start_eviction_loop) {
+            self.eviction_loop_started = true;
+            self.eviction_io = io;
+        }
+        self.unlockLoadedModels();
+        if (start_eviction_loop)
+            self.eviction_group.async(io, evictionLoop, .{ self, io });
     }
 
     /// Counts loaded models participating in the prompt-cache accounting target.
@@ -2946,9 +3206,30 @@ pub const ModelManager = struct {
         }
     }
 
-    /// Load a model from a directory path. Returns a cached model if already loaded.
-    pub fn loadFromDir(self: *ModelManager, model_dir: []const u8) !*LoadedModel {
+    /// Acquire a model for the duration of one operation. The returned handle
+    /// prevents eviction until release.
+    pub fn acquireFromDir(self: *ModelManager, model_dir: []const u8) !ModelHandle {
         return self.loadFromDirCoordinated(model_dir, self.session_manager.preferred_backends, true);
+    }
+
+    pub fn acquireFromDirWithPreferredBackends(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(model_dir, preferred_backends, cache_default_alias);
+    }
+
+    /// Compatibility API for offline tools that keep a raw model pointer. Such
+    /// callers explicitly pin the model because their pointer lifetime cannot
+    /// be observed by the cache.
+    pub fn loadFromDir(self: *ModelManager, model_dir: []const u8) !*LoadedModel {
+        var handle = try self.acquireFromDir(model_dir);
+        handle.pin();
+        const model = handle.get();
+        handle.release();
+        return model;
     }
 
     pub fn loadFromDirWithPreferredBackends(
@@ -2957,7 +3238,15 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
     ) !*LoadedModel {
-        return self.loadFromDirCoordinated(model_dir, preferred_backends, cache_default_alias);
+        var handle = try self.acquireFromDirWithPreferredBackends(
+            model_dir,
+            preferred_backends,
+            cache_default_alias,
+        );
+        handle.pin();
+        const model = handle.get();
+        handle.release();
+        return model;
     }
 
     fn lookupLoadedModelLocked(
@@ -3000,9 +3289,16 @@ pub const ModelManager = struct {
         return key;
     }
 
-    fn finishLoadFlight(flight: *LoadFlight, model: ?*LoadedModel, err: ?anyerror) void {
+    fn finishLoadFlight(
+        self: *ModelManager,
+        flight: *LoadFlight,
+        model: ?*LoadedModel,
+        err: ?anyerror,
+    ) void {
+        self.lockLoadedModels();
         flight.model = model;
         flight.err = err;
+        self.unlockLoadedModels();
         flight.completed.set(flight.io);
     }
 
@@ -3030,14 +3326,22 @@ pub const ModelManager = struct {
         self: *ModelManager,
         flight_key: []const u8,
         flight: *LoadFlight,
-    ) !*LoadedModel {
+    ) !ModelHandle {
         flight.completed.waitUncancelable(flight.io);
         const model = flight.model;
         const maybe_err = flight.err;
 
+        if (model) |loaded| {
+            self.lockLoadedModels();
+            loaded.active_handles += 1;
+            self.unlockLoadedModels();
+        }
         self.releaseLoadFlight(flight_key, flight);
         if (maybe_err) |err| return err;
-        return model orelse error.NoBackendAvailable;
+        return .{
+            .manager = self,
+            .model = model orelse return error.NoBackendAvailable,
+        };
     }
 
     fn loadFromDirCoordinated(
@@ -3045,7 +3349,7 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
-    ) !*LoadedModel {
+    ) !ModelHandle {
         const flight_key = try self.loadFlightKey(model_dir, preferred_backends, cache_default_alias);
         defer self.allocator.free(flight_key);
 
@@ -3059,8 +3363,9 @@ pub const ModelManager = struct {
             return err;
         };
         if (cached) |model| {
+            model.active_handles += 1;
             self.unlockLoadedModels();
-            return model;
+            return .{ .manager = self, .model = model };
         }
         if (self.in_flight_loads.get(flight_key)) |flight| {
             flight.refs += 1;
@@ -3103,14 +3408,14 @@ pub const ModelManager = struct {
         );
         self.unlockLoadedModels();
 
-        const model = self.loadFromDirUncached(model_dir, &session_manager, cache_default_alias) catch |err| {
-            finishLoadFlight(flight, null, err);
+        var handle = self.loadFromDirUncached(model_dir, &session_manager, cache_default_alias) catch |err| {
+            self.finishLoadFlight(flight, null, err);
             self.releaseLoadFlight(flight_key, flight);
             return err;
         };
-        finishLoadFlight(flight, model, null);
+        self.finishLoadFlight(flight, handle.get(), null);
         self.releaseLoadFlight(flight_key, flight);
-        return model;
+        return handle;
     }
 
     fn loadFromDirUncached(
@@ -3118,7 +3423,7 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         sm: *backends.SessionManager,
         cache_default_alias: bool,
-    ) !*LoadedModel {
+    ) !ModelHandle {
 
         // Load manifest
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
@@ -3334,7 +3639,7 @@ pub const ModelManager = struct {
         self: *ModelManager,
         model: *LoadedModel,
         cache_default_alias: bool,
-    ) !*LoadedModel {
+    ) !ModelHandle {
         var model_owned = true;
         errdefer if (model_owned) {
             model.deinit();
@@ -3356,52 +3661,71 @@ pub const ModelManager = struct {
         var alias_key_owned = alias_key != null;
         defer if (alias_key_owned) self.allocator.free(alias_key.?);
 
-        var selected = model;
-        self.lockLoadedModels();
-        if (self.loaded.get(variant_key)) |existing| {
-            selected = existing;
-            if (alias_key != null and
-                self.loaded.get(model.model_dir) == null and
-                self.loaded_aliases.get(model.model_dir) == null)
+        spinLock(&self.eviction_lock);
+        defer self.eviction_lock.unlock();
+        while (true) {
+            self.lockLoadedModels();
+            if (self.loaded.get(variant_key)) |existing| {
+                if (alias_key != null and
+                    self.loaded.get(model.model_dir) == null and
+                    self.loaded_aliases.get(model.model_dir) == null)
+                {
+                    self.loaded_aliases.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+                        self.unlockLoadedModels();
+                        return err;
+                    };
+                    self.loaded_aliases.putAssumeCapacity(alias_key.?, existing);
+                    alias_key_owned = false;
+                }
+                existing.active_handles += 1;
+                self.unlockLoadedModels();
+
+                model.deinit();
+                self.allocator.destroy(model);
+                model_owned = false;
+                return .{ .manager = self, .model = existing };
+            }
+
+            if (self.max_loaded_models > 0 and
+                self.loaded.count() >= self.max_loaded_models)
             {
+                const evicted = self.takeLruModelLocked(
+                    platform.time.monotonicNs(),
+                    false,
+                );
+                self.unlockLoadedModels();
+                if (evicted == null)
+                    return error.ResourceTemporarilyUnavailable;
+                self.destroyEvictedModel(evicted.?);
+                continue;
+            }
+
+            const needs_alias = alias_key != null and
+                self.loaded.get(model.model_dir) == null and
+                self.loaded_aliases.get(model.model_dir) == null;
+            self.loaded.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+                self.unlockLoadedModels();
+                return err;
+            };
+            if (needs_alias) {
                 self.loaded_aliases.ensureUnusedCapacity(self.allocator, 1) catch |err| {
                     self.unlockLoadedModels();
                     return err;
                 };
-                self.loaded_aliases.putAssumeCapacity(alias_key.?, existing);
+            }
+            model.active_handles = 1;
+            model.last_used_ns = platform.time.monotonicNs();
+            self.loaded.putAssumeCapacity(variant_key, model);
+            variant_key_owned = false;
+            if (needs_alias) {
+                self.loaded_aliases.putAssumeCapacity(alias_key.?, model);
                 alias_key_owned = false;
             }
             self.unlockLoadedModels();
 
-            model.deinit();
-            self.allocator.destroy(model);
             model_owned = false;
-            return selected;
+            return .{ .manager = self, .model = model };
         }
-
-        const needs_alias = alias_key != null and
-            self.loaded.get(model.model_dir) == null and
-            self.loaded_aliases.get(model.model_dir) == null;
-        self.loaded.ensureUnusedCapacity(self.allocator, 1) catch |err| {
-            self.unlockLoadedModels();
-            return err;
-        };
-        if (needs_alias) {
-            self.loaded_aliases.ensureUnusedCapacity(self.allocator, 1) catch |err| {
-                self.unlockLoadedModels();
-                return err;
-            };
-        }
-        self.loaded.putAssumeCapacity(variant_key, model);
-        variant_key_owned = false;
-        if (needs_alias) {
-            self.loaded_aliases.putAssumeCapacity(alias_key.?, model);
-            alias_key_owned = false;
-        }
-        self.unlockLoadedModels();
-
-        model_owned = false;
-        return selected;
     }
 };
 
@@ -3411,6 +3735,91 @@ fn backendVariantCacheKey(
     backend: backends.BackendType,
 ) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}\nbackend={s}", .{ model_dir, @tagName(backend) });
+}
+
+test "model cache eviction skips active and pinned models and removes aliases" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer {
+        var it = manager.loaded.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        manager.loaded.deinit(allocator);
+        var aliases = manager.loaded_aliases.iterator();
+        while (aliases.next()) |entry| allocator.free(entry.key_ptr.*);
+        manager.loaded_aliases.deinit(allocator);
+        manager.in_flight_loads.deinit(allocator);
+    }
+
+    var idle: LoadedModel = undefined;
+    idle.active_handles = 0;
+    idle.last_used_ns = 10;
+    idle.pinned = false;
+    var active: LoadedModel = undefined;
+    active.active_handles = 1;
+    active.last_used_ns = 1;
+    active.pinned = false;
+    var pinned: LoadedModel = undefined;
+    pinned.active_handles = 0;
+    pinned.last_used_ns = 0;
+    pinned.pinned = true;
+
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "idle"), &idle);
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "active"), &active);
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "pinned"), &pinned);
+    try manager.loaded_aliases.put(
+        allocator,
+        try allocator.dupe(u8, "idle-alias"),
+        &idle,
+    );
+
+    manager.lockLoadedModels();
+    const evicted = manager.takeLruModelLocked(100, false);
+    manager.unlockLoadedModels();
+    try std.testing.expect(evicted != null);
+    try std.testing.expect(evicted.?.model == &idle);
+    try std.testing.expectEqual(@as(usize, 2), manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded_aliases.count());
+    manager.lockLoadedModels();
+    const after_eviction = try manager.lookupLoadedModelLocked(
+        "idle-alias",
+        manager.session_manager.preferred_backends,
+        true,
+    );
+    manager.unlockLoadedModels();
+    try std.testing.expect(after_eviction == null);
+    allocator.free(evicted.?.key);
+}
+
+test "model cache idle expiration can be disabled" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer {
+        var it = manager.loaded.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        manager.loaded.deinit(allocator);
+        manager.loaded_aliases.deinit(allocator);
+        manager.in_flight_loads.deinit(allocator);
+    }
+
+    var idle: LoadedModel = undefined;
+    idle.active_handles = 0;
+    idle.last_used_ns = 1;
+    idle.pinned = false;
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "idle"), &idle);
+
+    manager.keep_alive_ms = 0;
+    manager.lockLoadedModels();
+    const disabled = manager.takeLruModelLocked(std.time.ns_per_s, true);
+    manager.unlockLoadedModels();
+    try std.testing.expect(disabled == null);
+
+    manager.keep_alive_ms = 1;
+    manager.lockLoadedModels();
+    const expired = manager.takeLruModelLocked(std.time.ns_per_s, true);
+    manager.unlockLoadedModels();
+    try std.testing.expect(expired != null);
+    try std.testing.expect(expired.?.model == &idle);
+    allocator.free(expired.?.key);
 }
 
 fn preferredModelPathForBackend(
@@ -3913,11 +4322,10 @@ fn loadSessionForPreferredBackends(
             }) |cuda_limit| {
                 backend_session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
             }
-            resource_lease = manager.admission.tryAcquire(
+            resource_lease = manager.acquireAmountsWithEviction(
                 admissionBackendClassForRuntime(backend_runtime),
                 admission_limits,
                 admission_plan.peak,
-                true,
             ) catch |err| {
                 if (first_err == null) first_err = err;
                 continue;
@@ -3935,7 +4343,7 @@ fn loadSessionForPreferredBackends(
             if (manager.admission_enabled) {
                 attachSessionRunAdmission(
                     &session,
-                    &manager.admission,
+                    manager,
                     backend_runtime,
                     admission_limits,
                     resident_amounts,

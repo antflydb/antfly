@@ -1148,6 +1148,23 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
     };
 }
 
+fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    return switch (err) {
+        error.ResourceLimitExceeded => ctx.status(400).json(.{
+            .@"error" = "MODEL_RESOURCE_LIMIT",
+            .message = "request resource plan exceeds the configured inference budget",
+        }),
+        error.ResourceTemporarilyUnavailable => ctx.status(503).json(.{
+            .@"error" = "MODEL_RESOURCE_BUSY",
+            .message = "insufficient inference capacity is currently available",
+        }),
+        else => ctx.status(500).json(.{
+            .@"error" = "INFERENCE_FAILED",
+            .message = @errorName(err),
+        }),
+    };
+}
+
 fn rejectExplicitBackendIncompatibility(
     ctx: *httpx.Context,
     model_path: []const u8,
@@ -1431,6 +1448,10 @@ pub const Node = struct {
         node.model_manager.configureServingPolicy(.{
             .allow_unknown = config.allow_unknown_models,
         });
+        node.model_manager.configureModelCache(
+            config.keep_alive_ms,
+            config.max_loaded_models,
+        );
         node.model_manager.configureAdmissionLimits(.{
             .host_limit_bytes = config.generation_budget_overrides.host_limit_bytes,
             .backend_limit_bytes = config.generation_budget_overrides.backend_limit_bytes,
@@ -1647,7 +1668,9 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        const model = try self.model_manager.loadFromDir(model_path);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         try ensureDirectEmbeddingDeadline(deadline_ns);
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         try model.ensureEmbeddingAssets(true, false, false);
@@ -1677,7 +1700,9 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
-        const model = try self.model_manager.loadFromDir(model_path);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
             .allocator = allocator,
@@ -1706,7 +1731,9 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rerankers");
-        const model = try self.model_manager.loadFromDir(model_path);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         var pipeline = model.rerankingPipeline(allocator);
         return try pipeline.rerank(query, documents);
     }
@@ -1730,7 +1757,7 @@ pub const Node = struct {
             };
         }
 
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null, false);
     }
 
     pub fn generateMessagesDirect(
@@ -1739,7 +1766,7 @@ pub const Node = struct {
         model_name: []const u8,
         messages: []const generation.Message,
     ) ![]u8 {
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null, false);
     }
 
     const DirectGenerateTiming = struct {
@@ -1785,6 +1812,7 @@ pub const Node = struct {
         max_tokens: i32,
         preferred_backends: ?[]const backends_mod.BackendType,
         timing: ?*DirectGenerateTiming,
+        pin_after_success: bool,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
@@ -1802,10 +1830,12 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "generators");
         const resolved_at_ns = embedTimingNowNs();
-        const model = if (preferred_backends) |backends|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, backends, false)
+        var model_handle = if (preferred_backends) |backends|
+            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, backends, false)
         else
-            try self.model_manager.loadFromDir(model_path);
+            try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         const loaded_at_ns = embedTimingNowNs();
         model.lockNativeGeneration();
         defer model.unlockNativeGeneration();
@@ -1942,7 +1972,9 @@ pub const Node = struct {
                 .total_ms = elapsedMs(started_at_ns, generated_at_ns),
             };
         }
-        return try allocator.dupe(u8, result.text);
+        const text = try allocator.dupe(u8, result.text);
+        if (pin_after_success) model_handle.pin();
+        return text;
     }
 
     pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
@@ -1976,7 +2008,7 @@ pub const Node = struct {
             .content = "ping",
         }};
         var timing = DirectGenerateTiming{};
-        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, &timing);
+        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, &timing, true);
         defer allocator.free(text);
         const elapsed_ms = elapsedMs(started_at_ns, embedTimingNowNs());
         std.log.info(
@@ -2001,10 +2033,12 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "embedders");
-        const model = if (backend) |value|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
+        var model_handle = if (backend) |value|
+            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
         else
-            try self.model_manager.loadFromDir(model_path);
+            try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
 
         if (model.manifest.hasCapability("sparse")) {
             var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
@@ -2027,6 +2061,7 @@ pub const Node = struct {
                 allocator.free(embeddings);
             }
         }
+        model_handle.pin();
         std.log.info("warmed inference embedder model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
@@ -2038,13 +2073,16 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "rerankers");
-        const model = if (backend) |value|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
+        var model_handle = if (backend) |value|
+            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
         else
-            try self.model_manager.loadFromDir(model_path);
+            try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         var pipeline = model.rerankingPipeline(allocator);
         const scores = try pipeline.rerank("ping", &documents);
         defer allocator.free(scores);
+        model_handle.pin();
         std.log.info("warmed inference reranker model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
@@ -2065,10 +2103,12 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model.name, task_dir);
-        _ = if (model.backend) |backend|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), false)
+        var model_handle = if (model.backend) |backend|
+            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), false)
         else
-            try self.model_manager.loadFromDir(model_path);
+            try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        model_handle.pin();
         std.log.info("loaded inference {s} model={s} elapsed_ms={d}", .{ @tagName(model.kind), model.name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
@@ -2100,7 +2140,9 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        const model = try self.model_manager.loadFromDir(model_path);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         try ensureDirectEmbeddingDeadline(deadline_ns);
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
 
@@ -2209,7 +2251,9 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "transcribers");
-        const model = try self.model_manager.loadFromDir(model_path);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         if (session_factory.getWhisperConfig(model.session) == null) return error.UnsupportedTranscriberProvider;
 
         const transcription = @import("../pipelines/transcription.zig");
@@ -2659,8 +2703,10 @@ pub const Node = struct {
 
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
 
-        const model = self.model_manager.loadFromDir(model_path) catch |err|
+        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
+        defer model_handle.release();
+        const model = model_handle.get();
 
         if (model.manifest.hasCapability("sparse")) {
             const sparse_texts = parseSparseEmbedInputs(ctx.allocator, request.input) catch {
@@ -2687,7 +2733,7 @@ pub const Node = struct {
                 .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
             };
             const sparse_vecs = pipeline.embed(sparse_texts) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                return inferenceFailureResponse(ctx, err);
             defer {
                 for (sparse_vecs) |*sv| @constCast(sv).deinit(ctx.allocator);
                 ctx.allocator.free(sparse_vecs);
@@ -2720,7 +2766,7 @@ pub const Node = struct {
             inputs.images.items.len > 0,
             inputs.audio.items.len > 0,
         ) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return inferenceFailureResponse(ctx, err);
 
         var pipeline = model.embeddingPipeline(ctx.allocator);
         applyDenseEmbeddingRequestOptions(&pipeline, &model.manifest, request) catch |err| {
@@ -2893,12 +2939,14 @@ pub const Node = struct {
                 .message = "model not found; specify 'model' as a path or owner/name",
             });
 
-        const model = self.model_manager.loadFromDir(model_path) catch |err|
+        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
+        defer model_handle.release();
+        const model = model_handle.get();
 
         var pipeline = model.rerankingPipeline(ctx.allocator);
         const scores = pipeline.rerank(body.query, body.prompts) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(scores);
 
         const prompt_tokens =
@@ -2928,8 +2976,10 @@ pub const Node = struct {
                 .message = "model not found; specify 'model' as a path or owner/name",
             });
 
-        const model = self.model_manager.loadFromDir(model_path) catch |err|
+        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
+        defer model_handle.release();
+        const model = model_handle.get();
 
         var parsed_docs = std.ArrayListUnmanaged(ParsedMultimodalRerankDocument).empty;
         defer {
@@ -2956,7 +3006,7 @@ pub const Node = struct {
 
             var pipeline = model.rerankingPipeline(ctx.allocator);
             const scores = pipeline.rerank(body.query, flat_texts) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                return inferenceFailureResponse(ctx, err);
             defer ctx.allocator.free(scores);
             const prompt_tokens =
                 (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * flat_texts.len +
@@ -2972,7 +3022,7 @@ pub const Node = struct {
         }
 
         model.ensureVisionSession() catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return inferenceFailureResponse(ctx, err);
         const vision_session = model.vision_session;
         const gpt_cfg = session_factory.getGptConfig(model.session) orelse
             return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "multimodal late-interaction reranking currently requires a native qwen/gpt text session" });
@@ -2999,7 +3049,7 @@ pub const Node = struct {
         );
 
         var query_encoded = mm_pipeline.encodeQueryText(body.query) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return inferenceFailureResponse(ctx, err);
         defer query_encoded.deinit();
 
         const scores = try ctx.allocator.alloc(f32, parsed_docs.items.len);
@@ -3009,7 +3059,7 @@ pub const Node = struct {
             if (doc.images.len == 0) {
                 var text_pipeline = model.rerankingPipeline(ctx.allocator);
                 const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                    return inferenceFailureResponse(ctx, err);
                 defer ctx.allocator.free(text_scores);
                 scores[idx] = text_scores[0];
                 continue;
@@ -3022,7 +3072,7 @@ pub const Node = struct {
             ) catch |err| switch (err) {
                 error.InvalidImageDataUri, error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
                 error.ImageTokenLengthMismatch, error.ImageProjectionSizeMismatch, error.UnexpectedOutputShape => return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) }),
-                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+                else => return inferenceFailureResponse(ctx, err),
             };
         }
 
@@ -3550,13 +3600,15 @@ pub const Node = struct {
         }
 
         // Fall back to native generation (CPU/GPU GPT arch forward pass).
-        const model = if (backend_selection.native_choice != .auto) blk: {
+        var model_handle = if (backend_selection.native_choice != .auto) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
             configureGenerateBackendPreference(&request_session_manager, backend_selection);
-            break :blk self.model_manager.loadFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err|
+            break :blk self.model_manager.acquireFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err|
                 return modelLoadFailureResponse(ctx, err);
-        } else self.model_manager.loadFromDir(model_path) catch |err|
+        } else self.model_manager.acquireFromDir(model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
+        defer model_handle.release();
+        const model = model_handle.get();
         model.lockNativeGeneration();
         defer model.unlockNativeGeneration();
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
@@ -3629,6 +3681,8 @@ pub const Node = struct {
         var draft_cb: ?ops.ComputeBackend = null;
         defer if (draft_cb) |*cb_value| cb_value.deinit();
         var draft_gpt_config: ?@import("../models/gpt.zig").Config = null;
+        var draft_model_handle: ?model_manager_mod.ModelHandle = null;
+        defer if (draft_model_handle) |*handle| handle.release();
         var draft_model_for_generation: ?*model_manager_mod.LoadedModel = null;
         var draft_backend_kind: ?runtime.kv.pool.BackendKind = null;
         var draft_kv_dtype: ?runtime.kv.pool.KvDType = null;
@@ -3666,13 +3720,14 @@ pub const Node = struct {
                     }
                 }
                 if (load_draft_backend) {
-                    const draft_model = if (backend_selection.native_choice != .auto) blk: {
+                    draft_model_handle = if (backend_selection.native_choice != .auto) blk: {
                         var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                         configureGenerateBackendPreference(&request_session_manager, backend_selection);
-                        break :blk self.model_manager.loadFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
+                        break :blk self.model_manager.acquireFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
                             return modelLoadFailureResponse(ctx, err);
-                    } else self.model_manager.loadFromDir(draft_model_path) catch |err|
+                    } else self.model_manager.acquireFromDir(draft_model_path) catch |err|
                         return modelLoadFailureResponse(ctx, err);
+                    const draft_model = draft_model_handle.?.get();
                     const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
                         return ctx.status(400).json(.{
                             .@"error" = "INVALID_MODEL",
@@ -4588,26 +4643,28 @@ pub const Node = struct {
                 continue;
             }
 
-            const model = if (selection.native_choice != .auto) blk: {
+            var model_handle = if (selection.native_choice != .auto) blk: {
                 var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                 configureGenerateBackendPreference(&request_session_manager, selection);
-                break :blk self.model_manager.loadFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err| {
+                break :blk self.model_manager.acquireFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err| {
                     for (group_indices.items) |idx| {
                         results[idx].@"error" = batchModelLoadError(err);
                         pending[idx] = false;
                     }
                     continue;
                 };
-            } else self.model_manager.loadFromDir(model_path) catch |err| {
+            } else self.model_manager.acquireFromDir(model_path) catch |err| {
                 for (group_indices.items) |idx| {
                     results[idx].@"error" = batchModelLoadError(err);
                     pending[idx] = false;
                 }
                 continue;
             };
+            const model = model_handle.get();
 
             model.lockNativeGeneration();
             {
+                defer model_handle.release();
                 defer model.unlockNativeGeneration();
 
                 const gpt_config = session_factory.getGptConfig(model.session) orelse {
@@ -5631,8 +5688,10 @@ pub const Node = struct {
             return self.recognizeRebel(ctx, model_path, body);
         }
 
-        const model = self.model_manager.loadFromDir(model_path) catch |err|
+        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
+        defer model_handle.release();
+        const model = model_handle.get();
 
         // Use GLiNER pipeline for GLiNER models, standard NER for BIO models
         if (model.isGlinerModel()) {
@@ -5647,7 +5706,7 @@ pub const Node = struct {
 
         var pipeline = model.nerPipeline(ctx.allocator);
         const all_entities = pipeline.recognizeBatch(body.texts) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return inferenceFailureResponse(ctx, err);
         defer {
             for (all_entities) |entities| {
                 for (entities) |e| ctx.allocator.free(e.text);
@@ -5728,7 +5787,7 @@ pub const Node = struct {
         if (body.relation_labels) |relation_labels| {
             if (relation_labels.len > 0) {
                 const extracted = pipeline.extractRelationsBatch(body.texts, body.labels, relation_labels) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                    return inferenceFailureResponse(ctx, err);
                 defer {
                     for (extracted.entities) |entities| {
                         for (entities) |entity| ctx.allocator.free(entity.text);
@@ -5754,7 +5813,7 @@ pub const Node = struct {
         }
 
         const all_entities = pipeline.recognizeBatch(body.texts) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return inferenceFailureResponse(ctx, err);
         defer {
             for (all_entities) |entities| {
                 for (entities) |entity| ctx.allocator.free(entity.text);
@@ -5795,7 +5854,7 @@ pub const Node = struct {
 
             const relation_labels = body.relation_labels.?;
             const extracted = pipeline.extractRelationsBatch(body.texts, labels, relation_labels) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                return inferenceFailureResponse(ctx, err);
             defer {
                 for (extracted.entities) |entities| {
                     for (entities) |e| ctx.allocator.free(e.text);
@@ -5820,7 +5879,7 @@ pub const Node = struct {
         }
 
         const all_entities = pipeline.recognizeBatch(body.texts, labels) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return inferenceFailureResponse(ctx, err);
         defer {
             for (all_entities) |entities| {
                 for (entities) |e| ctx.allocator.free(e.text);
@@ -5910,8 +5969,10 @@ pub const Node = struct {
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         if (self.resolveModelPath(ctx.io, model_name, "classifiers")) |model_path| {
-            const model = self.model_manager.loadFromDir(model_path) catch |err|
+            var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err);
+            defer model_handle.release();
+            const model = model_handle.get();
 
             // Detect entailment index from id2label (varies by NLI model)
             const entailment_idx: ?usize = if (model.manifest.id2label) |labels| blk: {
@@ -5932,7 +5993,7 @@ pub const Node = struct {
             var pipeline = model.classificationPipeline(ctx.allocator, config);
 
             const all_results = pipeline.classifyBatch(body.texts, body.labels) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                return inferenceFailureResponse(ctx, err);
             defer {
                 for (all_results) |r| ctx.allocator.free(r);
                 ctx.allocator.free(all_results);
@@ -5945,8 +6006,10 @@ pub const Node = struct {
         } else |_| {}
 
         if (self.resolveModelPath(ctx.io, model_name, "recognizers")) |model_path| {
-            const model = self.model_manager.loadFromDir(model_path) catch |err|
+            var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err);
+            defer model_handle.release();
+            const model = model_handle.get();
             if (!model.isGlinerModel() or !model.supportsClassification()) {
                 return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
             }
@@ -5957,7 +6020,7 @@ pub const Node = struct {
                 .multi_label = body.multi_label orelse false,
             }) catch |err| switch (err) {
                 error.MissingSpecialTokenIds => return ctx.status(500).json(.{ .@"error" = "MODEL_CONFIG_INVALID", .message = @errorName(err) }),
-                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+                else => return inferenceFailureResponse(ctx, err),
             };
             defer {
                 for (all_results) |r| ctx.allocator.free(r);
@@ -6011,7 +6074,7 @@ pub const Node = struct {
 
         const features = document_classification.extractFeatures(ctx.allocator, input) catch |err| switch (err) {
             error.FileNotFound => return ctx.status(404).json(.{ .@"error" = "IMAGE_NOT_FOUND", .message = "image not found" }),
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            else => return inferenceFailureResponse(ctx, err),
         };
 
         const results = document_classification.classifyWithHead(ctx.allocator, &head, body.labels, input) catch |err| switch (err) {
@@ -6020,7 +6083,7 @@ pub const Node = struct {
                 .message = "label count does not match checkpoint output width",
             }),
             error.FileNotFound => return ctx.status(404).json(.{ .@"error" = "IMAGE_NOT_FOUND", .message = "image not found" }),
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            else => return inferenceFailureResponse(ctx, err),
         };
         defer ctx.allocator.free(results);
 
@@ -6124,7 +6187,7 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "label count does not match checkpoint output width",
             }),
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            else => return inferenceFailureResponse(ctx, err),
         };
         defer {
             for (predictions) |pred| ctx.allocator.free(pred.scores);
@@ -6302,7 +6365,7 @@ pub const Node = struct {
         var completion_tokens: usize = 0;
         for (body.inputs, 0..) |input_text, i| {
             var result = pipeline.rewrite(input_text) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                return inferenceFailureResponse(ctx, err);
             defer result.deinit();
 
             const inner = try ctx.allocator.alloc([]const u8, 1);
@@ -6435,7 +6498,7 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "'max_tokens' exceeds the selected model's context limit",
             }),
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            else => return inferenceFailureResponse(ctx, err),
         };
         defer {
             for (results) |result| {
@@ -6531,6 +6594,8 @@ pub const Node = struct {
         var tokenizer: tokenizer_mod.Tokenizer = undefined;
         var hf_tok_owned: ?*hf_tokenizer.HfTokenizer = null;
         defer if (hf_tok_owned) |hf_tok| hf_tok.deinitSelf();
+        var loaded_model_handle: ?model_manager_mod.ModelHandle = null;
+        defer if (loaded_model_handle) |*handle| handle.release();
 
         if (enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path)) |paths| {
             defer ctx.allocator.free(paths.encoder);
@@ -6564,8 +6629,9 @@ pub const Node = struct {
                 tokenizer = hf_tok.tokenizer();
             }
         } else |_| {
-            const model = self.model_manager.loadFromDir(model_path) catch |err|
+            loaded_model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err);
+            const model = loaded_model_handle.?.get();
             if (session_factory.getWhisperConfig(model.session) == null) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_MODEL",
@@ -6627,7 +6693,7 @@ pub const Node = struct {
         }
 
         var result = pipeline.transcribeWithOptions(decoded_audio.data, decode_options) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return inferenceFailureResponse(ctx, err);
         defer result.deinit();
 
         const model_str = body.model orelse "default";
@@ -6922,10 +6988,8 @@ pub const Node = struct {
                 try body.append(a, ':');
                 // Discovery does not parse chat templates (that is what made this handler
                 // slow), so only models already loaded can report a template failure.
-                const chat_template_failed = if (self.model_manager.getLoadedModel(entry.path)) |loaded|
-                    loaded.chat_template_failed
-                else
-                    false;
+                const chat_template_failed =
+                    self.model_manager.loadedChatTemplateFailed(entry.path) orelse false;
                 try appendModelInfo(
                     &body,
                     a,
@@ -9244,6 +9308,16 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
             .code = "INVALID_IMAGE",
             .message = "unsupported or corrupt image input",
         },
+        error.ResourceLimitExceeded => .{
+            .status = 400,
+            .code = "MODEL_RESOURCE_LIMIT",
+            .message = "request resource plan exceeds the configured inference budget",
+        },
+        error.ResourceTemporarilyUnavailable => .{
+            .status = 503,
+            .code = "MODEL_RESOURCE_BUSY",
+            .message = "insufficient inference capacity is currently available",
+        },
         else => .{
             .status = 500,
             .code = "INFERENCE_FAILED",
@@ -9314,6 +9388,22 @@ fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemErr
             .stage = "image_decode",
             .retryable = false,
             .status = 400,
+        },
+        error.ResourceLimitExceeded => .{
+            .index = @intCast(index),
+            .code = "MODEL_RESOURCE_LIMIT",
+            .message = "request resource plan exceeds the configured inference budget",
+            .stage = stage,
+            .retryable = false,
+            .status = 400,
+        },
+        error.ResourceTemporarilyUnavailable => .{
+            .index = @intCast(index),
+            .code = "MODEL_RESOURCE_BUSY",
+            .message = "insufficient inference capacity is currently available",
+            .stage = stage,
+            .retryable = true,
+            .status = 503,
         },
         else => .{
             .index = @intCast(index),
@@ -10165,6 +10255,14 @@ test "embedding image decode failures are permanent client input errors" {
     const runtime_failure = embedDenseInputFailure(error.OutOfMemory);
     try std.testing.expectEqual(@as(u16, 500), runtime_failure.status);
     try std.testing.expectEqualStrings("INFERENCE_FAILED", runtime_failure.code);
+
+    const limit_failure = embedDenseInputFailure(error.ResourceLimitExceeded);
+    try std.testing.expectEqual(@as(u16, 400), limit_failure.status);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", limit_failure.code);
+
+    const busy_failure = embedDenseInputFailure(error.ResourceTemporarilyUnavailable);
+    try std.testing.expectEqual(@as(u16, 503), busy_failure.status);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", busy_failure.code);
 }
 
 test "Antfly inference embed parser accepts data uri media payloads" {

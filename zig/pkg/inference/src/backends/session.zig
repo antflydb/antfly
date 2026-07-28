@@ -53,7 +53,13 @@ pub const ResidentOutputs = struct {
 /// cannot be derived from public output shapes; tensor-derived bytes scale it
 /// for dynamic batches and sequence lengths.
 pub const RunAdmission = struct {
-    controller: *memory.AdmissionController,
+    context: *anyopaque,
+    acquire_fn: *const fn (
+        context: *anyopaque,
+        backend_class: memory.BackendClass,
+        limits: memory.Limits,
+        amounts: memory.AdmissionAmounts,
+    ) anyerror!memory.AdmissionLease,
     backend_class: memory.BackendClass,
     limits: memory.Limits,
     static_workspace_bytes: usize,
@@ -64,11 +70,11 @@ pub const RunAdmission = struct {
         inputs: []const Tensor,
         output_info: []const TensorInfo,
     ) !memory.AdmissionLease {
-        return self.controller.tryAcquire(
+        return self.acquire_fn(
+            self.context,
             self.backend_class,
             self.limits,
             try self.estimateAmounts(inputs, output_info),
-            true,
         );
     }
 
@@ -102,6 +108,16 @@ pub const RunAdmission = struct {
         };
     }
 };
+
+fn acquireFromController(
+    context: *anyopaque,
+    backend_class: memory.BackendClass,
+    limits: memory.Limits,
+    amounts: memory.AdmissionAmounts,
+) !memory.AdmissionLease {
+    const controller: *memory.AdmissionController = @ptrCast(@alignCast(context));
+    return controller.tryAcquire(backend_class, limits, amounts, true);
+}
 
 fn tensorBytes(tensors: []const Tensor) !usize {
     var total: usize = 0;
@@ -289,7 +305,8 @@ test "run admission scales dynamic outputs and honors reserved backend workspace
     }};
 
     const cpu = RunAdmission{
-        .controller = &controller,
+        .context = &controller,
+        .acquire_fn = acquireFromController,
         .backend_class = .cpu,
         .limits = .{},
         .static_workspace_bytes = 4096,
@@ -299,7 +316,8 @@ test "run admission scales dynamic outputs and honors reserved backend workspace
     try std.testing.expectEqual(@as(usize, 0), cpu_amounts.backend_scratch_bytes);
 
     const gpu = RunAdmission{
-        .controller = &controller,
+        .context = &controller,
+        .acquire_fn = acquireFromController,
         .backend_class = .gpu,
         .limits = .{},
         .static_workspace_bytes = 4096,

@@ -1350,6 +1350,11 @@ pub fn runFromIterator(
     if (loaded_config) |*cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
         if (cfg.inference.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
+        if (cfg.inference.keep_alive) |value|
+            antfly_node_cfg.keep_alive_ms = try parseInferenceKeepAliveMs(value);
+        if (cfg.inference.max_loaded_models) |value|
+            antfly_node_cfg.max_loaded_models =
+                std.math.cast(usize, value) orelse return error.InvalidInferenceModelCacheConfig;
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
     // Until DataServer exists, error cleanup is owned here. Once its
@@ -3761,6 +3766,52 @@ fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.C
     if (cli.inference_models_dir) |value| return value;
     if (cfg) |loaded| return loaded.inference.models_dir;
     return null;
+}
+
+fn parseInferenceKeepAliveMs(raw: []const u8) !u64 {
+    if (std.mem.eql(u8, raw, "0")) return 0;
+    if (raw.len == 0) return error.InvalidInferenceModelCacheConfig;
+    var i: usize = 0;
+    var total_ns: u64 = 0;
+    while (i < raw.len) {
+        const start = i;
+        while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) {}
+        if (i == start) return error.InvalidInferenceModelCacheConfig;
+        const value = std.fmt.parseUnsigned(u64, raw[start..i], 10) catch
+            return error.InvalidInferenceModelCacheConfig;
+        const unit_ns: u64 = if (std.mem.startsWith(u8, raw[i..], "ms")) blk: {
+            i += 2;
+            break :blk std.time.ns_per_ms;
+        } else if (i < raw.len and raw[i] == 's') blk: {
+            i += 1;
+            break :blk std.time.ns_per_s;
+        } else if (i < raw.len and raw[i] == 'm') blk: {
+            i += 1;
+            break :blk std.time.ns_per_min;
+        } else if (i < raw.len and raw[i] == 'h') blk: {
+            i += 1;
+            break :blk std.time.ns_per_hour;
+        } else return error.InvalidInferenceModelCacheConfig;
+        const part_ns = std.math.mul(u64, value, unit_ns) catch
+            return error.InvalidInferenceModelCacheConfig;
+        total_ns = std.math.add(u64, total_ns, part_ns) catch
+            return error.InvalidInferenceModelCacheConfig;
+    }
+    if (total_ns == 0) return 0;
+    return @max(@as(u64, 1), total_ns / std.time.ns_per_ms);
+}
+
+test "standalone inference keep alive parses compound durations and zero" {
+    try std.testing.expectEqual(@as(u64, 0), try parseInferenceKeepAliveMs("0"));
+    try std.testing.expectEqual(@as(u64, 0), try parseInferenceKeepAliveMs("0s"));
+    try std.testing.expectEqual(
+        @as(u64, 90_000),
+        try parseInferenceKeepAliveMs("1m30s"),
+    );
+    try std.testing.expectError(
+        error.InvalidInferenceModelCacheConfig,
+        parseInferenceKeepAliveMs("forever"),
+    );
 }
 
 fn resolveInferenceMlDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {

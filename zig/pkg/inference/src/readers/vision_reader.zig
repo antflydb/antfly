@@ -43,6 +43,7 @@ pub const LoadedVisionReader = struct {
     dec_config: enc_dec_mod.DecoderConfig,
     preproc: PreprocessorConfig,
     loaded_model: ?*model_manager_mod.LoadedModel = null,
+    loaded_model_handle: ?model_manager_mod.ModelHandle = null,
     managed_hf_tok: ?model_manager_mod.ManagedHfTokenizer = null,
     owns_sessions: bool = false,
     encoder_managed: ?model_manager_mod.ManagedSession = null,
@@ -69,7 +70,9 @@ pub const LoadedVisionReader = struct {
             return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), &loader, null);
         } else |_| {}
 
-        const model = try model_manager.loadFromDir(model_path);
+        var model_handle = try model_manager.acquireFromDir(model_path);
+        errdefer model_handle.release();
+        const model = model_handle.get();
         const florence_config = session_factory.getFlorenceConfig(model.session) orelse return error.InvalidModelForReading;
         const preproc_path = model.manifest.preprocessor_config_path orelse return error.IncompleteFlorence2Bundle;
         const preproc = try loadPreprocessorConfigFile(allocator, preproc_path);
@@ -85,6 +88,7 @@ pub const LoadedVisionReader = struct {
             .dec_config = dec_config,
             .preproc = preproc,
             .loaded_model = model,
+            .loaded_model_handle = model_handle,
             .owns_sessions = false,
         };
     }
@@ -170,6 +174,7 @@ pub const LoadedVisionReader = struct {
             if (self.encoder_managed) |*managed| managed.deinit() else self.encoder_session.close();
             if (self.decoder_managed) |*managed| managed.deinit() else self.decoder_session.close();
         }
+        if (self.loaded_model_handle) |*handle| handle.release();
     }
 
     pub fn readRaw(self: *LoadedVisionReader, image_data: []const u8, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadResult {
