@@ -10014,15 +10014,8 @@ components:
         - $setOnInsert
         - $unset
         - $inc
-        - $push
-        - $pull
         - $addToSet
-        - $pop
-        - $mul
-        - $min
         - $max
-        - $currentDate
-        - $rename
       description: MongoDB-style update operator
     TransformOp:
       type: object
@@ -10037,8 +10030,7 @@ components:
           description: JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
           example: $.views
         value:
-          description: Value for operation (not required for $unset, $currentDate). Type depends on operator
-            (number for $inc/$mul, any for $set/$setOnInsert, etc.)
+          description: Value for operation (not required for $unset). Type depends on the supported operator.
     Transform:
       type: object
       required:
@@ -10075,8 +10067,9 @@ components:
           - op: $inc
             path: $.views
             value: 1
-          - op: $currentDate
+          - op: $set
             path: $.lastViewed
+            value: '2026-07-28T12:00:00Z'
     ScanKeysRequest:
       type: object
       description: >
@@ -10284,16 +10277,16 @@ components:
 
             - Multiple operations per document are applied in sequence
 
-            - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more
+            - Supports numeric and set-like operations ($inc, $max, $addToSet)
 
 
             Common use cases:
 
             - Increment counters (views, likes, votes)
 
-            - Update timestamps ($currentDate)
+            - Update timestamps ($set)
 
-            - Manage arrays (add/remove tags, items)
+            - Add unique array values ($addToSet)
 
             - Update nested fields without overwriting the entire document
           items:
@@ -10304,11 +10297,12 @@ components:
                 - op: $inc
                   path: $.views
                   value: 1
-                - op: $currentDate
+                - op: $set
                   path: $.lastViewed
+                  value: '2026-07-28T12:00:00Z'
             - key: user:456
               operations:
-                - op: $push
+                - op: $addToSet
                   path: $.tags
                   value: vip
         sync_level:
@@ -14599,9 +14593,8 @@ components:
         op:
           type: string
           description: >
-            Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
-
-            `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`.
+            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`,
+            `$max`.
 
             Replication-specific: `$merge` (flatten JSONB into top-level fields),
 

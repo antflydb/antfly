@@ -32,9 +32,16 @@ pub fn resolveDocumentTransform(
     } else std.json.Value{ .object = std.json.ObjectMap.empty };
     defer freeJsonValue(alloc, &root);
 
+    // Validate the whole transform before changing the cloned document.  In
+    // particular, never acknowledge an operator that this implementation does
+    // not support and never partially apply a mixed transform.
     for (transform.operations) |op| {
-        applyTransformOp(alloc, &root, op, is_insert) catch continue;
+        switch (op.op) {
+            .set, .set_on_insert, .unset, .inc, .add_to_set, .max => {},
+            else => return error.UnsupportedTransformOperation,
+        }
     }
+    for (transform.operations) |op| try applyTransformOp(alloc, &root, op, is_insert);
 
     return try std.json.Stringify.valueAlloc(alloc, root, .{});
 }
@@ -430,4 +437,24 @@ test "resolve document transform skips missing document without upsert" {
     };
     const resolved = try resolveDocumentTransform(alloc, null, transform);
     try std.testing.expect(resolved == null);
+}
+
+test "unsupported transforms fail atomically instead of reporting success" {
+    const alloc = std.testing.allocator;
+    const unsupported = [_]types.TransformOpType{
+        .push, .pull, .pop, .mul, .min, .current_date, .rename,
+    };
+    for (unsupported) |op| {
+        const operations = [_]types.TransformOp{
+            .{ .op = .set, .path = "changed", .value_json = "true" },
+            .{ .op = op, .path = "n", .value_json = "3" },
+        };
+        try std.testing.expectError(
+            error.UnsupportedTransformOperation,
+            resolveDocumentTransform(alloc, "{\"n\":9}", .{
+                .key = "doc",
+                .operations = &operations,
+            }),
+        );
+    }
 }

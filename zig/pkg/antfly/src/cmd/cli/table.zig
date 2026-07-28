@@ -23,7 +23,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
 
     if (std.mem.eql(u8, subcommand, "create")) return createTable(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "drop")) return dropTable(client, args);
-    if (std.mem.eql(u8, subcommand, "list")) return listTables(allocator, io, client);
+    if (std.mem.eql(u8, subcommand, "list")) return listTablesWithArgs(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "get")) return getTable(allocator, io, client, args);
 
     if (std.mem.startsWith(u8, subcommand, "--")) {
@@ -55,7 +55,7 @@ fn runWithFlags(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
     if (table_name) |name| {
         return getTableByName(allocator, io, client, name);
     }
-    return listTables(allocator, io, client);
+    return listTablesMode(allocator, io, client, if (output != null) .json else .summary);
 }
 
 fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -114,10 +114,53 @@ fn dropTable(client: *antfly_client.AntflyClient, args: *std.process.Args.Iterat
 }
 
 fn listTables(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
+    return listTablesMode(allocator, io, client, .summary);
+}
+
+const ListOutput = enum { summary, json };
+
+fn listTablesWithArgs(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+    var output: ListOutput = .summary;
+    var explicitly_selected = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--verbose")) {
+            if (explicitly_selected) cli.fatal("use only one of --verbose or --output json", .{});
+            output = .json;
+            explicitly_selected = true;
+        } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
+            if (explicitly_selected) cli.fatal("use only one of --verbose or --output json", .{});
+            const value = args.next() orelse cli.fatal("--output requires json", .{});
+            if (!std.mem.eql(u8, value, "json")) cli.fatal("only JSON output is supported for table", .{});
+            output = .json;
+            explicitly_selected = true;
+        } else {
+            cli.fatal("unknown table list option: {s}", .{arg});
+        }
+    }
+    return listTablesMode(allocator, io, client, output);
+}
+
+fn listTablesMode(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, output: ListOutput) !void {
     var resp = try client.listTables();
     defer resp.deinit();
     if (resp.data) |parsed| {
-        try cli.writeJson(allocator, io, parsed.value);
+        if (output == .json) return cli.writeJson(allocator, io, parsed.value);
+        cli.writeStdout(io, "NAME\tSHARDS\tINDEXES\tSTORAGE\n");
+        for (parsed.value) |table| {
+            const storage = if (table.storage_status.empty orelse false)
+                "empty"
+            else if (table.storage_status.disk_usage != null)
+                "used"
+            else
+                "unknown";
+            const line = try std.fmt.allocPrint(
+                allocator,
+                "{s}\t{d}\t{d}\t{s}\n",
+                .{ table.name, table.shards.map.count(), table.indexes.map.count(), storage },
+            );
+            defer allocator.free(line);
+            cli.writeStdout(io, line);
+        }
     }
 }
 

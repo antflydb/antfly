@@ -144,6 +144,19 @@ pub const MetadataState = struct {
         try self.desired.replaceTopology(tables, ranges);
         try self.desired.syncProjectedSplitTransitions(self.committed_splits.items);
         try self.desired.syncProjectedMergeTransitions(self.committed_merges.items);
+        // A finalized transition can be visible one reconciliation before the
+        // projected topology contains its result.  Fold that durable intent
+        // into desired topology before compacting it.
+        for (self.committed_splits.items) |record| switch (record.phase) {
+            .finalized => try self.desired.applyFinalizedSplit(record),
+            .rolled_back => self.desired.applyRolledBackSplit(record.transition_id),
+            else => {},
+        };
+        for (self.committed_merges.items) |record| switch (record.phase) {
+            .finalized => try self.desired.applyFinalizedMerge(record),
+            .rolled_back => self.desired.applyRolledBackMerge(record.transition_id),
+            else => {},
+        };
     }
 
     pub fn syncProjected(self: *MetadataState, service: anytype) !void {
@@ -1269,6 +1282,37 @@ test "metadata state seeds active projected transitions after authority handoff"
     try std.testing.expectEqual(@as(u64, 7001), splits[0].transition_id);
     try std.testing.expectEqual(@as(u64, 4), splits[0].attempt_epoch);
     try std.testing.expectEqualStrings("doc:m", splits[0].split_key.?);
+}
+
+test "metadata state folds finalized split before projected topology catches up" {
+    var state = MetadataState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.projected.upsertTable(.{ .table_id = 7, .name = "docs" });
+    try state.projected.upsertRange(.{
+        .group_id = 71,
+        .table_id = 7,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+        .split_attempt_epoch = 4,
+    });
+    try state.committed_splits.append(std.testing.allocator, try cloneSplitRecord(std.testing.allocator, .{
+        .transition_id = 7001,
+        .attempt_epoch = 4,
+        .source_group_id = 71,
+        .destination_group_id = 72,
+        .phase = .finalized,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+    }));
+
+    try state.seedDesiredFromProjected();
+    const ranges = try state.desired.listRanges(std.testing.allocator);
+    defer state.desired.freeRanges(std.testing.allocator, ranges);
+    try std.testing.expectEqual(@as(usize, 2), ranges.len);
+    const splits = try state.desired.listDesiredSplitTransitions(std.testing.allocator);
+    defer state.desired.freeSplitTransitions(std.testing.allocator, splits);
+    try std.testing.expectEqual(@as(usize, 0), splits.len);
 }
 
 test "metadata state skips orphan projected ranges during projected sync" {

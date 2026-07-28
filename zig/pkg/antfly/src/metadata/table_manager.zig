@@ -1281,9 +1281,14 @@ pub const TableManager = struct {
     }
 
     pub fn applyFinalizedSplit(self: *TableManager, record: transition_state.SplitTransitionRecord) !void {
-        if (!self.split_intents.contains(record.transition_id)) return;
         const split_key = record.split_key orelse return error.MissingSplitKey;
         const source = self.ranges.get(record.source_group_id) orelse return error.UnknownSourceRange;
+        if (self.ranges.contains(record.destination_group_id) and
+            source.end_key != null and std.mem.eql(u8, source.end_key.?, split_key))
+        {
+            _ = self.removeSplitIntent(record.transition_id);
+            return;
+        }
         const identity_shard_id = rangeDocIdentityShardId(source);
         const identity_range_id = rangeDocIdentityRangeId(source);
 
@@ -1317,8 +1322,13 @@ pub const TableManager = struct {
     }
 
     pub fn applyFinalizedMerge(self: *TableManager, record: transition_state.MergeTransitionRecord) !void {
-        if (!self.merge_intents.contains(record.transition_id)) return;
-        const donor = self.ranges.get(record.donor_group_id) orelse return error.UnknownDonorRange;
+        const donor = self.ranges.get(record.donor_group_id) orelse {
+            if (self.ranges.contains(record.receiver_group_id)) {
+                _ = self.removeMergeIntent(record.transition_id);
+                return;
+            }
+            return error.UnknownDonorRange;
+        };
         const receiver = self.ranges.get(record.receiver_group_id) orelse return error.UnknownReceiverRange;
         const merged_start = if (std.mem.order(u8, donor.start_key, receiver.start_key) == .lt) donor.start_key else receiver.start_key;
         const merged_end = switch (optionalBytesOrder(donor.end_key, receiver.end_key)) {

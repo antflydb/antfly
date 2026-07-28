@@ -39,6 +39,18 @@ def _response_hit_ids(result: dict) -> list[str]:
     return [hit.get("_id") for hit in responses[0].get("hits", {}).get("hits", [])]
 
 
+def test_missing_table_index_list_fails_without_status_retry_delay(stateful_api):
+    started = time.monotonic()
+    response = stateful_api.s.get(
+        f"{stateful_api.url}/tables/missing-{time.time_ns()}/indexes",
+        timeout=5,
+    )
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 404
+    assert elapsed < 2.0
+
+
 def _index_names(index_list: list[dict]) -> set[str]:
     return {entry["config"]["name"] for entry in index_list}
 

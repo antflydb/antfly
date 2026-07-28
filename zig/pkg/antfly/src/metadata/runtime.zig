@@ -58,7 +58,6 @@ const CliConfig = struct {
     api_host: ?[]const u8 = null,
     api_port: ?u16 = null,
     cluster_json: ?[]const u8 = null,
-    join: bool = false,
     health_enabled: ?bool = null,
     health_port: ?u16 = null,
     raft_tick_ms: u64 = antfly.raft.RuntimeCadence.default_raft_tick_ms,
@@ -871,7 +870,6 @@ pub fn runFromIterator(
     const metadata_group_id = group_ids.main_metadata_group_id;
     const cluster_peers = try resolveMetadataClusterPeers(alloc, cli.cluster_json, if (loaded_config) |*cfg| cfg else null);
     defer freeMetadataClusterPeers(alloc, cluster_peers);
-    if (cli.join) return error.UnsupportedMetadataJoin;
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
 
@@ -1008,10 +1006,6 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--cluster")) {
             cfg.cluster_json = args.next() orelse return error.InvalidArguments;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--join")) {
-            cfg.join = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--health-port")) {
@@ -1393,7 +1387,6 @@ fn printUsage(argv0: []const u8) void {
         \\  --api-host <host>              Metadata admin API bind host (default: raft host)
         \\  --api-port <port>              Metadata admin API bind port (default: 0)
         \\  --cluster <json>               Metadata raft peer URLs, e.g. {{"1":"http://127.0.0.1:9017"}}
-        \\  --join                         Join an existing metadata cluster (not yet supported)
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --raft-tick-ms <ms>            Consensus progress interval, 1-1000 (default: 100)

@@ -97,6 +97,11 @@ pub const AntflyApiHandler = struct {
         _ = ctx.status(resp.status);
         if (resp.content_type) |ct| {
             try ctx.setHeader("content-type", ct);
+        } else if (resp.status >= 200 and resp.status < 300) {
+            // Legacy API responses without an explicit type are JSON.  Keep
+            // this compatibility default at the shared adapter so every
+            // successful route presents the same wire contract.
+            try ctx.setHeader("content-type", "application/json");
         }
         for (resp.headers) |hdr| {
             try ctx.setHeader(hdr.name, hdr.value);
@@ -110,6 +115,8 @@ pub const AntflyApiHandler = struct {
         _ = ctx.status(resp.status);
         if (resp.content_type) |ct| {
             try ctx.setHeader("content-type", ct);
+        } else if (resp.status >= 200 and resp.status < 300) {
+            try ctx.setHeader("content-type", "application/json");
         }
         for (resp.headers) |hdr| {
             try ctx.setHeader(hdr.name, hdr.value);

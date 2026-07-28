@@ -8952,6 +8952,14 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
     ) public_table_http.TableApi.ExecuteListIndexesError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        // A projected catalog miss is authoritative enough to reject a typo;
+        // do not enter the five-second linearizable/status retry path for a
+        // table that is already known not to exist.
+        var cached = self.source.cachedAdminSnapshot() catch null;
+        if (cached) |*snapshot| {
+            defer self.source.freeAdminSnapshot(snapshot);
+            if (tables_api.findTableByName(snapshot, table_name) == null) return error.NotFound;
+        }
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot) catch return error.InternalFailure;

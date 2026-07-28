@@ -19720,7 +19720,7 @@ fn resolveWritesForSchemaValidation(
         defer if (existing_from_db) |body| alloc.free(body);
         const existing = existing_from_request orelse existing_from_db;
         const resolved = db_mod.transform.resolveDocumentTransform(alloc, existing, transform) catch |err| switch (err) {
-            error.InvalidArgument => return error.InvalidBatchRequest,
+            error.InvalidArgument, error.UnsupportedTransformOperation => return error.InvalidBatchRequest,
             else => return err,
         } orelse continue;
 
