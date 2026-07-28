@@ -5582,7 +5582,10 @@ pub const ApiHttpServer = struct {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, table_path.table_name);
                 defer self.alloc.free(table_name);
                 var create_req = table_contract.parseCreateTableRequest(self.alloc, req.body) catch |err| {
-                    std.log.err("create table parse failed: {} body_len={d}", .{ err, req.body.len });
+                    // Invalid client input is an expected 4xx outcome. Keep
+                    // enough diagnostic context at debug level without turning
+                    // arbitrary requests into operational error alerts.
+                    std.log.debug("create table request rejected: {} body_len={d}", .{ err, req.body.len });
                     if (err == error.InvalidCreateTableSchemaRequest) {
                         return try textResponse(self.alloc, 400, table_contract.createTableRequestErrorMessage(req.body));
                     }

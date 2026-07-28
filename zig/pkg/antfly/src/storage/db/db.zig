@@ -55038,6 +55038,117 @@ test "db async replay truncation retains durable enrichment debt" {
     try std.testing.expectEqual(target_sequence, retained[0].sequence);
 }
 
+test "db restart after provider failure resumes enrichment from retained async replay" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var first_applied_sequence: u64 = 0;
+    var failed_target_sequence: u64 = 0;
+    {
+        // Permit one document to establish a durable enrichment watermark, then
+        // keep returning a retryable provider error for the next document while
+        // the independent managed-index executor reaches the replay tail.
+        var gated = GateDenseEmbedder{};
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = gated.interface(),
+            },
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+        first_applied_sequence = db.core.nextEnrichmentSequence();
+        try db.enrichment_runtime.?.waitForApplied(first_applied_sequence);
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"beta\"}" }},
+            .sync_level = .write,
+        });
+        failed_target_sequence = db.core.nextEnrichmentSequence();
+        try std.testing.expect(failed_target_sequence > first_applied_sequence);
+
+        var attempts: usize = 0;
+        while (attempts < default_test_wait_attempts and gated.snapshot().rate_limited_requests == 0) : (attempts += 1) {
+            sleepPollInterval();
+        }
+        try std.testing.expect(gated.snapshot().rate_limited_requests > 0);
+
+        // Stop at the observed provider failure boundary, then let the
+        // independent executor finish and attempt async truncation. This
+        // deterministically models the process exiting during the outage
+        // without spending the test budget on provider retry backoff.
+        db.enrichment_runtime.?.stop();
+        try db.executor.waitForAll(failed_target_sequence);
+
+        const failed_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, failed_stats);
+        try std.testing.expectEqual(first_applied_sequence, failed_stats.enrichment.applied_sequence);
+        try std.testing.expectEqual(failed_target_sequence, failed_stats.enrichment.target_sequence);
+
+        const retained = try replay_stream_mod.iterateFrom(alloc, db.core.store, first_applied_sequence + 1);
+        defer {
+            for (retained) |*entry| entry.deinit(alloc);
+            alloc.free(retained);
+        }
+        try std.testing.expect(retained.len > 0);
+        var retained_failed_target = false;
+        for (retained) |entry| {
+            if (entry.sequence == failed_target_sequence) retained_failed_target = true;
+        }
+        try std.testing.expect(retained_failed_target);
+    }
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try reopened.runUntilIdle();
+
+    const recovered_stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, recovered_stats);
+    try std.testing.expect(recovered_stats.enrichment.applied_sequence >= failed_target_sequence);
+    try std.testing.expectEqual(recovered_stats.enrichment.applied_sequence, recovered_stats.enrichment.target_sequence);
+
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:b", "body_dense_v1");
+    defer alloc.free(artifact_key);
+    const artifacts = try reopened.core.store.scanPrefix(alloc, artifact_key);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.len);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "beta", 3);
+    defer alloc.free(query_vec);
+    var result = try reopened.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = query_vec,
+            .k = 2,
+        },
+        .limit = 2,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+}
+
 test "db io_threaded executor processes indexed writes" {
     const alloc = std.testing.allocator;
 

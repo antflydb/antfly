@@ -37,10 +37,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         else => return error.InvalidCreateTableRequest,
     };
     if (raw_root.get("indexes")) |indexes_value| {
-        if (indexes_value != .null) {
-            const validated_indexes_json = try normalizeCreateTableIndexesFromValue(alloc, indexes_value);
-            alloc.free(validated_indexes_json);
-        }
+        if (indexes_value != .null) try validateCreateTableIndexesValue(indexes_value);
     }
 
     // Use typed OpenAPI parsing for scalar fields (num_shards, description, schema,
@@ -319,6 +316,20 @@ fn validatePublicIndexObject(object: anytype) !void {
         return;
     }
     return error.InvalidCreateIndexRequest;
+}
+
+fn validateCreateTableIndexesValue(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
+        try validateCreateTableIndexName(entry.key_ptr.*);
+        validatePublicIndexObject(entry.value_ptr.object) catch return error.InvalidCreateTableRequest;
+    }
 }
 
 fn normalizeArtifactEnrichmentConfigJson(
