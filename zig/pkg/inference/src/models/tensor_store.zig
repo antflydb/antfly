@@ -338,6 +338,7 @@ pub const GgufStore = struct {
 
         var parsed = try gguf_mod.format.parse(allocator, mmap_region.data);
         errdefer parsed.deinit(allocator);
+        try gguf_mod.format.validateTensorDataRanges(&parsed, mmap_region.data.len);
 
         // Mark the tensor data region as random-access to prevent kernel
         // readahead from faulting the entire file into RAM. Header/metadata
@@ -367,6 +368,7 @@ pub const GgufStore = struct {
 
         var parsed = try gguf_mod.format.parse(allocator, owned_bytes);
         errdefer parsed.deinit(allocator);
+        try gguf_mod.format.validateTensorDataRanges(&parsed, owned_bytes.len);
 
         self.* = .{
             .allocator = allocator,

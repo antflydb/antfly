@@ -121,6 +121,31 @@ pub fn parseStructure(allocator: std.mem.Allocator, bytes: []const u8) !File {
     return parseWithOptions(allocator, bytes, .{ .skip_tokenizer_metadata = true });
 }
 
+/// Validate every tensor's encoded byte range without reading tensor payloads.
+///
+/// Header parsing alone cannot prove that a GGUF is safe to materialize: a
+/// truncated file can contain a valid tensor table whose offsets extend beyond
+/// the mapping. Keep this check separate from parsing so metadata-only callers
+/// can operate on header fixtures, while artifact-opening paths can fail before
+/// retaining an unsafe mapping.
+pub fn validateTensorDataRanges(file: *const File, file_len: usize) !void {
+    const file_len_u64: u64 = @intCast(file_len);
+    // Metadata-only GGUFs have no data region to validate, and need not carry
+    // alignment padding after their header.
+    if (file.tensors.len > 0 and file.data_region_offset > file_len_u64)
+        return error.TruncatedTensorData;
+
+    for (file.tensors) |tensor| {
+        if (tensor.offset % file.alignment != 0) return error.InvalidTensorOffset;
+        // Unknown encodings are reported by backend compatibility checks. Their
+        // byte span is unknowable here, so do not misclassify them as truncation.
+        const byte_len = tensor_types.byteLen(tensor.tensor_type, tensor.dimensions) orelse continue;
+        const data_end = std.math.add(u64, tensor.data_offset, byte_len) catch
+            return error.InvalidTensorOffset;
+        if (data_end > file_len_u64) return error.TruncatedTensorData;
+    }
+}
+
 /// Return the encoded byte span of metadata entries whose keys share `prefix`
 /// without allocating or materializing arrays. Resource admission uses this to
 /// size embedded tokenizer state without treating the whole GGUF weight file as
@@ -729,6 +754,26 @@ test "parse tensor type 39 by gguf architecture dialect" {
     defer parsed_bitnet.deinit(allocator);
     try std.testing.expectEqualStrings("TL2", parsed_bitnet.tensors[0].tensor_type.name());
     try std.testing.expectEqual(@as(u32, 39), parsed_bitnet.tensors[0].tensor_type.raw());
+}
+
+test "tensor data range validation rejects truncated payloads" {
+    const allocator = std.testing.allocator;
+
+    // The fixture contains 128 payload bytes, while its 256x4 F32 tensor
+    // contract requires 4,096 bytes.
+    var truncated = try buildSingleTensorGguf(
+        allocator,
+        "llama",
+        @intFromEnum(tensor_types.KnownTensorType.F32),
+    );
+    defer truncated.deinit(allocator);
+    var parsed = try parseStructure(allocator, truncated.items);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expectError(
+        error.TruncatedTensorData,
+        validateTensorDataRanges(&parsed, truncated.items.len),
+    );
 }
 
 fn buildSingleTensorGguf(allocator: std.mem.Allocator, architecture: []const u8, raw_tensor_type: u32) !std.ArrayListUnmanaged(u8) {

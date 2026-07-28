@@ -142,6 +142,148 @@ fn summaryFromAssessment(assessment: model_compatibility.Assessment) Compatibili
     };
 }
 
+const NativeCompanionKind = enum {
+    gguf,
+    safetensors,
+};
+
+const NativeCompanion = struct {
+    path: []const u8,
+    kind: NativeCompanionKind,
+};
+
+fn validateGgufCompanionForBackend(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    backend: backends.BackendType,
+) !?CompatibilitySummary {
+    var mapped = c_file.MmapRegion.init(allocator, path) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .level = .incompatible,
+            .code = .artifact_unreadable,
+            .message = "a required companion GGUF is missing or unreadable",
+        };
+    };
+    defer mapped.deinit();
+
+    var file = gguf_format.parseStructure(allocator, mapped.data) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .level = .incompatible,
+            .code = .artifact_unreadable,
+            .message = "a required companion GGUF has invalid structure",
+        };
+    };
+    defer file.deinit(allocator);
+    gguf_format.validateTensorDataRanges(&file, mapped.data.len) catch {
+        return .{
+            .level = .incompatible,
+            .code = .artifact_unreadable,
+            .message = "a required companion GGUF has invalid or truncated tensor data",
+        };
+    };
+    const parsed_prefix_len = std.math.cast(usize, file.data_region_offset) orelse mapped.data.len;
+    mapped.adviseSequentialPrefix(@min(parsed_prefix_len, mapped.data.len));
+
+    if (file.tensors.len == 0) {
+        return .{
+            .level = .incompatible,
+            .code = .artifact_unreadable,
+            .message = "a required companion GGUF contains no tensors",
+        };
+    }
+    for (file.tensors) |tensor| {
+        if (!session_factory.ggufTensorTypeSupportsBackend(tensor.tensor_type, backend)) {
+            return .{
+                .level = .incompatible,
+                .code = .unsupported_tensor_type,
+                .message = "the selected backend cannot materialize a required companion GGUF",
+            };
+        }
+    }
+    return null;
+}
+
+fn validateNativeCompanionsForBackend(
+    allocator: std.mem.Allocator,
+    man: *const manifest_mod.ModelManifest,
+    candidate: ArtifactCandidateKind,
+    backend: backends.BackendType,
+) !?CompatibilitySummary {
+    // An ONNX route never consumes native sidecars. Native primary routes can
+    // consume a projector, a split GLiNER head, and lazily loaded multimodal
+    // sessions, so all of those are part of the compatibility contract.
+    if (candidate == .onnx) return null;
+
+    var companions: [8]NativeCompanion = undefined;
+    var companion_count: usize = 0;
+    if (man.gguf_projector_path) |path| {
+        companions[companion_count] = .{ .path = path, .kind = .gguf };
+        companion_count += 1;
+    }
+    if (candidate == .gguf) {
+        if (man.gliner_head_gguf_path) |path| {
+            companions[companion_count] = .{ .path = path, .kind = .gguf };
+            companion_count += 1;
+        } else if (man.gliner_head_safetensors_path) |path| {
+            companions[companion_count] = .{ .path = path, .kind = .safetensors };
+            companion_count += 1;
+        }
+    }
+
+    const lazy_component_paths = [_]?[]const u8{
+        man.visual_model_path,
+        man.audio_model_path,
+        man.text_projection_path,
+        man.visual_projection_path,
+        man.audio_projection_path,
+    };
+    for (lazy_component_paths) |maybe_path| {
+        const path = maybe_path orelse continue;
+        const kind: NativeCompanionKind = if (std.mem.endsWith(u8, path, ".gguf"))
+            .gguf
+        else if (std.mem.endsWith(u8, path, ".safetensors"))
+            .safetensors
+        else
+            continue;
+        companions[companion_count] = .{ .path = path, .kind = kind };
+        companion_count += 1;
+    }
+
+    for (companions[0..companion_count], 0..) |companion, companion_index| {
+        var duplicate = false;
+        for (companions[0..companion_index]) |previous| {
+            if (previous.kind == companion.kind and std.mem.eql(u8, previous.path, companion.path)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
+        switch (companion.kind) {
+            .gguf => if (try validateGgufCompanionForBackend(
+                allocator,
+                companion.path,
+                backend,
+            )) |summary| return summary,
+            .safetensors => safetensors_mod.validateArtifactSet(
+                allocator,
+                companion.path,
+                null,
+            ) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return .{
+                    .level = .incompatible,
+                    .code = .artifact_unreadable,
+                    .message = "a required companion safetensors file is invalid or unreadable",
+                };
+            },
+        }
+    }
+    return null;
+}
+
 /// Assess exactly the artifact route that `backend` would load. Optional
 /// artifacts for other backends must not poison this result.
 pub fn compatibilitySummaryForBackend(
@@ -207,6 +349,12 @@ pub fn compatibilitySummaryForBackend(
             };
         };
     }
+    if (try validateNativeCompanionsForBackend(
+        allocator,
+        man,
+        candidate,
+        backend,
+    )) |summary| return summary;
 
     // Validate only ONNX graphs reachable from the selected artifact route.
     // Native GGUF/safetensors routes can still lazily load vision/audio and
@@ -3625,6 +3773,133 @@ test "safetensors compatibility rejects a missing referenced shard" {
     try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
 }
 
+test "native compatibility rejects a missing lazy GGUF companion" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeTinyHeadSafetensorsForModelManagerTest(
+        dir.dir,
+        allocator,
+        "model.safetensors",
+    );
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "llama"),
+        .safetensors_path = try std.fs.path.join(allocator, &.{ root, "model.safetensors" }),
+        .audio_model_path = try std.fs.path.join(allocator, &.{ root, "missing-clap.gguf" }),
+    };
+    defer man.deinit();
+
+    const summary = (try compatibilitySummaryForBackend(
+        allocator,
+        root,
+        &man,
+        .native,
+    )).?;
+    try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
+    try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
+}
+
+test "native compatibility rejects a corrupt GGUF projector" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeTinyHeadSafetensorsForModelManagerTest(
+        dir.dir,
+        allocator,
+        "model.safetensors",
+    );
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "mmproj.gguf",
+        .data = "not a GGUF",
+    });
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "llama"),
+        .safetensors_path = try std.fs.path.join(allocator, &.{ root, "model.safetensors" }),
+        .gguf_projector_path = try std.fs.path.join(allocator, &.{ root, "mmproj.gguf" }),
+    };
+    defer man.deinit();
+
+    const summary = (try compatibilitySummaryForBackend(
+        allocator,
+        root,
+        &man,
+        .native,
+    )).?;
+    try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
+    try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
+}
+
+test "native compatibility rejects unsupported companion GGUF tensor types" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeTinyHeadSafetensorsForModelManagerTest(
+        dir.dir,
+        allocator,
+        "model.safetensors",
+    );
+    try writeTinyHeadGgufWithTensorTypeForModelManagerTest(
+        dir.dir,
+        allocator,
+        "clap.gguf",
+        .{ .known = .F64 },
+    );
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "llama"),
+        .safetensors_path = try std.fs.path.join(allocator, &.{ root, "model.safetensors" }),
+        .audio_model_path = try std.fs.path.join(allocator, &.{ root, "clap.gguf" }),
+    };
+    defer man.deinit();
+
+    const summary = (try compatibilitySummaryForBackend(
+        allocator,
+        root,
+        &man,
+        .native,
+    )).?;
+    try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
+    try std.testing.expectEqual(model_compatibility.Code.unsupported_tensor_type, summary.code);
+}
+
+test "native compatibility rejects a malformed split GLiNER safetensors head" {
+    const allocator = std.testing.allocator;
+    const summary = (try validateNativeCompanionsForBackend(
+        allocator,
+        &.{
+            .allocator = allocator,
+            .gliner_head_safetensors_path = "/missing/gliner_head.safetensors",
+        },
+        .gguf,
+        .native,
+    )).?;
+    try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
+    try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
+}
+
 test "compatible artifact candidate wins aggregate compatibility" {
     const incompatible = CompatibilitySummary{
         .level = .incompatible,
@@ -4319,13 +4594,27 @@ fn writeTinyHeadGgufForModelManagerTest(
     allocator: std.mem.Allocator,
     sub_path: []const u8,
 ) !void {
+    return writeTinyHeadGgufWithTensorTypeForModelManagerTest(
+        dir,
+        allocator,
+        sub_path,
+        .{ .known = .F32 },
+    );
+}
+
+fn writeTinyHeadGgufWithTensorTypeForModelManagerTest(
+    dir: anytype,
+    allocator: std.mem.Allocator,
+    sub_path: []const u8,
+    tensor_type: gguf_tensor_types.TensorType,
+) !void {
     const metadata = [_]gguf_format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "antfly-gliner-head" } },
         .{ .key = "general.alignment", .value = .{ .u32 = @intCast(gguf_format.default_alignment) } },
     };
     const dims = [_]u64{2};
     const tensors = [_]gguf_writer.TensorSpec{
-        .{ .name = "span_rep.test", .dimensions = &dims, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "span_rep.test", .dimensions = &dims, .tensor_type = tensor_type },
     };
 
     var layout = try gguf_writer.buildLayout(allocator, &metadata, &tensors);
@@ -4336,7 +4625,9 @@ fn writeTinyHeadGgufForModelManagerTest(
     try data.appendSlice(allocator, layout.header_bytes);
     const data_region_offset = std.mem.alignForward(usize, layout.header_bytes.len, @intCast(layout.alignment));
     try data.appendNTimes(allocator, 0, data_region_offset - layout.header_bytes.len);
-    try data.appendSlice(allocator, std.mem.asBytes(&[_]f32{ 0.0, 0.0 }));
+    const tensor_byte_len = gguf_tensor_types.byteLen(tensor_type, &dims) orelse
+        return error.UnsupportedTensorType;
+    try data.appendNTimes(allocator, 0, tensor_byte_len);
 
     try dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = data.items });
 }

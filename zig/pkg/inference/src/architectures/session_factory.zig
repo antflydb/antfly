@@ -438,6 +438,7 @@ pub fn inspectGgufModelForListing(
 
     var file = try gguf_mod.format.parseStructure(allocator, mapped.data);
     defer file.deinit(allocator);
+    try gguf_mod.format.validateTensorDataRanges(&file, mapped.data.len);
     const parsed_prefix_len = std.math.cast(usize, file.data_region_offset) orelse mapped.data.len;
     mapped.adviseSequentialPrefix(@min(parsed_prefix_len, mapped.data.len));
 
@@ -2262,6 +2263,24 @@ fn tensorTypeSupported(tensor_type: gguf_mod.tensor_types.TensorType) bool {
         },
         .bitnet_tl2 => true,
         .unknown => false,
+    };
+}
+
+/// Whether a backend can consume a tensor encoding after the generic GGUF
+/// loader has decoded or retained it. Companion-artifact preflight uses this
+/// same gate as whole-model inspection so admission and runtime cannot diverge.
+pub fn ggufTensorTypeSupportsBackend(
+    tensor_type: gguf_mod.tensor_types.TensorType,
+    backend: BackendType,
+) bool {
+    if (!tensorTypeSupported(tensor_type)) return false;
+    return switch (backend) {
+        .metal => if (comptime build_options.enable_metal)
+            metal_runtime.isMetalNativeSupported(tensor_type)
+        else
+            true,
+        .native, .cuda, .onnx, .wasm => true,
+        .pjrt => false,
     };
 }
 
