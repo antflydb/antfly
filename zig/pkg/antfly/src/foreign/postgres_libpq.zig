@@ -30,6 +30,7 @@ const connection_pool_idle_ttl_ns: u64 = 5 * std.time.ns_per_min;
 const max_pool_reclaims_per_acquire: usize = 1;
 const max_column_cache_entries: usize = 1_024;
 const column_cache_ttl_ns: u64 = std.time.ns_per_min;
+const failed_cutover_cleanup_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const supports_waitable_pool = builtin.os.tag != .freestanding and
     builtin.link_libc and
     @hasDecl(std.c, "pthread_cond_wait") and
@@ -740,8 +741,8 @@ pub const Executor = struct {
         try self.acquireGlobalConnectionPermits(2, execution_deadline_ns);
         var release_reserved_permits = true;
         errdefer if (release_reserved_permits) self.releaseGlobalConnections(2);
-        const sql_conn = try self.connectFreshWithDeadline(dsn, execution_deadline_ns);
-        errdefer self.pqfinish(sql_conn);
+        var sql_conn: ?*PGconn = try self.connectFreshWithDeadline(dsn, execution_deadline_ns);
+        errdefer if (sql_conn) |conn| self.pqfinish(conn);
         try self.ensurePublicationAlloc(
             alloc,
             dsn,
@@ -760,12 +761,41 @@ pub const Executor = struct {
             return error.UnsupportedExactCutover;
         }
 
-        const repl_conn = try self.connectReplicationFreshWithDeadline(
+        var repl_conn: ?*PGconn = try self.connectReplicationFreshWithDeadline(
             alloc,
             dsn,
             execution_deadline_ns,
         );
-        errdefer self.pqfinish(repl_conn);
+        errdefer if (repl_conn) |conn| self.pqfinish(conn);
+        var slot_may_exist = true;
+        errdefer if (slot_may_exist) {
+            // CREATE_REPLICATION_SLOT can commit server-side immediately
+            // before a socket timeout, and failures after export would
+            // otherwise poison every exact-cutover retry with an orphaned
+            // persistent slot. Close both possibly-busy sessions, then spend
+            // one already-reserved permit on a bounded idempotent cleanup.
+            if (repl_conn) |conn| {
+                self.pqfinish(conn);
+                repl_conn = null;
+            }
+            if (sql_conn) |conn| {
+                self.pqfinish(conn);
+                sql_conn = null;
+            }
+            const cleanup_deadline_ns =
+                platform_time.monotonicNs() +| failed_cutover_cleanup_timeout_ns;
+            self.dropLogicalReplicationSlotIfExistsWithReservedPermit(
+                alloc,
+                dsn,
+                slot_name,
+                cleanup_deadline_ns,
+            ) catch |cleanup_err| {
+                std.log.err(
+                    "postgres exact cutover cleanup failed slot={s}: {s}",
+                    .{ slot_name, @errorName(cleanup_err) },
+                );
+            };
+        };
         var exported = try self.createLogicalReplicationSlotExportSnapshotAlloc(
             alloc,
             repl_conn,
@@ -807,8 +837,10 @@ pub const Executor = struct {
         };
         const checkpoint = try alloc.dupe(u8, exported.checkpoint);
         self.pqfinish(repl_conn);
+        repl_conn = null;
         self.releaseGlobalConnections(1);
         release_reserved_permits = false;
+        slot_may_exist = false;
         return .{
             .checkpoint = checkpoint,
             .snapshot_query = snapshot_query.asSnapshotQuery(),
@@ -2370,6 +2402,35 @@ pub const Executor = struct {
             .checkpoint = try copyCellAlloc(alloc, self.pqgetvalue(result, 0, 1), @intCast(self.pqgetlength(result, 0, 1))),
             .snapshot_name = try copyCellAlloc(alloc, self.pqgetvalue(result, 0, 2), @intCast(self.pqgetlength(result, 0, 2))),
         };
+    }
+
+    fn dropLogicalReplicationSlotIfExistsWithReservedPermit(
+        self: *@This(),
+        alloc: Allocator,
+        dsn: []const u8,
+        slot_name: []const u8,
+        execution_deadline_ns: u64,
+    ) !void {
+        const conn = try self.connectFreshWithDeadline(dsn, execution_deadline_ns);
+        defer self.pqfinish(conn);
+
+        const args = try alloc.alloc(sql.ParameterValue, 1);
+        args[0] = .{ .string = try alloc.dupe(u8, slot_name) };
+        var prepared = sql.PreparedQuery{
+            .sql_text = try alloc.dupe(
+                u8,
+                "SELECT pg_drop_replication_slot($1) FROM pg_replication_slots WHERE slot_name = $1",
+            ),
+            .args = args,
+        };
+        defer prepared.deinit(alloc);
+        const result = try self.execPreparedWithDeadline(
+            conn,
+            alloc,
+            prepared,
+            execution_deadline_ns,
+        );
+        self.pqclear(result);
     }
 };
 
