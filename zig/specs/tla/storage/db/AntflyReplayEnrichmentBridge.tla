@@ -25,7 +25,8 @@
 
 EXTENDS Naturals, TLC
 
-CONSTANTS BuggyOmitEnrichmentFloor, BuggyAdvanceEmptyScan, MaxSeq, MaxEpoch
+CONSTANTS BuggyOmitEnrichmentFloor, BuggyAdvanceEmptyScan,
+          BuggyOmitRestartArm, MaxSeq, MaxEpoch
 
 Seqs == 1..MaxSeq
 
@@ -38,10 +39,11 @@ VARIABLES
     completed,
     volatileCollected,
     providerUp,
+    workerArmed,
     processEpoch
 
 vars == <<sourceSeq, journal, fastApplied, enrichmentApplied, coverageDebt,
-          completed, volatileCollected, providerUp, processEpoch>>
+          completed, volatileCollected, providerUp, workerArmed, processEpoch>>
 
 Init ==
     /\ sourceSeq = 0
@@ -52,6 +54,7 @@ Init ==
     /\ completed = {}
     /\ volatileCollected = {}
     /\ providerUp = TRUE
+    /\ workerArmed = TRUE
     /\ processEpoch = 0
 
 AppendGeneratedSource ==
@@ -60,13 +63,13 @@ AppendGeneratedSource ==
     /\ journal' = journal \cup {sourceSeq + 1}
     /\ coverageDebt' = coverageDebt \cup {sourceSeq + 1}
     /\ UNCHANGED <<fastApplied, enrichmentApplied, completed,
-                  volatileCollected, providerUp, processEpoch>>
+                  volatileCollected, providerUp, workerArmed, processEpoch>>
 
 FastConsumerAdvance ==
     /\ fastApplied < sourceSeq
     /\ fastApplied' = fastApplied + 1
     /\ UNCHANGED <<sourceSeq, journal, enrichmentApplied, coverageDebt,
-                  completed, volatileCollected, providerUp, processEpoch>>
+                  completed, volatileCollected, providerUp, workerArmed, processEpoch>>
 
 CollectPending(s) ==
     /\ s \in coverageDebt
@@ -74,29 +77,30 @@ CollectPending(s) ==
     /\ s \notin volatileCollected
     /\ volatileCollected' = volatileCollected \cup {s}
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
-                  coverageDebt, completed, providerUp, processEpoch>>
+                  coverageDebt, completed, providerUp, workerArmed, processEpoch>>
 
 ProviderFails ==
     /\ providerUp
     /\ providerUp' = FALSE
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
-                  coverageDebt, completed, volatileCollected, processEpoch>>
+                  coverageDebt, completed, volatileCollected, workerArmed, processEpoch>>
 
 ProviderRecovers ==
     /\ ~providerUp
     /\ providerUp' = TRUE
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
-                  coverageDebt, completed, volatileCollected, processEpoch>>
+                  coverageDebt, completed, volatileCollected, workerArmed, processEpoch>>
 
 CompleteEnrichment(s) ==
     /\ providerUp
+    /\ workerArmed
     /\ s \in coverageDebt
     /\ s \in journal
     /\ completed' = completed \cup {s}
     /\ coverageDebt' = coverageDebt \ {s}
     /\ volatileCollected' = volatileCollected \ {s}
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
-                  providerUp, processEpoch>>
+                  providerUp, workerArmed, processEpoch>>
 
 AdvanceEnrichment ==
     /\ enrichmentApplied < sourceSeq
@@ -108,7 +112,7 @@ AdvanceEnrichment ==
           /\ next \notin volatileCollected
     /\ enrichmentApplied' = enrichmentApplied + 1
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, coverageDebt,
-                  completed, volatileCollected, providerUp, processEpoch>>
+                  completed, volatileCollected, providerUp, workerArmed, processEpoch>>
 
 TruncateReplay(s) ==
     /\ s \in journal
@@ -116,14 +120,24 @@ TruncateReplay(s) ==
     /\ BuggyOmitEnrichmentFloor \/ s <= enrichmentApplied
     /\ journal' = journal \ {s}
     /\ UNCHANGED <<sourceSeq, fastApplied, enrichmentApplied, coverageDebt,
-                  completed, volatileCollected, providerUp, processEpoch>>
+                  completed, volatileCollected, providerUp, workerArmed, processEpoch>>
 
 Restart ==
     /\ processEpoch < MaxEpoch
     /\ processEpoch' = processEpoch + 1
     /\ volatileCollected' = {}
+    /\ workerArmed' = FALSE
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
                   coverageDebt, completed, providerUp>>
+
+ArmStartupEnrichment ==
+    /\ processEpoch > 0
+    /\ ~workerArmed
+    /\ ~BuggyOmitRestartArm
+    /\ workerArmed' = TRUE
+    /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
+                  coverageDebt, completed, volatileCollected, providerUp,
+                  processEpoch>>
 
 Next ==
     \/ AppendGeneratedSource
@@ -132,6 +146,7 @@ Next ==
     \/ ProviderRecovers
     \/ AdvanceEnrichment
     \/ Restart
+    \/ ArmStartupEnrichment
     \/ \E s \in Seqs:
         \/ CollectPending(s)
         \/ CompleteEnrichment(s)
@@ -142,12 +157,15 @@ Spec == Init /\ [][Next]_vars
 FairSpec ==
     Spec
     /\ WF_vars(ProviderRecovers)
+    /\ WF_vars(Restart)
+    /\ WF_vars(ArmStartupEnrichment)
     /\ WF_vars(AdvanceEnrichment)
     /\ \A s \in Seqs: SF_vars(CompleteEnrichment(s))
 
 TypeOK ==
     /\ BuggyOmitEnrichmentFloor \in BOOLEAN
     /\ BuggyAdvanceEmptyScan \in BOOLEAN
+    /\ BuggyOmitRestartArm \in BOOLEAN
     /\ MaxSeq \in 1..3
     /\ MaxEpoch \in 0..2
     /\ sourceSeq \in 0..MaxSeq
@@ -158,6 +176,7 @@ TypeOK ==
     /\ completed \in SUBSET Seqs
     /\ volatileCollected \in SUBSET Seqs
     /\ providerUp \in BOOLEAN
+    /\ workerArmed \in BOOLEAN
     /\ processEpoch \in 0..MaxEpoch
 
 WatermarksOrdered ==
