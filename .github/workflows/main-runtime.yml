@@ -9,6 +9,10 @@ on:
       - '.github/workflows/main-runtime.yml'
   workflow_dispatch:
 
+concurrency:
+  group: main-runtime-${{ github.sha }}
+  cancel-in-progress: false
+
 # The image registry and build configuration live in the existing local helper.
 # Keeping this orchestration free of infrastructure coordinates avoids creating a
 # second public configuration surface.
@@ -42,7 +46,15 @@ jobs:
           image_tag="$(scripts/publish-zig-runtime-dev.sh --tag "$tag" --image-ref)"
           registry="${image_tag%%/*}"
           echo "$(gcloud auth print-access-token)" | crane auth login "$registry" -u oauth2accesstoken --password-stdin
-          if crane digest "$image_tag" >/dev/null 2>&1; then exists=true; else exists=false; fi
+          if lookup="$(crane digest "$image_tag" 2>&1)"; then
+            [[ "$lookup" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "invalid registry digest: $lookup" >&2; exit 1; }
+            exists=true
+          elif [[ "$lookup" == *MANIFEST_UNKNOWN* || "$lookup" == *NAME_UNKNOWN* ]]; then
+            exists=false
+          else
+            echo "unable to determine whether $image_tag exists: $lookup" >&2
+            exit 1
+          fi
           echo "exists=$exists" >> "$GITHUB_OUTPUT"
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
@@ -78,6 +90,23 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v3
+      - name: Install the pinned native build toolchain
+        env:
+          ZIG_VERSION: 0.16.0
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates
+          case '${{ matrix.arch }}' in
+            amd64) zig_arch=x86_64 ;;
+            arm64) zig_arch=aarch64 ;;
+            *) exit 1 ;;
+          esac
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/zig/zig" version | grep -Fx "$ZIG_VERSION"
       - name: Build the native runtime artifact
         run: scripts/publish-zig-runtime-dev.sh --tag '${{ needs.resolve.outputs.tag }}' --arch '${{ matrix.arch }}'
 
@@ -112,10 +141,25 @@ jobs:
           # immutable tag; it does not create aliases or a second image identity.
           registry="${image_tag%%/*}"
           echo "$(gcloud auth print-access-token)" | crane auth login "$registry" -u oauth2accesstoken --password-stdin
-          if [[ '${{ needs.resolve.outputs.exists }}' != true ]]; then
-            scripts/publish-zig-runtime-dev.sh --tag "$tag" --manifest
+          if lookup="$(crane digest "$image_tag" 2>&1)"; then
+            digest="$lookup"
+          elif [[ "$lookup" == *MANIFEST_UNKNOWN* || "$lookup" == *NAME_UNKNOWN* ]]; then
+            # Recheck immediately before publication. The helper refuses to
+            # retag an image that appeared after this lookup.
+            if ! scripts/publish-zig-runtime-dev.sh --tag "$tag" --manifest; then
+              digest="$(crane digest "$image_tag")" || exit 1
+            else
+              digest="$(crane digest "$image_tag")"
+            fi
+          else
+            echo "unable to determine whether $image_tag exists: $lookup" >&2
+            exit 1
           fi
-          digest="$(crane digest "$image_tag")"
+          amd64_digest="$(crane digest "${image_tag}-amd64")"
+          arm64_digest="$(crane digest "${image_tag}-arm64")"
+          crane manifest "$image_tag" | jq -e --arg amd64 "$amd64_digest" --arg arm64 "$arm64_digest" '
+            ([.manifests[] | select(.platform.os == "linux") | .digest] | sort) == ([$amd64, $arm64] | sort)
+          ' >/dev/null || { echo "immutable image conflicts with this main runtime's platform images" >&2; exit 1; }
           repository="${image_tag%:*}"
           image="${repository}@${digest}"
           jq -cn --arg source_sha '${{ needs.resolve.outputs.source_sha }}' --arg image "$image" --arg tag "$tag" '{source_sha:$source_sha,image:$image,tag:$tag,platforms:["linux/amd64","linux/arm64"]}' > antfly-main-runtime.json

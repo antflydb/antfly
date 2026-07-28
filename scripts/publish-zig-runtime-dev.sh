@@ -115,6 +115,15 @@ inspect_image() {
 }
 
 if [[ "$manifest" == true ]]; then
+  if lookup="$(gcloud artifacts docker images describe "${image_base}:${tag}" \
+      --project="$gcp_project" \
+      --format='value(image_summary.digest)' 2>&1)"; then
+    echo "refusing to retag existing immutable image: ${image_base}:${tag}" >&2
+    exit 1
+  elif [[ "$lookup" != *NOT_FOUND* && "$lookup" != *"not found"* ]]; then
+    echo "unable to determine whether immutable image exists: $lookup" >&2
+    exit 1
+  fi
   gcloud builds submit "$repo_root" \
     --project="$gcp_project" \
     --region="$gcp_region" \
@@ -150,10 +159,21 @@ echo "Building $arch Zig runtime artifact for $zig_target"
 )
 
 test -x "$out_dir/bin/antfly"
-tar -C "$out_dir" -czf "$tmpdir/antfly-zig-${arch}.tar.gz" bin share
+test -d "$out_dir/share/antfly"
+archive_dir="$tmpdir/archive"
+mkdir -p "$archive_dir/share"
+install -m 0755 "$out_dir/bin/antfly" "$archive_dir/antfly"
+cp -a "$out_dir/share/antfly" "$archive_dir/share/antfly"
+archive="$tmpdir/antfly-zig-${arch}.tar.gz"
+tar -C "$archive_dir" -czf "$archive" antfly share
+extract_dir="$tmpdir/extract"
+mkdir "$extract_dir"
+tar -xzf "$archive" -C "$extract_dir"
+test -x "$extract_dir/antfly"
+test -d "$extract_dir/share/antfly"
 
 echo "Uploading $artifact_uri"
-gcloud storage cp "$tmpdir/antfly-zig-${arch}.tar.gz" "$artifact_uri" --project="$gcp_project"
+gcloud storage cp "$archive" "$artifact_uri" --project="$gcp_project"
 
 echo "Packaging ${image_base}:${tag}-${arch}"
 gcloud builds submit "$repo_root" \
