@@ -762,6 +762,8 @@ pub const Executor = struct {
         try ensureDeadline(execution_deadline_ns);
         const slot_name = params.slot_name orelse return error.InvalidQueryRequest;
         const publication_name = params.publication_name orelse return error.InvalidQueryRequest;
+        const exact_cutover_intent = params.exact_cutover_intent orelse
+            return error.InvalidQueryRequest;
 
         const pool = try self.getOrCreateConnectionPool(dsn, execution_deadline_ns);
         defer self.releaseConnectionPool(pool);
@@ -811,11 +813,9 @@ pub const Executor = struct {
         // intent only after the slot was proved absent (or a prior owned,
         // inactive slot was reclaimed), and creation does not begin unless
         // that replicated write succeeds.
-        if (params.exact_cutover_intent) |intent| {
-            try ensureDeadline(execution_deadline_ns);
-            try intent.persist();
-            try ensureDeadline(execution_deadline_ns);
-        }
+        try ensureDeadline(execution_deadline_ns);
+        try exact_cutover_intent.persist();
+        try ensureDeadline(execution_deadline_ns);
 
         var repl_conn: ?*PGconn = try self.connectReplicationFreshWithDeadline(
             alloc,
@@ -4871,10 +4871,21 @@ test "postgres libpq prepared replication snapshot bridges initial cutover" {
     try execCommandForTest(&executor, conn, alloc, create_table_sql);
     try execCommandForTest(&executor, conn, alloc, seed_sql);
 
+    var intent_persisted = false;
+    const Intent = struct {
+        fn persist(ptr: *anyopaque) !void {
+            const persisted: *bool = @ptrCast(@alignCast(ptr));
+            persisted.* = true;
+        }
+    };
     var begin_params = foreign_source.ReplicationPollParams{
         .table = try alloc.dupe(u8, table_name),
         .slot_name = try alloc.dupe(u8, slot_name),
         .publication_name = try alloc.dupe(u8, publication_name),
+        .exact_cutover_intent = .{
+            .ptr = &intent_persisted,
+            .persist_fn = Intent.persist,
+        },
     };
     defer begin_params.deinit(alloc);
     var prepared = try executor.asQueryExecutor().beginPreparedReplicationSnapshot(
@@ -4884,6 +4895,7 @@ test "postgres libpq prepared replication snapshot bridges initial cutover" {
         platform_time.monotonicNs() + 30 * std.time.ns_per_s,
     );
     defer prepared.deinit(alloc);
+    try std.testing.expect(intent_persisted);
     try std.testing.expect(prepared.checkpoint.len > 0);
 
     var snapshot_result = try prepared.snapshot_query.queryPrepared(alloc, .{
