@@ -1964,7 +1964,7 @@ test "metadata replication backfill applies postgres snapshot rows through bound
                 inner_alloc.destroy(self);
             }
 
-            fn query(_: *anyopaque, inner_alloc: Allocator, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
+            fn query(_: *anyopaque, inner_alloc: Allocator, prepared: foreign_mod.PreparedQuery, _: ?u64) !foreign_mod.QueryResult {
                 var owned = prepared;
                 defer owned.deinit(inner_alloc);
                 Parent.snapshot_query_calls += 1;
@@ -1988,7 +1988,7 @@ test "metadata replication backfill applies postgres snapshot rows through bound
             }
         };
 
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64) !foreign_mod.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             saw_order_by_id = std.mem.indexOf(u8, owned.sql_text, "ORDER BY \"id\" ASC") != null;
@@ -2036,7 +2036,7 @@ test "metadata replication backfill applies postgres snapshot rows through bound
             return .{ .checkpoint = try inner_alloc.dupe(u8, "lsn:prepared") };
         }
 
-        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_mod.Column {
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_mod.Column {
             const columns = try inner_alloc.alloc(foreign_mod.Column, 2);
             columns[0] = .{
                 .name = try inner_alloc.dupe(u8, "id"),
@@ -2162,7 +2162,7 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
                 inner_alloc.destroy(self);
             }
 
-            fn query(_: *anyopaque, inner_alloc: Allocator, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
+            fn query(_: *anyopaque, inner_alloc: Allocator, prepared: foreign_mod.PreparedQuery, _: ?u64) !foreign_mod.QueryResult {
                 var owned = prepared;
                 defer owned.deinit(inner_alloc);
                 Parent.snapshot_query_calls += 1;
@@ -2183,7 +2183,7 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
             }
         };
 
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64) !foreign_mod.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             return .{ .rows = &.{}, .total = 0 };
@@ -2219,7 +2219,7 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
             return .{ .checkpoint = try inner_alloc.dupe(u8, "lsn:fallback") };
         }
 
-        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_mod.Column {
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_mod.Column {
             const columns = try inner_alloc.alloc(foreign_mod.Column, 1);
             columns[0] = .{
                 .name = try inner_alloc.dupe(u8, "id"),
@@ -2300,7 +2300,7 @@ test "metadata replication backfill applies configured update transforms" {
     }
 
     const FakeExecutor = struct {
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64) !foreign_mod.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             const rows = try inner_alloc.alloc(std.json.Value, 1);
@@ -2316,7 +2316,7 @@ test "metadata replication backfill applies configured update transforms" {
             return .{ .checkpoint = try inner_alloc.dupe(u8, "lsn:prepared") };
         }
 
-        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_mod.Column {
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_mod.Column {
             const columns = try inner_alloc.alloc(foreign_mod.Column, 1);
             columns[0] = .{
                 .name = try inner_alloc.dupe(u8, "id"),
@@ -2370,7 +2370,7 @@ test "metadata replication backfill routes matching snapshot rows to target tabl
     const alloc = std.testing.allocator;
 
     const FakeExecutor = struct {
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64) !foreign_mod.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             const rows = try inner_alloc.alloc(std.json.Value, 2);
@@ -2387,7 +2387,7 @@ test "metadata replication backfill routes matching snapshot rows to target tabl
             return .{ .checkpoint = try inner_alloc.dupe(u8, "lsn:prepared") };
         }
 
-        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_mod.Column {
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_mod.Column {
             const columns = try inner_alloc.alloc(foreign_mod.Column, 1);
             columns[0] = .{
                 .name = try inner_alloc.dupe(u8, "id"),
@@ -2638,7 +2638,7 @@ test "metadata replication backfill coordinator resumes and then skips completed
     }
 
     const FakeExecutor = struct {
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64) !foreign_mod.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
 
@@ -2663,7 +2663,7 @@ test "metadata replication backfill coordinator resumes and then skips completed
             return .{ .row_count = 2, .size_bytes = 64 };
         }
 
-        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_mod.Column {
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_mod.Column {
             const columns = try inner_alloc.alloc(foreign_mod.Column, 1);
             columns[0] = .{
                 .name = try inner_alloc.dupe(u8, "id"),
@@ -2858,7 +2858,7 @@ test "metadata replication backfill marks existing-slot fallback as slot_resumed
     }
 
     const FakeExecutor = struct {
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64) !foreign_mod.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             const rows = try inner_alloc.alloc(std.json.Value, 1);
@@ -2877,7 +2877,7 @@ test "metadata replication backfill marks existing-slot fallback as slot_resumed
             };
         }
 
-        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_mod.Column {
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_mod.Column {
             const columns = try inner_alloc.alloc(foreign_mod.Column, 1);
             columns[0] = .{
                 .name = try inner_alloc.dupe(u8, "id"),
@@ -2951,7 +2951,7 @@ test "metadata replication backfill rejects existing-slot fallback when exact cu
     }
 
     const FakeExecutor = struct {
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery) !foreign_mod.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64) !foreign_mod.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             return .{ .rows = &.{}, .total = 0 };
@@ -2968,7 +2968,7 @@ test "metadata replication backfill rejects existing-slot fallback when exact cu
             };
         }
 
-        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_mod.Column {
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_mod.Column {
             const columns = try inner_alloc.alloc(foreign_mod.Column, 1);
             columns[0] = .{
                 .name = try inner_alloc.dupe(u8, "id"),
