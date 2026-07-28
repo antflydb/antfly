@@ -1113,6 +1113,55 @@ fn cloneProjectedReplicationSourceStatusesOwned(
     return out;
 }
 
+fn replicationCutoverIntentApplied(
+    record: metadata_table_manager.ReplicationSourceStatusRecord,
+    expected: metadata_table_manager.ReplicationSourceStatusRecord,
+) bool {
+    return record.table_id == expected.table_id and
+        record.source_ordinal == expected.source_ordinal and
+        record.cutover_intent_id == expected.cutover_intent_id and
+        std.mem.eql(
+            u8,
+            &record.cutover_config_fingerprint,
+            &expected.cutover_config_fingerprint,
+        ) and
+        std.mem.eql(u8, record.source_kind, expected.source_kind) and
+        std.mem.eql(u8, record.external_table, expected.external_table) and
+        std.mem.eql(u8, record.cutover_mode, expected.cutover_mode) and
+        std.mem.eql(u8, record.slot_name, expected.slot_name) and
+        std.mem.eql(u8, record.publication_name, expected.publication_name) and
+        std.mem.eql(u8, record.phase, expected.phase);
+}
+
+test "metadata durable cutover acknowledgement is attempt scoped" {
+    const fingerprint = [_]u8{0x5a} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const expected = metadata_table_manager.ReplicationSourceStatusRecord{
+        .table_id = 41,
+        .source_ordinal = 2,
+        .source_kind = "postgres",
+        .external_table = "public.docs",
+        .cutover_mode = "exported_snapshot_pending",
+        .slot_name = "antfly_docs",
+        .publication_name = "antfly_docs_pub",
+        .phase = "cutover_preparing",
+        .cutover_intent_id = 99,
+        .cutover_config_fingerprint = fingerprint,
+    };
+    try std.testing.expect(replicationCutoverIntentApplied(expected, expected));
+
+    var stale_attempt = expected;
+    stale_attempt.cutover_intent_id = 98;
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_attempt, expected));
+
+    var stale_config = expected;
+    stale_config.cutover_config_fingerprint[0] ^= 0xff;
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_config, expected));
+
+    var overwritten_phase = expected;
+    overwritten_phase.phase = "failed";
+    try std.testing.expect(!replicationCutoverIntentApplied(overwritten_phase, expected));
+}
+
 fn cloneProjectedMergeTransitionsOwned(
     alloc: std.mem.Allocator,
     records: []const transition_state.MergeTransitionRecord,
@@ -1661,6 +1710,37 @@ pub const MetadataService = struct {
 
     pub fn upsertReplicationSourceStatus(self: *MetadataService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
+    }
+
+    /// Persists an exact-cutover ownership intent and does not return until
+    /// that same attempt is visible in the applied Raft projection.
+    pub fn upsertReplicationSourceStatusDurable(self: *MetadataService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+        if (record.cutover_intent_id == 0) return error.InvalidReplicationCutoverIntent;
+        try self.upsertReplicationSourceStatus(record);
+
+        const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            if (try store.getReplicationSourceStatus(
+                self.alloc,
+                self.metadata_group_id,
+                record.table_id,
+                record.source_ordinal,
+            )) |applied_record| {
+                defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, applied_record);
+                if (replicationCutoverIntentApplied(applied_record, record)) return;
+            }
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                try self.raft.runRaftRoundOnly();
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn removeReplicationSourceStatus(self: *MetadataService, table_id: u64, source_ordinal: u32) !void {
@@ -3152,6 +3232,41 @@ pub const MetadataHttpService = struct {
 
     pub fn upsertReplicationSourceStatus(self: *MetadataHttpService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
+    }
+
+    /// Persists an exact-cutover ownership intent and does not return until
+    /// that same attempt is visible in the applied Raft projection.
+    pub fn upsertReplicationSourceStatusDurable(self: *MetadataHttpService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+        if (record.cutover_intent_id == 0) return error.InvalidReplicationCutoverIntent;
+        try self.upsertReplicationSourceStatus(record);
+
+        const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            if (try store.getReplicationSourceStatus(
+                self.alloc,
+                self.metadata_group_id,
+                record.table_id,
+                record.source_ordinal,
+            )) |applied_record| {
+                defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, applied_record);
+                if (replicationCutoverIntentApplied(applied_record, record)) return;
+            }
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                if (self.raft.pending_updates.items.len > 0) {
+                    _ = try self.raft.syncPendingRaftOnly();
+                } else {
+                    try self.raft.runRaftRoundOnly();
+                }
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn removeReplicationSourceStatus(self: *MetadataHttpService, table_id: u64, source_ordinal: u32) !void {

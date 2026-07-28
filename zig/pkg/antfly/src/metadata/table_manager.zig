@@ -881,6 +881,12 @@ pub const ReplicationSourceStatusRecord = struct {
     last_source_commit_at_ms: u64 = 0,
     last_success_at_ms: u64 = 0,
     last_change_applied_at_ms: u64 = 0,
+    /// Non-zero only after an exact-cutover ownership intent is replicated.
+    /// Retries must present this identity and the matching configuration
+    /// fingerprint before reclaiming the provider slot.
+    cutover_intent_id: u64 = 0,
+    cutover_config_fingerprint: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
+        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
     updated_at_ms: u64 = 0,
 };
 
@@ -1718,6 +1724,8 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
         .last_source_commit_at_ms = record.last_source_commit_at_ms,
         .last_success_at_ms = record.last_success_at_ms,
         .last_change_applied_at_ms = record.last_change_applied_at_ms,
+        .cutover_intent_id = record.cutover_intent_id,
+        .cutover_config_fingerprint = record.cutover_config_fingerprint,
         .updated_at_ms = record.updated_at_ms,
     };
 }
