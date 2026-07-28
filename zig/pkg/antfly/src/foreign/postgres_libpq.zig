@@ -279,6 +279,12 @@ pub const Executor = struct {
         pool: *ConnectionPool,
     };
 
+    const PermitReclaimOutcome = enum {
+        acquired,
+        retry,
+        unavailable,
+    };
+
     const ConnectionLease = struct {
         executor: *Executor,
         pool: *ConnectionPool,
@@ -978,76 +984,112 @@ pub const Executor = struct {
         execution_deadline_ns: ?u64,
     ) !void {
         while (true) {
-            if (self.reserveGlobalConnections(count)) return;
+            // Observe before testing the predicate. A release between a failed
+            // reservation and a later snapshot would otherwise be invisible,
+            // allowing a waiter to sleep while capacity is already available.
             const observed = self.connection_availability.snapshot();
-            if (try self.reclaimIdleConnections(count, execution_deadline_ns)) continue;
-            if (try self.reclaimInactiveConnectionPool(execution_deadline_ns)) continue;
+            if (self.reserveGlobalConnections(count)) return;
+            switch (try self.tryAcquireGlobalConnectionPermitsByReclaiming(
+                count,
+                execution_deadline_ns,
+            )) {
+                .acquired => return,
+                .retry => continue,
+                .unavailable => {},
+            }
             try self.connection_availability.waitForChange(observed, execution_deadline_ns);
         }
     }
 
-    fn reclaimIdleConnections(
+    /// Replaces the minimum number of idle sockets with permits for this
+    /// caller in one atomic counter transition. The reclaimed capacity cannot
+    /// be stolen by another waiter between closing a socket and reserving its
+    /// replacement, and a two-socket cutover only evicts one idle connection
+    /// when one global slot was already free.
+    fn tryAcquireGlobalConnectionPermitsByReclaiming(
         self: *@This(),
-        max_count: usize,
+        count: usize,
         execution_deadline_ns: ?u64,
-    ) !bool {
+    ) !PermitReclaimOutcome {
         var reclaimed: [max_total_connections]*PGconn = undefined;
         var reclaimed_count: usize = 0;
 
         try lockUntil(&self.reclaim_mutex, execution_deadline_ns);
         defer self.reclaim_mutex.unlock();
-        try lockUntil(&self.pools_mutex, execution_deadline_ns);
-        var it = self.pools.iterator();
-        while (it.next()) |entry| {
-            if (reclaimed_count >= max_count) break;
-            const pool = entry.value_ptr.*;
-            const pool_reclaimed_start = reclaimed_count;
-            lockUntil(&pool.mutex, execution_deadline_ns) catch |err| {
-                self.pools_mutex.unlock();
+
+        while (true) {
+            const current = self.total_connections.load(.acquire);
+            std.debug.assert(current >= reclaimed_count);
+            const desired = current - reclaimed_count + count;
+            if (desired <= max_total_connections) {
+                if (self.total_connections.cmpxchgWeak(
+                    current,
+                    desired,
+                    .acq_rel,
+                    .acquire,
+                ) != null) continue;
+
+                for (reclaimed[0..reclaimed_count]) |conn| self.pqfinish(conn);
+                if (execution_deadline_ns) |deadline_ns| {
+                    ensureDeadline(deadline_ns) catch |err| {
+                        self.releaseGlobalConnections(count);
+                        return err;
+                    };
+                }
+                return .acquired;
+            }
+
+            const additional_needed = desired - max_total_connections;
+            std.debug.assert(additional_needed > 0);
+            std.debug.assert(reclaimed_count + additional_needed <= count);
+
+            lockUntil(&self.pools_mutex, execution_deadline_ns) catch |err| {
                 for (reclaimed[0..reclaimed_count]) |conn| self.pqfinish(conn);
                 if (reclaimed_count > 0) self.releaseGlobalConnections(reclaimed_count);
                 return err;
             };
-            while (reclaimed_count < max_count) {
-                reclaimed[reclaimed_count] = pool.idle.pop() orelse break;
-                reclaimed_count += 1;
-                pool.total -= 1;
+            var added: usize = 0;
+            var it = self.pools.iterator();
+            while (it.next()) |entry| {
+                if (added >= additional_needed) break;
+                const pool = entry.value_ptr.*;
+                const pool_reclaimed_start = reclaimed_count;
+                lockUntil(&pool.mutex, execution_deadline_ns) catch |err| {
+                    self.pools_mutex.unlock();
+                    for (reclaimed[0..reclaimed_count]) |conn| self.pqfinish(conn);
+                    if (reclaimed_count > 0) self.releaseGlobalConnections(reclaimed_count);
+                    return err;
+                };
+                while (added < additional_needed) {
+                    reclaimed[reclaimed_count] = pool.idle.pop() orelse break;
+                    reclaimed_count += 1;
+                    added += 1;
+                    pool.total -= 1;
+                }
+                pool.mutex.unlock();
+                if (reclaimed_count > pool_reclaimed_start) pool.availability.advanceAll();
             }
-            pool.mutex.unlock();
-            if (reclaimed_count > pool_reclaimed_start) pool.availability.advanceAll();
+            self.pools_mutex.unlock();
+
+            if (added < additional_needed) {
+                for (reclaimed[0..reclaimed_count]) |conn| self.pqfinish(conn);
+                if (reclaimed_count > 0) {
+                    self.releaseGlobalConnections(reclaimed_count);
+                    return .retry;
+                }
+                return .unavailable;
+            }
         }
-        self.pools_mutex.unlock();
-
-        if (reclaimed_count == 0) return false;
-        for (reclaimed[0..reclaimed_count]) |conn| self.pqfinish(conn);
-        self.releaseGlobalConnections(reclaimed_count);
-        if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
-        return true;
-    }
-
-    fn reclaimInactiveConnectionPool(
-        self: *@This(),
-        execution_deadline_ns: ?u64,
-    ) !bool {
-        try lockUntil(&self.reclaim_mutex, execution_deadline_ns);
-        defer self.reclaim_mutex.unlock();
-        try lockUntil(&self.pools_mutex, execution_deadline_ns);
-        const detached = self.detachOneConnectionPoolLocked(platform_time.monotonicNs(), false);
-        self.pools_mutex.unlock();
-        const victim = detached orelse return false;
-        self.destroyDetachedConnectionPool(victim);
-        if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
-        return true;
     }
 
     fn releaseGlobalConnections(self: *@This(), count: usize) void {
         std.debug.assert(count > 0);
         const previous = self.total_connections.fetchSub(count, .acq_rel);
         std.debug.assert(previous >= count);
-        if (count == 1)
-            self.connection_availability.advance()
-        else
-            self.connection_availability.advanceAll();
+        // One- and two-permit callers share this predicate. Signaling an
+        // arbitrary waiter can wake a two-permit cutover after only one slot
+        // is released while leaving a satisfiable one-permit query asleep.
+        self.connection_availability.advanceAll();
     }
 
     fn acquireConnection(
@@ -2618,6 +2660,126 @@ test "postgres libpq global permits are atomic and bounded" {
     try std.testing.expect(!executor.reserveGlobalConnections(1));
     executor.releaseGlobalConnections(max_total_connections);
     try std.testing.expectEqual(@as(usize, 0), executor.total_connections.load(.acquire));
+}
+
+test "postgres libpq permit saturation preserves zero-connection pools" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    defer executor.deinit();
+
+    const pool_count = 4;
+    for (0..pool_count) |idx| {
+        const dsn = try std.fmt.allocPrint(alloc, "postgres://saturated-empty-{d}", .{idx});
+        defer alloc.free(dsn);
+        const pool = try executor.getOrCreateConnectionPool(dsn, null);
+        executor.releaseConnectionPool(pool);
+    }
+    try std.testing.expect(executor.reserveGlobalConnections(max_total_connections));
+    defer executor.releaseGlobalConnections(max_total_connections);
+
+    try std.testing.expectError(
+        error.Timeout,
+        executor.acquireGlobalConnectionPermits(
+            1,
+            platform_time.monotonicNs() + 20 * std.time.ns_per_ms,
+        ),
+    );
+    try std.testing.expectEqual(pool_count, executor.pools.count());
+}
+
+test "postgres libpq a single released permit broadcasts to all global waiters" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    defer executor.deinit();
+
+    try std.testing.expect(executor.reserveGlobalConnections(1));
+    const observed = executor.connection_availability.snapshot();
+    const Waiter = struct {
+        fn run(
+            availability: *PoolAvailability,
+            inner_observed: u64,
+            deadline_ns: u64,
+            completed: *std.atomic.Value(usize),
+            failed: *std.atomic.Value(bool),
+        ) void {
+            availability.waitForChange(inner_observed, deadline_ns) catch {
+                failed.store(true, .release);
+                return;
+            };
+            _ = completed.fetchAdd(1, .acq_rel);
+        }
+    };
+    const waiter_count = 4;
+    const deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    var completed: std.atomic.Value(usize) = .init(0);
+    var failed: std.atomic.Value(bool) = .init(false);
+    var waiters: [waiter_count]std.Thread = undefined;
+    var started: usize = 0;
+    for (&waiters) |*waiter| {
+        waiter.* = std.Thread.spawn(
+            .{},
+            Waiter.run,
+            .{
+                &executor.connection_availability,
+                observed,
+                deadline_ns,
+                &completed,
+                &failed,
+            },
+        ) catch |err| {
+            executor.releaseGlobalConnections(1);
+            for (waiters[0..started]) |started_waiter| started_waiter.join();
+            return err;
+        };
+        started += 1;
+    }
+    executor.releaseGlobalConnections(1);
+    for (waiters) |waiter| waiter.join();
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(waiter_count, completed.load(.acquire));
+}
+
+test "postgres libpq idle reclamation transfers only missing capacity" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    defer executor.deinit();
+
+    const Fake = struct {
+        var finish_count: usize = 0;
+
+        fn finish(_: ?*PGconn) callconv(.c) void {
+            finish_count += 1;
+        }
+    };
+    Fake.finish_count = 0;
+    executor.pqfinish = Fake.finish;
+
+    const pool = try executor.getOrCreateConnectionPool("postgres://permit-transfer", null);
+    defer executor.releaseConnectionPool(pool);
+    const fake_conn: *PGconn = @ptrFromInt(1);
+    lock(&pool.mutex);
+    pool.idle.append(alloc, fake_conn) catch |err| {
+        pool.mutex.unlock();
+        return err;
+    };
+    pool.total = 1;
+    pool.mutex.unlock();
+
+    try std.testing.expect(executor.reserveGlobalConnections(max_total_connections - 1));
+    defer {
+        const remaining = executor.total_connections.load(.acquire);
+        if (remaining > 0) executor.releaseGlobalConnections(remaining);
+    }
+    try executor.acquireGlobalConnectionPermits(
+        2,
+        platform_time.monotonicNs() + std.time.ns_per_s,
+    );
+    try std.testing.expectEqual(@as(usize, 1), Fake.finish_count);
+    try std.testing.expectEqual(max_total_connections, executor.total_connections.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool.total);
+    try std.testing.expectEqual(@as(usize, 0), pool.idle.items.len);
+
+    executor.releaseGlobalConnections(2);
 }
 
 test "postgres libpq availability broadcast wakes every waiter" {
