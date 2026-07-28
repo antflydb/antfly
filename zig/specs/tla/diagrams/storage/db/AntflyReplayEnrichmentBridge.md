@@ -2,7 +2,7 @@
 
 # AntflyReplayEnrichmentBridge — structural diagrams
 
-Generated from [`AntflyReplayEnrichmentBridge.tla`](../../../storage/db/AntflyReplayEnrichmentBridge.tla). 9 state variables, 9 actions in `Next`.
+Generated from [`AntflyReplayEnrichmentBridge.tla`](../../../storage/db/AntflyReplayEnrichmentBridge.tla). 10 state variables, 10 actions in `Next`.
 
 ## Actions and the state they touch
 
@@ -13,9 +13,10 @@ Generated from [`AntflyReplayEnrichmentBridge.tla`](../../../storage/db/AntflyRe
 | `ProviderFails` | `providerUp` | `providerUp` |
 | `ProviderRecovers` | `providerUp` | `providerUp` |
 | `AdvanceEnrichment` | `sourceSeq`, `journal`, `enrichmentApplied`, `coverageDebt`, `volatileCollected` | `enrichmentApplied` |
-| `Restart` | `processEpoch` | `volatileCollected`, `processEpoch` |
+| `Restart` | `processEpoch` | `volatileCollected`, `workerArmed`, `processEpoch` |
+| `ArmStartupEnrichment` | `workerArmed`, `processEpoch` | `workerArmed` |
 | `CollectPending` | `journal`, `coverageDebt`, `volatileCollected` | `volatileCollected` |
-| `CompleteEnrichment` | `journal`, `coverageDebt`, `completed`, `volatileCollected`, `providerUp` | `coverageDebt`, `completed`, `volatileCollected` |
+| `CompleteEnrichment` | `journal`, `coverageDebt`, `completed`, `volatileCollected`, `providerUp`, `workerArmed` | `coverageDebt`, `completed`, `volatileCollected` |
 | `TruncateReplay` | `journal`, `fastApplied`, `enrichmentApplied` | `journal` |
 
 ## Write graph
@@ -31,9 +32,10 @@ flowchart LR
         a3[ProviderRecovers]
         a4[AdvanceEnrichment]
         a5[Restart]
-        a6[CollectPending]
-        a7[CompleteEnrichment]
-        a8[TruncateReplay]
+        a6[ArmStartupEnrichment]
+        a7[CollectPending]
+        a8[CompleteEnrichment]
+        a9[TruncateReplay]
     end
     subgraph state["State variables"]
         v0([sourceSeq])
@@ -43,8 +45,9 @@ flowchart LR
         v4([providerUp])
         v5([enrichmentApplied])
         v6([volatileCollected])
-        v7([processEpoch])
-        v8([completed])
+        v7([workerArmed])
+        v8([processEpoch])
+        v9([completed])
     end
     a0 --> v0
     a0 --> v1
@@ -60,15 +63,19 @@ flowchart LR
     v6 -.-> a4
     a5 --> v6
     a5 --> v7
-    a6 --> v6
-    v1 -.-> a6
-    v2 -.-> a6
-    a7 --> v2
-    a7 --> v8
+    a5 --> v8
+    a6 --> v7
+    v8 -.-> a6
     a7 --> v6
     v1 -.-> a7
-    v4 -.-> a7
-    a8 --> v1
-    v3 -.-> a8
-    v5 -.-> a8
+    v2 -.-> a7
+    a8 --> v2
+    a8 --> v9
+    a8 --> v6
+    v1 -.-> a8
+    v4 -.-> a8
+    v7 -.-> a8
+    a9 --> v1
+    v3 -.-> a9
+    v5 -.-> a9
 ```

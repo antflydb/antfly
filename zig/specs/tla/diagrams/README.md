@@ -43,7 +43,7 @@ Auto-generated overviews of each protocol spec: phase state machines, action/sta
 - [AntflyIndexLifecycle](storage/db/AntflyIndexLifecycle.md) — 11 actions, 11 variables, 2 phase state machines
 - [AntflyLeaseRetryBackoff](storage/db/AntflyLeaseRetryBackoff.md) — 4 actions, 5 variables, 0 phase state machines
 - [AntflyPromotionOwnerHandoff](storage/db/AntflyPromotionOwnerHandoff.md) — 6 actions, 5 variables, 1 phase state machine
-- [AntflyReplayEnrichmentBridge](storage/db/AntflyReplayEnrichmentBridge.md) — 9 actions, 9 variables, 0 phase state machines
+- [AntflyReplayEnrichmentBridge](storage/db/AntflyReplayEnrichmentBridge.md) — 10 actions, 10 variables, 0 phase state machines
 - [AntflyTransaction](storage/db/AntflyTransaction.md) — 15 actions, 9 variables, 3 phase state machines
 - [AntflyTransactionSession](storage/db/AntflyTransactionSession.md) — 15 actions, 13 variables, 1 phase state machine
 
