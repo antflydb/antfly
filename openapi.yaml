@@ -21751,11 +21751,11 @@ components:
 
             Models are automatically unloaded after this duration of inactivity.
 
-            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
 
-            Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
+            Defaults to "5m". Set to "0" to disable idle-time eviction; models can
 
-            where all models are loaded at startup and never unloaded.
+            still be evicted under resource pressure or to enforce max_loaded_models.
           default: 5m
           example: 5m
         max_loaded_models:
@@ -21765,8 +21765,10 @@ components:
 
             generators, chunkers, etc.). When the limit is reached, the least-recently-used
 
-            idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-          default: 0
+            idle model from any registry is evicted to make room. Set to 0 for unlimited.
+
+            Defaults to 10.
+          default: 10
           example: 3
         pool_size:
           type: integer
@@ -21885,11 +21887,9 @@ components:
           description: >
             Per-model loading strategy overrides. Maps model names to their loading strategy.
 
-            Models not in this map use the default strategy based on keep_alive:
+            Models not in this map load on demand. keep_alive controls their idle
 
-            - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-
-            - If keep_alive="0": eager loading (load at startup, never unload)
+            eviction; setting it to "0" disables idle eviction but does not preload or pin them.
 
 
             When a model has strategy "eager" in this map:

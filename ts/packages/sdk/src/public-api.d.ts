@@ -11974,9 +11974,9 @@ export interface components {
             /**
              * @description How long to keep models loaded in memory after last use (Ollama-compatible).
              *     Models are automatically unloaded after this duration of inactivity.
-             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
-             *     Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
-             *     where all models are loaded at startup and never unloaded.
+             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
+             *     Defaults to "5m". Set to "0" to disable idle-time eviction; models can
+             *     still be evicted under resource pressure or to enforce max_loaded_models.
              * @default 5m
              * @example 5m
              */
@@ -11984,8 +11984,9 @@ export interface components {
             /**
              * @description Maximum total models loaded across all registry types (embedders, rerankers,
              *     generators, chunkers, etc.). When the limit is reached, the least-recently-used
-             *     idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-             * @default 0
+             *     idle model from any registry is evicted to make room. Set to 0 for unlimited.
+             *     Defaults to 10.
+             * @default 10
              * @example 3
              */
             max_loaded_models?: number;
@@ -12075,9 +12076,8 @@ export interface components {
             max_memory_mb?: number;
             /**
              * @description Per-model loading strategy overrides. Maps model names to their loading strategy.
-             *     Models not in this map use the default strategy based on keep_alive:
-             *     - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-             *     - If keep_alive="0": eager loading (load at startup, never unload)
+             *     Models not in this map load on demand. keep_alive controls their idle
+             *     eviction; setting it to "0" disables idle eviction but does not preload or pin them.
              *
              *     When a model has strategy "eager" in this map:
              *     - It is loaded at startup through the same startup warmup path
