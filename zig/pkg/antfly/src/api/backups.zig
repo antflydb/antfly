@@ -63,6 +63,10 @@ pub const backup_attempt_reclaim_scan_budget: usize = 64;
 const backup_attempt_reclaim_shard_count: u8 = 64;
 const backup_attempt_reclaim_claim_timeout_ns: u64 = std.time.ns_per_hour;
 const max_backup_attempt_reclaim_ticket_bytes: usize = 64;
+const backup_attempt_staging_orphan_age_ns: u64 =
+    backup_attempt_reclaim_claim_timeout_ns +
+    backup_attempt_lease_clock_skew_allowance_ns;
+const backup_attempt_staging_scan_budget: usize = 16;
 /// Maximum remote objects a single opportunistic maintenance job may delete.
 /// Keeping this quantum small prevents cleanup from monopolizing the shared
 /// background I/O lane; an incomplete marker remains durable for the next pass.
@@ -2787,6 +2791,34 @@ const LocalBackupAttemptReclaimTicketKind = enum {
     claimed,
 };
 
+const BackupStagingPublicationTestHook = struct {
+    io: std.Io,
+    staged: std.atomic.Value(bool) = .init(false),
+    progress: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+    force_modify_timestamp_ns: ?i96 = null,
+    failure: ?anyerror = null,
+
+    fn pauseAfterSync(self: *@This(), path: []const u8) void {
+        if (self.force_modify_timestamp_ns) |timestamp_ns| {
+            const timestamp = std.Io.Timestamp.fromNanoseconds(timestamp_ns);
+            std.Io.Dir.cwd().setTimestamps(self.io, path, .{
+                .modify_timestamp = .{ .new = timestamp },
+            }) catch |err| {
+                self.failure = err;
+            };
+        }
+        self.staged.store(true, .release);
+        self.progress.set(self.io);
+        self.release.waitUncancelable(self.io);
+    }
+};
+
+const BackupMaintenanceTestHook = struct {
+    stale_staging_candidate: std.atomic.Value(bool) = .init(false),
+    progress: std.Io.Event = .unset,
+};
+
 fn localBackupAttemptReclaimShard(eligible_at_unix_ns: u64) u8 {
     const bucket = @divTrunc(eligible_at_unix_ns, std.time.ns_per_hour);
     return @intCast(bucket % backup_attempt_reclaim_shard_count);
@@ -2820,6 +2852,22 @@ fn localBackupAttemptReclaimShardPath(
     if (shard >= backup_attempt_reclaim_shard_count)
         return error.InvalidBackupRequest;
     return try std.fmt.allocPrint(alloc, "{s}/{s}/{s}/{d:0>2}", .{
+        backup_root,
+        backup_attempt_reclaim_index_name,
+        @tagName(kind),
+        shard,
+    });
+}
+
+fn localBackupAttemptReclaimStagingShardPath(
+    alloc: std.mem.Allocator,
+    backup_root: []const u8,
+    kind: LocalBackupAttemptReclaimTicketKind,
+    shard: u8,
+) ![]u8 {
+    if (shard >= backup_attempt_reclaim_shard_count)
+        return error.InvalidBackupRequest;
+    return try std.fmt.allocPrint(alloc, "{s}/{s}/.staging/{s}/{d:0>2}", .{
         backup_root,
         backup_attempt_reclaim_index_name,
         @tagName(kind),
@@ -2873,6 +2921,22 @@ fn replaceLocalBackupAttemptReclaimTicketTimestamp(
     path: []const u8,
     timestamp_unix_ns: u64,
 ) !void {
+    return replaceLocalBackupAttemptReclaimTicketTimestampWithHook(
+        alloc,
+        io,
+        path,
+        timestamp_unix_ns,
+        null,
+    );
+}
+
+fn replaceLocalBackupAttemptReclaimTicketTimestampWithHook(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    timestamp_unix_ns: u64,
+    test_hook: ?*BackupStagingPublicationTestHook,
+) !void {
     var body_buf: [32]u8 = undefined;
     const body = try std.fmt.bufPrint(&body_buf, "{d}\n", .{timestamp_unix_ns});
     const shard_dir = std.fs.path.dirname(path) orelse
@@ -2881,18 +2945,36 @@ fn replaceLocalBackupAttemptReclaimTicketTimestamp(
         return error.InvalidBackupRequest;
     const reclaim_root = std.fs.path.dirname(state_dir) orelse
         return error.InvalidBackupRequest;
-    const staging_dir = try std.fmt.allocPrint(alloc, "{s}/.staging/{s}/{s}", .{
-        reclaim_root,
+    if (!std.mem.eql(
+        u8,
+        std.fs.path.basename(reclaim_root),
+        backup_attempt_reclaim_index_name,
+    )) return error.InvalidBackupRequest;
+    const kind = std.meta.stringToEnum(
+        LocalBackupAttemptReclaimTicketKind,
         std.fs.path.basename(state_dir),
+    ) orelse return error.InvalidBackupRequest;
+    const shard = std.fmt.parseInt(
+        u8,
         std.fs.path.basename(shard_dir),
-    });
+        10,
+    ) catch return error.InvalidBackupRequest;
+    const backup_root = std.fs.path.dirname(reclaim_root) orelse
+        return error.InvalidBackupRequest;
+    const staging_dir = try localBackupAttemptReclaimStagingShardPath(
+        alloc,
+        backup_root,
+        kind,
+        shard,
+    );
     defer alloc.free(staging_dir);
-    try replaceFileAbsoluteFromStagingDirUnderHeldLock(
+    try replaceFileAbsoluteFromStagingDirUnderHeldLockWithHook(
         alloc,
         io,
         path,
         staging_dir,
         body,
+        test_hook,
     );
 }
 
@@ -3316,6 +3398,22 @@ pub fn writeClusterBackupAttemptMarker(
     location: *BackupLocation,
     marker: *const ClusterBackupAttemptMarker,
 ) !void {
+    return writeClusterBackupAttemptMarkerWithHook(
+        alloc,
+        io,
+        location,
+        marker,
+        null,
+    );
+}
+
+fn writeClusterBackupAttemptMarkerWithHook(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    marker: *const ClusterBackupAttemptMarker,
+    test_hook: ?*BackupStagingPublicationTestHook,
+) !void {
     try validateClusterBackupAttemptMarker(alloc, marker, marker.attempt_id);
     const encoded = try stringifyJsonAlloc(alloc, marker.*);
     defer alloc.free(encoded);
@@ -3368,11 +3466,12 @@ pub fn writeClusterBackupAttemptMarker(
             // The per-attempt lock closes that publication race without making
             // request admission wait behind unrelated directory enumeration.
             if (!(try pathExistsWithIo(io, ticket_path))) {
-                try replaceLocalBackupAttemptReclaimTicketTimestamp(
+                try replaceLocalBackupAttemptReclaimTicketTimestampWithHook(
                     alloc,
                     io,
                     ticket_path,
                     eligible_at_unix_ns,
+                    test_hook,
                 );
             }
             try writeFileAbsoluteIfAbsentWithIo(alloc, io, path, encoded);
@@ -4496,6 +4595,97 @@ fn openLocalBackupAttemptReclaimDir(
         try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
 }
 
+fn localBackupAttemptStagingFileStale(
+    mtime: std.Io.Timestamp,
+    now_unix_ns: u64,
+) bool {
+    const mtime_ns = mtime.toNanoseconds();
+    if (mtime_ns < 0) return true;
+    const modified_at = std.math.cast(u64, mtime_ns) orelse return false;
+    if (modified_at > now_unix_ns) return false;
+    return now_unix_ns - modified_at >= backup_attempt_staging_orphan_age_ns;
+}
+
+fn scavengeLocalBackupAttemptStagingShard(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    backup_root: []const u8,
+    kind: LocalBackupAttemptReclaimTicketKind,
+    shard: u8,
+    now_unix_ns: u64,
+    remaining_budget: *usize,
+    test_hook: ?*BackupMaintenanceTestHook,
+) !usize {
+    if (remaining_budget.* == 0) return 0;
+    const staging_root = try localBackupAttemptReclaimStagingShardPath(
+        alloc,
+        backup_root,
+        kind,
+        shard,
+    );
+    defer alloc.free(staging_root);
+    var dir = openLocalBackupAttemptReclaimDir(io, staging_root) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    const suffix = ".replace.tmp";
+    var iterator = dir.iterate();
+    var examined: usize = 0;
+    while (remaining_budget.* > 0) {
+        const entry = try iterator.next(io) orelse break;
+        remaining_budget.* -= 1;
+        examined += 1;
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, suffix))
+            continue;
+        const attempt_id = entry.name[0 .. entry.name.len - suffix.len];
+        validateBackupId(attempt_id) catch continue;
+        const stat = dir.statFile(io, entry.name, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (!localBackupAttemptStagingFileStale(stat.mtime, now_unix_ns))
+            continue;
+
+        const staged_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+            staging_root,
+            entry.name,
+        });
+        defer alloc.free(staged_path);
+        const publication_lock_path = try localBackupAttemptPublicationLockPath(
+            alloc,
+            backup_root,
+            attempt_id,
+        );
+        defer alloc.free(publication_lock_path);
+        if (std.fs.path.dirname(publication_lock_path)) |dir_name|
+            try ensureDirPathWithIo(io, dir_name);
+        var publication_lock = if (std.fs.path.isAbsolute(publication_lock_path))
+            try std.Io.Dir.createFileAbsolute(io, publication_lock_path, .{ .truncate = false })
+        else
+            try std.Io.Dir.cwd().createFile(io, publication_lock_path, .{ .truncate = false });
+        defer publication_lock.close(io);
+        if (test_hook) |hook| {
+            hook.stale_staging_candidate.store(true, .release);
+            hook.progress.set(io);
+        }
+        try publication_lock.lock(io, .exclusive);
+        defer publication_lock.unlock(io);
+
+        const current_stat = std.Io.Dir.cwd().statFile(io, staged_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (!localBackupAttemptStagingFileStale(
+            current_stat.mtime,
+            now_unix_ns,
+        )) continue;
+        try deletePathDurably(io, staged_path);
+    }
+    return examined;
+}
+
 fn recoverExpiredLocalBackupAttemptReclaimClaims(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -4581,6 +4771,7 @@ fn claimLocalBackupAttemptsForReclamation(
     io: std.Io,
     backup_root: []const u8,
     now_unix_ns: u64,
+    test_hook: ?*BackupMaintenanceTestHook,
 ) !std.ArrayListUnmanaged(LocalBackupAttemptReclaimClaim) {
     var claims = std.ArrayListUnmanaged(LocalBackupAttemptReclaimClaim).empty;
     errdefer {
@@ -4605,10 +4796,31 @@ fn claimLocalBackupAttemptsForReclamation(
     };
     defer if (cursor_body) |value| alloc.free(value);
     const start_shard = localBackupAttemptReclaimCursor(cursor_body);
+    var staging_budget = backup_attempt_staging_scan_budget;
 
     var offset: u8 = 0;
     while (offset < backup_attempt_reclaim_shard_count) : (offset += 1) {
         const shard = (start_shard +% offset) % backup_attempt_reclaim_shard_count;
+        var staging_examined = try scavengeLocalBackupAttemptStagingShard(
+            alloc,
+            io,
+            backup_root,
+            .queued,
+            shard,
+            now_unix_ns,
+            &staging_budget,
+            test_hook,
+        );
+        staging_examined += try scavengeLocalBackupAttemptStagingShard(
+            alloc,
+            io,
+            backup_root,
+            .claimed,
+            shard,
+            now_unix_ns,
+            &staging_budget,
+            test_hook,
+        );
         try recoverExpiredLocalBackupAttemptReclaimClaims(
             alloc,
             io,
@@ -4625,7 +4837,26 @@ fn claimLocalBackupAttemptsForReclamation(
         );
         defer alloc.free(queue_root);
         var dir = openLocalBackupAttemptReclaimDir(io, queue_root) catch |err| switch (err) {
-            error.FileNotFound => continue,
+            error.FileNotFound => {
+                if (staging_examined > 0) {
+                    const next_shard =
+                        (shard + 1) % backup_attempt_reclaim_shard_count;
+                    var cursor_buf: [8]u8 = undefined;
+                    const cursor = try std.fmt.bufPrint(
+                        &cursor_buf,
+                        "{d}\n",
+                        .{next_shard},
+                    );
+                    try replaceFileAbsoluteUnderHeldLock(
+                        alloc,
+                        io,
+                        cursor_path,
+                        cursor,
+                    );
+                    return claims;
+                }
+                continue;
+            },
             else => return err,
         };
         defer dir.close(io);
@@ -4724,7 +4955,7 @@ fn claimLocalBackupAttemptsForReclamation(
             });
         }
 
-        if (examined > 0) {
+        if (examined > 0 or staging_examined > 0) {
             const next_shard = (shard + 1) % backup_attempt_reclaim_shard_count;
             var cursor_buf: [8]u8 = undefined;
             const cursor = try std.fmt.bufPrint(&cursor_buf, "{d}\n", .{next_shard});
@@ -4801,6 +5032,22 @@ pub fn reclaimStaleClusterBackupAttempts(
     location: *BackupLocation,
     now_unix_ns: u64,
 ) !usize {
+    return reclaimStaleClusterBackupAttemptsWithHook(
+        alloc,
+        io,
+        location,
+        now_unix_ns,
+        null,
+    );
+}
+
+fn reclaimStaleClusterBackupAttemptsWithHook(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    now_unix_ns: u64,
+    test_hook: ?*BackupMaintenanceTestHook,
+) !usize {
     var reclaimed: usize = 0;
     var object_budget: usize = backup_attempt_reclaim_object_budget;
     var parsed_head = try readClusterBackupAttemptHead(alloc, io, location);
@@ -4828,6 +5075,7 @@ pub fn reclaimStaleClusterBackupAttempts(
                 io,
                 backup_root,
                 now_unix_ns,
+                test_hook,
             ) catch |err| {
                 cursor_lock.unlock(io);
                 return err;
@@ -7666,12 +7914,13 @@ fn replaceFileAbsoluteUnderHeldLock(
 /// Atomically replace an enumerated control record while keeping its temporary
 /// file outside the directory readers treat as committed namespace. The
 /// staging directory must share a filesystem with `path`.
-fn replaceFileAbsoluteFromStagingDirUnderHeldLock(
+fn replaceFileAbsoluteFromStagingDirUnderHeldLockWithHook(
     alloc: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     staging_dir: []const u8,
     data: []const u8,
+    test_hook: ?*BackupStagingPublicationTestHook,
 ) !void {
     const destination_dir = std.fs.path.dirname(path) orelse
         return error.InvalidBackupRequest;
@@ -7706,6 +7955,7 @@ fn replaceFileAbsoluteFromStagingDirUnderHeldLock(
     try file.sync(io);
     file.close(io);
     file_open = false;
+    if (test_hook) |hook| hook.pauseAfterSync(tmp_path);
 
     if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.renameAbsolute(tmp_path, path, io)
@@ -10247,36 +10497,35 @@ test "filesystem attempt publication tolerates concurrent bounded maintenance" {
     }};
 
     const Race = struct {
-        start: std.atomic.Value(bool) = .init(false),
         io: std.Io,
         location: *BackupLocation,
         marker: *const ClusterBackupAttemptMarker,
+        publication_hook: *BackupStagingPublicationTestHook,
+        maintenance_hook: *BackupMaintenanceTestHook,
         publish_err: ?anyerror = null,
         maintenance_err: ?anyerror = null,
 
-        fn awaitStart(self: *@This()) void {
-            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
-        }
-
         fn publish(self: *@This()) void {
-            self.awaitStart();
-            writeClusterBackupAttemptMarker(
+            defer self.publication_hook.progress.set(self.io);
+            writeClusterBackupAttemptMarkerWithHook(
                 std.heap.page_allocator,
                 self.io,
                 self.location,
                 self.marker,
+                self.publication_hook,
             ) catch |err| {
                 self.publish_err = err;
             };
         }
 
         fn maintain(self: *@This()) void {
-            self.awaitStart();
-            _ = reclaimStaleClusterBackupAttempts(
+            defer self.maintenance_hook.progress.set(self.io);
+            _ = reclaimStaleClusterBackupAttemptsWithHook(
                 std.heap.page_allocator,
                 self.io,
                 self.location,
-                self.marker.created_at_unix_ns,
+                backup_attempt_staging_orphan_age_ns + 1,
+                self.maintenance_hook,
             ) catch |err| {
                 self.maintenance_err = err;
                 return;
@@ -10284,10 +10533,10 @@ test "filesystem attempt publication tolerates concurrent bounded maintenance" {
         }
     };
 
-    // Each iteration uses a fresh repository so the maintenance cursor always
-    // examines the shard being published. This reliably exercises the window
-    // between staging the reclaim ticket and atomically publishing its name.
-    for (0..32) |iteration| {
+    // Pause exactly after the hidden ticket is durable and before rename. Its
+    // forced old mtime makes maintenance take the deletion path; the existing
+    // per-attempt lock must fence deletion until publication completes.
+    for (0..4) |iteration| {
         const iteration_root = try std.fmt.allocPrint(
             alloc,
             "{s}/iteration-{d}",
@@ -10308,19 +10557,49 @@ test "filesystem attempt publication tolerates concurrent bounded maintenance" {
             .tables = &tables,
         };
 
+        var publication_hook: BackupStagingPublicationTestHook = .{
+            .io = io,
+            .force_modify_timestamp_ns = 0,
+        };
+        var maintenance_hook: BackupMaintenanceTestHook = .{};
         var race: Race = .{
             .io = io,
             .location = &location,
             .marker = &marker,
+            .publication_hook = &publication_hook,
+            .maintenance_hook = &maintenance_hook,
         };
-        const publisher = try std.Thread.spawn(.{}, Race.publish, .{&race});
-        const maintenance = try std.Thread.spawn(.{}, Race.maintain, .{&race});
-        race.start.store(true, .release);
-        publisher.join();
-        maintenance.join();
+        var publisher = try io.concurrent(Race.publish, .{&race});
+        var publisher_pending = true;
+        defer if (publisher_pending) {
+            publication_hook.release.set(io);
+            _ = publisher.await(io);
+        };
+        publication_hook.progress.waitUncancelable(io);
+        if (!publication_hook.staged.load(.acquire)) {
+            _ = publisher.await(io);
+            publisher_pending = false;
+            if (race.publish_err) |err| return err;
+            return error.TestUnexpectedResult;
+        }
+        var maintenance = try io.concurrent(Race.maintain, .{&race});
+        var maintenance_pending = true;
+        defer {
+            if (maintenance_pending) _ = maintenance.await(io);
+        }
+        maintenance_hook.progress.waitUncancelable(io);
+        const maintenance_observed_staging =
+            maintenance_hook.stale_staging_candidate.load(.acquire);
+        publication_hook.release.set(io);
+        _ = publisher.await(io);
+        publisher_pending = false;
+        _ = maintenance.await(io);
+        maintenance_pending = false;
 
+        if (publication_hook.failure) |err| return err;
         if (race.publish_err) |err| return err;
         if (race.maintenance_err) |err| return err;
+        try std.testing.expect(maintenance_observed_staging);
         var parsed = try readClusterBackupAttemptMarker(
             alloc,
             io,
@@ -10333,6 +10612,74 @@ test "filesystem attempt publication tolerates concurrent bounded maintenance" {
             parsed.value.cluster_backup_id,
         );
     }
+}
+
+test "filesystem attempt maintenance removes only stale staged tickets" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/staging-scavenge",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(root);
+    var location: BackupLocation = .{ .file = root };
+    const staging_root = try localBackupAttemptReclaimStagingShardPath(
+        alloc,
+        root,
+        .queued,
+        0,
+    );
+    defer alloc.free(staging_root);
+    try ensureDirPathWithIo(io, staging_root);
+
+    const stale_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/stale-attempt.replace.tmp",
+        .{staging_root},
+    );
+    defer alloc.free(stale_path);
+    const recent_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/recent-attempt.replace.tmp",
+        .{staging_root},
+    );
+    defer alloc.free(recent_path);
+    for ([_][]const u8{ stale_path, recent_path }) |path| {
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{
+            .truncate = true,
+        });
+        file.close(io);
+    }
+    const now_unix_ns = backup_attempt_staging_orphan_age_ns + 100;
+    try std.Io.Dir.cwd().setTimestamps(io, stale_path, .{
+        .modify_timestamp = .{
+            .new = std.Io.Timestamp.fromNanoseconds(0),
+        },
+    });
+    try std.Io.Dir.cwd().setTimestamps(io, recent_path, .{
+        .modify_timestamp = .{
+            .new = std.Io.Timestamp.fromNanoseconds(
+                @intCast(now_unix_ns - 1),
+            ),
+        },
+    });
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try reclaimStaleClusterBackupAttempts(
+            alloc,
+            io,
+            &location,
+            now_unix_ns,
+        ),
+    );
+    try std.testing.expect(!(try pathExistsWithIo(io, stale_path)));
+    try std.testing.expect(try pathExistsWithIo(io, recent_path));
 }
 
 test "filesystem stale attempt reclamation recovers an abandoned claim" {

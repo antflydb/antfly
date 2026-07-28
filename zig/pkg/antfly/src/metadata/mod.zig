@@ -103,6 +103,7 @@ pub const parsePlacementClass = table_manager.parsePlacementClass;
 pub const placementRoleCompatible = table_manager.placementRoleCompatible;
 pub const TransitionKind = transition_state.TransitionKind;
 pub const TransitionPhase = transition_state.TransitionPhase;
+pub const TransitionTableContract = transition_state.TransitionTableContract;
 pub const SplitTransitionRecord = transition_state.SplitTransitionRecord;
 pub const MergeTransitionRecord = transition_state.MergeTransitionRecord;
 pub const SplitObservation = transition_state.SplitObservation;

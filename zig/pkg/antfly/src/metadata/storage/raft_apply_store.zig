@@ -188,17 +188,22 @@ pub const TransitionCommand = union(enum) {
                 metadata_table_manager.freeRestoreIntentIdentity(alloc, identity.*);
             },
             .upsert_split_transition => |*record| {
-                if (record.split_key) |split_key| alloc.free(split_key);
-                if (record.source_range_end) |end| alloc.free(end);
-                if (record.rollback_reason) |reason| alloc.free(reason);
+                metadata_table_manager.freeSplitTransitionRecord(
+                    alloc,
+                    record.*,
+                );
             },
             .admit_split_transition => |*admission| {
-                if (admission.record.split_key) |split_key| alloc.free(split_key);
-                if (admission.record.source_range_end) |end| alloc.free(end);
-                if (admission.record.rollback_reason) |reason| alloc.free(reason);
+                metadata_table_manager.freeSplitTransitionRecord(
+                    alloc,
+                    admission.record,
+                );
             },
             .upsert_merge_transition => |*record| {
-                if (record.rollback_reason) |reason| alloc.free(reason);
+                metadata_table_manager.freeMergeTransitionRecord(
+                    alloc,
+                    record.*,
+                );
             },
             .upsert_extension_package => |*record| record.deinitOwned(alloc),
             .remove_extension_package => |record| {
@@ -338,6 +343,15 @@ fn validateRestoreJobLogicalKey(key: []const u8) !void {
         !std.mem.startsWith(u8, key, restore_job_logical_prefix)) return error.InvalidRestoreJobRecord;
 }
 
+const test_transition_table_contract: metadata.TransitionTableContract = .{
+    .table_id = 7,
+    .table_name = "docs",
+    .schema_json = "{\"title\":{\"type\":\"keyword\"}}",
+    .indexes_json = "{\"full_text\":{\"type\":\"full_text\"}}",
+    .source_identity = .{ .shard_id = 70, .range_id = 700 },
+    .target_identity = .{ .shard_id = 70, .range_id = 700 },
+};
+
 test "transition command validation rejects metadata group ids in data group fields" {
     const metadata_group_id = group_ids.main_metadata_group_id;
     const commands = [_]TransitionCommand{
@@ -424,11 +438,21 @@ test "metadata transition decoders reject unknown enum values" {
             .transition_id = 1,
             .donor_group_id = 7001,
             .receiver_group_id = 7002,
+            .table_contract = test_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(merge);
     const merge_phase_offset = transition_magic.len + 1 + @sizeOf(u64) * 3;
+    const original_merge_phase = merge[merge_phase_offset];
     merge[merge_phase_offset] = 0xff;
+    try std.testing.expectError(
+        error.InvalidMetadataTransitionEncoding,
+        decodeTransitionCommand(std.testing.allocator, merge),
+    );
+    merge[merge_phase_offset] = original_merge_phase;
+
+    const merge_reassignment_offset = merge_phase_offset + 2;
+    merge[merge_reassignment_offset] = 2;
     try std.testing.expectError(
         error.InvalidMetadataTransitionEncoding,
         decodeTransitionCommand(std.testing.allocator, merge),
@@ -547,6 +571,7 @@ test "metadata raft apply store snapshot replaces one complete projection and pr
             .destination_group_id = 102,
             .phase = .prepare,
             .split_key = "m",
+            .table_contract = test_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(split_command);
@@ -774,10 +799,12 @@ fn cloneCommittedTransitionDelta(alloc: std.mem.Allocator, delta: CommittedTrans
 }
 
 fn cloneCommittedSplitTransition(alloc: std.mem.Allocator, record: metadata.SplitTransitionRecord) !metadata.SplitTransitionRecord {
+    const table_contract = try record.table_contract.clone(alloc);
     var owned = record;
     owned.split_key = null;
     owned.source_range_end = null;
     owned.rollback_reason = null;
+    owned.table_contract = table_contract;
     errdefer metadata_table_manager.freeSplitTransitionRecord(alloc, owned);
     if (record.split_key) |value| owned.split_key = try alloc.dupe(u8, value);
     if (record.source_range_end) |value| owned.source_range_end = try alloc.dupe(u8, value);
@@ -786,8 +813,10 @@ fn cloneCommittedSplitTransition(alloc: std.mem.Allocator, record: metadata.Spli
 }
 
 fn cloneCommittedMergeTransition(alloc: std.mem.Allocator, record: metadata.MergeTransitionRecord) !metadata.MergeTransitionRecord {
+    const table_contract = try record.table_contract.clone(alloc);
     var owned = record;
     owned.rollback_reason = null;
+    owned.table_contract = table_contract;
     errdefer metadata_table_manager.freeMergeTransitionRecord(alloc, owned);
     if (record.rollback_reason) |value| owned.rollback_reason = try alloc.dupe(u8, value);
     return owned;
@@ -969,16 +998,17 @@ pub const RaftApplyStore = struct {
         }
 
         const out = try alloc.alloc(metadata.SplitTransitionRecord, kvs.len);
+        var initialized: usize = 0;
         errdefer {
-            for (out[0..kvs.len]) |*record| {
-                if (record.split_key) |split_key| alloc.free(split_key);
-                if (record.source_range_end) |end| alloc.free(end);
-                if (record.rollback_reason) |reason| alloc.free(reason);
-            }
+            for (out[0..initialized]) |record|
+                metadata_table_manager.freeSplitTransitionRecord(alloc, record);
             alloc.free(out);
         }
 
-        for (kvs, 0..) |kv, i| out[i] = try decodeSplitTransitionRecord(alloc, kv.value);
+        for (kvs, 0..) |kv, i| {
+            out[i] = try decodeSplitTransitionRecord(alloc, kv.value);
+            initialized += 1;
+        }
         return out;
     }
 
@@ -1160,14 +1190,17 @@ pub const RaftApplyStore = struct {
         }
 
         const out = try alloc.alloc(metadata.MergeTransitionRecord, kvs.len);
+        var initialized: usize = 0;
         errdefer {
-            for (out[0..kvs.len]) |*record| {
-                if (record.rollback_reason) |reason| alloc.free(reason);
-            }
+            for (out[0..initialized]) |record|
+                metadata_table_manager.freeMergeTransitionRecord(alloc, record);
             alloc.free(out);
         }
 
-        for (kvs, 0..) |kv, i| out[i] = try decodeMergeTransitionRecord(alloc, kv.value);
+        for (kvs, 0..) |kv, i| {
+            out[i] = try decodeMergeTransitionRecord(alloc, kv.value);
+            initialized += 1;
+        }
         return out;
     }
 
@@ -1441,18 +1474,14 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn freeSplitTransitions(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []metadata.SplitTransitionRecord) void {
-        for (records) |record| {
-            if (record.split_key) |split_key| alloc.free(split_key);
-            if (record.source_range_end) |end| alloc.free(end);
-            if (record.rollback_reason) |reason| alloc.free(reason);
-        }
+        for (records) |record|
+            metadata_table_manager.freeSplitTransitionRecord(alloc, record);
         alloc.free(records);
     }
 
     pub fn freeMergeTransitions(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []metadata.MergeTransitionRecord) void {
-        for (records) |record| {
-            if (record.rollback_reason) |reason| alloc.free(reason);
-        }
+        for (records) |record|
+            metadata_table_manager.freeMergeTransitionRecord(alloc, record);
         alloc.free(records);
     }
 
@@ -4717,6 +4746,8 @@ fn appendSplitTransitionRecord(
     } else {
         try out.append(alloc, 0);
     }
+    try record.table_contract.validateForSplit();
+    try appendTransitionTableContract(alloc, out, record.table_contract);
 }
 
 fn appendMergeTransitionRecord(
@@ -4724,6 +4755,11 @@ fn appendMergeTransitionRecord(
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.MergeTransitionRecord,
 ) !void {
+    if (record.transition_id == 0 or record.donor_group_id == 0 or
+        record.receiver_group_id == 0)
+    {
+        return error.InvalidMetadataTransitionEncoding;
+    }
     try appendInt(alloc, out, u64, record.transition_id);
     try appendInt(alloc, out, u64, record.donor_group_id);
     try appendInt(alloc, out, u64, record.receiver_group_id);
@@ -4736,6 +4772,26 @@ fn appendMergeTransitionRecord(
         try out.append(alloc, 0);
     }
     try out.append(alloc, if (record.allow_doc_identity_reassignment) 1 else 0);
+    try record.table_contract.validateForMerge(
+        record.allow_doc_identity_reassignment,
+    );
+    try appendTransitionTableContract(alloc, out, record.table_contract);
+}
+
+fn appendTransitionTableContract(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    contract: metadata.TransitionTableContract,
+) !void {
+    try contract.validate();
+    try appendInt(alloc, out, u64, contract.table_id);
+    try appendRequiredString(alloc, out, contract.table_name);
+    try appendRequiredString(alloc, out, contract.schema_json);
+    try appendRequiredString(alloc, out, contract.indexes_json);
+    try appendInt(alloc, out, u64, contract.source_identity.shard_id);
+    try appendInt(alloc, out, u64, contract.source_identity.range_id);
+    try appendInt(alloc, out, u64, contract.target_identity.shard_id);
+    try appendInt(alloc, out, u64, contract.target_identity.range_id);
 }
 
 fn appendReconcileLeaseRecord(
@@ -5419,8 +5475,14 @@ fn readSplitTransitionRecord(
         return error.InvalidMetadataTransitionEncoding;
     pos.* += 1;
     const split_key = try readOptionalString(alloc, encoded, pos);
+    errdefer if (split_key) |value| alloc.free(value);
     const source_range_end = try readOptionalString(alloc, encoded, pos);
+    errdefer if (source_range_end) |value| alloc.free(value);
     const rollback_reason = try readOptionalString(alloc, encoded, pos);
+    errdefer if (rollback_reason) |value| alloc.free(value);
+    var table_contract = try readTransitionTableContract(alloc, encoded, pos);
+    errdefer table_contract.deinitOwned(alloc);
+    try table_contract.validateForSplit();
     return .{
         .transition_id = transition_id,
         .attempt_epoch = attempt_epoch,
@@ -5430,6 +5492,7 @@ fn readSplitTransitionRecord(
         .split_key = split_key,
         .source_range_end = source_range_end,
         .rollback_reason = rollback_reason,
+        .table_contract = table_contract,
     };
 }
 
@@ -5441,16 +5504,22 @@ fn readMergeTransitionRecord(
     const transition_id = try readInt(encoded, pos, u64);
     const donor_group_id = try readInt(encoded, pos, u64);
     const receiver_group_id = try readInt(encoded, pos, u64);
+    if (transition_id == 0 or donor_group_id == 0 or receiver_group_id == 0)
+        return error.InvalidMetadataTransitionEncoding;
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
     const phase = std.enums.fromInt(metadata.TransitionPhase, encoded[pos.*]) orelse
         return error.InvalidMetadataTransitionEncoding;
     pos.* += 1;
     const rollback_reason = try readOptionalString(alloc, encoded, pos);
-    const allow_doc_identity_reassignment = if (pos.* < encoded.len) blk: {
-        const value = encoded[pos.*] != 0;
-        pos.* += 1;
-        break :blk value;
-    } else false;
+    errdefer if (rollback_reason) |value| alloc.free(value);
+    if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+    const reassignment_tag = encoded[pos.*];
+    if (reassignment_tag > 1) return error.InvalidMetadataTransitionEncoding;
+    const allow_doc_identity_reassignment = reassignment_tag == 1;
+    pos.* += 1;
+    var table_contract = try readTransitionTableContract(alloc, encoded, pos);
+    errdefer table_contract.deinitOwned(alloc);
+    try table_contract.validateForMerge(allow_doc_identity_reassignment);
     return .{
         .transition_id = transition_id,
         .donor_group_id = donor_group_id,
@@ -5458,7 +5527,38 @@ fn readMergeTransitionRecord(
         .phase = phase,
         .rollback_reason = rollback_reason,
         .allow_doc_identity_reassignment = allow_doc_identity_reassignment,
+        .table_contract = table_contract,
     };
+}
+
+fn readTransitionTableContract(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata.TransitionTableContract {
+    const table_id = try readInt(encoded, pos, u64);
+    const table_name = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(table_name);
+    const schema_json = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(schema_json);
+    const indexes_json = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(indexes_json);
+    const contract: metadata.TransitionTableContract = .{
+        .table_id = table_id,
+        .table_name = table_name,
+        .schema_json = schema_json,
+        .indexes_json = indexes_json,
+        .source_identity = .{
+            .shard_id = try readInt(encoded, pos, u64),
+            .range_id = try readInt(encoded, pos, u64),
+        },
+        .target_identity = .{
+            .shard_id = try readInt(encoded, pos, u64),
+            .range_id = try readInt(encoded, pos, u64),
+        },
+    };
+    try contract.validate();
+    return contract;
 }
 
 fn readReconcileLeaseRecord(
@@ -5837,6 +5937,7 @@ fn splitTransitionUpdateAllowed(existing: metadata.SplitTransitionRecord, incomi
         existing.attempt_epoch == incoming.attempt_epoch and
         existing.source_group_id == incoming.source_group_id and
         existing.destination_group_id == incoming.destination_group_id and
+        existing.table_contract.eql(incoming.table_contract) and
         optionalBytesEqual(existing.split_key, incoming.split_key) and
         optionalBytesEqual(existing.source_range_end, incoming.source_range_end) and
         transitionPhaseCanAdvance(existing.phase, incoming.phase) and
@@ -5847,6 +5948,7 @@ fn mergeTransitionUpdateAllowed(existing: metadata.MergeTransitionRecord, incomi
     return existing.transition_id == incoming.transition_id and
         existing.donor_group_id == incoming.donor_group_id and
         existing.receiver_group_id == incoming.receiver_group_id and
+        existing.table_contract.eql(incoming.table_contract) and
         existing.allow_doc_identity_reassignment == incoming.allow_doc_identity_reassignment and
         transitionPhaseCanAdvance(existing.phase, incoming.phase) and
         !(existing.rollback_reason != null and incoming.rollback_reason == null);
@@ -5906,6 +6008,7 @@ test "metadata raft apply store fences transition identity and active removal" {
             .split_key = "doc:m",
             .source_range_end = "doc:z",
             .rollback_reason = "slow-peer",
+            .table_contract = test_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(split_cmd);
@@ -5916,6 +6019,7 @@ test "metadata raft apply store fences transition identity and active removal" {
             .receiver_group_id = 30,
             .phase = .replay_deltas,
             .allow_doc_identity_reassignment = true,
+            .table_contract = test_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(merge_cmd);
@@ -5945,9 +6049,15 @@ test "metadata raft apply store fences transition identity and active removal" {
         try std.testing.expectEqualStrings("doc:m", splits[0].split_key.?);
         try std.testing.expectEqualStrings("doc:z", splits[0].source_range_end.?);
         try std.testing.expectEqualStrings("slow-peer", splits[0].rollback_reason.?);
+        try std.testing.expect(splits[0].table_contract.eql(
+            test_transition_table_contract,
+        ));
         try std.testing.expectEqual(@as(usize, 1), merges.len);
         try std.testing.expectEqual(@as(u64, 601), merges[0].transition_id);
         try std.testing.expect(merges[0].allow_doc_identity_reassignment);
+        try std.testing.expect(merges[0].table_contract.eql(
+            test_transition_table_contract,
+        ));
     }
 
     const conflicting_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
@@ -5959,6 +6069,7 @@ test "metadata raft apply store fences transition identity and active removal" {
             .phase = .prepare,
             .split_key = "doc:m",
             .source_range_end = "doc:z",
+            .table_contract = test_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(conflicting_split_cmd);
@@ -5969,9 +6080,43 @@ test "metadata raft apply store fences transition identity and active removal" {
             .receiver_group_id = 30,
             .phase = .prepare,
             .allow_doc_identity_reassignment = true,
+            .table_contract = test_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(regressive_merge_cmd);
+    const drifted_contract: metadata.TransitionTableContract = .{
+        .table_id = test_transition_table_contract.table_id,
+        .table_name = test_transition_table_contract.table_name,
+        .schema_json = "{\"title\":{\"type\":\"text\"}}",
+        .indexes_json = test_transition_table_contract.indexes_json,
+        .source_identity = test_transition_table_contract.source_identity,
+        .target_identity = test_transition_table_contract.target_identity,
+    };
+    const contract_drift_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_split_transition = .{
+            .transition_id = 501,
+            .attempt_epoch = 1,
+            .source_group_id = 21,
+            .destination_group_id = 22,
+            .phase = .replay_deltas,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
+            .rollback_reason = "slow-peer",
+            .table_contract = drifted_contract,
+        },
+    });
+    defer std.testing.allocator.free(contract_drift_split_cmd);
+    const contract_drift_merge_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_merge_transition = .{
+            .transition_id = 601,
+            .donor_group_id = 31,
+            .receiver_group_id = 30,
+            .phase = .cutover_pending,
+            .allow_doc_identity_reassignment = true,
+            .table_contract = drifted_contract,
+        },
+    });
+    defer std.testing.allocator.free(contract_drift_merge_cmd);
     const remove_active_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .remove_split_transition = .{ .transition_id = 501 },
     });
@@ -5983,8 +6128,10 @@ test "metadata raft apply store fences transition identity and active removal" {
     const encoded_stale_commands = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 2, .index = 9, .entry_type = .normal, .data = conflicting_split_cmd },
         .{ .term = 2, .index = 10, .entry_type = .normal, .data = regressive_merge_cmd },
-        .{ .term = 2, .index = 11, .entry_type = .normal, .data = remove_active_split_cmd },
-        .{ .term = 2, .index = 12, .entry_type = .normal, .data = remove_active_merge_cmd },
+        .{ .term = 2, .index = 11, .entry_type = .normal, .data = contract_drift_split_cmd },
+        .{ .term = 2, .index = 12, .entry_type = .normal, .data = contract_drift_merge_cmd },
+        .{ .term = 2, .index = 13, .entry_type = .normal, .data = remove_active_split_cmd },
+        .{ .term = 2, .index = 14, .entry_type = .normal, .data = remove_active_merge_cmd },
     });
     defer std.testing.allocator.free(encoded_stale_commands);
 
@@ -5993,7 +6140,7 @@ test "metadata raft apply store fences transition identity and active removal" {
         defer store.deinit();
         try store.snapshotBuilder().applyBatch(.{
             .group_id = 21,
-            .commit_index = 12,
+            .commit_index = 14,
             .entries_bytes = encoded_stale_commands,
         });
 
@@ -6005,8 +6152,14 @@ test "metadata raft apply store fences transition identity and active removal" {
         try std.testing.expectEqual(@as(usize, 1), splits.len);
         try std.testing.expectEqual(@as(u64, 1), splits[0].attempt_epoch);
         try std.testing.expectEqual(metadata.TransitionPhase.bootstrap_peer, splits[0].phase);
+        try std.testing.expect(splits[0].table_contract.eql(
+            test_transition_table_contract,
+        ));
         try std.testing.expectEqual(@as(usize, 1), merges.len);
         try std.testing.expectEqual(metadata.TransitionPhase.replay_deltas, merges[0].phase);
+        try std.testing.expect(merges[0].table_contract.eql(
+            test_transition_table_contract,
+        ));
     }
 
     const finalize_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
@@ -6019,6 +6172,7 @@ test "metadata raft apply store fences transition identity and active removal" {
             .split_key = "doc:m",
             .source_range_end = "doc:z",
             .rollback_reason = "slow-peer",
+            .table_contract = test_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(finalize_split_cmd);
@@ -6029,12 +6183,13 @@ test "metadata raft apply store fences transition identity and active removal" {
             .receiver_group_id = 30,
             .phase = .finalized,
             .allow_doc_identity_reassignment = true,
+            .table_contract = test_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(finalize_merge_cmd);
     const encoded_terminal = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 2, .index = 13, .entry_type = .normal, .data = finalize_split_cmd },
-        .{ .term = 2, .index = 14, .entry_type = .normal, .data = finalize_merge_cmd },
+        .{ .term = 2, .index = 15, .entry_type = .normal, .data = finalize_split_cmd },
+        .{ .term = 2, .index = 16, .entry_type = .normal, .data = finalize_merge_cmd },
     });
     defer std.testing.allocator.free(encoded_terminal);
 
@@ -6043,7 +6198,7 @@ test "metadata raft apply store fences transition identity and active removal" {
         defer store.deinit();
         try store.snapshotBuilder().applyBatch(.{
             .group_id = 21,
-            .commit_index = 14,
+            .commit_index = 16,
             .entries_bytes = encoded_terminal,
         });
 
@@ -6064,8 +6219,8 @@ test "metadata raft apply store fences transition identity and active removal" {
     });
     defer std.testing.allocator.free(remove_merge_cmd);
     const encoded_terminal_remove = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 3, .index = 15, .entry_type = .normal, .data = remove_split_cmd },
-        .{ .term = 3, .index = 16, .entry_type = .normal, .data = remove_merge_cmd },
+        .{ .term = 3, .index = 17, .entry_type = .normal, .data = remove_split_cmd },
+        .{ .term = 3, .index = 18, .entry_type = .normal, .data = remove_merge_cmd },
     });
     defer std.testing.allocator.free(encoded_terminal_remove);
 
@@ -6074,7 +6229,7 @@ test "metadata raft apply store fences transition identity and active removal" {
         defer store.deinit();
         try store.snapshotBuilder().applyBatch(.{
             .group_id = 21,
-            .commit_index = 16,
+            .commit_index = 18,
             .entries_bytes = encoded_terminal_remove,
         });
 
@@ -6105,12 +6260,14 @@ test "metadata raft apply store returns only durable transition deltas" {
         .phase = .prepare,
         .split_key = "doc:m",
         .source_range_end = "doc:z",
+        .table_contract = test_transition_table_contract,
     };
     const merge = metadata.MergeTransitionRecord{
         .transition_id = 801,
         .donor_group_id = 81,
         .receiver_group_id = 80,
         .phase = .prepare,
+        .table_contract = test_transition_table_contract,
     };
 
     const split_upsert = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_split_transition = split });
@@ -6229,6 +6386,7 @@ test "metadata raft apply store publishes listeners only after commit" {
         .source_group_id = 91,
         .destination_group_id = group_ids.main_metadata_group_id,
         .phase = .prepare,
+        .table_contract = test_transition_table_contract,
     } });
     defer std.testing.allocator.free(invalid_split);
     const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
@@ -6913,6 +7071,7 @@ test "metadata raft apply store rejects reserved data group ids in transition re
             .source_group_id = 21,
             .destination_group_id = group_ids.main_metadata_group_id,
             .phase = .prepare,
+            .table_contract = test_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(split_cmd);
@@ -6932,6 +7091,7 @@ test "metadata raft apply store rejects reserved data group ids in transition re
             .donor_group_id = group_ids.main_metadata_group_id,
             .receiver_group_id = 30,
             .phase = .prepare,
+            .table_contract = test_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(merge_cmd);
@@ -7943,6 +8103,7 @@ test "metadata state machine projects transitions through metadata apply store" 
             .source_group_id = 41,
             .destination_group_id = 42,
             .phase = .bootstrap_peer,
+            .table_contract = test_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(cmd);
@@ -8122,6 +8283,7 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
             .source_group_id = 51,
             .destination_group_id = 52,
             .phase = .bootstrap_peer,
+            .table_contract = test_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(cmd);

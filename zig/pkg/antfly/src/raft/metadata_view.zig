@@ -261,38 +261,20 @@ fn deinitTransitionRecord(alloc: std.mem.Allocator, record: *metadata.Transition
 }
 
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: metadata.SplitTransitionRecord) !metadata.SplitTransitionRecord {
-    return .{
-        .transition_id = record.transition_id,
-        .attempt_epoch = record.attempt_epoch,
-        .source_group_id = record.source_group_id,
-        .destination_group_id = record.destination_group_id,
-        .phase = record.phase,
-        .split_key = if (record.split_key) |split_key| try alloc.dupe(u8, split_key) else null,
-        .source_range_end = if (record.source_range_end) |end| try alloc.dupe(u8, end) else null,
-        .rollback_reason = if (record.rollback_reason) |reason| try alloc.dupe(u8, reason) else null,
-    };
+    return try metadata.table_manager.cloneSplitTransitionRecord(alloc, record);
 }
 
 fn cloneMergeRecord(alloc: std.mem.Allocator, record: metadata.MergeTransitionRecord) !metadata.MergeTransitionRecord {
-    return .{
-        .transition_id = record.transition_id,
-        .donor_group_id = record.donor_group_id,
-        .receiver_group_id = record.receiver_group_id,
-        .phase = record.phase,
-        .rollback_reason = if (record.rollback_reason) |reason| try alloc.dupe(u8, reason) else null,
-        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
-    };
+    return try metadata.table_manager.cloneMergeTransitionRecord(alloc, record);
 }
 
 fn deinitSplitRecord(alloc: std.mem.Allocator, record: *metadata.SplitTransitionRecord) void {
-    if (record.split_key) |split_key| alloc.free(split_key);
-    if (record.source_range_end) |end| alloc.free(end);
-    if (record.rollback_reason) |reason| alloc.free(reason);
+    metadata.table_manager.freeSplitTransitionRecord(alloc, record.*);
     record.* = undefined;
 }
 
 fn deinitMergeRecord(alloc: std.mem.Allocator, record: *metadata.MergeTransitionRecord) void {
-    if (record.rollback_reason) |reason| alloc.free(reason);
+    metadata.table_manager.freeMergeTransitionRecord(alloc, record.*);
     record.* = undefined;
 }
 

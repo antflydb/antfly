@@ -2369,11 +2369,24 @@ const EncodedTransitionAction = struct {
     allow_doc_identity_reassignment: bool = false,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
+    table_contract: metadata_mod.TransitionTableContract,
 };
 
 fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.TransitionAction) ![]u8 {
-    const encoded: EncodedTransitionAction = switch (action) {
+    switch (action) {
         .none => return error.UnsupportedOperation,
+        inline else => |op| {
+            if (@hasField(@TypeOf(op), "allow_doc_identity_reassignment")) {
+                try op.table_contract.validateForMerge(
+                    op.allow_doc_identity_reassignment,
+                );
+            } else {
+                try op.table_contract.validateForSplit();
+            }
+        },
+    }
+    const encoded: EncodedTransitionAction = switch (action) {
+        .none => unreachable,
         .prepare_split_source => |op| .{
             .kind = .prepare_split_source,
             .transition_id = op.transition_id,
@@ -2382,6 +2395,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .destination_group_id = op.destination_group_id,
             .split_key = op.split_key,
             .source_range_end = op.source_range_end,
+            .table_contract = op.table_contract,
         },
         .start_split_source => |op| .{
             .kind = .start_split_source,
@@ -2389,6 +2403,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .table_contract = op.table_contract,
         },
         .bootstrap_split_destination => |op| .{
             .kind = .bootstrap_split_destination,
@@ -2396,6 +2411,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .table_contract = op.table_contract,
         },
         .catch_up_split_destination => |op| .{
             .kind = .catch_up_split_destination,
@@ -2403,6 +2419,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .table_contract = op.table_contract,
         },
         .finalize_split_source => |op| .{
             .kind = .finalize_split_source,
@@ -2410,6 +2427,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .table_contract = op.table_contract,
         },
         .rollback_split => |op| .{
             .kind = .rollback_split,
@@ -2417,6 +2435,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .attempt_epoch = op.attempt_epoch,
             .source_group_id = op.source_group_id,
             .destination_group_id = op.destination_group_id,
+            .table_contract = op.table_contract,
         },
         .accept_merge_receiver => |op| .{
             .kind = .accept_merge_receiver,
@@ -2424,6 +2443,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .donor_group_id = op.donor_group_id,
             .receiver_group_id = op.receiver_group_id,
             .allow_doc_identity_reassignment = op.allow_doc_identity_reassignment,
+            .table_contract = op.table_contract,
         },
         .catch_up_merge_receiver => |op| .{
             .kind = .catch_up_merge_receiver,
@@ -2431,6 +2451,7 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .donor_group_id = op.donor_group_id,
             .receiver_group_id = op.receiver_group_id,
             .allow_doc_identity_reassignment = op.allow_doc_identity_reassignment,
+            .table_contract = op.table_contract,
         },
         .finalize_merge => |op| .{
             .kind = .finalize_merge,
@@ -2438,12 +2459,15 @@ fn encodeTransitionAction(alloc: std.mem.Allocator, action: metadata_mod.Transit
             .donor_group_id = op.donor_group_id,
             .receiver_group_id = op.receiver_group_id,
             .allow_doc_identity_reassignment = op.allow_doc_identity_reassignment,
+            .table_contract = op.table_contract,
         },
         .rollback_merge => |op| .{
             .kind = .rollback_merge,
             .transition_id = op.transition_id,
             .donor_group_id = op.donor_group_id,
             .receiver_group_id = op.receiver_group_id,
+            .allow_doc_identity_reassignment = op.allow_doc_identity_reassignment,
+            .table_contract = op.table_contract,
         },
     };
     return try jsonStringifyAlloc(alloc, encoded);
@@ -2795,15 +2819,35 @@ test "api http client preserves group doc identity conflicts" {
 
 test "api http client encodes merge doc identity reassignment action flag" {
     const alloc = std.testing.allocator;
+    const table_contract: metadata_mod.TransitionTableContract = .{
+        .table_id = 7,
+        .table_name = "docs",
+        .schema_json = "",
+        .indexes_json = "{}",
+        .source_identity = .{ .shard_id = 70, .range_id = 700 },
+        .target_identity = .{ .shard_id = 71, .range_id = 701 },
+    };
     const body = try encodeTransitionAction(alloc, .{ .finalize_merge = .{
         .transition_id = 8,
         .donor_group_id = 10,
         .receiver_group_id = 9,
         .allow_doc_identity_reassignment = true,
+        .table_contract = table_contract,
     } });
     defer alloc.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"allow_doc_identity_reassignment\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"source_identity\":{\"shard_id\":70,\"range_id\":700}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"target_identity\":{\"shard_id\":71,\"range_id\":701}") != null);
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        encodeTransitionAction(alloc, .{ .finalize_merge = .{
+            .transition_id = 8,
+            .donor_group_id = 10,
+            .receiver_group_id = 9,
+            .table_contract = table_contract,
+        } }),
+    );
 }
 
 test "api http client round-trips public status route" {

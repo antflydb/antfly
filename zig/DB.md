@@ -571,13 +571,42 @@ path. Pending destinations are leased by globally unique group ID so metadata
 publication and visible-root generation changes cannot hide an already-open
 writer behind a stale table label. A process-local transition admission lock
 serializes fallback coordinators while a destination is not yet published.
-Destination identity comes from its projected range when available, with the
-source range used only for pre-publication bootstrap; identity reassignment is
-never performed against a live managed DB. Writer-cache admission validates the
-expected namespace before returning a lease. An idle mismatched owner is
-retired and closed before replacement; an active mismatch blocks the new open
-until its existing lease drains. This prevents a pre-publication destination
-open from becoming the serving writer for a differently namespaced range.
+Every durable transition record owns an immutable table contract and two
+explicit identity roles: `source_identity` for the source or merge donor, and
+`target_identity` for the split destination or merge receiver. A split records
+the same inherited identity in both roles; a merge records the donor and
+receiver independently. Phase updates must preserve the complete contract, and
+the binary and HTTP codecs require both roles. Runtime code selects a typed role
+at each open instead of inferring one identity from current topology, which may
+already have advanced past the transition.
+
+Reconciliation-authority handoff rehydrates projected intents with an owned
+copy of the durable contract and split boundary. It never reconstructs either
+from the new authority's desired catalog, and it can resume an admitted
+transition even when that desired catalog has already removed the table.
+
+Writer-cache admission validates the expected namespace before returning a
+lease. Normal source and target opens require an exact match. The sole relaxed
+case is an explicitly admitted merge identity reassignment: while holding
+exclusive transition admission, the receiver may be opened under its prior
+namespace only when its persisted table ID matches the contract table ID. The
+coordinator then performs the fenced reassignment before serving admission
+reopens. Cross-table mismatches and all unflagged mismatches fail closed. An
+idle mismatched owner is retired and closed before replacement; an active
+mismatch blocks the new open until its existing lease drains. This prevents a
+pre-publication destination open from becoming the serving writer for a
+differently namespaced range and gives rollback enough durable information to
+reopen the same-table receiver safely after restart.
+
+Metadata reconciliation treats that contract as an active structural fence.
+Schema and index changes wait until every contract for the table is terminal.
+Range updates are fenced for each transition participant and its immediate
+range-boundary neighbors, preventing half of a coupled boundary update from
+publishing while allowing independent shard pairs in a large table to continue
+reconciling. A requested table drop retains the table, every range, and their
+placements until all transitions terminate; only then can normal removal
+proceed.
+
 Every destination bootstrap and catch-up batch carries a typed split replication
 context containing the metadata transition ID, source group, destination group,
 inherited identity namespace, operation kind, and source delta sequence where

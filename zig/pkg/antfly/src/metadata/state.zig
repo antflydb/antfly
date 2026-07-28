@@ -1063,27 +1063,11 @@ fn applyMergeObservationReadiness(
 }
 
 fn cloneSplitRecord(alloc: std.mem.Allocator, record: transition_state.SplitTransitionRecord) !transition_state.SplitTransitionRecord {
-    return .{
-        .transition_id = record.transition_id,
-        .attempt_epoch = record.attempt_epoch,
-        .source_group_id = record.source_group_id,
-        .destination_group_id = record.destination_group_id,
-        .phase = record.phase,
-        .split_key = if (record.split_key) |value| try alloc.dupe(u8, value) else null,
-        .source_range_end = if (record.source_range_end) |value| try alloc.dupe(u8, value) else null,
-        .rollback_reason = if (record.rollback_reason) |value| try alloc.dupe(u8, value) else null,
-    };
+    return try metadata_table_manager.cloneSplitTransitionRecord(alloc, record);
 }
 
 fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTransitionRecord) !transition_state.MergeTransitionRecord {
-    return .{
-        .transition_id = record.transition_id,
-        .donor_group_id = record.donor_group_id,
-        .receiver_group_id = record.receiver_group_id,
-        .phase = record.phase,
-        .rollback_reason = if (record.rollback_reason) |value| try alloc.dupe(u8, value) else null,
-        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
-    };
+    return try metadata_table_manager.cloneMergeTransitionRecord(alloc, record);
 }
 
 fn defaultSplitObservation() transition_state.SplitObservation {

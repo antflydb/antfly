@@ -32,6 +32,99 @@ pub const TransitionPhase = enum {
     rolled_back,
 };
 
+pub const TransitionIdentity = struct {
+    shard_id: u64 = 0,
+    range_id: u64 = 0,
+
+    pub fn validate(self: @This()) !void {
+        if (self.shard_id == 0 or self.range_id == 0)
+            return error.InvalidTransitionTableContract;
+    }
+
+    pub fn eql(self: @This(), other: @This()) bool {
+        return self.shard_id == other.shard_id and
+            self.range_id == other.range_id;
+    }
+};
+
+/// Immutable storage descriptor captured when a range transition is admitted.
+///
+/// A transition can outlive metadata-cache entries, leaders, and processes.
+/// Carrying the exact table configuration in the replicated record prevents a
+/// later phase from opening the shard with whichever catalog snapshot happens
+/// to be cached on the executor. Source and target identities are distinct
+/// because merge donors may use a different document namespace from the
+/// receiver that survives cutover.
+pub const TransitionTableContract = struct {
+    table_id: u64 = 0,
+    table_name: []const u8 = "",
+    schema_json: []const u8 = "",
+    indexes_json: []const u8 = "",
+    source_identity: TransitionIdentity = .{},
+    target_identity: TransitionIdentity = .{},
+
+    pub fn validate(self: @This()) !void {
+        if (self.table_id == 0 or
+            self.table_name.len == 0 or
+            self.indexes_json.len == 0)
+        {
+            return error.InvalidTransitionTableContract;
+        }
+        try self.source_identity.validate();
+        try self.target_identity.validate();
+    }
+
+    pub fn validateForSplit(self: @This()) !void {
+        try self.validate();
+        if (!self.source_identity.eql(self.target_identity))
+            return error.InvalidTransitionTableContract;
+    }
+
+    pub fn validateForMerge(
+        self: @This(),
+        allow_doc_identity_reassignment: bool,
+    ) !void {
+        try self.validate();
+        if (!allow_doc_identity_reassignment and
+            !self.source_identity.eql(self.target_identity))
+        {
+            return error.InvalidTransitionTableContract;
+        }
+    }
+
+    pub fn eql(self: @This(), other: @This()) bool {
+        return self.table_id == other.table_id and
+            self.source_identity.eql(other.source_identity) and
+            self.target_identity.eql(other.target_identity) and
+            std.mem.eql(u8, self.table_name, other.table_name) and
+            std.mem.eql(u8, self.schema_json, other.schema_json) and
+            std.mem.eql(u8, self.indexes_json, other.indexes_json);
+    }
+
+    pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
+        const table_name = try alloc.dupe(u8, self.table_name);
+        errdefer alloc.free(table_name);
+        const schema_json = try alloc.dupe(u8, self.schema_json);
+        errdefer alloc.free(schema_json);
+        const indexes_json = try alloc.dupe(u8, self.indexes_json);
+        return .{
+            .table_id = self.table_id,
+            .table_name = table_name,
+            .schema_json = schema_json,
+            .indexes_json = indexes_json,
+            .source_identity = self.source_identity,
+            .target_identity = self.target_identity,
+        };
+    }
+
+    pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.schema_json);
+        alloc.free(self.indexes_json);
+        self.* = undefined;
+    }
+};
+
 pub const SplitTransitionRecord = struct {
     transition_id: u64,
     attempt_epoch: u64,
@@ -41,6 +134,7 @@ pub const SplitTransitionRecord = struct {
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
     rollback_reason: ?[]const u8 = null,
+    table_contract: TransitionTableContract = .{},
 };
 
 pub const MergeTransitionRecord = struct {
@@ -50,6 +144,7 @@ pub const MergeTransitionRecord = struct {
     phase: TransitionPhase = .prepare,
     rollback_reason: ?[]const u8 = null,
     allow_doc_identity_reassignment: bool = false,
+    table_contract: TransitionTableContract = .{},
 };
 
 pub const SplitObservation = struct {
@@ -397,10 +492,45 @@ test "transition state module compiles" {
     _ = GroupTransitionReadinessSource;
     _ = GroupTransitionReadinessResult;
     _ = StablePlacementReadiness;
+    _ = TransitionTableContract;
     _ = readinessForGroup;
     _ = readinessForLocalGroup;
     _ = readinessResultForLocalSplitTransition;
     _ = readinessResultForLocalMergeTransition;
+}
+
+test "transition table contract is validated and cloned as owned state" {
+    const contract: TransitionTableContract = .{
+        .table_id = 7,
+        .table_name = "docs",
+        .schema_json = "{\"title\":{\"type\":\"keyword\"}}",
+        .indexes_json = "{\"full_text\":{\"type\":\"full_text\"}}",
+        .source_identity = .{ .shard_id = 70, .range_id = 700 },
+        .target_identity = .{ .shard_id = 71, .range_id = 701 },
+    };
+    try contract.validate();
+    var cloned = try contract.clone(std.testing.allocator);
+    defer cloned.deinitOwned(std.testing.allocator);
+    try std.testing.expect(contract.eql(cloned));
+    try std.testing.expect(contract.table_name.ptr != cloned.table_name.ptr);
+    try std.testing.expect(contract.schema_json.ptr != cloned.schema_json.ptr);
+    try std.testing.expect(contract.indexes_json.ptr != cloned.indexes_json.ptr);
+
+    var invalid = contract;
+    invalid.source_identity.range_id = 0;
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        invalid.validate(),
+    );
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        contract.validateForSplit(),
+    );
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        contract.validateForMerge(false),
+    );
+    try contract.validateForMerge(true);
 }
 
 test "transition state derives heartbeat readiness for active phases" {

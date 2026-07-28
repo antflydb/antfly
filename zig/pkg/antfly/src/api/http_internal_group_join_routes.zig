@@ -180,15 +180,15 @@ test "internal group join routes map doc identity mismatch to conflict" {
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8) !query_api.QueryResponse {
+        fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) !query_api.QueryResponse {
             return error.UnsupportedOperation;
         }
 
-        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8) ![]u8 {
+        fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) ![]u8 {
             return error.UnsupportedOperation;
         }
 
-        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value) !query_api.OwnedQueryRequest {
+        fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64) !query_api.OwnedQueryRequest {
             return error.UnsupportedOperation;
         }
 
@@ -295,15 +295,15 @@ const TestJoinContext = struct {
 
     fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-    fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8) !query_api.QueryResponse {
+    fn executePlainQuery(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) !query_api.QueryResponse {
         return error.UnsupportedOperation;
     }
 
-    fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8) ![]u8 {
+    fn executeQueryDispatch(_: *anyopaque, _: std.mem.Allocator, _: table_reads.TableReadSource, _: []const u8, _: []const u8, _: ?[]const u8, _: ?u64) ![]u8 {
         return error.UnsupportedOperation;
     }
 
-    fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value) !query_api.OwnedQueryRequest {
+    fn buildOwnedSearchRequest(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?u64) !query_api.OwnedQueryRequest {
         return error.UnsupportedOperation;
     }
 

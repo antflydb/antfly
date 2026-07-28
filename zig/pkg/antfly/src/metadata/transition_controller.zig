@@ -143,6 +143,7 @@ pub const TransitionController = struct {
                             .destination_group_id = record.destination_group_id,
                             .split_key = split_key,
                             .source_range_end = record.source_range_end,
+                            .table_contract = record.table_contract,
                         },
                     } else .none
                 else
@@ -152,6 +153,7 @@ pub const TransitionController = struct {
                             .attempt_epoch = record.attempt_epoch,
                             .source_group_id = record.source_group_id,
                             .destination_group_id = record.destination_group_id,
+                            .table_contract = record.table_contract,
                         },
                     },
             },
@@ -163,6 +165,7 @@ pub const TransitionController = struct {
                         .attempt_epoch = record.attempt_epoch,
                         .source_group_id = record.source_group_id,
                         .destination_group_id = record.destination_group_id,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -174,6 +177,7 @@ pub const TransitionController = struct {
                         .attempt_epoch = record.attempt_epoch,
                         .source_group_id = record.source_group_id,
                         .destination_group_id = record.destination_group_id,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -185,6 +189,7 @@ pub const TransitionController = struct {
                         .attempt_epoch = record.attempt_epoch,
                         .source_group_id = record.source_group_id,
                         .destination_group_id = record.destination_group_id,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -200,6 +205,7 @@ pub const TransitionController = struct {
                         .attempt_epoch = record.attempt_epoch,
                         .source_group_id = record.source_group_id,
                         .destination_group_id = record.destination_group_id,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -243,6 +249,7 @@ pub const TransitionController = struct {
                         .donor_group_id = record.donor_group_id,
                         .receiver_group_id = record.receiver_group_id,
                         .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -254,6 +261,7 @@ pub const TransitionController = struct {
                         .donor_group_id = record.donor_group_id,
                         .receiver_group_id = record.receiver_group_id,
                         .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -265,6 +273,7 @@ pub const TransitionController = struct {
                         .donor_group_id = record.donor_group_id,
                         .receiver_group_id = record.receiver_group_id,
                         .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -279,6 +288,8 @@ pub const TransitionController = struct {
                         .transition_id = record.transition_id,
                         .donor_group_id = record.donor_group_id,
                         .receiver_group_id = record.receiver_group_id,
+                        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
+                        .table_contract = record.table_contract,
                     },
                 },
             },
@@ -474,6 +485,9 @@ test "transition controller plans merge accept catch-up and rollback actions" {
     });
     try std.testing.expectEqual(transition_state.TransitionPhase.rolling_back, rollback.next_phase);
     try std.testing.expect(rollback.action == .rollback_merge);
+    try std.testing.expect(
+        rollback.action.rollback_merge.allow_doc_identity_reassignment,
+    );
 }
 
 test "transition controller preserves merge doc identity reassignment flag on finalize" {

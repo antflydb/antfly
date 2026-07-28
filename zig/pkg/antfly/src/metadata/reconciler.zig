@@ -302,6 +302,17 @@ pub const Reconciler = struct {
         defer planner.freeIntents(self.alloc, desired_placements);
         var membership_index = try MembershipTransitionIndex.init(self.alloc, current, desired_placements, &evidence);
         defer membership_index.deinit();
+        var active_transition_contracts = try ActiveTransitionContractIndex.init(
+            self.alloc,
+            current,
+        );
+        defer active_transition_contracts.deinit();
+        try active_transition_contracts.fenceAdjacentRangeMutations(
+            current.ranges,
+        );
+        try active_transition_contracts.fenceAdjacentRangeMutations(
+            desired_ranges,
+        );
         var table_upserts = std.ArrayListUnmanaged(table_manager.TableRecord).empty;
         var placement_upserts = std.ArrayListUnmanaged(raft_reconciler.PlacementIntent).empty;
         errdefer {
@@ -382,6 +393,18 @@ pub const Reconciler = struct {
             try maybeFinalizeSchemaMigration(self.alloc, current, desired);
             const existing = findTableRecord(current.tables, desired.table_id);
             if (existing == null or !tableRecordsEqual(existing.?, desired.*)) {
+                if (active_transition_contracts.get(desired.table_id)) |contract| {
+                    const current_table = existing orelse
+                        return error.TransitionTableContractViolated;
+                    if (!contract.matches(current_table))
+                        return error.TransitionTableContractViolated;
+                    // Schema and index mutation is serialized behind the
+                    // active range generation. Non-structural table metadata
+                    // can still advance without changing how transition DBs
+                    // are opened.
+                    if (!contract.matches(desired.*))
+                        continue;
+                }
                 try table_upserts.ensureUnusedCapacity(self.alloc, 1);
                 table_upserts.appendAssumeCapacity(
                     try table_manager.cloneTable(self.alloc, desired.*),
@@ -391,6 +414,12 @@ pub const Reconciler = struct {
         for (desired_ranges) |desired| {
             const existing = findRangeRecord(current.ranges, desired.group_id);
             if (existing == null or !rangeRecordsEqual(existing.?, desired)) {
+                if (active_transition_contracts.rangeMutationFenced(desired.group_id) or
+                    (existing != null and
+                        active_transition_contracts.rangeMutationFenced(existing.?.group_id)))
+                {
+                    continue;
+                }
                 if (rangeEpochPublishedBySplitAdmission(current, desired_splits, desired)) continue;
                 try range_upserts.ensureUnusedCapacity(self.alloc, 1);
                 range_upserts.appendAssumeCapacity(
@@ -401,6 +430,15 @@ pub const Reconciler = struct {
         for (desired_splits) |desired| {
             const existing = findSplitRecord(current.split_transitions, desired.transition_id);
             if (existing == null) {
+                try desired.table_contract.validateForSplit();
+                const current_table = findTableRecord(
+                    current.tables,
+                    desired.table_contract.table_id,
+                ) orelse continue;
+                if (!tableMatchesTransitionContract(
+                    current_table,
+                    desired.table_contract,
+                )) continue;
                 if (!splitTransitionDocIdentityCompatibleIndexed(current, &evidence, desired)) continue;
                 if (splitAdmissionExpectedEpoch(current, desired)) |expected_source_epoch| {
                     try split_admissions.ensureUnusedCapacity(self.alloc, 1);
@@ -451,6 +489,17 @@ pub const Reconciler = struct {
         for (desired_merges) |desired| {
             const existing = findMergeRecord(current.merge_transitions, desired.transition_id);
             if (existing == null) {
+                desired.table_contract.validateForMerge(
+                    desired.allow_doc_identity_reassignment,
+                ) catch continue;
+                const current_table = findTableRecord(
+                    current.tables,
+                    desired.table_contract.table_id,
+                ) orelse continue;
+                if (!tableMatchesTransitionContract(
+                    current_table,
+                    desired.table_contract,
+                )) continue;
                 if (!mergeTransitionDocIdentityCompatibleIndexed(current, &evidence, desired, .disallow_active)) continue;
                 try merge_upserts.ensureUnusedCapacity(self.alloc, 1);
                 merge_upserts.appendAssumeCapacity(
@@ -490,6 +539,31 @@ pub const Reconciler = struct {
 
         for (current.placement_intents) |intent| {
             if (!membership_index.hasDesiredMember(intent.record.group_id, intent.record.local_node_id)) {
+                const current_range = findRangeRecord(
+                    current.ranges,
+                    intent.record.group_id,
+                );
+                const transition_group =
+                    active_transition_contracts.tableIdForGroup(
+                        intent.record.group_id,
+                    ) != null;
+                const dropping_active_table = if (current_range) |range|
+                    active_transition_contracts.get(range.table_id) != null and
+                        findTableRecord(desired_tables, range.table_id) == null
+                else
+                    false;
+                if (transition_group or dropping_active_table) {
+                    // Keep unpublished transition peers and groups removed
+                    // from the desired range topology alive until transition
+                    // termination. A table drop also retains unrelated ranges
+                    // so the table cannot disappear beneath a live contract.
+                    // Existing desired ranges may still heal or rebalance.
+                    if (current_range == null or
+                        findRangeRecord(desired_ranges, intent.record.group_id) == null)
+                    {
+                        continue;
+                    }
+                }
                 if (membership_index.preserveCurrentPlacement(intent.record.group_id, intent.record.local_node_id)) continue;
                 if (membership_index.placementSafeToRemove(intent)) {
                     try placement_removals.append(self.alloc, .{
@@ -528,10 +602,22 @@ pub const Reconciler = struct {
             }
         }
         for (current.tables) |record| {
-            if (findTableRecord(desired_tables, record.table_id) == null) try table_removals.append(self.alloc, record.table_id);
+            if (findTableRecord(desired_tables, record.table_id) == null and
+                active_transition_contracts.get(record.table_id) == null)
+            {
+                try table_removals.append(self.alloc, record.table_id);
+            }
         }
         for (current.ranges) |record| {
-            if (findRangeRecord(desired_ranges, record.group_id) == null) try range_removals.append(self.alloc, record.group_id);
+            if (findRangeRecord(desired_ranges, record.group_id) != null) continue;
+            if (active_transition_contracts.rangeMutationFenced(record.group_id))
+                continue;
+            if (active_transition_contracts.get(record.table_id) != null and
+                findTableRecord(desired_tables, record.table_id) == null)
+            {
+                continue;
+            }
+            try range_removals.append(self.alloc, record.group_id);
         }
         for (current.split_transitions) |record| {
             if (findSplitRecord(desired_splits, record.transition_id) != null) continue;
@@ -2884,6 +2970,295 @@ fn freeMergeIntentOwned(alloc: std.mem.Allocator, intent: table_manager.MergeInt
     if (intent.rollback_reason) |reason| alloc.free(reason);
 }
 
+const ActiveTransitionContractIndex = struct {
+    const BoundaryKey = struct {
+        table_id: u64,
+        key: []const u8,
+    };
+
+    const BoundaryKeyContext = struct {
+        pub fn hash(_: @This(), boundary: BoundaryKey) u64 {
+            var hasher = std.hash.Wyhash.init(0x7472_616e_7369_746e);
+            hasher.update(std.mem.asBytes(&boundary.table_id));
+            hasher.update(boundary.key);
+            return hasher.final();
+        }
+
+        pub fn eql(
+            _: @This(),
+            lhs: BoundaryKey,
+            rhs: BoundaryKey,
+        ) bool {
+            return lhs.table_id == rhs.table_id and
+                std.mem.eql(u8, lhs.key, rhs.key);
+        }
+    };
+
+    const BoundaryMap = std.HashMapUnmanaged(
+        BoundaryKey,
+        u64,
+        BoundaryKeyContext,
+        80,
+    );
+
+    const TableConfiguration = struct {
+        table_id: u64,
+        table_name: []const u8,
+        schema_json: []const u8,
+        indexes_json: []const u8,
+
+        fn fromContract(
+            contract: transition_state.TransitionTableContract,
+        ) TableConfiguration {
+            return .{
+                .table_id = contract.table_id,
+                .table_name = contract.table_name,
+                .schema_json = contract.schema_json,
+                .indexes_json = contract.indexes_json,
+            };
+        }
+
+        fn eql(self: TableConfiguration, other: TableConfiguration) bool {
+            return self.table_id == other.table_id and
+                std.mem.eql(u8, self.table_name, other.table_name) and
+                std.mem.eql(u8, self.schema_json, other.schema_json) and
+                std.mem.eql(u8, self.indexes_json, other.indexes_json);
+        }
+
+        fn matches(
+            self: TableConfiguration,
+            table: table_manager.TableRecord,
+        ) bool {
+            return table.table_id == self.table_id and
+                std.mem.eql(u8, table.name, self.table_name) and
+                std.mem.eql(u8, table.schema_json, self.schema_json) and
+                std.mem.eql(u8, table.indexes_json, self.indexes_json);
+        }
+    };
+
+    alloc: std.mem.Allocator,
+    by_table: std.AutoHashMapUnmanaged(
+        u64,
+        TableConfiguration,
+    ) = .empty,
+    table_by_group: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    range_mutation_fences: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    fn init(
+        alloc: std.mem.Allocator,
+        current: CurrentMetadataState,
+    ) !ActiveTransitionContractIndex {
+        var self: ActiveTransitionContractIndex = .{ .alloc = alloc };
+        errdefer self.deinit();
+        var active_transition_count: usize = 0;
+        for (current.split_transitions) |record| {
+            if (!transitionPhaseTerminal(record.phase))
+                active_transition_count = try std.math.add(
+                    usize,
+                    active_transition_count,
+                    1,
+                );
+        }
+        for (current.merge_transitions) |record| {
+            if (!transitionPhaseTerminal(record.phase))
+                active_transition_count = try std.math.add(
+                    usize,
+                    active_transition_count,
+                    1,
+                );
+        }
+        try self.by_table.ensureTotalCapacity(
+            alloc,
+            @intCast(active_transition_count),
+        );
+        for (current.split_transitions) |record| {
+            if (transitionPhaseTerminal(record.phase)) continue;
+            try record.table_contract.validateForSplit();
+            try self.addContract(record.table_contract);
+        }
+        for (current.merge_transitions) |record| {
+            if (transitionPhaseTerminal(record.phase)) continue;
+            try record.table_contract.validateForMerge(
+                record.allow_doc_identity_reassignment,
+            );
+            try self.addContract(record.table_contract);
+        }
+        var contract_it = self.by_table.iterator();
+        while (contract_it.next()) |entry| {
+            const current_table = findTableRecord(
+                current.tables,
+                entry.key_ptr.*,
+            ) orelse return error.TransitionTableContractViolated;
+            if (!entry.value_ptr.matches(current_table))
+                return error.TransitionTableContractViolated;
+        }
+
+        const group_capacity = try std.math.mul(
+            usize,
+            active_transition_count,
+            2,
+        );
+        try self.table_by_group.ensureTotalCapacity(alloc, @intCast(group_capacity));
+        try self.range_mutation_fences.ensureTotalCapacity(
+            alloc,
+            @intCast(group_capacity),
+        );
+        for (current.split_transitions) |record| {
+            if (transitionPhaseTerminal(record.phase)) continue;
+            try self.addGroup(record.source_group_id, record.table_contract.table_id);
+            try self.addGroup(record.destination_group_id, record.table_contract.table_id);
+        }
+        for (current.merge_transitions) |record| {
+            if (transitionPhaseTerminal(record.phase)) continue;
+            try self.addGroup(record.donor_group_id, record.table_contract.table_id);
+            try self.addGroup(record.receiver_group_id, record.table_contract.table_id);
+        }
+        return self;
+    }
+
+    fn deinit(self: *ActiveTransitionContractIndex) void {
+        self.by_table.deinit(self.alloc);
+        self.table_by_group.deinit(self.alloc);
+        self.range_mutation_fences.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn addContract(
+        self: *ActiveTransitionContractIndex,
+        contract: transition_state.TransitionTableContract,
+    ) !void {
+        try contract.validate();
+        const configuration = TableConfiguration.fromContract(contract);
+        const entry = self.by_table.getOrPutAssumeCapacity(contract.table_id);
+        if (entry.found_existing) {
+            if (!entry.value_ptr.eql(configuration))
+                return error.ConflictingTableTransitionContract;
+            return;
+        }
+        entry.value_ptr.* = configuration;
+    }
+
+    fn addGroup(
+        self: *ActiveTransitionContractIndex,
+        group_id: u64,
+        table_id: u64,
+    ) !void {
+        if (group_id == 0) return error.InvalidTransitionGroup;
+        const entry = self.table_by_group.getOrPutAssumeCapacity(group_id);
+        if (entry.found_existing) {
+            if (entry.value_ptr.* != table_id)
+                return error.ConflictingGroupTransitionContract;
+        } else {
+            entry.value_ptr.* = table_id;
+        }
+        self.range_mutation_fences.putAssumeCapacity(group_id, {});
+    }
+
+    fn fenceAdjacentRangeMutations(
+        self: *ActiveTransitionContractIndex,
+        ranges: []const table_manager.RangeRecord,
+    ) !void {
+        if (self.table_by_group.count() == 0 or ranges.len == 0) return;
+
+        var by_start: BoundaryMap = .empty;
+        defer by_start.deinit(self.alloc);
+        var by_end: BoundaryMap = .empty;
+        defer by_end.deinit(self.alloc);
+        try by_start.ensureTotalCapacity(self.alloc, @intCast(ranges.len));
+        try by_end.ensureTotalCapacity(self.alloc, @intCast(ranges.len));
+
+        for (ranges) |range| {
+            try putRangeBoundary(
+                &by_start,
+                self.alloc,
+                .{ .table_id = range.table_id, .key = range.start_key },
+                range.group_id,
+            );
+            if (range.end_key) |end_key| {
+                try putRangeBoundary(
+                    &by_end,
+                    self.alloc,
+                    .{ .table_id = range.table_id, .key = end_key },
+                    range.group_id,
+                );
+            }
+        }
+
+        for (ranges) |range| {
+            if (!self.table_by_group.contains(range.group_id)) continue;
+            if (by_end.get(.{
+                .table_id = range.table_id,
+                .key = range.start_key,
+            })) |predecessor_group_id| {
+                try self.range_mutation_fences.put(
+                    self.alloc,
+                    predecessor_group_id,
+                    {},
+                );
+            }
+            if (range.end_key) |end_key| {
+                if (by_start.get(.{
+                    .table_id = range.table_id,
+                    .key = end_key,
+                })) |successor_group_id| {
+                    try self.range_mutation_fences.put(
+                        self.alloc,
+                        successor_group_id,
+                        {},
+                    );
+                }
+            }
+        }
+    }
+
+    fn putRangeBoundary(
+        map: *BoundaryMap,
+        alloc: std.mem.Allocator,
+        boundary: BoundaryKey,
+        group_id: u64,
+    ) !void {
+        const entry = try map.getOrPut(alloc, boundary);
+        if (entry.found_existing and entry.value_ptr.* != group_id)
+            return error.DuplicateRangeBoundary;
+        entry.value_ptr.* = group_id;
+    }
+
+    fn get(
+        self: *const ActiveTransitionContractIndex,
+        table_id: u64,
+    ) ?TableConfiguration {
+        return self.by_table.get(table_id);
+    }
+
+    fn tableIdForGroup(
+        self: *const ActiveTransitionContractIndex,
+        group_id: u64,
+    ) ?u64 {
+        return self.table_by_group.get(group_id);
+    }
+
+    fn rangeMutationFenced(
+        self: *const ActiveTransitionContractIndex,
+        group_id: u64,
+    ) bool {
+        return self.range_mutation_fences.contains(group_id);
+    }
+};
+
+fn transitionPhaseTerminal(phase: transition_state.TransitionPhase) bool {
+    return phase == .finalized or phase == .rolled_back;
+}
+
+fn tableMatchesTransitionContract(
+    table: table_manager.TableRecord,
+    contract: transition_state.TransitionTableContract,
+) bool {
+    return table.table_id == contract.table_id and
+        std.mem.eql(u8, table.name, contract.table_name) and
+        std.mem.eql(u8, table.schema_json, contract.schema_json) and
+        std.mem.eql(u8, table.indexes_json, contract.indexes_json);
+}
+
 fn hasExcludedCurrentPeer(
     group_id: u64,
     current_intents: []const raft_reconciler.PlacementIntent,
@@ -2919,6 +3294,12 @@ fn cloneSplitRecord(alloc: std.mem.Allocator, record: transition_state.SplitTran
         }
     else
         null;
+    const table_contract = record.table_contract.clone(alloc) catch |err| {
+        if (rollback_reason) |owned| alloc.free(owned);
+        if (source_range_end) |owned| alloc.free(owned);
+        if (split_key) |owned| alloc.free(owned);
+        return err;
+    };
     return .{
         .transition_id = record.transition_id,
         .attempt_epoch = record.attempt_epoch,
@@ -2928,6 +3309,7 @@ fn cloneSplitRecord(alloc: std.mem.Allocator, record: transition_state.SplitTran
         .split_key = split_key,
         .source_range_end = source_range_end,
         .rollback_reason = rollback_reason,
+        .table_contract = table_contract,
     };
 }
 
@@ -3132,6 +3514,11 @@ fn allocSplitProvisioningRanges(
 }
 
 fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTransitionRecord) !transition_state.MergeTransitionRecord {
+    const table_contract = try record.table_contract.clone(alloc);
+    errdefer {
+        var owned_contract = table_contract;
+        owned_contract.deinitOwned(alloc);
+    }
     return .{
         .transition_id = record.transition_id,
         .donor_group_id = record.donor_group_id,
@@ -3139,6 +3526,7 @@ fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTran
         .phase = record.phase,
         .rollback_reason = if (record.rollback_reason) |value| try alloc.dupe(u8, value) else null,
         .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
+        .table_contract = table_contract,
     };
 }
 
@@ -3150,7 +3538,8 @@ fn splitRecordsEqual(a: transition_state.SplitTransitionRecord, b: transition_st
         a.phase == b.phase and
         optionalBytesEqual(a.split_key, b.split_key) and
         optionalBytesEqual(a.source_range_end, b.source_range_end) and
-        optionalBytesEqual(a.rollback_reason, b.rollback_reason);
+        optionalBytesEqual(a.rollback_reason, b.rollback_reason) and
+        a.table_contract.eql(b.table_contract);
 }
 
 fn mergeRecordsEqual(a: transition_state.MergeTransitionRecord, b: transition_state.MergeTransitionRecord) bool {
@@ -3159,7 +3548,8 @@ fn mergeRecordsEqual(a: transition_state.MergeTransitionRecord, b: transition_st
         a.receiver_group_id == b.receiver_group_id and
         a.phase == b.phase and
         a.allow_doc_identity_reassignment == b.allow_doc_identity_reassignment and
-        optionalBytesEqual(a.rollback_reason, b.rollback_reason);
+        optionalBytesEqual(a.rollback_reason, b.rollback_reason) and
+        a.table_contract.eql(b.table_contract);
 }
 
 fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
@@ -3243,7 +3633,23 @@ fn defaultMergeObservation(record: transition_state.MergeTransitionRecord) trans
     };
 }
 
-test "metadata reconciler plans transition upserts before runtime steps" {
+fn transitionTableContractForTest(
+    table_id: u64,
+    table_name: []const u8,
+    shard_id: u64,
+    range_id: u64,
+) transition_state.TransitionTableContract {
+    return .{
+        .table_id = table_id,
+        .table_name = table_name,
+        .schema_json = "",
+        .indexes_json = "{}",
+        .source_identity = .{ .shard_id = shard_id, .range_id = range_id },
+        .target_identity = .{ .shard_id = shard_id, .range_id = range_id },
+    };
+}
+
+test "metadata reconciler publishes table contracts before admitting transitions" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
 
@@ -3253,12 +3659,16 @@ test "metadata reconciler plans transition upserts before runtime steps" {
         .table_id = 10,
         .start_key = "doc:a",
         .end_key = "doc:m",
+        .doc_identity_shard_id = 101,
+        .doc_identity_range_id = 101,
     });
     try manager.upsertRange(.{
         .group_id = 102,
         .table_id = 10,
         .start_key = "doc:m",
         .end_key = "doc:z",
+        .doc_identity_shard_id = 101,
+        .doc_identity_range_id = 101,
     });
     try manager.requestSplit(.{
         .transition_id = 7001,
@@ -3280,10 +3690,25 @@ test "metadata reconciler plans transition upserts before runtime steps" {
 
     try std.testing.expectEqual(@as(usize, 1), plan.table_upserts.len);
     try std.testing.expectEqual(@as(usize, 2), plan.range_upserts.len);
-    try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
-    try std.testing.expectEqual(@as(usize, 1), plan.merge_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.merge_upserts.len);
     try std.testing.expectEqual(@as(usize, 0), plan.split_steps.len);
     try std.testing.expectEqual(@as(usize, 0), plan.merge_steps.len);
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+    var admission_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+    });
+    defer admission_plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), admission_plan.table_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), admission_plan.range_upserts.len);
+    try std.testing.expectEqual(@as(usize, 1), admission_plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 1), admission_plan.merge_upserts.len);
 }
 
 test "metadata reconciler provisions split destination without publishing overlapping range" {
@@ -3360,6 +3785,7 @@ test "metadata reconciler resumes projected transition after authority handoff" 
         .destination_group_id = 103,
         .split_key = "doc:h",
         .source_range_end = "doc:m",
+        .table_contract = transitionTableContractForTest(10, "docs", 101, 101),
     }};
     try manager.syncProjectedSplitTransitions(&projected);
 
@@ -3417,6 +3843,7 @@ test "metadata reconciler never removes an unterminated durable transition" {
         .destination_group_id = 103,
         .split_key = "doc:h",
         .source_range_end = "doc:m",
+        .table_contract = transitionTableContractForTest(10, "docs", 101, 101),
     }};
 
     var reconciler = Reconciler.init(std.testing.allocator);
@@ -3455,6 +3882,321 @@ test "metadata reconciler never removes an unterminated durable transition" {
     try std.testing.expectEqual(transition_state.TransitionPhase.finalized, terminal_plan.split_upserts[0].phase);
 }
 
+test "metadata reconciler preserves dropped table topology until transitions terminate" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const tables = [_]table_manager.TableRecord{.{
+        .table_id = 10,
+        .name = "docs",
+    }};
+    const ranges = [_]table_manager.RangeRecord{
+        .{
+            .group_id = 101,
+            .table_id = 10,
+            .start_key = "doc:a",
+            .end_key = "doc:m",
+        },
+        .{
+            .group_id = 102,
+            .table_id = 10,
+            .start_key = "doc:m",
+            .end_key = "doc:z",
+        },
+    };
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{ .group_id = 101, .replica_id = 1, .local_node_id = 1 },
+            .peer_node_ids = &.{1},
+        },
+        .{
+            .record = .{ .group_id = 102, .replica_id = 1, .local_node_id = 1 },
+            .peer_node_ids = &.{1},
+        },
+        .{
+            .record = .{ .group_id = 103, .replica_id = 1, .local_node_id = 1 },
+            .peer_node_ids = &.{1},
+        },
+    };
+    const transitions = [_]transition_state.SplitTransitionRecord{.{
+        .transition_id = 7104,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 103,
+        .split_key = "doc:h",
+        .source_range_end = "doc:m",
+        .table_contract = transitionTableContractForTest(10, "docs", 101, 101),
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    defer reconciler.deinit();
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = &tables,
+        .ranges = &ranges,
+        .placement_intents = &placements,
+        .split_transitions = &transitions,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.table_removals.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.range_removals.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.placement_removals.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.placement_upserts.len);
+}
+
+test "metadata reconciler fences transition groups without serializing unrelated ranges" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 10, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:g",
+        .split_attempt_epoch = 2,
+    });
+    try manager.upsertRange(.{
+        .group_id = 102,
+        .table_id = 10,
+        .start_key = "doc:g",
+        .end_key = "doc:m",
+        .split_attempt_epoch = 1,
+    });
+    try manager.upsertRange(.{
+        .group_id = 103,
+        .table_id = 10,
+        .start_key = "doc:m",
+        .end_key = "doc:u",
+    });
+    try manager.upsertRange(.{
+        .group_id = 104,
+        .table_id = 10,
+        .start_key = "doc:u",
+        .end_key = null,
+    });
+
+    const tables = [_]table_manager.TableRecord{.{
+        .table_id = 10,
+        .name = "docs",
+    }};
+    const ranges = [_]table_manager.RangeRecord{
+        .{
+            .group_id = 101,
+            .table_id = 10,
+            .start_key = "doc:a",
+            .end_key = "doc:g",
+            .split_attempt_epoch = 1,
+        },
+        .{
+            .group_id = 102,
+            .table_id = 10,
+            .start_key = "doc:g",
+            .end_key = "doc:m",
+        },
+        .{
+            .group_id = 103,
+            .table_id = 10,
+            .start_key = "doc:m",
+            .end_key = "doc:t",
+        },
+        .{
+            .group_id = 104,
+            .table_id = 10,
+            .start_key = "doc:t",
+            .end_key = null,
+        },
+    };
+    const transitions = [_]transition_state.SplitTransitionRecord{.{
+        .transition_id = 7108,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 105,
+        .split_key = "doc:d",
+        .source_range_end = "doc:g",
+        .table_contract = transitionTableContractForTest(10, "docs", 101, 101),
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    defer reconciler.deinit();
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = &tables,
+        .ranges = &ranges,
+        .split_transitions = &transitions,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), plan.range_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.range_removals.len);
+    try std.testing.expect(findRangeRecord(plan.range_upserts, 101) == null);
+    try std.testing.expect(findRangeRecord(plan.range_upserts, 102) == null);
+    try std.testing.expect(findRangeRecord(plan.range_upserts, 103) != null);
+    try std.testing.expect(findRangeRecord(plan.range_upserts, 104) != null);
+}
+
+test "metadata reconciler serializes structural table mutation behind transitions" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.upsertTable(.{
+        .table_id = 10,
+        .name = "docs",
+        .description = "new description",
+        .schema_json = "{\"version\":2}",
+    });
+    try manager.upsertRange(.{
+        .group_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const current_tables = [_]table_manager.TableRecord{.{
+        .table_id = 10,
+        .name = "docs",
+        .description = "old description",
+    }};
+    const current_ranges = [_]table_manager.RangeRecord{.{
+        .group_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    }};
+    const transitions = [_]transition_state.SplitTransitionRecord{.{
+        .transition_id = 7105,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 103,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+        .table_contract = transitionTableContractForTest(10, "docs", 101, 101),
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    defer reconciler.deinit();
+    var structural_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = &current_tables,
+        .ranges = &current_ranges,
+        .split_transitions = &transitions,
+    });
+    defer structural_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), structural_plan.table_upserts.len);
+
+    try manager.upsertTable(.{
+        .table_id = 10,
+        .name = "docs",
+        .description = "new description",
+    });
+    var descriptive_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = &current_tables,
+        .ranges = &current_ranges,
+        .split_transitions = &transitions,
+    });
+    defer descriptive_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), descriptive_plan.table_upserts.len);
+    try std.testing.expectEqualStrings(
+        "new description",
+        descriptive_plan.table_upserts[0].description,
+    );
+}
+
+test "metadata reconciler rejects conflicting active table contracts" {
+    const contracts = [_]transition_state.SplitTransitionRecord{
+        .{
+            .transition_id = 7106,
+            .attempt_epoch = 1,
+            .source_group_id = 101,
+            .destination_group_id = 103,
+            .table_contract = transitionTableContractForTest(10, "docs", 101, 101),
+        },
+        .{
+            .transition_id = 7107,
+            .attempt_epoch = 1,
+            .source_group_id = 102,
+            .destination_group_id = 104,
+            .table_contract = .{
+                .table_id = 10,
+                .table_name = "docs",
+                .schema_json = "{\"version\":2}",
+                .indexes_json = "{}",
+                .source_identity = .{ .shard_id = 101, .range_id = 101 },
+                .target_identity = .{ .shard_id = 101, .range_id = 101 },
+            },
+        },
+    };
+    try std.testing.expectError(
+        error.ConflictingTableTransitionContract,
+        ActiveTransitionContractIndex.init(std.testing.allocator, .{
+            .split_transitions = &contracts,
+        }),
+    );
+}
+
+test "metadata reconciler allows concurrent range contracts for one table" {
+    const tables = [_]table_manager.TableRecord{.{
+        .table_id = 10,
+        .name = "docs",
+    }};
+    const transitions = [_]transition_state.SplitTransitionRecord{
+        .{
+            .transition_id = 7110,
+            .attempt_epoch = 1,
+            .source_group_id = 101,
+            .destination_group_id = 103,
+            .table_contract = transitionTableContractForTest(
+                10,
+                "docs",
+                101,
+                1001,
+            ),
+        },
+        .{
+            .transition_id = 7111,
+            .attempt_epoch = 1,
+            .source_group_id = 102,
+            .destination_group_id = 104,
+            .table_contract = transitionTableContractForTest(
+                10,
+                "docs",
+                102,
+                1002,
+            ),
+        },
+    };
+    var index = try ActiveTransitionContractIndex.init(
+        std.testing.allocator,
+        .{
+            .tables = &tables,
+            .split_transitions = &transitions,
+        },
+    );
+    defer index.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), index.by_table.count());
+    try std.testing.expectEqual(@as(?u64, 10), index.tableIdForGroup(101));
+    try std.testing.expectEqual(@as(?u64, 10), index.tableIdForGroup(104));
+}
+
+test "metadata reconciler rejects catalog drift from active table contract" {
+    const tables = [_]table_manager.TableRecord{.{
+        .table_id = 10,
+        .name = "docs",
+        .schema_json = "{\"version\":2}",
+    }};
+    const transitions = [_]transition_state.SplitTransitionRecord{.{
+        .transition_id = 7109,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 103,
+        .table_contract = transitionTableContractForTest(10, "docs", 101, 101),
+    }};
+    try std.testing.expectError(
+        error.TransitionTableContractViolated,
+        ActiveTransitionContractIndex.init(std.testing.allocator, .{
+            .tables = &tables,
+            .split_transitions = &transitions,
+        }),
+    );
+}
+
 test "metadata reconciler preserves admitted split identity" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
@@ -3473,6 +4215,7 @@ test "metadata reconciler preserves admitted split identity" {
         .destination_group_id = 103,
         .split_key = "doc:h",
         .source_range_end = "doc:m",
+        .table_contract = transitionTableContractForTest(10, "docs", 101, 101),
     }};
     try manager.syncProjectedSplitTransitions(&desired);
 
@@ -3487,6 +4230,7 @@ test "metadata reconciler preserves admitted split identity" {
         .destination_group_id = 103,
         .split_key = "doc:h",
         .source_range_end = "doc:m",
+        .table_contract = transitionTableContractForTest(10, "docs", 101, 101),
     }};
 
     var reconciler = Reconciler.init(std.testing.allocator);
@@ -6411,6 +7155,8 @@ test "metadata reconciler blocks merge replay when one side lacks doc identity s
     try manager.upsertRange(.{
         .group_id = 4161,
         .range_id = 6001,
+        .doc_identity_shard_id = 4161,
+        .doc_identity_range_id = 6001,
         .table_id = 416,
         .start_key = "doc:a",
         .end_key = "doc:m",
@@ -6418,6 +7164,8 @@ test "metadata reconciler blocks merge replay when one side lacks doc identity s
     try manager.upsertRange(.{
         .group_id = 4162,
         .range_id = 6002,
+        .doc_identity_shard_id = 4161,
+        .doc_identity_range_id = 6001,
         .table_id = 416,
         .start_key = "doc:m",
         .end_key = "doc:z",
@@ -6485,6 +7233,8 @@ test "metadata reconciler rolls back existing merge with incompatible doc identi
     try manager.upsertRange(.{
         .group_id = 4131,
         .range_id = 2001,
+        .doc_identity_shard_id = 4131,
+        .doc_identity_range_id = 2001,
         .table_id = 413,
         .start_key = "doc:a",
         .end_key = "doc:m",
@@ -6492,6 +7242,8 @@ test "metadata reconciler rolls back existing merge with incompatible doc identi
     try manager.upsertRange(.{
         .group_id = 4132,
         .range_id = 2002,
+        .doc_identity_shard_id = 4131,
+        .doc_identity_range_id = 2001,
         .table_id = 413,
         .start_key = "doc:m",
         .end_key = "doc:z",
@@ -7672,6 +8424,12 @@ test "metadata reconciler ignores in-flight transition groups for automatic tran
             .destination_group_id = 4603,
             .phase = .prepare,
             .split_key = "doc:g",
+            .table_contract = transitionTableContractForTest(
+                46,
+                "docs",
+                4601,
+                4601,
+            ),
         }},
     });
     defer plan.deinit(std.testing.allocator);
