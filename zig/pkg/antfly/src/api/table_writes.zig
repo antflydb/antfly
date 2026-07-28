@@ -5547,9 +5547,9 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) u64 {
+    fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) !u64 {
         if (self.dropped_table_delete_owner_id == 0) {
-            self.dropped_table_delete_owner_id = runtime.allocOwnerId();
+            self.dropped_table_delete_owner_id = try runtime.tryAllocOwnerId();
         }
         return self.dropped_table_delete_owner_id;
     }
@@ -5569,7 +5569,7 @@ pub const ProvisionedTableWriteSource = struct {
         errdefer std.heap.page_allocator.free(owned_path);
         work.* = .{ .path = owned_path };
         try runtime.durable_jobs.submit(.{
-            .owner_id = self.droppedTableDeleteOwnerId(runtime),
+            .owner_id = try self.droppedTableDeleteOwnerId(runtime),
             .class = .cleanup,
             .ptr = work,
             .run = DroppedTableDeleteWork.run,

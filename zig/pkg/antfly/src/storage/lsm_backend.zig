@@ -5447,7 +5447,7 @@ pub const BackendHandle = struct {
             if (resolved_options.background_executor != null) return error.BackgroundExecutorAlreadyConfigured;
             owned_runtime = try background_runtime_mod.BackendRuntimeHandle.init(allocator, runtime_config);
             const runtime = owned_runtime.?.ptr();
-            const executor = BackgroundExecutor.init(runtime, runtime.allocOwnerId());
+            const executor = BackgroundExecutor.init(runtime, try runtime.tryAllocOwnerId());
             resolved_options.background_executor = &executor;
             if (resolved_options.read_runtime == null) {
                 if (runtime.io()) |io| resolved_options.read_runtime = storage_io.ReadRuntime.init(io);
@@ -5487,7 +5487,7 @@ pub const BackendHandle = struct {
             if (resolved_options.background_executor != null) return error.BackgroundExecutorAlreadyConfigured;
             owned_runtime = try background_runtime_mod.BackendRuntimeHandle.init(allocator, runtime_config);
             const runtime = owned_runtime.?.ptr();
-            const executor = BackgroundExecutor.init(runtime, runtime.allocOwnerId());
+            const executor = BackgroundExecutor.init(runtime, try runtime.tryAllocOwnerId());
             resolved_options.background_executor = &executor;
             if (resolved_options.read_runtime == null) {
                 if (runtime.io()) |io| resolved_options.read_runtime = storage_io.ReadRuntime.init(io);

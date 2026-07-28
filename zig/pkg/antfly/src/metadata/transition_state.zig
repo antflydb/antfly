@@ -231,6 +231,7 @@ pub fn readinessForGroup(
 
 pub fn readinessForLocalGroup(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     group_id: u64,
     split_transitions: []const SplitTransitionRecord,
@@ -243,6 +244,7 @@ pub fn readinessForLocalGroup(
         if (record.source_group_id != group_id and record.destination_group_id != group_id) continue;
         readiness = combineReadiness(readiness, (try readinessResultForLocalSplitTransition(
             alloc,
+            io,
             replica_root_dir,
             record,
             split_observations,
@@ -252,6 +254,7 @@ pub fn readinessForLocalGroup(
         if (record.donor_group_id != group_id and record.receiver_group_id != group_id) continue;
         readiness = combineReadiness(readiness, (try readinessResultForLocalMergeTransition(
             alloc,
+            io,
             replica_root_dir,
             record,
             merge_observations,
@@ -275,11 +278,12 @@ fn combineReadiness(
 
 pub fn readinessResultForLocalSplitTransition(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     record: SplitTransitionRecord,
     split_observations: []const SplitObservationRecord,
 ) !GroupTransitionReadinessResult {
-    if (try observeLocalSplitTransition(alloc, replica_root_dir, record)) |status| {
+    if (try observeLocalSplitTransition(alloc, io, replica_root_dir, record)) |status| {
         return .{
             .readiness = readinessFromObservedLocalSplit(status),
             .source = .local_observation,
@@ -309,11 +313,12 @@ pub fn readinessResultForSplitTransition(
 
 pub fn readinessResultForLocalMergeTransition(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     record: MergeTransitionRecord,
     merge_observations: []const MergeObservationRecord,
 ) !GroupTransitionReadinessResult {
-    if (try observeLocalMergeTransition(alloc, replica_root_dir, record)) |status| {
+    if (try observeLocalMergeTransition(alloc, io, replica_root_dir, record)) |status| {
         return .{
             .readiness = readinessFromObservedMerge(status),
             .source = .local_observation,
@@ -343,7 +348,7 @@ pub fn readinessResultForMergeTransition(
 
 fn readinessFromPhase(phase: TransitionPhase) GroupTransitionReadiness {
     return .{
-        .transition_pending = true,
+        .transition_pending = phase != .finalized and phase != .rolled_back,
         .replay_required = switch (phase) {
             .bootstrap_peer, .replay_deltas, .cutover_pending, .finalizing => true,
             else => false,
@@ -395,6 +400,7 @@ fn readinessFromObservedMerge(status: data.MergeTransitionStatus) GroupTransitio
 
 fn observeLocalSplitTransition(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     record: SplitTransitionRecord,
 ) !?data.SplitSyncStatus {
@@ -403,7 +409,7 @@ fn observeLocalSplitTransition(
     const dest_root_dir = try groupDbPathAlloc(alloc, replica_root_dir, record.destination_group_id);
     defer alloc.free(dest_root_dir);
 
-    if (!try pathExists(alloc, source_root_dir) or !try pathExists(alloc, dest_root_dir)) return null;
+    if (!try pathExists(io, source_root_dir) or !try pathExists(io, dest_root_dir)) return null;
 
     var coord = try data.SplitSyncCoordinator.init(alloc, .{
         .transition_id = record.transition_id,
@@ -419,6 +425,7 @@ fn observeLocalSplitTransition(
 
 fn observeLocalMergeTransition(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     record: MergeTransitionRecord,
 ) !?data.MergeTransitionStatus {
@@ -427,7 +434,7 @@ fn observeLocalMergeTransition(
     const receiver_root_dir = try groupDbPathAlloc(alloc, replica_root_dir, record.receiver_group_id);
     defer alloc.free(receiver_root_dir);
 
-    if (!try pathExists(alloc, donor_root_dir) or !try pathExists(alloc, receiver_root_dir)) return null;
+    if (!try pathExists(io, donor_root_dir) or !try pathExists(io, receiver_root_dir)) return null;
 
     var coord = try data.MergeCoordinator.init(alloc, .{
         .donor_root_dir = donor_root_dir,
@@ -447,10 +454,8 @@ fn groupDbPathAlloc(
     return try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ replica_root_dir, group_id });
 }
 
-fn pathExists(alloc: std.mem.Allocator, path: []const u8) !bool {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    _ = std.Io.Dir.cwd().statFile(io_impl.io(), path, .{}) catch |err| switch (err) {
+fn pathExists(io: std.Io, path: []const u8) !bool {
+    _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -624,6 +629,7 @@ test "transition state prefers observed local split readiness over metadata phas
 
     const readiness = try readinessForLocalGroup(
         std.testing.allocator,
+        std.testing.io,
         replica_root_dir,
         132,
         &[_]SplitTransitionRecord{.{
@@ -648,6 +654,7 @@ test "transition state prefers observed local split readiness over metadata phas
 test "transition state falls back to metadata observation when local pair is absent" {
     const readiness = try readinessForLocalGroup(
         std.testing.allocator,
+        std.testing.io,
         ".zig-cache/tmp/nonexistent-transition-state-root",
         212,
         &[_]SplitTransitionRecord{.{

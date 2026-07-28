@@ -1146,15 +1146,14 @@ pub const TableManager = struct {
         var hydrated = std.ArrayListUnmanaged(SplitIntent).empty;
         defer hydrated.deinit(self.alloc);
         errdefer for (hydrated.items) |intent| freeSplitIntent(self.alloc, intent);
+        var active_ids = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer active_ids.deinit(self.alloc);
 
-        for (records, 0..) |record, i| {
+        for (records) |record| {
             if (transitionTerminal(record.phase)) continue;
             try record.table_contract.validateForSplit();
-            for (records[0..i]) |prior| {
-                if (!transitionTerminal(prior.phase) and prior.transition_id == record.transition_id) {
-                    return error.DuplicateProjectedSplitTransition;
-                }
-            }
+            const active = try active_ids.getOrPut(self.alloc, record.transition_id);
+            if (active.found_existing) return error.DuplicateProjectedSplitTransition;
 
             try group_ids.requireDataGroupId(record.source_group_id);
             try group_ids.requireDataGroupId(record.destination_group_id);
@@ -1187,7 +1186,7 @@ pub const TableManager = struct {
         try stale_ids.ensureTotalCapacity(self.alloc, self.split_intents.count());
         var existing_it = self.split_intents.iterator();
         while (existing_it.next()) |entry| {
-            if (entry.value_ptr.projected and !containsActiveSplitRecord(records, entry.key_ptr.*)) {
+            if (entry.value_ptr.projected and !active_ids.contains(entry.key_ptr.*)) {
                 stale_ids.appendAssumeCapacity(entry.key_ptr.*);
             }
         }
@@ -1210,17 +1209,16 @@ pub const TableManager = struct {
         var hydrated = std.ArrayListUnmanaged(MergeIntent).empty;
         defer hydrated.deinit(self.alloc);
         errdefer for (hydrated.items) |intent| freeMergeIntent(self.alloc, intent);
+        var active_ids = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer active_ids.deinit(self.alloc);
 
-        for (records, 0..) |record, i| {
+        for (records) |record| {
             if (transitionTerminal(record.phase)) continue;
             try record.table_contract.validateForMerge(
                 record.allow_doc_identity_reassignment,
             );
-            for (records[0..i]) |prior| {
-                if (!transitionTerminal(prior.phase) and prior.transition_id == record.transition_id) {
-                    return error.DuplicateProjectedMergeTransition;
-                }
-            }
+            const active = try active_ids.getOrPut(self.alloc, record.transition_id);
+            if (active.found_existing) return error.DuplicateProjectedMergeTransition;
 
             try group_ids.requireDataGroupId(record.donor_group_id);
             try group_ids.requireDataGroupId(record.receiver_group_id);
@@ -1246,7 +1244,7 @@ pub const TableManager = struct {
         try stale_ids.ensureTotalCapacity(self.alloc, self.merge_intents.count());
         var existing_it = self.merge_intents.iterator();
         while (existing_it.next()) |entry| {
-            if (entry.value_ptr.projected and !containsActiveMergeRecord(records, entry.key_ptr.*)) {
+            if (entry.value_ptr.projected and !active_ids.contains(entry.key_ptr.*)) {
                 stale_ids.appendAssumeCapacity(entry.key_ptr.*);
             }
         }
@@ -1519,20 +1517,6 @@ fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
 
 fn transitionTerminal(phase: transition_state.TransitionPhase) bool {
     return phase == .finalized or phase == .rolled_back;
-}
-
-fn containsActiveSplitRecord(records: []const transition_state.SplitTransitionRecord, transition_id: u64) bool {
-    for (records) |record| {
-        if (!transitionTerminal(record.phase) and record.transition_id == transition_id) return true;
-    }
-    return false;
-}
-
-fn containsActiveMergeRecord(records: []const transition_state.MergeTransitionRecord, transition_id: u64) bool {
-    for (records) |record| {
-        if (!transitionTerminal(record.phase) and record.transition_id == transition_id) return true;
-    }
-    return false;
 }
 
 fn cloneOwnedOptional(alloc: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {

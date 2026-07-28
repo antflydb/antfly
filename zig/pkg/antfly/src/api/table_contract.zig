@@ -23,6 +23,26 @@ fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tables_api.CreateTableRequest {
     if (body.len == 0) return .{};
 
+    // Validate and normalize indexes from the raw request before invoking the
+    // generated parser. The generated OpenAPI parser rejects unknown enum
+    // values, and this function historically fell back to the more permissive
+    // internal parser on any generated-parser error. That allowed an unknown
+    // index type to reach catalog publication before local admission rejected
+    // it. Performing public index validation first keeps the compatibility
+    // fallback without making it an admission bypass.
+    var raw_parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer raw_parsed.deinit();
+    const raw_root = switch (raw_parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+    if (raw_root.get("indexes")) |indexes_value| {
+        if (indexes_value != .null) {
+            const validated_indexes_json = try normalizeCreateTableIndexesFromValue(alloc, indexes_value);
+            alloc.free(validated_indexes_json);
+        }
+    }
+
     // Use typed OpenAPI parsing for scalar fields (num_shards, description, schema,
     // replication_sources). For indexes, parse from the raw body to preserve
     // type-specific fields (external, dimension, edge_types, etc.) that the
@@ -42,13 +62,6 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         req.description = try alloc.dupe(u8, description);
     }
 
-    // Extract indexes from raw body to preserve all fields.
-    var raw_parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
-    defer raw_parsed.deinit();
-    const raw_root = switch (raw_parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidCreateTableRequest,
-    };
     if (raw_root.get("indexes")) |indexes_value| {
         if (indexes_value != .null)
             req.indexes_json = try normalizeCreateTableIndexesFromValue(alloc, indexes_value)
@@ -297,7 +310,15 @@ fn validatePublicIndexObject(object: anytype) !void {
     const index_type = extractPublicIndexType(object) orelse "full_text";
     if (std.mem.eql(u8, index_type, "full_text")) {
         try validatePublicFullTextIndexObject(object);
+        return;
     }
+    if (std.mem.eql(u8, index_type, "embeddings") or
+        std.mem.eql(u8, index_type, "graph") or
+        std.mem.eql(u8, index_type, "algebraic"))
+    {
+        return;
+    }
+    return error.InvalidCreateIndexRequest;
 }
 
 fn normalizeArtifactEnrichmentConfigJson(
@@ -718,6 +739,16 @@ test "table contract rejects reserved full text index names on create table" {
         parseCreateTableRequest(
             std.testing.allocator,
             "{\"indexes\":{\"full_text_index_v1\":{\"type\":\"embeddings\",\"dimension\":3}}}",
+        ),
+    );
+}
+
+test "table contract rejects unsupported index kinds before catalog admission" {
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"unsupported_idx\":{\"type\":\"unsupported\"}}}",
         ),
     );
 }

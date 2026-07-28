@@ -5130,6 +5130,11 @@ fn syncLocalStoreStatus(
     const merge_transitions = admin_snapshot.merge_transitions;
     const split_observations = admin_snapshot.split_observations;
     const merge_observations = admin_snapshot.merge_observations;
+    const backend_runtime = try service.ensureBackendRuntime();
+    const status_io = backend_runtime.io() orelse if (builtin.is_test)
+        std.testing.io
+    else
+        return error.BackendIoUnavailable;
 
     var local_stores = std.ArrayListUnmanaged(metadata_table_manager.StoreRecord).empty;
     defer local_stores.deinit(service.alloc);
@@ -5142,6 +5147,9 @@ fn syncLocalStoreStatus(
     const group_statuses = try collectLocalGroupStatusReportsWithProvider(
         service,
         service.alloc,
+        backend_runtime,
+        status_io,
+        local_node_id,
         replica_root_dir,
         tables,
         ranges,
@@ -5390,6 +5398,9 @@ fn shouldRefreshLocalStoreStatusForLifecycleRound(service: anytype, backfill_mar
 fn collectLocalGroupStatusReportsWithProvider(
     service: anytype,
     alloc: std.mem.Allocator,
+    backend_runtime: *backend_runtime_mod.BackendRuntime,
+    io: std.Io,
+    local_node_id: u64,
     replica_root_dir: []const u8,
     tables: []const metadata_table_manager.TableRecord,
     ranges: []const metadata_table_manager.RangeRecord,
@@ -5420,6 +5431,9 @@ fn collectLocalGroupStatusReportsWithProvider(
     return try collectLocalGroupStatusReports(
         service,
         alloc,
+        backend_runtime,
+        io,
+        local_node_id,
         replica_root_dir,
         tables,
         ranges,
@@ -5435,6 +5449,9 @@ fn collectLocalGroupStatusReportsWithProvider(
 fn collectLocalGroupStatusReports(
     service: anytype,
     alloc: std.mem.Allocator,
+    backend_runtime: *backend_runtime_mod.BackendRuntime,
+    io: std.Io,
+    local_node_id: u64,
     replica_root_dir: []const u8,
     tables: []const metadata_table_manager.TableRecord,
     ranges: []const metadata_table_manager.RangeRecord,
@@ -5456,28 +5473,49 @@ fn collectLocalGroupStatusReports(
         const db_path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ replica_root_dir, range.group_id });
         defer alloc.free(db_path);
 
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        _ = statFilePath(io_impl.io(), db_path) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
+        const path_present = present: {
+            _ = statFilePath(io, db_path) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => break :present false,
+                else => return err,
+            };
+            break :present true;
         };
 
-        const group_status = try collectLocalGroupStatusReport(
-            service,
-            alloc,
-            db_path,
-            replica_root_dir,
-            range.group_id,
-            stores,
-            merged_group_statuses,
-            split_transitions,
-            merge_transitions,
-            split_observations,
-            merge_observations,
-        );
-        errdefer metadata_table_manager.freeGroupStatus(alloc, group_status);
-        try reports.append(alloc, group_status);
+        const group_status = if (path_present)
+            try collectLocalGroupStatusReport(
+                service,
+                alloc,
+                backend_runtime,
+                io,
+                db_path,
+                replica_root_dir,
+                range.group_id,
+                stores,
+                merged_group_statuses,
+                split_transitions,
+                merge_transitions,
+                split_observations,
+                merge_observations,
+            )
+        else
+            null;
+        if (group_status) |status| {
+            errdefer metadata_table_manager.freeGroupStatus(alloc, status);
+            try reports.append(alloc, status);
+        } else if (latestLocalGroupStatus(stores, local_node_id, range.group_id)) |previous| {
+            var preserved = previous;
+            const readiness = transition_state.readinessForGroup(
+                range.group_id,
+                split_transitions,
+                merge_transitions,
+            );
+            preserved.transition_pending = readiness.transition_pending;
+            preserved.replay_required = readiness.replay_required;
+            preserved.replay_caught_up = readiness.replay_caught_up;
+            preserved.cutover_ready = readiness.cutover_ready;
+            preserved.reads_ready_after_cutover = readiness.reads_ready_after_cutover;
+            try reports.append(alloc, preserved);
+        }
     }
 
     return try reports.toOwnedSlice(alloc);
@@ -5486,6 +5524,8 @@ fn collectLocalGroupStatusReports(
 fn collectLocalGroupStatusReport(
     service: anytype,
     alloc: std.mem.Allocator,
+    backend_runtime: *backend_runtime_mod.BackendRuntime,
+    io: std.Io,
     db_path: []const u8,
     replica_root_dir: ?[]const u8,
     group_id: u64,
@@ -5495,10 +5535,10 @@ fn collectLocalGroupStatusReport(
     merge_transitions: []const transition_state.MergeTransitionRecord,
     split_observations: []const transition_state.SplitObservationRecord,
     merge_observations: []const transition_state.MergeObservationRecord,
-) !metadata_table_manager.GroupStatusReport {
+) !?metadata_table_manager.GroupStatusReport {
     _ = stores;
     _ = merged_group_statuses;
-    var db = try db_mod.DB.open(alloc, db_path, .{
+    var db = db_mod.DB.open(alloc, db_path, .{
         // This path is only a fallback when no local data-runtime provider is
         // installed. Group status needs primary identity count and filesystem
         // size, never query execution. Catalog-only mode avoids mmap/open of
@@ -5508,7 +5548,11 @@ fn collectLocalGroupStatusReport(
         .ttl_cleanup = .{ .enabled = false },
         .transaction_recovery = .{ .enabled = false },
         .text_merge = .{ .enabled = false },
-    });
+        .backend_runtime = backend_runtime,
+    }) catch |err| switch (err) {
+        error.GenerationTransitionActive, error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
     defer db.close();
 
     const stats = try db.stats(alloc);
@@ -5519,6 +5563,7 @@ fn collectLocalGroupStatusReport(
     const readiness = if (replica_root_dir) |root_dir|
         try transition_state.readinessForLocalGroup(
             alloc,
+            io,
             root_dir,
             group_id,
             split_transitions,
@@ -5533,7 +5578,7 @@ fn collectLocalGroupStatusReport(
     return .{
         .group_id = group_id,
         .doc_count = stats.doc_count,
-        .disk_bytes = try directoryUsageBytes(alloc, db_path),
+        .disk_bytes = try directoryUsageBytes(alloc, io, db_path),
         .empty = stats.doc_count == 0,
         .created_at_millis = created_at_millis,
         .updated_at_millis = now_realtime_ms,
@@ -5551,6 +5596,31 @@ fn collectLocalGroupStatusReport(
         .cutover_ready = readiness.cutover_ready,
         .reads_ready_after_cutover = readiness.reads_ready_after_cutover,
     };
+}
+
+fn latestLocalGroupStatus(
+    stores: []const metadata_table_manager.StoreRecord,
+    local_node_id: u64,
+    group_id: u64,
+) ?metadata_table_manager.GroupStatusReport {
+    var latest: ?metadata_table_manager.GroupStatusReport = null;
+    for (stores) |store| {
+        if (store.node_id != local_node_id) continue;
+        for (store.group_statuses) |status| {
+            if (status.group_id != group_id) continue;
+            if (latest == null or
+                status.raft_term > latest.?.raft_term or
+                (status.raft_term == latest.?.raft_term and
+                    status.raft_applied_index > latest.?.raft_applied_index) or
+                (status.raft_term == latest.?.raft_term and
+                    status.raft_applied_index == latest.?.raft_applied_index and
+                    status.updated_at_millis > latest.?.updated_at_millis))
+            {
+                latest = status;
+            }
+        }
+    }
+    return latest;
 }
 
 const ServiceGroupRaftObservation = struct {
@@ -5707,21 +5777,19 @@ fn serviceGroupMembership(service: anytype, group_id: u64) ServiceGroupMembershi
     return .{};
 }
 
-fn directoryUsageBytes(alloc: std.mem.Allocator, path: []const u8) !u64 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    var dir = openDirPath(io_impl.io(), path, true) catch |err| switch (err) {
+fn directoryUsageBytes(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !u64 {
+    var dir = openDirPath(io, path, true) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
-    defer dir.close(io_impl.io());
+    defer dir.close(io);
 
     var total: u64 = 0;
     var walker = try dir.walk(alloc);
     defer walker.deinit();
-    while (try walker.next(io_impl.io())) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        const stat = try dir.statFile(io_impl.io(), entry.path, .{});
+        const stat = try dir.statFile(io, entry.path, .{});
         total += stat.size;
     }
     return total;

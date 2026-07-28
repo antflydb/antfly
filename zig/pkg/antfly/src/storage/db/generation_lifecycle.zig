@@ -143,7 +143,7 @@ const CleanupScheduler = struct {
     lane: background_runtime.DurableJobLane,
     owner_id: u64,
 
-    fn fromRuntime(runtime: ?*background_runtime.BackendRuntime) ?CleanupScheduler {
+    fn fromRuntime(runtime: ?*background_runtime.BackendRuntime) !?CleanupScheduler {
         const active = runtime orelse return null;
         // The manual runtime executes jobs inline. Preserve cleanup as durable
         // reconciliation debt instead of extending publication downtime.
@@ -151,7 +151,7 @@ const CleanupScheduler = struct {
         return .{
             .alloc = active.alloc,
             .lane = active.durable_jobs,
-            .owner_id = active.allocOwnerId(),
+            .owner_id = try active.tryAllocOwnerId(),
         };
     }
 };
@@ -1305,21 +1305,33 @@ pub fn acquirePublishedGenerationReadWithRuntime(alloc: Allocator, path: []const
     defer reconciliation.deinit();
     var publication_lock = try openPublicationLock(process_manager_allocator, reconciliation.path_key, .exclusive);
     errdefer closePublicationLock(publication_lock);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
+    var fallback_io_impl: std.Io.Threaded = undefined;
+    var fallback_io_owned = false;
+    defer if (fallback_io_owned) fallback_io_impl.deinit();
+    const io = if (runtime) |active|
+        active.io() orelse fallback: {
+            fallback_io_impl = std.Io.Threaded.init(alloc, .{});
+            fallback_io_owned = true;
+            break :fallback fallback_io_impl.io();
+        }
+    else fallback: {
+        fallback_io_impl = std.Io.Threaded.init(alloc, .{});
+        fallback_io_owned = true;
+        break :fallback fallback_io_impl.io();
+    };
     var deferred_cleanup = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (deferred_cleanup.items) |stale_path| alloc.free(stale_path);
         deferred_cleanup.deinit(alloc);
     }
-    const cleanup_scheduler = CleanupScheduler.fromRuntime(runtime);
-    const reconciled = try reconcilePublishedGeneration(alloc, io_impl.io(), path, cleanup_scheduler, &deferred_cleanup);
-    try publication_lock.downgradeLock(io_impl.io());
+    const cleanup_scheduler = try CleanupScheduler.fromRuntime(runtime);
+    const reconciled = try reconcilePublishedGeneration(alloc, io, path, cleanup_scheduler, &deferred_cleanup);
+    try publication_lock.downgradeLock(io);
     var read_lease = try reconciliation.promoteToRead(publication_lock, reconciled);
     errdefer read_lease.deinit();
     if (deferred_cleanup.items.len > 0) {
         const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
-        deleteRetiredGenerationPaths(alloc, io_impl.io(), deferred_cleanup.items, parent) catch |err| {
+        deleteRetiredGenerationPaths(alloc, io, deferred_cleanup.items, parent) catch |err| {
             std.log.warn("stale generation cleanup remains retryable after read admission path={s} count={} err={s}", .{ path, deferred_cleanup.items.len, @errorName(err) });
         };
     }
@@ -1412,12 +1424,13 @@ pub fn beginProcessExclusive(path: []const u8) !ExclusiveTransition {
 
 pub fn beginProcessExclusiveWithRuntime(path: []const u8, runtime: ?*background_runtime.BackendRuntime) !ExclusiveTransition {
     var transition = try process_manager.beginExclusive(path);
-    transition.cleanup_scheduler = CleanupScheduler.fromRuntime(runtime);
+    errdefer transition.deinit();
+    transition.cleanup_scheduler = try CleanupScheduler.fromRuntime(runtime);
     return transition;
 }
 
 pub fn beginProcessPreparationWithRuntime(path: []const u8, runtime: ?*background_runtime.BackendRuntime) !PreparationTransition {
-    return try process_manager.beginPreparation(path, CleanupScheduler.fromRuntime(runtime));
+    return try process_manager.beginPreparation(path, try CleanupScheduler.fromRuntime(runtime));
 }
 
 pub fn hasPublishedGenerationRead(path: []const u8) !bool {

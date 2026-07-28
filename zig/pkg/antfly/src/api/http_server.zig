@@ -1993,7 +1993,7 @@ pub const ApiHttpServer = struct {
         self.restore_schedule_mutex.unlock();
         self.restore_jobs_resumed.store(false, .release);
         try self.restore_job_store.prepareReplicatedLeadership(self.alloc);
-        self.restore_job_owner_id.store(runtime.allocOwnerId(), .release);
+        self.restore_job_owner_id.store(try runtime.tryAllocOwnerId(), .release);
         self.restore_leadership_term.store(leadership_term, .release);
         self.restore_dispatch_paused.store(false, .release);
         self.restore_dispatch_requested.store(true, .release);
@@ -26945,6 +26945,44 @@ test "api http server create table with local writes waits for projected presenc
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
+}
+
+test "api http server rejects unsupported table index before metadata publication" {
+    const FakeSource = struct {
+        create_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .create_table = createTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.create_calls += 1;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = "{\"indexes\":{\"unsupported_idx\":{\"type\":\"unsupported\"}}}",
+    });
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expectEqual(@as(usize, 0), source.create_calls);
 }
 
 test "api runtime status upsert keeps one authoritative observation per group" {
