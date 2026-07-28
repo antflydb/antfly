@@ -2247,6 +2247,11 @@ pub const ModelManager = struct {
         std.debug.assert(self.loaded.count() == 0);
         self.serving_policy = policy;
         self.admission_enabled = true;
+        self.admission.configureSharedLimits(
+            runtime.tier.memory.sharedAdmissionLimitsWithOverrides(
+                self.admission_limit_overrides,
+            ),
+        );
     }
 
     pub fn acquireRunResources(
@@ -2279,6 +2284,9 @@ pub const ModelManager = struct {
     ) void {
         std.debug.assert(self.loaded.count() == 0);
         self.admission_limit_overrides = overrides;
+        self.admission.configureSharedLimits(
+            runtime.tier.memory.sharedAdmissionLimitsWithOverrides(overrides),
+        );
     }
 
     pub fn configureAdmissionResourceBudget(
@@ -3831,6 +3839,21 @@ fn loadSessionForPreferredBackends(
     // NoModelFileFound only when nothing was even attempted.
     if (first_err) |err| return err;
     return error.NoModelFileFound;
+}
+
+test "serving admission applies the node-wide host-memory override" {
+    var manager = ModelManager.init(
+        std.testing.allocator,
+        backends.SessionManager.init(std.testing.allocator),
+    );
+    defer manager.deinit();
+
+    manager.configureServingPolicy(.{});
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 100 });
+    try std.testing.expectEqual(
+        @as(usize, 100),
+        manager.admission.shared_limits.host_limit_bytes,
+    );
 }
 
 test "shouldPreferNativeSession prefers native GLiNER weights" {

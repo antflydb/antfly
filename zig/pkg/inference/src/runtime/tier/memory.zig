@@ -93,6 +93,15 @@ pub const Limits = struct {
     scratch_limit_bytes: usize = 0,
 };
 
+/// Stable node-wide limits for physical memory domains shared by otherwise
+/// independent CPU/GPU workload policies. On discrete-GPU systems only host
+/// RAM is shared; Metal allocations also consume the unified system-memory
+/// domain.
+pub const SharedAdmissionLimits = struct {
+    host_limit_bytes: usize = 0,
+    unified_limit_bytes: usize = 0,
+};
+
 pub const SystemMemoryInfo = struct {
     total_bytes: usize,
     available_bytes: ?usize = null,
@@ -518,12 +527,24 @@ pub const AdmissionLease = struct {
 pub const AdmissionController = struct {
     mutex: std.atomic.Mutex = .unlocked,
     /// Aggregate accounting is retained for observability and for the optional
-    /// process-owner resource budget. Policy limits are enforced against the
-    /// matching backend bucket below so CPU and GPU limits are never mixed.
+    /// process-owner resource budget. Host memory is enforced against the
+    /// shared physical domain, while workload/device policy is enforced against
+    /// the matching backend bucket below.
     admitted: AdmissionAmounts = .{},
     admitted_by_backend: [backend_class_count]AdmissionAmounts =
         emptyAdmissionAmountsByBackend(),
+    shared_limits: SharedAdmissionLimits = .{},
     resource_budget: ?AdmissionResourceBudget = null,
+
+    pub fn configureSharedLimits(
+        self: *AdmissionController,
+        shared_limits: SharedAdmissionLimits,
+    ) void {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        std.debug.assert(std.meta.eql(self.admitted, AdmissionAmounts{}));
+        self.shared_limits = shared_limits;
+    }
 
     pub fn configureResourceBudget(
         self: *AdmissionController,
@@ -601,6 +622,27 @@ pub const AdmissionController = struct {
                 return error.ResourceLimitExceeded;
             _ = next.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
             _ = next.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
+
+            // CPU work and CUDA staging/cache allocations consume the same host
+            // RAM. Enforce that physical domain before backend-local policies so
+            // provisional cross-backend reservations cannot race past it.
+            try checkAdmissionLimit(
+                request_host,
+                next_global_host,
+                self.shared_limits.host_limit_bytes,
+            );
+            if (builtin.os.tag == .macos) {
+                try checkAdmissionLimit(
+                    request_combined,
+                    std.math.add(
+                        usize,
+                        next_global_host,
+                        next_global_backend,
+                    ) catch return error.ResourceLimitExceeded,
+                    self.shared_limits.unified_limit_bytes,
+                );
+            }
+
             var next_by_backend = self.admitted_by_backend;
             for (0..backend_class_count) |index| {
                 if (!active_backends[index]) continue;
@@ -840,6 +882,43 @@ pub fn defaultLimitsForBackend(backend: BackendClass) Limits {
         });
     }
     return staticLimitsForBackend(backend);
+}
+
+/// Derive one stable physical-memory policy for the process. Backend-local
+/// defaults intentionally remain more conservative workload caps; this shared
+/// cap represents all memory available after the node's safety headroom and
+/// therefore also accommodates explicitly widened large-model floors.
+pub fn defaultSharedAdmissionLimits() SharedAdmissionLimits {
+    const defaults = if (currentSystemMemoryInfo()) |info| blk: {
+        const safe_pool = info.total_bytes -|
+            @min(info.total_bytes, liveHostMemoryHeadroom(info.total_bytes));
+        break :blk SharedAdmissionLimits{
+            .host_limit_bytes = safe_pool,
+            .unified_limit_bytes = if (builtin.os.tag == .macos) safe_pool else 0,
+        };
+    } else blk: {
+        const cpu = staticLimitsForBackend(.cpu);
+        const gpu = staticLimitsForBackend(.gpu);
+        break :blk SharedAdmissionLimits{
+            .host_limit_bytes = @max(cpu.host_limit_bytes, gpu.host_limit_bytes),
+            .unified_limit_bytes = if (builtin.os.tag == .macos)
+                @max(cpu.combined_limit_bytes, gpu.combined_limit_bytes)
+            else
+                0,
+        };
+    };
+    return defaults;
+}
+
+/// Node overrides are global policy for shared physical domains, while the
+/// remaining fields continue to constrain each CPU/GPU workload bucket.
+pub fn sharedAdmissionLimitsWithOverrides(overrides: Limits) SharedAdmissionLimits {
+    var limits = defaultSharedAdmissionLimits();
+    if (overrides.host_limit_bytes > 0)
+        limits.host_limit_bytes = overrides.host_limit_bytes;
+    if (builtin.os.tag == .macos and overrides.combined_limit_bytes > 0)
+        limits.unified_limit_bytes = overrides.combined_limit_bytes;
+    return limits;
 }
 
 fn staticLimitsForBackend(backend: BackendClass) Limits {
@@ -1851,6 +1930,7 @@ test "shared admission accounts for concurrent leases and releases capacity" {
 
 test "cpu and gpu admission enforce independent policy domains" {
     var controller = AdmissionController{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = 100 });
     var gpu_lease = try controller.tryAcquire(
         .gpu,
         .{
@@ -1898,6 +1978,92 @@ test "cpu and gpu admission enforce independent policy domains" {
             .{ .host_kv_bytes = 70 },
             false,
         ),
+    );
+}
+
+test "cpu and gpu admission share one physical host-memory domain" {
+    var controller = AdmissionController{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = 100 });
+    const limits = Limits{
+        .host_limit_bytes = 100,
+        .combined_limit_bytes = 100,
+    };
+
+    var cpu_lease = try controller.tryAcquire(
+        .cpu,
+        limits,
+        .{ .host_weight_bytes = 60 },
+        false,
+    );
+    defer cpu_lease.release();
+
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        controller.tryAcquire(
+            .gpu,
+            limits,
+            .{ .host_scratch_bytes = 50 },
+            false,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 60), controller.snapshot().hostTotalBytes());
+    try std.testing.expectEqual(
+        AdmissionAmounts{},
+        controller.snapshotBackend(.gpu),
+    );
+
+    // Device-local CUDA bytes remain independent and do not consume the shared
+    // host cap or the CPU workload policy.
+    var gpu_lease = try controller.tryAcquire(
+        .gpu,
+        .{
+            .host_limit_bytes = 100,
+            .backend_limit_bytes = 1000,
+            .combined_limit_bytes = 1000,
+        },
+        .{ .backend_weight_bytes = 800 },
+        false,
+    );
+    defer gpu_lease.release();
+    try std.testing.expectEqual(@as(usize, 60), controller.snapshot().hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 800), controller.snapshot().backendTotalBytes());
+}
+
+test "metal backend bytes share the unified system-memory domain" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    var controller = AdmissionController{};
+    controller.configureSharedLimits(.{
+        .host_limit_bytes = 1000,
+        .unified_limit_bytes = 100,
+    });
+    var metal_lease = try controller.tryAcquire(
+        .gpu,
+        .{
+            .backend_limit_bytes = 100,
+            .combined_limit_bytes = 100,
+        },
+        .{ .backend_weight_bytes = 60 },
+        false,
+    );
+    defer metal_lease.release();
+
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        controller.tryAcquire(
+            .cpu,
+            .{
+                .host_limit_bytes = 100,
+                .combined_limit_bytes = 100,
+            },
+            .{ .host_weight_bytes = 50 },
+            false,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 60), controller.snapshot().backendTotalBytes());
+    try std.testing.expectEqual(
+        AdmissionAmounts{},
+        controller.snapshotBackend(.cpu),
     );
 }
 
