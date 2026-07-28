@@ -2,7 +2,7 @@
 
 # AntflyDerivedReplay — structural diagrams
 
-Generated from [`AntflyDerivedReplay.tla`](../../../storage/db/AntflyDerivedReplay.tla). 12 state variables, 12 actions in `Next`. 1 expected-failure mutant action(s) (gated by `Buggy*` constants) omitted.
+Generated from [`AntflyDerivedReplay.tla`](../../../storage/db/AntflyDerivedReplay.tla). 12 state variables, 13 actions in `Next`. 1 expected-failure mutant action(s) (gated by `Buggy*` constants) omitted.
 
 ## Actions and the state they touch
 
@@ -16,10 +16,11 @@ Generated from [`AntflyDerivedReplay.tla`](../../../storage/db/AntflyDerivedRepl
 | `FinishBulkSession` | `bulkSessionActive` | `bulkSessionActive` |
 | `ObserveReplayTarget` | `latestHintMeta`, `target`, `catchupActive`, `bulkSessionActive` | `target` |
 | `StartCatchup` | `applied`, `target`, `catchupActive`, `bulkSessionActive` | `catchupActive` |
-| `AdvanceWhenNoVisibleHintMatch` | `replayAll`, `hintLane`, `hintLaneAvailable`, `truncateFloor`, `applied`, `target`, `catchupActive` | `applied` |
+| `AdvanceWhenNoVisibleHintMatch` | `replayAll`, `truncateFloor`, `applied`, `target`, `catchupActive` | `applied` |
 | `FinishCatchup` | `applied`, `target`, `catchupActive` | `catchupActive` |
 | `AdvanceQueryTarget` | `applied`, `queryTarget`, `catchupActive`, `bulkSessionActive` | `queryTarget` |
 | `ApplyHintMatch` | `replayAll`, `hintLane`, `hintLaneAvailable`, `truncateFloor`, `applied`, `appliedRecords`, `target`, `catchupActive` | `applied`, `appliedRecords` |
+| `ApplyFallbackMatch` | `replayAll`, `hintLane`, `hintLaneAvailable`, `truncateFloor`, `applied`, `appliedRecords`, `target`, `catchupActive` | `applied`, `appliedRecords` |
 
 ## Write graph
 
@@ -40,6 +41,7 @@ flowchart LR
         a9[FinishCatchup]
         a10[AdvanceQueryTarget]
         a11[ApplyHintMatch]
+        a12[ApplyFallbackMatch]
     end
     subgraph state["State variables"]
         v0([journalSeq])
@@ -77,7 +79,6 @@ flowchart LR
     v8 -.-> a7
     v7 -.-> a7
     a8 --> v9
-    v5 -.-> a8
     v8 -.-> a8
     v6 -.-> a8
     a9 --> v6
@@ -92,4 +93,9 @@ flowchart LR
     v5 -.-> a11
     v8 -.-> a11
     v6 -.-> a11
+    a12 --> v9
+    a12 --> v11
+    v5 -.-> a12
+    v8 -.-> a12
+    v6 -.-> a12
 ```

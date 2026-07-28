@@ -1855,6 +1855,7 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
     };
     runtime.mutex.unlock(io);
     if (!acquired) {
+        enrichment_trace.event(runtime, "LeaseDenied", null, target_sequence, null);
         // A live lease held by another owner can remain valid for the full
         // 30-second TTL. Pace denial retries so failover does not monopolize a
         // core or hammer the durable lease record while still reacting quickly
@@ -1863,6 +1864,7 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
             Io.Duration.fromMilliseconds(@intCast(lease_denied_retry_sleep_ns / std.time.ns_per_ms)),
             .awake,
         ) catch {};
+        enrichment_trace.event(runtime, "LeaseRetryReady", null, target_sequence, null);
         return;
     }
     enrichment_trace.event(runtime, "AcquireLease", null, target_sequence, null);

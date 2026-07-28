@@ -1,0 +1,23 @@
+\* All TLC check configs for AntflyTableAdmission.tla.
+
+==== positive tier=fast
+SPECIFICATION Spec
+
+CONSTANT
+    BuggyPersistInvalid = FALSE
+
+INVARIANTS
+    TypeOK
+    RejectedLeavesNoResidue
+    CommittedWasAccepted
+    NameReusableAfterReject
+    Safety
+
+==== BadPersistInvalid
+SPECIFICATION Spec
+
+CONSTANT
+    BuggyPersistInvalid = TRUE
+
+INVARIANTS
+    RejectedLeavesNoResidue

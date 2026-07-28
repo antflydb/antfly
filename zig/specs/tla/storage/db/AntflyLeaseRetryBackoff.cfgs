@@ -1,0 +1,27 @@
+\* All TLC check configs for AntflyLeaseRetryBackoff.tla.
+
+==== positive tier=fast
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyImmediateRetry = FALSE
+    MaxAttempts = 3
+
+INVARIANTS
+    TypeOK
+    DeniedAttemptsHaveWaitBoundaries
+    AcquiredOnlyAfterLeaseRelease
+    Safety
+
+PROPERTIES
+    EventuallyAcquires
+
+==== BadImmediateRetry
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyImmediateRetry = TRUE
+    MaxAttempts = 3
+
+INVARIANTS
+    DeniedAttemptsHaveWaitBoundaries

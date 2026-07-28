@@ -1,0 +1,45 @@
+\* All TLC check configs for AntflyReplayEnrichmentBridge.tla.
+
+==== positive tier=fast
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyOmitEnrichmentFloor = FALSE
+    BuggyAdvanceEmptyScan = FALSE
+    MaxSeq = 2
+    MaxEpoch = 1
+
+INVARIANTS
+    TypeOK
+    WatermarksOrdered
+    RetainedUntilAllConsumersApplied
+    NoAdvancePastCoverageDebt
+    CompletedWorkWasDurable
+    Safety
+
+PROPERTIES
+    CoverageEventuallyDrains
+
+==== BadRetention
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyOmitEnrichmentFloor = TRUE
+    BuggyAdvanceEmptyScan = FALSE
+    MaxSeq = 2
+    MaxEpoch = 1
+
+INVARIANTS
+    RetainedUntilAllConsumersApplied
+
+==== BadRestartFalseAdvance
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyOmitEnrichmentFloor = TRUE
+    BuggyAdvanceEmptyScan = TRUE
+    MaxSeq = 2
+    MaxEpoch = 1
+
+INVARIANTS
+    NoAdvancePastCoverageDebt

@@ -16,6 +16,7 @@ Auto-generated overviews of each protocol spec: phase state machines, action/sta
 - [AntflyShardSplit](metadata/AntflyShardSplit.md) — 20 actions, 14 variables, 3 phase state machines
 - [AntflyShardSplitSeq](metadata/AntflyShardSplitSeq.md) — 5 actions, 5 variables, 0 phase state machines
 - [AntflySplitRefinementBridge](metadata/AntflySplitRefinementBridge.md) — 13 actions, 15 variables, 2 phase state machines
+- [AntflyTableAdmission](metadata/AntflyTableAdmission.md) — 5 actions, 5 variables, 1 phase state machine
 - [AntflyTableLifecycle](metadata/AntflyTableLifecycle.md) — 11 actions, 8 variables, 0 phase state machines
 
 ## ml
@@ -35,12 +36,14 @@ Auto-generated overviews of each protocol spec: phase state machines, action/sta
 
 - [AntflyBatcherCoalescing](storage/db/AntflyBatcherCoalescing.md) — 3 actions, 5 variables, 2 phase state machines
 - [AntflyDbSplitVisibility](storage/db/AntflyDbSplitVisibility.md) — 15 actions, 30 variables, 4 phase state machines
-- [AntflyDerivedReplay](storage/db/AntflyDerivedReplay.md) — 12 actions, 12 variables, 0 phase state machines
+- [AntflyDerivedReplay](storage/db/AntflyDerivedReplay.md) — 13 actions, 12 variables, 0 phase state machines
 - [AntflyDocumentIdentity](storage/db/AntflyDocumentIdentity.md) — 8 actions, 16 variables, 0 phase state machines
 - [AntflyDocumentIdentityRangeRepair](storage/db/AntflyDocumentIdentityRangeRepair.md) — 11 actions, 23 variables, 5 phase state machines
 - [AntflyEnrichmentLease](storage/db/AntflyEnrichmentLease.md) — 13 actions, 20 variables, 1 phase state machine
 - [AntflyIndexLifecycle](storage/db/AntflyIndexLifecycle.md) — 11 actions, 11 variables, 2 phase state machines
+- [AntflyLeaseRetryBackoff](storage/db/AntflyLeaseRetryBackoff.md) — 4 actions, 5 variables, 0 phase state machines
 - [AntflyPromotionOwnerHandoff](storage/db/AntflyPromotionOwnerHandoff.md) — 6 actions, 5 variables, 1 phase state machine
+- [AntflyReplayEnrichmentBridge](storage/db/AntflyReplayEnrichmentBridge.md) — 9 actions, 9 variables, 0 phase state machines
 - [AntflyTransaction](storage/db/AntflyTransaction.md) — 15 actions, 9 variables, 3 phase state machines
 - [AntflyTransactionSession](storage/db/AntflyTransactionSession.md) — 15 actions, 13 variables, 1 phase state machine
 

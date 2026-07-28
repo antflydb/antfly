@@ -196,6 +196,7 @@ These specs are bounded around cohesive protocols and lifecycles, not individual
 - `AntflyPlacementReadiness.tla` -- Store voter-report knowledge/estimate aggregation and exact stable-placement transition admission. Its B1 mutant reproduces an unknown follower count latching ambiguity against an exact leader count.
 - `AntflyRuntimeStatusReconciliation.tla` -- Runtime observation precedence and storage-root provenance composed with complete join statistics, schema-migration progress, old-read-schema retention, and standby availability.
 - `AntflyTableLifecycle.tla` -- Table create/drop lifecycle: in-memory desired vs raft-committed topology, per-command applies, crash rebuilding desired from committed, planner scope, and convergence liveness.
+- `AntflyTableAdmission.tla` -- Public index-kind validation before desired/committed table metadata, including an expected-failure persist-then-reject mutant.
 - `AntflyHARetentionReseed.tla` -- WAL retention floor vs per-slot reseed marking vs truncation, plus backup slots as retention pins with fail-closed backup end; no-permanent-unmarked-lag liveness.
 - `AntflyPromotionOwnerHandoff.tla` -- Entity promotion single-owner handoff across split/merge: detach-before-transfer-before-attach, non-durable attachment with crash/reattach, isLocalOwner promotion gate, handoff-completes liveness. Sketch-tier authority guardrail; intentionally collapses raft leadership and runtime detail.
 - `AntflyIndexLifecycle.tla` -- Two-generation index lifecycle with non-atomic durable status, shadow-swap completeness, bounded competing work, durable scheduler wakeups/admission, and explicit convergence assumptions. The B5-shaped mutant loses the second generation's rebuild wakeup.
@@ -210,6 +211,8 @@ These specs are bounded around cohesive protocols and lifecycles, not individual
 - `AntflyEnrichmentLease.tla` -- Generated enrichment worker target/applied watermarks, replay visibility, retry/isolation state, and lease-owned collection/generation/publication so stale work cannot publish and hidden pending generated work cannot be skipped.
 - `AntflyEnrichmentLeaseBadStalePublish` -- Expected-failure stale lease publication mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyEnrichmentLeaseBadEmptyPending` -- Expected-failure hidden pending advancement mutant used by `bash ../scripts/tla-check.sh negative`.
+- `AntflyReplayEnrichmentBridge.tla` -- Shared replay retention across fast derived and generated-enrichment consumers, provider failure, volatile work loss on restart, and coverage-debt-safe applied advancement.
+- `AntflyLeaseRetryBackoff.tla` -- Wait-boundary ordering between durable lease denials; exact delay and CPU rate remain runtime-test obligations.
 - `AntflyLmdbCommit.tla` -- Zig LMDB prepared data pages, data-sync/meta-write/meta-sync publication phases, crash reopen meta selection, nested child transaction merge/abort, reader snapshots, and free-record reuse gated by oldest reader.
 - `AntflyLmdbCommitBadMetaBeforeData` -- Expected-failure meta-before-data mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyLmdbCommitBadReaderReuse` -- Expected-failure reader-visible page reuse mutant used by `bash ../scripts/tla-check.sh negative`.

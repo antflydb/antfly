@@ -196,9 +196,9 @@
     "label": "index generation lifecycle",
     "archetype": "narrative",
     "traceFamily": "index-lifecycle",
-    "laneField": "indexName",
+    "laneField": "facts.indexName",
     "lanePrefix": "index ",
-    "bandField": "phase",
+    "bandField": "facts.phase",
     "bandQuiet": ["admitted"],
     "milestones": ["^RequestGeneration$", "^SwapGeneration$", "^ObserveReady$"],
     "faultPatterns": ["^FailBuild$", "^WorkerDeferred$"],
@@ -209,12 +209,12 @@
     ],
     "scene": {
       "stores": [
-        {"id": "generation", "label": "config generation", "valueField": "configHash", "style": "record"},
-        {"id": "intent", "label": "durable repair intent", "valueField": "phase", "style": "durable"}
+        {"id": "generation", "label": "config generation", "valueField": "facts.configHash", "style": "record"},
+        {"id": "intent", "label": "durable repair intent", "valueField": "facts.phase", "style": "durable"}
       ],
       "lamps": [
-        {"field": "durableWork", "label": "durable work"},
-        {"field": "workerAdmitted", "label": "worker admitted"}
+        {"field": "facts.durableWork", "label": "durable work"},
+        {"field": "facts.workerAdmitted", "label": "worker admitted"}
       ],
       "flows": [
         {"on": "^QueueDurableWork$", "from": "generation", "to": "intent", "label": "publish durable wakeup"},
@@ -222,5 +222,56 @@
         {"on": "^SwapGeneration$", "from": "generation", "to": "intent", "label": "activate replacement"}
       ]
     }
+  },
+
+  "derived-replay-trace": {
+    "label": "derived replay and fallback",
+    "archetype": "dialogue",
+    "traceFamily": "derived-replay",
+    "model": "storage/db/AntflyDerivedReplay",
+    "laneRules": [
+      ["^ObserveTarget$", "target watermark"],
+      ["^BeginCatchUp$|^FinishCatchUp$", "derived worker"],
+      ["^HintLaneScan$", "hint lane"],
+      ["^FallbackScan$", "replay-all fallback"],
+      [".*", "replay"]
+    ],
+    "laneOrder": ["target watermark", "derived worker", "hint lane", "replay-all fallback", "replay"],
+    "milestones": ["^ObserveTarget$", "^BeginCatchUp$", "^FinishCatchUp$"],
+    "faultPatterns": ["^FallbackScan$"],
+    "categories": [
+      {"label": "Target", "patterns": ["Target"]},
+      {"label": "Scan", "patterns": ["Scan"]},
+      {"label": "Apply", "patterns": ["CatchUp"]}
+    ],
+    "pairs": [
+      {"send": "^BeginCatchUp$", "recv": "^FinishCatchUp$", "label": "catch-up window"}
+    ]
+  },
+
+  "enrichment-lease-trace": {
+    "label": "enrichment lease and provider recovery",
+    "archetype": "dialogue",
+    "traceFamily": "enrichment-lease",
+    "model": "storage/db/AntflyEnrichmentLease",
+    "laneRules": [
+      ["Lease", "durable lease"],
+      ["RetryTransient", "provider"],
+      ["CollectPending|PublishGenerated|AdvanceApplied", "enrichment worker"],
+      ["FatalWorkerFailure|IsolateRequestFailure", "failure isolation"],
+      [".*", "runtime"]
+    ],
+    "laneOrder": ["durable lease", "enrichment worker", "provider", "failure isolation", "runtime"],
+    "milestones": ["^AcquireLease$", "^CollectPending$", "^AdvanceApplied$"],
+    "faultPatterns": ["^LeaseDenied$", "^RetryTransient$", "^FatalWorkerFailure$"],
+    "categories": [
+      {"label": "Ownership", "patterns": ["Lease"]},
+      {"label": "Work", "patterns": ["CollectPending", "PublishGenerated", "AdvanceApplied"]},
+      {"label": "Retry / isolate", "patterns": ["Retry", "Failure"]}
+    ],
+    "pairs": [
+      {"send": "^LeaseDenied$", "recv": "^LeaseRetryReady$", "label": "bounded retry wait"},
+      {"send": "^CollectPending$", "recv": "^AdvanceApplied$", "label": "enrichment pass"}
+    ]
   }
 }

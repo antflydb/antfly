@@ -13,31 +13,48 @@ ASSUME TLCGet("config").worker = 1
 JsonFile == IF "JSON" \in DOMAIN IOEnv THEN IOEnv.JSON ELSE "./enrichment-lease.ndjson"
 TraceLog == ndJsonDeserialize(JsonFile)
 
-VARIABLES l, applied, target
-vars == <<l, applied, target>>
+VARIABLES l, applied, target, denialCooling
+vars == <<l, applied, target, denialCooling>>
 
-Init == /\ l = 1 /\ applied = 0 /\ target = 0
+Init == /\ l = 1 /\ applied = 0 /\ target = 0 /\ denialCooling = FALSE
 event == TraceLog[l].event
 facts == event.facts
 
-Observe ==
+ObserveWorker ==
     /\ event.name \in {
         "AcquireLease", "CollectPending", "PublishGenerated",
         "AdvanceApplied", "RetryTransient", "FatalWorkerFailure",
         "IsolateRequestFailure"
        }
+    /\ event.name = "AcquireLease" => ~denialCooling
     /\ facts.appliedSequence <= facts.targetSequence
     /\ event.name \in {"PublishGenerated", "AdvanceApplied"} => facts.leaseValid
+    /\ applied' = facts.appliedSequence
+    /\ target' = facts.targetSequence
+    /\ UNCHANGED denialCooling
+
+ObserveLeaseDenied ==
+    /\ event.name = "LeaseDenied"
+    /\ ~facts.leaseValid
+    /\ ~denialCooling
+    /\ denialCooling' = TRUE
+    /\ applied' = facts.appliedSequence
+    /\ target' = facts.targetSequence
+
+ObserveLeaseRetryReady ==
+    /\ event.name = "LeaseRetryReady"
+    /\ denialCooling
+    /\ denialCooling' = FALSE
     /\ applied' = facts.appliedSequence
     /\ target' = facts.targetSequence
 
 TraceNext ==
     /\ l <= Len(TraceLog)
-    /\ Observe
+    /\ ObserveWorker \/ ObserveLeaseDenied \/ ObserveLeaseRetryReady
     /\ l' = l + 1
 
 Spec == Init /\ [][TraceNext]_vars
-TypeOK == /\ l \in Nat /\ applied \in Nat /\ target \in Nat
+TypeOK == /\ l \in Nat /\ applied \in Nat /\ target \in Nat /\ denialCooling \in BOOLEAN
 WatermarksOrdered == applied <= target
 TraceMatched == [](l <= Len(TraceLog) => [](TLCGet("queue") = 1 \/ l > Len(TraceLog)))
 

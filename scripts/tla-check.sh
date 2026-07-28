@@ -140,6 +140,7 @@ NEG_TRACE_FIXTURES=(
     "TraceAntflyIndexLifecycle ${SPEC_ROOT}/traces/negative/index_lifecycle_lost_second_wakeup.ndjson"
     "TraceAntflyDerivedReplay ${SPEC_ROOT}/traces/negative/derived_replay_advance_beyond_target.ndjson"
     "TraceAntflyEnrichmentLease ${SPEC_ROOT}/traces/negative/enrichment_stale_owner_publish.ndjson"
+    "TraceAntflyEnrichmentLease ${SPEC_ROOT}/traces/negative/enrichment_lease_immediate_retry.ndjson"
 )
 
 run_negative() {
