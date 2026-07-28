@@ -27,65 +27,155 @@ const max_connections_per_dsn: usize = 8;
 const max_connection_pools: usize = 32;
 const max_total_connections: usize = 128;
 const connection_pool_idle_ttl_ns: u64 = 5 * std.time.ns_per_min;
+const max_pool_reclaims_per_acquire: usize = 1;
 const max_column_cache_entries: usize = 1_024;
 const column_cache_ttl_ns: u64 = std.time.ns_per_min;
-const max_condition_deadline_slice_ns: u64 = 250 * std.time.ns_per_ms;
 const supports_waitable_pool = builtin.os.tag != .freestanding and
     builtin.link_libc and
     @hasDecl(std.c, "pthread_cond_wait") and
     @hasDecl(std.c, "pthread_cond_timedwait");
 
+const PthreadCondAttr = extern struct {
+    value: c_int = 0,
+};
+
+const pthread_ext = struct {
+    extern "c" fn pthread_cond_init(cond: *std.c.pthread_cond_t, attr: ?*const PthreadCondAttr) c_int;
+    extern "c" fn pthread_condattr_init(attr: *PthreadCondAttr) c_int;
+    extern "c" fn pthread_condattr_destroy(attr: *PthreadCondAttr) c_int;
+    extern "c" fn pthread_condattr_setclock(attr: *PthreadCondAttr, clock_id: std.c.clockid_t) c_int;
+    extern "c" fn pthread_cond_timedwait_relative_np(
+        cond: *std.c.pthread_cond_t,
+        mutex: *std.c.pthread_mutex_t,
+        relative: *const std.c.timespec,
+    ) c_int;
+};
+
+const uses_monotonic_condattr = builtin.os.tag == .linux;
+const uses_relative_condwait = switch (builtin.os.tag) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
+    else => false,
+};
+
 /// An epoch-based condition avoids missed wakeups between observing pool state
-/// and sleeping. Timed waits are sliced so the authoritative monotonic
-/// deadline is rechecked even on platforms whose pthread condition clock is
-/// wall-clock based.
+/// and sleeping. Native timed waits use a monotonic clock (Linux) or a relative
+/// timeout (Darwin), so wall-clock corrections cannot extend query deadlines.
 const PoolAvailability = if (supports_waitable_pool)
     struct {
-        mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-        cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
-        epoch: std.atomic.Value(u64) = .init(0),
+        const State = struct {
+            mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+            cond: std.c.pthread_cond_t = undefined,
+            epoch: std.atomic.Value(u64) = .init(0),
+            waiters: usize = 0,
+        };
+
+        alloc: Allocator,
+        state: *State,
+
+        fn init(alloc: Allocator) !@This() {
+            const state = try alloc.create(State);
+            errdefer alloc.destroy(state);
+            state.* = .{};
+            if (uses_monotonic_condattr) {
+                var attr = PthreadCondAttr{};
+                if (pthread_ext.pthread_condattr_init(&attr) != 0)
+                    return error.SystemResources;
+                defer if (pthread_ext.pthread_condattr_destroy(&attr) != 0) unreachable;
+                if (pthread_ext.pthread_condattr_setclock(&attr, .MONOTONIC) != 0)
+                    return error.SystemResources;
+                if (pthread_ext.pthread_cond_init(&state.cond, &attr) != 0)
+                    return error.SystemResources;
+            } else {
+                if (pthread_ext.pthread_cond_init(&state.cond, null) != 0)
+                    return error.SystemResources;
+            }
+            return .{
+                .alloc = alloc,
+                .state = state,
+            };
+        }
 
         fn snapshot(self: *@This()) u64 {
-            return self.epoch.load(.acquire);
+            return self.state.epoch.load(.acquire);
         }
 
         fn waitForChange(self: *@This(), observed: u64, execution_deadline_ns: ?u64) !void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
-            defer if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
-            if (self.epoch.load(.acquire) != observed) return;
+            const state = self.state;
+            if (std.c.pthread_mutex_lock(&state.mutex) != .SUCCESS) unreachable;
+            defer if (std.c.pthread_mutex_unlock(&state.mutex) != .SUCCESS) unreachable;
+            if (state.epoch.load(.acquire) != observed) return;
+            state.waiters += 1;
+            defer state.waiters -= 1;
 
             if (execution_deadline_ns) |deadline_ns| {
                 const now_ns = platform_time.monotonicNs();
                 if (now_ns >= deadline_ns) return error.Timeout;
-                const wait_ns = @min(deadline_ns - now_ns, max_condition_deadline_slice_ns);
-                const abstime = realtimeAfterNs(wait_ns);
-                const result = std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &abstime);
+                const wait_ns = deadline_ns - now_ns;
+                const result = if (uses_monotonic_condattr) blk: {
+                    const abstime = monotonicDeadlineTimespec(deadline_ns);
+                    break :blk std.c.pthread_cond_timedwait(
+                        &state.cond,
+                        &state.mutex,
+                        &abstime,
+                    );
+                } else if (uses_relative_condwait) blk: {
+                    const relative = durationTimespec(wait_ns);
+                    break :blk @as(std.c.E, @enumFromInt(pthread_ext.pthread_cond_timedwait_relative_np(
+                        &state.cond,
+                        &state.mutex,
+                        &relative,
+                    )));
+                } else blk: {
+                    // The remaining supported pthread targets do not expose a
+                    // portable monotonic condition clock. Use a short relative
+                    // sleep rather than make deadline correctness depend on
+                    // CLOCK_REALTIME.
+                    if (std.c.pthread_mutex_unlock(&state.mutex) != .SUCCESS) unreachable;
+                    platform_time.sleepNs(@min(wait_ns, std.time.ns_per_ms));
+                    if (std.c.pthread_mutex_lock(&state.mutex) != .SUCCESS) unreachable;
+                    break :blk std.c.E.TIMEDOUT;
+                };
                 if (result != .SUCCESS and result != .TIMEDOUT) unreachable;
                 try ensureDeadline(deadline_ns);
                 return;
             }
 
-            while (self.epoch.load(.acquire) == observed) {
-                if (std.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
+            while (state.epoch.load(.acquire) == observed) {
+                if (std.c.pthread_cond_wait(&state.cond, &state.mutex) != .SUCCESS) unreachable;
             }
         }
 
         fn advance(self: *@This()) void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
-            _ = self.epoch.fetchAdd(1, .release);
-            if (std.c.pthread_cond_signal(&self.cond) != .SUCCESS) unreachable;
-            if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+            const state = self.state;
+            if (std.c.pthread_mutex_lock(&state.mutex) != .SUCCESS) unreachable;
+            _ = state.epoch.fetchAdd(1, .release);
+            if (state.waiters > 0 and std.c.pthread_cond_signal(&state.cond) != .SUCCESS) unreachable;
+            if (std.c.pthread_mutex_unlock(&state.mutex) != .SUCCESS) unreachable;
+        }
+
+        fn advanceAll(self: *@This()) void {
+            const state = self.state;
+            if (std.c.pthread_mutex_lock(&state.mutex) != .SUCCESS) unreachable;
+            _ = state.epoch.fetchAdd(1, .release);
+            if (state.waiters > 0 and std.c.pthread_cond_broadcast(&state.cond) != .SUCCESS) unreachable;
+            if (std.c.pthread_mutex_unlock(&state.mutex) != .SUCCESS) unreachable;
         }
 
         fn deinit(self: *@This()) void {
-            if (std.c.pthread_cond_destroy(&self.cond) != .SUCCESS) unreachable;
-            if (std.c.pthread_mutex_destroy(&self.mutex) != .SUCCESS) unreachable;
+            const state = self.state;
+            if (std.c.pthread_cond_destroy(&state.cond) != .SUCCESS) unreachable;
+            if (std.c.pthread_mutex_destroy(&state.mutex) != .SUCCESS) unreachable;
+            self.alloc.destroy(state);
             self.* = undefined;
         }
     }
 else
     struct {
         epoch: std.atomic.Value(u64) = .init(0),
+
+        fn init(_: Allocator) !@This() {
+            return .{};
+        }
 
         fn snapshot(self: *@This()) u64 {
             return self.epoch.load(.acquire);
@@ -103,6 +193,10 @@ else
         }
 
         fn advance(self: *@This()) void {
+            _ = self.epoch.fetchAdd(1, .release);
+        }
+
+        fn advanceAll(self: *@This()) void {
             _ = self.epoch.fetchAdd(1, .release);
         }
 
@@ -167,7 +261,7 @@ pub const Executor = struct {
     const ConnectionPool = struct {
         mutex: Mutex = .unlocked,
         control_mutex: Mutex = .unlocked,
-        availability: PoolAvailability = .{},
+        availability: PoolAvailability,
         idle: std.ArrayListUnmanaged(*PGconn) = .empty,
         total: usize = 0,
         refs: usize = 0,
@@ -178,6 +272,11 @@ pub const Executor = struct {
         columns: []foreign_source.Column,
         refreshed_at_ns: u64,
         access_sequence: u64,
+    };
+
+    const DetachedConnectionPool = struct {
+        key: []const u8,
+        pool: *ConnectionPool,
     };
 
     const ConnectionLease = struct {
@@ -199,24 +298,21 @@ pub const Executor = struct {
                     pool.total -= 1;
                     pool.mutex.unlock();
                     executor.pqfinish(self.conn);
-                    executor.releaseGlobalConnection();
+                    executor.releaseGlobalConnections(1);
                     pool.availability.advance();
-                    executor.connection_availability.advance();
                     executor.releaseConnectionPool(pool);
                     self.* = undefined;
                     return;
                 };
                 pool.mutex.unlock();
                 pool.availability.advance();
-                executor.connection_availability.advance();
             } else {
                 lock(&pool.mutex);
                 pool.total -= 1;
                 pool.mutex.unlock();
                 executor.pqfinish(self.conn);
-                executor.releaseGlobalConnection();
+                executor.releaseGlobalConnections(1);
                 pool.availability.advance();
-                executor.connection_availability.advance();
             }
             executor.releaseConnectionPool(pool);
             self.* = undefined;
@@ -226,8 +322,9 @@ pub const Executor = struct {
     alloc: Allocator,
     lib: std.DynLib,
     pools_mutex: Mutex = .unlocked,
+    reclaim_mutex: Mutex = .unlocked,
     pools: std.StringHashMapUnmanaged(*ConnectionPool) = .empty,
-    connection_availability: PoolAvailability = .{},
+    connection_availability: PoolAvailability,
     total_connections: std.atomic.Value(usize) = .init(0),
     cache_mutex: Mutex = .unlocked,
     columns_cache: std.StringHashMapUnmanaged(CachedColumns) = .empty,
@@ -264,9 +361,12 @@ pub const Executor = struct {
     pub fn init(alloc: Allocator) !@This() {
         var lib = try openDefaultLibpq();
         errdefer lib.close();
+        var connection_availability = try PoolAvailability.init(alloc);
+        errdefer connection_availability.deinit();
         return .{
             .alloc = alloc,
             .lib = lib,
+            .connection_availability = connection_availability,
             .pqconnectdb = try lookupRequired(&lib, FnPQconnectdb, "PQconnectdb"),
             .pqconnectStart = try lookupRequired(&lib, FnPQconnectStart, "PQconnectStart"),
             .pqconnectPoll = try lookupRequired(&lib, FnPQconnectPoll, "PQconnectPoll"),
@@ -345,6 +445,7 @@ pub const Executor = struct {
                 .statistics = Executor.statistics,
                 .statistics_with_deadline = Executor.statisticsWithDeadline,
                 .discover_columns = Executor.discoverColumns,
+                .refresh_columns = Executor.refreshColumns,
                 .begin_snapshot_query = Executor.beginSnapshotQuery,
                 .begin_prepared_replication_snapshot = Executor.beginPreparedReplicationSnapshot,
                 .prepare_replication = Executor.prepareReplication,
@@ -379,6 +480,12 @@ pub const Executor = struct {
         return try self.discoverColumnsAllocWithDeadline(alloc, dsn, table, execution_deadline_ns);
     }
 
+    fn refreshColumns(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) ![]foreign_source.Column {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try self.invalidateColumnsCache(alloc, dsn, table, execution_deadline_ns);
+        return try self.discoverColumnsAllocWithDeadline(alloc, dsn, table, execution_deadline_ns);
+    }
+
     const SnapshotQuery = struct {
         executor: *Executor,
         conn: ?*PGconn,
@@ -397,7 +504,7 @@ pub const Executor = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.conn) |conn| {
                 _ = self.executor.execSimpleAllowCommand(conn, alloc, "ROLLBACK") catch {};
-                self.executor.pqfinish(conn);
+                self.executor.closeCountedConnection(conn);
             }
             alloc.destroy(self);
         }
@@ -414,10 +521,12 @@ pub const Executor = struct {
 
             const conn = self.conn orelse return error.ForeignConnectionFailed;
             const result = self.executor.execPreparedWithDeadline(conn, alloc, owned, execution_deadline_ns) catch |err| {
-                if (invalidatesConnection(err)) {
-                    self.executor.pqfinish(conn);
-                    self.conn = null;
-                }
+                // PostgreSQL aborts the entire transaction after any statement
+                // error. A snapshot connection is therefore never reusable
+                // after a failed query, even when the underlying socket is
+                // healthy.
+                self.executor.closeCountedConnection(conn);
+                self.conn = null;
                 return err;
             };
             defer self.executor.pqclear(result);
@@ -428,8 +537,8 @@ pub const Executor = struct {
     fn beginSnapshotQuery(ptr: *anyopaque, alloc: Allocator, dsn: []const u8) !postgres_source.QueryExecutor.SnapshotQuery {
         const self: *@This() = @ptrCast(@alignCast(ptr));
 
-        const conn = try self.connectFresh(alloc, dsn);
-        errdefer self.pqfinish(conn);
+        const conn = try self.connectCountedFresh(alloc, dsn, null);
+        errdefer self.closeCountedConnection(conn);
         const begin_result = try self.execSimpleAllowCommand(conn, alloc, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
         self.pqclear(begin_result);
 
@@ -456,6 +565,12 @@ pub const Executor = struct {
         lock(&pool.control_mutex);
         defer pool.control_mutex.unlock();
 
+        // Reserve both sockets atomically. Acquiring the replication socket
+        // after opening the SQL socket can deadlock when many cutovers reach
+        // the global ceiling together.
+        try self.acquireGlobalConnectionPermits(2, null);
+        var release_reserved_permits = true;
+        errdefer if (release_reserved_permits) self.releaseGlobalConnections(2);
         const sql_conn = try self.connectFresh(alloc, dsn);
         errdefer self.pqfinish(sql_conn);
         try self.ensurePublicationAlloc(alloc, dsn, sql_conn, publication_name, params.table, params.filter_query_json);
@@ -464,7 +579,7 @@ pub const Executor = struct {
         }
 
         const repl_conn = try self.connectReplicationFresh(alloc, dsn);
-        defer self.pqfinish(repl_conn);
+        errdefer self.pqfinish(repl_conn);
         var exported = try self.createLogicalReplicationSlotExportSnapshotAlloc(alloc, repl_conn, slot_name);
         defer exported.deinit(alloc);
 
@@ -487,8 +602,12 @@ pub const Executor = struct {
             .executor = self,
             .conn = sql_conn,
         };
+        const checkpoint = try alloc.dupe(u8, exported.checkpoint);
+        self.pqfinish(repl_conn);
+        self.releaseGlobalConnections(1);
+        release_reserved_permits = false;
         return .{
-            .checkpoint = try alloc.dupe(u8, exported.checkpoint),
+            .checkpoint = checkpoint,
             .snapshot_query = snapshot_query.asSnapshotQuery(),
         };
     }
@@ -589,6 +708,25 @@ pub const Executor = struct {
 
     fn discoverColumnsAlloc(self: *@This(), alloc: Allocator, dsn: []const u8, table: []const u8) ![]foreign_source.Column {
         return try self.discoverColumnsAllocWithDeadline(alloc, dsn, table, null);
+    }
+
+    fn invalidateColumnsCache(
+        self: *@This(),
+        alloc: Allocator,
+        dsn: []const u8,
+        table: []const u8,
+        execution_deadline_ns: ?u64,
+    ) !void {
+        const relation_sql = try sql.quotePostgresRelationAlloc(alloc, table);
+        defer alloc.free(relation_sql);
+        const lookup_key = try columnCacheKeyAlloc(alloc, dsn, relation_sql);
+        defer alloc.free(lookup_key);
+        try lockUntil(&self.cache_mutex, execution_deadline_ns);
+        defer self.cache_mutex.unlock();
+        if (self.columns_cache.fetchRemove(lookup_key)) |removed| {
+            self.alloc.free(removed.key);
+            freeColumns(self.alloc, removed.value.columns);
+        }
     }
 
     fn discoverColumnsAllocWithDeadline(
@@ -699,33 +837,66 @@ pub const Executor = struct {
         dsn: []const u8,
         execution_deadline_ns: ?u64,
     ) !*ConnectionPool {
-        try lockUntil(&self.pools_mutex, execution_deadline_ns);
-        defer self.pools_mutex.unlock();
-        const now_ns = platform_time.monotonicNs();
-        while (self.evictOneConnectionPoolLocked(now_ns, true)) {}
-        if (self.pools.get(dsn)) |pool| {
-            pool.refs += 1;
-            pool.last_used_ns = now_ns;
+        var reclaim_count: usize = 0;
+        while (true) {
+            try lockUntil(&self.pools_mutex, execution_deadline_ns);
+            const now_ns = platform_time.monotonicNs();
+            if (self.pools.get(dsn)) |pool| {
+                pool.refs += 1;
+                pool.last_used_ns = now_ns;
+                self.pools_mutex.unlock();
+                return pool;
+            }
+
+            var detached: ?DetachedConnectionPool = null;
+            if (reclaim_count < max_pool_reclaims_per_acquire) {
+                detached = self.detachOneConnectionPoolLocked(
+                    now_ns,
+                    self.pools.count() < max_connection_pools,
+                );
+            }
+            if (detached) |victim| {
+                reclaim_count += 1;
+                self.pools_mutex.unlock();
+                self.destroyDetachedConnectionPool(victim);
+                if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
+                continue;
+            }
+            if (self.pools.count() >= max_connection_pools) {
+                self.pools_mutex.unlock();
+                return error.ForeignConnectionPoolLimitExceeded;
+            }
+
+            const owned_dsn = self.alloc.dupe(u8, dsn) catch |err| {
+                self.pools_mutex.unlock();
+                return err;
+            };
+            const pool = self.alloc.create(ConnectionPool) catch |err| {
+                self.alloc.free(owned_dsn);
+                self.pools_mutex.unlock();
+                return err;
+            };
+            const availability = PoolAvailability.init(self.alloc) catch |err| {
+                self.alloc.destroy(pool);
+                self.alloc.free(owned_dsn);
+                self.pools_mutex.unlock();
+                return err;
+            };
+            pool.* = .{
+                .availability = availability,
+                .refs = 1,
+                .last_used_ns = now_ns,
+            };
+            self.pools.put(self.alloc, owned_dsn, pool) catch |err| {
+                pool.availability.deinit();
+                self.alloc.destroy(pool);
+                self.alloc.free(owned_dsn);
+                self.pools_mutex.unlock();
+                return err;
+            };
+            self.pools_mutex.unlock();
             return pool;
         }
-        while (self.pools.count() >= max_connection_pools) {
-            if (!self.evictOneConnectionPoolLocked(now_ns, false))
-                return error.ForeignConnectionPoolLimitExceeded;
-        }
-
-        const owned_dsn = try self.alloc.dupe(u8, dsn);
-        errdefer self.alloc.free(owned_dsn);
-        const pool = try self.alloc.create(ConnectionPool);
-        errdefer {
-            pool.availability.deinit();
-            self.alloc.destroy(pool);
-        }
-        pool.* = .{
-            .refs = 1,
-            .last_used_ns = now_ns,
-        };
-        try self.pools.put(self.alloc, owned_dsn, pool);
-        return pool;
     }
 
     fn releaseConnectionPool(self: *@This(), pool: *ConnectionPool) void {
@@ -733,10 +904,16 @@ pub const Executor = struct {
         std.debug.assert(pool.refs > 0);
         pool.refs -= 1;
         pool.last_used_ns = platform_time.monotonicNs();
+        const became_reclaimable = pool.refs == 0;
         self.pools_mutex.unlock();
+        if (became_reclaimable) self.connection_availability.advanceAll();
     }
 
-    fn evictOneConnectionPoolLocked(self: *@This(), now_ns: u64, expired_only: bool) bool {
+    fn detachOneConnectionPoolLocked(
+        self: *@This(),
+        now_ns: u64,
+        expired_only: bool,
+    ) ?DetachedConnectionPool {
         var candidate_key: ?[]const u8 = null;
         var candidate_pool: ?*ConnectionPool = null;
         var it = self.pools.iterator();
@@ -749,14 +926,17 @@ pub const Executor = struct {
                 candidate_pool = pool;
             }
         }
-        const key = candidate_key orelse return false;
+        const key = candidate_key orelse return null;
         const removed = self.pools.fetchRemove(key) orelse unreachable;
-        self.destroyConnectionPoolLocked(removed.value);
-        self.alloc.free(removed.key);
-        return true;
+        return .{
+            .key = removed.key,
+            .pool = removed.value,
+        };
     }
 
-    fn destroyConnectionPoolLocked(self: *@This(), pool: *ConnectionPool) void {
+    fn destroyDetachedConnectionPool(self: *@This(), detached: DetachedConnectionPool) void {
+        defer self.alloc.free(detached.key);
+        const pool = detached.pool;
         std.debug.assert(pool.refs == 0);
         lock(&pool.mutex);
         std.debug.assert(pool.total == pool.idle.items.len);
@@ -768,18 +948,19 @@ pub const Executor = struct {
         if (closed_count > 0) {
             const previous = self.total_connections.fetchSub(closed_count, .acq_rel);
             std.debug.assert(previous >= closed_count);
-            self.connection_availability.advance();
+            self.connection_availability.advanceAll();
         }
         pool.availability.deinit();
         self.alloc.destroy(pool);
     }
 
-    fn reserveGlobalConnection(self: *@This()) bool {
+    fn reserveGlobalConnections(self: *@This(), count: usize) bool {
+        std.debug.assert(count > 0 and count <= max_total_connections);
         var current = self.total_connections.load(.acquire);
-        while (current < max_total_connections) {
+        while (current <= max_total_connections - count) {
             if (self.total_connections.cmpxchgWeak(
                 current,
-                current + 1,
+                current + count,
                 .acq_rel,
                 .acquire,
             )) |observed| {
@@ -791,18 +972,82 @@ pub const Executor = struct {
         return false;
     }
 
+    fn acquireGlobalConnectionPermits(
+        self: *@This(),
+        count: usize,
+        execution_deadline_ns: ?u64,
+    ) !void {
+        while (true) {
+            if (self.reserveGlobalConnections(count)) return;
+            const observed = self.connection_availability.snapshot();
+            if (try self.reclaimIdleConnections(count, execution_deadline_ns)) continue;
+            if (try self.reclaimInactiveConnectionPool(execution_deadline_ns)) continue;
+            try self.connection_availability.waitForChange(observed, execution_deadline_ns);
+        }
+    }
+
+    fn reclaimIdleConnections(
+        self: *@This(),
+        max_count: usize,
+        execution_deadline_ns: ?u64,
+    ) !bool {
+        var reclaimed: [max_total_connections]*PGconn = undefined;
+        var reclaimed_count: usize = 0;
+
+        try lockUntil(&self.reclaim_mutex, execution_deadline_ns);
+        defer self.reclaim_mutex.unlock();
+        try lockUntil(&self.pools_mutex, execution_deadline_ns);
+        var it = self.pools.iterator();
+        while (it.next()) |entry| {
+            if (reclaimed_count >= max_count) break;
+            const pool = entry.value_ptr.*;
+            const pool_reclaimed_start = reclaimed_count;
+            lockUntil(&pool.mutex, execution_deadline_ns) catch |err| {
+                self.pools_mutex.unlock();
+                for (reclaimed[0..reclaimed_count]) |conn| self.pqfinish(conn);
+                if (reclaimed_count > 0) self.releaseGlobalConnections(reclaimed_count);
+                return err;
+            };
+            while (reclaimed_count < max_count) {
+                reclaimed[reclaimed_count] = pool.idle.pop() orelse break;
+                reclaimed_count += 1;
+                pool.total -= 1;
+            }
+            pool.mutex.unlock();
+            if (reclaimed_count > pool_reclaimed_start) pool.availability.advanceAll();
+        }
+        self.pools_mutex.unlock();
+
+        if (reclaimed_count == 0) return false;
+        for (reclaimed[0..reclaimed_count]) |conn| self.pqfinish(conn);
+        self.releaseGlobalConnections(reclaimed_count);
+        if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
+        return true;
+    }
+
     fn reclaimInactiveConnectionPool(
         self: *@This(),
         execution_deadline_ns: ?u64,
     ) !bool {
+        try lockUntil(&self.reclaim_mutex, execution_deadline_ns);
+        defer self.reclaim_mutex.unlock();
         try lockUntil(&self.pools_mutex, execution_deadline_ns);
-        defer self.pools_mutex.unlock();
-        return self.evictOneConnectionPoolLocked(platform_time.monotonicNs(), false);
+        const detached = self.detachOneConnectionPoolLocked(platform_time.monotonicNs(), false);
+        self.pools_mutex.unlock();
+        const victim = detached orelse return false;
+        self.destroyDetachedConnectionPool(victim);
+        if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
+        return true;
     }
 
-    fn releaseGlobalConnection(self: *@This()) void {
-        const previous = self.total_connections.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
+    fn releaseGlobalConnections(self: *@This(), count: usize) void {
+        std.debug.assert(count > 0);
+        const previous = self.total_connections.fetchSub(count, .acq_rel);
+        std.debug.assert(previous >= count);
+        if (count == 1)
+            self.connection_availability.advance()
+        else
+            self.connection_availability.advanceAll();
     }
 
     fn acquireConnection(
@@ -823,21 +1068,23 @@ pub const Executor = struct {
                 lock(&pool.mutex);
                 pool.total -= 1;
                 pool.mutex.unlock();
-                self.releaseGlobalConnection();
+                self.releaseGlobalConnections(1);
                 pool.availability.advance();
-                self.connection_availability.advance();
                 continue;
             }
             if (pool.total < max_connections_per_dsn) {
-                if (!self.reserveGlobalConnection()) {
-                    const observed = self.connection_availability.snapshot();
+                pool.mutex.unlock();
+                try self.acquireGlobalConnectionPermits(1, execution_deadline_ns);
+                lockUntil(&pool.mutex, execution_deadline_ns) catch |err| {
+                    self.releaseGlobalConnections(1);
+                    return err;
+                };
+                // Another waiter may have filled the per-DSN pool while this
+                // request waited for a global permit. Return the permit and
+                // re-evaluate rather than exceeding the per-DSN bound.
+                if (pool.total >= max_connections_per_dsn or pool.idle.items.len > 0) {
                     pool.mutex.unlock();
-                    // The global cap may be consumed entirely by idle
-                    // connections for other DSNs. Reclaim one inactive pool
-                    // before sleeping so a live request cannot deadlock behind
-                    // capacity that nobody is using.
-                    if (try self.reclaimInactiveConnectionPool(execution_deadline_ns)) continue;
-                    try self.connection_availability.waitForChange(observed, execution_deadline_ns);
+                    self.releaseGlobalConnections(1);
                     continue;
                 }
                 pool.total += 1;
@@ -846,9 +1093,8 @@ pub const Executor = struct {
                     lock(&pool.mutex);
                     pool.total -= 1;
                     pool.mutex.unlock();
-                    self.releaseGlobalConnection();
+                    self.releaseGlobalConnections(1);
                     pool.availability.advance();
-                    self.connection_availability.advance();
                     return err;
                 };
                 return .{ .executor = self, .pool = pool, .conn = conn };
@@ -1010,6 +1256,25 @@ pub const Executor = struct {
             return error.ForeignConnectionFailed;
         }
         return conn;
+    }
+
+    fn connectCountedFresh(
+        self: *@This(),
+        alloc: Allocator,
+        dsn: []const u8,
+        execution_deadline_ns: ?u64,
+    ) !*PGconn {
+        try self.acquireGlobalConnectionPermits(1, execution_deadline_ns);
+        errdefer self.releaseGlobalConnections(1);
+        return if (execution_deadline_ns != null)
+            try self.connectFreshWithDeadline(dsn, execution_deadline_ns)
+        else
+            (try self.connectFresh(alloc, dsn)) orelse error.ForeignConnectionFailed;
+    }
+
+    fn closeCountedConnection(self: *@This(), conn: ?*PGconn) void {
+        self.pqfinish(conn);
+        self.releaseGlobalConnections(1);
     }
 
     fn connectReplicationFresh(self: *@This(), alloc: Allocator, dsn: []const u8) !?*PGconn {
@@ -1198,8 +1463,8 @@ pub const Executor = struct {
         const slot_name = params.slot_name orelse return error.InvalidQueryRequest;
         const publication_name = params.publication_name orelse return error.InvalidQueryRequest;
         std.log.info("postgres libpq poll begin table={s} slot={s}", .{ params.table, slot_name });
-        const conn = try self.connectFresh(alloc, dsn);
-        defer self.pqfinish(conn);
+        const conn = try self.connectCountedFresh(alloc, dsn, null);
+        defer self.closeCountedConnection(conn);
         std.log.info("postgres libpq poll connected table={s} slot={s}", .{ params.table, slot_name });
         var observed_checkpoint: ?[]u8 = null;
         errdefer if (observed_checkpoint) |value| alloc.free(value);
@@ -1306,8 +1571,8 @@ pub const Executor = struct {
         const slot_name = params.slot_name orelse return error.InvalidQueryRequest;
         const publication_name = params.publication_name orelse return error.InvalidQueryRequest;
         std.log.info("postgres libpq prepare replication table={s} slot={s}", .{ params.table, slot_name });
-        const conn = try self.connectFresh(alloc, dsn);
-        defer self.pqfinish(conn);
+        const conn = try self.connectCountedFresh(alloc, dsn, null);
+        defer self.closeCountedConnection(conn);
         try self.ensurePublicationAlloc(alloc, dsn, conn, publication_name, params.table, params.filter_query_json);
         const slot_existed = try self.ensureLogicalReplicationSlotAlloc(alloc, conn, slot_name);
         return .{
@@ -1318,8 +1583,8 @@ pub const Executor = struct {
 
     fn cleanupReplicationAlloc(self: *@This(), alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationCleanupParams) !void {
         std.log.info("postgres libpq cleanup replication slot={s} publication={s}", .{ params.slot_name, params.publication_name });
-        const conn = try self.connectFresh(alloc, dsn);
-        defer self.pqfinish(conn);
+        const conn = try self.connectCountedFresh(alloc, dsn, null);
+        defer self.closeCountedConnection(conn);
 
         const quoted_publication = try sql.postgresDialect().quote_identifier(alloc, params.publication_name);
         defer alloc.free(quoted_publication);
@@ -1527,6 +1792,7 @@ const LazyExecutor = struct {
                 .statistics = statistics,
                 .statistics_with_deadline = statisticsWithDeadline,
                 .discover_columns = discoverColumns,
+                .refresh_columns = refreshColumns,
                 .begin_snapshot_query = beginSnapshotQuery,
                 .begin_prepared_replication_snapshot = beginPreparedReplicationSnapshot,
                 .prepare_replication = prepareReplication,
@@ -1584,6 +1850,12 @@ const LazyExecutor = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const executor = try self.ensureExecutor(execution_deadline_ns);
         return try executor.asQueryExecutor().discoverColumns(alloc, dsn, table, execution_deadline_ns);
+    }
+
+    fn refreshColumns(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) ![]foreign_source.Column {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const executor = try self.ensureExecutor(execution_deadline_ns);
+        return try executor.asQueryExecutor().refreshColumns(alloc, dsn, table, execution_deadline_ns);
     }
 
     fn beginSnapshotQuery(ptr: *anyopaque, alloc: Allocator, dsn: []const u8) !postgres_source.QueryExecutor.SnapshotQuery {
@@ -2233,18 +2505,15 @@ fn ensureDeadline(deadline_ns: u64) !void {
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
 }
 
-fn realtimeAfterNs(wait_ns: u64) std.c.timespec {
-    var now: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &now) != 0) unreachable;
-    const added_seconds: std.c.time_t = @intCast(wait_ns / std.time.ns_per_s);
-    const added_nanos: c_long = @intCast(wait_ns % std.time.ns_per_s);
-    now.sec += added_seconds;
-    now.nsec += added_nanos;
-    if (now.nsec >= std.time.ns_per_s) {
-        now.sec += 1;
-        now.nsec -= std.time.ns_per_s;
-    }
-    return now;
+fn durationTimespec(duration_ns: u64) std.c.timespec {
+    return .{
+        .sec = @intCast(duration_ns / std.time.ns_per_s),
+        .nsec = @intCast(duration_ns % std.time.ns_per_s),
+    };
+}
+
+fn monotonicDeadlineTimespec(deadline_ns: u64) std.c.timespec {
+    return durationTimespec(deadline_ns);
 }
 
 fn invalidatesConnection(err: anyerror) bool {
@@ -2338,6 +2607,82 @@ test "postgres libpq pool registry evicts inactive DSNs at its hard bound" {
         executor.releaseConnectionPool(pool);
     }
     try std.testing.expectEqual(max_connection_pools, executor.pools.count());
+}
+
+test "postgres libpq global permits are atomic and bounded" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    defer executor.deinit();
+
+    try std.testing.expect(executor.reserveGlobalConnections(max_total_connections));
+    try std.testing.expect(!executor.reserveGlobalConnections(1));
+    executor.releaseGlobalConnections(max_total_connections);
+    try std.testing.expectEqual(@as(usize, 0), executor.total_connections.load(.acquire));
+}
+
+test "postgres libpq availability broadcast wakes every waiter" {
+    const alloc = std.testing.allocator;
+    var availability = try PoolAvailability.init(alloc);
+    defer availability.deinit();
+
+    const Waiter = struct {
+        fn run(
+            inner: *PoolAvailability,
+            observed: u64,
+            completed: *std.atomic.Value(usize),
+            failed: *std.atomic.Value(bool),
+        ) void {
+            inner.waitForChange(observed, null) catch {
+                failed.store(true, .release);
+                return;
+            };
+            _ = completed.fetchAdd(1, .acq_rel);
+        }
+    };
+    const waiter_count = 4;
+    const observed = availability.snapshot();
+    var completed: std.atomic.Value(usize) = .init(0);
+    var failed: std.atomic.Value(bool) = .init(false);
+    var waiters: [waiter_count]std.Thread = undefined;
+    for (&waiters) |*waiter| {
+        waiter.* = try std.Thread.spawn(
+            .{},
+            Waiter.run,
+            .{ &availability, observed, &completed, &failed },
+        );
+    }
+    availability.advanceAll();
+    for (waiters) |waiter| waiter.join();
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(waiter_count, completed.load(.acquire));
+}
+
+test "postgres libpq releasing the final pool reference wakes global waiters" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    defer executor.deinit();
+
+    const pool = try executor.getOrCreateConnectionPool("postgres://reference-notify", null);
+    const observed = executor.connection_availability.snapshot();
+    const Waiter = struct {
+        fn run(
+            availability: *PoolAvailability,
+            inner_observed: u64,
+            completed: *std.atomic.Value(bool),
+        ) void {
+            availability.waitForChange(inner_observed, null) catch return;
+            completed.store(true, .release);
+        }
+    };
+    var completed: std.atomic.Value(bool) = .init(false);
+    const waiter = try std.Thread.spawn(
+        .{},
+        Waiter.run,
+        .{ &executor.connection_availability, observed, &completed },
+    );
+    executor.releaseConnectionPool(pool);
+    waiter.join();
+    try std.testing.expect(completed.load(.acquire));
 }
 
 test "postgres libpq column cache keys isolate sources and schemas" {
@@ -2574,6 +2919,14 @@ test "postgres libpq live deadline cancels slow query and pool remains reusable"
     try std.testing.expect(stats.size_bytes > 0);
 
     {
+        const before_snapshot = executor.total_connections.load(.acquire);
+        var snapshot = try executor.asQueryExecutor().beginSnapshotQuery(alloc, dsn);
+        try std.testing.expectEqual(before_snapshot + 1, executor.total_connections.load(.acquire));
+        snapshot.deinit(alloc);
+        try std.testing.expectEqual(before_snapshot, executor.total_connections.load(.acquire));
+    }
+
+    {
         var first_lease = try executor.acquireConnection(
             dsn,
             platform_time.monotonicNs() + std.time.ns_per_s,
@@ -2742,18 +3095,43 @@ test "postgres libpq live relation resolution supports schemas quoted dots and c
     defer alloc.free(alter_sql);
     try execCommandForTest(&executor, conn, alloc, alter_sql);
 
-    const cache_key = try columnCacheKeyAlloc(alloc, dsn, quoted_relation);
-    defer alloc.free(cache_key);
-    lock(&executor.cache_mutex);
-    const cached = executor.columns_cache.getPtr(cache_key) orelse unreachable;
-    cached.refreshed_at_ns = platform_time.monotonicNs() -| column_cache_ttl_ns;
-    executor.cache_mutex.unlock();
+    const runtime = try alloc.create(postgres_source.RuntimeSource);
+    runtime.* = .{
+        .alloc = alloc,
+        .executor = executor.asQueryExecutor(),
+        .dsn = try alloc.dupe(u8, dsn),
+    };
+    var source = runtime.asSource();
+    defer source.deinit(alloc);
+    var extra_fields = [_][]u8{@constCast("extra")};
+    var refreshed_query = try source.query(alloc, .{
+        .table = @constCast(relation_name),
+        .fields = &extra_fields,
+    });
+    defer refreshed_query.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), refreshed_query.rows.len);
+    try std.testing.expect(refreshed_query.rows[0].object.get("extra").? == .null);
 
     const refreshed_columns = try executor.discoverColumnsAlloc(alloc, dsn, relation_name);
     defer freeColumns(alloc, refreshed_columns);
     try std.testing.expectEqual(@as(usize, 3), refreshed_columns.len);
     try std.testing.expectEqualStrings("extra", refreshed_columns[2].name);
     try std.testing.expect(refreshed_columns[2].nullable);
+
+    const drop_column_sql = try std.fmt.allocPrint(
+        alloc,
+        "ALTER TABLE {s} DROP COLUMN extra",
+        .{quoted_relation},
+    );
+    defer alloc.free(drop_column_sql);
+    try execCommandForTest(&executor, conn, alloc, drop_column_sql);
+    try std.testing.expectError(
+        error.UnknownColumn,
+        source.query(alloc, .{
+            .table = @constCast(relation_name),
+            .fields = &extra_fields,
+        }),
+    );
 }
 
 test "postgres libpq live logical poll returns inserted row" {
