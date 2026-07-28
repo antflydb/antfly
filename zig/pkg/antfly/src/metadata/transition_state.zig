@@ -165,6 +165,25 @@ pub const SplitObservationRecord = struct {
     observation: SplitObservation,
 };
 
+/// Conservative observation used until the source has reported durable split
+/// state. Treating missing telemetry as prepared can skip the prepare command
+/// and append an unapplyable start command to the source Raft log.
+pub fn unpreparedSplitObservation() SplitObservation {
+    return .{
+        .status = .{
+            .phase = .prepare,
+            .source_split_phase = null,
+            .bootstrapped = false,
+            .replay_required = false,
+            .replay_caught_up = false,
+            .cutover_ready = false,
+            .destination_ready_for_reads = false,
+            .source_delta_sequence = 0,
+            .dest_delta_sequence = 0,
+        },
+    };
+}
+
 pub const MergeObservationRecord = struct {
     transition_id: u64,
     observation: MergeObservation,

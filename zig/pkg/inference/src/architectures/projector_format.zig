@@ -20,6 +20,8 @@ const gguf_tensor_catalog = @import("../gguf/tensor_catalog.zig");
 const gguf_mod = @import("../gguf/root.zig");
 const compat = @import("../io/compat.zig");
 
+pub const gemma4_spatial_merge_size: u64 = 3;
+
 pub const Kind = enum {
     unknown,
     antfly_gemma3,
@@ -194,7 +196,7 @@ fn inspectGemma4ClipContract(
                 "clip.audio.embedding_length",
             )
         else
-            audio_hidden;
+            projection_dim;
         try validateGemma4AudioTensorShapes(
             TensorValidator.init(file),
             view,
@@ -386,16 +388,32 @@ const TensorValidator = struct {
         self: TensorValidator,
         name: []const u8,
         hidden: u64,
-    ) !void {
-        const tensor = try self.require(name);
-        if (tensor.dimensions.len != 3 or tensor.dimensions[1] == 0) {
-            return error.InvalidProjectorContract;
-        }
-        const hidden_first = tensor.dimensions[0] == hidden and tensor.dimensions[2] == 2;
-        const axis_first = tensor.dimensions[0] == 2 and tensor.dimensions[2] == hidden;
-        if (!hidden_first and !axis_first) return error.InvalidProjectorContract;
+    ) !u64 {
+        return axisPositionEmbeddingCapacity(try self.require(name), hidden);
     }
 };
+
+fn axisPositionEmbeddingCapacity(
+    tensor: *const gguf_format.TensorInfo,
+    hidden: u64,
+) !u64 {
+    if (tensor.dimensions.len != 3 or tensor.dimensions[1] == 0) {
+        return error.InvalidProjectorContract;
+    }
+    const hidden_first = tensor.dimensions[0] == hidden and tensor.dimensions[2] == 2;
+    const axis_first = tensor.dimensions[0] == 2 and tensor.dimensions[2] == hidden;
+    if (!hidden_first and !axis_first) return error.InvalidProjectorContract;
+    return tensor.dimensions[1];
+}
+
+pub fn gemma4PositionEmbeddingCapacity(
+    file: *const gguf_format.File,
+    hidden: u64,
+) !u64 {
+    const tensor = gguf_tensor_catalog.Catalog.init(file).find("v.position_embd.weight") orelse
+        return error.InvalidProjectorContract;
+    return axisPositionEmbeddingCapacity(tensor, hidden);
+}
 
 fn validateAntflyGemma3TensorShapes(
     validator: TensorValidator,
@@ -483,7 +501,12 @@ fn validateGemma4ImageTensorShapes(
     direct: bool,
 ) !void {
     try validator.requireMatrix("mm.input_projection.weight", vision_hidden, projection_dim);
-    try validator.requireAxisPositionEmbedding("v.position_embd.weight", vision_hidden);
+    const positions_per_axis = try validator.requireAxisPositionEmbedding(
+        "v.position_embd.weight",
+        vision_hidden,
+    );
+    const spatial_merge_size: u64 = if (direct) 1 else gemma4_spatial_merge_size;
+    if (positions_per_axis < spatial_merge_size) return error.InvalidProjectorContract;
 
     if (direct) {
         const patch_dims = [_]u32{ patch_size, patch_size, 3 };
@@ -678,6 +701,7 @@ fn buildDirectGemma4ContractFixture(
     patch_size: u32,
     scale_factor: u32,
     patch_input_dimension: u64,
+    positions_per_axis: u64,
 ) ![]u8 {
     const metadata = [_]gguf_mod.format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "clip" } },
@@ -694,7 +718,7 @@ fn buildDirectGemma4ContractFixture(
     const dims_patch = [_]u64{patch_input_dimension};
     const dims_hidden = [_]u64{4};
     const dims_patch_projection = [_]u64{ 4, patch_input_dimension };
-    const dims_position = [_]u64{ 2, 16, 4 };
+    const dims_position = [_]u64{ 2, positions_per_axis, 4 };
     const dims_projection = [_]u64{ 4, 4 };
     const tensors = [_]gguf_mod.writer.TensorSpec{
         .{ .name = "v.patch_norm.1.weight", .dimensions = &dims_patch, .tensor_type = .{ .known = .F32 } },
@@ -715,7 +739,7 @@ fn buildDirectGemma4ContractFixture(
 
 test "contract inspection accepts complete direct Gemma 4 projector shapes" {
     const allocator = std.testing.allocator;
-    const bytes = try buildDirectGemma4ContractFixture(allocator, 2, 1, 12);
+    const bytes = try buildDirectGemma4ContractFixture(allocator, 2, 1, 12, 16);
     defer allocator.free(bytes);
     var parsed = try gguf_format.parse(allocator, bytes);
     defer parsed.deinit(allocator);
@@ -740,6 +764,7 @@ test "contract inspection rejects zero or overflowing direct projector scale" {
             case.patch_size,
             case.scale_factor,
             12,
+            16,
         );
         defer allocator.free(bytes);
         var parsed = try gguf_format.parse(allocator, bytes);
@@ -754,7 +779,21 @@ test "contract inspection rejects zero or overflowing direct projector scale" {
 
 test "contract inspection rejects malformed nonterminal projector tensor shape" {
     const allocator = std.testing.allocator;
-    const bytes = try buildDirectGemma4ContractFixture(allocator, 2, 1, 11);
+    const bytes = try buildDirectGemma4ContractFixture(allocator, 2, 1, 11, 16);
+    defer allocator.free(bytes);
+    var parsed = try gguf_format.parse(allocator, bytes);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expectError(error.InvalidProjectorContract, inspectFileContract(&parsed));
+}
+
+test "contract inspection rejects a position table smaller than spatial merge" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildLayeredGemma4ImageContractFixtureWithPositions(
+        allocator,
+        2,
+        2,
+    );
     defer allocator.free(bytes);
     var parsed = try gguf_format.parse(allocator, bytes);
     defer parsed.deinit(allocator);
@@ -765,6 +804,18 @@ test "contract inspection rejects malformed nonterminal projector tensor shape" 
 fn buildLayeredGemma4ImageContractFixture(
     allocator: std.mem.Allocator,
     q_norm_dimension: u64,
+) ![]u8 {
+    return buildLayeredGemma4ImageContractFixtureWithPositions(
+        allocator,
+        q_norm_dimension,
+        16,
+    );
+}
+
+fn buildLayeredGemma4ImageContractFixtureWithPositions(
+    allocator: std.mem.Allocator,
+    q_norm_dimension: u64,
+    positions_per_axis: u64,
 ) ![]u8 {
     const metadata = [_]gguf_mod.format.MetadataEntry{
         .{ .key = "general.architecture", .value = .{ .string = "clip" } },
@@ -780,7 +831,7 @@ fn buildLayeredGemma4ImageContractFixture(
     const dims_patch = [_]u64{ 2, 2, 3, 4 };
     const dims_hidden = [_]u64{4};
     const dims_head = [_]u64{q_norm_dimension};
-    const dims_position = [_]u64{ 2, 16, 4 };
+    const dims_position = [_]u64{ 2, positions_per_axis, 4 };
     const dims_hidden_matrix = [_]u64{ 4, 4 };
     const dims_up = [_]u64{ 4, 8 };
     const dims_down = [_]u64{ 8, 4 };
@@ -820,6 +871,74 @@ test "contract inspection validates every layered Gemma 4 image tensor shape" {
     var invalid = try gguf_format.parse(allocator, invalid_bytes);
     defer invalid.deinit(allocator);
     try std.testing.expectError(error.InvalidProjectorContract, inspectFileContract(&invalid));
+}
+
+test "contract inspection accepts regular Gemma 4 audio projection width transition" {
+    const allocator = std.testing.allocator;
+    const metadata = [_]gguf_mod.format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+        .{ .key = "clip.audio.projector_type", .value = .{ .string = "gemma4a" } },
+        .{ .key = "clip.audio.projection_dim", .value = .{ .u32 = 6 } },
+        .{ .key = "clip.audio.embedding_length", .value = .{ .u32 = 4 } },
+        .{ .key = "clip.audio.feed_forward_length", .value = .{ .u32 = 8 } },
+        .{ .key = "clip.audio.block_count", .value = .{ .u32 = 1 } },
+        .{ .key = "clip.audio.attention.head_count", .value = .{ .u32 = 2 } },
+        .{ .key = "clip.audio.num_mel_bins", .value = .{ .u32 = 8 } },
+    };
+    const dims_hidden = [_]u64{4};
+    const dims_projection = [_]u64{6};
+    const dims_head = [_]u64{2};
+    const dims_hidden_matrix = [_]u64{ 4, 4 };
+    const dims_up = [_]u64{ 4, 8 };
+    const dims_down = [_]u64{ 8, 4 };
+    const dims_terminal = [_]u64{ 6, 6 };
+    const dims_preencode = [_]u64{ 4, 6 };
+    const dims_input_projection = [_]u64{ 64, 4 };
+    const dims_conv0 = [_]u64{ 3, 3, 1, 128 };
+    const dims_conv1 = [_]u64{ 3, 3, 128, 32 };
+    const dims_conv0_norm = [_]u64{128};
+    const dims_conv1_norm = [_]u64{32};
+    const dims_depthwise = [_]u64{ 5, 4 };
+    const tensors = [_]gguf_mod.writer.TensorSpec{
+        .{ .name = "mm.a.input_projection.weight", .dimensions = &dims_terminal, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.conv1d.0.weight", .dimensions = &dims_conv0, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.conv1d.0.norm.weight", .dimensions = &dims_conv0_norm, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.conv1d.1.weight", .dimensions = &dims_conv1, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.conv1d.1.norm.weight", .dimensions = &dims_conv1_norm, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.input_projection.weight", .dimensions = &dims_input_projection, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.pre_encode.out.weight", .dimensions = &dims_preencode, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.pre_encode.out.bias", .dimensions = &dims_projection, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.ffn_norm.weight", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.ffn_up.weight", .dimensions = &dims_up, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.ffn_down.weight", .dimensions = &dims_down, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.ffn_post_norm.weight", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.attn_pre_norm.weight", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.attn_q.weight", .dimensions = &dims_hidden_matrix, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.attn_k.weight", .dimensions = &dims_hidden_matrix, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.attn_v.weight", .dimensions = &dims_hidden_matrix, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.attn_k_rel.weight", .dimensions = &dims_hidden_matrix, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.per_dim_scale.weight", .dimensions = &dims_head, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.attn_out.weight", .dimensions = &dims_hidden_matrix, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.attn_post_norm.weight", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.norm_conv.weight", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.conv_pw1.weight", .dimensions = &dims_up, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.conv_dw.weight", .dimensions = &dims_depthwise, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.conv_norm.weight", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.conv_pw2.weight", .dimensions = &dims_hidden_matrix, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.ffn_norm_1.weight", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.ffn_up_1.weight", .dimensions = &dims_up, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.ffn_down_1.weight", .dimensions = &dims_down, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.ffn_post_norm_1.weight", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.blk.0.ln2.weight", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+    };
+    var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &tensors);
+    defer layout.deinit(allocator);
+    var parsed = try gguf_format.parse(allocator, layout.header_bytes);
+    defer parsed.deinit(allocator);
+
+    const contract = try inspectFileContract(&parsed);
+    try std.testing.expectEqual(Kind.clip_gemma4_audio, contract.kind);
+    try std.testing.expectEqual(@as(u32, 6), contract.text_hidden_size);
 }
 
 test "detect clip gemma4 image projector" {

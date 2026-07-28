@@ -151,6 +151,10 @@ pub const PlacementPlanner = struct {
         defer load_by_node.deinit(self.alloc);
         var pair_by_nodes = std.AutoHashMapUnmanaged(u128, usize).empty;
         defer pair_by_nodes.deinit(self.alloc);
+        var placement_load_by_node = std.AutoHashMapUnmanaged(u64, usize).empty;
+        defer placement_load_by_node.deinit(self.alloc);
+        try seedCurrentPlacementLoads(self.alloc, &placement_load_by_node, current_intents);
+        const force_reallocate = forcedReallocationRequested(candidate_domains);
 
         for (ranges.items) |range| {
             const table = findTable(tables, range.table_id) orelse return error.UnknownTable;
@@ -179,11 +183,27 @@ pub const PlacementPlanner = struct {
                 candidate_domains,
                 table.placement_role,
                 protect_current_members,
+                force_reallocate,
             );
             defer self.alloc.free(preserved);
+            const forced_move = if (force_reallocate and
+                !groupPlacementTransitionInFlight(current_intents, range.group_id) and
+                preserved.len >= replica_count)
+                selectBeneficialForcedMove(
+                    preserved,
+                    candidate_node_ids,
+                    candidate_domains,
+                    table.placement_role,
+                    &placement_load_by_node,
+                )
+            else
+                null;
             var selection_exclusions = std.ArrayListUnmanaged(u64).empty;
             defer selection_exclusions.deinit(self.alloc);
             for (preserved) |node_id| {
+                if (forced_move) |move| {
+                    if (node_id == move.source_node_id) continue;
+                }
                 if (selected.items.len >= replica_count) break;
                 try selected.append(self.alloc, node_id);
                 try selection_exclusions.append(self.alloc, node_id);
@@ -195,6 +215,7 @@ pub const PlacementPlanner = struct {
                 if (replicaIdExistsOnSelectedNode(current_intents, range.group_id, intent.record.replica_id, selected.items))
                     try selection_exclusions.append(self.alloc, intent.record.local_node_id);
             }
+            if (forced_move) |move| try selected.append(self.alloc, move.target_node_id);
 
             const start = @as(usize, @intCast(range.group_id % candidate_node_ids.len));
             const ordered = if (membership_repair)
@@ -211,6 +232,13 @@ pub const PlacementPlanner = struct {
                 try selected.append(self.alloc, node_id);
                 try selection_exclusions.append(self.alloc, node_id);
             }
+            try updateProjectedPlacementLoads(
+                self.alloc,
+                &placement_load_by_node,
+                current_intents,
+                range.group_id,
+                selected.items,
+            );
 
             const dropped_sources = try collectDroppedCurrentPeers(self.alloc, current_intents, range.group_id, selected.items);
             defer self.alloc.free(dropped_sources);
@@ -318,6 +346,7 @@ pub const CandidateDomain = struct {
     read_load: u32 = 0,
     write_load: u32 = 0,
     retain_current: bool = true,
+    force_reallocate: bool = false,
 };
 
 fn findTable(records: []const table_manager.TableRecord, table_id: u64) ?table_manager.TableRecord {
@@ -585,6 +614,7 @@ fn collectCurrentPeers(
     candidate_domains: []const CandidateDomain,
     placement_role: []const u8,
     protect_current_members: bool,
+    force_reallocate: bool,
 ) ![]u64 {
     const ExistingPeer = struct {
         node_id: u64,
@@ -595,11 +625,22 @@ fn collectCurrentPeers(
 
     var peers = std.ArrayListUnmanaged(ExistingPeer).empty;
     errdefer peers.deinit(alloc);
+    const transition_in_flight = groupPlacementTransitionInFlight(current_intents, group_id);
     for (current_intents) |intent| {
         if (intent.record.group_id != group_id) continue;
         if (!containsNode(candidate_node_ids, intent.record.local_node_id)) continue;
         if (!candidateRoleMatches(candidate_domains, intent.record.local_node_id, placement_role)) continue;
-        if (!candidateRetentionAllowed(candidate_domains, intent.record.local_node_id, protect_current_members)) continue;
+        // Explicit reallocation makes otherwise healthy candidates non-sticky.
+        // Do not retarget a group whose previous placement change has not
+        // converged yet: repeated requests would otherwise accumulate a new
+        // voter on every reconciliation round. An excluded candidate remains
+        // replaceable so node drain and failure repair can still make progress.
+        if (!candidateRetentionAllowed(candidate_domains, intent.record.local_node_id, protect_current_members) and
+            !((transition_in_flight or force_reallocate) and
+                candidateEligibleForInFlightRetention(candidate_domains, intent.record.local_node_id)))
+        {
+            continue;
+        }
         var duplicate = false;
         for (peers.items) |peer| {
             if (peer.node_id == intent.record.local_node_id) {
@@ -782,6 +823,164 @@ fn groupNeedsMembershipRepair(
     return current_count != 0 and current_count != replica_count;
 }
 
+fn candidateEligibleForInFlightRetention(candidate_domains: []const CandidateDomain, node_id: u64) bool {
+    for (candidate_domains) |candidate| {
+        if (candidate.node_id == node_id) return candidate.status_tag != .excluded;
+    }
+    return true;
+}
+
+fn forcedReallocationRequested(candidate_domains: []const CandidateDomain) bool {
+    for (candidate_domains) |candidate| {
+        if (candidate.force_reallocate) return true;
+    }
+    return false;
+}
+
+const ForcedMove = struct {
+    source_node_id: u64,
+    target_node_id: u64,
+};
+
+fn selectBeneficialForcedMove(
+    current_nodes: []const u64,
+    candidate_node_ids: []const u64,
+    candidate_domains: []const CandidateDomain,
+    placement_role: []const u8,
+    placement_load_by_node: *const std.AutoHashMapUnmanaged(u64, usize),
+) ?ForcedMove {
+    const current_domain_conflicts = placementDomainConflicts(current_nodes, candidate_domains);
+    var best: ?ForcedMove = null;
+    var best_domain_improvement: usize = 0;
+    var best_load_improvement: usize = 0;
+    var best_target_priority: u8 = std.math.maxInt(u8);
+    var best_target_pressure: u64 = std.math.maxInt(u64);
+
+    for (current_nodes) |source_node_id| {
+        const source_load = load_byNode(placement_load_by_node, source_node_id);
+        for (candidate_node_ids) |target_node_id| {
+            if (containsNode(current_nodes, target_node_id)) continue;
+            if (!candidateSelectable(candidate_domains, target_node_id, placement_role)) continue;
+
+            const target_load = load_byNode(placement_load_by_node, target_node_id);
+            const load_improvement = if (source_load > target_load and source_load - target_load > 1)
+                source_load - target_load - 1
+            else
+                0;
+            const domain_conflicts = placementDomainConflictsAfterMove(
+                current_nodes,
+                source_node_id,
+                target_node_id,
+                candidate_domains,
+            );
+            const domain_improvement = if (current_domain_conflicts > domain_conflicts)
+                current_domain_conflicts - domain_conflicts
+            else
+                0;
+            if (domain_improvement == 0 and load_improvement == 0) continue;
+
+            const target_priority = candidatePriority(candidate_domains, target_node_id);
+            const target_pressure = @as(u64, candidateLeasePressure(candidate_domains, target_node_id)) +
+                @as(u64, candidateLoadPressure(candidate_domains, target_node_id));
+            const better = best == null or
+                domain_improvement > best_domain_improvement or
+                (domain_improvement == best_domain_improvement and load_improvement > best_load_improvement) or
+                (domain_improvement == best_domain_improvement and load_improvement == best_load_improvement and target_priority < best_target_priority) or
+                (domain_improvement == best_domain_improvement and load_improvement == best_load_improvement and target_priority == best_target_priority and target_pressure < best_target_pressure) or
+                (domain_improvement == best_domain_improvement and load_improvement == best_load_improvement and target_priority == best_target_priority and target_pressure == best_target_pressure and
+                    (target_node_id < best.?.target_node_id or
+                        (target_node_id == best.?.target_node_id and source_node_id > best.?.source_node_id)));
+            if (!better) continue;
+
+            best = .{
+                .source_node_id = source_node_id,
+                .target_node_id = target_node_id,
+            };
+            best_domain_improvement = domain_improvement;
+            best_load_improvement = load_improvement;
+            best_target_priority = target_priority;
+            best_target_pressure = target_pressure;
+        }
+    }
+    return best;
+}
+
+fn placementDomainConflicts(nodes: []const u64, candidate_domains: []const CandidateDomain) usize {
+    var conflicts: usize = 0;
+    for (nodes, 0..) |left, i| {
+        const left_domain = findFailureDomain(candidate_domains, left);
+        if (left_domain.len == 0) continue;
+        for (nodes[i + 1 ..]) |right| {
+            if (std.mem.eql(u8, left_domain, findFailureDomain(candidate_domains, right))) conflicts += 1;
+        }
+    }
+    return conflicts;
+}
+
+fn placementDomainConflictsAfterMove(
+    nodes: []const u64,
+    source_node_id: u64,
+    target_node_id: u64,
+    candidate_domains: []const CandidateDomain,
+) usize {
+    var conflicts: usize = 0;
+    for (nodes, 0..) |raw_left, i| {
+        const left = if (raw_left == source_node_id) target_node_id else raw_left;
+        const left_domain = findFailureDomain(candidate_domains, left);
+        if (left_domain.len == 0) continue;
+        for (nodes[i + 1 ..]) |raw_right| {
+            const right = if (raw_right == source_node_id) target_node_id else raw_right;
+            if (std.mem.eql(u8, left_domain, findFailureDomain(candidate_domains, right))) conflicts += 1;
+        }
+    }
+    return conflicts;
+}
+
+fn seedCurrentPlacementLoads(
+    alloc: std.mem.Allocator,
+    placement_load_by_node: *std.AutoHashMapUnmanaged(u64, usize),
+    current_intents: []const raft_reconciler.PlacementIntent,
+) !void {
+    for (current_intents) |intent| {
+        const entry = try placement_load_by_node.getOrPut(alloc, intent.record.local_node_id);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* += 1;
+    }
+}
+
+fn updateProjectedPlacementLoads(
+    alloc: std.mem.Allocator,
+    placement_load_by_node: *std.AutoHashMapUnmanaged(u64, usize),
+    current_intents: []const raft_reconciler.PlacementIntent,
+    group_id: u64,
+    selected_nodes: []const u64,
+) !void {
+    for (current_intents) |intent| {
+        if (intent.record.group_id != group_id) continue;
+        if (containsNode(selected_nodes, intent.record.local_node_id)) continue;
+        if (placement_load_by_node.getPtr(intent.record.local_node_id)) |load| {
+            if (load.* > 0) load.* -= 1;
+        }
+    }
+    for (selected_nodes) |node_id| {
+        if (findCurrentIntent(current_intents, group_id, node_id) != null) continue;
+        const entry = try placement_load_by_node.getOrPut(alloc, node_id);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* += 1;
+    }
+}
+
+fn groupPlacementTransitionInFlight(
+    current_intents: []const raft_reconciler.PlacementIntent,
+    group_id: u64,
+) bool {
+    for (current_intents) |intent| {
+        if (intent.record.group_id != group_id) continue;
+        if (intent.serving_state != .serving) return true;
+    }
+    return false;
+}
+
 fn containsNode(nodes: []const u64, node_id: u64) bool {
     for (nodes) |existing| {
         if (existing == node_id) return true;
@@ -872,6 +1071,107 @@ test "placement planner preserves valid current peers before moving replicas" {
     try std.testing.expectEqual(@as(usize, 2), intents.len);
     try std.testing.expectEqual(@as(u64, 1), intents[0].record.local_node_id);
     try std.testing.expectEqual(@as(u64, 2), intents[1].record.local_node_id);
+}
+
+test "placement planner forced reallocation replaces at most one peer per group" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 91, .name = "docs", .desired_replica_count = 3 });
+    try manager.upsertRange(.{
+        .group_id = 9101,
+        .table_id = 91,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+    });
+    try manager.upsertRange(.{
+        .group_id = 9102,
+        .table_id = 91,
+        .start_key = "doc:m",
+        .end_key = "doc:z",
+    });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 9101, .replica_id = 1, .local_node_id = 1 }, .peer_node_ids = &.{ 1, 2, 3 } },
+        .{ .record = .{ .group_id = 9101, .replica_id = 2, .local_node_id = 2 }, .peer_node_ids = &.{ 1, 2, 3 } },
+        .{ .record = .{ .group_id = 9101, .replica_id = 3, .local_node_id = 3 }, .peer_node_ids = &.{ 1, 2, 3 } },
+        .{ .record = .{ .group_id = 9102, .replica_id = 1, .local_node_id = 1 }, .peer_node_ids = &.{ 1, 2, 3 } },
+        .{ .record = .{ .group_id = 9102, .replica_id = 2, .local_node_id = 2 }, .peer_node_ids = &.{ 1, 2, 3 } },
+        .{ .record = .{ .group_id = 9102, .replica_id = 3, .local_node_id = 3 }, .peer_node_ids = &.{ 1, 2, 3 } },
+    };
+    const candidate_domains = [_]CandidateDomain{
+        .{ .node_id = 1, .role = "data", .failure_domain = "rack-a", .retain_current = false, .force_reallocate = true },
+        .{ .node_id = 2, .role = "data", .failure_domain = "rack-b", .retain_current = false, .force_reallocate = true },
+        .{ .node_id = 3, .role = "data", .failure_domain = "rack-c", .retain_current = false, .force_reallocate = true },
+        .{ .node_id = 4, .role = "data", .failure_domain = "rack-d", .retain_current = false, .force_reallocate = true },
+        .{ .node_id = 5, .role = "data", .failure_domain = "rack-e", .retain_current = false, .force_reallocate = true },
+    };
+
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const intents = try planner.planAllIntentsWithCurrentAndDomains(
+        &manager,
+        &.{ 1, 2, 3, 4, 5 },
+        &current,
+        &candidate_domains,
+    );
+    defer planner.freeIntents(std.testing.allocator, intents);
+
+    try std.testing.expectEqual(@as(usize, 6), intents.len);
+    var retained: usize = 0;
+    var replacements: usize = 0;
+    var group_9101_replacements: usize = 0;
+    var group_9102_replacements: usize = 0;
+    for (intents) |intent| {
+        if (intent.record.local_node_id <= 3) {
+            retained += 1;
+        } else {
+            replacements += 1;
+            if (intent.record.group_id == 9101) group_9101_replacements += 1;
+            if (intent.record.group_id == 9102) group_9102_replacements += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), retained);
+    try std.testing.expectEqual(@as(usize, 2), replacements);
+    try std.testing.expect(group_9101_replacements <= 1);
+    try std.testing.expect(group_9102_replacements <= 1);
+}
+
+test "placement planner forced reallocation avoids balanced no-op churn" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 92, .name = "docs", .desired_replica_count = 3 });
+    try manager.upsertRange(.{
+        .group_id = 9201,
+        .table_id = 92,
+        .start_key = "",
+        .end_key = null,
+    });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 9201, .replica_id = 1, .local_node_id = 1 }, .peer_node_ids = &.{ 1, 2, 3 } },
+        .{ .record = .{ .group_id = 9201, .replica_id = 2, .local_node_id = 2 }, .peer_node_ids = &.{ 1, 2, 3 } },
+        .{ .record = .{ .group_id = 9201, .replica_id = 3, .local_node_id = 3 }, .peer_node_ids = &.{ 1, 2, 3 } },
+    };
+    const candidate_domains = [_]CandidateDomain{
+        .{ .node_id = 1, .role = "data", .failure_domain = "rack-a", .retain_current = false, .force_reallocate = true },
+        .{ .node_id = 2, .role = "data", .failure_domain = "rack-b", .retain_current = false, .force_reallocate = true },
+        .{ .node_id = 3, .role = "data", .failure_domain = "rack-c", .retain_current = false, .force_reallocate = true },
+        .{ .node_id = 4, .role = "data", .failure_domain = "rack-d", .retain_current = false, .force_reallocate = true },
+        .{ .node_id = 5, .role = "data", .failure_domain = "rack-e", .retain_current = false, .force_reallocate = true },
+    };
+
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const intents = try planner.planAllIntentsWithCurrentAndDomains(
+        &manager,
+        &.{ 1, 2, 3, 4, 5 },
+        &current,
+        &candidate_domains,
+    );
+    defer planner.freeIntents(std.testing.allocator, intents);
+
+    try std.testing.expectEqual(@as(usize, 3), intents.len);
+    for (intents) |intent| try std.testing.expect(intent.record.local_node_id <= 3);
 }
 
 test "placement planner anti-affinity rotates replica pairs across ranges" {

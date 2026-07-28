@@ -717,7 +717,6 @@ fn selectWorseCompatibility(
 
 const ComponentPlanKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 const component_plan_cache_capacity = 256;
-const component_signature_sample_bytes: usize = 16 * 1024;
 
 fn updateComponentPlanKeySlice(
     hash: *std.crypto.hash.sha2.Sha256,
@@ -812,8 +811,11 @@ fn componentPlanKey(
     return digest;
 }
 
+/// Build a cheap cache-coherency identity from filesystem metadata. Full
+/// artifact validation populates the cache; cache hits only need to detect
+/// replacement or mutation. inode/size/mtime/ctime cover those transitions
+/// without rereading and hashing model contents on request paths.
 fn componentDependencySignature(
-    allocator: std.mem.Allocator,
     io: std.Io,
     dependencies: []const []const u8,
 ) !ComponentPlanKey {
@@ -835,28 +837,6 @@ fn componentDependencySignature(
         const canonical_ctime_ns: i128 = ctime_ns;
         hash.update(std.mem.asBytes(&canonical_mtime_ns));
         hash.update(std.mem.asBytes(&canonical_ctime_ns));
-        if (stat.size > 0) {
-            const sample_len: usize = @intCast(@min(
-                stat.size,
-                component_signature_sample_bytes,
-            ));
-            const offsets = [_]u64{
-                0,
-                if (stat.size > sample_len) (stat.size - sample_len) / 2 else 0,
-                if (stat.size > sample_len) stat.size - sample_len else 0,
-            };
-            for (offsets, 0..) |offset, index| {
-                if (index > 0 and offset == offsets[index - 1]) continue;
-                const bytes = c_file.readRegion(allocator, path, offset, sample_len) catch |err| {
-                    if (err == error.OutOfMemory) return err;
-                    hash.update("sample-unreadable");
-                    break;
-                };
-                defer allocator.free(bytes);
-                hash.update(std.mem.asBytes(&offset));
-                hash.update(bytes);
-            }
-        }
         const final_stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
             hash.update("changed-during-read");
             continue;
@@ -2470,7 +2450,6 @@ pub const ModelManager = struct {
         defer entry.release();
 
         const signature = try componentDependencySignature(
-            self.allocator,
             self.componentPlanIo(),
             entry.dependencies,
         );
@@ -2571,7 +2550,6 @@ pub const ModelManager = struct {
             );
             defer inspection.deinit();
             const signature_before = try componentDependencySignature(
-                self.allocator,
                 self.componentPlanIo(),
                 inspection.dependencies.items,
             );
@@ -2588,7 +2566,6 @@ pub const ModelManager = struct {
                 &inspection,
             );
             const signature_after = try componentDependencySignature(
-                self.allocator,
                 self.componentPlanIo(),
                 inspection.dependencies.items,
             );
