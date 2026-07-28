@@ -77,6 +77,7 @@ pub const Config = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
+    inline_retry_max_attempts: u32 = transient_embed_retry_max_attempts,
 };
 
 pub const RuntimeError = error{ EnrichmentWorkerFailed, EnrichmentRetryInProgress };
@@ -105,6 +106,7 @@ const transient_embed_retry_max_attempts: u32 = 6;
 const transient_embed_retry_base_sleep_ns: u64 = 250 * std.time.ns_per_ms;
 const transient_embed_retry_max_sleep_ns: u64 = 5 * std.time.ns_per_s;
 const transient_worker_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
+const lease_denied_retry_sleep_ms: i64 = 25;
 
 const CoverageOutcome = enum { produced, skipped, terminal_failed };
 const coverage_outcome_count = std.meta.fields(CoverageOutcome).len;
@@ -447,7 +449,7 @@ fn transientEmbedRetryDecision(runtime: *EnrichmentRuntime, attempt: u32) Transi
     if (comptime builtin.os.tag != .freestanding) {
         if (runtimeShuttingDown(runtime)) return .abort_shutdown;
     }
-    if (attempt + 1 >= transient_embed_retry_max_attempts) return .yield_to_worker;
+    if (attempt + 1 >= @max(runtime.config.inline_retry_max_attempts, 1)) return .yield_to_worker;
     return .retry_inline;
 }
 
@@ -1139,6 +1141,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .remote_content = config.remote_content,
                 .resource_manager = config.resource_manager,
                 .clock = config.clock,
+                .inline_retry_max_attempts = config.inline_retry_max_attempts,
             },
         };
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
@@ -1399,6 +1402,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .remote_content = config.remote_content,
                 .resource_manager = config.resource_manager,
                 .clock = config.clock,
+                .inline_retry_max_attempts = config.inline_retry_max_attempts,
             },
             .ownership = try ownership_mod.State.init(alloc, store, enrichment_lease.default_lease_key, .{
                 .lease_owned = true,
@@ -1850,7 +1854,7 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
     };
     runtime.mutex.unlock(io);
     if (!acquired) {
-        io.sleep(Io.Duration.zero, .awake) catch {};
+        io.sleep(Io.Duration.fromMilliseconds(lease_denied_retry_sleep_ms), .awake) catch {};
         return;
     }
 
@@ -1860,7 +1864,7 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
     var processed_request_count: u64 = 0;
     var max_seen = runtime.applied_sequence;
 
-    retry_pending: while (true) {
+    while (true) {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
         defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
@@ -1886,36 +1890,34 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
             max_seen = @max(max_seen, group.sequence);
             processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count) catch |err| {
                 if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-                if (isRetryableEnrichmentError(err)) continue :retry_pending;
+                // The embedder already performed its bounded inline retry
+                // budget. Yield durable pending work to the supervised
+                // worker/scheduler boundary instead of spinning this entire
+                // replay window without backoff.
                 return err;
             };
             flushGeneratedReplayWindowIfNeeded(runtime, &window, max_window_items) catch |err| {
                 if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-                if (isRetryableEnrichmentError(err)) continue :retry_pending;
                 return err;
             };
         }
         flushAssetProducerBatch(runtime, &deferred_assets, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            if (isRetryableEnrichmentError(err)) continue :retry_pending;
             return err;
         };
         processPlainDenseWindow(runtime, deferred_plain_dense.items, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            if (isRetryableEnrichmentError(err)) continue :retry_pending;
             return err;
         };
         processChunkedDenseWindow(runtime, deferred_chunked_dense.items, &chunk_cache, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            if (isRetryableEnrichmentError(err)) continue :retry_pending;
             return err;
         };
         flushGeneratedReplayWindow(runtime, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            if (isRetryableEnrichmentError(err)) continue :retry_pending;
             return err;
         };
-        break :retry_pending;
+        break;
     }
     if (pending.len == 0) {
         max_seen = target_sequence;

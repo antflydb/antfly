@@ -17410,10 +17410,15 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
     identity_namespace: ?doc_identity.Namespace,
     options: ManagedDbOpenOptions,
 ) !db_mod.DB {
-    var enrichments = if (mode == .startup_catch_up)
-        ManagedDbEnrichmentSet{}
-    else
-        try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
+    var enrichments = try createManagedDbEnrichments(
+        alloc,
+        indexes_json,
+        backend_runtime,
+        antfly_provider,
+        options.inference_api_url,
+        secret_store,
+        remote_content,
+    );
     errdefer enrichments.deinit(alloc);
 
     const openDb = struct {
@@ -17521,7 +17526,20 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     .ha_write_gate = open_options.ha_write_gate,
                     .open_mode = .writer_no_replay,
                     .start_index_workers = false,
-                    .start_optional_runtimes = false,
+                    .enrichment = if (enrichment_cfg) |configured| blk: {
+                        var bounded = configured;
+                        // Loaded-state startup must not wait through the
+                        // normal external-provider inline retry budget. One
+                        // attempt records durable retry state; the startup
+                        // scheduler owns later attempts.
+                        bounded.inline_retry_max_attempts = 1;
+                        break :blk bounded;
+                    } else null,
+                    // Startup catch-up drives enrichment synchronously below.
+                    // Construct the runtime with metadata-owned providers, but
+                    // do not leave workers attached to this short-lived owner.
+                    .start_optional_runtimes = enrichment_cfg != null,
+                    .start_optional_runtime_workers = false,
                     .ttl_cleanup = .{ .enabled = false },
                     .transaction_recovery = .{ .enabled = false },
                     .text_merge = .{ .enabled = false },
@@ -17678,10 +17696,15 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
         // request work runs against the stabilized post-reconcile state.
         db.close();
         db_open = false;
-        enrichments = if (mode == .startup_catch_up)
-            ManagedDbEnrichmentSet{}
-        else
-            try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
+        enrichments = try createManagedDbEnrichments(
+            alloc,
+            indexes_json,
+            backend_runtime,
+            antfly_provider,
+            options.inference_api_url,
+            secret_store,
+            remote_content,
+        );
         db = blk: {
             const enrichment_cfg = if (enrichments.enabled()) enrichments.takeConfig() else null;
             const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
@@ -18987,6 +19010,12 @@ fn catchUpManagedDb(
         if (!status.catch_up_required) continue;
         had_debt = true;
         break;
+    }
+    const enrichment_before = db.pendingWorkStats().enrichment;
+    if (enrichment_before.enabled and
+        enrichment_before.applied_sequence < enrichment_before.target_sequence)
+    {
+        had_debt = true;
     }
     const ProgressCtx = struct {
         source: *ProvisionedTableWriteSource,

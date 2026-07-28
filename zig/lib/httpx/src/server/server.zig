@@ -125,7 +125,10 @@ fn routeErrorStatus(err: anyerror) u16 {
 fn routeErrorBody(code: u16) []const u8 {
     return switch (code) {
         400 => "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
+        404 => "{\"error\":\"NOT_FOUND\",\"message\":\"resource not found\"}",
+        408 => "{\"error\":\"REQUEST_TIMEOUT\",\"message\":\"request timed out\"}",
         413 => "{\"error\":\"PAYLOAD_TOO_LARGE\",\"message\":\"request payload is too large\"}",
+        431 => "{\"error\":\"REQUEST_HEADER_FIELDS_TOO_LARGE\",\"message\":\"request headers are too large\"}",
         else => "{\"error\":\"INTERNAL_ERROR\",\"message\":\"internal server error\"}",
     };
 }
@@ -138,6 +141,7 @@ pub const Context = struct {
     response: ResponseBuilder,
     params: []const RouteParam = &.{},
     data: ?std.StringHashMap(DataEntry) = null,
+    decoded_query_values: std.ArrayListUnmanaged([]u8) = .empty,
     max_file_size: usize = types.default_max_body_size,
 
     // H1 streaming field (set by the server, null for HTTP/2).
@@ -177,6 +181,8 @@ pub const Context = struct {
 
     /// Releases context resources. Calls destructors for data entries that have them.
     pub fn deinit(self: *Self) void {
+        for (self.decoded_query_values.items) |value| self.allocator.free(value);
+        self.decoded_query_values.deinit(self.allocator);
         if (self.data) |*data| {
             var it = data.iterator();
             while (it.next()) |entry| {
@@ -223,7 +229,10 @@ pub const Context = struct {
     /// exactly once into request-owned memory.
     pub fn queryDecoded(self: *Self, name: []const u8) !?[]const u8 {
         const raw = self.query(name) orelse return null;
-        return try encoding.PercentEncoding.decodeFormData(self.allocator, raw);
+        const decoded = try encoding.PercentEncoding.decodeFormData(self.allocator, raw);
+        errdefer self.allocator.free(decoded);
+        try self.decoded_query_values.append(self.allocator, decoded);
+        return decoded;
     }
 
     /// Returns a request header by name.
@@ -2390,6 +2399,22 @@ test "routeErrorStatus maps oversized route errors to payload too large" {
         routeErrorBody(400),
     );
     try std.testing.expectEqualStrings(
+        "{\"error\":\"NOT_FOUND\",\"message\":\"resource not found\"}",
+        routeErrorBody(404),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"REQUEST_TIMEOUT\",\"message\":\"request timed out\"}",
+        routeErrorBody(408),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"PAYLOAD_TOO_LARGE\",\"message\":\"request payload is too large\"}",
+        routeErrorBody(413),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"REQUEST_HEADER_FIELDS_TOO_LARGE\",\"message\":\"request headers are too large\"}",
+        routeErrorBody(431),
+    );
+    try std.testing.expectEqualStrings(
         "{\"error\":\"INTERNAL_ERROR\",\"message\":\"internal server error\"}",
         routeErrorBody(500),
     );
@@ -2408,11 +2433,12 @@ test "Context queryDecoded decodes percent escapes exactly once" {
     defer ctx.deinit();
 
     const location = (try ctx.queryDecoded("location")).?;
-    defer allocator.free(location);
     try std.testing.expectEqualStrings("s3://bucket/a%20b", location);
     const plus = (try ctx.queryDecoded("plus")).?;
-    defer allocator.free(plus);
     try std.testing.expectEqualStrings("a b", plus);
+    const location_again = (try ctx.queryDecoded("location")).?;
+    try std.testing.expectEqualStrings(location, location_again);
+    try std.testing.expectEqual(@as(usize, 3), ctx.decoded_query_values.items.len);
 }
 
 test "Context max_file_size default and override" {

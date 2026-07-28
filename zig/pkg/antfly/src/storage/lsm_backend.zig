@@ -4889,6 +4889,7 @@ pub const Backend = struct {
             if (self.active_bulk_ingest_batches == 0 and self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
                 try self.persistManifest();
             }
+            self.scheduleMaintenanceAfterBulkIngestLocked();
             return;
         }
         self.active_bulk_ingest_batches -= 1;
@@ -4899,6 +4900,13 @@ pub const Backend = struct {
                 }
             }
             try self.finalizeDeferredRunWork(.{ .force_soft_compaction = options.compact });
+            self.scheduleMaintenanceAfterBulkIngestLocked();
+        }
+    }
+
+    fn scheduleMaintenanceAfterBulkIngestLocked(self: *Backend) void {
+        if (self.active_bulk_ingest_batches == 0) {
+            self.scheduleMaintenanceJobIfNeededLocked();
         }
     }
 
@@ -4917,6 +4925,7 @@ pub const Backend = struct {
     fn abortBulkIngestSessionLocked(self: *Backend) void {
         std.debug.assert(self.active_bulk_ingest_batches > 0);
         self.active_bulk_ingest_batches -= 1;
+        self.scheduleMaintenanceAfterBulkIngestLocked();
     }
 
     pub fn markManifestDirty(self: *Backend) void {
@@ -7179,7 +7188,6 @@ test "lsm backend detached no-op maintenance does not resubmit forever" {
     // The job was admitted while work was possible, but a bulk session makes
     // the actual pass a no-op. It must not busy-resubmit itself.
     try backend.beginBulkIngestSession();
-    defer backend.abortBulkIngestSession();
     var job = lane.submitted_job.?;
     lane.submitted_job = null;
     try job.run(job.ptr);
@@ -7189,6 +7197,32 @@ test "lsm backend detached no-op maintenance does not resubmit forever" {
     try std.testing.expect(!backend.maintenance_job_in_flight);
     try std.testing.expect(lane.submitted_job == null);
     try std.testing.expectEqual(@as(usize, 1), lane.submitted_count);
+
+    // Ending the transient blocker must give existing debt exactly one fresh
+    // opportunity to run. If the hint is still non-actionable, that job stops
+    // without recreating the original loop.
+    backend.abortBulkIngestSession();
+    try std.testing.expect(backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job != null);
+    try std.testing.expectEqual(@as(usize, 2), lane.submitted_count);
+    try backend.beginBulkIngestSession();
+    var retry_after_abort = lane.submitted_job.?;
+    lane.submitted_job = null;
+    try retry_after_abort.run(retry_after_abort.ptr);
+    retry_after_abort.deinit(retry_after_abort.ptr);
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job == null);
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = false });
+    try std.testing.expect(backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job != null);
+    try std.testing.expectEqual(@as(usize, 3), lane.submitted_count);
+    var retry_after_finish = lane.submitted_job.?;
+    lane.submitted_job = null;
+    try retry_after_finish.run(retry_after_finish.ptr);
+    retry_after_finish.deinit(retry_after_finish.ptr);
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job == null);
 }
 
 test "lsm backends share one threaded runtime durable lane" {

@@ -1793,6 +1793,28 @@ def stateful_api(request: pytest.FixtureRequest):
                 new_session.headers["Connection"] = "close"
                 self.s = new_session
 
+        def pause_server(self) -> None:
+            server = self._server
+            if server is None or not hasattr(server, "pause"):
+                raise AssertionError("pause is only available for locally managed stateful servers")
+            with self._request_lock:
+                self.s.close()
+                server.pause()
+
+        def resume_server(self) -> None:
+            server = self._server
+            if server is None or not hasattr(server, "resume"):
+                raise AssertionError("resume is only available for locally managed stateful servers")
+            with self._request_lock:
+                server.resume()
+                if not wait_for_server(self.url, timeout=20):
+                    logs = server.debug_logs().strip()
+                    raise AssertionError(f"stateful server failed to resume at {self.url}\n{logs}")
+                new_session = requests.Session()
+                new_session.headers["Content-Type"] = "application/json"
+                new_session.headers["Connection"] = "close"
+                self.s = new_session
+
         def corrupt_embedding_artifact(self, table_name: str, doc_key: str, index_name: str) -> None:
             server = self._server
             if server is None:

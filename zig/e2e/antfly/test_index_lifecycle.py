@@ -979,6 +979,94 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
     assert _response_hit_ids(alpha_query)[0] == "doc:a"
 
 
+def test_stateful_managed_embeddings_backfill_resumes_after_process_restart(
+    single_item_enrichment_batches,
+    stateful_api,
+    rate_limited_openai_embedder,
+):
+    table_name = f"stateful_restart_managed_embeddings_{time.time_ns()}"
+    index_name = "semantic_idx"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert created["name"] == table_name
+    assert (
+        stateful_api.create_index(
+            table_name,
+            index_name,
+            {
+                "name": index_name,
+                "type": "embeddings",
+                "field": "body",
+                "dimension": 3,
+                "embedder": {
+                    "provider": "openai",
+                    "model": "text-embedding-3-small",
+                    "url": rate_limited_openai_embedder.url,
+                },
+            },
+        )
+        == {}
+    )
+    assert wait_until(
+        lambda: ready_index_status(stateful_api.get_index(table_name, index_name)),
+        timeout_s=30.0,
+        interval_s=0.25,
+    )
+
+    documents = {
+        f"doc:{i:03d}": {
+            "title": f"restart document {i}",
+            "body": "alpha concept overview" if i == 0 else f"managed restart payload {i}",
+        }
+        for i in range(24)
+    }
+    batch = stateful_api.batch_write(table_name, inserts=documents, sync_level="write")
+    assert batch["inserted"] == len(documents)
+    assert wait_until(
+        lambda: (
+            stats
+            if (stats := rate_limited_openai_embedder.stats())["rate_limited_requests"] > 0
+            and stats["successful_requests"] >= 1
+            else None
+        ),
+        timeout_s=30.0,
+        interval_s=0.1,
+    )
+
+    stateful_api.pause_server()
+    rate_limited_before_restart = rate_limited_openai_embedder.stats()["rate_limited_requests"]
+    stateful_api.resume_server()
+    rate_limited_during_restart = (
+        rate_limited_openai_embedder.stats()["rate_limited_requests"] - rate_limited_before_restart
+    )
+    assert rate_limited_during_restart <= 12
+    rate_limited_openai_embedder.allow_all_requests()
+
+    recovered = wait_until(
+        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=len(documents)),
+        timeout_s=90.0,
+        interval_s=0.25,
+    )
+    assert recovered is not None, json.dumps(
+        {
+            "index": stateful_api.get_index(table_name, index_name),
+            "embedder": rate_limited_openai_embedder.stats(),
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+    query = stateful_api.query_table(
+        table_name,
+        {
+            "embeddings": {index_name: [1.0, 0.0, 0.0]},
+            "indexes": [index_name],
+            "limit": 3,
+        },
+    )
+    assert _response_hit_ids(query)[0] == "doc:000"
+
+
 def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_after_rate_limit(
     single_item_enrichment_batches,
     stateful_api,
