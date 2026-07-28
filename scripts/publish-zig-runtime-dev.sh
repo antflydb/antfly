@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/publish-zig-runtime-dev.sh [--tag TAG] [--arch amd64|arm64] [--manifest|--image-ref]
+  scripts/publish-zig-runtime-dev.sh [--tag TAG] [--arch amd64|arm64] [--optimize ReleaseFast|ReleaseSmall] [--jobs N] [--manifest|--image-ref]
 
 Build the local native Zig runtime artifact, upload it to GCS, and ask Cloud
 Build to package/push a single-arch GAR image. Run once on amd64 and once on
@@ -32,6 +32,8 @@ tag="dev-$(git -C "$repo_root" rev-parse --short=8 HEAD)"
 manifest=false
 image_ref=false
 arch=""
+optimize="ReleaseFast"
+jobs=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,6 +43,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --arch)
       arch="${2:?--arch requires amd64 or arm64}"
+      shift 2
+      ;;
+    --optimize)
+      optimize="${2:?--optimize requires a value}"
+      shift 2
+      ;;
+    --jobs)
+      jobs="${2:?--jobs requires a value}"
       shift 2
       ;;
     --manifest)
@@ -72,6 +82,9 @@ if [[ "$arch" != "" && "$arch" != "amd64" && "$arch" != "arm64" ]]; then
   echo "--arch must be amd64 or arm64" >&2
   exit 2
 fi
+
+case "$optimize" in ReleaseFast|ReleaseSmall) ;; *) echo "--optimize must be ReleaseFast or ReleaseSmall" >&2; exit 2;; esac
+[[ -z "$jobs" || "$jobs" =~ ^[1-9][0-9]*$ ]] || { echo "--jobs must be a positive integer" >&2; exit 2; }
 
 host_arch="$(uname -m)"
 case "$host_arch" in
@@ -147,15 +160,18 @@ cache_dir="${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}"
 mkdir -p "$cache_dir"
 
 echo "Building $arch Zig runtime artifact for $zig_target"
+jobs_arg=()
+[[ -z "$jobs" ]] || jobs_arg=(--jobs "$jobs")
 (
   cd "$repo_root/zig"
   zig build \
     install \
     -Dtarget="$zig_target" \
-    -Doptimize=ReleaseFast \
+    -Doptimize="$optimize" \
     -Dedition=full \
     --prefix "$out_dir" \
-    --global-cache-dir "$cache_dir"
+    --global-cache-dir "$cache_dir" \
+    "${jobs_arg[@]+${jobs_arg[@]}}"
 )
 
 test -x "$out_dir/bin/antfly"

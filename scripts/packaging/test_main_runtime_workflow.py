@@ -7,6 +7,8 @@ import unittest
 
 WORKFLOW = (Path(__file__).resolve().parents[2] / ".github/workflows/main-runtime.yml").read_text()
 RUNTIME_BUILD = (Path(__file__).resolve().parents[2] / "zig/cloudbuild.runtime.yaml").read_text()
+CONTAINER_WORKFLOW = (Path(__file__).resolve().parents[2] / ".github/workflows/antfly-container.yml").read_text()
+DEV_HELPER = (Path(__file__).resolve().parents[2] / "scripts/publish-zig-runtime-dev.sh").read_text()
 FIXTURES = Path(__file__).with_name("testdata")
 
 
@@ -25,6 +27,8 @@ class MainRuntimeWorkflowTest(unittest.TestCase):
         self.assertIn("MANIFEST_UNKNOWN", WORKFLOW)
         self.assertIn("group: main-runtime-main", WORKFLOW)
         self.assertIn("immutable image conflicts", WORKFLOW)
+        self.assertIn("cosign verify", WORKFLOW)
+        self.assertIn("missing Buildx provenance attestations", WORKFLOW)
 
     def test_emits_digest_sha_and_platform_identity(self):
         self.assertIn("source_sha:$source_sha", WORKFLOW)
@@ -62,6 +66,25 @@ class MainRuntimeWorkflowTest(unittest.TestCase):
         fixture = json.loads((FIXTURES / "runtime-overlap.json").read_text())
         self.assertEqual({run["image"] for run in fixture["runs"]}, {fixture["expected_image"]})
         self.assertEqual({run["receipt_digest"] for run in fixture["runs"]}, {fixture["expected_digest"]})
+
+    def test_stale_workflow_and_main_source_cannot_mix(self):
+        self.assertIn("ref: ${{ github.sha }}", WORKFLOW)
+        self.assertIn("main advanced after this workflow was selected", WORKFLOW)
+        self.assertIn("git fetch origin main", WORKFLOW)
+
+    def test_arm_runtime_uses_the_existing_small_single_job_policy(self):
+        self.assertIn("optimize: ReleaseSmall", WORKFLOW)
+        self.assertIn("jobs: '1'", WORKFLOW)
+        self.assertIn("args+=(--jobs '${{ matrix.jobs }}')", WORKFLOW)
+        self.assertIn("--optimize)", DEV_HELPER)
+        self.assertIn("--jobs)", DEV_HELPER)
+        self.assertIn('-Doptimize="$optimize"', DEV_HELPER)
+
+    def test_generic_container_rejects_reserved_main_tags(self):
+        fixture = json.loads((FIXTURES / "generic-container-main-tag.json").read_text())
+        self.assertTrue(fixture["tag"].startswith("main-"))
+        self.assertEqual(fixture["expected"], "rejected")
+        self.assertIn("main-* tags are reserved for Main Runtime", CONTAINER_WORKFLOW)
 
 
 if __name__ == "__main__":
