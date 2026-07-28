@@ -266,6 +266,7 @@ pub const Source = struct {
         query: *const fn (ptr: *anyopaque, alloc: Allocator, params: QueryParams) anyerror!QueryResult,
         aggregate: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: AggregateParams) anyerror!AggregateResult = null,
         statistics: *const fn (ptr: *anyopaque, table: []const u8) anyerror!TableStatistics,
+        statistics_with_deadline: ?*const fn (ptr: *anyopaque, table: []const u8, execution_deadline_ns: ?u64) anyerror!TableStatistics = null,
         begin_snapshot_query: ?*const fn (ptr: *anyopaque, alloc: Allocator) anyerror!SnapshotReader = null,
         begin_prepared_replication_snapshot: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: ReplicationPollParams) anyerror!PreparedReplicationSnapshot = null,
         prepare_replication: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: ReplicationPollParams) anyerror!ReplicationPrepareResult = null,
@@ -289,6 +290,14 @@ pub const Source = struct {
 
     pub fn statistics(self: Source, table: []const u8) !TableStatistics {
         return try self.vtable.statistics(self.ptr, table);
+    }
+
+    pub fn statisticsWithDeadline(self: Source, table: []const u8, execution_deadline_ns: ?u64) !TableStatistics {
+        if (self.vtable.statistics_with_deadline) |fn_ptr| {
+            return try fn_ptr(self.ptr, table, execution_deadline_ns);
+        }
+        if (execution_deadline_ns != null) return error.UnsupportedDeadline;
+        return try self.statistics(table);
     }
 
     pub fn beginSnapshotQuery(self: Source, alloc: Allocator) !SnapshotReader {
@@ -484,6 +493,11 @@ test "foreign source registry creates registered source" {
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), result.total);
     try std.testing.expectEqual(@as(i64, 42), result.rows[0].integer);
+    try std.testing.expectEqual(@as(i64, 7), (try source_instance.statistics("customers")).row_count);
+    try std.testing.expectError(
+        error.UnsupportedDeadline,
+        source_instance.statisticsWithDeadline("customers", 1),
+    );
     var poll_params = ReplicationPollParams{
         .table = try alloc.dupe(u8, "customers"),
     };

@@ -1763,6 +1763,38 @@ pub const TableReadSource = struct {
             table_name: []const u8,
             body: []const u8,
         ) anyerror!?query_api.QueryResponse = null,
+        join_partition_group_local_with_timeout: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+            timeout_ms: ?u32,
+        ) anyerror!?query_api.QueryResponse = null,
+        join_rows_group_local_with_timeout: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+            timeout_ms: ?u32,
+        ) anyerror!?query_api.QueryResponse = null,
+        join_unmatched_group_local_with_timeout: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+            timeout_ms: ?u32,
+        ) anyerror!?query_api.QueryResponse = null,
+        join_finalize_group_local_with_timeout: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+            timeout_ms: ?u32,
+        ) anyerror!?query_api.QueryResponse = null,
         join_job_state_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2064,6 +2096,66 @@ pub const TableReadSource = struct {
     ) !?query_api.QueryResponse {
         const fn_ptr = self.vtable.join_finalize_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+    }
+
+    pub fn joinPartitionGroupLocalWithTimeout(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.join_partition_group_local_with_timeout) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+        }
+        if (timeout_ms != null) return error.UnsupportedDeadline;
+        return try self.joinPartitionGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    pub fn joinRowsGroupLocalWithTimeout(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.join_rows_group_local_with_timeout) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+        }
+        if (timeout_ms != null) return error.UnsupportedDeadline;
+        return try self.joinRowsGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    pub fn joinUnmatchedGroupLocalWithTimeout(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.join_unmatched_group_local_with_timeout) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+        }
+        if (timeout_ms != null) return error.UnsupportedDeadline;
+        return try self.joinUnmatchedGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    pub fn joinFinalizeGroupLocalWithTimeout(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.join_finalize_group_local_with_timeout) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+        }
+        if (timeout_ms != null) return error.UnsupportedDeadline;
+        return try self.joinFinalizeGroupLocal(alloc, group_id, table_name, body);
     }
 
     pub fn joinJobStateGroupLocal(
@@ -3661,10 +3753,10 @@ pub const HostedProvisionedTableReadSource = struct {
                 .search_result_group_local = searchResultGroupLocal,
                 .text_stats_group_local = textStatsGroupLocal,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
-                .join_partition_group_local = joinPartitionGroupLocal,
-                .join_rows_group_local = joinRowsGroupLocal,
-                .join_unmatched_group_local = joinUnmatchedGroupLocal,
-                .join_finalize_group_local = joinFinalizeGroupLocal,
+                .join_partition_group_local_with_timeout = joinPartitionGroupLocal,
+                .join_rows_group_local_with_timeout = joinRowsGroupLocal,
+                .join_unmatched_group_local_with_timeout = joinUnmatchedGroupLocal,
+                .join_finalize_group_local_with_timeout = joinFinalizeGroupLocal,
                 .join_job_state_group_local = joinJobStateGroupLocal,
                 .graph_expand_group_local = graphExpandGroupLocal,
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
@@ -4162,6 +4254,7 @@ pub const HostedProvisionedTableReadSource = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+        timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
@@ -4169,7 +4262,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinPartitionRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+            .remote => |remote| joinPartitionRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4182,6 +4275,7 @@ pub const HostedProvisionedTableReadSource = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+        timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
@@ -4189,7 +4283,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinRowsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+            .remote => |remote| joinRowsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4202,6 +4296,7 @@ pub const HostedProvisionedTableReadSource = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+        timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
@@ -4209,7 +4304,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinUnmatchedRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+            .remote => |remote| joinUnmatchedRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4222,6 +4317,7 @@ pub const HostedProvisionedTableReadSource = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+        timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
@@ -4229,7 +4325,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinFinalizeRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+            .remote => |remote| joinFinalizeRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -13517,18 +13613,6 @@ fn algebraicPartialsRemote(
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
 
-fn internalJoinRequestTimeoutMs(alloc: std.mem.Allocator, body: []const u8) ?u32 {
-    const Envelope = struct {
-        remaining_timeout_ms: ?u64 = null,
-    };
-    var parsed = std.json.parseFromSlice(Envelope, alloc, body, .{
-        .ignore_unknown_fields = true,
-    }) catch return null;
-    defer parsed.deinit();
-    const value = parsed.value.remaining_timeout_ms orelse return null;
-    return @intCast(@min(@max(value, 1), std.math.maxInt(u32)));
-}
-
 fn joinPartitionRemote(
     executor: http_common.RequestExecutor,
     alloc: std.mem.Allocator,
@@ -13536,6 +13620,7 @@ fn joinPartitionRemote(
     group_id: u64,
     table_name: []const u8,
     body: []const u8,
+    timeout_ms: ?u32,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
     var result = try client.fetchGroupJoinPartitionWithTimeout(
@@ -13543,7 +13628,7 @@ fn joinPartitionRemote(
         group_id,
         table_name,
         body,
-        internalJoinRequestTimeoutMs(alloc, body),
+        timeout_ms,
     );
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
@@ -13556,6 +13641,7 @@ fn joinRowsRemote(
     group_id: u64,
     table_name: []const u8,
     body: []const u8,
+    timeout_ms: ?u32,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
     var result = try client.fetchGroupJoinRowsWithTimeout(
@@ -13563,7 +13649,7 @@ fn joinRowsRemote(
         group_id,
         table_name,
         body,
-        internalJoinRequestTimeoutMs(alloc, body),
+        timeout_ms,
     );
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
@@ -13576,6 +13662,7 @@ fn joinUnmatchedRemote(
     group_id: u64,
     table_name: []const u8,
     body: []const u8,
+    timeout_ms: ?u32,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
     var result = try client.fetchGroupJoinUnmatchedWithTimeout(
@@ -13583,7 +13670,7 @@ fn joinUnmatchedRemote(
         group_id,
         table_name,
         body,
-        internalJoinRequestTimeoutMs(alloc, body),
+        timeout_ms,
     );
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
@@ -13596,6 +13683,7 @@ fn joinFinalizeRemote(
     group_id: u64,
     table_name: []const u8,
     body: []const u8,
+    timeout_ms: ?u32,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
     var result = try client.fetchGroupJoinFinalizeWithTimeout(
@@ -13603,7 +13691,7 @@ fn joinFinalizeRemote(
         group_id,
         table_name,
         body,
-        internalJoinRequestTimeoutMs(alloc, body),
+        timeout_ms,
     );
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };

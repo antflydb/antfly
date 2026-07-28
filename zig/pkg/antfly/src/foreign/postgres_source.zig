@@ -69,6 +69,7 @@ pub const QueryExecutor = struct {
         deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
         query: *const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64) anyerror!foreign_source.QueryResult,
         statistics: *const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8) anyerror!foreign_source.TableStatistics,
+        statistics_with_deadline: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) anyerror!foreign_source.TableStatistics = null,
         discover_columns: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) anyerror![]foreign_source.Column = null,
         begin_snapshot_query: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8) anyerror!SnapshotQuery = null,
         begin_prepared_replication_snapshot: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) anyerror!PreparedReplicationSnapshot = null,
@@ -87,6 +88,17 @@ pub const QueryExecutor = struct {
 
     pub fn statistics(self: @This(), alloc: Allocator, dsn: []const u8, table: []const u8) !foreign_source.TableStatistics {
         return try self.vtable.statistics(self.ptr, alloc, dsn, table);
+    }
+
+    pub fn statisticsWithDeadline(self: @This(), alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) !foreign_source.TableStatistics {
+        if (self.vtable.statistics_with_deadline) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, dsn, table, execution_deadline_ns);
+        }
+        if (execution_deadline_ns != null) return error.UnsupportedDeadline;
+        try ensureExecutionDeadline(execution_deadline_ns);
+        const result = try self.statistics(alloc, dsn, table);
+        try ensureExecutionDeadline(execution_deadline_ns);
+        return result;
     }
 
     pub fn discoverColumns(self: @This(), alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) ![]foreign_source.Column {
@@ -217,6 +229,7 @@ pub const RuntimeSource = struct {
                 .query = RuntimeSource.query,
                 .aggregate = aggregate,
                 .statistics = statistics,
+                .statistics_with_deadline = statisticsWithDeadline,
                 .begin_snapshot_query = beginSnapshotQuery,
                 .begin_prepared_replication_snapshot = beginPreparedReplicationSnapshot,
                 .prepare_replication = prepareReplication,
@@ -309,8 +322,15 @@ pub const RuntimeSource = struct {
     }
 
     fn statistics(ptr: *anyopaque, table: []const u8) !foreign_source.TableStatistics {
+        return try statisticsWithDeadline(ptr, table, null);
+    }
+
+    fn statisticsWithDeadline(ptr: *anyopaque, table: []const u8, execution_deadline_ns: ?u64) !foreign_source.TableStatistics {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.executor.statistics(self.alloc, self.dsn, table);
+        try ensureExecutionDeadline(execution_deadline_ns);
+        const result = try self.executor.statisticsWithDeadline(self.alloc, self.dsn, table, execution_deadline_ns);
+        try ensureExecutionDeadline(execution_deadline_ns);
+        return result;
     }
 
     const RuntimeSnapshotReader = struct {
@@ -1475,11 +1495,13 @@ test "postgres source runtime live polling still sees insert after repeated empt
         .dsn = try alloc.dupe(u8, dsn),
     });
     defer query_source.deinit(alloc);
-    var snapshot_result = try query_source.query(alloc, .{
+    var snapshot_params = foreign_source.QueryParams{
         .table = try alloc.dupe(u8, table_name),
         .limit = 16,
         .offset = 0,
-    });
+    };
+    defer snapshot_params.deinit(alloc);
+    var snapshot_result = try query_source.query(alloc, snapshot_params);
     defer snapshot_result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), snapshot_result.rows.len);
 
