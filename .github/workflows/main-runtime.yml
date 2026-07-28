@@ -9,17 +9,9 @@ on:
       - '.github/workflows/main-runtime.yml'
   workflow_dispatch:
 
-env:
-  GCP_REGION: us-central1
-  GCP_PROJECT: antfly-image-artifacts
-  GCP_REPOSITORY: containers
-  GAR_REGISTRY: us-central1-docker.pkg.dev
-  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
-  ZIG_ARTIFACT_BUCKET: antfly-image-artifacts-zig-build-artifacts
-  ZIG_VERSION: 0.16.0
-
-# This is deliberately a small, main-only development publication path.  Release
-# publishing remains in antfly-container.yml and is not coupled to this workflow.
+# The image registry and build configuration live in the existing local helper.
+# Keeping this orchestration free of infrastructure coordinates avoids creating a
+# second public configuration surface.
 jobs:
   resolve:
     runs-on: arc-antfly-publish
@@ -28,42 +20,35 @@ jobs:
       contents: read
       id-token: write
     outputs:
-      image: ${{ steps.image.outputs.image }}
-      exists: ${{ steps.image.outputs.exists }}
-      tag: ${{ steps.image.outputs.tag }}
-      source_sha: ${{ steps.image.outputs.source_sha }}
+      exists: ${{ steps.runtime.outputs.exists }}
+      source_sha: ${{ steps.runtime.outputs.source_sha }}
+      tag: ${{ steps.runtime.outputs.tag }}
+      image_tag: ${{ steps.runtime.outputs.image_tag }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: main
-          persist-credentials: false
       - uses: google-github-actions/auth@v3
-        id: auth
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          token_format: access_token
+      - uses: google-github-actions/setup-gcloud@v3
       - uses: imjasonh/setup-crane@v0.4
-      - id: image
-        env:
-          TOKEN: ${{ steps.auth.outputs.access_token }}
+      - id: runtime
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
           tag="main-${source_sha}"
-          repository="${GAR_REGISTRY}/${GCP_PROJECT}/${GCP_REPOSITORY}/antfly"
-          echo "$TOKEN" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
-          if digest="$(crane digest "${repository}:${tag}" 2>/dev/null)"; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "image=${repository}@${digest}" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "image=" >> "$GITHUB_OUTPUT"
-          fi
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
+          image_tag="$(scripts/publish-zig-runtime-dev.sh --tag "$tag" --image-ref)"
+          registry="${image_tag%%/*}"
+          echo "$(gcloud auth print-access-token)" | crane auth login "$registry" -u oauth2accesstoken --password-stdin
+          if crane digest "$image_tag" >/dev/null 2>&1; then exists=true; else exists=false; fi
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
 
-  build-artifact:
+  publish:
     needs: resolve
     if: needs.resolve.outputs.exists != 'true'
     runs-on: ${{ matrix.runner }}
@@ -77,43 +62,28 @@ jobs:
         include:
           - arch: amd64
             runner: arc-antfly-publish
-            zig_arch: x86_64
-            zig_target: x86_64-linux-musl
-            zig_optimize: ReleaseFast
-            zig_jobs: ''
           - arch: arm64
             runner: arc-antfly-publish-arm64
-            zig_arch: aarch64
-            zig_target: aarch64-linux-musl
-            zig_optimize: ReleaseSmall
-            zig_jobs: '1'
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
           submodules: true
+      - name: Require the current main commit
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == '${{ needs.resolve.outputs.source_sha }}' ]]
       - uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v3
-      - run: sudo apt-get update && sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates
-      - run: |
-          curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_arch }}-linux-${ZIG_VERSION}.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
-          mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
-      - run: |
-          set -euo pipefail
-          jobs=()
-          [ -z '${{ matrix.zig_jobs }}' ] || jobs=(--jobs '${{ matrix.zig_jobs }}')
-          source_sha='${{ needs.resolve.outputs.source_sha }}'
-          scripts/packaging/build_zig_release_archive.sh --version "main-${source_sha}" --target '${{ matrix.zig_target }}' --optimize '${{ matrix.zig_optimize }}' "${jobs[@]}" --archive-name "antfly-zig-${{ matrix.arch }}.tar.gz" --out-dir "$RUNNER_TEMP" --metal false --system-blas false
-          gsutil cp "$RUNNER_TEMP/antfly-zig-${{ matrix.arch }}.tar.gz" "gs://${ZIG_ARTIFACT_BUCKET}/zig/main/${source_sha}/antfly-zig-${{ matrix.arch }}.tar.gz"
+      - name: Build the native runtime artifact
+        run: scripts/publish-zig-runtime-dev.sh --tag '${{ needs.resolve.outputs.tag }}' --arch '${{ matrix.arch }}'
 
-  publish:
-    needs: [resolve, build-artifact]
-    if: always() && needs.resolve.result == 'success' && (needs.resolve.outputs.exists == 'true' || needs.build-artifact.result == 'success')
+  manifest:
+    needs: [resolve, publish]
+    if: always() && needs.resolve.result == 'success' && (needs.resolve.outputs.exists == 'true' || needs.publish.result == 'success')
     runs-on: arc-antfly-publish
     environment: container-publish
     permissions:
@@ -123,36 +93,32 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
+      - name: Require the current main commit
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == '${{ needs.resolve.outputs.source_sha }}' ]]
       - uses: google-github-actions/auth@v3
-        id: auth
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          token_format: access_token
       - uses: google-github-actions/setup-gcloud@v3
       - uses: imjasonh/setup-crane@v0.4
       - id: runtime
-        env:
-          TOKEN: ${{ steps.auth.outputs.access_token }}
-          EXISTING_IMAGE: ${{ needs.resolve.outputs.image }}
-          EXISTS: ${{ needs.resolve.outputs.exists }}
-          TAG: ${{ needs.resolve.outputs.tag }}
-          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
         run: |
           set -euo pipefail
-          repository="${GAR_REGISTRY}/${GCP_PROJECT}/${GCP_REPOSITORY}/antfly"
-          if [[ "$EXISTS" == true ]]; then
-            image="$EXISTING_IMAGE"
-          else
-            for arch in amd64 arm64; do
-              gcloud builds submit . --project="$GCP_PROJECT" --region="$GCP_REGION" --worker-pool="$CLOUD_BUILD_WORKER_POOL" --config=zig/cloudbuild.runtime.yaml --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/main/${SOURCE_SHA}/antfly-zig-${arch}.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${TAG}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=Antfly main runtime image"
-            done
-            gcloud builds submit . --project="$GCP_PROJECT" --region="$GCP_REGION" --worker-pool="$CLOUD_BUILD_WORKER_POOL" --config=zig/cloudbuild.manifest.yaml --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${TAG},_ALIAS_TAG=__skip_alias__,_AMD64_TAG=${TAG}-amd64,_ARM64_TAG=${TAG}-arm64"
-            echo "$TOKEN" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
-            image="${repository}@$(crane digest "${repository}:${TAG}")"
+          tag='${{ needs.resolve.outputs.tag }}'
+          image_tag='${{ needs.resolve.outputs.image_tag }}'
+          # Re-running the same verified main commit only resolves its existing
+          # immutable tag; it does not create aliases or a second image identity.
+          registry="${image_tag%%/*}"
+          echo "$(gcloud auth print-access-token)" | crane auth login "$registry" -u oauth2accesstoken --password-stdin
+          if [[ '${{ needs.resolve.outputs.exists }}' != true ]]; then
+            scripts/publish-zig-runtime-dev.sh --tag "$tag" --manifest
           fi
-          jq -cn --arg source_sha "$SOURCE_SHA" --arg image "$image" --arg tag "$TAG" '{source_sha:$source_sha,image:$image,tag:$tag,platforms:["linux/amd64","linux/arm64"]}' > antfly-main-runtime.json
-          echo "image=$image" >> "$GITHUB_OUTPUT"
+          digest="$(crane digest "$image_tag")"
+          repository="${image_tag%:*}"
+          image="${repository}@${digest}"
+          jq -cn --arg source_sha '${{ needs.resolve.outputs.source_sha }}' --arg image "$image" --arg tag "$tag" '{source_sha:$source_sha,image:$image,tag:$tag,platforms:["linux/amd64","linux/arm64"]}' > antfly-main-runtime.json
           cat antfly-main-runtime.json >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v6
         with:

@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/publish-zig-runtime-dev.sh [--tag TAG] [--arch amd64|arm64] [--manifest]
+  scripts/publish-zig-runtime-dev.sh [--tag TAG] [--arch amd64|arm64] [--manifest|--image-ref]
 
 Build the local native Zig runtime artifact, upload it to GCS, and ask Cloud
 Build to package/push a single-arch GAR image. Run once on amd64 and once on
@@ -30,6 +30,7 @@ worker_pool="${CLOUD_BUILD_WORKER_POOL:-projects/${gcp_project}/locations/${gcp_
 gar_registry="${gcp_region}-docker.pkg.dev"
 tag="dev-$(git -C "$repo_root" rev-parse --short=8 HEAD)"
 manifest=false
+image_ref=false
 arch=""
 
 while [[ $# -gt 0 ]]; do
@@ -46,6 +47,10 @@ while [[ $# -gt 0 ]]; do
       manifest=true
       shift
       ;;
+    --image-ref)
+      image_ref=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -57,6 +62,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$manifest" == true && "$image_ref" == true ]]; then
+  echo "--manifest and --image-ref cannot be used together" >&2
+  exit 2
+fi
 
 if [[ "$arch" != "" && "$arch" != "amd64" && "$arch" != "arm64" ]]; then
   echo "--arch must be amd64 or arm64" >&2
@@ -82,6 +92,11 @@ fi
 
 image_base="${gar_registry}/${gcp_project}/${gcp_repository}/antfly"
 artifact_uri="gs://${artifact_bucket}/zig/dev/${tag}/antfly-zig-${arch}.tar.gz"
+
+if [[ "$image_ref" == true ]]; then
+  printf '%s\n' "${image_base}:${tag}"
+  exit 0
+fi
 
 inspect_image() {
   local image="$1"

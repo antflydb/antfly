@@ -16,13 +16,19 @@ class MainRuntimeWorkflowTest(unittest.TestCase):
 
     def test_names_an_immutable_main_commit_and_reuses_it(self):
         self.assertIn('tag="main-${source_sha}"', WORKFLOW)
-        self.assertIn('crane digest "${repository}:${tag}"', WORKFLOW)
+        self.assertIn("--image-ref", WORKFLOW)
+        self.assertIn('crane digest "$image_tag"', WORKFLOW)
         self.assertIn("needs.resolve.outputs.exists", WORKFLOW)
 
     def test_emits_digest_sha_and_platform_identity(self):
         self.assertIn("source_sha:$source_sha", WORKFLOW)
         self.assertIn("image:$image", WORKFLOW)
         self.assertIn('platforms:["linux/amd64","linux/arm64"]', WORKFLOW)
+
+    def test_does_not_duplicate_private_infrastructure_configuration(self):
+        self.assertNotIn("antfly-image-artifacts", WORKFLOW)
+        self.assertNotIn("us-central1", WORKFLOW)
+        self.assertNotIn("workerPools", WORKFLOW)
 
 
 if __name__ == "__main__":
