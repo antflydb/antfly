@@ -80,23 +80,6 @@ pub const JoinContext = struct {
         return out;
     }
 
-    /// Reconstructs a local monotonic deadline from a timestamped transport
-    /// budget. Forward wall-clock movement is charged to the budget; backward
-    /// movement is treated as zero elapsed time so skew can never extend the
-    /// sender's advertised relative budget.
-    pub fn withTransportExecutionBudgetMs(
-        self: JoinContext,
-        remaining_ms: ?u64,
-        budget_started_at_unix_ms: ?u64,
-    ) !JoinContext {
-        const budget_ms = remaining_ms orelse return self;
-        const started_ms = budget_started_at_unix_ms orelse return error.InvalidQueryRequest;
-        const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
-        const elapsed_ms = if (now_ms >= started_ms) now_ms - started_ms else 0;
-        if (elapsed_ms >= budget_ms) return error.Timeout;
-        return try self.withRemainingExecutionBudgetMs(budget_ms - elapsed_ms);
-    }
-
     /// Returns a ceiling-rounded relative budget so serialization cannot make
     /// a live sub-millisecond deadline expire early on the receiving node.
     pub fn remainingExecutionBudgetMs(self: JoinContext) !?u64 {
@@ -566,7 +549,6 @@ pub const JoinPartitionRequest = struct {
     partition_count: usize = 1,
     right_group_ids: []const u64 = &.{},
     remaining_timeout_ms: ?u64 = null,
-    budget_started_at_unix_ms: ?u64 = null,
     parsed: std.json.Parsed(EncodedJoinPartitionRequest),
 
     pub fn deinit(self: *JoinPartitionRequest, alloc: std.mem.Allocator) void {
@@ -582,7 +564,6 @@ pub const JoinRowsRequest = struct {
     partition_index: usize = 0,
     partition_count: usize = 1,
     remaining_timeout_ms: ?u64 = null,
-    budget_started_at_unix_ms: ?u64 = null,
     parsed: std.json.Parsed(EncodedJoinRowsRequest),
 
     pub fn deinit(self: *JoinRowsRequest, alloc: std.mem.Allocator) void {
@@ -599,7 +580,6 @@ pub const JoinUnmatchedRequest = struct {
     appended_left_field: bool = false,
     matched_right_ids: []const []const u8 = &.{},
     remaining_timeout_ms: ?u64 = null,
-    budget_started_at_unix_ms: ?u64 = null,
     parsed: std.json.Parsed(EncodedJoinUnmatchedRequest),
 
     pub fn deinit(self: *JoinUnmatchedRequest, alloc: std.mem.Allocator) void {
@@ -618,7 +598,6 @@ pub const JoinFinalizeRequest = struct {
     appended_left_field: bool = false,
     shuffle_partitions: usize = 1,
     remaining_timeout_ms: ?u64 = null,
-    budget_started_at_unix_ms: ?u64 = null,
     parsed: std.json.Parsed(EncodedJoinFinalizeRequest),
 
     pub fn deinit(self: *JoinFinalizeRequest, alloc: std.mem.Allocator) void {
@@ -637,7 +616,6 @@ pub const EncodedJoinPartitionRequest = struct {
     partition_count: ?u64 = null,
     right_group_ids: ?[]const u64 = null,
     remaining_timeout_ms: ?u64 = null,
-    budget_started_at_unix_ms: ?u64 = null,
 };
 
 pub const EncodedJoinRowsRequest = struct {
@@ -646,7 +624,6 @@ pub const EncodedJoinRowsRequest = struct {
     partition_index: ?u64 = null,
     partition_count: ?u64 = null,
     remaining_timeout_ms: ?u64 = null,
-    budget_started_at_unix_ms: ?u64 = null,
 };
 
 pub const EncodedJoinUnmatchedRequest = struct {
@@ -656,7 +633,6 @@ pub const EncodedJoinUnmatchedRequest = struct {
     appended_left_field: ?bool = null,
     matched_right_ids: ?[]const []const u8 = null,
     remaining_timeout_ms: ?u64 = null,
-    budget_started_at_unix_ms: ?u64 = null,
 };
 
 pub const EncodedJoinFinalizeRequest = struct {
@@ -668,7 +644,6 @@ pub const EncodedJoinFinalizeRequest = struct {
     appended_left_field: ?bool = null,
     shuffle_partitions: ?u64 = null,
     remaining_timeout_ms: ?u64 = null,
-    budget_started_at_unix_ms: ?u64 = null,
 };
 
 pub const EncodedJoinRowsResponse = struct {
@@ -2827,7 +2802,7 @@ pub fn executeJoinFinalizeWorkerLocal(
 ) !JoinPartitionExecutionResult {
     var req = try parseJoinFinalizeRequest(alloc, body);
     defer req.deinit(alloc);
-    const worker_ctx = try ctx.withTransportExecutionBudgetMs(req.remaining_timeout_ms, req.budget_started_at_unix_ms);
+    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
     const engine: StatefulDistributedShuffleEngine = .{
@@ -2879,7 +2854,7 @@ fn executeJoinRowsLocal(
 ) ![]std.json.Value {
     var req = try parseJoinRowsRequest(alloc, body);
     defer req.deinit(alloc);
-    const worker_ctx = try ctx.withTransportExecutionBudgetMs(req.remaining_timeout_ms, req.budget_started_at_unix_ms);
+    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
     if (req.join.nested_join != null) return error.UnsupportedQueryRequest;
@@ -2931,7 +2906,7 @@ fn executeJoinUnmatchedLocal(
 ) !EncodedJoinUnmatchedResponse {
     var req = try parseJoinUnmatchedRequest(alloc, body);
     defer req.deinit(alloc);
-    const worker_ctx = try ctx.withTransportExecutionBudgetMs(req.remaining_timeout_ms, req.budget_started_at_unix_ms);
+    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
     if (req.join.nested_join != null) return error.UnsupportedQueryRequest;
@@ -3041,7 +3016,7 @@ pub fn executeJoinPartitionWorkerLocal(
         return err;
     };
     defer req.deinit(alloc);
-    const worker_ctx = try ctx.withTransportExecutionBudgetMs(req.remaining_timeout_ms, req.budget_started_at_unix_ms);
+    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
 
@@ -4336,12 +4311,6 @@ fn putTransportBudgetFields(
 ) !void {
     const remaining_ms = remaining_timeout_ms orelse return;
     try putOwnedJsonU64Field(alloc, object, "remaining_timeout_ms", remaining_ms);
-    try putOwnedJsonU64Field(
-        alloc,
-        object,
-        "budget_started_at_unix_ms",
-        platform_time.realtimeNs() / std.time.ns_per_ms,
-    );
 }
 
 fn encodeJoinJobStateRequest(
@@ -4380,7 +4349,6 @@ fn parseJoinPartitionRequest(
             1,
         .right_group_ids = parsed.value.right_group_ids orelse &.{},
         .remaining_timeout_ms = parsed.value.remaining_timeout_ms,
-        .budget_started_at_unix_ms = parsed.value.budget_started_at_unix_ms,
         .parsed = parsed,
     };
 }
@@ -4489,7 +4457,6 @@ fn parseJoinRowsRequest(
         else
             1,
         .remaining_timeout_ms = parsed.value.remaining_timeout_ms,
-        .budget_started_at_unix_ms = parsed.value.budget_started_at_unix_ms,
         .parsed = parsed,
     };
 }
@@ -4512,7 +4479,6 @@ fn parseJoinUnmatchedRequest(
         .appended_left_field = parsed.value.appended_left_field orelse false,
         .matched_right_ids = parsed.value.matched_right_ids orelse &.{},
         .remaining_timeout_ms = parsed.value.remaining_timeout_ms,
-        .budget_started_at_unix_ms = parsed.value.budget_started_at_unix_ms,
         .parsed = parsed,
     };
 }
@@ -4540,7 +4506,6 @@ fn parseJoinFinalizeRequest(
         else
             1,
         .remaining_timeout_ms = parsed.value.remaining_timeout_ms,
-        .budget_started_at_unix_ms = parsed.value.budget_started_at_unix_ms,
         .parsed = parsed,
     };
 }
@@ -5820,34 +5785,15 @@ test "distributed join transports relative budgets and rejects exhausted handoff
         remaining_ms,
     );
     defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "budget_started_at_unix_ms") == null);
     var parsed = try parseJoinPartitionRequest(alloc, body);
     defer parsed.deinit(alloc);
     try std.testing.expectEqual(@as(?u64, remaining_ms), parsed.remaining_timeout_ms);
-    try std.testing.expect(parsed.budget_started_at_unix_ms != null);
     const worker_ctx = try (JoinContext{
         .ptr = &state,
         .vtable = undefined,
-    }).withTransportExecutionBudgetMs(parsed.remaining_timeout_ms, parsed.budget_started_at_unix_ms);
+    }).withRemainingExecutionBudgetMs(parsed.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
-    const charged_ctx = try (JoinContext{
-        .ptr = &state,
-        .vtable = undefined,
-    }).withTransportExecutionBudgetMs(
-        1_000,
-        platform_time.realtimeNs() / std.time.ns_per_ms -| 100,
-    );
-    try std.testing.expect((try charged_ctx.remainingExecutionBudgetMs()).? <= 900);
-    try std.testing.expectError(
-        error.InvalidQueryRequest,
-        ctx.withTransportExecutionBudgetMs(remaining_ms, null),
-    );
-    try std.testing.expectError(
-        error.Timeout,
-        ctx.withTransportExecutionBudgetMs(
-            10,
-            platform_time.realtimeNs() / std.time.ns_per_ms -| 100,
-        ),
-    );
 }
 
 test "distributed join transport passes timeout out of band without parsing payload" {

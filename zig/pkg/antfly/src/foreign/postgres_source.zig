@@ -567,7 +567,7 @@ pub const RuntimeSource = struct {
         const field = definition.field orelse return error.InvalidQueryRequest;
         const quoted_field = try sql.postgresDialect().quote_identifier(alloc, field);
         defer alloc.free(quoted_field);
-        const quoted_table = try sql.postgresDialect().quote_identifier(alloc, table);
+        const quoted_table = try sql.postgresDialect().quote_relation(alloc, table);
         defer alloc.free(quoted_table);
         const where_clause = if (where_sql) |value|
             try std.fmt.allocPrint(alloc, " WHERE {s}", .{value})
@@ -614,7 +614,7 @@ pub const RuntimeSource = struct {
         const field = definition.field orelse return error.InvalidQueryRequest;
         const quoted_field = try sql.postgresDialect().quote_identifier(alloc, field);
         defer alloc.free(quoted_field);
-        const quoted_table = try sql.postgresDialect().quote_identifier(alloc, table);
+        const quoted_table = try sql.postgresDialect().quote_relation(alloc, table);
         defer alloc.free(quoted_table);
         const size = @min(definition.size orelse 10, 1000);
         const where_clause = if (where_sql) |value|
@@ -819,7 +819,7 @@ fn buildSimpleAggregatePreparedQueryAlloc(
     where_sql: ?[]const u8,
     where_args: []const sql.ParameterValue,
 ) !sql.PreparedQuery {
-    const quoted_table = try sql.postgresDialect().quote_identifier(alloc, table);
+    const quoted_table = try sql.postgresDialect().quote_relation(alloc, table);
     defer alloc.free(quoted_table);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);

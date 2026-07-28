@@ -62,6 +62,7 @@ pub const PreparedQuery = sql.PreparedQuery;
 pub const SqlSourceConfig = sql.SqlSourceConfig;
 pub const SelectStatementOptions = sql.SelectStatementOptions;
 pub const postgresDialect = sql.postgresDialect;
+pub const quotePostgresRelationAlloc = sql.quotePostgresRelationAlloc;
 pub const placeholderAlloc = sql.placeholderAlloc;
 pub const buildSelectStatementAlloc = sql.buildSelectStatementAlloc;
 
@@ -115,6 +116,7 @@ test "foreign module compiles" {
     _ = SqlSourceConfig;
     _ = SelectStatementOptions;
     _ = postgresDialect;
+    _ = quotePostgresRelationAlloc;
     _ = placeholderAlloc;
     _ = buildSelectStatementAlloc;
 }
