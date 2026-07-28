@@ -2120,7 +2120,7 @@ test "data server repair owner cancels and drains through backend runtime" {
         fn deinit(_: *anyopaque) void {}
     };
 
-    server.provisioned_index_repair_owner_id = try runtime.ptr().tryAllocOwnerId();
+    server.provisioned_index_repair_owner_id = try runtime.ptr().allocOwnerId();
     server.provisioned_index_repair_active.store(true, .release);
     try runtime.ptr().durable_jobs.submit(.{
         .owner_id = server.provisioned_index_repair_owner_id,
@@ -6318,7 +6318,7 @@ pub const DataServer = struct {
         if (self.replicated_transition_action_shutdown.load(.acquire))
             return error.BackgroundOwnerClosing;
         if (self.replicated_transition_action_owner_id == 0) {
-            self.replicated_transition_action_owner_id = try runtime.tryAllocOwnerId();
+            self.replicated_transition_action_owner_id = try runtime.allocOwnerId();
         }
         return self.replicated_transition_action_owner_id;
     }
@@ -10017,7 +10017,7 @@ pub const DataServer = struct {
         if (self.provisioned_index_repair_shutdown.load(.acquire)) return error.BackgroundOwnerClosing;
         if (self.provisioned_index_repair_active.load(.acquire)) return;
         if (self.provisioned_index_repair_owner_id == 0) {
-            self.provisioned_index_repair_owner_id = try runtime.tryAllocOwnerId();
+            self.provisioned_index_repair_owner_id = try runtime.allocOwnerId();
         }
         self.provisioned_index_repair_active.store(true, .release);
         errdefer self.provisioned_index_repair_active.store(false, .release);

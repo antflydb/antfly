@@ -1673,6 +1673,29 @@ pub const ApiHttpServer = struct {
         },
     };
 
+    const RuntimeOwnerIds = struct {
+        repair: u64 = 0,
+        restore: u64 = 0,
+        session_maintenance: u64 = 0,
+        backup_maintenance: u64 = 0,
+    };
+
+    fn allocRuntimeOwnerIds(runtime: ?*db_mod.background_runtime.BackendRuntime) !RuntimeOwnerIds {
+        const active = runtime orelse return .{};
+        var ids: RuntimeOwnerIds = .{};
+        errdefer {
+            if (ids.repair != 0) active.durable_jobs.closeOwner(ids.repair);
+            if (ids.restore != 0) active.durable_jobs.closeOwner(ids.restore);
+            if (ids.session_maintenance != 0) active.durable_jobs.closeOwner(ids.session_maintenance);
+            if (ids.backup_maintenance != 0) active.durable_jobs.closeOwner(ids.backup_maintenance);
+        }
+        ids.repair = try active.allocOwnerId();
+        ids.restore = try active.allocOwnerId();
+        ids.session_maintenance = try active.allocOwnerId();
+        ids.backup_maintenance = try active.allocOwnerId();
+        return ids;
+    }
+
     pub fn init(
         alloc: std.mem.Allocator,
         cfg: ApiHttpServerConfig,
@@ -1724,6 +1747,29 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) ApiHttpServer {
+        const owner_ids = allocRuntimeOwnerIds(cfg.backend_runtime) catch {
+            @panic("API background owner registration failed");
+        };
+        return initWithRequestAllocatorAndOwners(
+            owner_alloc,
+            request_alloc,
+            cfg,
+            source,
+            table_read_source,
+            table_write_source,
+            owner_ids,
+        );
+    }
+
+    fn initWithRequestAllocatorAndOwners(
+        owner_alloc: std.mem.Allocator,
+        request_alloc: std.mem.Allocator,
+        cfg: ApiHttpServerConfig,
+        source: StatusSource,
+        table_read_source: ?table_reads.TableReadSource,
+        table_write_source: ?table_writes.TableWriteSource,
+        owner_ids: RuntimeOwnerIds,
+    ) ApiHttpServer {
         const effective_query_embedding_cache = effectiveQueryEmbeddingCacheConfig(cfg);
         return .{
             .alloc = request_alloc,
@@ -1762,10 +1808,10 @@ pub const ApiHttpServer = struct {
                 if (runtime.io()) |io| restore_jobs.Store.initWithIo(owner_alloc, io) else restore_jobs.Store.init(owner_alloc)
             else
                 restore_jobs.Store.init(owner_alloc),
-            .repair_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
-            .restore_job_owner_id = .init(if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0),
-            .session_maintenance_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
-            .backup_maintenance_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
+            .repair_job_owner_id = owner_ids.repair,
+            .restore_job_owner_id = .init(owner_ids.restore),
+            .session_maintenance_owner_id = owner_ids.session_maintenance,
+            .backup_maintenance_owner_id = owner_ids.backup_maintenance,
             .connections_cache = connections_api.Cache.init(owner_alloc),
             .local_resource_manager = resource_manager_mod.ResourceManager.init(.{}),
             .shared_resource_manager = cfg.resource_manager,
@@ -1834,7 +1880,30 @@ pub const ApiHttpServer = struct {
         table_write_source: ?table_writes.TableWriteSource,
     ) !ApiHttpServer {
         var effective_cfg = cfg;
-        var server = ApiHttpServer.init(alloc, effective_cfg, source, table_read_source, table_write_source);
+        const request_alloc = if (builtin.is_test)
+            alloc
+        else
+            platform.allocator.processAllocator(std.heap.smp_allocator);
+        const owner_ids = try allocRuntimeOwnerIds(effective_cfg.backend_runtime);
+        var owner_ids_transferred = false;
+        errdefer if (!owner_ids_transferred) {
+            if (effective_cfg.backend_runtime) |runtime| {
+                if (owner_ids.repair != 0) runtime.durable_jobs.closeOwner(owner_ids.repair);
+                if (owner_ids.restore != 0) runtime.durable_jobs.closeOwner(owner_ids.restore);
+                if (owner_ids.session_maintenance != 0) runtime.durable_jobs.closeOwner(owner_ids.session_maintenance);
+                if (owner_ids.backup_maintenance != 0) runtime.durable_jobs.closeOwner(owner_ids.backup_maintenance);
+            }
+        };
+        var server = initWithRequestAllocatorAndOwners(
+            alloc,
+            request_alloc,
+            effective_cfg,
+            source,
+            table_read_source,
+            table_write_source,
+            owner_ids,
+        );
+        owner_ids_transferred = true;
         errdefer server.deinit();
         if (cfg.session_store_path) |path| {
             if (cfg.session_store != null) return error.InvalidApiServerConfig;
@@ -1993,7 +2062,7 @@ pub const ApiHttpServer = struct {
         self.restore_schedule_mutex.unlock();
         self.restore_jobs_resumed.store(false, .release);
         try self.restore_job_store.prepareReplicatedLeadership(self.alloc);
-        self.restore_job_owner_id.store(try runtime.tryAllocOwnerId(), .release);
+        self.restore_job_owner_id.store(try runtime.allocOwnerId(), .release);
         self.restore_leadership_term.store(leadership_term, .release);
         self.restore_dispatch_paused.store(false, .release);
         self.restore_dispatch_requested.store(true, .release);
@@ -5582,9 +5651,10 @@ pub const ApiHttpServer = struct {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, table_path.table_name);
                 defer self.alloc.free(table_name);
                 var create_req = table_contract.parseCreateTableRequest(self.alloc, req.body) catch |err| {
-                    // Invalid client input is an expected 4xx outcome. Keep
-                    // enough diagnostic context at debug level without turning
-                    // arbitrary requests into operational error alerts.
+                    if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
+                        std.log.err("create table request parsing failed: {} body_len={d}", .{ err, req.body.len });
+                        return err;
+                    }
                     std.log.debug("create table request rejected: {} body_len={d}", .{ err, req.body.len });
                     if (err == error.InvalidCreateTableSchemaRequest) {
                         return try textResponse(self.alloc, 400, table_contract.createTableRequestErrorMessage(req.body));
@@ -10862,7 +10932,7 @@ pub const ApiHttpServer = struct {
             defer parsed.deinit();
             const queued = try self.repair_job_store.recordRetryableFailure(self.alloc, parsed.value, @errorName(err));
             defer self.alloc.free(queued);
-            if (err == error.BackgroundOwnerClosing) {
+            if (err == error.BackgroundOwnerClosing or err == error.BackgroundOwnerClosed) {
                 std.log.warn("table repair job submission deferred during shutdown table={s} job_id={d}", .{ table_name, job_id });
             } else {
                 std.log.warn("table repair job submission deferred table={s} job_id={d} err={}", .{ table_name, job_id, err });
@@ -13694,7 +13764,7 @@ test "api http server durably retries table repair job when background submit is
     var parsed_updated = try std.json.parseFromSlice(repair_jobs.JobState, alloc, updated, .{ .ignore_unknown_fields = true });
     defer parsed_updated.deinit();
     try std.testing.expectEqualStrings("queued", parsed_updated.value.phase);
-    try std.testing.expectEqualStrings("BackgroundOwnerClosing", parsed_updated.value.last_error.?);
+    try std.testing.expectEqualStrings("BackgroundOwnerClosed", parsed_updated.value.last_error.?);
     try std.testing.expect(parsed_updated.value.next_retry_at_millis > parsed_updated.value.last_updated_at_millis);
 }
 

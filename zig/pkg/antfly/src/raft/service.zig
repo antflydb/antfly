@@ -1467,6 +1467,14 @@ test "managed host service seeds queued transitions from projected metadata stor
                 .source_group_id = 1300,
                 .destination_group_id = 1301,
                 .phase = .prepare,
+                .split_key = "doc:m",
+                .table_contract = .{
+                    .table_id = 13,
+                    .table_name = "docs",
+                    .indexes_json = "{}",
+                    .source_identity = .{ .shard_id = 1300, .range_id = 1300 },
+                    .target_identity = .{ .shard_id = 1300, .range_id = 1300 },
+                },
             },
         });
         defer std.testing.allocator.free(cmd);

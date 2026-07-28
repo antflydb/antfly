@@ -100,7 +100,7 @@ test "lsm background executor submits jobs with backend owner id" {
     defer handle.deinit();
 
     var ctx = Ctx{};
-    const executor = Executor.init(handle.ptr(), try handle.ptr().tryAllocOwnerId());
+    const executor = Executor.init(handle.ptr(), try handle.ptr().allocOwnerId());
     try executor.submit(.commit_durable, &ctx, Fns.run, Fns.deinit);
 
     try std.testing.expect(ctx.ran);

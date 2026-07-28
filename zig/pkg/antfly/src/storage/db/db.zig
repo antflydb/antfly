@@ -3168,7 +3168,14 @@ pub const DB = struct {
             if (backend_runtime.io_impl == null and effective_executor.backend == .io_threaded) {
                 effective_executor.backend = .manual;
             }
-            const backend_owner_id = try backend_runtime.tryAllocOwnerId();
+            const backend_owner_id = try backend_runtime.allocOwnerId();
+            var backend_owner_transferred = false;
+            errdefer if (!backend_owner_transferred)
+                backend_runtime.durable_jobs.closeOwner(backend_owner_id);
+            const repair_cleanup_owner_id = try backend_runtime.allocOwnerId();
+            var repair_cleanup_owner_transferred = false;
+            errdefer if (!repair_cleanup_owner_transferred)
+                backend_runtime.durable_jobs.closeOwner(repair_cleanup_owner_id);
             var primary_lsm_background_executor: lsm_backend_mod.BackgroundExecutor = undefined;
             var effective_primary_backend = opts.primary_backend;
             var effective_index_backends = opts.index_backends;
@@ -3268,7 +3275,7 @@ pub const DB = struct {
                 .async_context = async_context,
                 .backend_runtime = backend_runtime,
                 .backend_owner_id = backend_owner_id,
-                .repair_cleanup_owner_id = try backend_runtime.tryAllocOwnerId(),
+                .repair_cleanup_owner_id = repair_cleanup_owner_id,
                 .owned_backend_runtime = owned_backend_runtime,
                 .owned_resource_manager = owned_resource_manager,
                 .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
@@ -3296,6 +3303,8 @@ pub const DB = struct {
                 .sparse_compaction_runtime = null,
                 .shadow = null,
             };
+            backend_owner_transferred = true;
+            repair_cleanup_owner_transferred = true;
             var executor_ready = false;
             owned_async_context = null;
             owned_backend_runtime = null;
@@ -4081,7 +4090,7 @@ pub const DB = struct {
         self.async_context.background_closing.store(true, .release);
         self.async_context.enrichment_desired_running.store(false, .release);
         self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
-        self.backend_runtime.durable_jobs.drainOwner(self.repair_cleanup_owner_id);
+        self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
         self.clearLiveDocSetCache();
         self.clearNonVisibleDocSetCache();
         self.bulk_ingest_coalescer.deinit(self.alloc);
@@ -38689,9 +38698,51 @@ test "db open borrows shared backend runtime" {
     try std.testing.expect(first.backend_owner_id != 0);
     try std.testing.expect(second.backend_owner_id != 0);
     try std.testing.expect(first.backend_owner_id != second.backend_owner_id);
-    // Each DB owns one executor lane identity and one independently drained
-    // retired-generation cleanup identity.
-    try std.testing.expectEqual(@as(u64, 5), runtime.ptr().allocOwnerId());
+    // Each DB owns one backend lane and one repair/cleanup lane. Generation
+    // retirement uses the runtime-wide cleanup owner instead.
+    try std.testing.expectEqual(
+        second.repair_cleanup_owner_id + 1,
+        try runtime.ptr().allocOwnerId(),
+    );
+}
+
+test "db close retires runtime owners for memory primary backend" {
+    const alloc = std.testing.allocator;
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+    });
+    const backend_owner_id = db.backend_owner_id;
+    const repair_cleanup_owner_id = db.repair_cleanup_owner_id;
+    db.close();
+
+    const Fns = struct {
+        fn run(_: *anyopaque) !void {}
+        fn deinit(_: *anyopaque) void {}
+    };
+    var ctx: u8 = 0;
+    try std.testing.expectError(error.BackgroundOwnerClosed, runtime.ptr().durable_jobs.submit(.{
+        .owner_id = backend_owner_id,
+        .class = .maintenance,
+        .ptr = &ctx,
+        .run = Fns.run,
+        .deinit = Fns.deinit,
+    }));
+    try std.testing.expectError(error.BackgroundOwnerClosed, runtime.ptr().durable_jobs.submit(.{
+        .owner_id = repair_cleanup_owner_id,
+        .class = .cleanup,
+        .ptr = &ctx,
+        .run = Fns.run,
+        .deinit = Fns.deinit,
+    }));
 }
 
 test "db inherits the resource manager capacity source" {

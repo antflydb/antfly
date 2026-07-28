@@ -177,7 +177,7 @@ pub const Coordinator = struct {
             .allocator = allocator,
             .source = source,
             .durable_jobs = runtime.durable_jobs,
-            .job_owner_id = try runtime.tryAllocOwnerId(),
+            .job_owner_id = try runtime.allocOwnerId(),
             .id_seed = if (seed == 0) 1 else seed,
         };
     }

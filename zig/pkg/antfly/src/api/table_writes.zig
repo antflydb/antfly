@@ -5412,7 +5412,7 @@ pub const ProvisionedTableWriteSource = struct {
     /// destroy after its optional cache owner has already gone away.
     pub fn quiesce(self: *ProvisionedTableWriteSource) void {
         if (self.quiesced) return;
-        self.drainDroppedTableDeletes();
+        self.closeDroppedTableDeletes();
         const io = self.table_activity_threaded.io();
         self.restore_repair_shutdown.store(true, .release);
         self.restore_repair_work_group.cancel(io);
@@ -5549,7 +5549,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) !u64 {
         if (self.dropped_table_delete_owner_id == 0) {
-            self.dropped_table_delete_owner_id = try runtime.tryAllocOwnerId();
+            self.dropped_table_delete_owner_id = try runtime.allocOwnerId();
         }
         return self.dropped_table_delete_owner_id;
     }
@@ -5558,6 +5558,13 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.dropped_table_delete_owner_id == 0) return;
         if (self.backend_runtime) |runtime| {
             runtime.durable_jobs.drainOwner(self.dropped_table_delete_owner_id);
+        }
+    }
+
+    fn closeDroppedTableDeletes(self: *ProvisionedTableWriteSource) void {
+        if (self.dropped_table_delete_owner_id == 0) return;
+        if (self.backend_runtime) |runtime| {
+            runtime.durable_jobs.closeOwner(self.dropped_table_delete_owner_id);
         }
     }
 

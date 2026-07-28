@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const foreign_mod = @import("../foreign/mod.zig");
 const table_writes_api = @import("../api/table_writes.zig");
 const metadata_api = @import("api.zig");
@@ -33,6 +34,7 @@ const Allocator = std.mem.Allocator;
 // CDC checkpoints are external resume positions. Only publish progress after
 // the applied row is visible through query/index paths.
 const cdc_apply_sync_level = db_mod.types.SyncLevel.full_index;
+const default_prepared_snapshot_timeout_ns: u64 = 30 * std.time.ns_per_s;
 
 fn classifyReplicationError(err: anyerror) []const u8 {
     return switch (err) {
@@ -60,6 +62,7 @@ pub const SnapshotBackfillRunner = struct {
     write_source: table_writes_api.TableWriteSource,
     secret_store: ?*secrets.FileStore = null,
     batch_size: usize = 256,
+    prepared_snapshot_timeout_ns: u64 = default_prepared_snapshot_timeout_ns,
 
     pub fn runTableSource(
         self: *SnapshotBackfillRunner,
@@ -164,8 +167,14 @@ pub const SnapshotBackfillRunner = struct {
         };
         defer prepare_params.deinit(self.alloc);
         var exact_cutover_rejected = false;
+        const prepared_snapshot_deadline_ns =
+            platform_time.monotonicNs() +| self.prepared_snapshot_timeout_ns;
         var prepared_snapshot = if (start_offset == 0 and persisted_prepared_checkpoint == null)
-            source.beginPreparedReplicationSnapshot(self.alloc, prepare_params) catch |err| switch (err) {
+            source.beginPreparedReplicationSnapshot(
+                self.alloc,
+                prepare_params,
+                prepared_snapshot_deadline_ns,
+            ) catch |err| switch (err) {
                 error.UnsupportedExactCutover => blk: {
                     if (parsed.require_exact_cutover) return error.ReplicationExactCutoverRequired;
                     exact_cutover_rejected = true;
@@ -2198,7 +2207,9 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
             inner_alloc: Allocator,
             _: []const u8,
             _: foreign_mod.ReplicationPollParams,
+            execution_deadline_ns: u64,
         ) !foreign_mod.PostgresQueryExecutor.PreparedReplicationSnapshot {
+            if (platform_time.monotonicNs() >= execution_deadline_ns) return error.Timeout;
             Parent.exact_cutover_calls += 1;
             const session = try inner_alloc.create(SnapshotSession);
             session.* = .{};

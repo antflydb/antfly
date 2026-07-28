@@ -420,16 +420,20 @@ pub const Reconciler = struct {
                 continue;
             }
 
-            if (splitRangePublicationEpoch(current, desired_splits, desired)) |published_epoch| {
-                var publishable = desired;
-                publishable.split_attempt_epoch = published_epoch;
-                if (existing == null or !rangeRecordsEqual(existing.?, publishable)) {
-                    try range_upserts.ensureUnusedCapacity(self.alloc, 1);
-                    range_upserts.appendAssumeCapacity(
-                        try table_manager.cloneRange(self.alloc, publishable),
-                    );
-                }
-                continue;
+            switch (splitRangePublication(current, desired_splits, desired)) {
+                .publish_epoch => |published_epoch| {
+                    var publishable = desired;
+                    publishable.split_attempt_epoch = published_epoch;
+                    if (existing == null or !rangeRecordsEqual(existing.?, publishable)) {
+                        try range_upserts.ensureUnusedCapacity(self.alloc, 1);
+                        range_upserts.appendAssumeCapacity(
+                            try table_manager.cloneRange(self.alloc, publishable),
+                        );
+                    }
+                    continue;
+                },
+                .blocked => continue,
+                .none => {},
             }
 
             if (existing == null or !rangeRecordsEqual(existing.?, desired)) {
@@ -3487,11 +3491,17 @@ fn splitAdmissionExpectedEpoch(
     return source.split_attempt_epoch;
 }
 
-fn splitRangePublicationEpoch(
+const SplitRangePublication = union(enum) {
+    none,
+    blocked,
+    publish_epoch: u64,
+};
+
+fn splitRangePublication(
     current: CurrentMetadataState,
     desired_splits: []const transition_state.SplitTransitionRecord,
     desired_range: table_manager.RangeRecord,
-) ?u64 {
+) SplitRangePublication {
     for (desired_splits) |split| {
         if (split.source_group_id != desired_range.group_id or
             split.attempt_epoch != desired_range.split_attempt_epoch or
@@ -3504,9 +3514,13 @@ fn splitRangePublicationEpoch(
         const previous_epoch = split.attempt_epoch - 1;
         const current_source = findRangeRecord(current.ranges, split.source_group_id);
         if (current_source == null or current_source.?.split_attempt_epoch == previous_epoch)
-            return previous_epoch;
+            return .{ .publish_epoch = previous_epoch };
+        // A stale or consumed epoch must never fall through to the ordinary
+        // range upsert path. Only the atomic admission command may advance the
+        // durable source epoch for a new split.
+        return .blocked;
     }
-    return null;
+    return .none;
 }
 
 fn allocSplitProvisioningRanges(
@@ -3785,6 +3799,56 @@ test "metadata reconciler provisions split destination without publishing overla
     try std.testing.expectEqual(@as(usize, 0), plan.range_upserts.len);
     try std.testing.expect(findPlacementIntent(plan.placement_upserts, 103, 1) != null);
     try std.testing.expectEqual(@as(usize, 1), plan.split_admissions.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
+}
+
+test "metadata reconciler never publishes a split epoch without atomic admission" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const desired_table: table_manager.TableRecord = .{
+        .table_id = 10,
+        .name = "docs",
+        .desired_replica_count = 1,
+    };
+    try manager.upsertTable(desired_table);
+    try manager.upsertRange(.{
+        .group_id = 101,
+        .range_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+        .doc_identity_shard_id = 101,
+        .doc_identity_range_id = 101,
+        .split_attempt_epoch = 2,
+    });
+    try manager.requestSplit(.{
+        .transition_id = 7004,
+        .table_id = 10,
+        .source_group_id = 101,
+        .destination_group_id = 102,
+        .split_key = "doc:m",
+    });
+
+    const stale_source: table_manager.RangeRecord = .{
+        .group_id = 101,
+        .range_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+        .doc_identity_shard_id = 101,
+        .doc_identity_range_id = 101,
+        .split_attempt_epoch = 1,
+    };
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = &.{desired_table},
+        .ranges = &.{stale_source},
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.range_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_admissions.len);
     try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
 }
 

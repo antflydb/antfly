@@ -93,8 +93,9 @@ pub const RangeRecord = struct {
     end_key: ?[]const u8 = null,
     doc_identity_shard_id: u64 = 0,
     doc_identity_range_id: u64 = 0,
-    /// Monotonic source-local split attempt allocator. Gaps are valid: the
-    /// range update may commit before its transition record during recovery.
+    /// Monotonic source-local split attempt allocator. Durable metadata
+    /// advances this only in the CAS command that admits the corresponding
+    /// transition, so an epoch cannot be consumed without recovery state.
     split_attempt_epoch: u64 = 0,
     restore_backup_id: []const u8 = "",
     restore_artifact_backup_id: []const u8 = "",

@@ -268,7 +268,7 @@ pub const Source = struct {
         statistics: *const fn (ptr: *anyopaque, table: []const u8) anyerror!TableStatistics,
         statistics_with_deadline: ?*const fn (ptr: *anyopaque, table: []const u8, execution_deadline_ns: ?u64) anyerror!TableStatistics = null,
         begin_snapshot_query: ?*const fn (ptr: *anyopaque, alloc: Allocator) anyerror!SnapshotReader = null,
-        begin_prepared_replication_snapshot: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: ReplicationPollParams) anyerror!PreparedReplicationSnapshot = null,
+        begin_prepared_replication_snapshot: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: ReplicationPollParams, execution_deadline_ns: u64) anyerror!PreparedReplicationSnapshot = null,
         prepare_replication: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: ReplicationPollParams) anyerror!ReplicationPrepareResult = null,
         poll_changes: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: ReplicationPollParams) anyerror!ReplicationPollResult = null,
         cleanup_replication: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: ReplicationCleanupParams) anyerror!void = null,
@@ -305,9 +305,14 @@ pub const Source = struct {
         return try begin_fn(self.ptr, alloc);
     }
 
-    pub fn beginPreparedReplicationSnapshot(self: Source, alloc: Allocator, params: ReplicationPollParams) !PreparedReplicationSnapshot {
+    pub fn beginPreparedReplicationSnapshot(
+        self: Source,
+        alloc: Allocator,
+        params: ReplicationPollParams,
+        execution_deadline_ns: u64,
+    ) !PreparedReplicationSnapshot {
         const begin_fn = self.vtable.begin_prepared_replication_snapshot orelse return error.UnsupportedExactCutover;
-        return try begin_fn(self.ptr, alloc, params);
+        return try begin_fn(self.ptr, alloc, params, execution_deadline_ns);
     }
 
     pub fn prepareReplication(self: Source, alloc: Allocator, params: ReplicationPollParams) !ReplicationPrepareResult {

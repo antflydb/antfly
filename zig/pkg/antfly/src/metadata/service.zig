@@ -5181,6 +5181,7 @@ fn syncLocalStoreStatus(
     const reports = try collectExplicitLocalStoreStatusReports(
         service,
         service.alloc,
+        status_io,
         replica_root_dir,
         local_stores.items,
         ranges,
@@ -5197,6 +5198,7 @@ fn syncLocalStoreStatus(
     const shared_reports = try collectSharedRootLocalStoreStatusReports(
         service,
         service.alloc,
+        status_io,
         replica_root_dir,
         local_node_id,
         local_stores.items,
@@ -5236,15 +5238,13 @@ fn reportStoreStatusesWithProjected(
 fn collectExplicitLocalStoreStatusReports(
     service: anytype,
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     stores: []const metadata_table_manager.StoreRecord,
     ranges: []const metadata_table_manager.RangeRecord,
     group_statuses: []const metadata_table_manager.GroupStatusReport,
     backfill_markers: []const StoreStatusBackfillMarker,
 ) ![]metadata_table_manager.StoreStatusReport {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
     var reports = std.ArrayListUnmanaged(metadata_table_manager.StoreStatusReport).empty;
     errdefer reports.deinit(alloc);
 
@@ -5252,14 +5252,14 @@ fn collectExplicitLocalStoreStatusReports(
         const store_root = try std.fmt.allocPrint(alloc, "{s}/store-{d}", .{ replica_root_dir, store.store_id });
         defer alloc.free(store_root);
 
-        var dir = openDirPath(io_impl.io(), store_root, false) catch |err| switch (err) {
+        var dir = openDirPath(io, store_root, false) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => {
                 reports.deinit(alloc);
                 return try alloc.alloc(metadata_table_manager.StoreStatusReport, 0);
             },
             else => return err,
         };
-        dir.close(io_impl.io());
+        dir.close(io);
 
         try reports.append(alloc, try collectLocalStoreStatusReport(
             service,
@@ -5325,6 +5325,7 @@ fn collectLocalStoreStatusReport(
 fn collectSharedRootLocalStoreStatusReports(
     service: anytype,
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     local_node_id: u64,
     stores: []const metadata_table_manager.StoreRecord,
@@ -5361,7 +5362,7 @@ fn collectSharedRootLocalStoreStatusReports(
     for (backfill_markers) |marker| {
         if (marker.store_id != null) continue;
         const range = findRangeByGroupId(ranges, marker.group_id) orelse continue;
-        const store_id = try resolveSharedRootStoreAffinity(alloc, replica_root_dir, local_node_id, marker.group_id, stores, placements, tables, range);
+        const store_id = try resolveSharedRootStoreAffinity(alloc, io, replica_root_dir, local_node_id, marker.group_id, stores, placements, tables, range);
         const report_index = findStoreStatusReportIndex(reports, store_id) orelse continue;
         try accumulateStoreStatusBackfillProgress(
             alloc,
@@ -5504,10 +5505,12 @@ fn collectLocalGroupStatusReports(
             try reports.append(alloc, status);
         } else if (latestLocalGroupStatus(stores, local_node_id, range.group_id)) |previous| {
             var preserved = previous;
-            const readiness = transition_state.readinessForGroup(
+            const readiness = transition_state.readinessForGroupWithObservations(
                 range.group_id,
                 split_transitions,
                 merge_transitions,
+                split_observations,
+                merge_observations,
             );
             preserved.transition_pending = readiness.transition_pending;
             preserved.replay_required = readiness.replay_required;
@@ -5621,6 +5624,101 @@ fn latestLocalGroupStatus(
         }
     }
     return latest;
+}
+
+test "metadata service status preserves the last observation during a generation transition" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/status-generation-transition",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root);
+    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root});
+    defer alloc.free(db_path);
+    try fs_paths.createDirPathPortable(std.testing.io, db_path);
+
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusive(db_path);
+    defer transition.deinit();
+
+    const tables = [_]metadata_table_manager.TableRecord{
+        .{ .table_id = 7, .name = "docs" },
+    };
+    const ranges = [_]metadata_table_manager.RangeRecord{
+        .{ .group_id = 77, .range_id = 77, .table_id = 7, .start_key = "" },
+    };
+    var previous_statuses = [_]metadata_table_manager.GroupStatusReport{.{
+        .group_id = 77,
+        .doc_count = 42,
+        .disk_bytes = 4096,
+        .disk_bytes_known = true,
+        .empty = false,
+        .updated_at_millis = 1234,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 1,
+    }};
+    var stores = [_]metadata_table_manager.StoreRecord{.{
+        .store_id = 1,
+        .node_id = 1,
+        .group_statuses = &previous_statuses,
+    }};
+    const splits = [_]transition_state.SplitTransitionRecord{.{
+        .transition_id = 7001,
+        .attempt_epoch = 1,
+        .source_group_id = 77,
+        .destination_group_id = 78,
+        .phase = .prepare,
+    }};
+    const split_observations = [_]transition_state.SplitObservationRecord{.{
+        .transition_id = 7001,
+        .observation = .{
+            .status = .{
+                .phase = .cutover_ready,
+                .source_split_phase = .splitting,
+                .bootstrapped = true,
+                .replay_required = true,
+                .replay_caught_up = true,
+                .cutover_ready = true,
+                .destination_ready_for_reads = true,
+                .source_delta_sequence = 5,
+                .dest_delta_sequence = 5,
+            },
+        },
+    }};
+    var fake_service: struct {} = .{};
+
+    const reports = try collectLocalGroupStatusReports(
+        &fake_service,
+        alloc,
+        runtime.ptr(),
+        runtime.ptr().io().?,
+        1,
+        replica_root,
+        &tables,
+        &ranges,
+        &stores,
+        &.{},
+        &splits,
+        &.{},
+        &split_observations,
+        &.{},
+    );
+    defer metadata_table_manager.freeGroupStatuses(alloc, reports);
+
+    try std.testing.expectEqual(@as(usize, 1), reports.len);
+    try std.testing.expectEqual(@as(u64, 42), reports[0].doc_count);
+    try std.testing.expectEqual(@as(u64, 1234), reports[0].updated_at_millis);
+    try std.testing.expect(reports[0].transition_pending);
+    try std.testing.expect(reports[0].replay_required);
+    try std.testing.expect(reports[0].replay_caught_up);
+    try std.testing.expect(reports[0].cutover_ready);
+    try std.testing.expect(reports[0].reads_ready_after_cutover);
 }
 
 const ServiceGroupRaftObservation = struct {
@@ -6067,6 +6165,7 @@ fn freeOwnedStoreStatusReports(alloc: std.mem.Allocator, reports: []const metada
 
 fn resolveSharedRootStoreAffinity(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     local_node_id: u64,
     group_id: u64,
@@ -6076,29 +6175,28 @@ fn resolveSharedRootStoreAffinity(
     range: metadata_table_manager.RangeRecord,
 ) !u64 {
     if (findPlacementIntentStoreId(placements, group_id, local_node_id, stores)) |store_id| {
-        try writeStoreAffinityFile(alloc, replica_root_dir, group_id, store_id);
+        try writeStoreAffinityFile(alloc, io, replica_root_dir, group_id, store_id);
         return store_id;
     }
-    const existing = try readStoreAffinityFile(alloc, replica_root_dir, group_id);
+    const existing = try readStoreAffinityFile(alloc, io, replica_root_dir, group_id);
     if (existing) |store_id| {
         if (findProjectedStore(stores, store_id) != null) return store_id;
     }
 
     const assigned = try assignSharedRootStoreAffinity(alloc, stores, tables, range);
-    try writeStoreAffinityFile(alloc, replica_root_dir, group_id, assigned);
+    try writeStoreAffinityFile(alloc, io, replica_root_dir, group_id, assigned);
     return assigned;
 }
 
 fn readStoreAffinityFile(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     group_id: u64,
 ) !?u64 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
     const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/store-affinity", .{ replica_root_dir, group_id });
     defer alloc.free(path);
-    const contents = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(128)) catch |err| switch (err) {
+    const contents = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(128)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -6110,21 +6208,20 @@ fn readStoreAffinityFile(
 
 fn writeStoreAffinityFile(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     group_id: u64,
     store_id: u64,
 ) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
     const dir_path = try std.fmt.allocPrint(alloc, "{s}/group-{d}", .{ replica_root_dir, group_id });
     defer alloc.free(dir_path);
-    try fs_paths.createDirPathPortable(io_impl.io(), dir_path);
+    try fs_paths.createDirPathPortable(io, dir_path);
     const path = try std.fmt.allocPrint(alloc, "{s}/store-affinity", .{dir_path});
     defer alloc.free(path);
-    var file = try std.Io.Dir.cwd().createFile(io_impl.io(), path, .{ .truncate = true });
-    defer file.close(io_impl.io());
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
     var buf: [64]u8 = undefined;
-    var writer = file.writer(io_impl.io(), &buf);
+    var writer = file.writer(io, &buf);
     try writer.interface.print("{d}\n", .{store_id});
     try writer.end();
 }
@@ -7363,9 +7460,12 @@ test "metadata service proposes split transitions into the metadata group" {
     try svc.upsertTable(.{ .table_id = 20, .name = "docs" });
     try svc.upsertRange(.{
         .group_id = 2001,
+        .range_id = 2001,
         .table_id = 20,
         .start_key = "",
         .end_key = "doc:z",
+        .doc_identity_shard_id = 2001,
+        .doc_identity_range_id = 2001,
         .split_attempt_epoch = 1,
     });
     try svc.upsertSplitTransition(.{
@@ -7376,6 +7476,13 @@ test "metadata service proposes split transitions into the metadata group" {
         .phase = .prepare,
         .split_key = "doc:m",
         .source_range_end = "doc:z",
+        .table_contract = .{
+            .table_id = 20,
+            .table_name = "docs",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 2001, .range_id = 2001 },
+            .target_identity = .{ .shard_id = 2001, .range_id = 2001 },
+        },
     });
 
     try runServiceRounds(&svc, 8);
@@ -7711,15 +7818,21 @@ test "metadata service can apply reconciliation plan proposals" {
     try manager.upsertTable(.{ .table_id = 10, .name = "docs" });
     try manager.upsertRange(.{
         .group_id = 2101,
+        .range_id = 2101,
         .table_id = 10,
         .start_key = "doc:a",
         .end_key = "doc:m",
+        .doc_identity_shard_id = 2101,
+        .doc_identity_range_id = 2101,
     });
     try manager.upsertRange(.{
         .group_id = 2102,
+        .range_id = 2102,
         .table_id = 10,
         .start_key = "doc:m",
         .end_key = "doc:z",
+        .doc_identity_shard_id = 2102,
+        .doc_identity_range_id = 2102,
     });
     try manager.requestSplit(.{
         .transition_id = 9101,
@@ -7734,6 +7847,20 @@ test "metadata service can apply reconciliation plan proposals" {
     defer plan.deinit(std.testing.allocator);
 
     try svc.applyReconciliationPlan(&plan);
+    try runServiceRounds(&svc, 8);
+
+    const projected_tables = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, projected_tables);
+    const projected_ranges = try svc.listProjectedRanges(std.testing.allocator);
+    defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
+
+    var admission_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = projected_tables,
+        .ranges = projected_ranges,
+    });
+    defer admission_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), admission_plan.split_admissions.len);
+    try svc.applyReconciliationPlan(&admission_plan);
     try runServiceRounds(&svc, 8);
 
     const split_records = try svc.listProjectedSplitTransitions(std.testing.allocator);
@@ -9275,6 +9402,7 @@ test "metadata service shared-root reports survive transient rebuild marker remo
     const projected = try collectSharedRootLocalStoreStatusReports(
         .{},
         std.testing.allocator,
+        std.testing.io,
         replica_root,
         1,
         stores[0..],
@@ -9838,6 +9966,7 @@ test "metadata service prefers planned store affinity in shared roots" {
     const projected = try collectSharedRootLocalStoreStatusReports(
         .{},
         std.testing.allocator,
+        std.testing.io,
         replica_root,
         1,
         stores[0..],

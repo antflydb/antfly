@@ -118,6 +118,8 @@ const OwnerRegistry = struct {
     }
 
     fn deinit(self: *OwnerRegistry) void {
+        var iterator = self.states.valueIterator();
+        while (iterator.next()) |state| std.debug.assert(state.in_flight == 0);
         self.states.deinit(self.alloc);
         self.* = undefined;
     }
@@ -193,7 +195,8 @@ const OwnerRegistry = struct {
 pub const BackendRuntime = struct {
     alloc: Allocator,
     backend: Backend,
-    next_owner_id: AtomicU64 = .init(1),
+    next_owner_id: AtomicU64,
+    retired_generation_cleanup_owner_id: u64,
     owner_registry: *OwnerRegistry,
     io_impl: ?*IoImpl = null,
     raft_inbound_io_impl: ?*IoImpl = null,
@@ -210,10 +213,14 @@ pub const BackendRuntime = struct {
         errdefer alloc.destroy(owner_registry);
         owner_registry.* = OwnerRegistry.init(alloc);
         errdefer owner_registry.deinit();
+        const retired_generation_cleanup_owner_id: u64 = 1;
+        try owner_registry.register(retired_generation_cleanup_owner_id);
 
         var runtime = BackendRuntime{
             .alloc = alloc,
             .backend = config.backend,
+            .next_owner_id = .init(retired_generation_cleanup_owner_id + 1),
+            .retired_generation_cleanup_owner_id = retired_generation_cleanup_owner_id,
             .owner_registry = owner_registry,
             .durable_jobs = undefined,
         };
@@ -307,22 +314,13 @@ pub const BackendRuntime = struct {
         return self.api_io_impl orelse self.io_impl;
     }
 
-    pub fn tryAllocOwnerId(self: *BackendRuntime) !u64 {
+    pub fn allocOwnerId(self: *BackendRuntime) !u64 {
         while (true) {
             const owner_id = self.next_owner_id.fetchAdd(1, .monotonic);
             if (owner_id == 0) continue;
             try self.owner_registry.register(owner_id);
             return owner_id;
         }
-    }
-
-    /// Compatibility for infallible aggregate constructors. Production
-    /// fallible initialization paths should use `tryAllocOwnerId` so owner
-    /// registration failure is reported before the owner becomes visible.
-    pub fn allocOwnerId(self: *BackendRuntime) u64 {
-        return self.tryAllocOwnerId() catch {
-            @panic("background owner registration failed");
-        };
     }
 };
 
@@ -665,7 +663,7 @@ test "backend runtime durable lane runs inline jobs" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
     defer handle.deinit();
 
-    const owner_id = try handle.ptr().tryAllocOwnerId();
+    const owner_id = try handle.ptr().allocOwnerId();
     var ctx = Ctx{};
     try handle.ptr().durable_jobs.submit(.{
         .owner_id = owner_id,
@@ -700,7 +698,7 @@ test "backend runtime durable lane leaves inline failed jobs owned by caller" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
     defer handle.deinit();
 
-    const owner_id = try handle.ptr().tryAllocOwnerId();
+    const owner_id = try handle.ptr().allocOwnerId();
     var ctx = Ctx{};
     try std.testing.expectError(error.ExpectedFailure, handle.ptr().durable_jobs.submit(.{
         .owner_id = owner_id,
@@ -738,7 +736,7 @@ test "backend runtime threaded durable lane sees initialized jobs" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
-    const owner_id = try handle.ptr().tryAllocOwnerId();
+    const owner_id = try handle.ptr().allocOwnerId();
     var ctxs: [64]Ctx = [_]Ctx{.{}} ** 64;
     for (&ctxs) |*ctx| {
         try handle.ptr().durable_jobs.submit(.{
@@ -761,11 +759,23 @@ test "backend runtime allocates stable nonzero owner ids" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
     defer handle.deinit();
 
-    const first = try handle.ptr().tryAllocOwnerId();
-    const second = try handle.ptr().tryAllocOwnerId();
+    const first = try handle.ptr().allocOwnerId();
+    const second = try handle.ptr().allocOwnerId();
 
     try std.testing.expect(first != 0);
     try std.testing.expectEqual(first + 1, second);
+}
+
+test "backend runtime retires closed owner registry state" {
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer handle.deinit();
+
+    const shared_owner_count = handle.ptr().owner_registry.states.count();
+    for (0..1024) |_| {
+        const owner_id = try handle.ptr().allocOwnerId();
+        handle.ptr().durable_jobs.closeOwner(owner_id);
+    }
+    try std.testing.expectEqual(shared_owner_count, handle.ptr().owner_registry.states.count());
 }
 
 test "backend runtime durable lane drains threaded jobs by owner" {
@@ -790,8 +800,8 @@ test "backend runtime durable lane drains threaded jobs by owner" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
-    const first_owner_id = try handle.ptr().tryAllocOwnerId();
-    const second_owner_id = try handle.ptr().tryAllocOwnerId();
+    const first_owner_id = try handle.ptr().allocOwnerId();
+    const second_owner_id = try handle.ptr().allocOwnerId();
     var first = Ctx{};
     var second = Ctx{};
     try handle.ptr().durable_jobs.submit(.{
@@ -840,7 +850,7 @@ test "backend runtime threaded durable lane rejects jobs after owner close" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
-    const owner_id = try handle.ptr().tryAllocOwnerId();
+    const owner_id = try handle.ptr().allocOwnerId();
     var ctx = Ctx{};
     try handle.ptr().durable_jobs.submit(.{
         .owner_id = owner_id,
@@ -853,6 +863,7 @@ test "backend runtime threaded durable lane rejects jobs after owner close" {
 
     try std.testing.expectEqual(@as(u32, 1), ctx.ran.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), ctx.deinits.load(.acquire));
+    try std.testing.expect(!handle.ptr().owner_registry.states.contains(owner_id));
     try std.testing.expectError(error.BackgroundOwnerClosed, handle.ptr().durable_jobs.submit(.{
         .owner_id = owner_id,
         .class = .maintenance,
@@ -907,7 +918,7 @@ test "backend runtime owner close rejects recursive submit from draining job" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
-    const owner_id = try handle.ptr().tryAllocOwnerId();
+    const owner_id = try handle.ptr().allocOwnerId();
     var ctx = Ctx{ .lane = handle.ptr().durable_jobs, .owner_id = owner_id };
     try handle.ptr().durable_jobs.submit(.{
         .owner_id = owner_id,
@@ -953,7 +964,7 @@ test "backend runtime durable lane deinits threaded job payload after completion
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
-    const owner_id = try handle.ptr().tryAllocOwnerId();
+    const owner_id = try handle.ptr().allocOwnerId();
     var ctx = Ctx{};
     try handle.ptr().durable_jobs.submit(.{
         .owner_id = owner_id,
@@ -1002,7 +1013,7 @@ test "backend runtime threaded worker releases payload before reaper joins" {
     lockAtomic(&jobs.reap_mutex);
     defer jobs.reap_mutex.unlock();
 
-    const owner_id = try handle.ptr().tryAllocOwnerId();
+    const owner_id = try handle.ptr().allocOwnerId();
     var ctx = Ctx{};
     try handle.ptr().durable_jobs.submit(.{
         .owner_id = owner_id,

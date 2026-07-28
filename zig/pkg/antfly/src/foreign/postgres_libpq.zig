@@ -222,6 +222,7 @@ const FnPQconnectdb = *const fn ([*:0]const u8) callconv(.c) ?*PGconn;
 const FnPQconnectStart = *const fn ([*:0]const u8) callconv(.c) ?*PGconn;
 const FnPQconnectPoll = *const fn (?*PGconn) callconv(.c) c_uint;
 const FnPQexec = *const fn (?*PGconn, [*:0]const u8) callconv(.c) ?*PGresult;
+const FnPQsendQuery = *const fn (?*PGconn, [*:0]const u8) callconv(.c) c_int;
 const FnPQstatus = *const fn (?*PGconn) callconv(.c) ConnStatusType;
 const FnPQerrorMessage = *const fn (?*PGconn) callconv(.c) [*:0]const u8;
 const FnPQfinish = *const fn (?*PGconn) callconv(.c) void;
@@ -244,6 +245,110 @@ const FnPQgetisnull = *const fn (?*PGresult, c_int, c_int) callconv(.c) c_int;
 const FnPQgetlength = *const fn (?*PGresult, c_int, c_int) callconv(.c) c_int;
 const FnPQgetvalue = *const fn (?*PGresult, c_int, c_int) callconv(.c) [*]const u8;
 const FnPQclear = *const fn (?*PGresult) callconv(.c) void;
+
+const TestLibpqStubs = struct {
+    fn unexpected() noreturn {
+        @panic("permit-only test unexpectedly called libpq");
+    }
+
+    fn connectdb(_: [*:0]const u8) callconv(.c) ?*PGconn {
+        unexpected();
+    }
+    fn connectStart(_: [*:0]const u8) callconv(.c) ?*PGconn {
+        unexpected();
+    }
+    fn connectPoll(_: ?*PGconn) callconv(.c) c_uint {
+        unexpected();
+    }
+    fn exec(_: ?*PGconn, _: [*:0]const u8) callconv(.c) ?*PGresult {
+        unexpected();
+    }
+    fn sendQuery(_: ?*PGconn, _: [*:0]const u8) callconv(.c) c_int {
+        unexpected();
+    }
+    fn status(_: ?*PGconn) callconv(.c) ConnStatusType {
+        unexpected();
+    }
+    fn errorMessage(_: ?*PGconn) callconv(.c) [*:0]const u8 {
+        unexpected();
+    }
+    fn finish(_: ?*PGconn) callconv(.c) void {}
+    fn execParams(
+        _: ?*PGconn,
+        _: [*:0]const u8,
+        _: c_int,
+        _: ?[*]const Oid,
+        _: ?[*]const ?[*:0]const u8,
+        _: ?[*]const c_int,
+        _: ?[*]const c_int,
+        _: c_int,
+    ) callconv(.c) ?*PGresult {
+        unexpected();
+    }
+    fn sendQueryParams(
+        _: ?*PGconn,
+        _: [*:0]const u8,
+        _: c_int,
+        _: ?[*]const Oid,
+        _: ?[*]const ?[*:0]const u8,
+        _: ?[*]const c_int,
+        _: ?[*]const c_int,
+        _: c_int,
+    ) callconv(.c) c_int {
+        unexpected();
+    }
+    fn setnonblocking(_: ?*PGconn, _: c_int) callconv(.c) c_int {
+        unexpected();
+    }
+    fn flush(_: ?*PGconn) callconv(.c) c_int {
+        unexpected();
+    }
+    fn consumeInput(_: ?*PGconn) callconv(.c) c_int {
+        unexpected();
+    }
+    fn isBusy(_: ?*PGconn) callconv(.c) c_int {
+        unexpected();
+    }
+    fn getResult(_: ?*PGconn) callconv(.c) ?*PGresult {
+        unexpected();
+    }
+    fn socket(_: ?*PGconn) callconv(.c) c_int {
+        unexpected();
+    }
+    fn resultStatus(_: ?*PGresult) callconv(.c) ExecStatusType {
+        unexpected();
+    }
+    fn resultErrorMessage(_: ?*PGresult) callconv(.c) [*:0]const u8 {
+        unexpected();
+    }
+    fn resultErrorField(_: ?*PGresult, _: c_int) callconv(.c) ?[*:0]const u8 {
+        unexpected();
+    }
+    fn ntuples(_: ?*PGresult) callconv(.c) c_int {
+        unexpected();
+    }
+    fn nfields(_: ?*PGresult) callconv(.c) c_int {
+        unexpected();
+    }
+    fn fname(_: ?*PGresult, _: c_int) callconv(.c) ?[*:0]const u8 {
+        unexpected();
+    }
+    fn ftype(_: ?*PGresult, _: c_int) callconv(.c) Oid {
+        unexpected();
+    }
+    fn getisnull(_: ?*PGresult, _: c_int, _: c_int) callconv(.c) c_int {
+        unexpected();
+    }
+    fn getlength(_: ?*PGresult, _: c_int, _: c_int) callconv(.c) c_int {
+        unexpected();
+    }
+    fn getvalue(_: ?*PGresult, _: c_int, _: c_int) callconv(.c) [*]const u8 {
+        unexpected();
+    }
+    fn clear(_: ?*PGresult) callconv(.c) void {
+        unexpected();
+    }
+};
 
 const TypeOid = struct {
     const boolean = 16;
@@ -355,6 +460,7 @@ pub const Executor = struct {
     pqconnectStart: FnPQconnectStart,
     pqconnectPoll: FnPQconnectPoll,
     pqexec: FnPQexec,
+    pqsendQuery: FnPQsendQuery,
     pqstatus: FnPQstatus,
     pqerrorMessage: FnPQerrorMessage,
     pqfinish: FnPQfinish,
@@ -388,6 +494,7 @@ pub const Executor = struct {
             .pqconnectStart = try lookupRequired(&lib, FnPQconnectStart, "PQconnectStart"),
             .pqconnectPoll = try lookupRequired(&lib, FnPQconnectPoll, "PQconnectPoll"),
             .pqexec = try lookupRequired(&lib, FnPQexec, "PQexec"),
+            .pqsendQuery = try lookupRequired(&lib, FnPQsendQuery, "PQsendQuery"),
             .pqstatus = try lookupRequired(&lib, FnPQstatus, "PQstatus"),
             .pqerrorMessage = try lookupRequired(&lib, FnPQerrorMessage, "PQerrorMessage"),
             .pqfinish = try lookupRequired(&lib, FnPQfinish, "PQfinish"),
@@ -414,39 +521,40 @@ pub const Executor = struct {
     }
 
     /// Scheduler and pool-registry tests must not depend on a host libpq
-    /// installation. Only `pqfinish` is used by those tests; every other
-    /// function pointer remains deliberately inaccessible.
+    /// installation. Typed fail-fast stubs keep accidental future libpq use
+    /// deterministic instead of invoking an undefined function pointer.
     fn initForPermitTests(alloc: Allocator) @This() {
         if (!builtin.is_test) @compileError("initForPermitTests is test-only");
         return .{
             .alloc = alloc,
             .lib = null,
-            .pqconnectdb = undefined,
-            .pqconnectStart = undefined,
-            .pqconnectPoll = undefined,
-            .pqexec = undefined,
-            .pqstatus = undefined,
-            .pqerrorMessage = undefined,
-            .pqfinish = noopPQfinish,
-            .pqexecParams = undefined,
-            .pqsendQueryParams = undefined,
-            .pqsetnonblocking = undefined,
-            .pqflush = undefined,
-            .pqconsumeInput = undefined,
-            .pqisBusy = undefined,
-            .pqgetResult = undefined,
-            .pqsocket = undefined,
-            .pqresultStatus = undefined,
-            .pqresultErrorMessage = undefined,
-            .pqresultErrorField = undefined,
-            .pqntuples = undefined,
-            .pqnfields = undefined,
-            .pqfname = undefined,
-            .pqftype = undefined,
-            .pqgetisnull = undefined,
-            .pqgetlength = undefined,
-            .pqgetvalue = undefined,
-            .pqclear = undefined,
+            .pqconnectdb = TestLibpqStubs.connectdb,
+            .pqconnectStart = TestLibpqStubs.connectStart,
+            .pqconnectPoll = TestLibpqStubs.connectPoll,
+            .pqexec = TestLibpqStubs.exec,
+            .pqsendQuery = TestLibpqStubs.sendQuery,
+            .pqstatus = TestLibpqStubs.status,
+            .pqerrorMessage = TestLibpqStubs.errorMessage,
+            .pqfinish = TestLibpqStubs.finish,
+            .pqexecParams = TestLibpqStubs.execParams,
+            .pqsendQueryParams = TestLibpqStubs.sendQueryParams,
+            .pqsetnonblocking = TestLibpqStubs.setnonblocking,
+            .pqflush = TestLibpqStubs.flush,
+            .pqconsumeInput = TestLibpqStubs.consumeInput,
+            .pqisBusy = TestLibpqStubs.isBusy,
+            .pqgetResult = TestLibpqStubs.getResult,
+            .pqsocket = TestLibpqStubs.socket,
+            .pqresultStatus = TestLibpqStubs.resultStatus,
+            .pqresultErrorMessage = TestLibpqStubs.resultErrorMessage,
+            .pqresultErrorField = TestLibpqStubs.resultErrorField,
+            .pqntuples = TestLibpqStubs.ntuples,
+            .pqnfields = TestLibpqStubs.nfields,
+            .pqfname = TestLibpqStubs.fname,
+            .pqftype = TestLibpqStubs.ftype,
+            .pqgetisnull = TestLibpqStubs.getisnull,
+            .pqgetlength = TestLibpqStubs.getlength,
+            .pqgetvalue = TestLibpqStubs.getvalue,
+            .pqclear = TestLibpqStubs.clear,
         };
     }
 
@@ -614,35 +722,65 @@ pub const Executor = struct {
         alloc: Allocator,
         dsn: []const u8,
         params: foreign_source.ReplicationPollParams,
+        execution_deadline_ns: u64,
     ) !postgres_source.QueryExecutor.PreparedReplicationSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        try ensureDeadline(execution_deadline_ns);
         const slot_name = params.slot_name orelse return error.InvalidQueryRequest;
         const publication_name = params.publication_name orelse return error.InvalidQueryRequest;
 
-        const pool = try self.getOrCreateConnectionPool(dsn, null);
+        const pool = try self.getOrCreateConnectionPool(dsn, execution_deadline_ns);
         defer self.releaseConnectionPool(pool);
-        lock(&pool.control_mutex);
+        try lockUntil(&pool.control_mutex, execution_deadline_ns);
         defer pool.control_mutex.unlock();
 
         // Reserve both sockets atomically. Acquiring the replication socket
         // after opening the SQL socket can deadlock when many cutovers reach
         // the global ceiling together.
-        try self.acquireGlobalConnectionPermits(2, null);
+        try self.acquireGlobalConnectionPermits(2, execution_deadline_ns);
         var release_reserved_permits = true;
         errdefer if (release_reserved_permits) self.releaseGlobalConnections(2);
-        const sql_conn = try self.connectFresh(alloc, dsn);
+        const sql_conn = try self.connectFreshWithDeadline(dsn, execution_deadline_ns);
         errdefer self.pqfinish(sql_conn);
-        try self.ensurePublicationAlloc(alloc, dsn, sql_conn, publication_name, params.table, params.filter_query_json);
-        if (try self.logicalReplicationSlotExistsAlloc(alloc, sql_conn, slot_name)) {
+        try self.ensurePublicationAlloc(
+            alloc,
+            dsn,
+            sql_conn,
+            publication_name,
+            params.table,
+            params.filter_query_json,
+            execution_deadline_ns,
+        );
+        if (try self.logicalReplicationSlotExistsAlloc(
+            alloc,
+            sql_conn,
+            slot_name,
+            execution_deadline_ns,
+        )) {
             return error.UnsupportedExactCutover;
         }
 
-        const repl_conn = try self.connectReplicationFresh(alloc, dsn);
+        const repl_conn = try self.connectReplicationFreshWithDeadline(
+            alloc,
+            dsn,
+            execution_deadline_ns,
+        );
         errdefer self.pqfinish(repl_conn);
-        var exported = try self.createLogicalReplicationSlotExportSnapshotAlloc(alloc, repl_conn, slot_name);
+        var exported = try self.createLogicalReplicationSlotExportSnapshotAlloc(
+            alloc,
+            repl_conn,
+            slot_name,
+            execution_deadline_ns,
+        );
         defer exported.deinit(alloc);
 
-        const begin_result = try self.execSimpleAllowCommand(sql_conn, alloc, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+        const begin_result = try self.execSimpleWithDeadline(
+            sql_conn,
+            alloc,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+            execution_deadline_ns,
+            true,
+        );
         self.pqclear(begin_result);
         const quoted_snapshot = try quoteSqlStringLiteralAlloc(alloc, exported.snapshot_name);
         defer alloc.free(quoted_snapshot);
@@ -652,7 +790,13 @@ pub const Executor = struct {
             .{quoted_snapshot},
         );
         defer alloc.free(import_sql);
-        const import_result = try self.execSimpleAllowCommand(sql_conn, alloc, import_sql);
+        const import_result = try self.execSimpleWithDeadline(
+            sql_conn,
+            alloc,
+            import_sql,
+            execution_deadline_ns,
+            true,
+        );
         self.pqclear(import_result);
 
         const snapshot_query = try alloc.create(SnapshotQuery);
@@ -1037,7 +1181,11 @@ pub const Executor = struct {
         }
         self.permit_waiter_tail = waiter;
         waiter.queued = true;
-        _ = self.permit_waiter_count.fetchAdd(1, .release);
+        // Queue publication participates in the zero-waiter notification
+        // handshake. A producer that observed zero before this RMW publishes
+        // its capacity change to the newly queued waiter; a producer after
+        // this RMW must observe a non-zero count and enter the scheduler.
+        _ = self.permit_waiter_count.fetchAdd(1, .seq_cst);
     }
 
     fn removeGlobalPermitWaiterLocked(self: *@This(), waiter: *PermitWaiter) bool {
@@ -1057,9 +1205,23 @@ pub const Executor = struct {
         waiter.previous = null;
         waiter.next = null;
         waiter.queued = false;
-        const old_count = self.permit_waiter_count.fetchSub(1, .acq_rel);
+        const old_count = self.permit_waiter_count.fetchSub(1, .seq_cst);
         std.debug.assert(old_count > 0);
         return true;
+    }
+
+    fn hasPublishedGlobalPermitWaiters(self: *@This()) bool {
+        // Queue membership changes and this advisory gate share the global
+        // sequentially consistent order:
+        //
+        // * a producer ordered after enqueue observes a waiter and schedules it;
+        // * a producer ordered before enqueue may skip the mutex, but the new
+        //   waiter immediately rechecks atomic capacity and idle pools under
+        //   their publication locks before it can sleep.
+        //
+        // A read-only load keeps the common no-waiter path cache-friendly
+        // without allowing a stale zero to strand the FIFO head.
+        return self.permit_waiter_count.load(.seq_cst) != 0;
     }
 
     fn grantAvailableGlobalPermitWaitersLocked(self: *@This()) void {
@@ -1085,9 +1247,7 @@ pub const Executor = struct {
     }
 
     fn notifyGlobalPermitHead(self: *@This()) void {
-        // Queue membership is protected by permit_mutex. The atomic waiter
-        // count is observability only: using a potentially stale zero as a
-        // correctness gate can strand a waiter after the last idle return.
+        if (!self.hasPublishedGlobalPermitWaiters()) return;
         lock(&self.permit_mutex);
         if (self.permit_waiter_head) |waiter| waiter.availability.advance();
         self.permit_mutex.unlock();
@@ -1369,9 +1529,7 @@ pub const Executor = struct {
 
     fn releaseGlobalConnections(self: *@This(), count: usize) void {
         self.releaseGlobalConnectionsRaw(count);
-        // Always synchronize with queue publication. Releasing connections is
-        // substantially rarer than leasing an already-idle socket, and the
-        // uncontended mutex path is cheaper than a missed final handoff.
+        if (!self.hasPublishedGlobalPermitWaiters()) return;
         lock(&self.permit_mutex);
         self.grantAvailableGlobalPermitWaitersLocked();
         self.permit_mutex.unlock();
@@ -1610,6 +1768,17 @@ pub const Executor = struct {
         return try self.connectFresh(alloc, repl_dsn);
     }
 
+    fn connectReplicationFreshWithDeadline(
+        self: *@This(),
+        alloc: Allocator,
+        dsn: []const u8,
+        execution_deadline_ns: u64,
+    ) !*PGconn {
+        const repl_dsn = try appendReplicationModeAlloc(alloc, dsn);
+        defer alloc.free(repl_dsn);
+        return try self.connectFreshWithDeadline(repl_dsn, execution_deadline_ns);
+    }
+
     fn execPrepared(self: *@This(), conn: ?*PGconn, alloc: Allocator, prepared: sql.PreparedQuery) !?*PGresult {
         return try self.execPreparedInternal(conn, alloc, prepared, false);
     }
@@ -1622,6 +1791,27 @@ pub const Executor = struct {
         execution_deadline_ns: ?u64,
     ) !?*PGresult {
         const deadline_ns = execution_deadline_ns orelse return try self.execPrepared(conn, alloc, prepared);
+        return try self.execPreparedWithDeadlineInternal(conn, alloc, prepared, deadline_ns, false);
+    }
+
+    fn execPreparedAllowCommandWithDeadline(
+        self: *@This(),
+        conn: ?*PGconn,
+        alloc: Allocator,
+        prepared: sql.PreparedQuery,
+        execution_deadline_ns: u64,
+    ) !?*PGresult {
+        return try self.execPreparedWithDeadlineInternal(conn, alloc, prepared, execution_deadline_ns, true);
+    }
+
+    fn execPreparedWithDeadlineInternal(
+        self: *@This(),
+        conn: ?*PGconn,
+        alloc: Allocator,
+        prepared: sql.PreparedQuery,
+        deadline_ns: u64,
+        allow_command_ok: bool,
+    ) !?*PGresult {
         try ensureDeadline(deadline_ns);
         var owned_args = try OwnedArgs.init(alloc, prepared.args);
         defer owned_args.deinit(alloc);
@@ -1640,6 +1830,15 @@ pub const Executor = struct {
             0,
         ) != 1) return error.ForeignQueryFailed;
 
+        return try self.readAsyncResultWithDeadline(conn, deadline_ns, allow_command_ok);
+    }
+
+    fn readAsyncResultWithDeadline(
+        self: *@This(),
+        conn: ?*PGconn,
+        deadline_ns: u64,
+        allow_command_ok: bool,
+    ) !?*PGresult {
         while (true) {
             const flush_status = self.pqflush(conn);
             if (flush_status == 0) break;
@@ -1651,6 +1850,7 @@ pub const Executor = struct {
             if (self.pqconsumeInput(conn) != 1) return error.ForeignQueryFailed;
         }
 
+        try ensureDeadline(deadline_ns);
         const result = self.pqgetResult(conn) orelse return error.ForeignQueryFailed;
         var saw_extra_result = false;
         while (self.pqgetResult(conn)) |extra_result| {
@@ -1666,7 +1866,7 @@ pub const Executor = struct {
             return error.ForeignQueryFailed;
         }
         const status = self.pqresultStatus(result);
-        if (status != PGRES_TUPLES_OK) {
+        if (status != PGRES_TUPLES_OK and !(allow_command_ok and status == PGRES_COMMAND_OK)) {
             defer self.pqclear(result);
             return mapResultError(self.pqresultErrorField(result, PG_DIAG_SQLSTATE), self.pqresultErrorMessage(result));
         }
@@ -1709,6 +1909,27 @@ pub const Executor = struct {
 
     fn execSimpleAllowCommand(self: *@This(), conn: ?*PGconn, alloc: Allocator, sql_text: []const u8) !?*PGresult {
         return try self.execSimpleInternal(conn, alloc, sql_text, true);
+    }
+
+    fn execSimpleWithDeadline(
+        self: *@This(),
+        conn: ?*PGconn,
+        alloc: Allocator,
+        sql_text: []const u8,
+        execution_deadline_ns: u64,
+        allow_command_ok: bool,
+    ) !?*PGresult {
+        try ensureDeadline(execution_deadline_ns);
+        const sql_text_z = try alloc.dupeZ(u8, sql_text);
+        defer alloc.free(sql_text_z);
+
+        if (self.pqsetnonblocking(conn, 1) != 0) return error.ForeignQueryFailed;
+        if (self.pqsendQuery(conn, sql_text_z.ptr) != 1) return error.ForeignQueryFailed;
+        return try self.readAsyncResultWithDeadline(
+            conn,
+            execution_deadline_ns,
+            allow_command_ok,
+        );
     }
 
     fn execSimpleInternal(self: *@This(), conn: ?*PGconn, alloc: Allocator, sql_text: []const u8, allow_command_ok: bool) !?*PGresult {
@@ -1795,9 +2016,22 @@ pub const Executor = struct {
         std.log.info("postgres libpq poll connected table={s} slot={s}", .{ params.table, slot_name });
         var observed_checkpoint: ?[]u8 = null;
         errdefer if (observed_checkpoint) |value| alloc.free(value);
-        try self.ensurePublicationAlloc(alloc, dsn, conn, publication_name, params.table, params.filter_query_json);
+        try self.ensurePublicationAlloc(
+            alloc,
+            dsn,
+            conn,
+            publication_name,
+            params.table,
+            params.filter_query_json,
+            null,
+        );
         if (params.checkpoint) |checkpoint| {
-            if (checkpoint.len > 0 and !try self.logicalReplicationSlotExistsAlloc(alloc, conn, slot_name)) {
+            if (checkpoint.len > 0 and !try self.logicalReplicationSlotExistsAlloc(
+                alloc,
+                conn,
+                slot_name,
+                null,
+            )) {
                 return error.ForeignReplicationSlotMissing;
             }
             if (checkpoint.len > 0) {
@@ -1900,7 +2134,15 @@ pub const Executor = struct {
         std.log.info("postgres libpq prepare replication table={s} slot={s}", .{ params.table, slot_name });
         const conn = try self.connectCountedFresh(alloc, dsn, null);
         defer self.closeCountedConnection(conn);
-        try self.ensurePublicationAlloc(alloc, dsn, conn, publication_name, params.table, params.filter_query_json);
+        try self.ensurePublicationAlloc(
+            alloc,
+            dsn,
+            conn,
+            publication_name,
+            params.table,
+            params.filter_query_json,
+            null,
+        );
         const slot_existed = try self.ensureLogicalReplicationSlotAlloc(alloc, conn, slot_name);
         return .{
             .checkpoint = try self.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name),
@@ -1942,6 +2184,7 @@ pub const Executor = struct {
         publication_name: []const u8,
         table: []const u8,
         filter_query_json: ?[]const u8,
+        execution_deadline_ns: ?u64,
     ) !void {
         const check_args = try alloc.alloc(sql.ParameterValue, 1);
         check_args[0] = .{ .string = try alloc.dupe(u8, publication_name) };
@@ -1950,7 +2193,12 @@ pub const Executor = struct {
             .args = check_args,
         };
         defer check_prepared.deinit(alloc);
-        const check_result = try self.execPrepared(conn, alloc, check_prepared);
+        const check_result = try self.execPreparedWithDeadline(
+            conn,
+            alloc,
+            check_prepared,
+            execution_deadline_ns,
+        );
         defer self.pqclear(check_result);
         if (@as(usize, @intCast(self.pqntuples(check_result))) > 0) return;
 
@@ -1967,7 +2215,12 @@ pub const Executor = struct {
         var translated_filter: ?filter.Translation = null;
         defer if (translated_filter) |*value| value.deinit(alloc);
         if (filter_query_json) |query_json| {
-            const columns = try self.discoverColumnsAlloc(alloc, dsn, table);
+            const columns = try self.discoverColumnsAllocWithDeadline(
+                alloc,
+                dsn,
+                table,
+                execution_deadline_ns,
+            );
             defer freeColumns(alloc, columns);
             translated_filter = try filter.translateAlloc(alloc, sql.postgresDialect(), query_json, columns);
             if (translated_filter.?.where_sql.len > 0) {
@@ -1982,7 +2235,15 @@ pub const Executor = struct {
             .args = if (translated_filter) |value| try cloneParameterValuesAlloc(alloc, value.args) else &.{},
         };
         defer create_prepared.deinit(alloc);
-        const create_result = try self.execPreparedAllowCommand(conn, alloc, create_prepared);
+        const create_result = if (execution_deadline_ns) |deadline_ns|
+            try self.execPreparedAllowCommandWithDeadline(
+                conn,
+                alloc,
+                create_prepared,
+                deadline_ns,
+            )
+        else
+            try self.execPreparedAllowCommand(conn, alloc, create_prepared);
         defer self.pqclear(create_result);
     }
 
@@ -2056,7 +2317,13 @@ pub const Executor = struct {
         }
     };
 
-    fn logicalReplicationSlotExistsAlloc(self: *@This(), alloc: Allocator, conn: ?*PGconn, slot_name: []const u8) !bool {
+    fn logicalReplicationSlotExistsAlloc(
+        self: *@This(),
+        alloc: Allocator,
+        conn: ?*PGconn,
+        slot_name: []const u8,
+        execution_deadline_ns: ?u64,
+    ) !bool {
         const args = try alloc.alloc(sql.ParameterValue, 1);
         args[0] = .{ .string = try alloc.dupe(u8, slot_name) };
         var prepared = sql.PreparedQuery{
@@ -2064,7 +2331,12 @@ pub const Executor = struct {
             .args = args,
         };
         defer prepared.deinit(alloc);
-        const result = try self.execPrepared(conn, alloc, prepared);
+        const result = try self.execPreparedWithDeadline(
+            conn,
+            alloc,
+            prepared,
+            execution_deadline_ns,
+        );
         defer self.pqclear(result);
         return @as(usize, @intCast(self.pqntuples(result))) > 0;
     }
@@ -2074,6 +2346,7 @@ pub const Executor = struct {
         alloc: Allocator,
         conn: ?*PGconn,
         slot_name: []const u8,
+        execution_deadline_ns: u64,
     ) !ExportedReplicationSnapshot {
         const quoted_slot = try sql.postgresDialect().quote_identifier(alloc, slot_name);
         defer alloc.free(quoted_slot);
@@ -2083,7 +2356,13 @@ pub const Executor = struct {
             .{quoted_slot},
         );
         defer alloc.free(create_sql);
-        const result = try self.execSimple(conn, alloc, create_sql);
+        const result = try self.execSimpleWithDeadline(
+            conn,
+            alloc,
+            create_sql,
+            execution_deadline_ns,
+            false,
+        );
         defer self.pqclear(result);
         if (self.pqntuples(result) == 0 or self.pqnfields(result) < 3) return error.ForeignQueryFailed;
         if (self.pqgetisnull(result, 0, 1) != 0 or self.pqgetisnull(result, 0, 2) != 0) return error.ForeignQueryFailed;
@@ -2196,10 +2475,16 @@ const LazyExecutor = struct {
         alloc: Allocator,
         dsn: []const u8,
         params: foreign_source.ReplicationPollParams,
+        execution_deadline_ns: u64,
     ) !postgres_source.QueryExecutor.PreparedReplicationSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const executor = try self.ensureExecutor(null);
-        return try executor.asQueryExecutor().beginPreparedReplicationSnapshot(alloc, dsn, params);
+        const executor = try self.ensureExecutor(execution_deadline_ns);
+        return try executor.asQueryExecutor().beginPreparedReplicationSnapshot(
+            alloc,
+            dsn,
+            params,
+            execution_deadline_ns,
+        );
     }
 
     fn prepareReplication(
@@ -2670,8 +2955,6 @@ fn openDefaultLibpq() !std.DynLib {
     return error.LibpqUnavailable;
 }
 
-fn noopPQfinish(_: ?*PGconn) callconv(.c) void {}
-
 fn lookupRequired(lib: *std.DynLib, comptime T: type, name: [:0]const u8) !T {
     return lib.lookup(T, name) orelse error.MissingLibpqSymbol;
 }
@@ -3058,6 +3341,99 @@ test "postgres libpq weighted FIFO preserves a queued two-permit cutover" {
     small_joined = true;
     try std.testing.expect(!failed.load(.acquire));
     try std.testing.expect(small_acquired.load(.acquire));
+}
+
+test "postgres libpq timed out weighted head hands released capacity to follower" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.initForPermitTests(alloc);
+    defer executor.deinit();
+
+    try std.testing.expect(executor.reserveGlobalConnections(max_total_connections));
+    var head_timed_out: std.atomic.Value(bool) = .init(false);
+    var follower_acquired: std.atomic.Value(bool) = .init(false);
+    var failed: std.atomic.Value(bool) = .init(false);
+
+    const Head = struct {
+        fn run(
+            inner: *Executor,
+            deadline_ns: u64,
+            timed_out: *std.atomic.Value(bool),
+            failure: *std.atomic.Value(bool),
+        ) void {
+            inner.acquireGlobalConnectionPermits(2, deadline_ns) catch |err| {
+                if (err == error.Timeout) {
+                    timed_out.store(true, .release);
+                } else {
+                    failure.store(true, .release);
+                }
+                return;
+            };
+            failure.store(true, .release);
+            inner.releaseGlobalConnections(2);
+        }
+    };
+    const Follower = struct {
+        fn run(
+            inner: *Executor,
+            deadline_ns: u64,
+            acquired: *std.atomic.Value(bool),
+            failure: *std.atomic.Value(bool),
+        ) void {
+            inner.acquireGlobalConnectionPermits(1, deadline_ns) catch {
+                failure.store(true, .release);
+                return;
+            };
+            acquired.store(true, .release);
+            inner.releaseGlobalConnections(1);
+        }
+    };
+
+    const head_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    const test_deadline_ns = head_deadline_ns + 5 * std.time.ns_per_s;
+    const head = try std.Thread.spawn(
+        .{},
+        Head.run,
+        .{ &executor, head_deadline_ns, &head_timed_out, &failed },
+    );
+    var head_joined = false;
+    defer {
+        if (!head_joined) head.join();
+        const remaining = executor.total_connections.load(.acquire);
+        if (remaining > 0) executor.releaseGlobalConnections(remaining);
+    }
+
+    while (executor.permit_waiter_count.load(.acquire) != 1) {
+        try ensureDeadline(test_deadline_ns);
+        spinOrYield();
+    }
+    const follower = try std.Thread.spawn(
+        .{},
+        Follower.run,
+        .{ &executor, test_deadline_ns, &follower_acquired, &failed },
+    );
+    var follower_joined = false;
+    defer if (!follower_joined) follower.join();
+
+    while (executor.permit_waiter_count.load(.acquire) != 2) {
+        try ensureDeadline(test_deadline_ns);
+        spinOrYield();
+    }
+    while (platform_time.monotonicNs() < head_deadline_ns) spinOrYield();
+
+    // This release deliberately races the head's timed wait cleanup. Whether
+    // cancellation or release enters the scheduler first, the expired
+    // two-permit owner must roll back exactly once and the one-permit follower
+    // must receive the available slot.
+    executor.releaseGlobalConnections(1);
+    head.join();
+    head_joined = true;
+    follower.join();
+    follower_joined = true;
+
+    try std.testing.expect(head_timed_out.load(.acquire));
+    try std.testing.expect(follower_acquired.load(.acquire));
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, max_total_connections - 1), executor.total_connections.load(.acquire));
 }
 
 test "postgres libpq cancelled FIFO head hands capacity to next waiter" {
@@ -4179,7 +4555,12 @@ test "postgres libpq prepared replication snapshot bridges initial cutover" {
         .publication_name = try alloc.dupe(u8, publication_name),
     };
     defer begin_params.deinit(alloc);
-    var prepared = try executor.asQueryExecutor().beginPreparedReplicationSnapshot(alloc, dsn, begin_params);
+    var prepared = try executor.asQueryExecutor().beginPreparedReplicationSnapshot(
+        alloc,
+        dsn,
+        begin_params,
+        platform_time.monotonicNs() + 30 * std.time.ns_per_s,
+    );
     defer prepared.deinit(alloc);
     try std.testing.expect(prepared.checkpoint.len > 0);
 

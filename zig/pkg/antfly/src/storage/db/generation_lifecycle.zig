@@ -140,18 +140,20 @@ pub const PublicationOutcome = enum {
 
 const CleanupScheduler = struct {
     alloc: Allocator,
+    io: std.Io,
     lane: background_runtime.DurableJobLane,
     owner_id: u64,
 
-    fn fromRuntime(runtime: ?*background_runtime.BackendRuntime) !?CleanupScheduler {
+    fn fromRuntime(runtime: ?*background_runtime.BackendRuntime) ?CleanupScheduler {
         const active = runtime orelse return null;
         // The manual runtime executes jobs inline. Preserve cleanup as durable
         // reconciliation debt instead of extending publication downtime.
         if (active.threaded_jobs == null) return null;
         return .{
             .alloc = active.alloc,
+            .io = active.io() orelse return null,
             .lane = active.durable_jobs,
-            .owner_id = try active.tryAllocOwnerId(),
+            .owner_id = active.retired_generation_cleanup_owner_id,
         };
     }
 };
@@ -1024,6 +1026,7 @@ fn clearPublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) bool {
 
 const RetiredGenerationCleanupBatch = struct {
     alloc: Allocator,
+    io: std.Io,
     paths: [][]u8,
     parent: []u8,
 
@@ -1033,10 +1036,7 @@ const RetiredGenerationCleanupBatch = struct {
             test_retired_cleanup_started.store(true, .release);
             while (test_block_retired_cleanup.load(.acquire)) platform.time.yieldBriefly();
         }
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        try deleteRetiredGenerationPaths(self.alloc, io, self.paths, self.parent);
+        try deleteRetiredGenerationPaths(self.alloc, self.io, self.paths, self.parent);
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -1103,6 +1103,7 @@ fn scheduleRetiredGenerationCleanupBatch(scheduler: ?CleanupScheduler, paths: []
     }
     work.* = .{
         .alloc = active.alloc,
+        .io = active.io,
         .paths = owned_paths,
         .parent = try active.alloc.dupe(u8, parent),
     };
@@ -1324,7 +1325,7 @@ pub fn acquirePublishedGenerationReadWithRuntime(alloc: Allocator, path: []const
         for (deferred_cleanup.items) |stale_path| alloc.free(stale_path);
         deferred_cleanup.deinit(alloc);
     }
-    const cleanup_scheduler = try CleanupScheduler.fromRuntime(runtime);
+    const cleanup_scheduler = CleanupScheduler.fromRuntime(runtime);
     const reconciled = try reconcilePublishedGeneration(alloc, io, path, cleanup_scheduler, &deferred_cleanup);
     try publication_lock.downgradeLock(io);
     var read_lease = try reconciliation.promoteToRead(publication_lock, reconciled);
@@ -1424,13 +1425,12 @@ pub fn beginProcessExclusive(path: []const u8) !ExclusiveTransition {
 
 pub fn beginProcessExclusiveWithRuntime(path: []const u8, runtime: ?*background_runtime.BackendRuntime) !ExclusiveTransition {
     var transition = try process_manager.beginExclusive(path);
-    errdefer transition.deinit();
-    transition.cleanup_scheduler = try CleanupScheduler.fromRuntime(runtime);
+    transition.cleanup_scheduler = CleanupScheduler.fromRuntime(runtime);
     return transition;
 }
 
 pub fn beginProcessPreparationWithRuntime(path: []const u8, runtime: ?*background_runtime.BackendRuntime) !PreparationTransition {
-    return try process_manager.beginPreparation(path, try CleanupScheduler.fromRuntime(runtime));
+    return try process_manager.beginPreparation(path, CleanupScheduler.fromRuntime(runtime));
 }
 
 pub fn hasPublishedGenerationRead(path: []const u8) !bool {

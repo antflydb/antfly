@@ -284,7 +284,7 @@ pub const MetadataServer = struct {
             const runtime = try self.svc.ensureBackendRuntime();
             if (runtime.threaded_jobs != null and runtime.io() != null) {
                 self.restore_supervisor_stop.store(false, .release);
-                self.restore_supervisor_owner_id = try runtime.tryAllocOwnerId();
+                self.restore_supervisor_owner_id = try runtime.allocOwnerId();
                 errdefer self.restore_supervisor_owner_id = 0;
                 try runtime.durable_jobs.submit(.{
                     .owner_id = self.restore_supervisor_owner_id,

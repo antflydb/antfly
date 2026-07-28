@@ -229,6 +229,33 @@ pub fn readinessForGroup(
     return readiness;
 }
 
+/// Derive readiness from replicated transition records and their latest
+/// control-plane observations without opening local transition storage.
+pub fn readinessForGroupWithObservations(
+    group_id: u64,
+    split_transitions: []const SplitTransitionRecord,
+    merge_transitions: []const MergeTransitionRecord,
+    split_observations: []const SplitObservationRecord,
+    merge_observations: []const MergeObservationRecord,
+) GroupTransitionReadiness {
+    var readiness = GroupTransitionReadiness{};
+    for (split_transitions) |record| {
+        if (record.source_group_id != group_id and record.destination_group_id != group_id) continue;
+        readiness = combineReadiness(
+            readiness,
+            readinessResultForSplitTransition(record, split_observations).readiness,
+        );
+    }
+    for (merge_transitions) |record| {
+        if (record.donor_group_id != group_id and record.receiver_group_id != group_id) continue;
+        readiness = combineReadiness(
+            readiness,
+            readinessResultForMergeTransition(record, merge_observations).readiness,
+        );
+    }
+    return readiness;
+}
+
 pub fn readinessForLocalGroup(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -299,6 +326,12 @@ pub fn readinessResultForSplitTransition(
     record: SplitTransitionRecord,
     split_observations: []const SplitObservationRecord,
 ) GroupTransitionReadinessResult {
+    if (transitionPhaseTerminal(record.phase)) {
+        return .{
+            .readiness = readinessFromPhase(record.phase),
+            .source = .phase,
+        };
+    }
     if (findSplitObservation(split_observations, record.transition_id)) |observation| {
         return .{
             .readiness = readinessFromObservedSplit(observation.status),
@@ -334,6 +367,12 @@ pub fn readinessResultForMergeTransition(
     record: MergeTransitionRecord,
     merge_observations: []const MergeObservationRecord,
 ) GroupTransitionReadinessResult {
+    if (transitionPhaseTerminal(record.phase)) {
+        return .{
+            .readiness = readinessFromPhase(record.phase),
+            .source = .phase,
+        };
+    }
     if (findMergeObservation(merge_observations, record.transition_id)) |observation| {
         return .{
             .readiness = readinessFromObservedMerge(observation.receiver),
@@ -344,6 +383,10 @@ pub fn readinessResultForMergeTransition(
         .readiness = readinessFromPhase(record.phase),
         .source = .phase,
     };
+}
+
+fn transitionPhaseTerminal(phase: TransitionPhase) bool {
+    return phase == .finalized or phase == .rolled_back;
 }
 
 fn readinessFromPhase(phase: TransitionPhase) GroupTransitionReadiness {
@@ -499,6 +542,7 @@ test "transition state module compiles" {
     _ = StablePlacementReadiness;
     _ = TransitionTableContract;
     _ = readinessForGroup;
+    _ = readinessForGroupWithObservations;
     _ = readinessForLocalGroup;
     _ = readinessResultForLocalSplitTransition;
     _ = readinessResultForLocalMergeTransition;
@@ -571,6 +615,106 @@ test "transition state leaves readiness empty for unrelated groups" {
     try std.testing.expect(!readiness.replay_caught_up);
     try std.testing.expect(!readiness.cutover_ready);
     try std.testing.expect(!readiness.reads_ready_after_cutover);
+}
+
+test "transition state control-plane readiness prefers replicated observations" {
+    const readiness = readinessForGroupWithObservations(
+        12,
+        &[_]SplitTransitionRecord{.{
+            .transition_id = 9001,
+            .attempt_epoch = 1,
+            .source_group_id = 10,
+            .destination_group_id = 12,
+            .phase = .prepare,
+        }},
+        &.{},
+        &[_]SplitObservationRecord{.{
+            .transition_id = 9001,
+            .observation = .{
+                .status = .{
+                    .phase = .cutover_ready,
+                    .source_split_phase = .splitting,
+                    .bootstrapped = true,
+                    .replay_required = true,
+                    .replay_caught_up = true,
+                    .cutover_ready = true,
+                    .destination_ready_for_reads = true,
+                    .source_delta_sequence = 5,
+                    .dest_delta_sequence = 5,
+                },
+            },
+        }},
+        &.{},
+    );
+    try std.testing.expect(readiness.transition_pending);
+    try std.testing.expect(readiness.replay_required);
+    try std.testing.expect(readiness.replay_caught_up);
+    try std.testing.expect(readiness.cutover_ready);
+    try std.testing.expect(readiness.reads_ready_after_cutover);
+}
+
+test "transition state does not publish terminal records as pending" {
+    const finalized = readinessForGroupWithObservations(
+        12,
+        &[_]SplitTransitionRecord{.{
+            .transition_id = 9001,
+            .attempt_epoch = 1,
+            .source_group_id = 10,
+            .destination_group_id = 12,
+            .phase = .finalized,
+        }},
+        &.{},
+        &[_]SplitObservationRecord{.{
+            .transition_id = 9001,
+            .observation = .{
+                .status = .{
+                    .phase = .prepare,
+                    .source_split_phase = null,
+                    .bootstrapped = false,
+                    .replay_required = false,
+                    .replay_caught_up = false,
+                    .cutover_ready = false,
+                    .destination_ready_for_reads = false,
+                    .source_delta_sequence = 0,
+                    .dest_delta_sequence = 0,
+                },
+            },
+        }},
+        &.{},
+    );
+    try std.testing.expect(!finalized.transition_pending);
+    try std.testing.expect(finalized.reads_ready_after_cutover);
+
+    const rolled_back = readinessForGroupWithObservations(
+        12,
+        &[_]SplitTransitionRecord{.{
+            .transition_id = 9002,
+            .attempt_epoch = 2,
+            .source_group_id = 10,
+            .destination_group_id = 12,
+            .phase = .rolled_back,
+        }},
+        &.{},
+        &[_]SplitObservationRecord{.{
+            .transition_id = 9002,
+            .observation = .{
+                .status = .{
+                    .phase = .cutover_ready,
+                    .source_split_phase = .splitting,
+                    .bootstrapped = true,
+                    .replay_required = true,
+                    .replay_caught_up = true,
+                    .cutover_ready = true,
+                    .destination_ready_for_reads = true,
+                    .source_delta_sequence = 5,
+                    .dest_delta_sequence = 5,
+                },
+            },
+        }},
+        &.{},
+    );
+    try std.testing.expect(!rolled_back.transition_pending);
+    try std.testing.expect(!rolled_back.reads_ready_after_cutover);
 }
 
 test "transition state prefers observed local split readiness over metadata phase" {
