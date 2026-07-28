@@ -178,21 +178,20 @@ test "metadata control loop proposes desired transitions through the service sea
 
         pub fn listProjectedRanges(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
             const out = try alloc.alloc(metadata_table_manager.RangeRecord, self.ranges.len);
-            errdefer alloc.free(out);
-            for (self.ranges, 0..) |record, i| out[i] = .{
-                .group_id = record.group_id,
-                .table_id = record.table_id,
-                .start_key = try alloc.dupe(u8, record.start_key),
-                .end_key = if (record.end_key) |end| try alloc.dupe(u8, end) else null,
-            };
+            var cloned: usize = 0;
+            errdefer {
+                for (out[0..cloned]) |record| metadata_table_manager.freeRange(alloc, record);
+                alloc.free(out);
+            }
+            for (self.ranges, 0..) |record, i| {
+                out[i] = try metadata_table_manager.cloneRange(alloc, record);
+                cloned += 1;
+            }
             return out;
         }
 
         pub fn freeProjectedRanges(_: *@This(), alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
-            for (records) |record| {
-                alloc.free(record.start_key);
-                if (record.end_key) |end| alloc.free(end);
-            }
+            for (records) |record| metadata_table_manager.freeRange(alloc, record);
             alloc.free(records);
         }
 
@@ -305,21 +304,20 @@ test "metadata control loop plans placement intents from desired topology and ca
 
         pub fn listProjectedRanges(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
             const out = try alloc.alloc(metadata_table_manager.RangeRecord, self.ranges.len);
-            errdefer alloc.free(out);
-            for (self.ranges, 0..) |record, i| out[i] = .{
-                .group_id = record.group_id,
-                .table_id = record.table_id,
-                .start_key = try alloc.dupe(u8, record.start_key),
-                .end_key = if (record.end_key) |end| try alloc.dupe(u8, end) else null,
-            };
+            var cloned: usize = 0;
+            errdefer {
+                for (out[0..cloned]) |record| metadata_table_manager.freeRange(alloc, record);
+                alloc.free(out);
+            }
+            for (self.ranges, 0..) |record, i| {
+                out[i] = try metadata_table_manager.cloneRange(alloc, record);
+                cloned += 1;
+            }
             return out;
         }
 
         pub fn freeProjectedRanges(_: *@This(), alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
-            for (records) |record| {
-                alloc.free(record.start_key);
-                if (record.end_key) |end| alloc.free(end);
-            }
+            for (records) |record| metadata_table_manager.freeRange(alloc, record);
             alloc.free(records);
         }
 
@@ -609,21 +607,20 @@ test "metadata control loop rewrites desired topology after finalized split" {
 
         pub fn listProjectedRanges(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
             const out = try alloc.alloc(metadata_table_manager.RangeRecord, self.ranges.len);
-            errdefer alloc.free(out);
-            for (self.ranges, 0..) |record, i| out[i] = .{
-                .group_id = record.group_id,
-                .table_id = record.table_id,
-                .start_key = try alloc.dupe(u8, record.start_key),
-                .end_key = if (record.end_key) |end| try alloc.dupe(u8, end) else null,
-            };
+            var cloned: usize = 0;
+            errdefer {
+                for (out[0..cloned]) |record| metadata_table_manager.freeRange(alloc, record);
+                alloc.free(out);
+            }
+            for (self.ranges, 0..) |record, i| {
+                out[i] = try metadata_table_manager.cloneRange(alloc, record);
+                cloned += 1;
+            }
             return out;
         }
 
         pub fn freeProjectedRanges(_: *@This(), alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
-            for (records) |record| {
-                alloc.free(record.start_key);
-                if (record.end_key) |end| alloc.free(end);
-            }
+            for (records) |record| metadata_table_manager.freeRange(alloc, record);
             alloc.free(records);
         }
 
@@ -637,18 +634,14 @@ test "metadata control loop rewrites desired topology after finalized split" {
 
         pub fn listProjectedSplitTransitions(self: *@This(), alloc: std.mem.Allocator) ![]transition_state.SplitTransitionRecord {
             const out = try alloc.alloc(transition_state.SplitTransitionRecord, self.split_records.len);
-            errdefer alloc.free(out);
+            var cloned: usize = 0;
+            errdefer {
+                for (out[0..cloned]) |record| metadata_table_manager.freeSplitTransitionRecord(alloc, record);
+                alloc.free(out);
+            }
             for (self.split_records, 0..) |record, i| {
-                out[i] = .{
-                    .transition_id = record.transition_id,
-                    .attempt_epoch = record.attempt_epoch,
-                    .source_group_id = record.source_group_id,
-                    .destination_group_id = record.destination_group_id,
-                    .phase = record.phase,
-                    .split_key = if (record.split_key) |value| try alloc.dupe(u8, value) else null,
-                    .source_range_end = if (record.source_range_end) |value| try alloc.dupe(u8, value) else null,
-                    .rollback_reason = null,
-                };
+                out[i] = try metadata_table_manager.cloneSplitTransitionRecord(alloc, record);
+                cloned += 1;
             }
             return out;
         }
@@ -699,10 +692,15 @@ test "metadata control loop rewrites desired topology after finalized split" {
     const tables = [_]metadata_table_manager.TableRecord{
         .{ .table_id = 10, .name = "docs" },
     };
-    const ranges = [_]metadata_table_manager.RangeRecord{
-        .{ .group_id = 101, .table_id = 10, .start_key = "doc:a", .end_key = "doc:z" },
+    const desired_ranges = [_]metadata_table_manager.RangeRecord{
+        .{
+            .group_id = 101,
+            .table_id = 10,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        },
     };
-    try loop.stateRef().tableManager().replaceTopology(&tables, &ranges);
+    try loop.stateRef().tableManager().replaceTopology(&tables, &desired_ranges);
     try loop.stateRef().tableManager().requestSplit(.{
         .transition_id = 8001,
         .table_id = 10,
@@ -711,7 +709,16 @@ test "metadata control loop rewrites desired topology after finalized split" {
         .split_key = "doc:m",
     });
 
-    const split_records = [_]transition_state.SplitTransitionRecord{
+    const projected_ranges = [_]metadata_table_manager.RangeRecord{
+        .{
+            .group_id = 101,
+            .table_id = 10,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+            .split_attempt_epoch = 1,
+        },
+    };
+    var split_records = [_]transition_state.SplitTransitionRecord{
         .{
             .transition_id = 8001,
             .attempt_epoch = 1,
@@ -720,19 +727,40 @@ test "metadata control loop rewrites desired topology after finalized split" {
             .phase = .finalizing,
             .split_key = "doc:m",
             .source_range_end = "doc:z",
+            .table_contract = .{
+                .table_id = 10,
+                .table_name = "docs",
+                .indexes_json = "{}",
+                .source_identity = .{ .shard_id = 101, .range_id = 101 },
+                .target_identity = .{ .shard_id = 101, .range_id = 101 },
+            },
         },
     };
     var fake = FakeService{
         .tables = &tables,
-        .ranges = &ranges,
+        .ranges = &projected_ranges,
         .split_records = &split_records,
     };
 
-    const summary = try loop.reconcileOnce(&fake);
-    try std.testing.expectEqual(@as(usize, 2), summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
-    try std.testing.expectEqual(@as(usize, 0), summary.split_removals);
-    try std.testing.expectEqual(@as(usize, 2), fake.range_upserts);
+    const terminal_summary = try loop.reconcileOnce(&fake);
+    try std.testing.expectEqual(@as(usize, 0), terminal_summary.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), terminal_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 0), terminal_summary.split_removals);
+    try std.testing.expectEqual(@as(usize, 0), fake.range_upserts);
     try std.testing.expectEqual(@as(usize, 1), fake.split_upserts);
     try std.testing.expectEqual(@as(usize, 0), fake.split_removals);
+
+    // The immutable contract fences range mutation until the terminal
+    // transition record is durably projected. The next round can publish the
+    // replacement ranges and retire the transition.
+    split_records[0].phase = .finalized;
+    try loop.stateRef().syncProjected(&fake);
+    try loop.stateRef().seedDesiredFromProjected();
+    const topology_summary = try loop.reconcilePrepared(&fake);
+    try std.testing.expectEqual(@as(usize, 2), topology_summary.range_upserts);
+    try std.testing.expectEqual(@as(usize, 0), topology_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), topology_summary.split_removals);
+    try std.testing.expectEqual(@as(usize, 2), fake.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), fake.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), fake.split_removals);
 }

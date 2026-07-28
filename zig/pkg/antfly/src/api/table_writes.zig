@@ -28837,7 +28837,6 @@ test "structural reconcile publishes durable index repair debt once per group" {
     const DebtCapture = struct {
         enqueue_calls: usize = 0,
         runnable_enqueue_calls: usize = 0,
-        remove_calls: usize = 0,
 
         fn onDebt(ptr: *anyopaque, table_name: []const u8, group_id: u64, action: ProvisionedTableWriteSource.LocalIndexRepairDebtAction) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -28849,7 +28848,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
                     self.enqueue_calls += 1;
                     self.runnable_enqueue_calls += 1;
                 },
-                .remove => self.remove_calls += 1,
+                .remove => {},
                 .cancel, .clear_cancel => unreachable,
             }
         }
@@ -28936,7 +28935,8 @@ test "structural reconcile publishes durable index repair debt once per group" {
         try source.reconcileTableStructureStep(alloc, &request),
     );
     try std.testing.expectEqual(first_pass_enqueue_calls, capture.enqueue_calls);
-    try std.testing.expect(capture.remove_calls >= 1);
+    // Queue retirement belongs to the aggregate DataServer scheduler after it
+    // verifies that no other named index intent remains in this group.
 }
 
 test "structural reconcile pending set never revisits completed groups" {

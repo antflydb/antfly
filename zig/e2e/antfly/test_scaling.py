@@ -1041,6 +1041,40 @@ def _table_group_ids(cluster: MultiNodeScalingCluster, table_name: str) -> set[i
     return group_ids if group_ids else None
 
 
+def _oversized_table_group_ids(
+    cluster: MultiNodeScalingCluster,
+    table_name: str,
+    max_shard_size_bytes: int,
+) -> set[int] | None:
+    snapshot = cluster.metadata_snapshot()
+    table_id = next(
+        (
+            int(table["table_id"])
+            for table in snapshot.get("tables", [])
+            if isinstance(table, dict) and table.get("name") == table_name
+        ),
+        None,
+    )
+    if table_id is None:
+        return None
+
+    table_group_ids = {
+        int(record["group_id"])
+        for record in snapshot.get("ranges", [])
+        if isinstance(record, dict) and int(record.get("table_id", 0)) == table_id
+    }
+    oversized_group_ids = {
+        int(status["group_id"])
+        for status in snapshot.get("merged_group_statuses", [])
+        if isinstance(status, dict)
+        and int(status.get("group_id", 0)) in table_group_ids
+        and status.get("leader_known") is True
+        and status.get("disk_bytes_known") is True
+        and int(status.get("disk_bytes", 0)) > max_shard_size_bytes
+    }
+    return oversized_group_ids if oversized_group_ids else None
+
+
 def _placed_nodes_for_groups(cluster: MultiNodeScalingCluster, group_ids: set[int]) -> set[int]:
     snapshot = cluster.metadata_snapshot()
     return {
@@ -1645,6 +1679,27 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
     phase_started = time.monotonic()
     _insert_docs(cluster, table_name, docs, min_group_count=1)
     timings.record("insert_docs", phase_started)
+
+    phase_started = time.monotonic()
+    oversized_groups = wait_until(
+        lambda: _oversized_table_group_ids(
+            cluster,
+            table_name,
+            cluster.max_shard_size_bytes,
+        ),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    timings.record("oversized_status_observed", phase_started)
+    assert oversized_groups is not None, (
+        "metadata did not observe the source shard above the configured size threshold\n"
+        f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
+        f"{cluster.debug_logs()}"
+    )
+
+    phase_started = time.monotonic()
+    cluster.trigger_reallocate()
+    timings.record("reallocate_requested", phase_started)
 
     def split_completed() -> set[int] | None:
         try:

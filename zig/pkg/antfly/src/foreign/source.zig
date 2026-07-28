@@ -183,9 +183,9 @@ pub const ReplicationChange = struct {
     }
 };
 
-/// Synchronous durability barrier invoked after the provider proves that the
-/// configured slot name is available, but before it creates a persistent
-/// exact-cutover slot. The callback lifetime is limited to the enclosing
+/// Synchronous durability barrier invoked after the provider inspects the
+/// physical slot, but before it deletes or creates persistent provider state.
+/// The callback lifetime is limited to the enclosing
 /// beginPreparedReplicationSnapshot call.
 pub const ExactCutoverIntent = struct {
     ptr: *anyopaque,
@@ -203,9 +203,9 @@ pub const ReplicationPollParams = struct {
     filter_query_json: ?[]u8 = null,
     checkpoint: ?[]u8 = null,
     limit: ?usize = null,
-    /// A replicated pending intent proves that an existing inactive slot with
-    /// this name belongs to an interrupted exact-cutover attempt and may be
-    /// reclaimed. Never set this based only on the slot naming convention.
+    /// A replicated pending intent proves that this attempt-scoped physical
+    /// slot belongs to an interrupted exact cutover and may be reclaimed.
+    /// Never set this based only on a configured/provider-visible name.
     reclaim_exact_cutover_slot: bool = false,
     exact_cutover_intent: ?ExactCutoverIntent = null,
 

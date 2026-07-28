@@ -885,6 +885,10 @@ pub const ReplicationSourceStatusRecord = struct {
     /// Retries must present this identity and the matching configuration
     /// fingerprint before reclaiming the provider slot.
     cutover_intent_id: u64 = 0,
+    /// Fresh for every provider mutation attempt. Unlike cutover_intent_id,
+    /// this token is never reused after an authority handoff; the durable
+    /// acknowledgement must match it before provider state may be changed.
+    cutover_authority_id: u64 = 0,
     cutover_config_fingerprint: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
         [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
     updated_at_ms: u64 = 0,
@@ -1269,6 +1273,40 @@ pub const TableManager = struct {
         hydrated.items.len = 0;
     }
 
+    /// Reconstruct topology changes whose terminal transition marker committed
+    /// before all range records. The marker is a write-ahead intent: replay is
+    /// idempotent across authority handoff and every partially published prefix.
+    pub fn applyProjectedTerminalTransitions(
+        self: *TableManager,
+        split_records: []const transition_state.SplitTransitionRecord,
+        merge_records: []const transition_state.MergeTransitionRecord,
+    ) !void {
+        for (split_records) |record| switch (record.phase) {
+            .finalized => {
+                try self.materializeFinalizedSplit(record);
+                _ = self.removeSplitIntent(record.transition_id);
+            },
+            .rolled_back => {
+                try record.table_contract.validateForSplit();
+                _ = self.removeSplitIntent(record.transition_id);
+            },
+            else => {},
+        };
+        for (merge_records) |record| switch (record.phase) {
+            .finalized => {
+                try self.materializeFinalizedMerge(record);
+                _ = self.removeMergeIntent(record.transition_id);
+            },
+            .rolled_back => {
+                try record.table_contract.validateForMerge(
+                    record.allow_doc_identity_reassignment,
+                );
+                _ = self.removeMergeIntent(record.transition_id);
+            },
+            else => {},
+        };
+    }
+
     pub fn removeSplitIntent(self: *TableManager, transition_id: u64) bool {
         if (self.split_intents.fetchRemove(transition_id)) |entry| {
             freeSplitIntent(self.alloc, entry.value);
@@ -1287,34 +1325,84 @@ pub const TableManager = struct {
 
     pub fn applyFinalizedSplit(self: *TableManager, record: transition_state.SplitTransitionRecord) !void {
         if (!self.split_intents.contains(record.transition_id)) return;
+        try self.materializeFinalizedSplit(record);
+        _ = self.removeSplitIntent(record.transition_id);
+    }
+
+    fn materializeFinalizedSplit(self: *TableManager, record: transition_state.SplitTransitionRecord) !void {
+        try record.table_contract.validateForSplit();
+        try self.validateTransitionTable(record.table_contract);
         const split_key = record.split_key orelse return error.MissingSplitKey;
         const source = self.ranges.get(record.source_group_id) orelse return error.UnknownSourceRange;
+        if (source.table_id != record.table_contract.table_id)
+            return error.TransitionTopologyConflict;
+        if (source.split_attempt_epoch != record.attempt_epoch)
+            return error.StaleSplitAttempt;
+        if (!rangeMatchesTransitionIdentity(source, record.table_contract.source_identity))
+            return error.DocIdentityNamespaceMismatch;
+        if (std.mem.order(u8, split_key, source.start_key) != .gt)
+            return error.InvalidSplitKey;
+        if (record.source_range_end) |source_range_end| {
+            if (std.mem.order(u8, split_key, source_range_end) != .lt)
+                return error.InvalidSplitKey;
+        }
+        const source_already_narrowed = source.end_key != null and
+            std.mem.eql(u8, source.end_key.?, split_key);
+        if (!source_already_narrowed and
+            !optionalBytesEqual(source.end_key, record.source_range_end))
+        {
+            return error.TransitionTopologyConflict;
+        }
         const identity_shard_id = rangeDocIdentityShardId(source);
         const identity_range_id = rangeDocIdentityRangeId(source);
+        const table_id = source.table_id;
+        const completion_fingerprint = source.completed_restore_fingerprint;
 
-        try self.upsertRange(.{
-            .group_id = source.group_id,
-            .range_id = source.range_id,
-            .table_id = source.table_id,
-            .start_key = source.start_key,
-            .end_key = split_key,
-            .doc_identity_shard_id = source.doc_identity_shard_id,
-            .doc_identity_range_id = source.doc_identity_range_id,
-            .split_attempt_epoch = source.split_attempt_epoch,
-            .completed_restore_fingerprint = source.completed_restore_fingerprint,
-        });
-        try self.upsertRange(.{
-            .group_id = record.destination_group_id,
-            .range_id = record.destination_group_id,
-            .table_id = source.table_id,
-            .start_key = split_key,
-            .end_key = record.source_range_end,
-            .doc_identity_shard_id = identity_shard_id,
-            .doc_identity_range_id = identity_range_id,
-            .split_attempt_epoch = 0,
-            .completed_restore_fingerprint = source.completed_restore_fingerprint,
-        });
-        _ = self.removeSplitIntent(record.transition_id);
+        if (!source_already_narrowed) {
+            try self.upsertRange(.{
+                .group_id = source.group_id,
+                .range_id = source.range_id,
+                .table_id = table_id,
+                .start_key = source.start_key,
+                .end_key = split_key,
+                .doc_identity_shard_id = source.doc_identity_shard_id,
+                .doc_identity_range_id = source.doc_identity_range_id,
+                .split_attempt_epoch = source.split_attempt_epoch,
+                .completed_restore_fingerprint = completion_fingerprint,
+            });
+        }
+
+        if (self.ranges.get(record.destination_group_id)) |destination| {
+            if (destination.range_id != record.destination_group_id or
+                destination.table_id != table_id or
+                !std.mem.eql(u8, destination.start_key, split_key) or
+                !optionalBytesEqual(destination.end_key, record.source_range_end) or
+                destination.split_attempt_epoch != 0 or
+                !rangeMatchesTransitionIdentity(
+                    destination,
+                    record.table_contract.target_identity,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    &destination.completed_restore_fingerprint,
+                    &completion_fingerprint,
+                ))
+            {
+                return error.TransitionTopologyConflict;
+            }
+        } else {
+            try self.upsertRange(.{
+                .group_id = record.destination_group_id,
+                .range_id = record.destination_group_id,
+                .table_id = table_id,
+                .start_key = split_key,
+                .end_key = record.source_range_end,
+                .doc_identity_shard_id = identity_shard_id,
+                .doc_identity_range_id = identity_range_id,
+                .split_attempt_epoch = 0,
+                .completed_restore_fingerprint = completion_fingerprint,
+            });
+        }
     }
 
     pub fn applyRolledBackSplit(self: *TableManager, transition_id: u64) void {
@@ -1323,8 +1411,26 @@ pub const TableManager = struct {
 
     pub fn applyFinalizedMerge(self: *TableManager, record: transition_state.MergeTransitionRecord) !void {
         if (!self.merge_intents.contains(record.transition_id)) return;
-        const donor = self.ranges.get(record.donor_group_id) orelse return error.UnknownDonorRange;
+        try self.materializeFinalizedMerge(record);
+        _ = self.removeMergeIntent(record.transition_id);
+    }
+
+    fn materializeFinalizedMerge(self: *TableManager, record: transition_state.MergeTransitionRecord) !void {
+        try record.table_contract.validateForMerge(
+            record.allow_doc_identity_reassignment,
+        );
+        try self.validateTransitionTable(record.table_contract);
         const receiver = self.ranges.get(record.receiver_group_id) orelse return error.UnknownReceiverRange;
+        if (receiver.table_id != record.table_contract.table_id)
+            return error.TransitionTopologyConflict;
+        if (!rangeMatchesTransitionIdentity(receiver, record.table_contract.target_identity))
+            return error.DocIdentityNamespaceMismatch;
+
+        const donor = self.ranges.get(record.donor_group_id) orelse return;
+        if (donor.table_id != record.table_contract.table_id)
+            return error.TransitionTopologyConflict;
+        if (!rangeMatchesTransitionIdentity(donor, record.table_contract.source_identity))
+            return error.DocIdentityNamespaceMismatch;
         const merged_start = if (std.mem.order(u8, donor.start_key, receiver.start_key) == .lt) donor.start_key else receiver.start_key;
         const merged_end = switch (optionalBytesOrder(donor.end_key, receiver.end_key)) {
             .lt => receiver.end_key,
@@ -1339,19 +1445,47 @@ pub const TableManager = struct {
             receiver.completed_restore_fingerprint
         else
             empty_restore_completion_fingerprint;
+        const receiver_already_merged =
+            std.mem.eql(u8, receiver.start_key, merged_start) and
+            optionalBytesEqual(receiver.end_key, merged_end);
+        if (!receiver_already_merged and !rangesAdjacent(donor, receiver))
+            return error.TransitionTopologyConflict;
 
-        try self.upsertRange(.{
-            .group_id = receiver.group_id,
-            .range_id = receiver.range_id,
-            .table_id = receiver.table_id,
-            .start_key = merged_start,
-            .end_key = merged_end,
-            .doc_identity_shard_id = receiver.doc_identity_shard_id,
-            .doc_identity_range_id = receiver.doc_identity_range_id,
-            .completed_restore_fingerprint = completed_restore_fingerprint,
-        });
+        if (receiver_already_merged) {
+            if (!std.mem.eql(
+                u8,
+                &receiver.completed_restore_fingerprint,
+                &completed_restore_fingerprint,
+            )) {
+                return error.TransitionTopologyConflict;
+            }
+        } else {
+            try self.upsertRange(.{
+                .group_id = receiver.group_id,
+                .range_id = receiver.range_id,
+                .table_id = receiver.table_id,
+                .start_key = merged_start,
+                .end_key = merged_end,
+                .doc_identity_shard_id = receiver.doc_identity_shard_id,
+                .doc_identity_range_id = receiver.doc_identity_range_id,
+                .completed_restore_fingerprint = completed_restore_fingerprint,
+            });
+        }
         _ = self.removeRange(donor.group_id);
-        _ = self.removeMergeIntent(record.transition_id);
+    }
+
+    fn validateTransitionTable(
+        self: *const TableManager,
+        contract: transition_state.TransitionTableContract,
+    ) !void {
+        const table = self.tables.get(contract.table_id) orelse
+            return error.TransitionTableContractViolated;
+        if (!std.mem.eql(u8, table.name, contract.table_name) or
+            !std.mem.eql(u8, table.schema_json, contract.schema_json) or
+            !std.mem.eql(u8, table.indexes_json, contract.indexes_json))
+        {
+            return error.TransitionTableContractViolated;
+        }
     }
 
     pub fn applyRolledBackMerge(self: *TableManager, transition_id: u64) void {
@@ -1627,6 +1761,14 @@ pub fn rangeDocIdentityRangeId(record: RangeRecord) u64 {
     return if (record.range_id == 0) record.group_id else record.range_id;
 }
 
+fn rangeMatchesTransitionIdentity(
+    record: RangeRecord,
+    identity: transition_state.TransitionIdentity,
+) bool {
+    return rangeDocIdentityShardId(record) == identity.shard_id and
+        rangeDocIdentityRangeId(record) == identity.range_id;
+}
+
 pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
     alloc.free(record.start_key);
     freeOwnedOptional(alloc, record.end_key);
@@ -1725,6 +1867,7 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
         .last_success_at_ms = record.last_success_at_ms,
         .last_change_applied_at_ms = record.last_change_applied_at_ms,
         .cutover_intent_id = record.cutover_intent_id,
+        .cutover_authority_id = record.cutover_authority_id,
         .cutover_config_fingerprint = record.cutover_config_fingerprint,
         .updated_at_ms = record.updated_at_ms,
     };
@@ -2390,6 +2533,13 @@ test "table manager applies finalized split to desired topology" {
         .phase = .finalized,
         .split_key = "doc:m",
         .source_range_end = "doc:z",
+        .table_contract = .{
+            .table_id = 10,
+            .table_name = "docs",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 101, .range_id = 101 },
+            .target_identity = .{ .shard_id = 101, .range_id = 101 },
+        },
     });
     try manager.applyFinalizedSplit(.{
         .transition_id = 5003,
@@ -2399,6 +2549,13 @@ test "table manager applies finalized split to desired topology" {
         .phase = .finalized,
         .split_key = "doc:m",
         .source_range_end = "doc:z",
+        .table_contract = .{
+            .table_id = 10,
+            .table_name = "docs",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 101, .range_id = 101 },
+            .target_identity = .{ .shard_id = 101, .range_id = 101 },
+        },
     });
 
     const ranges = try manager.listRanges(std.testing.allocator);
@@ -2454,6 +2611,7 @@ test "table manager applies finalized merge preserving receiver range id" {
         .table_id = 10,
         .donor_group_id = 102,
         .receiver_group_id = 101,
+        .allow_doc_identity_reassignment = true,
     });
 
     try manager.applyFinalizedMerge(.{
@@ -2461,12 +2619,28 @@ test "table manager applies finalized merge preserving receiver range id" {
         .donor_group_id = 102,
         .receiver_group_id = 101,
         .phase = .finalized,
+        .allow_doc_identity_reassignment = true,
+        .table_contract = .{
+            .table_id = 10,
+            .table_name = "docs",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 102, .range_id = 1002 },
+            .target_identity = .{ .shard_id = 101, .range_id = 1001 },
+        },
     });
     try manager.applyFinalizedMerge(.{
         .transition_id = 6003,
         .donor_group_id = 102,
         .receiver_group_id = 101,
         .phase = .finalized,
+        .allow_doc_identity_reassignment = true,
+        .table_contract = .{
+            .table_id = 10,
+            .table_name = "docs",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 102, .range_id = 1002 },
+            .target_identity = .{ .shard_id = 101, .range_id = 1001 },
+        },
     });
 
     const ranges = try manager.listRanges(std.testing.allocator);
@@ -2484,6 +2658,80 @@ test "table manager applies finalized merge preserving receiver range id" {
         &ranges[0].completed_restore_fingerprint,
     );
     try std.testing.expect(manager.merge_intents.count() == 0);
+}
+
+test "table manager replays terminal split and merge topology idempotently" {
+    var split_manager = TableManager.init(std.testing.allocator);
+    defer split_manager.deinit();
+    try split_manager.upsertTable(.{ .table_id = 10, .name = "docs" });
+    // Model a crash after publishing the narrowed source but before publishing
+    // the destination range.
+    try split_manager.upsertRange(.{
+        .group_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+        .split_attempt_epoch = 1,
+    });
+    const terminal_split: transition_state.SplitTransitionRecord = .{
+        .transition_id = 7001,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 102,
+        .phase = .finalized,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+        .table_contract = .{
+            .table_id = 10,
+            .table_name = "docs",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 101, .range_id = 101 },
+            .target_identity = .{ .shard_id = 101, .range_id = 101 },
+        },
+    };
+    try split_manager.applyProjectedTerminalTransitions(&.{terminal_split}, &.{});
+    try split_manager.applyProjectedTerminalTransitions(&.{terminal_split}, &.{});
+    const split_ranges = try split_manager.listRanges(std.testing.allocator);
+    defer split_manager.freeRanges(std.testing.allocator, split_ranges);
+    try std.testing.expectEqual(@as(usize, 2), split_ranges.len);
+
+    var merge_manager = TableManager.init(std.testing.allocator);
+    defer merge_manager.deinit();
+    try merge_manager.upsertTable(.{ .table_id = 20, .name = "events" });
+    try merge_manager.upsertRange(.{
+        .group_id = 201,
+        .table_id = 20,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+    });
+    try merge_manager.upsertRange(.{
+        .group_id = 202,
+        .table_id = 20,
+        .start_key = "doc:m",
+        .end_key = "doc:z",
+        .doc_identity_shard_id = 201,
+        .doc_identity_range_id = 201,
+    });
+    const terminal_merge: transition_state.MergeTransitionRecord = .{
+        .transition_id = 7002,
+        .donor_group_id = 202,
+        .receiver_group_id = 201,
+        .phase = .finalized,
+        .table_contract = .{
+            .table_id = 20,
+            .table_name = "events",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 201, .range_id = 201 },
+            .target_identity = .{ .shard_id = 201, .range_id = 201 },
+        },
+    };
+    try merge_manager.applyProjectedTerminalTransitions(&.{}, &.{terminal_merge});
+    try merge_manager.applyProjectedTerminalTransitions(&.{}, &.{terminal_merge});
+    const merge_ranges = try merge_manager.listRanges(std.testing.allocator);
+    defer merge_manager.freeRanges(std.testing.allocator, merge_ranges);
+    try std.testing.expectEqual(@as(usize, 1), merge_ranges.len);
+    try std.testing.expectEqualStrings("doc:a", merge_ranges[0].start_key);
+    try std.testing.expectEqualStrings("doc:z", merge_ranges[0].end_key.?);
 }
 
 test "table manager rejects invalid split key" {

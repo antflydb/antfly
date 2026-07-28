@@ -6765,15 +6765,21 @@ test "metadata reconciler plans an automatic merge from adjacent small fresh gro
     try manager.upsertTable(.{ .table_id = 41, .name = "docs", .min_ranges = 1 });
     try manager.upsertRange(.{
         .group_id = 4101,
+        .range_id = 4101,
         .table_id = 41,
         .start_key = "doc:a",
         .end_key = "doc:m",
+        .doc_identity_shard_id = 4101,
+        .doc_identity_range_id = 4101,
     });
     try manager.upsertRange(.{
         .group_id = 4102,
+        .range_id = 4102,
         .table_id = 41,
         .start_key = "doc:m",
         .end_key = "doc:z",
+        .doc_identity_shard_id = 4101,
+        .doc_identity_range_id = 4101,
     });
 
     const tables = try manager.listTables(std.testing.allocator);
@@ -7673,15 +7679,21 @@ test "metadata reconciler does not merge shards that are younger than the merge 
     try manager.upsertTable(.{ .table_id = 410, .name = "docs", .min_ranges = 1 });
     try manager.upsertRange(.{
         .group_id = 41011,
+        .range_id = 41011,
         .table_id = 410,
         .start_key = "doc:a",
         .end_key = "doc:m",
+        .doc_identity_shard_id = 41011,
+        .doc_identity_range_id = 41011,
     });
     try manager.upsertRange(.{
         .group_id = 41012,
+        .range_id = 41012,
         .table_id = 410,
         .start_key = "doc:m",
         .end_key = "doc:z",
+        .doc_identity_shard_id = 41011,
+        .doc_identity_range_id = 41011,
     });
 
     const tables = try manager.listTables(std.testing.allocator);
@@ -7762,15 +7774,21 @@ test "metadata reconciler merges shards once they are older than the merge age t
     try manager.upsertTable(.{ .table_id = 411, .name = "docs", .min_ranges = 1 });
     try manager.upsertRange(.{
         .group_id = 41111,
+        .range_id = 41111,
         .table_id = 411,
         .start_key = "doc:a",
         .end_key = "doc:m",
+        .doc_identity_shard_id = 41111,
+        .doc_identity_range_id = 41111,
     });
     try manager.upsertRange(.{
         .group_id = 41112,
+        .range_id = 41112,
         .table_id = 411,
         .start_key = "doc:m",
         .end_key = "doc:z",
+        .doc_identity_shard_id = 41111,
+        .doc_identity_range_id = 41111,
     });
 
     const tables = try manager.listTables(std.testing.allocator);

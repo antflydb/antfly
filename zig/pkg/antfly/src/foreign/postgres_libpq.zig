@@ -778,6 +778,22 @@ pub const Executor = struct {
         errdefer if (release_reserved_permits) self.releaseGlobalConnections(2);
         var sql_conn: ?*PGconn = try self.connectFreshWithDeadline(dsn, execution_deadline_ns);
         errdefer if (sql_conn) |conn| self.pqfinish(conn);
+        const slot_exists = try self.logicalReplicationSlotExistsAlloc(
+            alloc,
+            sql_conn,
+            slot_name,
+            execution_deadline_ns,
+        );
+        if (slot_exists and !params.reclaim_exact_cutover_slot)
+            return error.UnsupportedExactCutover;
+
+        // Fence the current authority before any persistent provider mutation.
+        // A stale leader may know the stable ownership identity, but cannot get
+        // its fresh authority token applied after losing leadership.
+        try ensureDeadline(execution_deadline_ns);
+        try exact_cutover_intent.persist();
+        try ensureDeadline(execution_deadline_ns);
+
         try self.ensurePublicationAlloc(
             alloc,
             dsn,
@@ -787,14 +803,7 @@ pub const Executor = struct {
             params.filter_query_json,
             execution_deadline_ns,
         );
-        if (try self.logicalReplicationSlotExistsAlloc(
-            alloc,
-            sql_conn,
-            slot_name,
-            execution_deadline_ns,
-        )) {
-            if (!params.reclaim_exact_cutover_slot)
-                return error.UnsupportedExactCutover;
+        if (slot_exists) {
             try self.dropInactiveLogicalReplicationSlotIfExistsAlloc(
                 alloc,
                 sql_conn,
@@ -808,14 +817,6 @@ pub const Executor = struct {
                 execution_deadline_ns,
             )) return error.ExactCutoverCleanupPending;
         }
-
-        // This is the ownership linearization point. The caller persists an
-        // intent only after the slot was proved absent (or a prior owned,
-        // inactive slot was reclaimed), and creation does not begin unless
-        // that replicated write succeeds.
-        try ensureDeadline(execution_deadline_ns);
-        try exact_cutover_intent.persist();
-        try ensureDeadline(execution_deadline_ns);
 
         var repl_conn: ?*PGconn = try self.connectReplicationFreshWithDeadline(
             alloc,

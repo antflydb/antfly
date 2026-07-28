@@ -1120,6 +1120,7 @@ fn replicationCutoverIntentApplied(
     return record.table_id == expected.table_id and
         record.source_ordinal == expected.source_ordinal and
         record.cutover_intent_id == expected.cutover_intent_id and
+        record.cutover_authority_id == expected.cutover_authority_id and
         std.mem.eql(
             u8,
             &record.cutover_config_fingerprint,
@@ -1177,6 +1178,7 @@ test "metadata durable cutover acknowledgement is attempt scoped" {
         .publication_name = "antfly_docs_pub",
         .phase = "cutover_preparing",
         .cutover_intent_id = 99,
+        .cutover_authority_id = 1001,
         .cutover_config_fingerprint = fingerprint,
     };
     try std.testing.expect(replicationCutoverIntentApplied(expected, expected));
@@ -1184,6 +1186,10 @@ test "metadata durable cutover acknowledgement is attempt scoped" {
     var stale_attempt = expected;
     stale_attempt.cutover_intent_id = 98;
     try std.testing.expect(!replicationCutoverIntentApplied(stale_attempt, expected));
+
+    var stale_authority = expected;
+    stale_authority.cutover_authority_id = 1000;
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_authority, expected));
 
     var stale_config = expected;
     stale_config.cutover_config_fingerprint[0] ^= 0xff;
@@ -1762,10 +1768,11 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
     }
 
-    /// Persists an exact-cutover ownership intent and does not return until
-    /// that same attempt is visible in the applied Raft projection.
+    /// Persists exact-cutover ownership and fresh authority and does not return
+    /// until this provider attempt is visible in the applied Raft projection.
     pub fn upsertReplicationSourceStatusDurable(self: *MetadataService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
-        if (record.cutover_intent_id == 0) return error.InvalidReplicationCutoverIntent;
+        if (record.cutover_intent_id == 0 or record.cutover_authority_id == 0)
+            return error.InvalidReplicationCutoverIntent;
         try self.upsertReplicationSourceStatus(record);
 
         const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
@@ -3240,10 +3247,11 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
     }
 
-    /// Persists an exact-cutover ownership intent and does not return until
-    /// that same attempt is visible in the applied Raft projection.
+    /// Persists exact-cutover ownership and fresh authority and does not return
+    /// until this provider attempt is visible in the applied Raft projection.
     pub fn upsertReplicationSourceStatusDurable(self: *MetadataHttpService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
-        if (record.cutover_intent_id == 0) return error.InvalidReplicationCutoverIntent;
+        if (record.cutover_intent_id == 0 or record.cutover_authority_id == 0)
+            return error.InvalidReplicationCutoverIntent;
         try self.upsertReplicationSourceStatus(record);
 
         const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;

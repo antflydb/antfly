@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_test_filters = @import("build_test_filters.zig");
 const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
 const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
@@ -162,10 +163,15 @@ fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) voi
     }
 }
 
-fn addRuntimeTestFilters(run: *std.Build.Step.Run, filters: []const []const u8) void {
+fn addRuntimeTestFilters(
+    b: *std.Build,
+    run: *std.Build.Step.Run,
+    filters: []const []const u8,
+) void {
     for (filters) |filter| {
         run.addArgs(&.{ "--test-filter", filter });
     }
+    build_test_filters.addRuntimeControls(run, b.args orelse &.{});
 }
 
 fn compileFiltersWithAnchors(
@@ -209,7 +215,7 @@ fn addFilteredTestRunArtifactWithRuntimeFilters(
         runner_path.addStepDependencies(&tests.step);
     }
     const run = b.addRunArtifact(tests);
-    addRuntimeTestFilters(run, runtime_filters);
+    addRuntimeTestFilters(b, run, runtime_filters);
     return run;
 }
 
@@ -3270,7 +3276,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
-    addRuntimeTestFilters(run_lib_unit_tests, lib_unit_filters);
+    addRuntimeTestFilters(b, run_lib_unit_tests, lib_unit_filters);
     for (root_test_skip_filters) |filter| {
         run_lib_unit_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
@@ -3999,7 +4005,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_db_query_tests = b.addRunArtifact(lib_db_query_tests);
-    addRuntimeTestFilters(run_lib_db_query_tests, &lib_db_query_default_filters);
+    addRuntimeTestFilters(b, run_lib_db_query_tests, &lib_db_query_default_filters);
     const lib_db_query_step = b.step("lib-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
 
@@ -5949,7 +5955,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_unit_progress_root_tests = b.addRunArtifact(unit_progress_root_tests);
-    addRuntimeTestFilters(run_unit_progress_root_tests, unit_progress_root_filters);
+    addRuntimeTestFilters(b, run_unit_progress_root_tests, unit_progress_root_filters);
     for (unit_progress_skip_filters) |filter| {
         run_unit_progress_root_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
@@ -6466,7 +6472,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_unit_root_tests = b.addRunArtifact(unit_root_tests);
-    addRuntimeTestFilters(run_unit_root_tests, unit_root_filters);
+    addRuntimeTestFilters(b, run_unit_root_tests, unit_root_filters);
     for (root_test_skip_filters) |filter| {
         run_unit_root_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
@@ -8255,7 +8261,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);
-    addRuntimeTestFilters(run_antfly_main_tests, selectTestFilters(b, &.{}));
+    addRuntimeTestFilters(b, run_antfly_main_tests, selectTestFilters(b, &.{}));
     const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");
     antfly_main_test_step.dependOn(&run_antfly_main_tests.step);
     unit_test_step.dependOn(&run_antfly_main_tests.step);

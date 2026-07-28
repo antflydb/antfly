@@ -124,6 +124,14 @@ const TestSingleNodeFactory = struct {
     }
 };
 
+const test_transition_table_contract: metadata.TransitionTableContract = .{
+    .table_id = 1,
+    .table_name = "docs",
+    .indexes_json = "{}",
+    .source_identity = .{ .shard_id = 1, .range_id = 1 },
+    .target_identity = .{ .shard_id = 1, .range_id = 1 },
+};
+
 fn establishManagedHostTransitionAuthorityForTest(svc: *ManagedHostService, group_id: u64) !void {
     try svc.host.host.campaignGroup(group_id);
     for (0..16) |_| {
@@ -1614,6 +1622,7 @@ test "managed host service resumes real split transition after restart" {
                 .source_group_id = 1701,
                 .destination_group_id = 1702,
                 .phase = .prepare,
+                .table_contract = test_transition_table_contract,
             },
         });
         defer std.testing.allocator.free(cmd);
@@ -1771,6 +1780,7 @@ test "managed host service resumes real merge transition after restart" {
                 .donor_group_id = 1801,
                 .receiver_group_id = 1802,
                 .phase = .prepare,
+                .table_contract = test_transition_table_contract,
             },
         });
         defer std.testing.allocator.free(cmd);

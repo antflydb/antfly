@@ -10407,10 +10407,9 @@ test "api query contract public parser rejects internal shard doc identity contr
     defer timeout_request.deinit(alloc);
     const timeout_after_ns = platform_time.monotonicNs();
     const deadline_ns = timeout_request.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
-    try std.testing.expect(deadline_ns >= timeout_before_ns);
-    try std.testing.expect(deadline_ns >= timeout_after_ns);
-    try std.testing.expect(deadline_ns <= timeout_before_ns + 250 * std.time.ns_per_ms);
-    try std.testing.expect(deadline_ns <= timeout_after_ns + 250 * std.time.ns_per_ms);
+    const deadline_origin_ns = deadline_ns - 250 * std.time.ns_per_ms;
+    try std.testing.expect(deadline_origin_ns >= timeout_before_ns);
+    try std.testing.expect(deadline_origin_ns <= timeout_after_ns);
 
     try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
         \\{"query":{"match_all":{}},"timeout_ms":-1}
@@ -12606,10 +12605,9 @@ test "api query contract maps timeout_ms to execution deadline" {
     const after_ns = platform_time.monotonicNs();
 
     const deadline_ns = parsed.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
-    try std.testing.expect(deadline_ns >= before_ns);
-    try std.testing.expect(deadline_ns >= after_ns);
-    try std.testing.expect(deadline_ns <= before_ns + 250 * std.time.ns_per_ms);
-    try std.testing.expect(deadline_ns <= after_ns + 250 * std.time.ns_per_ms);
+    const deadline_origin_ns = deadline_ns - 250 * std.time.ns_per_ms;
+    try std.testing.expect(deadline_origin_ns >= before_ns);
+    try std.testing.expect(deadline_origin_ns <= after_ns);
 }
 
 test "api query contract applies timeout_ms with an escaped member name" {
