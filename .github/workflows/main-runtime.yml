@@ -169,7 +169,7 @@ jobs:
           echo "$(gcloud auth print-access-token)" | crane auth login "$registry" -u oauth2accesstoken --password-stdin
           if lookup="$(crane digest "$image_tag" 2>&1)"; then
             digest="$lookup"
-            cosign verify --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/main-runtime.yml@" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" -a "repo=${{ github.repository }}" -a "ref=${{ needs.resolve.outputs.source_sha }}" "${image_tag}@${digest}" >/dev/null
+            existing_final=true
           elif [[ "$lookup" == *MANIFEST_UNKNOWN* || "$lookup" == *NAME_UNKNOWN* ]]; then
             # Recheck immediately before publication. The helper refuses to
             # retag an image that appeared after this lookup.
@@ -187,6 +187,7 @@ jobs:
             else
               digest="$(crane digest "$image_tag")"
             fi
+            existing_final=false
           else
             echo "unable to determine whether $image_tag exists: $lookup" >&2
             exit 1
@@ -197,13 +198,14 @@ jobs:
               | if length == 1 then .[0] else error("expected one runnable platform child") end
             '
           }
-          if [[ '${{ needs.resolve.outputs.exists }}' != true ]]; then
-            amd64_digest="$(runnable_child "${image_tag}@${amd64_index_digest}" amd64)"
-            arm64_digest="$(runnable_child "${image_tag}@${arm64_index_digest}" arm64)"
-          else
-            amd64_digest="$(runnable_child "${image_tag}-amd64" amd64)"
-            arm64_digest="$(runnable_child "${image_tag}-arm64" arm64)"
-          fi
+          amd64_index_digest="${amd64_index_digest:-$(crane digest "${image_tag}-amd64")}"
+          arm64_index_digest="${arm64_index_digest:-$(crane digest "${image_tag}-arm64")}"
+          for spec in "${image_tag}@${amd64_index_digest}:amd64" "${image_tag}@${arm64_index_digest}:arm64"; do
+            image="${spec%:*}"; platform="${spec##*:}"
+            cosign verify --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/main-runtime.yml@" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" -a "repo=${{ github.repository }}" -a "ref=${{ needs.resolve.outputs.source_sha }}" -a "platform=${platform}" "$image" >/dev/null
+          done
+          amd64_digest="$(runnable_child "${image_tag}@${amd64_index_digest}" amd64)"
+          arm64_digest="$(runnable_child "${image_tag}@${arm64_index_digest}" arm64)"
           crane manifest "$image_tag" | jq -e --arg amd64 "$amd64_digest" --arg arm64 "$arm64_digest" '
             ([.manifests[]? | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .digest] | sort) == ([$amd64, $arm64] | sort)
           ' >/dev/null || { echo "immutable image conflicts with this main runtime's platform images" >&2; exit 1; }
@@ -212,7 +214,10 @@ jobs:
           }
           repository="${image_tag%:*}"
           image="${repository}@${digest}"
-          if [[ '${{ needs.resolve.outputs.exists }}' != true ]]; then
+          if ! cosign verify --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/main-runtime.yml@" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" -a "repo=${{ github.repository }}" -a "ref=${{ needs.resolve.outputs.source_sha }}" "$image" >/dev/null; then
+            # A prior attempt may have created the immutable descriptor before
+            # signing or uploading its receipt. Reuse it only after the signed
+            # source-bound children and provenance checks above succeeded.
             cosign sign --yes -a "repo=${{ github.repository }}" -a "workflow=${{ github.workflow }}" -a "ref=${{ needs.resolve.outputs.source_sha }}" "$image"
           fi
           cosign verify --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/main-runtime.yml@" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" -a "repo=${{ github.repository }}" -a "ref=${{ needs.resolve.outputs.source_sha }}" "$image" >/dev/null

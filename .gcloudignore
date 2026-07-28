@@ -6,3 +6,4 @@
 
 # Cloud Build metadata
 .gcloudignore
+gha-creds-*.json

@@ -2,6 +2,8 @@
 """Contract tests for the small, main-only runtime publication path."""
 import json
 from pathlib import Path
+import shutil
+import subprocess
 import unittest
 
 
@@ -103,6 +105,22 @@ class MainRuntimeWorkflowTest(unittest.TestCase):
     def test_every_main_push_queues_a_successor(self):
         push = WORKFLOW[WORKFLOW.index("  push:"):WORKFLOW.index("  workflow_dispatch:")]
         self.assertNotIn("paths:", push)
+
+    def test_gcloud_upload_excludes_ephemeral_credentials(self):
+        self.assertIn("gha-creds-*.json", (Path(__file__).resolve().parents[2] / ".gcloudignore").read_text())
+        if not shutil.which("gcloud"):
+            self.skipTest("gcloud is unavailable")
+        sentinel = Path(__file__).resolve().parents[2] / "gha-creds-regression.json"
+        sentinel.write_text("sentinel")
+        try:
+            files = subprocess.run(["gcloud", "meta", "list-files-for-upload", "."], cwd=sentinel.parent, text=True, capture_output=True, check=True).stdout.splitlines()
+        finally:
+            sentinel.unlink()
+        self.assertNotIn(sentinel.name, files)
+
+    def test_existing_final_can_resume_after_pre_receipt_interruption(self):
+        self.assertIn("prior attempt may have created", WORKFLOW)
+        self.assertIn("source-bound children", WORKFLOW)
 
 
 if __name__ == "__main__":
