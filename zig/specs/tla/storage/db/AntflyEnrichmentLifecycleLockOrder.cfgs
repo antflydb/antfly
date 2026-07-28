@@ -1,0 +1,21 @@
+\* All TLC check configs for AntflyEnrichmentLifecycleLockOrder.tla.
+
+==== positive tier=fast
+SPECIFICATION Spec
+
+CONSTANT
+    BlockingStatusSnapshot = FALSE
+
+INVARIANT TypeOK
+PROPERTY DeleteEventuallyCompletes
+
+==== BadBlockingStatusSnapshot
+\* A status request holding the apply lock must not wait for the lifecycle
+\* mutex while delete holds lifecycle and joins a worker waiting for apply.
+SPECIFICATION Spec
+
+CONSTANT
+    BlockingStatusSnapshot = TRUE
+
+INVARIANT TypeOK
+PROPERTY DeleteEventuallyCompletes

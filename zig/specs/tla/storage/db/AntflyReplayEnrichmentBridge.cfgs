@@ -7,6 +7,7 @@ CONSTANTS
     BuggyOmitEnrichmentFloor = FALSE
     BuggyAdvanceEmptyScan = FALSE
     BuggyOmitRestartArm = FALSE
+    BuggyRetryWithoutBoundary = FALSE
     MaxSeq = 2
     MaxEpoch = 1
 
@@ -16,6 +17,7 @@ INVARIANTS
     RetainedUntilAllConsumersApplied
     NoAdvancePastCoverageDebt
     CompletedWorkWasDurable
+    RetryRequiresSchedulerBoundary
     Safety
 
 PROPERTIES
@@ -28,6 +30,7 @@ CONSTANTS
     BuggyOmitEnrichmentFloor = TRUE
     BuggyAdvanceEmptyScan = FALSE
     BuggyOmitRestartArm = FALSE
+    BuggyRetryWithoutBoundary = FALSE
     MaxSeq = 2
     MaxEpoch = 1
 
@@ -41,6 +44,7 @@ CONSTANTS
     BuggyOmitEnrichmentFloor = TRUE
     BuggyAdvanceEmptyScan = TRUE
     BuggyOmitRestartArm = FALSE
+    BuggyRetryWithoutBoundary = FALSE
     MaxSeq = 2
     MaxEpoch = 1
 
@@ -54,8 +58,23 @@ CONSTANTS
     BuggyOmitEnrichmentFloor = FALSE
     BuggyAdvanceEmptyScan = FALSE
     BuggyOmitRestartArm = TRUE
+    BuggyRetryWithoutBoundary = FALSE
     MaxSeq = 2
     MaxEpoch = 1
 
 PROPERTIES
     CoverageEventuallyDrains
+
+==== BadRetryWithoutBoundary
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyOmitEnrichmentFloor = FALSE
+    BuggyAdvanceEmptyScan = FALSE
+    BuggyOmitRestartArm = FALSE
+    BuggyRetryWithoutBoundary = TRUE
+    MaxSeq = 2
+    MaxEpoch = 1
+
+INVARIANTS
+    RetryRequiresSchedulerBoundary

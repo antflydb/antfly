@@ -1,0 +1,24 @@
+\* All TLC check configs for AntflyReplayDeleteSupersession.tla.
+
+==== positive tier=fast
+SPECIFICATION FairSpec
+
+CONSTANT
+    BuggyRetryDeleted = FALSE
+
+INVARIANTS
+    Safety
+
+PROPERTIES
+    DurableDeleteEventuallyConverges
+
+==== Bad
+\* Treating a durably tombstoned source as an ordinary transient miss leaves
+\* the stale upsert permanently ahead of the later delete.
+SPECIFICATION FairSpec
+
+CONSTANT
+    BuggyRetryDeleted = TRUE
+
+PROPERTIES
+    DurableDeleteEventuallyConverges

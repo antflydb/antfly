@@ -1,0 +1,90 @@
+\* All TLC check configs for AntflyRepairArtifactRecovery.tla.
+
+==== positive tier=fast
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggySkipArtifactRecovery = FALSE
+    BuggyLeaveRecoveryUndrained = FALSE
+    BuggyReuseFailedCandidate = FALSE
+    BuggyPlannerUsesNameCounter = FALSE
+
+INVARIANTS
+    TypeOK
+    IncompleteCandidateNeverActivates
+    ReadyGenerationHasNoStartupDebt
+
+PROPERTIES
+    AutomaticRepairEventuallyStabilizes
+
+==== BadSkipArtifactRecovery
+\* Rebuilding cannot manufacture a corrupt/missing managed source artifact.
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggySkipArtifactRecovery = TRUE
+    BuggyLeaveRecoveryUndrained = FALSE
+    BuggyReuseFailedCandidate = FALSE
+    BuggyPlannerUsesNameCounter = FALSE
+
+INVARIANTS
+    TypeOK
+    IncompleteCandidateNeverActivates
+    ReadyGenerationHasNoStartupDebt
+
+PROPERTIES
+    AutomaticRepairEventuallyStabilizes
+
+==== BadLeaveRecoveryUndrained
+\* Queuing durable recovery without a foreground drain leaves repair waiting.
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggySkipArtifactRecovery = FALSE
+    BuggyLeaveRecoveryUndrained = TRUE
+    BuggyReuseFailedCandidate = FALSE
+    BuggyPlannerUsesNameCounter = FALSE
+
+INVARIANTS
+    TypeOK
+    IncompleteCandidateNeverActivates
+    ReadyGenerationHasNoStartupDebt
+
+PROPERTIES
+    AutomaticRepairEventuallyStabilizes
+
+==== BadReuseFailedCandidate
+\* Replaying the same snapshot candidate cannot fill a deficit below its floor.
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggySkipArtifactRecovery = FALSE
+    BuggyLeaveRecoveryUndrained = FALSE
+    BuggyReuseFailedCandidate = TRUE
+    BuggyPlannerUsesNameCounter = FALSE
+
+INVARIANTS
+    TypeOK
+    IncompleteCandidateNeverActivates
+    ReadyGenerationHasNoStartupDebt
+
+PROPERTIES
+    AutomaticRepairEventuallyStabilizes
+
+==== BadPlannerUsesNameCounter
+\* A stale cross-generation counter makes the repaired index look surplus.
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggySkipArtifactRecovery = FALSE
+    BuggyLeaveRecoveryUndrained = FALSE
+    BuggyReuseFailedCandidate = FALSE
+    BuggyPlannerUsesNameCounter = TRUE
+
+INVARIANTS
+    TypeOK
+    IncompleteCandidateNeverActivates
+    ReadyGenerationHasNoStartupDebt
+
+PROPERTIES
+    AutomaticRepairEventuallyStabilizes

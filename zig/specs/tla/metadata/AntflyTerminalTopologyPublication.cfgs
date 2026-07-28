@@ -1,0 +1,22 @@
+\* All TLC check configs for AntflyTerminalTopologyPublication.tla.
+
+==== positive tier=fast
+SPECIFICATION Spec
+
+CONSTANT BuggyDropFinalizedIntent = FALSE
+
+INVARIANTS
+    TypeOK
+    FinalizedOutcomeRetainedUntilTopology
+    TerminalCompactionRequiresPublishedTopology
+    Safety
+
+==== BadDropFinalizedIntent
+\* Expected-failure mutant: projected-state seeding discards a finalized
+\* transition before its two-range topology outcome is folded.
+
+SPECIFICATION Spec
+
+CONSTANT BuggyDropFinalizedIntent = TRUE
+
+INVARIANT FinalizedOutcomeRetainedUntilTopology

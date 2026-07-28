@@ -2,7 +2,10 @@
 (*
   Validates implementation-emitted managed index admission and repair events.
   In particular, every durable generation request must publish scheduler work,
-  and no worker may be admitted before that publication.
+  and no worker may be admitted before that publication. A trace captured after
+  restart may begin at a persisted "detected" repair intent; that event is the
+  durable replay boundary for request and queue events emitted by the prior
+  process.
 *)
 
 EXTENDS FiniteSets, Json, IOUtils, Naturals, Sequences, TLC
@@ -39,6 +42,14 @@ QueueDurableWork ==
     /\ queued' = queued \cup {generation}
     /\ UNCHANGED <<requested, admitted, completed>>
 
+ResumePersistedIntent ==
+    /\ event.name = "PersistIntentPhase"
+    /\ facts.phase = "detected"
+    /\ facts.durableWork
+    /\ requested' = requested \cup {generation}
+    /\ queued' = queued \cup {generation}
+    /\ UNCHANGED <<admitted, completed>>
+
 PersistIntent ==
     /\ event.name = "PersistIntentPhase"
     /\ generation \in requested
@@ -71,6 +82,7 @@ TraceNext ==
     /\ l <= Len(TraceLog)
     /\ \/ RequestGeneration
        \/ QueueDurableWork
+       \/ ResumePersistedIntent
        \/ PersistIntent
        \/ AdmitWorker
        \/ WorkerDeferred

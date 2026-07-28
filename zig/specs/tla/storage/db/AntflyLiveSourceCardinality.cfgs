@@ -1,0 +1,38 @@
+\* All TLC check configs for AntflyLiveSourceCardinality.tla.
+
+==== positive tier=fast
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyPreMoveOwner = FALSE
+    BuggyPreserveLiveCardinality = FALSE
+
+INVARIANTS
+    TypeOK
+
+PROPERTIES
+    DeleteEventuallyPublishesZero
+
+==== BadPreMoveOwner
+\* Updating the wrapper at its construction address leaves the stable managed
+\* writer's identity cache at the pre-delete cardinality.
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyPreMoveOwner = TRUE
+    BuggyPreserveLiveCardinality = FALSE
+
+PROPERTIES
+    DeleteEventuallyPublishesZero
+
+==== BadPreserveLiveCardinality
+\* Artifact anti-regression must not overwrite an authoritative live decrease
+\* in primary-source cardinality.
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyPreMoveOwner = FALSE
+    BuggyPreserveLiveCardinality = TRUE
+
+PROPERTIES
+    DeleteEventuallyPublishesZero

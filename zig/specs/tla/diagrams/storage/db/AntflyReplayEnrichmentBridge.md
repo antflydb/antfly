@@ -2,7 +2,7 @@
 
 # AntflyReplayEnrichmentBridge — structural diagrams
 
-Generated from [`AntflyReplayEnrichmentBridge.tla`](../../../storage/db/AntflyReplayEnrichmentBridge.tla). 10 state variables, 10 actions in `Next`.
+Generated from [`AntflyReplayEnrichmentBridge.tla`](../../../storage/db/AntflyReplayEnrichmentBridge.tla). 11 state variables, 12 actions in `Next`.
 
 ## Actions and the state they touch
 
@@ -11,9 +11,11 @@ Generated from [`AntflyReplayEnrichmentBridge.tla`](../../../storage/db/AntflyRe
 | `AppendGeneratedSource` | `sourceSeq`, `journal`, `coverageDebt` | `sourceSeq`, `journal`, `coverageDebt` |
 | `FastConsumerAdvance` | `sourceSeq`, `fastApplied` | `fastApplied` |
 | `ProviderFails` | `providerUp` | `providerUp` |
-| `ProviderRecovers` | `providerUp` | `providerUp` |
+| `ProviderRecovers` | `providerUp` | `providerUp`, `retryAttemptsSinceBoundary` |
+| `TransientProviderRetry` | `coverageDebt`, `providerUp`, `workerArmed`, `retryAttemptsSinceBoundary` | `retryAttemptsSinceBoundary` |
+| `RetrySchedulerBoundary` | `retryAttemptsSinceBoundary` | `retryAttemptsSinceBoundary` |
 | `AdvanceEnrichment` | `sourceSeq`, `journal`, `enrichmentApplied`, `coverageDebt`, `volatileCollected` | `enrichmentApplied` |
-| `Restart` | `processEpoch` | `volatileCollected`, `workerArmed`, `processEpoch` |
+| `Restart` | `processEpoch` | `volatileCollected`, `workerArmed`, `retryAttemptsSinceBoundary`, `processEpoch` |
 | `ArmStartupEnrichment` | `workerArmed`, `processEpoch` | `workerArmed` |
 | `CollectPending` | `journal`, `coverageDebt`, `volatileCollected` | `volatileCollected` |
 | `CompleteEnrichment` | `journal`, `coverageDebt`, `completed`, `volatileCollected`, `providerUp`, `workerArmed` | `coverageDebt`, `completed`, `volatileCollected` |
@@ -30,12 +32,14 @@ flowchart LR
         a1[FastConsumerAdvance]
         a2[ProviderFails]
         a3[ProviderRecovers]
-        a4[AdvanceEnrichment]
-        a5[Restart]
-        a6[ArmStartupEnrichment]
-        a7[CollectPending]
-        a8[CompleteEnrichment]
-        a9[TruncateReplay]
+        a4[TransientProviderRetry]
+        a5[RetrySchedulerBoundary]
+        a6[AdvanceEnrichment]
+        a7[Restart]
+        a8[ArmStartupEnrichment]
+        a9[CollectPending]
+        a10[CompleteEnrichment]
+        a11[TruncateReplay]
     end
     subgraph state["State variables"]
         v0([sourceSeq])
@@ -43,11 +47,12 @@ flowchart LR
         v2([coverageDebt])
         v3([fastApplied])
         v4([providerUp])
-        v5([enrichmentApplied])
-        v6([volatileCollected])
-        v7([workerArmed])
-        v8([processEpoch])
-        v9([completed])
+        v5([retryAttemptsSinceBoundary])
+        v6([workerArmed])
+        v7([enrichmentApplied])
+        v8([volatileCollected])
+        v9([processEpoch])
+        v10([completed])
     end
     a0 --> v0
     a0 --> v1
@@ -56,26 +61,33 @@ flowchart LR
     v0 -.-> a1
     a2 --> v4
     a3 --> v4
+    a3 --> v5
     a4 --> v5
-    v0 -.-> a4
-    v1 -.-> a4
     v2 -.-> a4
+    v4 -.-> a4
     v6 -.-> a4
-    a5 --> v6
-    a5 --> v7
-    a5 --> v8
+    a5 --> v5
     a6 --> v7
+    v0 -.-> a6
+    v1 -.-> a6
+    v2 -.-> a6
     v8 -.-> a6
+    a7 --> v8
     a7 --> v6
-    v1 -.-> a7
-    v2 -.-> a7
-    a8 --> v2
-    a8 --> v9
+    a7 --> v5
+    a7 --> v9
     a8 --> v6
-    v1 -.-> a8
-    v4 -.-> a8
-    v7 -.-> a8
-    a9 --> v1
-    v3 -.-> a9
-    v5 -.-> a9
+    v9 -.-> a8
+    a9 --> v8
+    v1 -.-> a9
+    v2 -.-> a9
+    a10 --> v2
+    a10 --> v10
+    a10 --> v8
+    v1 -.-> a10
+    v4 -.-> a10
+    v6 -.-> a10
+    a11 --> v1
+    v3 -.-> a11
+    v7 -.-> a11
 ```

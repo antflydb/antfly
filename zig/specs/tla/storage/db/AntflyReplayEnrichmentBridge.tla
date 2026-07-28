@@ -26,7 +26,7 @@
 EXTENDS Naturals, TLC
 
 CONSTANTS BuggyOmitEnrichmentFloor, BuggyAdvanceEmptyScan,
-          BuggyOmitRestartArm, MaxSeq, MaxEpoch
+          BuggyOmitRestartArm, BuggyRetryWithoutBoundary, MaxSeq, MaxEpoch
 
 Seqs == 1..MaxSeq
 
@@ -40,10 +40,12 @@ VARIABLES
     volatileCollected,
     providerUp,
     workerArmed,
+    retryAttemptsSinceBoundary,
     processEpoch
 
 vars == <<sourceSeq, journal, fastApplied, enrichmentApplied, coverageDebt,
-          completed, volatileCollected, providerUp, workerArmed, processEpoch>>
+          completed, volatileCollected, providerUp, workerArmed,
+          retryAttemptsSinceBoundary, processEpoch>>
 
 Init ==
     /\ sourceSeq = 0
@@ -55,6 +57,7 @@ Init ==
     /\ volatileCollected = {}
     /\ providerUp = TRUE
     /\ workerArmed = TRUE
+    /\ retryAttemptsSinceBoundary = 0
     /\ processEpoch = 0
 
 AppendGeneratedSource ==
@@ -63,13 +66,15 @@ AppendGeneratedSource ==
     /\ journal' = journal \cup {sourceSeq + 1}
     /\ coverageDebt' = coverageDebt \cup {sourceSeq + 1}
     /\ UNCHANGED <<fastApplied, enrichmentApplied, completed,
-                  volatileCollected, providerUp, workerArmed, processEpoch>>
+                  volatileCollected, providerUp, workerArmed,
+                  retryAttemptsSinceBoundary, processEpoch>>
 
 FastConsumerAdvance ==
     /\ fastApplied < sourceSeq
     /\ fastApplied' = fastApplied + 1
     /\ UNCHANGED <<sourceSeq, journal, enrichmentApplied, coverageDebt,
-                  completed, volatileCollected, providerUp, workerArmed, processEpoch>>
+                  completed, volatileCollected, providerUp, workerArmed,
+                  retryAttemptsSinceBoundary, processEpoch>>
 
 CollectPending(s) ==
     /\ s \in coverageDebt
@@ -77,19 +82,40 @@ CollectPending(s) ==
     /\ s \notin volatileCollected
     /\ volatileCollected' = volatileCollected \cup {s}
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
-                  coverageDebt, completed, providerUp, workerArmed, processEpoch>>
+                  coverageDebt, completed, providerUp, workerArmed,
+                  retryAttemptsSinceBoundary, processEpoch>>
 
 ProviderFails ==
     /\ providerUp
     /\ providerUp' = FALSE
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
-                  coverageDebt, completed, volatileCollected, workerArmed, processEpoch>>
+                  coverageDebt, completed, volatileCollected, workerArmed,
+                  retryAttemptsSinceBoundary, processEpoch>>
 
 ProviderRecovers ==
     /\ ~providerUp
     /\ providerUp' = TRUE
+    /\ retryAttemptsSinceBoundary' = 0
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
                   coverageDebt, completed, volatileCollected, workerArmed, processEpoch>>
+
+TransientProviderRetry ==
+    /\ ~providerUp
+    /\ workerArmed
+    /\ coverageDebt /= {}
+    /\ retryAttemptsSinceBoundary < 2
+    /\ BuggyRetryWithoutBoundary \/ retryAttemptsSinceBoundary = 0
+    /\ retryAttemptsSinceBoundary' = retryAttemptsSinceBoundary + 1
+    /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
+                  coverageDebt, completed, volatileCollected, providerUp,
+                  workerArmed, processEpoch>>
+
+RetrySchedulerBoundary ==
+    /\ retryAttemptsSinceBoundary = 1
+    /\ retryAttemptsSinceBoundary' = 0
+    /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
+                  coverageDebt, completed, volatileCollected, providerUp,
+                  workerArmed, processEpoch>>
 
 CompleteEnrichment(s) ==
     /\ providerUp
@@ -100,7 +126,7 @@ CompleteEnrichment(s) ==
     /\ coverageDebt' = coverageDebt \ {s}
     /\ volatileCollected' = volatileCollected \ {s}
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
-                  providerUp, workerArmed, processEpoch>>
+                  providerUp, workerArmed, retryAttemptsSinceBoundary, processEpoch>>
 
 AdvanceEnrichment ==
     /\ enrichmentApplied < sourceSeq
@@ -112,7 +138,8 @@ AdvanceEnrichment ==
           /\ next \notin volatileCollected
     /\ enrichmentApplied' = enrichmentApplied + 1
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, coverageDebt,
-                  completed, volatileCollected, providerUp, workerArmed, processEpoch>>
+                  completed, volatileCollected, providerUp, workerArmed,
+                  retryAttemptsSinceBoundary, processEpoch>>
 
 TruncateReplay(s) ==
     /\ s \in journal
@@ -120,13 +147,15 @@ TruncateReplay(s) ==
     /\ BuggyOmitEnrichmentFloor \/ s <= enrichmentApplied
     /\ journal' = journal \ {s}
     /\ UNCHANGED <<sourceSeq, fastApplied, enrichmentApplied, coverageDebt,
-                  completed, volatileCollected, providerUp, workerArmed, processEpoch>>
+                  completed, volatileCollected, providerUp, workerArmed,
+                  retryAttemptsSinceBoundary, processEpoch>>
 
 Restart ==
     /\ processEpoch < MaxEpoch
     /\ processEpoch' = processEpoch + 1
     /\ volatileCollected' = {}
     /\ workerArmed' = FALSE
+    /\ retryAttemptsSinceBoundary' = 0
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
                   coverageDebt, completed, providerUp>>
 
@@ -137,13 +166,15 @@ ArmStartupEnrichment ==
     /\ workerArmed' = TRUE
     /\ UNCHANGED <<sourceSeq, journal, fastApplied, enrichmentApplied,
                   coverageDebt, completed, volatileCollected, providerUp,
-                  processEpoch>>
+                  retryAttemptsSinceBoundary, processEpoch>>
 
 Next ==
     \/ AppendGeneratedSource
     \/ FastConsumerAdvance
     \/ ProviderFails
     \/ ProviderRecovers
+    \/ TransientProviderRetry
+    \/ RetrySchedulerBoundary
     \/ AdvanceEnrichment
     \/ Restart
     \/ ArmStartupEnrichment
@@ -157,6 +188,7 @@ Spec == Init /\ [][Next]_vars
 FairSpec ==
     Spec
     /\ WF_vars(ProviderRecovers)
+    /\ WF_vars(RetrySchedulerBoundary)
     /\ WF_vars(Restart)
     /\ WF_vars(ArmStartupEnrichment)
     /\ WF_vars(AdvanceEnrichment)
@@ -166,6 +198,7 @@ TypeOK ==
     /\ BuggyOmitEnrichmentFloor \in BOOLEAN
     /\ BuggyAdvanceEmptyScan \in BOOLEAN
     /\ BuggyOmitRestartArm \in BOOLEAN
+    /\ BuggyRetryWithoutBoundary \in BOOLEAN
     /\ MaxSeq \in 1..3
     /\ MaxEpoch \in 0..2
     /\ sourceSeq \in 0..MaxSeq
@@ -177,6 +210,7 @@ TypeOK ==
     /\ volatileCollected \in SUBSET Seqs
     /\ providerUp \in BOOLEAN
     /\ workerArmed \in BOOLEAN
+    /\ retryAttemptsSinceBoundary \in 0..2
     /\ processEpoch \in 0..MaxEpoch
 
 WatermarksOrdered ==
@@ -194,12 +228,16 @@ NoAdvancePastCoverageDebt ==
 CompletedWorkWasDurable ==
     completed \subseteq 1..sourceSeq
 
+RetryRequiresSchedulerBoundary ==
+    retryAttemptsSinceBoundary <= 1
+
 Safety ==
     /\ TypeOK
     /\ WatermarksOrdered
     /\ RetainedUntilAllConsumersApplied
     /\ NoAdvancePastCoverageDebt
     /\ CompletedWorkWasDurable
+    /\ RetryRequiresSchedulerBoundary
 
 CoverageEventuallyDrains == <>[](coverageDebt = {})
 

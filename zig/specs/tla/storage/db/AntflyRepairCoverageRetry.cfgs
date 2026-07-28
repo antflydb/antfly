@@ -1,0 +1,29 @@
+\* All TLC check configs for AntflyRepairCoverageRetry.tla.
+
+==== positive tier=fast
+SPECIFICATION FairSpec
+
+CONSTANT
+    BuggyNameScopedCounter = FALSE
+
+INVARIANTS
+    TypeOK
+    IncompleteGenerationNeverActivates
+
+PROPERTIES
+    CoverageCatchUpEventuallyActivates
+
+==== BadNameScopedCounter
+\* A retired incarnation's name-scoped counter must not override the complete
+\* current-generation outcome tuple during replacement activation.
+SPECIFICATION FairSpec
+
+CONSTANT
+    BuggyNameScopedCounter = TRUE
+
+INVARIANTS
+    TypeOK
+    IncompleteGenerationNeverActivates
+
+PROPERTIES
+    CoverageCatchUpEventuallyActivates
