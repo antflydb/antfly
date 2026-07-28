@@ -240,7 +240,7 @@ jobs:
             --region="${GCP_REGION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=zig/cloudbuild.manifest.yaml \
-            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${VERSION},_ALIAS_TAG=${ALIAS_TAG},_AMD64_TAG=${VERSION}-amd64,_ARM64_TAG=${VERSION}-arm64"
+            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${VERSION},_ALIAS_TAG=${ALIAS_TAG},_AMD64_REF=${GAR_REGISTRY}/${GCP_PROJECT}/${GCP_REPOSITORY}/antfly:${VERSION}-amd64,_ARM64_REF=${GAR_REGISTRY}/${GCP_PROJECT}/${GCP_REPOSITORY}/antfly:${VERSION}-arm64"
 
       - name: Install crane
         uses: imjasonh/setup-crane@v0.4

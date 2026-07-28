@@ -3,12 +3,6 @@ name: Main Runtime
 on:
   push:
     branches: [main]
-    paths:
-      - 'zig/**'
-      - 'scripts/packaging/**'
-      - 'scripts/publish-zig-runtime-dev.sh'
-      - 'go/pkg/antfly/src/metadata/antfarm/**'
-      - '.github/workflows/main-runtime.yml'
   workflow_dispatch:
 
 concurrency:
@@ -52,7 +46,6 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v3
       - uses: imjasonh/setup-crane@v0.4
       - uses: sigstore/cosign-installer@v3
-      - uses: imjasonh/setup-crane@v0.4
       - id: runtime
         run: |
           set -euo pipefail
@@ -109,6 +102,8 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v3
+      - uses: imjasonh/setup-crane@v0.4
+      - uses: sigstore/cosign-installer@v3
       - name: Install the pinned native build toolchain
         env:
           ZIG_VERSION: 0.16.0
@@ -178,14 +173,17 @@ jobs:
           elif [[ "$lookup" == *MANIFEST_UNKNOWN* || "$lookup" == *NAME_UNKNOWN* ]]; then
             # Recheck immediately before publication. The helper refuses to
             # retag an image that appeared after this lookup.
-            amd64_digest="$(crane digest "${image_tag}-amd64")"
-            arm64_digest="$(crane digest "${image_tag}-arm64")"
+            amd64_index_digest="$(crane digest "${image_tag}-amd64")"
+            arm64_index_digest="$(crane digest "${image_tag}-arm64")"
+            amd64_digest="$amd64_index_digest"
+            arm64_digest="$arm64_index_digest"
             for spec in "${image_tag}-amd64@${amd64_digest}:amd64" "${image_tag}-arm64@${arm64_digest}:arm64"; do
               image="${spec%:*}"; platform="${spec##*:}"
               cosign verify --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/main-runtime.yml@" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" -a "repo=${{ github.repository }}" -a "ref=${{ needs.resolve.outputs.source_sha }}" -a "platform=${platform}" "$image" >/dev/null
             done
             if ! scripts/publish-zig-runtime-dev.sh --tag "$tag" --manifest --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest"; then
-              digest="$(crane digest "$image_tag")" || exit 1
+              echo "final tag appeared after the verified miss; refusing raced publication" >&2
+              exit 1
             else
               digest="$(crane digest "$image_tag")"
             fi
@@ -199,8 +197,13 @@ jobs:
               | if length == 1 then .[0] else error("expected one runnable platform child") end
             '
           }
-          amd64_digest="$(runnable_child "${image_tag}-amd64" amd64)"
-          arm64_digest="$(runnable_child "${image_tag}-arm64" arm64)"
+          if [[ '${{ needs.resolve.outputs.exists }}' != true ]]; then
+            amd64_digest="$(runnable_child "${image_tag}@${amd64_index_digest}" amd64)"
+            arm64_digest="$(runnable_child "${image_tag}@${arm64_index_digest}" arm64)"
+          else
+            amd64_digest="$(runnable_child "${image_tag}-amd64" amd64)"
+            arm64_digest="$(runnable_child "${image_tag}-arm64" arm64)"
+          fi
           crane manifest "$image_tag" | jq -e --arg amd64 "$amd64_digest" --arg arm64 "$arm64_digest" '
             ([.manifests[]? | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .digest] | sort) == ([$amd64, $arm64] | sort)
           ' >/dev/null || { echo "immutable image conflicts with this main runtime's platform images" >&2; exit 1; }

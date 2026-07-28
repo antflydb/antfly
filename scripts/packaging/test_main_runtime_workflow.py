@@ -46,9 +46,9 @@ class MainRuntimeWorkflowTest(unittest.TestCase):
         self.assertIn("zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz", WORKFLOW)
         self.assertIn('zig" version | grep -Fx "$ZIG_VERSION"', WORKFLOW)
 
-    def test_trigger_covers_the_helper_and_packaged_antfarm_assets(self):
-        self.assertIn("scripts/publish-zig-runtime-dev.sh", WORKFLOW)
-        self.assertIn("go/pkg/antfly/src/metadata/antfarm/**", WORKFLOW)
+    def test_trigger_does_not_skip_successor_main_commits(self):
+        push = WORKFLOW[WORKFLOW.index("  push:"):WORKFLOW.index("  workflow_dispatch:")]
+        self.assertNotIn("paths:", push)
 
     def test_provenance_fixture_uses_runnable_children_and_receipt_final_digest(self):
         fixture = json.loads((FIXTURES / "runtime-manifest-with-attestation.json").read_text())
@@ -87,11 +87,22 @@ class MainRuntimeWorkflowTest(unittest.TestCase):
         self.assertEqual(fixture["expected"], "rejected")
         self.assertIn("main-* tags are reserved for Main Runtime", CONTAINER_WORKFLOW)
         self.assertIn("invalid release tag", CONTAINER_WORKFLOW)
+        self.assertIn("_AMD64_REF=${GAR_REGISTRY}", CONTAINER_WORKFLOW)
 
     def test_manifest_uses_signed_child_digests_not_mutable_child_tags(self):
         self.assertIn("--amd64-digest", WORKFLOW)
         self.assertIn("--arm64-digest", WORKFLOW)
         self.assertIn("cosign verify", WORKFLOW)
+        self.assertIn("final tag appeared after the verified miss", WORKFLOW)
+
+    def test_publish_has_the_tools_required_for_child_signing(self):
+        publish = WORKFLOW[WORKFLOW.index("  publish:"):WORKFLOW.index("  manifest:")]
+        self.assertIn("imjasonh/setup-crane", publish)
+        self.assertIn("sigstore/cosign-installer", publish)
+
+    def test_every_main_push_queues_a_successor(self):
+        push = WORKFLOW[WORKFLOW.index("  push:"):WORKFLOW.index("  workflow_dispatch:")]
+        self.assertNotIn("paths:", push)
 
 
 if __name__ == "__main__":
