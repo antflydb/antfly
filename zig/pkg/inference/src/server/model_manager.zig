@@ -2203,6 +2203,15 @@ const LoadFlight = struct {
     refs: usize = 1,
 };
 
+fn admissionBackendClassForBackend(
+    backend: backends.BackendType,
+) runtime.tier.memory.BackendClass {
+    return switch (backend) {
+        .metal, .cuda => .gpu,
+        else => .cpu,
+    };
+}
+
 pub const ModelManager = struct {
     allocator: std.mem.Allocator,
     session_manager: backends.SessionManager,
@@ -2242,10 +2251,16 @@ pub const ModelManager = struct {
 
     pub fn acquireRunResources(
         self: *ModelManager,
+        backend_class: runtime.tier.memory.BackendClass,
         limits: runtime.tier.memory.Limits,
         estimate: runtime.tier.memory.Estimate,
     ) !runtime.tier.memory.AdmissionLease {
-        return self.acquireRunResourceEstimates(limits, &.{estimate});
+        return self.admission.tryAcquire(
+            backend_class,
+            limits,
+            .fromEstimate(estimate),
+            true,
+        );
     }
 
     /// Atomically admits all transient resources for one execution. Speculative
@@ -2253,14 +2268,9 @@ pub const ModelManager = struct {
     /// requests cannot each pass admission using only a partial estimate.
     pub fn acquireRunResourceEstimates(
         self: *ModelManager,
-        limits: runtime.tier.memory.Limits,
-        estimates: []const runtime.tier.memory.Estimate,
+        requests: []const runtime.tier.memory.AdmissionRequest,
     ) !runtime.tier.memory.AdmissionLease {
-        var amounts: runtime.tier.memory.AdmissionAmounts = .{};
-        for (estimates) |estimate| {
-            amounts = try amounts.merge(.fromEstimate(estimate));
-        }
-        return self.admission.tryAcquire(limits, amounts, true);
+        return self.admission.tryAcquireRequests(requests, true);
     }
 
     pub fn configureAdmissionLimits(
@@ -2602,10 +2612,9 @@ pub const ModelManager = struct {
         self: *const ModelManager,
         backend: backends.BackendType,
     ) runtime.tier.memory.Limits {
-        var limits = runtime.tier.memory.defaultLimitsForBackend(switch (backend) {
-            .metal, .cuda => .gpu,
-            else => .cpu,
-        });
+        var limits = runtime.tier.memory.defaultLimitsForBackend(
+            admissionBackendClassForBackend(backend),
+        );
         const overrides = self.admission_limit_overrides;
         if (overrides.host_limit_bytes > 0) limits.host_limit_bytes = overrides.host_limit_bytes;
         if (overrides.backend_limit_bytes > 0) limits.backend_limit_bytes = overrides.backend_limit_bytes;
@@ -2655,6 +2664,7 @@ pub const ModelManager = struct {
                 };
                 resident_amounts = admission_plan.resident;
                 resource_lease = self.admission.tryAcquire(
+                    admissionBackendClassForBackend(backend),
                     self.admissionLimitsForBackend(backend),
                     admission_plan.peak,
                     true,
@@ -2728,6 +2738,7 @@ pub const ModelManager = struct {
     ) !?runtime.tier.memory.AdmissionLease {
         if (!self.admission_enabled) return null;
         return try self.admission.tryAcquire(
+            .cpu,
             self.admissionLimitsForBackend(.native),
             plan.peak,
             true,
@@ -3783,6 +3794,7 @@ fn loadSessionForPreferredBackends(
             };
             resident_amounts = admission_plan.resident;
             resource_lease = manager.admission.tryAcquire(
+                admissionBackendClassForBackend(backend),
                 manager.admissionLimitsForBackend(backend),
                 admission_plan.peak,
                 true,

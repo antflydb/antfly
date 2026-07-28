@@ -1845,7 +1845,11 @@ pub const Node = struct {
             }
             return err;
         };
-        var admission_lease = try self.model_manager.acquireRunResources(budget_limits, resource_estimate);
+        var admission_lease = try self.model_manager.acquireRunResources(
+            budget_backend_class,
+            budget_limits,
+            resource_estimate,
+        );
         defer admission_lease.release();
 
         var kv_manager = runtime.kv.manager.KvManager.init(allocator);
@@ -3764,14 +3768,37 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
             };
         }
-        var estimates = [_]runtime.tier.memory.Estimate{ resource_estimate, undefined };
-        const estimate_count: usize = if (draft_resource_estimate) |estimate| blk: {
-            estimates[1] = estimate;
+        const target_backend_class: runtime.tier.memory.BackendClass =
+            if (backend_kind == .native) .cpu else .gpu;
+        const target_admission_limits = self.config.generation_budget_overrides.apply(
+            session_factory.widenBudgetLimitsForSession(
+                model.session,
+                runtime.tier.memory.defaultLimitsForBackend(target_backend_class),
+            ),
+        );
+        var admission_requests: [2]runtime.tier.memory.AdmissionRequest = undefined;
+        admission_requests[0] = .{
+            .backend_class = target_backend_class,
+            .limits = target_admission_limits,
+            .amounts = .fromEstimate(resource_estimate),
+        };
+        const admission_request_count: usize = if (draft_resource_estimate) |estimate| blk: {
+            const draft_backend_class: runtime.tier.memory.BackendClass =
+                if (draft_backend_kind.? == .native) .cpu else .gpu;
+            admission_requests[1] = .{
+                .backend_class = draft_backend_class,
+                .limits = self.config.generation_budget_overrides.apply(
+                    session_factory.widenBudgetLimitsForSession(
+                        draft_model_for_generation.?.session,
+                        runtime.tier.memory.defaultLimitsForBackend(draft_backend_class),
+                    ),
+                ),
+                .amounts = .fromEstimate(estimate),
+            };
             break :blk 2;
         } else 1;
         var admission_lease = self.model_manager.acquireRunResourceEstimates(
-            budget_limits,
-            estimates[0..estimate_count],
+            admission_requests[0..admission_request_count],
         ) catch |err| switch (err) {
             error.ResourceLimitExceeded => return ctx.status(400).json(.{
                 .@"error" = "MODEL_RESOURCE_LIMIT",
@@ -4417,6 +4444,7 @@ pub const Node = struct {
 
     fn acquireBatchAdmission(
         self: *Node,
+        backend_class: runtime.tier.memory.BackendClass,
         limits: runtime.tier.memory.Limits,
         run_budget: *runtime.tier.memory.RunBudget,
         estimate: runtime.tier.memory.Estimate,
@@ -4424,7 +4452,11 @@ pub const Node = struct {
         try run_budget.reserveEstimate(estimate);
         errdefer run_budget.releaseEstimate(estimate);
         return .{
-            .lease = try self.model_manager.acquireRunResources(limits, estimate),
+            .lease = try self.model_manager.acquireRunResources(
+                backend_class,
+                limits,
+                estimate,
+            ),
             .estimate = estimate,
         };
     }
@@ -4695,6 +4727,7 @@ pub const Node = struct {
                         continue;
                     }
                     admissions[pos] = self.acquireBatchAdmission(
+                        budget_backend_class,
                         budget_limits,
                         &task_run_budgets[pos],
                         resource_estimate,
@@ -4717,6 +4750,7 @@ pub const Node = struct {
                     for (group_indices.items, 0..) |idx, pos| {
                         if (!pending[idx]) continue;
                         admissions[pos] = self.acquireBatchAdmission(
+                            budget_backend_class,
                             budget_limits,
                             &shared_run_budget,
                             resource_estimates[pos].?,
@@ -4853,6 +4887,7 @@ pub const Node = struct {
                     if (execution_mode == .shared_serial and admissions[pos] == null) {
                         const resource_estimate = resource_estimates[pos].?;
                         admissions[pos] = self.acquireBatchAdmission(
+                            budget_backend_class,
                             budget_limits,
                             &shared_run_budget,
                             resource_estimate,
