@@ -6025,7 +6025,10 @@ export interface components {
              */
             fields?: string[];
             /**
-             * @description Maximum number of results to return. For semantic_search, this is the topk parameter.
+             * @description Maximum number of results to return. For semantic_search, this is
+             *     the top-k candidate count. When a reranker is configured, all
+             *     `limit` candidates are scored by the reranker and
+             *     `reranker.top_n`, when set, becomes the final result count.
              *     Default varies by query type (typically 10).
              * @example 20
              */
@@ -6118,10 +6121,24 @@ export interface components {
              */
             distance_over?: number;
             /**
-             * @description Configuration for merging full-text and semantic search results.
-             *     Only applies when both `full_text_search` and `semantic_search` are specified.
+             * @description Configuration for merging named lexical, dense, sparse, structured,
+             *     and graph-derived result sources.
              */
             merge_config?: components["schemas"]["MergeConfig"];
+            /**
+             * @description Named exact structured filter bindings. Referencing a binding from
+             *     the boolean query applies it as a hard predicate. Giving its name a
+             *     positive `merge_config.weights` entry also evaluates it as a binary
+             *     soft signal over the bounded lexical/semantic candidate union: an
+             *     exact match contributes the configured weight and a non-match
+             *     contributes zero. A weighted binding does not generate candidates
+             *     by itself.
+             */
+            with?: {
+                [key: string]: {
+                    [key: string]: unknown;
+                };
+            };
             /**
              * @description If true, returns only the total count of matching documents without retrieving the actual documents.
              *     Useful for pagination and displaying result counts. Count-only requests
@@ -6139,6 +6156,16 @@ export interface components {
              */
             profile?: boolean;
             /**
+             * @description If true, each hybrid hit includes `_score_explanation` with the raw
+             *     source score, source rank, calibrated score, configured weight, and
+             *     additive contribution used to produce the fused score. Explanation
+             *     data is deterministic but adds response bytes; omit it on latency-
+             *     sensitive production traffic unless the trace is needed.
+             * @default false
+             * @example false
+             */
+            explain?: boolean;
+            /**
              * @description Optional reranker configuration to improve result relevance.
              *
              *     Rerankers use cross-encoder models that score query-document pairs directly,
@@ -6149,7 +6176,8 @@ export interface components {
              *     - You have semantic or hybrid search results to refine
              *     - Latency trade-off is acceptable (reranking adds 100-500ms typically)
              *
-             *     **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size.
+             *     **Best practice:** Set `limit` to a 50-100 candidate pool and
+             *     `reranker.top_n` to the final result count.
              *
              *     Example:
              *     ```json
@@ -6746,8 +6774,16 @@ export interface components {
              * @description Relevance score of the hit.
              */
             _score: number;
-            /** @description Scores partitioned by index when using RRF search. */
+            /** @description Backwards-compatible raw scores partitioned by source when using hybrid search. */
             _index_scores?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description Present when `explain: true` for a fused hit. Contains the final and
+             *     pre-rerank fusion scores plus per-source rank, raw score, calibrated
+             *     score, weight, and contribution.
+             */
+            _score_explanation?: {
                 [key: string]: unknown;
             };
             _source?: {
@@ -10632,30 +10668,48 @@ export interface components {
             duration_ms?: number;
         };
         /**
-         * @description Merge strategy for combining results from the semantic_search and full_text_search.
-         *     rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
-         *     rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
+         * @description Merge strategy for combining named lexical, semantic, structured, and
+         *     graph result sources.
+         *     rrf: Reciprocal Rank Fusion - combines ranked sources using reciprocal
+         *       rank; exact binary structured sources contribute their full weight.
+         *     rsf: Relative Score Fusion - min/max calibrates ranked scores within the
+         *       candidate window and combines weighted scores; exact binary
+         *       structured sources contribute either their full weight or zero.
          *     failover: Use full_text_search if embedding generation fails
          * @default rrf
          * @enum {string}
          */
         MergeStrategy: "rrf" | "rsf" | "failover";
-        /** @description Configuration for result fusion when combining multiple search indexes. */
+        /**
+         * @description Configuration for bounded, explainable fusion of named query sources.
+         *     `window_size` controls the candidate budget for each ranked source;
+         *     `limit` is the final result count unless a reranker is configured, in
+         *     which case `limit` is the fused candidate pool and `reranker.top_n` is
+         *     the final result count.
+         */
         MergeConfig: {
             strategy?: components["schemas"]["MergeStrategy"];
             /**
-             * @description Named weights keyed by index name. `full_text` for the full-text search index;
-             *     embedding index names for vector indexes.
-             *     Unspecified indexes default to 1.0. Applied in both RRF and RSF.
+             * @description Non-negative weights keyed by source name: `full_text` for the
+             *     default lexical source, an index name for a dense or sparse source,
+             *     a `with` binding name for exact candidate-level structured
+             *     membership, or a `graph_searches` name for an exact graph-derived
+             *     ranked result set. Unspecified sources default to 1.0. Unknown or
+             *     duplicate names and configurations with no positive effective
+             *     source weight fail closed. Applied in both RRF and RSF.
              * @example {
              *       "full_text": 0.3,
-             *       "title_embedding": 1
+             *       "title_embedding": 1,
+             *       "preferred_region": 0.2
              *     }
              */
             weights?: {
                 [key: string]: number;
             };
-            /** @description RSF normalization window size. Defaults to `limit`. */
+            /**
+             * @description Per-ranked-source candidate and RSF calibration window. Defaults to
+             *     `limit`. This is independent from the final result count.
+             */
             window_size?: number;
             /**
              * Format: double
