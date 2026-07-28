@@ -1133,6 +1133,38 @@ fn replicationCutoverIntentApplied(
         std.mem.eql(u8, record.phase, expected.phase);
 }
 
+fn isExpectedCdcRoundError(err: anyerror) bool {
+    return switch (err) {
+        error.UnknownReplicationSource,
+        error.UnsupportedReplicationSource,
+        error.UnsupportedReplicationStreaming,
+        error.UnsupportedReplicationTransform,
+        error.UnsupportedReplicationRoute,
+        error.ReplicationExactCutoverRequired,
+        error.InvalidReplicationSourceConfig,
+        error.InvalidReplicationSourceRow,
+        error.LibpqUnavailable,
+        error.ForeignAuthFailed,
+        error.ForeignConnectionFailed,
+        error.ForeignConnectionPoolLimitExceeded,
+        error.ForeignColumnCacheLimitExceeded,
+        error.ForeignQueryFailed,
+        error.ForeignReplicationSlotMissing,
+        error.ForeignTableNotFound,
+        error.ExactCutoverCleanupPending,
+        error.MetadataMutationApplyTimeout,
+        error.Timeout,
+        error.FileNotFound,
+        error.InvalidQueryRequest,
+        error.WriterLocked,
+        error.LmdbUnexpected,
+        error.Corrupted,
+        error.UnknownColumn,
+        => true,
+        else => false,
+    };
+}
+
 test "metadata durable cutover acknowledgement is attempt scoped" {
     const fingerprint = [_]u8{0x5a} ** std.crypto.hash.sha2.Sha256.digest_length;
     const expected = metadata_table_manager.ReplicationSourceStatusRecord{
@@ -1160,6 +1192,24 @@ test "metadata durable cutover acknowledgement is attempt scoped" {
     var overwritten_phase = expected;
     overwritten_phase.phase = "failed";
     try std.testing.expect(!replicationCutoverIntentApplied(overwritten_phase, expected));
+}
+
+test "metadata CDC round error policy isolates expected recovery failures" {
+    const expected_errors = [_]anyerror{
+        error.ExactCutoverCleanupPending,
+        error.MetadataMutationApplyTimeout,
+        error.Timeout,
+        error.ForeignConnectionPoolLimitExceeded,
+        error.ForeignColumnCacheLimitExceeded,
+        error.ForeignConnectionFailed,
+        error.ForeignQueryFailed,
+    };
+    for (expected_errors) |err| try std.testing.expect(isExpectedCdcRoundError(err));
+
+    // Process-health and authority failures remain visible to the lifecycle
+    // owner instead of being mistaken for a source-local retry.
+    try std.testing.expect(!isExpectedCdcRoundError(error.OutOfMemory));
+    try std.testing.expect(!isExpectedCdcRoundError(error.NotLeader));
 }
 
 fn cloneProjectedMergeTransitionsOwned(
@@ -2709,32 +2759,10 @@ pub const MetadataService = struct {
                 .secret_store = self.secret_store,
             },
         };
-        const summary = coordinator.runRound(self) catch |err| switch (err) {
-            error.UnknownReplicationSource,
-            error.UnsupportedReplicationSource,
-            error.UnsupportedReplicationStreaming,
-            error.UnsupportedReplicationTransform,
-            error.UnsupportedReplicationRoute,
-            error.ReplicationExactCutoverRequired,
-            error.InvalidReplicationSourceConfig,
-            error.InvalidReplicationSourceRow,
-            error.LibpqUnavailable,
-            error.ForeignAuthFailed,
-            error.ForeignConnectionFailed,
-            error.ForeignQueryFailed,
-            error.ForeignReplicationSlotMissing,
-            error.ForeignTableNotFound,
-            error.FileNotFound,
-            error.InvalidQueryRequest,
-            error.WriterLocked,
-            error.LmdbUnexpected,
-            error.Corrupted,
-            error.UnknownColumn,
-            => {
-                std.log.warn("metadata cdc snapshot round skipped: {s}", .{@errorName(err)});
-                return;
-            },
-            else => return err,
+        const summary = coordinator.runRound(self) catch |err| {
+            if (!isExpectedCdcRoundError(err)) return err;
+            std.log.warn("metadata cdc snapshot round skipped: {s}", .{@errorName(err)});
+            return;
         };
         if (summary.sources_considered > 0) {
             std.log.info(
@@ -2757,32 +2785,10 @@ pub const MetadataService = struct {
                 .secret_store = self.secret_store,
             },
         };
-        const stream_summary = streaming.runRound(self) catch |err| switch (err) {
-            error.UnknownReplicationSource,
-            error.UnsupportedReplicationSource,
-            error.UnsupportedReplicationStreaming,
-            error.UnsupportedReplicationTransform,
-            error.UnsupportedReplicationRoute,
-            error.ReplicationExactCutoverRequired,
-            error.InvalidReplicationSourceConfig,
-            error.InvalidReplicationSourceRow,
-            error.LibpqUnavailable,
-            error.ForeignAuthFailed,
-            error.ForeignConnectionFailed,
-            error.ForeignQueryFailed,
-            error.ForeignReplicationSlotMissing,
-            error.ForeignTableNotFound,
-            error.FileNotFound,
-            error.InvalidQueryRequest,
-            error.WriterLocked,
-            error.LmdbUnexpected,
-            error.Corrupted,
-            error.UnknownColumn,
-            => {
-                std.log.warn("metadata cdc streaming round skipped: {s}", .{@errorName(err)});
-                return;
-            },
-            else => return err,
+        const stream_summary = streaming.runRound(self) catch |err| {
+            if (!isExpectedCdcRoundError(err)) return err;
+            std.log.warn("metadata cdc streaming round skipped: {s}", .{@errorName(err)});
+            return;
         };
         if (stream_summary.sources_considered > 0) {
             std.log.info(
@@ -4927,35 +4933,13 @@ pub const MetadataHttpService = struct {
                 .secret_store = self.secret_store,
             },
         };
-        const summary = coordinator.runRound(self) catch |err| switch (err) {
-            error.UnknownReplicationSource,
-            error.UnsupportedReplicationSource,
-            error.UnsupportedReplicationStreaming,
-            error.UnsupportedReplicationTransform,
-            error.UnsupportedReplicationRoute,
-            error.ReplicationExactCutoverRequired,
-            error.InvalidReplicationSourceConfig,
-            error.InvalidReplicationSourceRow,
-            error.LibpqUnavailable,
-            error.ForeignAuthFailed,
-            error.ForeignConnectionFailed,
-            error.ForeignQueryFailed,
-            error.ForeignReplicationSlotMissing,
-            error.ForeignTableNotFound,
-            error.FileNotFound,
-            error.InvalidQueryRequest,
-            error.WriterLocked,
-            error.LmdbUnexpected,
-            error.Corrupted,
-            error.UnknownColumn,
-            => {
-                if (comptime builtin.is_test) {
-                    std.debug.print("metadata http cdc snapshot round skipped: {s}\n", .{@errorName(err)});
-                }
-                std.log.warn("metadata http cdc snapshot round skipped: {s}", .{@errorName(err)});
-                return;
-            },
-            else => return err,
+        const summary = coordinator.runRound(self) catch |err| {
+            if (!isExpectedCdcRoundError(err)) return err;
+            if (comptime builtin.is_test) {
+                std.debug.print("metadata http cdc snapshot round skipped: {s}\n", .{@errorName(err)});
+            }
+            std.log.warn("metadata http cdc snapshot round skipped: {s}", .{@errorName(err)});
+            return;
         };
         if (summary.sources_considered > 0) {
             std.log.info(
@@ -4978,32 +4962,10 @@ pub const MetadataHttpService = struct {
                 .secret_store = self.secret_store,
             },
         };
-        const stream_summary = streaming.runRound(self) catch |err| switch (err) {
-            error.UnknownReplicationSource,
-            error.UnsupportedReplicationSource,
-            error.UnsupportedReplicationStreaming,
-            error.UnsupportedReplicationTransform,
-            error.UnsupportedReplicationRoute,
-            error.ReplicationExactCutoverRequired,
-            error.InvalidReplicationSourceConfig,
-            error.InvalidReplicationSourceRow,
-            error.LibpqUnavailable,
-            error.ForeignAuthFailed,
-            error.ForeignConnectionFailed,
-            error.ForeignQueryFailed,
-            error.ForeignReplicationSlotMissing,
-            error.ForeignTableNotFound,
-            error.FileNotFound,
-            error.InvalidQueryRequest,
-            error.WriterLocked,
-            error.LmdbUnexpected,
-            error.Corrupted,
-            error.UnknownColumn,
-            => {
-                std.log.warn("metadata http cdc streaming round skipped: {s}", .{@errorName(err)});
-                return;
-            },
-            else => return err,
+        const stream_summary = streaming.runRound(self) catch |err| {
+            if (!isExpectedCdcRoundError(err)) return err;
+            std.log.warn("metadata http cdc streaming round skipped: {s}", .{@errorName(err)});
+            return;
         };
         if (stream_summary.sources_considered > 0) {
             std.log.info(

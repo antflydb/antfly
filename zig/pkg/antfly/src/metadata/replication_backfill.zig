@@ -3269,7 +3269,10 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
             _: u64,
         ) !foreign_mod.PostgresQueryExecutor.PreparedReplicationSnapshot {
             calls += 1;
-            if (calls == 2) reclaimed_on_retry = params.reclaim_exact_cutover_slot;
+            if (calls == 2) {
+                reclaimed_on_retry = params.reclaim_exact_cutover_slot;
+                return error.ExactCutoverCleanupPending;
+            }
             if (calls == 3) reclaimed_on_config_mismatch = params.reclaim_exact_cutover_slot;
             if (params.exact_cutover_intent) |intent| try intent.persist();
             return error.ForeignConnectionFailed;
@@ -3358,17 +3361,24 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
     const interrupted = status_sink.latest();
     const first_intent_id = interrupted.cutover_intent_id;
     try std.testing.expectError(
-        error.ForeignConnectionFailed,
+        error.ExactCutoverCleanupPending,
         runner.runTableSourceFromStatus(&status_sink, table, 0, 0, interrupted),
     );
     try std.testing.expectEqual(@as(usize, 2), FakeExecutor.calls);
     try std.testing.expect(FakeExecutor.reclaimed_on_retry);
     try std.testing.expectEqualStrings(
+        "ExactCutoverCleanupPending",
+        status_sink.latest().last_error,
+    );
+    try std.testing.expectEqualStrings("retryable", status_sink.latest().failure_class);
+    try std.testing.expectEqualStrings(
         cutover_mode_exported_snapshot_pending,
         status_sink.latest().cutover_mode,
     );
     try std.testing.expectEqual(first_intent_id, status_sink.latest().cutover_intent_id);
-    try std.testing.expectEqual(@as(usize, 2), status_sink.durable_calls);
+    // An active owned slot is left in place and does not require rewriting the
+    // already-applied ownership intent.
+    try std.testing.expectEqual(@as(usize, 1), status_sink.durable_calls);
 
     const mismatched_config_table = metadata_table_manager.TableRecord{
         .table_id = table.table_id,
@@ -3385,7 +3395,7 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
     try std.testing.expectEqual(@as(usize, 3), FakeExecutor.calls);
     try std.testing.expect(!FakeExecutor.reclaimed_on_config_mismatch);
     try std.testing.expect(status_sink.latest().cutover_intent_id != first_intent_id);
-    try std.testing.expectEqual(@as(usize, 3), status_sink.durable_calls);
+    try std.testing.expectEqual(@as(usize, 2), status_sink.durable_calls);
 }
 
 test "metadata replication stream applies insert update and delete through bound write source" {
