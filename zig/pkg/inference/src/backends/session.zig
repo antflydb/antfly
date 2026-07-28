@@ -523,8 +523,7 @@ test "run admission scales dynamic outputs and honors reserved backend workspace
     }};
 
     const cpu = RunAdmission{
-        .context = &controller,
-        .acquire_fn = acquireFromController,
+        .controller = &controller,
         .backend_class = .cpu,
         .limits = .{},
         .static_workspace_bytes = 4096,
@@ -534,8 +533,7 @@ test "run admission scales dynamic outputs and honors reserved backend workspace
     try std.testing.expectEqual(@as(usize, 0), cpu_amounts.backend_scratch_bytes);
 
     const gpu = RunAdmission{
-        .context = &controller,
-        .acquire_fn = acquireFromController,
+        .controller = &controller,
         .backend_class = .gpu,
         .limits = .{},
         .static_workspace_bytes = 4096,

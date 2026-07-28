@@ -2232,7 +2232,7 @@ fn admittedSessionCudaLimit(
 
 fn attachSessionRunAdmission(
     session: *backends.Session,
-    manager: *ModelManager,
+    controller: *runtime.tier.memory.AdmissionController,
     backend_runtime: backends.BackendRuntime,
     limits: runtime.tier.memory.Limits,
     resident: runtime.tier.memory.AdmissionAmounts,
@@ -2244,8 +2244,7 @@ fn attachSessionRunAdmission(
         resident.backend_weight_bytes,
     ) catch std.math.maxInt(usize);
     session.run_admission = .{
-        .context = manager,
-        .acquire_fn = acquireSessionRunResources,
+        .controller = controller,
         .backend_class = admissionBackendClassForRuntime(backend_runtime),
         .limits = limits,
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
@@ -2259,16 +2258,6 @@ fn attachSessionRunAdmission(
                 backend_runtime.onnx_execution_provider != .cuda,
         } else .{},
     };
-}
-
-fn acquireSessionRunResources(
-    context: *anyopaque,
-    backend_class: runtime.tier.memory.BackendClass,
-    limits: runtime.tier.memory.Limits,
-    amounts: runtime.tier.memory.AdmissionAmounts,
-) !runtime.tier.memory.AdmissionLease {
-    const manager: *ModelManager = @ptrCast(@alignCast(context));
-    return manager.acquireAmountsWithEviction(backend_class, limits, amounts);
 }
 
 pub const ModelHandle = struct {
@@ -2998,7 +2987,7 @@ pub const ModelManager = struct {
                 if (self.admission_enabled) {
                     attachSessionRunAdmission(
                         &session,
-                        self,
+                        &self.admission,
                         backend_runtime,
                         admission_limits,
                         resident_amounts,
@@ -4352,7 +4341,7 @@ fn loadSessionForPreferredBackends(
             if (manager.admission_enabled) {
                 attachSessionRunAdmission(
                     &session,
-                    manager,
+                    &manager.admission,
                     backend_runtime,
                     admission_limits,
                     resident_amounts,
