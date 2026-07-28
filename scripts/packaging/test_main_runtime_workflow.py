@@ -28,6 +28,7 @@ class MainRuntimeWorkflowTest(unittest.TestCase):
         self.assertIn("group: main-runtime-main", WORKFLOW)
         self.assertIn("immutable image conflicts", WORKFLOW)
         self.assertIn("cosign verify", WORKFLOW)
+        self.assertIn("platform=${platform}", WORKFLOW)
         self.assertIn("missing Buildx provenance attestations", WORKFLOW)
 
     def test_emits_digest_sha_and_platform_identity(self):
@@ -85,6 +86,12 @@ class MainRuntimeWorkflowTest(unittest.TestCase):
         self.assertTrue(fixture["tag"].startswith("main-"))
         self.assertEqual(fixture["expected"], "rejected")
         self.assertIn("main-* tags are reserved for Main Runtime", CONTAINER_WORKFLOW)
+        self.assertIn("invalid release tag", CONTAINER_WORKFLOW)
+
+    def test_manifest_uses_signed_child_digests_not_mutable_child_tags(self):
+        self.assertIn("--amd64-digest", WORKFLOW)
+        self.assertIn("--arm64-digest", WORKFLOW)
+        self.assertIn("cosign verify", WORKFLOW)
 
 
 if __name__ == "__main__":

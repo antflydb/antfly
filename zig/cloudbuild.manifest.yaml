@@ -4,8 +4,8 @@
 #   _IMAGE_NAME: image name in the containers repo
 #   _VERSION_TAG: final versioned tag, such as zig-v0.1.0
 #   _ALIAS_TAG: optional stable tag, such as zig
-#   _AMD64_TAG: source amd64 image tag
-#   _ARM64_TAG: source arm64 image tag
+#   _AMD64_REF: immutable source amd64 image reference
+#   _ARM64_REF: immutable source arm64 image reference
 
 steps:
   - name: gcr.io/cloud-builders/docker
@@ -18,8 +18,8 @@ steps:
         IMAGE_BASE="us-central1-docker.pkg.dev/$PROJECT_ID/containers/${_IMAGE_NAME}"
         docker buildx imagetools create \
           --tag "$${IMAGE_BASE}:${_VERSION_TAG}" \
-          "$${IMAGE_BASE}:${_AMD64_TAG}" \
-          "$${IMAGE_BASE}:${_ARM64_TAG}"
+          "${_AMD64_REF}" \
+          "${_ARM64_REF}"
         if [ -n "${_ALIAS_TAG}" ] && [ "${_ALIAS_TAG}" != "__skip_alias__" ]; then
           docker buildx imagetools create \
             --tag "$${IMAGE_BASE}:${_ALIAS_TAG}" \
@@ -36,5 +36,5 @@ substitutions:
   _IMAGE_NAME: antfly
   _VERSION_TAG: zig-latest
   _ALIAS_TAG: zig
-  _AMD64_TAG: zig-latest-amd64
-  _ARM64_TAG: zig-latest-arm64
+  _AMD64_REF: us-central1-docker.pkg.dev/$PROJECT_ID/containers/antfly@sha256:placeholder
+  _ARM64_REF: us-central1-docker.pkg.dev/$PROJECT_ID/containers/antfly@sha256:placeholder

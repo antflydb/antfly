@@ -68,6 +68,7 @@ jobs:
         run: |
           tag="${{ inputs.tag_name || github.event.release.tag_name || github.event.inputs.tag_name }}"
           [[ "$tag" != main-* ]] || { echo "main-* tags are reserved for Main Runtime" >&2; exit 1; }
+          [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || { echo "invalid release tag" >&2; exit 1; }
 
       - name: Authenticate to Google Cloud
         id: auth
@@ -146,6 +147,7 @@ jobs:
         run: |
           tag="${{ inputs.tag_name || github.event.release.tag_name || github.event.inputs.tag_name }}"
           [[ "$tag" != main-* ]] || { echo "main-* tags are reserved for Main Runtime" >&2; exit 1; }
+          [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || { echo "invalid release tag" >&2; exit 1; }
 
       - name: Authenticate to Google Cloud
         id: auth

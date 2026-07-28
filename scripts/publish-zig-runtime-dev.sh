@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/publish-zig-runtime-dev.sh [--tag TAG] [--arch amd64|arm64] [--optimize ReleaseFast|ReleaseSmall] [--jobs N] [--manifest|--image-ref]
+  scripts/publish-zig-runtime-dev.sh [--tag TAG] [--arch amd64|arm64] [--optimize ReleaseFast|ReleaseSmall] [--jobs N] [--manifest [--amd64-digest DIGEST --arm64-digest DIGEST]|--image-ref]
 
 Build the local native Zig runtime artifact, upload it to GCS, and ask Cloud
 Build to package/push a single-arch GAR image. Run once on amd64 and once on
@@ -34,6 +34,8 @@ image_ref=false
 arch=""
 optimize="ReleaseFast"
 jobs=""
+amd64_digest=""
+arm64_digest=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,6 +53,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --jobs)
       jobs="${2:?--jobs requires a value}"
+      shift 2
+      ;;
+    --amd64-digest)
+      amd64_digest="${2:?--amd64-digest requires a value}"
+      shift 2
+      ;;
+    --arm64-digest)
+      arm64_digest="${2:?--arm64-digest requires a value}"
       shift 2
       ;;
     --manifest)
@@ -85,6 +95,8 @@ fi
 
 case "$optimize" in ReleaseFast|ReleaseSmall) ;; *) echo "--optimize must be ReleaseFast or ReleaseSmall" >&2; exit 2;; esac
 [[ -z "$jobs" || "$jobs" =~ ^[1-9][0-9]*$ ]] || { echo "--jobs must be a positive integer" >&2; exit 2; }
+[[ -z "$amd64_digest" || "$amd64_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "invalid amd64 digest" >&2; exit 2; }
+[[ -z "$arm64_digest" || "$arm64_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "invalid arm64 digest" >&2; exit 2; }
 
 host_arch="$(uname -m)"
 case "$host_arch" in
@@ -128,6 +140,7 @@ inspect_image() {
 }
 
 if [[ "$manifest" == true ]]; then
+  [[ -z "$amd64_digest" && -z "$arm64_digest" || ( -n "$amd64_digest" && -n "$arm64_digest" ) ]] || { echo "both child digests are required" >&2; exit 2; }
   if lookup="$(gcloud artifacts docker images describe "${image_base}:${tag}" \
       --project="$gcp_project" \
       --format='value(image_summary.digest)' 2>&1)"; then
@@ -137,12 +150,16 @@ if [[ "$manifest" == true ]]; then
     echo "unable to determine whether immutable image exists: $lookup" >&2
     exit 1
   fi
+  amd64_ref="${image_base}:${tag}-amd64"
+  arm64_ref="${image_base}:${tag}-arm64"
+  [[ -z "$amd64_digest" ]] || amd64_ref="${image_base}@${amd64_digest}"
+  [[ -z "$arm64_digest" ]] || arm64_ref="${image_base}@${arm64_digest}"
   gcloud builds submit "$repo_root" \
     --project="$gcp_project" \
     --region="$gcp_region" \
     --worker-pool="$worker_pool" \
     --config=zig/cloudbuild.manifest.yaml \
-    --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${tag},_ALIAS_TAG=__skip_alias__,_AMD64_TAG=${tag}-amd64,_ARM64_TAG=${tag}-arm64"
+    --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${tag},_ALIAS_TAG=__skip_alias__,_AMD64_REF=${amd64_ref},_ARM64_REF=${arm64_ref}"
   inspect_image "${image_base}:${tag}"
   exit 0
 fi
@@ -161,7 +178,7 @@ mkdir -p "$cache_dir"
 
 echo "Building $arch Zig runtime artifact for $zig_target"
 jobs_arg=()
-[[ -z "$jobs" ]] || jobs_arg=(--jobs "$jobs")
+[[ -z "$jobs" ]] || jobs_arg=("-j${jobs}")
 (
   cd "$repo_root/zig"
   zig build \
