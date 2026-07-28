@@ -1126,6 +1126,11 @@ fn replicationCutoverIntentApplied(
             &record.cutover_config_fingerprint,
             &expected.cutover_config_fingerprint,
         ) and
+        std.mem.eql(
+            u8,
+            &record.cutover_provider_identity,
+            &expected.cutover_provider_identity,
+        ) and
         std.mem.eql(u8, record.source_kind, expected.source_kind) and
         std.mem.eql(u8, record.external_table, expected.external_table) and
         std.mem.eql(u8, record.cutover_mode, expected.cutover_mode) and
@@ -1150,6 +1155,8 @@ fn isExpectedCdcRoundError(err: anyerror) bool {
         error.ForeignConnectionPoolLimitExceeded,
         error.ForeignColumnCacheLimitExceeded,
         error.ForeignQueryFailed,
+        error.ForeignProviderIdentityMismatch,
+        error.ExactCutoverProviderIdentityMismatch,
         error.ForeignReplicationSlotMissing,
         error.ForeignTableNotFound,
         error.ExactCutoverCleanupPending,
@@ -1180,6 +1187,7 @@ test "metadata durable cutover acknowledgement is attempt scoped" {
         .cutover_intent_id = 99,
         .cutover_authority_id = 1001,
         .cutover_config_fingerprint = fingerprint,
+        .cutover_provider_identity = [_]u8{0x6b} ** std.crypto.hash.sha2.Sha256.digest_length,
     };
     try std.testing.expect(replicationCutoverIntentApplied(expected, expected));
 
@@ -1190,6 +1198,10 @@ test "metadata durable cutover acknowledgement is attempt scoped" {
     var stale_authority = expected;
     stale_authority.cutover_authority_id = 1000;
     try std.testing.expect(!replicationCutoverIntentApplied(stale_authority, expected));
+
+    var stale_provider = expected;
+    stale_provider.cutover_provider_identity[0] ^= 0xff;
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_provider, expected));
 
     var stale_config = expected;
     stale_config.cutover_config_fingerprint[0] ^= 0xff;
@@ -1209,6 +1221,8 @@ test "metadata CDC round error policy isolates expected recovery failures" {
         error.ForeignColumnCacheLimitExceeded,
         error.ForeignConnectionFailed,
         error.ForeignQueryFailed,
+        error.ForeignProviderIdentityMismatch,
+        error.ExactCutoverProviderIdentityMismatch,
     };
     for (expected_errors) |err| try std.testing.expect(isExpectedCdcRoundError(err));
 
@@ -1771,7 +1785,9 @@ pub const MetadataService = struct {
     /// Persists exact-cutover ownership and fresh authority and does not return
     /// until this provider attempt is visible in the applied Raft projection.
     pub fn upsertReplicationSourceStatusDurable(self: *MetadataService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
-        if (record.cutover_intent_id == 0 or record.cutover_authority_id == 0)
+        if (record.cutover_intent_id == 0 or
+            record.cutover_authority_id == 0 or
+            std.mem.allEqual(u8, &record.cutover_provider_identity, 0))
             return error.InvalidReplicationCutoverIntent;
         try self.upsertReplicationSourceStatus(record);
 
@@ -3250,7 +3266,9 @@ pub const MetadataHttpService = struct {
     /// Persists exact-cutover ownership and fresh authority and does not return
     /// until this provider attempt is visible in the applied Raft projection.
     pub fn upsertReplicationSourceStatusDurable(self: *MetadataHttpService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
-        if (record.cutover_intent_id == 0 or record.cutover_authority_id == 0)
+        if (record.cutover_intent_id == 0 or
+            record.cutover_authority_id == 0 or
+            std.mem.allEqual(u8, &record.cutover_provider_identity, 0))
             return error.InvalidReplicationCutoverIntent;
         try self.upsertReplicationSourceStatus(record);
 

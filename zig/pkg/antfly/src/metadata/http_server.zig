@@ -2627,7 +2627,9 @@ fn replicationStatusOwnsPhysicalSlot(
 ) bool {
     const postgres_identifier_max_len = 63;
     const suffix_len = "_af_".len + 16;
-    if (status.cutover_intent_id == 0 or status.cutover_authority_id == 0)
+    if (status.cutover_intent_id == 0 or
+        status.cutover_authority_id == 0 or
+        std.mem.allEqual(u8, &status.cutover_provider_identity, 0))
         return false;
     const prefix_len = @min(
         configured_slot_name.len,
@@ -2650,6 +2652,7 @@ test "metadata reseed accepts only the durable attempt-scoped physical slot" {
         .slot_name = "configured_slot_af_0000000000000042",
         .cutover_intent_id = 0x42,
         .cutover_authority_id = 0x43,
+        .cutover_provider_identity = [_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length,
     };
     try std.testing.expect(replicationStatusOwnsPhysicalSlot("configured_slot", status));
 

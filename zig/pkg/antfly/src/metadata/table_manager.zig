@@ -891,6 +891,10 @@ pub const ReplicationSourceStatusRecord = struct {
     cutover_authority_id: u64 = 0,
     cutover_config_fingerprint: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
         [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+    /// Authenticated PostgreSQL cluster, database, and database-incarnation
+    /// identity. This deliberately excludes connection credentials.
+    cutover_provider_identity: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
+        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
     updated_at_ms: u64 = 0,
 };
 
@@ -1869,6 +1873,7 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
         .cutover_intent_id = record.cutover_intent_id,
         .cutover_authority_id = record.cutover_authority_id,
         .cutover_config_fingerprint = record.cutover_config_fingerprint,
+        .cutover_provider_identity = record.cutover_provider_identity,
         .updated_at_ms = record.updated_at_ms,
     };
 }

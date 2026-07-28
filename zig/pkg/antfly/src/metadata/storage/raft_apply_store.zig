@@ -4696,6 +4696,7 @@ fn appendReplicationSourceStatusRecord(
     try appendInt(alloc, out, u64, record.cutover_intent_id);
     try out.appendSlice(alloc, &record.cutover_config_fingerprint);
     try appendInt(alloc, out, u64, record.cutover_authority_id);
+    try out.appendSlice(alloc, &record.cutover_provider_identity);
 }
 
 fn appendRangeRecord(
@@ -5359,6 +5360,15 @@ fn readReplicationSourceStatusRecord(
         try readInt(encoded, pos, u64)
     else
         0;
+    var cutover_provider_identity =
+        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+    if (pos.* + cutover_provider_identity.len <= encoded.len) {
+        @memcpy(
+            &cutover_provider_identity,
+            encoded[pos.*..][0..cutover_provider_identity.len],
+        );
+        pos.* += cutover_provider_identity.len;
+    }
     return .{
         .table_id = table_id,
         .source_ordinal = source_ordinal,
@@ -5383,6 +5393,7 @@ fn readReplicationSourceStatusRecord(
         .cutover_intent_id = cutover_intent_id,
         .cutover_authority_id = cutover_authority_id,
         .cutover_config_fingerprint = cutover_config_fingerprint,
+        .cutover_provider_identity = cutover_provider_identity,
         .updated_at_ms = updated_at_ms,
     };
 }
@@ -7720,6 +7731,7 @@ test "metadata replication source status transition command round-trips" {
             .last_change_applied_at_ms = 124,
             .cutover_intent_id = 0x1122,
             .cutover_authority_id = 0x3344,
+            .cutover_provider_identity = [_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length,
             .updated_at_ms = 555,
         },
     };
@@ -7747,10 +7759,30 @@ test "metadata replication source status transition command round-trips" {
     try std.testing.expectEqual(@as(u64, 124), decoded.?.upsert_replication_source_status.last_change_applied_at_ms);
     try std.testing.expectEqual(@as(u64, 0x1122), decoded.?.upsert_replication_source_status.cutover_intent_id);
     try std.testing.expectEqual(@as(u64, 0x3344), decoded.?.upsert_replication_source_status.cutover_authority_id);
+    try std.testing.expectEqualSlices(
+        u8,
+        &([_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length),
+        &decoded.?.upsert_replication_source_status.cutover_provider_identity,
+    );
+
+    var pre_provider_decoded = try decodeTransitionCommand(
+        std.testing.allocator,
+        encoded[0 .. encoded.len - std.crypto.hash.sha2.Sha256.digest_length],
+    );
+    defer if (pre_provider_decoded) |*d| d.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        @as(u64, 0x3344),
+        pre_provider_decoded.?.upsert_replication_source_status.cutover_authority_id,
+    );
+    try std.testing.expect(std.mem.allEqual(
+        u8,
+        &pre_provider_decoded.?.upsert_replication_source_status.cutover_provider_identity,
+        0,
+    ));
 
     var legacy_decoded = try decodeTransitionCommand(
         std.testing.allocator,
-        encoded[0 .. encoded.len - @sizeOf(u64)],
+        encoded[0 .. encoded.len - std.crypto.hash.sha2.Sha256.digest_length - @sizeOf(u64)],
     );
     defer if (legacy_decoded) |*d| d.deinit(std.testing.allocator);
     try std.testing.expectEqual(
@@ -7906,6 +7938,7 @@ test "metadata raft apply store projects replication source status records from 
             .last_change_applied_at_ms = 555,
             .cutover_intent_id = 0x1122,
             .cutover_authority_id = 0x3344,
+            .cutover_provider_identity = [_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length,
             .cutover_config_fingerprint = [_]u8{0x33} ** std.crypto.hash.sha2.Sha256.digest_length,
             .updated_at_ms = 777,
         },
@@ -7951,6 +7984,11 @@ test "metadata raft apply store projects replication source status records from 
         try std.testing.expectEqual(@as(u64, 0x3344), statuses[0].cutover_authority_id);
         try std.testing.expectEqualSlices(
             u8,
+            &([_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length),
+            &statuses[0].cutover_provider_identity,
+        );
+        try std.testing.expectEqualSlices(
+            u8,
             &([_]u8{0x33} ** std.crypto.hash.sha2.Sha256.digest_length),
             &statuses[0].cutover_config_fingerprint,
         );
@@ -7964,6 +8002,11 @@ test "metadata raft apply store projects replication source status records from 
         defer metadata_table_manager.freeReplicationSourceStatus(std.testing.allocator, point_status);
         try std.testing.expectEqual(@as(u64, 0x1122), point_status.cutover_intent_id);
         try std.testing.expectEqual(@as(u64, 0x3344), point_status.cutover_authority_id);
+        try std.testing.expectEqualSlices(
+            u8,
+            &([_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length),
+            &point_status.cutover_provider_identity,
+        );
     }
 }
 

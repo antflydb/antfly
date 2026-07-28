@@ -33,6 +33,7 @@ pub const SnapshotReader = source.SnapshotReader;
 pub const PreparedReplicationSnapshot = source.PreparedReplicationSnapshot;
 pub const ReplicationOp = source.ReplicationOp;
 pub const ReplicationChange = source.ReplicationChange;
+pub const ExactCutoverIntent = source.ExactCutoverIntent;
 pub const ReplicationPrepareResult = source.ReplicationPrepareResult;
 pub const ReplicationCleanupParams = source.ReplicationCleanupParams;
 pub const ReplicationPollParams = source.ReplicationPollParams;

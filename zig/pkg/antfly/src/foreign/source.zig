@@ -188,11 +188,16 @@ pub const ReplicationChange = struct {
 /// The callback lifetime is limited to the enclosing
 /// beginPreparedReplicationSnapshot call.
 pub const ExactCutoverIntent = struct {
-    ptr: *anyopaque,
-    persist_fn: *const fn (ptr: *anyopaque) anyerror!void,
+    pub const ProviderIdentity = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
-    pub fn persist(self: @This()) !void {
-        try self.persist_fn(self.ptr);
+    ptr: *anyopaque,
+    persist_fn: *const fn (
+        ptr: *anyopaque,
+        provider_identity: ProviderIdentity,
+    ) anyerror!void,
+
+    pub fn persist(self: @This(), provider_identity: ProviderIdentity) !void {
+        try self.persist_fn(self.ptr, provider_identity);
     }
 };
 

@@ -31,6 +31,7 @@ const max_pool_reclaims_per_acquire: usize = 1;
 const max_column_cache_entries: usize = 1_024;
 const column_cache_ttl_ns: u64 = std.time.ns_per_min;
 const failed_cutover_cleanup_timeout_ns: u64 = 5 * std.time.ns_per_s;
+const exact_cutover_identity_domain = "antfly/postgres-exact-cutover-identity/v1";
 const supports_waitable_pool = builtin.os.tag != .freestanding and
     builtin.link_libc and
     @hasDecl(std.c, "pthread_cond_wait") and
@@ -57,6 +58,43 @@ const uses_relative_condwait = switch (builtin.os.tag) {
     .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
     else => false,
 };
+
+fn exactCutoverProviderIdentity(
+    system_id: []const u8,
+    database: []const u8,
+    database_oid: []const u8,
+) foreign_source.ExactCutoverIntent.ProviderIdentity {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(exact_cutover_identity_domain);
+    hashIdentityField(&hasher, system_id);
+    hashIdentityField(&hasher, database);
+    hashIdentityField(&hasher, database_oid);
+    var identity: foreign_source.ExactCutoverIntent.ProviderIdentity = undefined;
+    hasher.final(&identity);
+    return identity;
+}
+
+fn hashIdentityField(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    value: []const u8,
+) void {
+    var encoded_len: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_len, @intCast(value.len), .big);
+    hasher.update(&encoded_len);
+    hasher.update(value);
+}
+
+test "postgres exact cutover identity binds cluster database and database incarnation" {
+    const baseline = exactCutoverProviderIdentity("734912783", "app", "16384");
+    const same = exactCutoverProviderIdentity("734912783", "app", "16384");
+    const other_cluster = exactCutoverProviderIdentity("734912784", "app", "16384");
+    const other_database = exactCutoverProviderIdentity("734912783", "other", "16384");
+    const recreated_database = exactCutoverProviderIdentity("734912783", "app", "24576");
+    try std.testing.expectEqualSlices(u8, &baseline, &same);
+    try std.testing.expect(!std.mem.eql(u8, &baseline, &other_cluster));
+    try std.testing.expect(!std.mem.eql(u8, &baseline, &other_database));
+    try std.testing.expect(!std.mem.eql(u8, &baseline, &recreated_database));
+}
 
 /// An epoch-based condition avoids missed wakeups between observing pool state
 /// and sleeping. Native timed waits use a monotonic clock (Linux) or a relative
@@ -787,11 +825,26 @@ pub const Executor = struct {
         if (slot_exists and !params.reclaim_exact_cutover_slot)
             return error.UnsupportedExactCutover;
 
-        // Fence the current authority before any persistent provider mutation.
-        // A stale leader may know the stable ownership identity, but cannot get
-        // its fresh authority token applied after losing leadership.
+        var repl_conn: ?*PGconn = try self.connectReplicationFreshWithDeadline(
+            alloc,
+            dsn,
+            execution_deadline_ns,
+        );
+        errdefer if (repl_conn) |conn| self.pqfinish(conn);
+        const provider_identity = try self.identifyExactCutoverProvider(
+            alloc,
+            sql_conn,
+            repl_conn,
+            execution_deadline_ns,
+        );
+
+        // Fence the current authority and authenticate the target before any
+        // persistent provider mutation. A stale leader may know the stable
+        // ownership identity, but cannot get its fresh authority token applied
+        // after losing leadership. Credentials are deliberately absent from
+        // provider_identity, so rotating them cannot invalidate ownership.
         try ensureDeadline(execution_deadline_ns);
-        try exact_cutover_intent.persist();
+        try exact_cutover_intent.persist(provider_identity);
         try ensureDeadline(execution_deadline_ns);
 
         try self.ensurePublicationAlloc(
@@ -818,12 +871,6 @@ pub const Executor = struct {
             )) return error.ExactCutoverCleanupPending;
         }
 
-        var repl_conn: ?*PGconn = try self.connectReplicationFreshWithDeadline(
-            alloc,
-            dsn,
-            execution_deadline_ns,
-        );
-        errdefer if (repl_conn) |conn| self.pqfinish(conn);
         var slot_created = false;
         errdefer if (slot_created) {
             // Clean up only a slot whose successful create response this
@@ -2413,6 +2460,77 @@ pub const Executor = struct {
         );
         defer self.pqclear(result);
         return @as(usize, @intCast(self.pqntuples(result))) > 0;
+    }
+
+    fn identifyExactCutoverProvider(
+        self: *@This(),
+        alloc: Allocator,
+        sql_conn: ?*PGconn,
+        replication_conn: ?*PGconn,
+        execution_deadline_ns: u64,
+    ) !foreign_source.ExactCutoverIntent.ProviderIdentity {
+        const result = try self.execSimpleWithDeadline(
+            replication_conn,
+            alloc,
+            "IDENTIFY_SYSTEM",
+            execution_deadline_ns,
+            false,
+        );
+        defer self.pqclear(result);
+        if (self.pqntuples(result) != 1 or self.pqnfields(result) < 4)
+            return error.ForeignQueryFailed;
+        if (self.pqgetisnull(result, 0, 0) != 0 or
+            self.pqgetisnull(result, 0, 3) != 0)
+            return error.ForeignQueryFailed;
+        const system_id = self.pqgetvalue(result, 0, 0)[0..@intCast(
+            self.pqgetlength(result, 0, 0),
+        )];
+        const database = self.pqgetvalue(result, 0, 3)[0..@intCast(
+            self.pqgetlength(result, 0, 3),
+        )];
+        if (system_id.len == 0 or database.len == 0)
+            return error.ForeignQueryFailed;
+
+        // Authenticate the SQL and replication sockets as the same database.
+        // The database OID additionally rejects drop/recreate of an identically
+        // named database within the same cluster.
+        const sql_identity_result = try self.execSimpleWithDeadline(
+            sql_conn,
+            alloc,
+            \\SELECT (pg_control_system()).system_identifier::text,
+            \\       current_database(),
+            \\       oid::text
+            \\  FROM pg_database
+            \\ WHERE datname = current_database()
+        ,
+            execution_deadline_ns,
+            false,
+        );
+        defer self.pqclear(sql_identity_result);
+        if (self.pqntuples(sql_identity_result) != 1 or
+            self.pqnfields(sql_identity_result) < 3)
+            return error.ForeignQueryFailed;
+        for (0..3) |column| {
+            if (self.pqgetisnull(sql_identity_result, 0, @intCast(column)) != 0)
+                return error.ForeignQueryFailed;
+        }
+        const sql_system_id =
+            self.pqgetvalue(sql_identity_result, 0, 0)[0..@intCast(
+                self.pqgetlength(sql_identity_result, 0, 0),
+            )];
+        const sql_database =
+            self.pqgetvalue(sql_identity_result, 0, 1)[0..@intCast(
+                self.pqgetlength(sql_identity_result, 0, 1),
+            )];
+        const database_oid =
+            self.pqgetvalue(sql_identity_result, 0, 2)[0..@intCast(
+                self.pqgetlength(sql_identity_result, 0, 2),
+            )];
+        if (!std.mem.eql(u8, system_id, sql_system_id) or
+            !std.mem.eql(u8, database, sql_database) or
+            database_oid.len == 0)
+            return error.ForeignProviderIdentityMismatch;
+        return exactCutoverProviderIdentity(system_id, database, database_oid);
     }
 
     fn cloneCreatedReplicationSnapshotAlloc(
@@ -4874,7 +4992,10 @@ test "postgres libpq prepared replication snapshot bridges initial cutover" {
 
     var intent_persisted = false;
     const Intent = struct {
-        fn persist(ptr: *anyopaque) !void {
+        fn persist(
+            ptr: *anyopaque,
+            _: foreign_source.ExactCutoverIntent.ProviderIdentity,
+        ) !void {
             const persisted: *bool = @ptrCast(@alignCast(ptr));
             persisted.* = true;
         }
@@ -4920,6 +5041,112 @@ test "postgres libpq prepared replication snapshot bridges initial cutover" {
     defer poll_result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), poll_result.changes.len);
     try std.testing.expectEqualStrings("u1", poll_result.changes[0].row.?.object.get("id").?.string);
+}
+
+test "postgres libpq exact cutover authority failure precedes provider mutation" {
+    const alloc = std.testing.allocator;
+    const dsn = try testPgDsnAlloc(alloc);
+    defer alloc.free(dsn);
+
+    var executor = try Executor.init(alloc);
+    defer executor.deinit();
+
+    const conn = executor.connect(dsn) catch return error.SkipZigTest;
+    const wal_level_result = executor.execSimple(conn, alloc, "show wal_level") catch return error.SkipZigTest;
+    defer executor.pqclear(wal_level_result);
+    if (executor.pqntuples(wal_level_result) == 0 or executor.pqgetisnull(wal_level_result, 0, 0) != 0) return error.SkipZigTest;
+    const wal_level = executor.pqgetvalue(wal_level_result, 0, 0)[0..@intCast(executor.pqgetlength(wal_level_result, 0, 0))];
+    if (!std.ascii.eqlIgnoreCase(wal_level, "logical")) return error.SkipZigTest;
+
+    live_poll_test_counter += 1;
+    const suffix = live_poll_test_counter;
+    const table_name = try std.fmt.allocPrint(alloc, "antfly_zig_fenced_cutover_{d}", .{suffix});
+    defer alloc.free(table_name);
+    const slot_name = try std.fmt.allocPrint(alloc, "antfly_zig_fenced_cutover_slot_{d}", .{suffix});
+    defer alloc.free(slot_name);
+    const publication_name = try std.fmt.allocPrint(alloc, "antfly_zig_fenced_cutover_pub_{d}", .{suffix});
+    defer alloc.free(publication_name);
+
+    const drop_publication_sql = try std.fmt.allocPrint(alloc, "drop publication if exists {s}", .{publication_name});
+    defer alloc.free(drop_publication_sql);
+    const drop_slot_sql = try std.fmt.allocPrint(
+        alloc,
+        "select pg_drop_replication_slot('{s}') from pg_replication_slots where slot_name = '{s}' and not active",
+        .{ slot_name, slot_name },
+    );
+    defer alloc.free(drop_slot_sql);
+    const drop_table_sql = try std.fmt.allocPrint(alloc, "drop table if exists {s}", .{table_name});
+    defer alloc.free(drop_table_sql);
+    defer {
+        execCommandForTest(&executor, conn, alloc, drop_publication_sql) catch {};
+        execCommandForTest(&executor, conn, alloc, drop_slot_sql) catch {};
+        execCommandForTest(&executor, conn, alloc, drop_table_sql) catch {};
+    }
+
+    const create_table_sql = try std.fmt.allocPrint(
+        alloc,
+        "create table {s} (id text primary key)",
+        .{table_name},
+    );
+    defer alloc.free(create_table_sql);
+    const create_slot_sql = try std.fmt.allocPrint(
+        alloc,
+        "select * from pg_create_logical_replication_slot('{s}', 'pgoutput')",
+        .{slot_name},
+    );
+    defer alloc.free(create_slot_sql);
+    try execCommandForTest(&executor, conn, alloc, drop_table_sql);
+    try execCommandForTest(&executor, conn, alloc, create_table_sql);
+    try execCommandForTest(&executor, conn, alloc, create_slot_sql);
+
+    var persist_calls: usize = 0;
+    const DeniedIntent = struct {
+        fn persist(
+            ptr: *anyopaque,
+            _: foreign_source.ExactCutoverIntent.ProviderIdentity,
+        ) !void {
+            const calls: *usize = @ptrCast(@alignCast(ptr));
+            calls.* += 1;
+            return error.TestAuthorityDenied;
+        }
+    };
+    var begin_params = foreign_source.ReplicationPollParams{
+        .table = try alloc.dupe(u8, table_name),
+        .slot_name = try alloc.dupe(u8, slot_name),
+        .publication_name = try alloc.dupe(u8, publication_name),
+        .reclaim_exact_cutover_slot = true,
+        .exact_cutover_intent = .{
+            .ptr = &persist_calls,
+            .persist_fn = DeniedIntent.persist,
+        },
+    };
+    defer begin_params.deinit(alloc);
+    try std.testing.expectError(
+        error.TestAuthorityDenied,
+        executor.asQueryExecutor().beginPreparedReplicationSnapshot(
+            alloc,
+            dsn,
+            begin_params,
+            platform_time.monotonicNs() + 30 * std.time.ns_per_s,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), persist_calls);
+    try std.testing.expect(try executor.logicalReplicationSlotExistsAlloc(
+        alloc,
+        conn,
+        slot_name,
+        platform_time.monotonicNs() + 30 * std.time.ns_per_s,
+    ));
+
+    const publication_query = try std.fmt.allocPrint(
+        alloc,
+        "select 1 from pg_publication where pubname = '{s}'",
+        .{publication_name},
+    );
+    defer alloc.free(publication_query);
+    const publication_result = try executor.execSimple(conn, alloc, publication_query);
+    defer executor.pqclear(publication_result);
+    try std.testing.expectEqual(@as(c_int, 0), executor.pqntuples(publication_result));
 }
 
 test "postgres libpq poll resumes from durable checkpoint across multiple transactions" {

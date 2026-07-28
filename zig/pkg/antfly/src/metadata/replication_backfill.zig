@@ -42,6 +42,8 @@ const postgres_identifier_max_len = 63;
 const exact_cutover_slot_suffix_len = "_af_".len + 16;
 const empty_cutover_config_fingerprint =
     [_]u8{0} ** cutover_config_fingerprint_len;
+const empty_cutover_provider_identity: foreign_mod.ExactCutoverIntent.ProviderIdentity =
+    [_]u8{0} ** cutover_config_fingerprint_len;
 
 fn classifyReplicationError(err: anyerror) []const u8 {
     return switch (err) {
@@ -49,6 +51,8 @@ fn classifyReplicationError(err: anyerror) []const u8 {
         error.ForeignAuthFailed,
         error.ForeignTableNotFound,
         error.ForeignReplicationSlotMissing,
+        error.ForeignProviderIdentityMismatch,
+        error.ExactCutoverProviderIdentityMismatch,
         error.UnknownColumn,
         error.InvalidQueryRequest,
         error.UnsupportedReplicationStreaming,
@@ -109,6 +113,7 @@ pub const SnapshotBackfillRunner = struct {
         var progress_cutover_intent_id: u64 = 0;
         var progress_cutover_authority_id: u64 = 0;
         var progress_cutover_config_fingerprint = empty_cutover_config_fingerprint;
+        var progress_cutover_provider_identity = empty_cutover_provider_identity;
         if (existing_status) |status| {
             try progress_cutover_mode.appendSlice(self.alloc, status.cutover_mode);
             try progress_prepared_checkpoint.appendSlice(self.alloc, status.prepared_checkpoint);
@@ -116,6 +121,7 @@ pub const SnapshotBackfillRunner = struct {
             progress_cutover_intent_id = status.cutover_intent_id;
             progress_cutover_authority_id = status.cutover_authority_id;
             progress_cutover_config_fingerprint = status.cutover_config_fingerprint;
+            progress_cutover_provider_identity = status.cutover_provider_identity;
         }
 
         return self.runTableSourceInner(
@@ -131,6 +137,7 @@ pub const SnapshotBackfillRunner = struct {
             &progress_cutover_intent_id,
             &progress_cutover_authority_id,
             &progress_cutover_config_fingerprint,
+            &progress_cutover_provider_identity,
         ) catch |err| {
             var parsed = parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal) catch return err;
             defer parsed.deinit(self.alloc);
@@ -158,6 +165,7 @@ pub const SnapshotBackfillRunner = struct {
                 .cutover_intent_id = progress_cutover_intent_id,
                 .cutover_authority_id = progress_cutover_authority_id,
                 .cutover_config_fingerprint = progress_cutover_config_fingerprint,
+                .cutover_provider_identity = progress_cutover_provider_identity,
                 .updated_at_ms = nowMillis(),
             }) catch {};
             return err;
@@ -178,6 +186,7 @@ pub const SnapshotBackfillRunner = struct {
         progress_cutover_intent_id: *u64,
         progress_cutover_authority_id: *u64,
         progress_cutover_config_fingerprint: *[cutover_config_fingerprint_len]u8,
+        progress_cutover_provider_identity: *foreign_mod.ExactCutoverIntent.ProviderIdentity,
     ) !BackfillSummary {
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal);
         defer parsed.deinit(self.alloc);
@@ -218,7 +227,6 @@ pub const SnapshotBackfillRunner = struct {
             table.table_id,
             source_ordinal,
             parsed,
-            resolved_dsn.value,
         );
         const reclaim_exact_cutover_slot = if (existing_status) |status|
             exactCutoverIntentOwnsConfig(status, parsed, cutover_config_fingerprint)
@@ -253,6 +261,7 @@ pub const SnapshotBackfillRunner = struct {
             progress_cutover_intent_id.* = 0;
             progress_cutover_authority_id.* = 0;
             progress_cutover_config_fingerprint.* = empty_cutover_config_fingerprint;
+            progress_cutover_provider_identity.* = empty_cutover_provider_identity;
         }
 
         var prepare_params = foreign_mod.ReplicationPollParams{
@@ -273,9 +282,18 @@ pub const SnapshotBackfillRunner = struct {
             progress_cutover_intent_id: *u64,
             progress_cutover_authority_id: *u64,
             progress_cutover_config_fingerprint: *[cutover_config_fingerprint_len]u8,
+            progress_cutover_provider_identity: *foreign_mod.ExactCutoverIntent.ProviderIdentity,
+            reclaim_provider_identity: ?foreign_mod.ExactCutoverIntent.ProviderIdentity,
 
-            fn persist(ptr: *anyopaque) !void {
+            fn persist(
+                ptr: *anyopaque,
+                provider_identity: foreign_mod.ExactCutoverIntent.ProviderIdentity,
+            ) !void {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                if (ctx.reclaim_provider_identity) |expected| {
+                    if (!std.mem.eql(u8, &expected, &provider_identity))
+                        return error.ExactCutoverProviderIdentityMismatch;
+                }
                 try ctx.progress_cutover_mode.ensureTotalCapacity(
                     ctx.alloc,
                     cutover_mode_exported_snapshot_pending.len,
@@ -288,7 +306,9 @@ pub const SnapshotBackfillRunner = struct {
                 // failure status until the synchronous Raft barrier succeeds.
                 // A timeout may be ambiguous, but provider mutation has not
                 // started and an async status write must not manufacture proof.
-                try callUpsertStatusDurable(ctx.status_sink, ctx.record);
+                var record = ctx.record;
+                record.cutover_provider_identity = provider_identity;
+                try callUpsertStatusDurable(ctx.status_sink, record);
                 ctx.progress_cutover_mode.clearRetainingCapacity();
                 ctx.progress_cutover_mode.appendSliceAssumeCapacity(
                     cutover_mode_exported_snapshot_pending,
@@ -299,6 +319,7 @@ pub const SnapshotBackfillRunner = struct {
                 ctx.progress_cutover_intent_id.* = ctx.record.cutover_intent_id;
                 ctx.progress_cutover_authority_id.* = ctx.record.cutover_authority_id;
                 ctx.progress_cutover_config_fingerprint.* = ctx.record.cutover_config_fingerprint;
+                ctx.progress_cutover_provider_identity.* = provider_identity;
             }
         };
         var exact_cutover_intent_context = ExactCutoverIntentContext{
@@ -318,6 +339,7 @@ pub const SnapshotBackfillRunner = struct {
                 .cutover_intent_id = cutover_intent_id,
                 .cutover_authority_id = cutover_authority_id,
                 .cutover_config_fingerprint = cutover_config_fingerprint,
+                .cutover_provider_identity = empty_cutover_provider_identity,
                 .updated_at_ms = nowMillis(),
             },
             .progress_cutover_mode = progress_cutover_mode,
@@ -326,6 +348,11 @@ pub const SnapshotBackfillRunner = struct {
             .progress_cutover_intent_id = progress_cutover_intent_id,
             .progress_cutover_authority_id = progress_cutover_authority_id,
             .progress_cutover_config_fingerprint = progress_cutover_config_fingerprint,
+            .progress_cutover_provider_identity = progress_cutover_provider_identity,
+            .reclaim_provider_identity = if (reclaim_exact_cutover_slot)
+                existing_status.?.cutover_provider_identity
+            else
+                null,
         };
         prepare_params.exact_cutover_intent = .{
             .ptr = &exact_cutover_intent_context,
@@ -351,6 +378,7 @@ pub const SnapshotBackfillRunner = struct {
                     progress_cutover_intent_id.* = 0;
                     progress_cutover_authority_id.* = 0;
                     progress_cutover_config_fingerprint.* = empty_cutover_config_fingerprint;
+                    progress_cutover_provider_identity.* = empty_cutover_provider_identity;
                     break :blk null;
                 },
                 else => return err,
@@ -429,6 +457,7 @@ pub const SnapshotBackfillRunner = struct {
             .cutover_intent_id = progress_cutover_intent_id.*,
             .cutover_authority_id = progress_cutover_authority_id.*,
             .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
+            .cutover_provider_identity = progress_cutover_provider_identity.*,
             .updated_at_ms = nowMillis(),
         });
 
@@ -514,6 +543,7 @@ pub const SnapshotBackfillRunner = struct {
                 .cutover_intent_id = progress_cutover_intent_id.*,
                 .cutover_authority_id = progress_cutover_authority_id.*,
                 .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
+                .cutover_provider_identity = progress_cutover_provider_identity.*,
                 .updated_at_ms = nowMillis(),
             });
 
@@ -547,6 +577,7 @@ pub const SnapshotBackfillRunner = struct {
             .cutover_intent_id = progress_cutover_intent_id.*,
             .cutover_authority_id = progress_cutover_authority_id.*,
             .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
+            .cutover_provider_identity = progress_cutover_provider_identity.*,
             .updated_at_ms = nowMillis(),
         });
 
@@ -784,6 +815,10 @@ pub const StreamingReplicationRunner = struct {
                     status.cutover_config_fingerprint
                 else
                     empty_cutover_config_fingerprint,
+                .cutover_provider_identity = if (existing_status) |status|
+                    status.cutover_provider_identity
+                else
+                    empty_cutover_provider_identity,
                 .updated_at_ms = nowMillis(),
             }) catch {};
             return err;
@@ -887,6 +922,10 @@ pub const StreamingReplicationRunner = struct {
                     status.cutover_config_fingerprint
                 else
                     empty_cutover_config_fingerprint,
+                .cutover_provider_identity = if (existing_status) |status|
+                    status.cutover_provider_identity
+                else
+                    empty_cutover_provider_identity,
                 .updated_at_ms = nowMillis(),
             });
             return summary;
@@ -933,6 +972,10 @@ pub const StreamingReplicationRunner = struct {
                     status.cutover_config_fingerprint
                 else
                     empty_cutover_config_fingerprint,
+                .cutover_provider_identity = if (existing_status) |status|
+                    status.cutover_provider_identity
+                else
+                    empty_cutover_provider_identity,
                 .updated_at_ms = nowMillis(),
             });
         }
@@ -2096,17 +2139,16 @@ fn exactCutoverConfigFingerprint(
     table_id: u64,
     source_ordinal: u32,
     parsed: ParsedReplicationSourceConfig,
-    resolved_dsn: []const u8,
 ) [cutover_config_fingerprint_len]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(std.mem.asBytes(&table_id));
-    hasher.update(std.mem.asBytes(&source_ordinal));
+    hasher.update("antfly/postgres-exact-cutover-config/v2");
+    var table_id_bytes: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &table_id_bytes, table_id, .big);
+    hasher.update(&table_id_bytes);
+    var source_ordinal_bytes: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &source_ordinal_bytes, source_ordinal, .big);
+    hasher.update(&source_ordinal_bytes);
     hashCutoverConfigBytes(&hasher, parsed.type_name);
-    // Bind recovery to the resolved provider target as well as the declared
-    // secret reference. A secret rotation must never authorize deleting the
-    // same slot name in a different database.
-    hashCutoverConfigBytes(&hasher, parsed.dsn);
-    hashCutoverConfigBytes(&hasher, resolved_dsn);
     hashCutoverConfigBytes(&hasher, parsed.postgres_table);
     hashCutoverConfigBytes(&hasher, parsed.slot_name);
     hashCutoverConfigBytes(&hasher, parsed.publication_name);
@@ -2122,8 +2164,9 @@ fn exactCutoverConfigFingerprint(
 }
 
 fn hashCutoverConfigBytes(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
-    const len: u64 = @intCast(value.len);
-    hasher.update(std.mem.asBytes(&len));
+    var encoded_len: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_len, @intCast(value.len), .big);
+    hasher.update(&encoded_len);
     hasher.update(value);
 }
 
@@ -2132,7 +2175,13 @@ fn exactCutoverIntentOwnsConfig(
     parsed: ParsedReplicationSourceConfig,
     config_fingerprint: [cutover_config_fingerprint_len]u8,
 ) bool {
-    if (status.cutover_intent_id == 0 or status.cutover_authority_id == 0)
+    if (status.cutover_intent_id == 0 or
+        status.cutover_authority_id == 0 or
+        std.mem.eql(
+            u8,
+            &status.cutover_provider_identity,
+            &empty_cutover_provider_identity,
+        ))
         return false;
     var expected_slot_buffer: [postgres_identifier_max_len]u8 = undefined;
     const expected_slot_name = exactCutoverPhysicalSlotName(
@@ -2573,7 +2622,9 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
         ) !foreign_mod.PostgresQueryExecutor.PreparedReplicationSnapshot {
             if (platform_time.monotonicNs() >= execution_deadline_ns) return error.Timeout;
             Parent.exact_cutover_calls += 1;
-            if (params.exact_cutover_intent) |intent| try intent.persist();
+            if (params.exact_cutover_intent) |intent| try intent.persist(
+                [_]u8{0x7a} ** cutover_config_fingerprint_len,
+            );
             const session = try inner_alloc.create(SnapshotSession);
             session.* = .{};
             return .{
@@ -2664,6 +2715,11 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     const final_status = status_sink.records.items[status_sink.records.items.len - 1];
     try std.testing.expect(final_status.cutover_intent_id != 0);
     try std.testing.expect(final_status.cutover_authority_id != 0);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &final_status.cutover_provider_identity,
+        &empty_cutover_provider_identity,
+    ));
     try std.testing.expect(!std.mem.eql(
         u8,
         final_status.slot_name,
@@ -2973,6 +3029,29 @@ test "metadata replication source parser preserves explicit slot and publication
     try std.testing.expectEqualStrings("custom_pub", parsed.publication_name);
     try std.testing.expect(parsed.has_delete_transforms);
     try std.testing.expect(!parsed.delete_document_on_delete);
+}
+
+test "metadata exact cutover config ownership survives credential rotation" {
+    const alloc = std.testing.allocator;
+    var before = try parseReplicationSourceConfig(
+        alloc,
+        "docs",
+        "[{\"type\":\"postgres\",\"dsn\":\"postgres://alice:old-secret@db/app\",\"postgres_table\":\"users\",\"slot_name\":\"custom_slot\",\"publication_name\":\"custom_pub\"}]",
+        0,
+    );
+    defer before.deinit(alloc);
+    var after = try parseReplicationSourceConfig(
+        alloc,
+        "docs",
+        "[{\"type\":\"postgres\",\"dsn\":\"postgres://alice:new-secret@db/app\",\"postgres_table\":\"users\",\"slot_name\":\"custom_slot\",\"publication_name\":\"custom_pub\"}]",
+        0,
+    );
+    defer after.deinit(alloc);
+
+    try std.testing.expect(!std.mem.eql(u8, before.dsn, after.dsn));
+    const before_fingerprint = exactCutoverConfigFingerprint(41, 2, before);
+    const after_fingerprint = exactCutoverConfigFingerprint(41, 2, after);
+    try std.testing.expectEqualSlices(u8, &before_fingerprint, &after_fingerprint);
 }
 
 test "metadata replication source parser accepts null optional fields" {
@@ -3427,7 +3506,7 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
     const FakeExecutor = struct {
         var calls: usize = 0;
         var reclaimed_on_retry: bool = false;
-        var reclaimed_on_config_mismatch: bool = true;
+        var reclaimed_on_provider_mismatch: bool = false;
 
         fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: foreign_mod.PreparedQuery, _: ?u64) !foreign_mod.QueryResult {
             var owned = prepared;
@@ -3449,17 +3528,21 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
             calls += 1;
             if (calls == 2) {
                 reclaimed_on_retry = params.reclaim_exact_cutover_slot;
-                if (params.exact_cutover_intent) |intent| try intent.persist();
+                if (params.exact_cutover_intent) |intent| try intent.persist(
+                    [_]u8{0x7a} ** cutover_config_fingerprint_len,
+                );
                 return error.ExactCutoverCleanupPending;
             }
-            if (calls == 3) reclaimed_on_config_mismatch = params.reclaim_exact_cutover_slot;
-            if (params.exact_cutover_intent) |intent| try intent.persist();
+            if (calls == 3) reclaimed_on_provider_mismatch = params.reclaim_exact_cutover_slot;
+            if (params.exact_cutover_intent) |intent| try intent.persist(
+                [_]u8{if (calls == 3) 0x7b else 0x7a} ** cutover_config_fingerprint_len,
+            );
             return error.ForeignConnectionFailed;
         }
     };
     FakeExecutor.calls = 0;
     FakeExecutor.reclaimed_on_retry = false;
-    FakeExecutor.reclaimed_on_config_mismatch = true;
+    FakeExecutor.reclaimed_on_provider_mismatch = false;
 
     var registry = foreign_mod.Registry{};
     defer registry.deinit(alloc);
@@ -3536,6 +3619,11 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
         &status_sink.latest().cutover_config_fingerprint,
         &empty_cutover_config_fingerprint,
     ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &status_sink.latest().cutover_provider_identity,
+        &empty_cutover_provider_identity,
+    ));
 
     const interrupted = status_sink.latest();
     const first_intent_id = interrupted.cutover_intent_id;
@@ -3562,27 +3650,25 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
     try std.testing.expectEqualStrings(first_physical_slot, status_sink.latest().slot_name);
     try std.testing.expectEqual(@as(usize, 2), status_sink.durable_calls);
 
-    const mismatched_config_table = metadata_table_manager.TableRecord{
+    const rotated_target_table = metadata_table_manager.TableRecord{
         .table_id = table.table_id,
         .name = table.name,
-        // Keep the provider resource names identical and change only the
-        // target. A name comparison alone must not authorize reclamation.
+        // DSN/credential text is not provider identity. IDENTIFY_SYSTEM must
+        // authenticate the actual cluster and database before reclamation.
         .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://other-db\",\"postgres_table\":\"users\",\"slot_name\":\"antfly_postgres_users_docs\",\"publication_name\":\"antfly_pub_postgres_users_docs\",\"key_template\":\"id\",\"require_exact_cutover\":true}]",
     };
     const second_interrupted = status_sink.latest();
     try std.testing.expectError(
-        error.ForeignConnectionFailed,
-        runner.runTableSourceFromStatus(&status_sink, mismatched_config_table, 0, 0, second_interrupted),
+        error.ExactCutoverProviderIdentityMismatch,
+        runner.runTableSourceFromStatus(&status_sink, rotated_target_table, 0, 0, second_interrupted),
     );
     try std.testing.expectEqual(@as(usize, 3), FakeExecutor.calls);
-    try std.testing.expect(!FakeExecutor.reclaimed_on_config_mismatch);
-    try std.testing.expect(status_sink.latest().cutover_intent_id != first_intent_id);
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        status_sink.latest().slot_name,
-        first_physical_slot,
-    ));
-    try std.testing.expectEqual(@as(usize, 3), status_sink.durable_calls);
+    try std.testing.expect(FakeExecutor.reclaimed_on_provider_mismatch);
+    try std.testing.expectEqual(first_intent_id, status_sink.latest().cutover_intent_id);
+    try std.testing.expectEqualStrings(first_physical_slot, status_sink.latest().slot_name);
+    // The provider mismatch is rejected before another durable authority
+    // record or any provider mutation.
+    try std.testing.expectEqual(@as(usize, 2), status_sink.durable_calls);
 }
 
 test "metadata replication stream applies insert update and delete through bound write source" {
@@ -3724,6 +3810,7 @@ test "metadata replication stream applies insert update and delete through bound
         .cutover_intent_id = 0x42,
         .cutover_authority_id = 0x43,
         .cutover_config_fingerprint = ownership_fingerprint,
+        .cutover_provider_identity = [_]u8{0x7a} ** cutover_config_fingerprint_len,
     };
     const summary = try runner.runTableSourceFromCheckpoint(&status_sink, .{
         .table_id = 11,
@@ -3747,6 +3834,11 @@ test "metadata replication stream applies insert update and delete through bound
     try std.testing.expectEqualStrings("antfly_pub_postgres_users_docs", status_sink.records.items[status_sink.records.items.len - 1].publication_name);
     try std.testing.expectEqual(@as(u64, 0x42), status_sink.records.items[status_sink.records.items.len - 1].cutover_intent_id);
     try std.testing.expectEqual(@as(u64, 0x43), status_sink.records.items[status_sink.records.items.len - 1].cutover_authority_id);
+    try std.testing.expectEqualSlices(
+        u8,
+        &([_]u8{0x7a} ** cutover_config_fingerprint_len),
+        &status_sink.records.items[status_sink.records.items.len - 1].cutover_provider_identity,
+    );
     try std.testing.expectEqualSlices(
         u8,
         &ownership_fingerprint,
@@ -4970,6 +5062,10 @@ test "metadata replication live snapshot and later streaming insert through runn
                 }
             }
             try self.records.append(self.alloc, try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record));
+        }
+
+        fn upsertReplicationSourceStatusDurable(self: *@This(), record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+            try self.upsertReplicationSourceStatus(record);
         }
 
         fn latest(self: *@This()) metadata_table_manager.ReplicationSourceStatusRecord {
