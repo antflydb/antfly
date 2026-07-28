@@ -2209,6 +2209,44 @@ fn admissionBackendClassForRuntime(
     return if (backend_runtime.usesGpuHostedSession()) .gpu else .cpu;
 }
 
+fn admittedSessionCudaLimit(
+    backend_runtime: backends.BackendRuntime,
+    resident: runtime.tier.memory.AdmissionAmounts,
+) !?usize {
+    if (backend_runtime.backend != .onnx or
+        backend_runtime.onnx_execution_provider != .cuda)
+    {
+        return null;
+    }
+    return try std.math.add(
+        usize,
+        resident.backend_weight_bytes,
+        resident.backend_scratch_bytes,
+    );
+}
+
+fn attachSessionRunAdmission(
+    session: *backends.Session,
+    controller: *runtime.tier.memory.AdmissionController,
+    backend_runtime: backends.BackendRuntime,
+    limits: runtime.tier.memory.Limits,
+    resident: runtime.tier.memory.AdmissionAmounts,
+) void {
+    const weight_bytes = std.math.add(
+        usize,
+        resident.host_weight_bytes,
+        resident.backend_weight_bytes,
+    ) catch std.math.maxInt(usize);
+    session.run_admission = .{
+        .controller = controller,
+        .backend_class = admissionBackendClassForRuntime(backend_runtime),
+        .limits = limits,
+        .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
+        .backend_workspace_reserved = backend_runtime.backend == .onnx and
+            backend_runtime.onnx_execution_provider == .cuda,
+    };
+}
+
 pub const ModelManager = struct {
     allocator: std.mem.Allocator,
     session_manager: backends.SessionManager,
@@ -2666,6 +2704,7 @@ pub const ModelManager = struct {
 
             var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
             var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
+            var admission_limits = runtime.tier.memory.Limits{};
             if (self.admission_enabled) {
                 const artifact_bytes = artifact_estimate.bytesForBackend(backend) catch |err| {
                     if (first_err == null) first_err = err;
@@ -2680,9 +2719,16 @@ pub const ModelManager = struct {
                     continue;
                 };
                 resident_amounts = admission_plan.resident;
+                admission_limits = self.admissionLimitsForBackend(backend_runtime);
+                if (try admittedSessionCudaLimit(
+                    backend_runtime,
+                    resident_amounts,
+                )) |cuda_limit| {
+                    session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
+                }
                 resource_lease = self.admission.tryAcquire(
                     admissionBackendClassForRuntime(backend_runtime),
-                    self.admissionLimitsForBackend(backend_runtime),
+                    admission_limits,
                     admission_plan.peak,
                     true,
                 ) catch |err| {
@@ -2694,13 +2740,23 @@ pub const ModelManager = struct {
             if (session_manager.loadModelWithImportedOnnxContext(
                 model_path,
                 shared_backend_ctx,
-            )) |session| {
+            )) |loaded_session| {
+                var session = loaded_session;
                 if (resource_lease) |*lease| {
                     lease.retain(resident_amounts) catch |err| {
                         session.close();
                         lease.release();
                         return err;
                     };
+                }
+                if (self.admission_enabled) {
+                    attachSessionRunAdmission(
+                        &session,
+                        &self.admission,
+                        backend_runtime,
+                        admission_limits,
+                        resident_amounts,
+                    );
                 }
                 return .{
                     .session = session,
@@ -3404,6 +3460,7 @@ fn sessionManagerForPreferredBackends(
         .preferred_backends = preferred_backends,
         .graph_runtime_strategy = source.graph_runtime_strategy,
         .onnx_execution_provider = source.onnx_execution_provider,
+        .onnx_cuda_memory_limit_bytes = source.onnx_cuda_memory_limit_bytes,
         .io = source.io,
     };
 }
@@ -3456,6 +3513,18 @@ const ModelLoadAdmissionPlan = struct {
     /// Bytes retained by the completed backend session.
     resident: runtime.tier.memory.AdmissionAmounts,
 };
+
+fn modelRunWorkspaceAllowance(weight_bytes: usize) usize {
+    const min_workspace = 16 * 1024 * 1024;
+    const max_workspace = 1024 * 1024 * 1024;
+    return std.math.clamp(weight_bytes / 8, min_workspace, max_workspace);
+}
+
+fn onnxCudaArenaAllowance(weight_bytes: usize) usize {
+    const min_workspace = 64 * 1024 * 1024;
+    const max_workspace = 2 * 1024 * 1024 * 1024;
+    return std.math.clamp(weight_bytes / 8, min_workspace, max_workspace);
+}
 
 const TokenizerArtifactKind = enum {
     huggingface,
@@ -3726,8 +3795,14 @@ fn onnxModelLoadAdmission(
                 .host_weight_bytes = std.math.mul(usize, weights, 2) catch
                     return error.ResourceLimitExceeded,
                 .backend_weight_bytes = weights,
+                .backend_scratch_bytes = onnxCudaArenaAllowance(weights),
             },
-            .resident = .{ .backend_weight_bytes = weights },
+            .resident = .{
+                .backend_weight_bytes = weights,
+                // ORT's CUDA arena retains its high-water allocation. Reserve
+                // and cap one bounded workspace for the session lifetime.
+                .backend_scratch_bytes = onnxCudaArenaAllowance(weights),
+            },
         } else .{
             .peak = .{
                 .host_weight_bytes = std.math.mul(usize, weights, 2) catch
@@ -3821,15 +3896,26 @@ fn loadSessionForPreferredBackends(
         backend_session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
+        var admission_limits = runtime.tier.memory.Limits{};
         if (manager.admission_enabled) {
             const admission_plan = estimateModelLoadAdmission(man, backend_runtime) catch |err| {
                 if (first_err == null) first_err = err;
                 continue;
             };
             resident_amounts = admission_plan.resident;
+            admission_limits = manager.admissionLimitsForBackend(backend_runtime);
+            if (admittedSessionCudaLimit(
+                backend_runtime,
+                resident_amounts,
+            ) catch |err| {
+                if (first_err == null) first_err = err;
+                continue;
+            }) |cuda_limit| {
+                backend_session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
+            }
             resource_lease = manager.admission.tryAcquire(
                 admissionBackendClassForRuntime(backend_runtime),
-                manager.admissionLimitsForBackend(backend_runtime),
+                admission_limits,
                 admission_plan.peak,
                 true,
             ) catch |err| {
@@ -3837,13 +3923,23 @@ fn loadSessionForPreferredBackends(
                 continue;
             };
         }
-        if (backend_session_manager.loadModel(candidate_path)) |session| {
+        if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
+            var session = loaded_session;
             if (resource_lease) |*lease| {
                 lease.retain(resident_amounts) catch |err| {
                     session.close();
                     lease.release();
                     return err;
                 };
+            }
+            if (manager.admission_enabled) {
+                attachSessionRunAdmission(
+                    &session,
+                    &manager.admission,
+                    backend_runtime,
+                    admission_limits,
+                    resident_amounts,
+                );
             }
             return .{ .session = session, .resource_lease = resource_lease };
         } else |err| {
@@ -4832,6 +4928,14 @@ test "onnx admission separates encoded staging from completed residency" {
     try std.testing.expectEqual(weights, gpu.peak.backend_weight_bytes);
     try std.testing.expectEqual(@as(usize, 0), gpu.resident.host_weight_bytes);
     try std.testing.expectEqual(weights, gpu.resident.backend_weight_bytes);
+    try std.testing.expectEqual(
+        onnxCudaArenaAllowance(weights),
+        gpu.peak.backend_scratch_bytes,
+    );
+    try std.testing.expectEqual(
+        onnxCudaArenaAllowance(weights),
+        gpu.resident.backend_scratch_bytes,
+    );
     try std.testing.expectEqual(
         runtime.tier.memory.BackendClass.gpu,
         admissionBackendClassForRuntime(.{

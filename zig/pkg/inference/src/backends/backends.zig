@@ -121,6 +121,9 @@ pub const SessionManager = struct {
     /// resolved before admission; candidate SessionManagers then carry only
     /// the resolved CPU/CUDA value through construction.
     onnx_execution_provider: OnnxExecutionProvider = .automatic,
+    /// Per-session CUDA allocation ceiling. ModelManager sets this to the
+    /// model-residency plus pre-admitted workspace reservation.
+    onnx_cuda_memory_limit_bytes: usize = std.math.maxInt(usize),
     /// Optional Io runtime threaded into compute backends so parallel GEMM
     /// dispatch goes through the caller's thread pool (linalg.sgemm*Io).
     /// Null means backends use the process-wide futex pool inside lib/linalg.
@@ -189,6 +192,7 @@ pub const SessionManager = struct {
                     if (!isOnnxFilePath(effective_model_path)) continue;
                     break :blk onnx.createSessionWithOptions(self.allocator, effective_model_path, .{
                         .execution_provider = backend_runtime.onnx_execution_provider,
+                        .cuda_memory_limit_bytes = self.onnx_cuda_memory_limit_bytes,
                     }) catch |err| {
                         std.log.err("onnx runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
