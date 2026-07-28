@@ -1,0 +1,13 @@
+{
+  "final_digest": "sha256:final",
+  "final": {
+    "manifests": [
+      {"digest": "sha256:amd64-runtime", "platform": {"os": "linux", "architecture": "amd64"}},
+      {"digest": "sha256:arm64-runtime", "platform": {"os": "linux", "architecture": "arm64"}},
+      {"digest": "sha256:amd64-attestation", "platform": {"os": "unknown", "architecture": "unknown"}},
+      {"digest": "sha256:arm64-attestation", "platform": {"os": "unknown", "architecture": "unknown"}}
+    ]
+  },
+  "expected_runnable_children": {"amd64": "sha256:amd64-runtime", "arm64": "sha256:arm64-runtime"},
+  "receipt": {"image": "example.invalid/antfly@sha256:final"}
+}

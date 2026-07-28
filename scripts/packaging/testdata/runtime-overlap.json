@@ -1,0 +1,8 @@
+{
+  "expected_image": "example.invalid/antfly@sha256:stable",
+  "expected_digest": "sha256:stable",
+  "runs": [
+    {"image": "example.invalid/antfly@sha256:stable", "receipt_digest": "sha256:stable"},
+    {"image": "example.invalid/antfly@sha256:stable", "receipt_digest": "sha256:stable"}
+  ]
+}

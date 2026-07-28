@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Contract tests for the small, main-only runtime publication path."""
+import json
 from pathlib import Path
 import unittest
 
 
 WORKFLOW = (Path(__file__).resolve().parents[2] / ".github/workflows/main-runtime.yml").read_text()
+RUNTIME_BUILD = (Path(__file__).resolve().parents[2] / "zig/cloudbuild.runtime.yaml").read_text()
+FIXTURES = Path(__file__).with_name("testdata")
 
 
 class MainRuntimeWorkflowTest(unittest.TestCase):
@@ -20,7 +23,7 @@ class MainRuntimeWorkflowTest(unittest.TestCase):
         self.assertIn('crane digest "$image_tag"', WORKFLOW)
         self.assertIn("needs.resolve.outputs.exists", WORKFLOW)
         self.assertIn("MANIFEST_UNKNOWN", WORKFLOW)
-        self.assertIn("cancel-in-progress: false", WORKFLOW)
+        self.assertIn("group: main-runtime-main", WORKFLOW)
         self.assertIn("immutable image conflicts", WORKFLOW)
 
     def test_emits_digest_sha_and_platform_identity(self):
@@ -37,6 +40,28 @@ class MainRuntimeWorkflowTest(unittest.TestCase):
         self.assertIn("ZIG_VERSION: 0.16.0", WORKFLOW)
         self.assertIn("zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz", WORKFLOW)
         self.assertIn('zig" version | grep -Fx "$ZIG_VERSION"', WORKFLOW)
+
+    def test_trigger_covers_the_helper_and_packaged_antfarm_assets(self):
+        self.assertIn("scripts/publish-zig-runtime-dev.sh", WORKFLOW)
+        self.assertIn("go/pkg/antfly/src/metadata/antfarm/**", WORKFLOW)
+
+    def test_provenance_fixture_uses_runnable_children_and_receipt_final_digest(self):
+        fixture = json.loads((FIXTURES / "runtime-manifest-with-attestation.json").read_text())
+        runnable = {
+            item["platform"]["architecture"]: item["digest"]
+            for item in fixture["final"]["manifests"]
+            if item["platform"].get("os") == "linux"
+        }
+        self.assertEqual(runnable, fixture["expected_runnable_children"])
+        self.assertEqual(fixture["receipt"]["image"].split("@", 1)[1], fixture["final_digest"])
+        self.assertIn("runnable_child()", WORKFLOW)
+        self.assertIn("receipt digest does not equal final tag", WORKFLOW)
+        self.assertIn("--provenance=true", RUNTIME_BUILD)
+
+    def test_overlapping_delayed_events_share_one_stable_receipt(self):
+        fixture = json.loads((FIXTURES / "runtime-overlap.json").read_text())
+        self.assertEqual({run["image"] for run in fixture["runs"]}, {fixture["expected_image"]})
+        self.assertEqual({run["receipt_digest"] for run in fixture["runs"]}, {fixture["expected_digest"]})
 
 
 if __name__ == "__main__":

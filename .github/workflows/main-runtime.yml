@@ -6,11 +6,15 @@ on:
     paths:
       - 'zig/**'
       - 'scripts/packaging/**'
+      - 'scripts/publish-zig-runtime-dev.sh'
+      - 'go/pkg/antfly/src/metadata/antfarm/**'
       - '.github/workflows/main-runtime.yml'
   workflow_dispatch:
 
 concurrency:
-  group: main-runtime-${{ github.sha }}
+  # Resolve main only after earlier main publications finish. github.sha belongs
+  # to a potentially delayed event, so it must not select this lock.
+  group: main-runtime-main
   cancel-in-progress: false
 
 # The image registry and build configuration live in the existing local helper.
@@ -155,14 +159,22 @@ jobs:
             echo "unable to determine whether $image_tag exists: $lookup" >&2
             exit 1
           fi
-          amd64_digest="$(crane digest "${image_tag}-amd64")"
-          arm64_digest="$(crane digest "${image_tag}-arm64")"
+          runnable_child() {
+            crane manifest "$1" | jq -er --arg arch "$2" '
+              [.manifests[]? | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest]
+              | if length == 1 then .[0] else error("expected one runnable platform child") end
+            '
+          }
+          amd64_digest="$(runnable_child "${image_tag}-amd64" amd64)"
+          arm64_digest="$(runnable_child "${image_tag}-arm64" arm64)"
           crane manifest "$image_tag" | jq -e --arg amd64 "$amd64_digest" --arg arm64 "$arm64_digest" '
-            ([.manifests[] | select(.platform.os == "linux") | .digest] | sort) == ([$amd64, $arm64] | sort)
+            ([.manifests[]? | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .digest] | sort) == ([$amd64, $arm64] | sort)
           ' >/dev/null || { echo "immutable image conflicts with this main runtime's platform images" >&2; exit 1; }
           repository="${image_tag%:*}"
           image="${repository}@${digest}"
           jq -cn --arg source_sha '${{ needs.resolve.outputs.source_sha }}' --arg image "$image" --arg tag "$tag" '{source_sha:$source_sha,image:$image,tag:$tag,platforms:["linux/amd64","linux/arm64"]}' > antfly-main-runtime.json
+          receipt_digest="$(jq -r '.image | split("@")[1]' antfly-main-runtime.json)"
+          [[ "$receipt_digest" == "$(crane digest "$image_tag")" ]] || { echo "receipt digest does not equal final tag" >&2; exit 1; }
           cat antfly-main-runtime.json >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v6
         with:

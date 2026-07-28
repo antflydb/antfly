@@ -49,6 +49,7 @@ steps:
         docker buildx build \
           --progress=plain \
           --platform="${_PLATFORMS}" \
+          --provenance=true \
           --push \
           -f "${_DOCKERFILE}" \
           "$${TAG_ARGS[@]}" \
