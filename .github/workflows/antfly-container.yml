@@ -108,6 +108,7 @@ jobs:
           fi
           git fetch --no-tags origin main
           [[ "$GITHUB_REPOSITORY" == "antflydb/antfly" ]] || { echo "container publishing is supported only from antflydb/antfly" >&2; exit 1; }
+          [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || { echo "publishing orchestration must run from protected main" >&2; exit 1; }
           git cat-file -e "${REQUESTED_SOURCE_SHA}^{commit}"
           if [[ "$MODE" == development ]]; then
             git merge-base --is-ancestor "$REQUESTED_SOURCE_SHA" origin/main || { echo "development source_sha must be an ancestor of protected main" >&2; exit 1; }
@@ -146,7 +147,7 @@ jobs:
     needs: plan
     if: ${{ inputs.artifact_source != 'github' }}
     runs-on: ${{ matrix.runner }}
-    environment: container-publish
+    environment: ${{ (inputs.publish_mode || 'release') == 'development' && 'container-publish-development' || 'container-publish' }}
     permissions:
       contents: read
       id-token: write
@@ -230,7 +231,7 @@ jobs:
           uri="gs://${ZIG_ARTIFACT_BUCKET}/${{ needs.plan.outputs.archive_prefix }}/antfly-zig-${{ matrix.arch }}.tar.gz"
           sha256="$(sha256sum "$artifact" | awk '{print $1}')"
           gsutil -h "x-goog-meta-sha256=${sha256}" cp "$artifact" "$uri"
-          [[ "$(gsutil hash -h "$uri" | awk '/Hash \(SHA256\):/ {print $3}')" == "$sha256" ]]
+          [[ "$(gsutil stat "$uri" | awk '$1 == "x-goog-meta-sha256:" {print $2}')" == "$sha256" ]]
           gsutil stat "$uri" | grep -q 'Generation:'
 
   publish:
@@ -297,7 +298,7 @@ jobs:
             uri="gs://${ZIG_ARTIFACT_BUCKET}/${{ needs.plan.outputs.archive_prefix }}/antfly-zig-${arch}.tar.gz"
             sha256="$(sha256sum "$artifact" | awk '{print $1}')"
             gsutil -h "x-goog-meta-sha256=${sha256}" cp "$artifact" "$uri"
-            [[ "$(gsutil hash -h "$uri" | awk '/Hash \(SHA256\):/ {print $3}')" == "$sha256" ]]
+            [[ "$(gsutil stat "$uri" | awk '$1 == "x-goog-meta-sha256:" {print $2}')" == "$sha256" ]]
             gsutil stat "$uri" | grep -q 'Generation:'
           done
 
@@ -352,7 +353,7 @@ jobs:
           IFS=, read -ra arches <<< "${{ steps.version.outputs.architectures }}"
           for arch in "${arches[@]}"; do
             ARTIFACT_URI="gs://${ZIG_ARTIFACT_BUCKET}/${ARCHIVE_PREFIX}/antfly-zig-${arch}.tar.gz"
-            ARTIFACT_SHA256="$(gsutil hash -h "$ARTIFACT_URI" | awk '/Hash \(SHA256\):/ {print $3}')"
+            ARTIFACT_SHA256="$(gsutil stat "$ARTIFACT_URI" | awk '$1 == "x-goog-meta-sha256:" {print $2}')"
             [[ "$ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "missing SHA-256 for $ARTIFACT_URI" >&2; exit 1; }
             submit_cloud_build . \
               --project="${GCP_PROJECT}" \
@@ -367,6 +368,8 @@ jobs:
 
       - name: Authenticate crane to GAR
         run: echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
+
+      - uses: sigstore/cosign-installer@v3
 
       - name: Create GAR multi-arch manifest with Cloud Build
         run: |
@@ -396,12 +399,24 @@ jobs:
             ALIAS_TAG=__skip_alias__
           fi
           REPOSITORY="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPOSITORY}/antfly"
-          expected_platforms="$(printf '%s\n' "${arches[@]}" | sort | jq -Rsc 'split("\n") | map(select(length > 0))')"
-          if existing_digest="$(crane digest "${REPOSITORY}:${VERSION}" 2>/dev/null)"; then
-            actual_platforms="$(crane manifest "${REPOSITORY}@${existing_digest}" | jq -c '[.manifests[]?.platform.architecture] | sort')"
-            [[ "$actual_platforms" == "$expected_platforms" ]] || { echo "immutable tag ${VERSION} already exists with different platforms" >&2; exit 1; }
+          expected_children='[]'
+          for arch in "${arches[@]}"; do
+            staging="${REPOSITORY}:${VERSION}-${arch}-${STAGING_SUFFIX}"
+            digest="$(crane digest "$staging")"
+            expected_children="$(jq -cn --arg arch "$arch" --arg digest "$digest" --argjson children "$expected_children" '$children + [{os:"linux",architecture:$arch,digest:$digest}]')"
+          done
+          if existing_output="$(crane digest "${REPOSITORY}:${VERSION}" 2>&1)"; then
+            existing_digest="$existing_output"
+            actual_children="$(crane manifest "${REPOSITORY}@${existing_digest}" | jq -c '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture != "unknown") | {os:.platform.os,architecture:.platform.architecture,digest:.digest}] | sort_by(.architecture)')"
+            [[ "$(jq -c 'sort_by(.architecture)' <<<"$expected_children")" == "$actual_children" ]] || { echo "immutable tag ${VERSION} already exists with different runnable child digests/platforms" >&2; exit 1; }
+            cosign verify --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/antfly-container.yml@" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" -a "repo=${{ github.repository }}" -a "ref=${{ needs.plan.outputs.source_sha }}" "${REPOSITORY}@${existing_digest}" >/dev/null
             echo "immutable tag ${VERSION} already exists at ${existing_digest}; rerun will not retag it"
             exit 0
+          elif grep -Eqi '(404|MANIFEST_UNKNOWN|not found)' <<<"$existing_output"; then
+            :
+          else
+            echo "unable to establish whether immutable tag ${VERSION} exists: $existing_output" >&2
+            exit 1
           fi
           # Cloud Build's default comma dictionary delimiter conflicts with the
           # source tag list.  @ is the explicit alternate delimiter.
@@ -421,13 +436,12 @@ jobs:
           if [[ "$VERSION" != *-* && "$VERSION" != v0.1.* ]]; then
             TAGS=(latest "${TAGS[@]}")
           fi
+          VERSION_DIGEST="$(crane digest "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${VERSION}")"
           for tag in "${TAGS[@]}"; do
             crane copy \
-              "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly:${tag}" \
+              "$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly@${VERSION_DIGEST}" \
               "ghcr.io/antflydb/antfly:${tag}"
           done
-
-      - uses: sigstore/cosign-installer@v3
 
       - name: Sign GHCR images
         if: ${{ (inputs.publish_mode || 'release') == 'release' }}

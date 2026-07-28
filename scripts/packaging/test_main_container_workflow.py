@@ -101,7 +101,11 @@ class MainContainerWorkflowTest(unittest.TestCase):
         self.assertIn("group: runtime-container-", self.workflow)
         self.assertIn('IMAGE="${{ steps.sign.outputs.image }}"', self.workflow)
         self.assertIn("rerun will not retag it", self.workflow)
-        self.assertIn("already exists with different platforms", self.workflow)
+        self.assertIn("different runnable child digests/platforms", self.workflow)
+        self.assertIn("platform.os == \"linux\"", self.workflow)
+        self.assertIn("architecture != \"unknown\"", self.workflow)
+        self.assertIn("expected_children", self.workflow)
+        self.assertIn("unable to establish whether immutable tag", self.workflow)
 
     def test_architecture_and_source_matrix_contracts(self) -> None:
         for arch in ("amd64", "arm64", "amd64,arm64"):
@@ -110,7 +114,8 @@ class MainContainerWorkflowTest(unittest.TestCase):
         self.assertIn("expected exactly one $arch release archive", self.workflow)
         self.assertIn("archive_prefix", self.workflow)
         self.assertIn("_ARTIFACT_SHA256", self.workflow)
-        self.assertIn("gsutil stat", self.workflow)
+        self.assertIn("x-goog-meta-sha256", self.workflow)
+        self.assertNotIn("gsutil hash -h", self.workflow)
 
     def test_protected_environment_requires_a_successful_plan(self) -> None:
         publish = self.workflow.index("  publish:")
@@ -118,6 +123,13 @@ class MainContainerWorkflowTest(unittest.TestCase):
         self.assertIn("needs.plan.result == 'success'", window)
         self.assertIn("container-publish-development", window)
         self.assertIn("GITHUB_REPOSITORY", self.workflow)
+        self.assertIn("publishing orchestration must run from protected main", self.workflow)
+
+    def test_standalone_runtime_submission_carries_the_archive_checksum(self) -> None:
+        script = DEV_PUBLISH.read_text()
+        self.assertIn("artifact_sha256=", script)
+        self.assertIn("_ARTIFACT_SHA256=${artifact_sha256}", script)
+        self.assertIn("sha256sum -c -", (ROOT / "zig/cloudbuild.runtime.yaml").read_text())
 
 
 if __name__ == "__main__":

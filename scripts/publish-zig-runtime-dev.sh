@@ -136,6 +136,7 @@ echo "Building $arch Zig runtime artifact for $zig_target"
 
 test -x "$out_dir/bin/antfly"
 tar -C "$out_dir" -czf "$tmpdir/antfly-zig-${arch}.tar.gz" bin share
+artifact_sha256="$(shasum -a 256 "$tmpdir/antfly-zig-${arch}.tar.gz" | awk '{print $1}')"
 
 echo "Uploading $artifact_uri"
 gcloud storage cp "$tmpdir/antfly-zig-${arch}.tar.gz" "$artifact_uri" --project="$gcp_project"
@@ -146,7 +147,7 @@ gcloud builds submit "$repo_root" \
   --region="$gcp_region" \
   --worker-pool="$worker_pool" \
   --config=zig/cloudbuild.runtime.yaml \
-  --substitutions="_ARTIFACT_URI=${artifact_uri},_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${tag}-${arch},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
+  --substitutions="^@^_ARTIFACT_URI=${artifact_uri}@_ARTIFACT_SHA256=${artifact_sha256}@_IMAGE_NAME=antfly@_DOCKERFILE=zig/Dockerfile.runtime@_CONTEXT=/workspace/.zig-container@_ALIAS_TAG=__skip_alias__@_VERSION_TAG=${tag}-${arch}@_PLATFORMS=linux/${arch}@_DESCRIPTION=AntflyDB Zig runtime image"
 
 inspect_image "${image_base}:${tag}-${arch}"
 
