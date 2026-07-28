@@ -9,7 +9,6 @@
 #   _VERSION_TAG: versioned tag, such as zig-v0.1.0-arm64
 #   _PLATFORMS: single build platform, linux/amd64 or linux/arm64
 #   _DESCRIPTION: OCI image description
-#   _ARTIFACT_SHA256: SHA-256 expected for the downloaded archive
 
 steps:
   - name: gcr.io/cloud-builders/gsutil
@@ -22,7 +21,6 @@ steps:
         rm -rf "${_CONTEXT}"
         mkdir -p "${_CONTEXT}"
         gsutil cp "${_ARTIFACT_URI}" /tmp/antfly-zig-runtime.tar.gz
-        echo "${_ARTIFACT_SHA256}  /tmp/antfly-zig-runtime.tar.gz" | sha256sum -c -
         tar -xzf /tmp/antfly-zig-runtime.tar.gz -C "${_CONTEXT}"
         test -x "${_CONTEXT}/antfly"
         test -d "${_CONTEXT}/share/antfly"
@@ -71,4 +69,3 @@ substitutions:
   _VERSION_TAG: zig-latest-amd64
   _PLATFORMS: linux/amd64
   _DESCRIPTION: AntflyDB Zig runtime image
-  _ARTIFACT_SHA256: unused
