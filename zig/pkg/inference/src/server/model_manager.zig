@@ -252,7 +252,7 @@ fn validateGgufCompanionForBackend(
             return .{
                 .level = .incompatible,
                 .code = .artifact_unreadable,
-                .message = "a projector GGUF is missing required metadata or projection tensors, or declares an invalid shape contract",
+                .message = "a projector GGUF is missing required metadata or tensors, or declares an invalid shape contract",
             };
         };
         if (!projectorMatchesDecoder(contract.kind, projector_decoder)) {

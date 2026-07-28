@@ -809,8 +809,27 @@ fn parseConfig(file: *const gguf_format.File) !Config {
     if (!projector_format_mod.isGemma4ImageProjectorType(projector_type)) return error.UnsupportedGgufProjector;
     const block_count: usize = @intCast(view.getU64("clip.vision.block_count") orelse return error.InvalidGgufProjector);
     const direct_unified = std.mem.eql(u8, projector_type, "gemma4uv") and block_count == 0;
-    const projection_scale_factor: usize = @intCast(view.getU64("clip.vision.projector_scale_factor") orelse default_spatial_merge_size);
-    const metadata_patch_size: usize = @intCast(view.getU64("clip.vision.patch_size") orelse return error.InvalidGgufProjector);
+    const projection_scale_factor = std.math.cast(
+        usize,
+        view.getU64("clip.vision.projector_scale_factor") orelse default_spatial_merge_size,
+    ) orelse return error.InvalidGgufProjector;
+    const metadata_patch_size = std.math.cast(
+        usize,
+        view.getU64("clip.vision.patch_size") orelse return error.InvalidGgufProjector,
+    ) orelse return error.InvalidGgufProjector;
+    if (metadata_patch_size == 0 or (direct_unified and projection_scale_factor == 0)) {
+        return error.InvalidGgufProjector;
+    }
+    const patch_size = if (direct_unified)
+        std.math.mul(usize, metadata_patch_size, projection_scale_factor) catch
+            return error.InvalidGgufProjector
+    else
+        metadata_patch_size;
+    const patch_area = std.math.mul(usize, patch_size, patch_size) catch
+        return error.InvalidGgufProjector;
+    const patch_input = std.math.mul(usize, patch_area, 3) catch
+        return error.InvalidGgufProjector;
+    if (patch_input > std.math.maxInt(i32)) return error.InvalidGgufProjector;
 
     var image_mean = [3]f32{ 0.0, 0.0, 0.0 };
     var image_std = [3]f32{ 1.0, 1.0, 1.0 };
@@ -829,7 +848,7 @@ fn parseConfig(file: *const gguf_format.File) !Config {
         .head_count = @intCast(view.getU64("clip.vision.attention.head_count") orelse return error.InvalidGgufProjector),
         .direct_unified = direct_unified,
         .image_size = @intCast(view.getU64("clip.vision.image_size") orelse return error.InvalidGgufProjector),
-        .patch_size = if (direct_unified) metadata_patch_size * projection_scale_factor else metadata_patch_size,
+        .patch_size = patch_size,
         .layer_norm_eps = view.getF32("clip.vision.attention.layer_norm_epsilon") orelse 1e-6,
         .image_mean = image_mean,
         .image_std = image_std,
@@ -1406,6 +1425,37 @@ test "gemma4 unified projector metadata parses image and audio configs" {
     try std.testing.expectEqual(@as(usize, 640), audio_cfg.audio_hidden);
     try std.testing.expectEqual(@as(usize, 640), audio_cfg.raw_samples_per_token);
     try std.testing.expect(audio_cfg.direct_unified);
+}
+
+test "gemma4 unified projector rejects invalid effective patch geometry" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        patch_size: u32,
+        scale_factor: u32,
+    }{
+        .{ .patch_size = 16, .scale_factor = 0 },
+        .{ .patch_size = std.math.maxInt(u32), .scale_factor = std.math.maxInt(u32) },
+    };
+    for (cases) |case| {
+        const metadata = [_]gguf_format.MetadataEntry{
+            .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+            .{ .key = "clip.vision.projector_type", .value = .{ .string = "gemma4uv" } },
+            .{ .key = "clip.vision.projection_dim", .value = .{ .u32 = 4 } },
+            .{ .key = "clip.vision.embedding_length", .value = .{ .u32 = 4 } },
+            .{ .key = "clip.vision.feed_forward_length", .value = .{ .u32 = 0 } },
+            .{ .key = "clip.vision.block_count", .value = .{ .u32 = 0 } },
+            .{ .key = "clip.vision.attention.head_count", .value = .{ .u32 = 0 } },
+            .{ .key = "clip.vision.image_size", .value = .{ .u32 = 224 } },
+            .{ .key = "clip.vision.patch_size", .value = .{ .u32 = case.patch_size } },
+            .{ .key = "clip.vision.projector_scale_factor", .value = .{ .u32 = case.scale_factor } },
+        };
+        var layout = try @import("../gguf/writer.zig").buildLayout(allocator, &metadata, &.{});
+        defer layout.deinit(allocator);
+        var parsed = try gguf_format.parse(allocator, layout.header_bytes);
+        defer parsed.deinit(allocator);
+
+        try std.testing.expectError(error.InvalidGgufProjector, parseConfig(&parsed));
+    }
 }
 
 fn metadataF32Triple(view: gguf_metadata.View, key: []const u8) ?[3]f32 {
