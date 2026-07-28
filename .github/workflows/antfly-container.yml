@@ -78,6 +78,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       source_sha: ${{ steps.source.outputs.source_sha }}
+      archive_prefix: ${{ steps.source.outputs.archive_prefix }}
     steps:
       # This checkout deliberately uses the workflow ref, not source_sha.  It is
       # the trust boundary for deciding whether a historical revision may use
@@ -106,6 +107,7 @@ jobs:
             exit 1
           fi
           git fetch --no-tags origin main
+          [[ "$GITHUB_REPOSITORY" == "antflydb/antfly" ]] || { echo "container publishing is supported only from antflydb/antfly" >&2; exit 1; }
           git cat-file -e "${REQUESTED_SOURCE_SHA}^{commit}"
           if [[ "$MODE" == development ]]; then
             git merge-base --is-ancestor "$REQUESTED_SOURCE_SHA" origin/main || { echo "development source_sha must be an ancestor of protected main" >&2; exit 1; }
@@ -115,6 +117,9 @@ jobs:
             [[ "$(git rev-parse "${RELEASE_TAG}^{commit}")" == "$REQUESTED_SOURCE_SHA" ]] || { echo "release source_sha must equal the requested release tag commit" >&2; exit 1; }
           fi
           echo "source_sha=$REQUESTED_SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          # Artifacts are scoped to this invocation, not just the source SHA:
+          # a release and a development build of the same commit cannot race.
+          echo "archive_prefix=zig/${REQUESTED_SOURCE_SHA}/${MODE}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
       - name: Select runtime architectures
         id: matrix
@@ -220,9 +225,13 @@ jobs:
 
       - name: Upload runtime artifact to GCS
         run: |
-          gsutil cp \
-            "$RUNNER_TEMP/antfly-zig-${{ matrix.arch }}.tar.gz" \
-            "gs://${ZIG_ARTIFACT_BUCKET}/zig/${{ needs.plan.outputs.source_sha }}/antfly-zig-${{ matrix.arch }}.tar.gz"
+          set -euo pipefail
+          artifact="$RUNNER_TEMP/antfly-zig-${{ matrix.arch }}.tar.gz"
+          uri="gs://${ZIG_ARTIFACT_BUCKET}/${{ needs.plan.outputs.archive_prefix }}/antfly-zig-${{ matrix.arch }}.tar.gz"
+          sha256="$(sha256sum "$artifact" | awk '{print $1}')"
+          gsutil -h "x-goog-meta-sha256=${sha256}" cp "$artifact" "$uri"
+          [[ "$(gsutil hash -h "$uri" | awk '/Hash \(SHA256\):/ {print $3}')" == "$sha256" ]]
+          gsutil stat "$uri" | grep -q 'Generation:'
 
   publish:
     outputs:
@@ -230,8 +239,11 @@ jobs:
       manifest: ${{ steps.manifest.outputs.manifest }}
     runs-on: arc-antfly-publish
     needs: [plan, build-artifact]
-    if: ${{ always() && (inputs.artifact_source == 'github' || needs.build-artifact.result == 'success') }}
-    environment: container-publish
+    if: ${{ always() && needs.plan.result == 'success' && (inputs.artifact_source == 'github' || needs.build-artifact.result == 'success') }}
+    # container-publish-development must be configured with the same-repo
+    # workload identity and no tag-only deployment restriction. Cross-repo
+    # callers are intentionally unsupported by the authorization guard above.
+    environment: ${{ (inputs.publish_mode || 'release') == 'development' && 'container-publish-development' || 'container-publish' }}
     permissions:
       contents: read
       packages: write
@@ -281,9 +293,12 @@ jobs:
             mapfile -t matches < <(find dist/release-archives -maxdepth 1 -type f -name "$source_glob" -print)
             [[ ${#matches[@]} -eq 1 && -f "${matches[0]}" ]] || { echo "expected exactly one $arch release archive" >&2; exit 1; }
             cp "${matches[0]}" "$RUNNER_TEMP/container-artifacts/antfly-zig-${arch}.tar.gz"
-            gsutil cp \
-              "$RUNNER_TEMP/container-artifacts/antfly-zig-${arch}.tar.gz" \
-              "gs://${ZIG_ARTIFACT_BUCKET}/zig/${{ needs.plan.outputs.source_sha }}/antfly-zig-${arch}.tar.gz"
+            artifact="$RUNNER_TEMP/container-artifacts/antfly-zig-${arch}.tar.gz"
+            uri="gs://${ZIG_ARTIFACT_BUCKET}/${{ needs.plan.outputs.archive_prefix }}/antfly-zig-${arch}.tar.gz"
+            sha256="$(sha256sum "$artifact" | awk '{print $1}')"
+            gsutil -h "x-goog-meta-sha256=${sha256}" cp "$artifact" "$uri"
+            [[ "$(gsutil hash -h "$uri" | awk '/Hash \(SHA256\):/ {print $3}')" == "$sha256" ]]
+            gsutil stat "$uri" | grep -q 'Generation:'
           done
 
       - name: Extract version
@@ -332,17 +347,26 @@ jobs:
             done
           }
           VERSION="${{ steps.version.outputs.version }}"
-          SOURCE_SHA="${{ needs.plan.outputs.source_sha }}"
+          ARCHIVE_PREFIX="${{ needs.plan.outputs.archive_prefix }}"
           STAGING_SUFFIX="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           IFS=, read -ra arches <<< "${{ steps.version.outputs.architectures }}"
           for arch in "${arches[@]}"; do
+            ARTIFACT_URI="gs://${ZIG_ARTIFACT_BUCKET}/${ARCHIVE_PREFIX}/antfly-zig-${arch}.tar.gz"
+            ARTIFACT_SHA256="$(gsutil hash -h "$ARTIFACT_URI" | awk '/Hash \(SHA256\):/ {print $3}')"
+            [[ "$ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "missing SHA-256 for $ARTIFACT_URI" >&2; exit 1; }
             submit_cloud_build . \
               --project="${GCP_PROJECT}" \
               --region="${GCP_REGION}" \
               --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
               --config=zig/cloudbuild.runtime.yaml \
-              --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${SOURCE_SHA}/antfly-zig-${arch}.tar.gz,_IMAGE_NAME=antfly,_DOCKERFILE=zig/Dockerfile.runtime,_CONTEXT=/workspace/.zig-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=${VERSION}-${arch}-${STAGING_SUFFIX},_PLATFORMS=linux/${arch},_DESCRIPTION=AntflyDB Zig runtime image"
+              --substitutions="^@^_ARTIFACT_URI=${ARTIFACT_URI}@_ARTIFACT_SHA256=${ARTIFACT_SHA256}@_IMAGE_NAME=antfly@_DOCKERFILE=zig/Dockerfile.runtime@_CONTEXT=/workspace/.zig-container@_ALIAS_TAG=__skip_alias__@_VERSION_TAG=${VERSION}-${arch}-${STAGING_SUFFIX}@_PLATFORMS=linux/${arch}@_DESCRIPTION=AntflyDB Zig runtime image"
           done
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Authenticate crane to GAR
+        run: echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
 
       - name: Create GAR multi-arch manifest with Cloud Build
         run: |
@@ -371,20 +395,22 @@ jobs:
           if [[ "${{ inputs.publish_mode || 'release' }}" == development || "$VERSION" == *-* || "$VERSION" == v0.1.* ]]; then
             ALIAS_TAG=__skip_alias__
           fi
+          REPOSITORY="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPOSITORY}/antfly"
+          expected_platforms="$(printf '%s\n' "${arches[@]}" | sort | jq -Rsc 'split("\n") | map(select(length > 0))')"
+          if existing_digest="$(crane digest "${REPOSITORY}:${VERSION}" 2>/dev/null)"; then
+            actual_platforms="$(crane manifest "${REPOSITORY}@${existing_digest}" | jq -c '[.manifests[]?.platform.architecture] | sort')"
+            [[ "$actual_platforms" == "$expected_platforms" ]] || { echo "immutable tag ${VERSION} already exists with different platforms" >&2; exit 1; }
+            echo "immutable tag ${VERSION} already exists at ${existing_digest}; rerun will not retag it"
+            exit 0
+          fi
+          # Cloud Build's default comma dictionary delimiter conflicts with the
+          # source tag list.  @ is the explicit alternate delimiter.
           submit_cloud_build . \
             --project="${GCP_PROJECT}" \
             --region="${GCP_REGION}" \
             --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
             --config=zig/cloudbuild.manifest.yaml \
-            --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${VERSION},_ALIAS_TAG=${ALIAS_TAG},_SOURCE_TAGS=${SOURCES//,/\\,}"
-
-      - name: Install crane
-        uses: imjasonh/setup-crane@v0.4
-
-      - name: Authenticate crane to GAR
-        # Development runs resolve and sign GAR digests too; authenticate before
-        # any crane or cosign operation, while GHCR remains release-only.
-        run: echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
+            --substitutions="^@^_IMAGE_NAME=antfly@_VERSION_TAG=${VERSION}@_ALIAS_TAG=${ALIAS_TAG}@_SOURCE_TAGS=${SOURCES}"
 
       - name: Mirror image GAR -> GHCR
         if: ${{ (inputs.publish_mode || 'release') == 'release' }}

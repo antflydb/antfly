@@ -105,7 +105,7 @@ if [[ "$manifest" == true ]]; then
     --region="$gcp_region" \
     --worker-pool="$worker_pool" \
     --config=zig/cloudbuild.manifest.yaml \
-    --substitutions="_IMAGE_NAME=antfly,_VERSION_TAG=${tag},_ALIAS_TAG=__skip_alias__,_SOURCE_TAGS=${tag}-amd64\\,${tag}-arm64"
+    --substitutions="^@^_IMAGE_NAME=antfly@_VERSION_TAG=${tag}@_ALIAS_TAG=__skip_alias__@_SOURCE_TAGS=${tag}-amd64,${tag}-arm64"
   inspect_image "${image_base}:${tag}"
   exit 0
 fi

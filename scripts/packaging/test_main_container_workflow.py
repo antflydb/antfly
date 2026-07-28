@@ -51,8 +51,9 @@ class MainContainerWorkflowTest(unittest.TestCase):
         self.assertNotIn("_AMD64_TAG:", self.manifest_build)
         self.assertNotIn("_ARM64_TAG:", self.manifest_build)
 
-    def test_gcloud_source_tags_escape_its_comma_grammar(self) -> None:
-        self.assertIn("_SOURCE_TAGS=${SOURCES//,/\\\\,}", self.workflow)
+    def test_gcloud_source_tags_use_the_alternate_dictionary_delimiter(self) -> None:
+        self.assertIn("--substitutions=\"^@^_IMAGE_NAME=antfly@", self.workflow)
+        self.assertIn("@_SOURCE_TAGS=${SOURCES}\"", self.workflow)
 
     def test_dev_script_passes_escaped_source_tags_to_gcloud(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -68,7 +69,19 @@ class MainContainerWorkflowTest(unittest.TestCase):
             env = os.environ | {"PATH": f"{bindir}:{os.environ['PATH']}", "GCLOUD_CAPTURE": str(capture)}
             completed = subprocess.run([str(DEV_PUBLISH), "--tag", "test", "--manifest"], cwd=ROOT, env=env, text=True, capture_output=True)
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertIn("_SOURCE_TAGS=test-amd64\\,test-arm64", capture.read_text())
+            self.assertIn("^@^_IMAGE_NAME=antfly@_VERSION_TAG=test@_ALIAS_TAG=__skip_alias__@_SOURCE_TAGS=test-amd64,test-arm64", capture.read_text())
+
+    def test_gcloud_sdk_accepts_alternate_delimiter_syntax(self) -> None:
+        # This intentionally fails only after argument parsing because the
+        # source directory does not exist. A bad substitution dictionary fails
+        # before that with a substitutions syntax error.
+        completed = subprocess.run(
+            ["gcloud", "builds", "submit", "/definitely/not/a/source", "--substitutions=^@^_A=one@_B=two,three"],
+            text=True,
+            capture_output=True,
+            env=os.environ | {"CLOUDSDK_CONFIG": tempfile.mkdtemp()},
+        )
+        self.assertNotIn("substitution", completed.stderr.lower())
 
     def test_manifest_is_digest_resolved_signed_and_retained(self) -> None:
         self.assertIn('DIGEST="$(crane digest', self.workflow)
@@ -87,12 +100,24 @@ class MainContainerWorkflowTest(unittest.TestCase):
         self.assertIn("STAGING_SUFFIX=\"${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\"", self.workflow)
         self.assertIn("group: runtime-container-", self.workflow)
         self.assertIn('IMAGE="${{ steps.sign.outputs.image }}"', self.workflow)
+        self.assertIn("rerun will not retag it", self.workflow)
+        self.assertIn("already exists with different platforms", self.workflow)
 
     def test_architecture_and_source_matrix_contracts(self) -> None:
         for arch in ("amd64", "arm64", "amd64,arm64"):
             self.assertIn(f"{arch})", self.workflow)
         self.assertIn("for arch in \"${arches[@]}\"", self.workflow)
         self.assertIn("expected exactly one $arch release archive", self.workflow)
+        self.assertIn("archive_prefix", self.workflow)
+        self.assertIn("_ARTIFACT_SHA256", self.workflow)
+        self.assertIn("gsutil stat", self.workflow)
+
+    def test_protected_environment_requires_a_successful_plan(self) -> None:
+        publish = self.workflow.index("  publish:")
+        window = self.workflow[publish : publish + 1000]
+        self.assertIn("needs.plan.result == 'success'", window)
+        self.assertIn("container-publish-development", window)
+        self.assertIn("GITHUB_REPOSITORY", self.workflow)
 
 
 if __name__ == "__main__":
