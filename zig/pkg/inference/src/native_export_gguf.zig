@@ -4441,6 +4441,7 @@ fn buildMetadataEntries(
     try appendArchU32(allocator, &entries, arch, "attention.head_count", config.num_attention_heads);
     try appendHeadCountKvMetadata(allocator, &entries, arch, config);
     try appendArchU32(allocator, &entries, arch, "attention.key_length", config.headDim());
+    try appendMultimodalDecoderMetadata(allocator, &entries, config);
 
     if (config.global_head_dim > 0) {
         try appendArchU32(allocator, &entries, arch, "attention.key_length_swa", config.attention_head_dim);
@@ -4520,6 +4521,49 @@ fn buildMetadataEntries(
     try appendStandaloneTokenizerMetadata(allocator, &entries, model_dir, manifest);
 
     return try entries.toOwnedSlice(allocator);
+}
+
+fn appendMultimodalDecoderMetadata(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayListUnmanaged(gguf_mod.format.MetadataEntry),
+    config: gpt_mod.Config,
+) !void {
+    if (!config.isMultimodal()) return;
+
+    // These keys are an Antfly-owned decoder contract. Upstream GGUF does not
+    // currently define a portable way to retain the HF multimodal decoder
+    // fields, but the native runtime needs them when the exported decoder and
+    // projector are deployed without the source config.json.
+    if (config.image_token_index >= 0)
+        try appendMetadataI64Entry(allocator, entries, "inference.multimodal.image_token_id", config.image_token_index);
+    if (config.boi_token_index >= 0)
+        try appendMetadataI64Entry(allocator, entries, "inference.multimodal.boi_token_id", config.boi_token_index);
+    if (config.eoi_token_index >= 0)
+        try appendMetadataI64Entry(allocator, entries, "inference.multimodal.eoi_token_id", config.eoi_token_index);
+    if (config.mm_tokens_per_image > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.tokens_per_image", config.mm_tokens_per_image);
+    if (config.vision_hidden_size > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.hidden_size", config.vision_hidden_size);
+    if (config.vision_embed_dim > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.embedding_length", config.vision_embed_dim);
+    if (config.vision_num_hidden_layers > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.block_count", config.vision_num_hidden_layers);
+    if (config.vision_num_attention_heads > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.attention.head_count", config.vision_num_attention_heads);
+    if (config.vision_intermediate_size > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.feed_forward_length", config.vision_intermediate_size);
+    if (config.vision_image_size > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.image_size", config.vision_image_size);
+    if (config.vision_patch_size > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.patch_size", config.vision_patch_size);
+    if (config.vision_mlp_ratio > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.mlp_ratio", config.vision_mlp_ratio);
+    if (config.vision_spatial_merge_size > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.spatial_merge_size", config.vision_spatial_merge_size);
+    if (config.vision_temporal_patch_size > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.temporal_patch_size", config.vision_temporal_patch_size);
+    if (config.vision_use_quick_gelu)
+        try appendMetadataBoolEntry(allocator, entries, "inference.multimodal.vision.use_quick_gelu", true);
 }
 
 fn appendStandaloneTokenizerMetadata(
@@ -5811,6 +5855,10 @@ test "multimodal export writes decoder gguf and preserves companion projector gg
     defer parsed.deinit(allocator);
     const view = gguf_mod.metadata.View.init(&parsed);
     try std.testing.expectEqualStrings("gemma3", view.getString("general.architecture").?);
+    const exported_config = gpt_mod.parseGgufMetadata(view).?;
+    try std.testing.expect(exported_config.isMultimodal());
+    try std.testing.expectEqual(@as(i32, 1), exported_config.image_token_index);
+    try std.testing.expectEqual(@as(u32, 2), exported_config.mm_tokens_per_image);
     const catalog = gguf_mod.tensor_catalog.Catalog.init(&parsed);
     try std.testing.expect(catalog.find("token_embd.weight") != null);
     try std.testing.expect(catalog.find("vision_tower.vision_model.post_layernorm.weight") == null);
@@ -5930,6 +5978,16 @@ test "multimodal export synthesizes projector gguf from integrated tensors" {
     defer decoder_parsed.deinit(allocator);
     const decoder_view = gguf_mod.metadata.View.init(&decoder_parsed);
     try std.testing.expectEqualStrings("gemma3", decoder_view.getString("general.architecture").?);
+    const exported_config = gpt_mod.parseGgufMetadata(decoder_view).?;
+    try std.testing.expect(exported_config.isMultimodal());
+    try std.testing.expectEqual(@as(i32, 1), exported_config.image_token_index);
+    try std.testing.expectEqual(@as(u32, 2), exported_config.mm_tokens_per_image);
+    try std.testing.expectEqual(@as(u32, 8), exported_config.vision_hidden_size);
+    try std.testing.expectEqual(@as(u32, 3), exported_config.vision_num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 4), exported_config.vision_num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 16), exported_config.vision_intermediate_size);
+    try std.testing.expectEqual(@as(u32, 224), exported_config.vision_image_size);
+    try std.testing.expectEqual(@as(u32, 14), exported_config.vision_patch_size);
     const decoder_catalog = gguf_mod.tensor_catalog.Catalog.init(&decoder_parsed);
     try std.testing.expect(decoder_catalog.find("token_embd.weight") != null);
     try std.testing.expect(decoder_catalog.find("vision_tower.vision_model.post_layernorm.weight") == null);

@@ -1164,6 +1164,7 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     if (metaF32(view, &key_buf, arch, "final_logit_softcapping")) |value| config.final_logit_softcapping = value;
 
     if (metaF32(view, &key_buf, arch, "rope.freq_base_swa")) |value| config.rope_local_theta = value;
+    applyAntflyMultimodalGgufMetadata(view, &config);
 
     // DeepSeek V4. Every field below was previously reachable only from an HF
     // config.json, so a real ds4 GGUF got family defaults and nothing else -- the
@@ -1258,6 +1259,30 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     applyGgufTokenizerStopMetadata(view, &config);
 
     return config;
+}
+
+fn applyAntflyMultimodalGgufMetadata(view: gguf_metadata.View, config: *Config) void {
+    if (ggufTokenId(view, "inference.multimodal.image_token_id")) |value| config.image_token_index = value;
+    if (ggufTokenId(view, "inference.multimodal.boi_token_id")) |value| config.boi_token_index = value;
+    if (ggufTokenId(view, "inference.multimodal.eoi_token_id")) |value| config.eoi_token_index = value;
+    if (ggufMetadataU32(view, "inference.multimodal.tokens_per_image")) |value| config.mm_tokens_per_image = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.hidden_size")) |value| config.vision_hidden_size = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.embedding_length")) |value| config.vision_embed_dim = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.block_count")) |value| config.vision_num_hidden_layers = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.attention.head_count")) |value| config.vision_num_attention_heads = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.feed_forward_length")) |value| config.vision_intermediate_size = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.image_size")) |value| config.vision_image_size = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.patch_size")) |value| config.vision_patch_size = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.mlp_ratio")) |value| config.vision_mlp_ratio = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.spatial_merge_size")) |value| config.vision_spatial_merge_size = value;
+    if (ggufMetadataU32(view, "inference.multimodal.vision.temporal_patch_size")) |value| config.vision_temporal_patch_size = value;
+    if (view.getBool("inference.multimodal.vision.use_quick_gelu")) |value| config.vision_use_quick_gelu = value;
+}
+
+fn ggufMetadataU32(view: gguf_metadata.View, key: []const u8) ?u32 {
+    const value = view.getU64(key) orelse return null;
+    if (value > std.math.maxInt(u32)) return null;
+    return @intCast(value);
 }
 
 fn applyGgufTokenizerStopMetadata(view: gguf_metadata.View, config: *Config) void {

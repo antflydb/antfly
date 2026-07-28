@@ -165,6 +165,14 @@ const ProjectorDecoderFamily = enum {
     unsupported,
 };
 
+const ProjectorDecoderContract = struct {
+    family: ProjectorDecoderFamily,
+    hidden_size: u32 = 0,
+    tokens_per_image: u32 = 0,
+    requires_image: bool = false,
+    requires_audio: bool = false,
+};
+
 fn projectorDecoderFamilyForArchitecture(architecture: []const u8) ProjectorDecoderFamily {
     if (std.mem.eql(u8, architecture, "gemma3")) return .gemma3;
     if (std.mem.eql(u8, architecture, "gemma4") or
@@ -177,14 +185,14 @@ fn projectorDecoderFamilyForArchitecture(architecture: []const u8) ProjectorDeco
 
 fn projectorMatchesDecoder(
     projector: projector_format_mod.Kind,
-    decoder: ProjectorDecoderFamily,
+    decoder: ProjectorDecoderContract,
 ) bool {
     return switch (projector) {
-        .antfly_gemma3 => decoder == .gemma3,
+        .antfly_gemma3 => decoder.family == .gemma3,
         .clip_gemma4_image,
         .clip_gemma4_audio,
         .clip_gemma4_image_audio,
-        => decoder == .gemma4,
+        => decoder.family == .gemma4,
         .unknown => false,
     };
 }
@@ -194,7 +202,7 @@ fn validateGgufCompanionForBackend(
     path: []const u8,
     backend: backends.BackendType,
     role: NativeCompanionRole,
-    projector_decoder: ProjectorDecoderFamily,
+    projector_decoder: ProjectorDecoderContract,
 ) !?CompatibilitySummary {
     var mapped = c_file.MmapRegion.init(allocator, path) catch |err| {
         if (err == error.OutOfMemory) return err;
@@ -233,19 +241,53 @@ fn validateGgufCompanionForBackend(
         };
     }
     if (role == .projector) {
-        const projector = projector_format_mod.detectFile(&file);
-        if (projector == .unknown) {
+        if (projector_format_mod.detectFile(&file) == .unknown) {
             return .{
                 .level = .incompatible,
                 .code = .unsupported_backend,
                 .message = "a projector GGUF does not declare a supported Antfly Gemma 3 or Gemma 4 CLIP projector format",
             };
         }
-        if (!projectorMatchesDecoder(projector, projector_decoder)) {
+        const contract = projector_format_mod.inspectFileContract(&file) catch {
+            return .{
+                .level = .incompatible,
+                .code = .artifact_unreadable,
+                .message = "a projector GGUF is missing required metadata or projection tensors, or declares an invalid shape contract",
+            };
+        };
+        if (!projectorMatchesDecoder(contract.kind, projector_decoder)) {
             return .{
                 .level = .incompatible,
                 .code = .unsupported_backend,
                 .message = "the projector GGUF format does not match the selected decoder architecture",
+            };
+        }
+        if (projector_decoder.hidden_size > 0 and
+            contract.text_hidden_size != projector_decoder.hidden_size)
+        {
+            return .{
+                .level = .incompatible,
+                .code = .missing_required_tensor,
+                .message = "the projector output width does not match the selected decoder hidden size",
+            };
+        }
+        if (projector_decoder.tokens_per_image > 0 and
+            contract.tokens_per_image != null and
+            contract.tokens_per_image.? != projector_decoder.tokens_per_image)
+        {
+            return .{
+                .level = .incompatible,
+                .code = .missing_required_tensor,
+                .message = "the projector image-token count does not match the selected decoder",
+            };
+        }
+        if ((projector_decoder.requires_image and !contract.supports_image) or
+            (projector_decoder.requires_audio and !contract.supports_audio))
+        {
+            return .{
+                .level = .incompatible,
+                .code = .unsupported_backend,
+                .message = "the projector modalities do not satisfy the model input contract",
             };
         }
     }
@@ -266,7 +308,7 @@ fn validateNativeCompanionsForBackend(
     man: *const manifest_mod.ModelManifest,
     candidate: ArtifactCandidateKind,
     backend: backends.BackendType,
-    projector_decoder: ProjectorDecoderFamily,
+    projector_decoder: ProjectorDecoderContract,
 ) !?CompatibilitySummary {
     // An ONNX route never consumes native sidecars. Native primary routes can
     // consume a projector, a split GLiNER head, and lazily loaded multimodal
@@ -367,7 +409,12 @@ pub fn compatibilitySummaryForBackend(
     const assessment = model_compatibility.assessInspection(&candidate_manifest, inspection);
     if (assessment.level == .incompatible) return summaryFromAssessment(assessment);
 
-    var projector_decoder = projectorDecoderFamilyForArchitecture(man.config_model_arch);
+    var projector_decoder = ProjectorDecoderContract{
+        .family = projectorDecoderFamilyForArchitecture(man.config_model_arch),
+        .hidden_size = man.hidden_size,
+        .requires_image = manifestRequiresInput(man, "image"),
+        .requires_audio = manifestRequiresInput(man, "audio"),
+    };
     if (candidate == .gguf) {
         var maybe_report = session_factory.inspectGgufModelForListing(
             allocator,
@@ -383,9 +430,16 @@ pub fn compatibilitySummaryForBackend(
         };
         if (maybe_report) |*report| {
             defer report.deinit();
-            projector_decoder = projectorDecoderFamilyForArchitecture(report.architecture);
+            projector_decoder.family = projectorDecoderFamilyForArchitecture(report.architecture);
             if (report.gpt_config) |config| {
-                if (!config.isMultimodal()) projector_decoder = .unsupported;
+                projector_decoder.hidden_size = config.hidden_size;
+                projector_decoder.tokens_per_image = config.mm_tokens_per_image;
+                // Gemma 3 needs decoder-side image-token geometry at runtime.
+                // Gemma 4 external projectors carry their own media geometry
+                // and can validly accompany a decoder GGUF that predates the
+                // Antfly multimodal metadata namespace.
+                if (!config.isMultimodal() and projector_decoder.family == .gemma3)
+                    projector_decoder.family = .unsupported;
             }
             if (report.missing_required_tensors.len > 0) {
                 return .{
@@ -1641,6 +1695,13 @@ fn findMetadataEntry(parsed: *const gguf_format.File, key: []const u8) ?*const g
         if (std.mem.eql(u8, entry.key, key)) return entry;
     }
     return null;
+}
+
+fn manifestRequiresInput(man: *const manifest_mod.ModelManifest, expected: []const u8) bool {
+    for (man.inputs) |input| {
+        if (std.mem.eql(u8, input, expected)) return true;
+    }
+    return false;
 }
 
 pub fn loadSentencePieceTokenizerFromDirOrGguf(
@@ -4213,6 +4274,7 @@ test "native compatibility rejects a projector for a different decoder family" {
         .allocator = allocator,
         .model_type = .generator,
         .config_model_arch = try allocator.dupe(u8, "gemma3"),
+        .hidden_size = 4,
         .safetensors_path = try std.fs.path.join(allocator, &.{ root, "model.safetensors" }),
         .gguf_projector_path = try std.fs.path.join(allocator, &.{ root, "mmproj.gguf" }),
     };
@@ -4237,6 +4299,7 @@ test "native compatibility rejects a projector for a different decoder family" {
         .allocator = allocator,
         .model_type = .generator,
         .config_model_arch = try allocator.dupe(u8, "gemma4"),
+        .hidden_size = 4,
         .safetensors_path = try std.fs.path.join(allocator, &.{ root, "model.safetensors" }),
         .gguf_projector_path = try std.fs.path.join(allocator, &.{ root, "mmproj.gguf" }),
     };
@@ -4248,6 +4311,48 @@ test "native compatibility rejects a projector for a different decoder family" {
         .native,
     )).?;
     try std.testing.expectEqual(model_compatibility.Level.compatible, matched_summary.level);
+
+    var wrong_width = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "gemma4"),
+        .hidden_size = 8,
+        .safetensors_path = try std.fs.path.join(allocator, &.{ root, "model.safetensors" }),
+        .gguf_projector_path = try std.fs.path.join(allocator, &.{ root, "mmproj.gguf" }),
+    };
+    defer wrong_width.deinit();
+    const wrong_width_summary = (try compatibilitySummaryForBackend(
+        allocator,
+        root,
+        &wrong_width,
+        .native,
+    )).?;
+    try std.testing.expectEqual(model_compatibility.Level.incompatible, wrong_width_summary.level);
+    try std.testing.expectEqual(model_compatibility.Code.missing_required_tensor, wrong_width_summary.code);
+
+    var audio_inputs = [_][]const u8{"audio"};
+    var wrong_modality = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "gemma4"),
+        .hidden_size = 4,
+        .inputs = &audio_inputs,
+        .safetensors_path = try std.fs.path.join(allocator, &.{ root, "model.safetensors" }),
+        .gguf_projector_path = try std.fs.path.join(allocator, &.{ root, "mmproj.gguf" }),
+    };
+    defer {
+        // The input slice and its literal are borrowed by this fixture.
+        wrong_modality.inputs = &.{};
+        wrong_modality.deinit();
+    }
+    const wrong_modality_summary = (try compatibilitySummaryForBackend(
+        allocator,
+        root,
+        &wrong_modality,
+        .native,
+    )).?;
+    try std.testing.expectEqual(model_compatibility.Level.incompatible, wrong_modality_summary.level);
+    try std.testing.expectEqual(model_compatibility.Code.unsupported_backend, wrong_modality_summary.code);
 }
 
 test "native compatibility rejects unsupported companion GGUF tensor types" {
@@ -4300,7 +4405,7 @@ test "native compatibility rejects a malformed split GLiNER safetensors head" {
         },
         .gguf,
         .native,
-        .unsupported,
+        .{ .family = .unsupported },
     )).?;
     try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
     try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
@@ -5236,23 +5341,76 @@ fn writeTinyProjectorGgufForModelManagerTest(
     sub_path: []const u8,
     kind: TestProjectorKind,
 ) !void {
-    const metadata = switch (kind) {
-        .gemma3 => [_]gguf_format.MetadataEntry{
+    const metadata: []const gguf_format.MetadataEntry = switch (kind) {
+        .gemma3 => &[_]gguf_format.MetadataEntry{
             .{ .key = "general.architecture", .value = .{ .string = "antfly-projector" } },
             .{ .key = "inference.projector.source_architecture", .value = .{ .string = "gemma3" } },
             .{ .key = "general.alignment", .value = .{ .u32 = @intCast(gguf_format.default_alignment) } },
         },
-        .gemma4_image => [_]gguf_format.MetadataEntry{
+        .gemma4_image => &[_]gguf_format.MetadataEntry{
             .{ .key = "general.architecture", .value = .{ .string = "clip" } },
-            .{ .key = "clip.vision.projector_type", .value = .{ .string = "gemma4v" } },
+            .{ .key = "clip.vision.projector_type", .value = .{ .string = "gemma4uv" } },
+            .{ .key = "clip.vision.projection_dim", .value = .{ .u32 = 4 } },
+            .{ .key = "clip.vision.embedding_length", .value = .{ .u32 = 4 } },
+            .{ .key = "clip.vision.feed_forward_length", .value = .{ .u32 = 0 } },
+            .{ .key = "clip.vision.block_count", .value = .{ .u32 = 0 } },
+            .{ .key = "clip.vision.attention.head_count", .value = .{ .u32 = 0 } },
+            .{ .key = "clip.vision.image_size", .value = .{ .u32 = 224 } },
+            .{ .key = "clip.vision.patch_size", .value = .{ .u32 = 14 } },
+            .{ .key = "clip.vision.projector_scale_factor", .value = .{ .u32 = 1 } },
             .{ .key = "general.alignment", .value = .{ .u32 = @intCast(gguf_format.default_alignment) } },
         },
     };
+    if (kind == .gemma4_image) {
+        const dims_patch = [_]u64{588};
+        const dims_hidden = [_]u64{4};
+        const dims_patch_projection = [_]u64{ 4, 588 };
+        const dims_position = [_]u64{ 2, 16, 4 };
+        const dims_projection = [_]u64{ 4, 4 };
+        const tensors = [_]gguf_writer.TensorSpec{
+            .{ .name = "v.patch_norm.1.weight", .dimensions = &dims_patch, .tensor_type = .{ .known = .F32 } },
+            .{ .name = "v.patch_norm.1.bias", .dimensions = &dims_patch, .tensor_type = .{ .known = .F32 } },
+            .{ .name = "v.patch_embd.weight", .dimensions = &dims_patch_projection, .tensor_type = .{ .known = .F32 } },
+            .{ .name = "v.patch_embd.bias", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+            .{ .name = "v.patch_norm.2.weight", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+            .{ .name = "v.patch_norm.2.bias", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+            .{ .name = "v.position_embd.weight", .dimensions = &dims_position, .tensor_type = .{ .known = .F32 } },
+            .{ .name = "v.patch_norm.3.weight", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+            .{ .name = "v.patch_norm.3.bias", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
+            .{ .name = "mm.input_projection.weight", .dimensions = &dims_projection, .tensor_type = .{ .known = .F32 } },
+        };
+        var layout = try gguf_writer.buildLayout(allocator, metadata, &tensors);
+        defer layout.deinit(allocator);
+        var data = std.ArrayListUnmanaged(u8).empty;
+        defer data.deinit(allocator);
+        try data.appendSlice(allocator, layout.header_bytes);
+        const data_region_offset = std.mem.alignForward(
+            usize,
+            layout.header_bytes.len,
+            @intCast(layout.alignment),
+        );
+        try data.appendNTimes(allocator, 0, data_region_offset - layout.header_bytes.len);
+        var written_offset: u64 = 0;
+        for (tensors, layout.offsets) |tensor, offset| {
+            if (offset > written_offset) {
+                try data.appendNTimes(allocator, 0, @intCast(offset - written_offset));
+                written_offset = offset;
+            }
+            const byte_len = gguf_tensor_types.byteLen(
+                tensor.tensor_type,
+                tensor.dimensions,
+            ) orelse return error.UnsupportedTensorType;
+            try data.appendNTimes(allocator, 0, byte_len);
+            written_offset += @intCast(byte_len);
+        }
+        try dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = data.items });
+        return;
+    }
     return writeTinyGgufForModelManagerTest(
         dir,
         allocator,
         sub_path,
-        &metadata,
+        metadata,
         .{ .known = .F32 },
     );
 }
