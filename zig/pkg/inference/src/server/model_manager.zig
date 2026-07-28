@@ -31,6 +31,7 @@ const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
 const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const gguf_writer = @import("../gguf/writer.zig");
+const projector_format_mod = @import("../architectures/projector_format.zig");
 const hf_tokenizer = @import("inference_hf_tokenizer");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
 const tokenizer_mod = @import("inference_tokenizer");
@@ -147,15 +148,22 @@ const NativeCompanionKind = enum {
     safetensors,
 };
 
+const NativeCompanionRole = enum {
+    generic,
+    projector,
+};
+
 const NativeCompanion = struct {
     path: []const u8,
     kind: NativeCompanionKind,
+    role: NativeCompanionRole = .generic,
 };
 
 fn validateGgufCompanionForBackend(
     allocator: std.mem.Allocator,
     path: []const u8,
     backend: backends.BackendType,
+    role: NativeCompanionRole,
 ) !?CompatibilitySummary {
     var mapped = c_file.MmapRegion.init(allocator, path) catch |err| {
         if (err == error.OutOfMemory) return err;
@@ -193,6 +201,13 @@ fn validateGgufCompanionForBackend(
             .message = "a required companion GGUF contains no tensors",
         };
     }
+    if (role == .projector and projector_format_mod.detectFile(&file) == .unknown) {
+        return .{
+            .level = .incompatible,
+            .code = .unsupported_backend,
+            .message = "a projector GGUF does not declare a supported Antfly Gemma 3 or Gemma 4 CLIP projector format",
+        };
+    }
     for (file.tensors) |tensor| {
         if (!session_factory.ggufTensorTypeSupportsBackend(tensor.tensor_type, backend)) {
             return .{
@@ -219,7 +234,11 @@ fn validateNativeCompanionsForBackend(
     var companions: [8]NativeCompanion = undefined;
     var companion_count: usize = 0;
     if (man.gguf_projector_path) |path| {
-        companions[companion_count] = .{ .path = path, .kind = .gguf };
+        companions[companion_count] = .{
+            .path = path,
+            .kind = .gguf,
+            .role = .projector,
+        };
         companion_count += 1;
     }
     if (candidate == .gguf) {
@@ -266,6 +285,7 @@ fn validateNativeCompanionsForBackend(
                 allocator,
                 companion.path,
                 backend,
+                companion.role,
             )) |summary| return summary,
             .safetensors => safetensors_mod.validateArtifactSet(
                 allocator,
@@ -502,12 +522,16 @@ fn policyAllowedBackends(
 }
 
 const ComponentInspection = struct {
+    const backend_count = std.meta.fields(backends.BackendType).len;
+
     allocator: std.mem.Allocator,
     base_summary: CompatibilitySummary,
     invalid_summary: ?CompatibilitySummary = null,
     has_onnx_component: bool = false,
     has_native_component: bool = false,
     imported_graph_compatible: bool = true,
+    native_backend_summaries: [backend_count]?CompatibilitySummary =
+        [_]?CompatibilitySummary{null} ** backend_count,
     dependencies: std.ArrayListUnmanaged([]u8) = .empty,
 
     fn deinit(self: *ComponentInspection) void {
@@ -523,6 +547,15 @@ const ComponentInspection = struct {
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
         try self.dependencies.append(self.allocator, owned_path);
+    }
+
+    fn mergeNativeSummary(
+        self: *ComponentInspection,
+        backend: backends.BackendType,
+        summary: CompatibilitySummary,
+    ) void {
+        const slot = &self.native_backend_summaries[@intFromEnum(backend)];
+        slot.* = selectWorseCompatibility(slot.*, summary);
     }
 
     fn summaryForBackend(
@@ -547,9 +580,30 @@ const ComponentInspection = struct {
                 .message = "a component ONNX graph cannot be converted and validated by the selected backend",
             };
         }
+        if (self.native_backend_summaries[@intFromEnum(backend)]) |native_summary| {
+            return selectWorseCompatibility(self.base_summary, native_summary);
+        }
         return self.base_summary;
     }
 };
+
+fn selectWorseCompatibility(
+    current: ?CompatibilitySummary,
+    candidate: CompatibilitySummary,
+) CompatibilitySummary {
+    const existing = current orelse return candidate;
+    const candidate_rank: u2 = switch (candidate.level) {
+        .incompatible => 0,
+        .unknown => 1,
+        .compatible => 2,
+    };
+    const existing_rank: u2 = switch (existing.level) {
+        .incompatible => 0,
+        .unknown => 1,
+        .compatible => 2,
+    };
+    return if (candidate_rank < existing_rank) candidate else existing;
+}
 
 const ComponentPlanKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 const component_plan_cache_capacity = 256;
@@ -708,6 +762,66 @@ fn componentDependencySignature(
     return digest;
 }
 
+fn addNativeComponentDependencies(
+    allocator: std.mem.Allocator,
+    component_path: []const u8,
+    native_manifest: manifest_mod.ModelManifest,
+    result: *ComponentInspection,
+) !void {
+    if (!std.mem.endsWith(u8, component_path, ".gguf")) {
+        // Include absent manifest candidates too: creating a config file must
+        // invalidate a plan that was cached before it existed.
+        const manifest_dependencies = [_][]const u8{
+            "config.json",
+            "clip_config.json",
+            "model_manifest.json",
+            "antfly_inference_bundle.json",
+            "antfly_inference_variants.json",
+            "gliner_config.json",
+            "added_tokens.json",
+            "1_SpladePooling/config.json",
+        };
+        for (manifest_dependencies) |relative_path| {
+            const dependency = try std.fs.path.join(
+                allocator,
+                &.{ component_path, relative_path },
+            );
+            defer allocator.free(dependency);
+            try result.addDependency(dependency);
+        }
+    }
+
+    const native_paths = [_]?[]const u8{
+        native_manifest.gguf_path,
+        native_manifest.gguf_projector_path,
+        native_manifest.safetensors_path,
+        native_manifest.safetensors_index_path,
+        native_manifest.gliner_head_gguf_path,
+        native_manifest.gliner_head_safetensors_path,
+    };
+    for (native_paths) |maybe_native_path| {
+        if (maybe_native_path) |native_path| try result.addDependency(native_path);
+    }
+    if (artifactCandidateForBackend(native_manifest, .native) == .safetensors) {
+        var safetensors_dependencies = safetensors_mod.inspectArtifactDependencies(
+            allocator,
+            native_manifest.safetensors_path,
+            native_manifest.safetensors_index_path,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            result.invalid_summary = .{
+                .level = .incompatible,
+                .code = .artifact_unreadable,
+                .message = "a directory-backed component safetensors index is invalid or unreadable",
+            };
+            return;
+        };
+        defer safetensors_dependencies.deinit();
+        for (safetensors_dependencies.paths) |dependency|
+            try result.addDependency(dependency);
+    }
+}
+
 fn inspectComponentArtifacts(
     allocator: std.mem.Allocator,
     man: *const manifest_mod.ModelManifest,
@@ -769,17 +883,7 @@ fn inspectComponentArtifacts(
                 };
                 continue;
             }
-            const native_paths = [_]?[]const u8{
-                native_manifest.gguf_path,
-                native_manifest.gguf_projector_path,
-                native_manifest.safetensors_path,
-                native_manifest.safetensors_index_path,
-                native_manifest.gliner_head_gguf_path,
-                native_manifest.gliner_head_safetensors_path,
-            };
-            for (native_paths) |maybe_native_path| {
-                if (maybe_native_path) |native_path| try result.addDependency(native_path);
-            }
+            try addNativeComponentDependencies(allocator, path, native_manifest, &result);
             continue;
         }
         result.has_onnx_component = true;
@@ -799,6 +903,58 @@ fn inspectComponentArtifacts(
         for (artifacts.external_paths) |external_path| try result.addDependency(external_path);
     }
     return result;
+}
+
+fn validateComponentNativeArtifacts(
+    allocator: std.mem.Allocator,
+    component_paths: []const []const u8,
+    preferred_backends: []const backends.BackendType,
+    inspection: *ComponentInspection,
+) !void {
+    if (!inspection.has_native_component or inspection.invalid_summary != null) return;
+    for (component_paths, 0..) |path, path_index| {
+        if (std.mem.endsWith(u8, path, ".onnx")) continue;
+        var duplicate = false;
+        for (component_paths[0..path_index]) |previous| {
+            if (std.mem.eql(u8, previous, path)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
+        var native_manifest = manifest_mod.loadFromDir(allocator, path) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            inspection.invalid_summary = .{
+                .level = .incompatible,
+                .code = .artifact_unreadable,
+                .message = "a directory-backed component manifest changed or became unreadable",
+            };
+            return;
+        };
+        defer native_manifest.deinit();
+        try addNativeComponentDependencies(
+            allocator,
+            path,
+            native_manifest,
+            inspection,
+        );
+        if (inspection.invalid_summary != null) return;
+        for (preferred_backends) |backend| {
+            if (!backend.supportsDirectSessionLoad() or backend == .onnx) continue;
+            const summary = try compatibilitySummaryForBackend(
+                allocator,
+                path,
+                &native_manifest,
+                backend,
+            ) orelse CompatibilitySummary{
+                .level = .incompatible,
+                .code = .unsupported_backend,
+                .message = "a directory-backed component has no artifact route for the selected backend",
+            };
+            inspection.mergeNativeSummary(backend, summary);
+        }
+    }
 }
 
 fn validateComponentImportedGraphs(
@@ -851,6 +1007,12 @@ fn inspectComponentBundle(
         contract,
     );
     errdefer inspection.deinit();
+    try validateComponentNativeArtifacts(
+        allocator,
+        component_paths,
+        preferred_backends,
+        &inspection,
+    );
     try validateComponentImportedGraphs(
         allocator,
         component_paths,
@@ -2260,6 +2422,12 @@ pub const ModelManager = struct {
                 self.allocator,
                 self.componentPlanIo(),
                 inspection.dependencies.items,
+            );
+            try validateComponentNativeArtifacts(
+                self.allocator,
+                component_paths,
+                preferred_backends,
+                &inspection,
             );
             try validateComponentImportedGraphs(
                 self.allocator,
@@ -3845,6 +4013,45 @@ test "native compatibility rejects a corrupt GGUF projector" {
     try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
 }
 
+test "native compatibility rejects an unrecognized GGUF projector format" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeTinyHeadSafetensorsForModelManagerTest(
+        dir.dir,
+        allocator,
+        "model.safetensors",
+    );
+    try writeTinyHeadGgufForModelManagerTest(
+        dir.dir,
+        allocator,
+        "mmproj.gguf",
+    );
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "gemma3"),
+        .safetensors_path = try std.fs.path.join(allocator, &.{ root, "model.safetensors" }),
+        .gguf_projector_path = try std.fs.path.join(allocator, &.{ root, "mmproj.gguf" }),
+    };
+    defer man.deinit();
+
+    const summary = (try compatibilitySummaryForBackend(
+        allocator,
+        root,
+        &man,
+        .native,
+    )).?;
+    try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
+    try std.testing.expectEqual(model_compatibility.Code.unsupported_backend, summary.code);
+}
+
 test "native compatibility rejects unsupported companion GGUF tensor types" {
     const allocator = std.testing.allocator;
     var dir = std.testing.tmpDir(.{});
@@ -4027,6 +4234,105 @@ test "component compatibility validates explicit split ONNX graphs" {
             root,
             &.{.native},
             &.{ encoder, decoder },
+            .multistage_ocr,
+        ),
+    );
+}
+
+test "component compatibility rejects malformed directory-backed native artifacts" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model.safetensors",
+        .data = "not a safetensors artifact",
+    });
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var parent = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .reader,
+    };
+    defer parent.deinit();
+    const summary = try componentCompatibilityForBackend(
+        allocator,
+        &parent,
+        .native,
+        &.{root},
+        .multistage_ocr,
+    );
+    try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
+    try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
+
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+    // Structurally invalid artifacts remain incompatible even when unknown
+    // model contracts are explicitly permitted.
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    try std.testing.expectError(
+        error.IncompatibleModel,
+        manager.componentLoaderForPathsWithContract(
+            root,
+            &.{.native},
+            &.{root},
+            .multistage_ocr,
+        ),
+    );
+}
+
+test "component plan invalidates when a referenced safetensors shard changes" {
+    const allocator = std.testing.allocator;
+    const shard_json =
+        \\{"weight":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}
+    ;
+    var shard_bytes: [8 + shard_json.len + 8]u8 = undefined;
+    std.mem.writeInt(u64, shard_bytes[0..8], shard_json.len, .little);
+    @memcpy(shard_bytes[8..][0..shard_json.len], shard_json);
+    @memset(shard_bytes[8 + shard_json.len ..], 0);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model-00001-of-00001.safetensors",
+        .data = &shard_bytes,
+    });
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model.safetensors.index.json",
+        .data =
+        \\{"weight_map":{"weight":"model-00001-of-00001.safetensors"}}
+        ,
+    });
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    _ = try manager.componentLoaderForPathsWithContract(
+        root,
+        &.{.native},
+        &.{root},
+        .multistage_ocr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), manager.component_plan_cache.count());
+
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model-00001-of-00001.safetensors",
+        .data = "invalidated shard",
+    });
+    try std.testing.expectError(
+        error.IncompatibleModel,
+        manager.componentLoaderForPathsWithContract(
+            root,
+            &.{.native},
+            &.{root},
             .multistage_ocr,
         ),
     );

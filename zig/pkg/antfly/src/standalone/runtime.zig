@@ -1810,8 +1810,9 @@ fn reserveInferenceAdmissionResources(
     const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
     const slices = inferenceAdmissionSliceAmounts(amounts) catch
         return error.ResourceLimitExceeded;
-    manager.reserveBatch(&slices) catch |err| switch (err) {
-        error.ResourceBudgetExceeded => return error.ResourceLimitExceeded,
+    manager.reserveBatchClassified(&slices) catch |err| switch (err) {
+        error.ResourceRequestTooLarge => return error.ResourceLimitExceeded,
+        error.ResourceTemporarilyUnavailable => return error.ResourceTemporarilyUnavailable,
         // Duplicate slices are impossible in the fixed bridge plan.
         error.DuplicateResourceSlice => unreachable,
     };
@@ -1853,6 +1854,12 @@ test "inference admission bridge charges combined native residency to resource m
     try std.testing.expectEqual(
         @as(u64, 90),
         manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        budget.try_reserve(budget.context, .{
+            .host_weight_bytes = 11,
+        }),
     );
     budget.release(budget.context, admitted);
     try std.testing.expectEqual(

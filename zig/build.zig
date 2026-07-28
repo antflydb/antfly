@@ -5501,6 +5501,7 @@ pub fn build(b: *std.Build) void {
     const resource_budget_runtime_filters = [_][]const u8{
         "default tokenizer cache budget is aligned with its resource slice",
         "batch reservation is atomic across inference resource slices",
+        "classified batch reservation distinguishes size from contention",
         "resource manager observes over-budget external usage",
         "resource manager evaluates projected admission with configured action",
         "resource manager bounds soft write throttling without waiting for compaction publication",

@@ -423,6 +423,75 @@ fn validateShardPath(path: []const u8) !void {
     }
 }
 
+pub const ArtifactDependencies = struct {
+    allocator: std.mem.Allocator,
+    paths: [][]u8,
+
+    pub fn deinit(self: *ArtifactDependencies) void {
+        for (self.paths) |path| self.allocator.free(path);
+        self.allocator.free(self.paths);
+        self.* = undefined;
+    }
+};
+
+/// Return every filesystem object that determines the selected SafeTensors
+/// artifact set. Callers use this to invalidate compatibility/admission plans
+/// when a shard changes without rewriting the index.
+pub fn inspectArtifactDependencies(
+    allocator: std.mem.Allocator,
+    single_path: ?[]const u8,
+    index_path: ?[]const u8,
+) !ArtifactDependencies {
+    var paths = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+
+    if (single_path) |path| {
+        const owned_path = try allocator.dupe(u8, path);
+        paths.append(allocator, owned_path) catch |err| {
+            allocator.free(owned_path);
+            return err;
+        };
+        return .{
+            .allocator = allocator,
+            .paths = try paths.toOwnedSlice(allocator),
+        };
+    }
+
+    const path = index_path orelse return error.NoSafetensorsArtifact;
+    const owned_index_path = try allocator.dupe(u8, path);
+    paths.append(allocator, owned_index_path) catch |err| {
+        allocator.free(owned_index_path);
+        return err;
+    };
+    const index_bytes = try c_file.readFileMax(allocator, path, max_header_size);
+    defer allocator.free(index_bytes);
+    var index = try ShardedIndex.load(allocator, index_bytes);
+    defer index.deinit();
+    if (index.weight_map.count() == 0) return error.EmptyWeightMap;
+
+    const model_dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    var seen_shards = std.StringHashMapUnmanaged(void).empty;
+    defer seen_shards.deinit(allocator);
+    var index_it = index.weight_map.iterator();
+    while (index_it.next()) |entry| {
+        const shard_name = entry.value_ptr.*;
+        try validateShardPath(shard_name);
+        if (seen_shards.contains(shard_name)) continue;
+        try seen_shards.put(allocator, shard_name, {});
+        const shard_path = try std.fs.path.join(allocator, &.{ model_dir, shard_name });
+        errdefer allocator.free(shard_path);
+        try paths.append(allocator, shard_path);
+    }
+
+    return .{
+        .allocator = allocator,
+        .paths = try paths.toOwnedSlice(allocator),
+    };
+}
+
 /// Validate the exact safetensors route selected by the runtime. A standalone
 /// file takes precedence over an index, matching TensorStore.openFromManifest.
 /// For sharded models every unique shard is opened once, its header is checked,
@@ -605,6 +674,15 @@ test "artifact validation checks shard headers and index membership" {
     );
     defer allocator.free(index_path);
     try validateArtifactSet(allocator, null, index_path);
+    var dependencies = try inspectArtifactDependencies(allocator, null, index_path);
+    defer dependencies.deinit();
+    try std.testing.expectEqual(@as(usize, 2), dependencies.paths.len);
+    try std.testing.expectEqualStrings(index_path, dependencies.paths[0]);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        dependencies.paths[1],
+        "model-00001-of-00001.safetensors",
+    ));
 
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "model.safetensors.index.json",

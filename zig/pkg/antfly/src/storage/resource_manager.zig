@@ -787,11 +787,23 @@ pub const ResourceManager = struct {
         };
     }
 
-    /// Atomically reserve several independent slices. Callers must provide at
-    /// most one entry per slice. This is used when one operation spans multiple
-    /// resource classes and partial admission would create a race or require
-    /// externally visible rollback.
-    pub fn reserveBatch(self: *ResourceManager, amounts: []const SliceAmount) !void {
+    pub const ClassifiedBatchReserveError = error{
+        DuplicateResourceSlice,
+        ResourceRequestTooLarge,
+        ResourceTemporarilyUnavailable,
+    };
+
+    /// Atomically reserve several independent slices while distinguishing a
+    /// request that can never fit from temporary contention with reservations
+    /// already held by other work.
+    ///
+    /// The intrinsic-size pass deliberately precedes the contention pass so a
+    /// multi-slice request has a stable classification independent of slice
+    /// order. Both passes and the commit occur under one lock.
+    pub fn reserveBatchClassified(
+        self: *ResourceManager,
+        amounts: []const SliceAmount,
+    ) ClassifiedBatchReserveError!void {
         for (amounts, 0..) |amount, index| {
             if (amount.bytes == 0) continue;
             for (amounts[0..index]) |previous| {
@@ -806,13 +818,23 @@ pub const ResourceManager = struct {
         for (amounts) |amount| {
             if (amount.bytes == 0) continue;
             const state = &self.slices[sliceIndex(amount.slice)];
+            const hard_limit = state.budget.hard_limit_bytes;
+            if (hard_limit > 0 and amount.bytes > hard_limit) {
+                state.hard_limit_rejections +|= 1;
+                return error.ResourceRequestTooLarge;
+            }
+        }
+
+        for (amounts) |amount| {
+            if (amount.bytes == 0) continue;
+            const state = &self.slices[sliceIndex(amount.slice)];
             const next = std.math.add(u64, state.used_bytes, amount.bytes) catch {
                 state.hard_limit_rejections +|= 1;
-                return error.ResourceBudgetExceeded;
+                return error.ResourceTemporarilyUnavailable;
             };
             if (state.budget.hard_limit_bytes > 0 and next > state.budget.hard_limit_bytes) {
                 state.hard_limit_rejections +|= 1;
-                return error.ResourceBudgetExceeded;
+                return error.ResourceTemporarilyUnavailable;
             }
         }
 
@@ -825,6 +847,17 @@ pub const ResourceManager = struct {
                 state.soft_limit_events +|= 1;
         }
         self.pressure_change.advance();
+    }
+
+    /// Compatibility wrapper for callers that do not need denial
+    /// classification.
+    pub fn reserveBatch(self: *ResourceManager, amounts: []const SliceAmount) !void {
+        return self.reserveBatchClassified(amounts) catch |err| switch (err) {
+            error.DuplicateResourceSlice => error.DuplicateResourceSlice,
+            error.ResourceRequestTooLarge,
+            error.ResourceTemporarilyUnavailable,
+            => error.ResourceBudgetExceeded,
+        };
     }
 
     pub fn releaseBatch(self: *ResourceManager, amounts: []const SliceAmount) void {
@@ -1622,6 +1655,41 @@ test "batch reservation is atomic across inference resource slices" {
         @as(u64, 0),
         manager.sliceStats(.inference_model_residency).used_bytes,
     );
+}
+
+test "classified batch reservation distinguishes size from contention" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.inference_model_residency)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+
+    try std.testing.expectError(
+        error.ResourceRequestTooLarge,
+        manager.reserveBatchClassified(&.{
+            .{ .slice = .inference_model_residency, .bytes = 101 },
+        }),
+    );
+
+    const admitted = [_]SliceAmount{
+        .{ .slice = .inference_model_residency, .bytes = 80 },
+    };
+    try manager.reserveBatchClassified(&admitted);
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        manager.reserveBatchClassified(&.{
+            .{ .slice = .inference_model_residency, .bytes = 21 },
+        }),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 80),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+
+    manager.releaseBatch(&admitted);
+    const after_release = [_]SliceAmount{
+        .{ .slice = .inference_model_residency, .bytes = 21 },
+    };
+    try manager.reserveBatchClassified(&after_release);
+    manager.releaseBatch(&after_release);
 }
 
 test "resource manager coordinates growable capacity by physical domain" {

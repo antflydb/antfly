@@ -100,8 +100,11 @@ the same compatibility and resource-fit checks as every other artifact.
 | Llama 3.x | `unsloth/Llama-3.2-1B-Instruct-GGUF` |
 | Qwen3 (dense) | `unsloth/Qwen3-1.7B-GGUF` |
 
-Text only. Multimodal projector sidecars (`mmproj-*.gguf`) are not used by the generation
-path; a bundle containing one still runs as a text model.
+Text generation works with the decoder artifacts listed above. Multimodal generation is
+also available when the bundle contains a compatible Antfly Gemma 3 projector or supported
+Gemma 4 CLIP projector: Gemma 3 accepts images, while Gemma 4 projector metadata can enable
+images, audio, or both. The projector is opened only when a request contains media, so the
+same bundle continues to serve text-only requests without projector execution.
 
 ## Known incompatible artifacts and families
 
