@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "decision": "no_go",
+  "recorded_at": "2026-07-27",
+  "host": {
+    "architecture": "arm64",
+    "optimize": "ReleaseFast"
+  },
+  "dataset": {
+    "base_fixture": "hdc-wands-bge-small-2026-07-26.json",
+    "association_format": "AFHDCAS1",
+    "association_fixture_sha256": "7e5c9999e909075697981e19c5e38e2da96eedc5d91f920005025749f5f15bf5",
+    "products": 42994,
+    "queries": 480,
+    "queries_with_explicit_attributes": 116,
+    "validation_queries": 23,
+    "holdout_queries": 93,
+    "query_associations": 132,
+    "product_associations": 61883,
+    "fields": [
+      "color",
+      "material",
+      "style",
+      "shape",
+      "finish",
+      "pattern",
+      "size"
+    ]
+  },
+  "protocol": {
+    "query_selection": "published query contains at least one token-bounded catalog attribute with support from at least 100 products",
+    "structural_evidence": "published query_class plus every extracted explicit attribute",
+    "labels": "original WANDS human relevance judgments; association extraction does not use labels",
+    "graph_answer": "stored category hierarchy",
+    "validation": "query_id % 5 == 0",
+    "selection_metric": "validation_ndcg10",
+    "selected_fusion_weight": 0.075,
+    "selected_hdc_dimensions": 8000,
+    "selected_hdc_coordinate_seed": 29,
+    "selected_hdc_semantic_weight": 3,
+    "ann_seed": 13,
+    "candidate_budgets": [
+      50,
+      100,
+      200
+    ]
+  },
+  "validation": {
+    "embedding_structured_fusion_ndcg10": 0.6931,
+    "hdc_dimension_ndcg10_at_weight_3_seed_29": {
+      "4000": 0.6694,
+      "8000": 0.6786,
+      "10000": 0.6668
+    },
+    "hdc_seed_ndcg10_at_8000_dimensions_weight_3": {
+      "13": 0.6739,
+      "29": 0.6786,
+      "47": 0.6742
+    },
+    "selected_hdc": {
+      "ndcg10": 0.6786,
+      "mrr10": 0.858,
+      "recall10": 0.0467,
+      "top1_relevant": 0.8261,
+      "graph_answer_top1": 0.9565
+    }
+  },
+  "exact_holdout": {
+    "embedding_structured_fusion": {
+      "ndcg10": 0.757,
+      "mrr10": 0.9427,
+      "recall10": 0.0521,
+      "top1_relevant": 0.9247,
+      "graph_answer_top1": 0.9677,
+      "score_ms_per_query": 1.1188
+    },
+    "complete_hdc_structured": {
+      "ndcg10": 0.7593,
+      "mrr10": 0.9435,
+      "recall10": 0.0532,
+      "top1_relevant": 0.914,
+      "graph_answer_top1": 0.9785,
+      "score_ms_per_query": 18.9354,
+      "projection_ms_per_query": 0.8465
+    }
+  },
+  "index": {
+    "embedding_rabitq": {
+      "bytes": 2753152,
+      "build_ms": 13.21
+    },
+    "complete_hdc_rabitq": {
+      "authoritative_bytes": 1375808000,
+      "bytes": 43713904,
+      "build_ms": 343.524
+    },
+    "complete_hdc_packed_bipolar": {
+      "authoritative_bytes": 1375808000,
+      "bytes": 42994000,
+      "build_ms": 1159.155
+    }
+  },
+  "holdout_50_candidates": {
+    "embedding_fusion_during_candidate_scoring": {
+      "ndcg10": 0.7563,
+      "mrr10": 0.9427,
+      "recall10": 0.052,
+      "top1_relevant": 0.9247,
+      "graph_answer_top1": 0.9677,
+      "exact_top10_recall": 0.9903,
+      "approximate_ms_per_query": 3.5929,
+      "rerank_ms_per_query": 0.0075
+    },
+    "embedding_candidates_then_structured_rerank": {
+      "ndcg10": 0.7472,
+      "mrr10": 0.9394,
+      "recall10": 0.0505,
+      "top1_relevant": 0.914,
+      "graph_answer_top1": 0.9677,
+      "exact_top10_recall": 0.7763,
+      "approximate_ms_per_query": 3.2026,
+      "rerank_ms_per_query": 0.0071
+    },
+    "complete_hdc_rabitq_then_exact_rerank": {
+      "ndcg10": 0.7593,
+      "mrr10": 0.9435,
+      "recall10": 0.0532,
+      "top1_relevant": 0.914,
+      "graph_answer_top1": 0.9785,
+      "exact_top10_recall": 1,
+      "approximate_ms_per_query": 6.5377,
+      "rerank_ms_per_query": 0.0435,
+      "ndcg10_delta_vs_candidate_fusion": 0.003059,
+      "ndcg10_ci95_vs_candidate_fusion": [
+        -0.016155,
+        0.024012
+      ],
+      "graph_answer_delta_vs_candidate_fusion": 0.010753,
+      "graph_answer_ci95_vs_candidate_fusion": [
+        0,
+        0.032258
+      ],
+      "significant_advantage": false
+    },
+    "complete_hdc_packed_bipolar_then_exact_rerank": {
+      "ndcg10": 0.7526,
+      "mrr10": 0.9439,
+      "recall10": 0.0527,
+      "top1_relevant": 0.914,
+      "graph_answer_top1": 0.9785,
+      "exact_top10_recall": 0.9269,
+      "approximate_ms_per_query": 4.5423,
+      "rerank_ms_per_query": 0.0438,
+      "ndcg10_delta_vs_candidate_fusion": -0.003619,
+      "ndcg10_ci95_vs_candidate_fusion": [
+        -0.022692,
+        0.015891
+      ],
+      "graph_answer_delta_vs_candidate_fusion": 0.010753,
+      "graph_answer_ci95_vs_candidate_fusion": [
+        0,
+        0.032258
+      ],
+      "significant_advantage": false
+    }
+  },
+  "limitations": [
+    "The compositional slice contains 116 queries, including 93 holdout queries; only 13 queries state more than one extracted attribute in addition to query_class.",
+    "Attribute extraction requires a literal token-bounded catalog value and does not evaluate inferred, contradictory, or missing structured evidence.",
+    "The product structural bundle is favorably restricted to attribute values stated by at least one published query.",
+    "Unjudged query-product pairs are treated as irrelevant.",
+    "The ANN measurement is a full-corpus scan rather than HBC tree topology.",
+    "Graph-answer quality uses stored category hierarchy and does not time distributed traversal."
+  ],
+  "conclusion": "Complete HDC shows a small positive NDCG and graph-answer signal on the real compositional slice, but paired 95% bootstrap intervals do not establish an advantage over fusion during candidate scoring. HDC remains about 16x larger and 1.8x slower for candidate scoring; packed bipolar is smaller/faster than HDC RaBitQ but loses the NDCG signal. The evidence does not meet the production graduation rule."
+}

@@ -19,6 +19,7 @@ components:
       enum:
         - full_text
         - embeddings
+        - hypervector
         - graph
         - algebraic
       description: "The type of the index."
@@ -28,6 +29,7 @@ components:
       oneOf:
         - $ref: "#/components/schemas/FullTextIndexConfig"
         - $ref: "#/components/schemas/EmbeddingsIndexConfig"
+        - $ref: "#/components/schemas/HypervectorIndexConfig"
         - $ref: "#/components/schemas/GraphIndexConfig"
         - $ref: "#/components/schemas/AlgebraicIndexConfig"
       required:
@@ -414,7 +416,7 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           minimum: 1
-          description: "Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes."
+          description: "Stored vector dimension for dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes."
         field:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -470,6 +472,106 @@ components:
         execution:
           $ref: "#/components/schemas/IndexExecutionConfig"
           description: "Non-semantic execution policy for shorthand-created chunking or embedding producers."
+    HypervectorIndexConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Logical hypervector index. Antfly deterministically combines a projected
+        semantic embedding with typed structural associations, then lowers the
+        result to the existing dense-vector storage, HBC/RaBitQ, coverage, and
+        rebuild machinery. This does not create a graph index.
+      required:
+        - dimensions
+        - semantic
+      properties:
+        dimensions:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          maximum: 65536
+          default: 10000
+          description: "Stored hypervector dimensions. This never means provider embedding dimensions."
+        encoding:
+          $ref: "#/components/schemas/HypervectorEncodingConfig"
+        semantic:
+          $ref: "#/components/schemas/HypervectorSemanticConfig"
+        structural:
+          $ref: "#/components/schemas/HypervectorStructuralConfig"
+        coverage_policy:
+          $ref: "#/components/schemas/DerivedCoveragePolicy"
+        mem_only:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether to use in-memory-only dense-vector storage."
+        execution:
+          $ref: "#/components/schemas/IndexExecutionConfig"
+          description: "Non-semantic execution policy for managed hypervector enrichment."
+    HypervectorEncodingConfig:
+      type: object
+      additionalProperties: false
+      description: "Deterministic hypervector encoding configuration."
+      properties:
+        type:
+          type: string
+          enum:
+            - map
+          default: map
+          description: "Encoding algorithm. MAP is the only supported algorithm."
+        seed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          default: 13
+          description: "Seed for deterministic typed structural symbols."
+        projection_seed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Seed for deterministic semantic projection. Defaults to seed."
+    HypervectorSemanticConfig:
+      type: object
+      additionalProperties: false
+      description: "Semantic channel projected into the hypervector coordinate system."
+      required:
+        - field
+        - embedder
+        - model_digest
+      properties:
+        field:
+          type: string
+          minLength: 1
+          description: "Document field embedded for both document and natural-language query encoding."
+        weight:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: float
+          minimum: 0
+          exclusiveMinimum: true
+          default: 8
+          description: "Positive contribution of the semantic channel. Zero is rejected so text queries cannot produce useless vectors."
+        model_digest:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: "Immutable provider model revision or content digest included in the persisted encoder identity. Mutable aliases must be resolved before index creation."
+        embedder:
+          description: "Managed embedding provider configuration. Its dimension is the provider embedding dimension, distinct from the stored hypervector dimensions."
+          $ref: "embeddings.yaml#/components/schemas/EmbedderConfig"
+    HypervectorStructuralConfig:
+      type: object
+      additionalProperties: false
+      description: "Typed document paths that can participate in document and structured-query composition."
+      properties:
+        paths:
+          type: array
+          maxItems: 256
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 1024
+          default: []
+          description: "Dot-separated document paths bound into the vector. Paths are canonicalized in sorted order; arrays are encoded as order-independent multisets."
     DerivedCoveragePolicy:
       type: string
       enum:
@@ -1132,13 +1234,22 @@ components:
         - failover
       default: rrf
       description: |
-        Merge strategy for combining results from the semantic_search and full_text_search.
-        rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
-        rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
+        Merge strategy for combining named lexical, semantic, structured, and
+        graph result sources.
+        rrf: Reciprocal Rank Fusion - combines ranked sources using reciprocal
+          rank; exact binary structured sources contribute their full weight.
+        rsf: Relative Score Fusion - min/max calibrates ranked scores within the
+          candidate window and combines weighted scores; exact binary
+          structured sources contribute either their full weight or zero.
         failover: Use full_text_search if embedding generation fails
     MergeConfig:
       type: object
-      description: Configuration for result fusion when combining multiple search indexes.
+      description: |
+        Configuration for bounded, explainable fusion of named query sources.
+        `window_size` controls the candidate budget for each ranked source;
+        `limit` is the final result count unless a reranker is configured, in
+        which case `limit` is the fused candidate pool and `reranker.top_n` is
+        the final result count.
       properties:
         strategy:
           $ref: "#/components/schemas/MergeStrategy"
@@ -1148,17 +1259,24 @@ components:
             type: number
             format: double
           description: |
-            Named weights keyed by index name. `full_text` for the full-text search index;
-            embedding index names for vector indexes.
-            Unspecified indexes default to 1.0. Applied in both RRF and RSF.
+            Non-negative weights keyed by source name: `full_text` for the
+            default lexical source, an index name for a dense or sparse source,
+            a `with` binding name for exact candidate-level structured
+            membership, or a `graph_searches` name for an exact graph-derived
+            ranked result set. Unspecified sources default to 1.0. Unknown or
+            duplicate names and configurations with no positive effective
+            source weight fail closed. Applied in both RRF and RSF.
           example:
             full_text: 0.3
             title_embedding: 1.0
+            preferred_region: 0.2
         window_size:
           x-go-type-skip-optional-pointer: true
           type: integer
           minimum: 1
-          description: RSF normalization window size. Defaults to `limit`.
+          description: |
+            Per-ranked-source candidate and RSF calibration window. Defaults to
+            `limit`. This is independent from the final result count.
         rank_constant:
           x-go-type-skip-optional-pointer: true
           type: number

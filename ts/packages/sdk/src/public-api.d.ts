@@ -2685,6 +2685,7 @@ export interface components {
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
             secret_store?: components["schemas"]["SecretStoreStatus"];
+            runtime_config?: components["schemas"]["RuntimeConfigStatus"];
             storage?: components["schemas"]["StorageRuntimeStatus"];
         } & {
             [key: string]: unknown;
@@ -2701,6 +2702,7 @@ export interface components {
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
             secret_store?: components["schemas"]["SecretStoreStatus"];
+            runtime_config?: components["schemas"]["RuntimeConfigStatus"];
             storage?: components["schemas"]["StorageRuntimeStatus"];
             data: components["schemas"]["ClusterDataStatus"];
         } & {
@@ -3617,8 +3619,41 @@ export interface components {
         };
         /** @description Non-secret status for the local secrets file store, when one is available. */
         SecretStoreStatus: {
+            /**
+             * Format: uint64
+             * @description Generation of the currently published secret-store snapshot.
+             */
+            generation?: number;
+            /** @description Whether this store can expose one exact opaque source-generation acknowledgement. This remains true when a single loaded file predates the generation field, and is false for layered stores whose served snapshot has multiple publication sources. */
+            supports_source_generation?: boolean;
+            /** @description Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values. */
+            source_generation?: string | null;
+            /** @description Whether the latest observed replacement failed to load. */
+            last_reload_failed?: boolean;
             /** @description Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh. */
             stale?: boolean;
+            /** Format: uint64 */
+            reload_successes?: number;
+            /** Format: uint64 */
+            reload_failures?: number;
+        };
+        /** @description Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only changes; startup-only changes remain stale until restart. */
+        RuntimeConfigStatus: {
+            /**
+             * Format: uint64
+             * @description Generation of the fully validated and atomically published configuration.
+             */
+            generation?: number;
+            /** @description Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters match the operator config-hash annotation. */
+            hash?: string;
+            /** @description Whether the latest observed replacement failed loading, semantic validation, or requires restart because startup-only fields changed. */
+            last_reload_failed?: boolean;
+            /** @description Whether requests are using the last-known-good snapshot after a failed reload. */
+            stale?: boolean;
+            /** Format: uint64 */
+            reload_successes?: number;
+            /** Format: uint64 */
+            reload_failures?: number;
         };
         /**
          * @description Source of the secret configuration
@@ -5818,6 +5853,31 @@ export interface components {
              */
             semantic_search?: string;
             /**
+             * @description Optional structured associations for logical hypervector indexes,
+             *     keyed by index name. Each inner key must exactly match a configured
+             *     `structural.paths` entry. Values use the same typed canonicalization
+             *     as indexed documents.
+             *
+             *     The natural-language channel still comes from `semantic_search`.
+             *     Antfly composes the projected semantic query and these structural
+             *     associations in the index's persisted coordinate system. Supplying
+             *     an entry for an ordinary embeddings index is rejected.
+             * @example {
+             *       "locations": {
+             *         "region": "us-west",
+             *         "features": [
+             *           "coastal",
+             *           "transit"
+             *         ]
+             *       }
+             *     }
+             */
+            hypervector_queries?: {
+                [key: string]: {
+                    [key: string]: unknown;
+                };
+            };
+            /**
              * @description Optional Handlebars template for multimodal embedding of the semantic_search query.
              *     The template has access to `this` which contains the semantic_search string value.
              *
@@ -5965,7 +6025,10 @@ export interface components {
              */
             fields?: string[];
             /**
-             * @description Maximum number of results to return. For semantic_search, this is the topk parameter.
+             * @description Maximum number of results to return. For semantic_search, this is
+             *     the top-k candidate count. When a reranker is configured, all
+             *     `limit` candidates are scored by the reranker and
+             *     `reranker.top_n`, when set, becomes the final result count.
              *     Default varies by query type (typically 10).
              * @example 20
              */
@@ -6058,10 +6121,24 @@ export interface components {
              */
             distance_over?: number;
             /**
-             * @description Configuration for merging full-text and semantic search results.
-             *     Only applies when both `full_text_search` and `semantic_search` are specified.
+             * @description Configuration for merging named lexical, dense, sparse, structured,
+             *     and graph-derived result sources.
              */
             merge_config?: components["schemas"]["MergeConfig"];
+            /**
+             * @description Named exact structured filter bindings. Referencing a binding from
+             *     the boolean query applies it as a hard predicate. Giving its name a
+             *     positive `merge_config.weights` entry also evaluates it as a binary
+             *     soft signal over the bounded lexical/semantic candidate union: an
+             *     exact match contributes the configured weight and a non-match
+             *     contributes zero. A weighted binding does not generate candidates
+             *     by itself.
+             */
+            with?: {
+                [key: string]: {
+                    [key: string]: unknown;
+                };
+            };
             /**
              * @description If true, returns only the total count of matching documents without retrieving the actual documents.
              *     Useful for pagination and displaying result counts. Count-only requests
@@ -6079,6 +6156,16 @@ export interface components {
              */
             profile?: boolean;
             /**
+             * @description If true, each hybrid hit includes `_score_explanation` with the raw
+             *     source score, source rank, calibrated score, configured weight, and
+             *     additive contribution used to produce the fused score. Explanation
+             *     data is deterministic but adds response bytes; omit it on latency-
+             *     sensitive production traffic unless the trace is needed.
+             * @default false
+             * @example false
+             */
+            explain?: boolean;
+            /**
              * @description Optional reranker configuration to improve result relevance.
              *
              *     Rerankers use cross-encoder models that score query-document pairs directly,
@@ -6089,7 +6176,8 @@ export interface components {
              *     - You have semantic or hybrid search results to refine
              *     - Latency trade-off is acceptable (reranking adds 100-500ms typically)
              *
-             *     **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size.
+             *     **Best practice:** Set `limit` to a 50-100 candidate pool and
+             *     `reranker.top_n` to the final result count.
              *
              *     Example:
              *     ```json
@@ -6686,8 +6774,16 @@ export interface components {
              * @description Relevance score of the hit.
              */
             _score: number;
-            /** @description Scores partitioned by index when using RRF search. */
+            /** @description Backwards-compatible raw scores partitioned by source when using hybrid search. */
             _index_scores?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description Present when `explain: true` for a fused hit. Contains the final and
+             *     pre-rerank fusion scores plus per-source rank, raw score, calibrated
+             *     score, weight, and contribution.
+             */
+            _score_explanation?: {
                 [key: string]: unknown;
             };
             _source?: {
@@ -8485,7 +8581,7 @@ export interface components {
              * @default false
              */
             sparse?: boolean;
-            /** @description Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
+            /** @description Stored vector dimension for dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
             dimension?: number;
             /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
             field?: string;
@@ -8524,6 +8620,65 @@ export interface components {
              */
             chunk_size?: number;
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
+            execution?: components["schemas"]["IndexExecutionConfig"];
+        };
+        /** @description Deterministic hypervector encoding configuration. */
+        HypervectorEncodingConfig: {
+            /**
+             * @description Encoding algorithm. MAP is the only supported algorithm.
+             * @default map
+             * @enum {string}
+             */
+            type?: "map";
+            /**
+             * Format: uint64
+             * @description Seed for deterministic typed structural symbols.
+             * @default 13
+             */
+            seed?: number;
+            /**
+             * Format: uint64
+             * @description Seed for deterministic semantic projection. Defaults to seed.
+             */
+            projection_seed?: number;
+        };
+        /** @description Semantic channel projected into the hypervector coordinate system. */
+        HypervectorSemanticConfig: {
+            /** @description Document field embedded for both document and natural-language query encoding. */
+            field: string;
+            /**
+             * Format: float
+             * @description Positive contribution of the semantic channel. Zero is rejected so text queries cannot produce useless vectors.
+             * @default 8
+             */
+            weight?: number;
+            /** @description Immutable provider model revision or content digest included in the persisted encoder identity. Mutable aliases must be resolved before index creation. */
+            model_digest: string;
+            /** @description Managed embedding provider configuration. Its dimension is the provider embedding dimension, distinct from the stored hypervector dimensions. */
+            embedder: components["schemas"]["EmbedderConfig"];
+        };
+        /** @description Typed document paths that can participate in document and structured-query composition. */
+        HypervectorStructuralConfig: {
+            /**
+             * @description Dot-separated document paths bound into the vector. Paths are canonicalized in sorted order; arrays are encoded as order-independent multisets.
+             * @default []
+             */
+            paths?: string[];
+        };
+        /** @description Logical hypervector index. Antfly deterministically combines a projected semantic embedding with typed structural associations, then lowers the result to the existing dense-vector storage, HBC/RaBitQ, coverage, and rebuild machinery. This does not create a graph index. */
+        HypervectorIndexConfig: {
+            /**
+             * @description Stored hypervector dimensions. This never means provider embedding dimensions.
+             * @default 10000
+             */
+            dimensions: number;
+            encoding?: components["schemas"]["HypervectorEncodingConfig"];
+            semantic: components["schemas"]["HypervectorSemanticConfig"];
+            structural?: components["schemas"]["HypervectorStructuralConfig"];
+            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
+            /** @description Whether to use in-memory-only dense-vector storage. */
+            mem_only?: boolean;
+            /** @description Non-semantic execution policy for managed hypervector enrichment. */
             execution?: components["schemas"]["IndexExecutionConfig"];
         };
         /** @description Configuration for a specific edge type */
@@ -8590,7 +8745,7 @@ export interface components {
          * @description The type of the index.
          * @enum {string}
          */
-        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
+        IndexType: "full_text" | "embeddings" | "hypervector" | "graph" | "algebraic";
         /** @description Configuration for an index */
         IndexConfig: {
             /** @description Name of the index */
@@ -8623,7 +8778,7 @@ export interface components {
              *     ]
              */
             enrichments?: components["schemas"]["EnrichmentConfig"][];
-        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["HypervectorIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
         /** @description Defines the structure of a document type */
         DocumentSchema: {
             /** @description A description of the document type. */
@@ -10513,30 +10668,48 @@ export interface components {
             duration_ms?: number;
         };
         /**
-         * @description Merge strategy for combining results from the semantic_search and full_text_search.
-         *     rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
-         *     rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
+         * @description Merge strategy for combining named lexical, semantic, structured, and
+         *     graph result sources.
+         *     rrf: Reciprocal Rank Fusion - combines ranked sources using reciprocal
+         *       rank; exact binary structured sources contribute their full weight.
+         *     rsf: Relative Score Fusion - min/max calibrates ranked scores within the
+         *       candidate window and combines weighted scores; exact binary
+         *       structured sources contribute either their full weight or zero.
          *     failover: Use full_text_search if embedding generation fails
          * @default rrf
          * @enum {string}
          */
         MergeStrategy: "rrf" | "rsf" | "failover";
-        /** @description Configuration for result fusion when combining multiple search indexes. */
+        /**
+         * @description Configuration for bounded, explainable fusion of named query sources.
+         *     `window_size` controls the candidate budget for each ranked source;
+         *     `limit` is the final result count unless a reranker is configured, in
+         *     which case `limit` is the fused candidate pool and `reranker.top_n` is
+         *     the final result count.
+         */
         MergeConfig: {
             strategy?: components["schemas"]["MergeStrategy"];
             /**
-             * @description Named weights keyed by index name. `full_text` for the full-text search index;
-             *     embedding index names for vector indexes.
-             *     Unspecified indexes default to 1.0. Applied in both RRF and RSF.
+             * @description Non-negative weights keyed by source name: `full_text` for the
+             *     default lexical source, an index name for a dense or sparse source,
+             *     a `with` binding name for exact candidate-level structured
+             *     membership, or a `graph_searches` name for an exact graph-derived
+             *     ranked result set. Unspecified sources default to 1.0. Unknown or
+             *     duplicate names and configurations with no positive effective
+             *     source weight fail closed. Applied in both RRF and RSF.
              * @example {
              *       "full_text": 0.3,
-             *       "title_embedding": 1
+             *       "title_embedding": 1,
+             *       "preferred_region": 0.2
              *     }
              */
             weights?: {
                 [key: string]: number;
             };
-            /** @description RSF normalization window size. Defaults to `limit`. */
+            /**
+             * @description Per-ranked-source candidate and RSF calibration window. Defaults to
+             *     `limit`. This is independent from the final result count.
+             */
             window_size?: number;
             /**
              * Format: double

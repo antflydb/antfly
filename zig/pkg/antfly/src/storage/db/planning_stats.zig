@@ -730,11 +730,10 @@ fn computePreflightShardResultWindow(req: types.SearchRequest) u32 {
 }
 
 fn computePreflightRerankDocUpperBound(req: types.SearchRequest) u32 {
-    const cfg = req.reranker orelse return 0;
-    return if (cfg.top_n) |top_n|
-        @min(req.limit, top_n)
-    else
-        req.limit;
+    if (req.reranker == null) return 0;
+    // Every retrieved candidate competes. `top_n` is only the final output
+    // cutoff, so it must not reduce the estimated reranker work.
+    return req.limit +| req.offset;
 }
 
 test {

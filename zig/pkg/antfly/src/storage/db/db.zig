@@ -118,6 +118,7 @@ const paths_mod = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
 const mapper = @import("document_mapper.zig");
+const hdc = @import("../../hdc.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
 const planning_stats_mod = @import("planning_stats.zig");
@@ -17697,6 +17698,7 @@ pub const DB = struct {
             .fuse_named_sets = fuseNamedSetsCallback,
             .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
             .attach_graph_results = attachGraphResultsCallback,
+            .apply_graph_expand_strategy = applyGraphExpandStrategyCallback,
         });
         if (result.sort_profile != null) {
             db_query_metrics.observeSortProfile(metric_name, .search, platform_time.monotonicNs() -| start_ns, result.sort_profile);
@@ -18116,7 +18118,16 @@ pub const DB = struct {
     ) anyerror!void {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         base.graph_results = try self.executeGraphQueriesWithSets(alloc, req, req.graph_queries, named_sets);
-        try self.applyGraphExpandStrategy(alloc, base, req.expand_strategy);
+    }
+
+    fn applyGraphExpandStrategyCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        base: *types.SearchResult,
+        strategy: ?graph_query_mod.ExpandStrategy,
+    ) anyerror!void {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        try self.applyGraphExpandStrategy(alloc, base, strategy);
     }
 
     fn hbcSearchCallback(
@@ -18453,6 +18464,7 @@ pub const DB = struct {
         const algebraic_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
+        try self.validateDenseCoordinateFingerprint(algebraic_filter.req.index_name, dense);
         if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
         const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
@@ -18506,6 +18518,7 @@ pub const DB = struct {
     fn searchDenseProfiledAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
+        try self.validateDenseCoordinateFingerprint(algebraic_filter.req.index_name, dense);
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
         const profiled = db_query_search.searchDenseProfiled(alloc, algebraic_filter.req, dense, .{
             .ctx = self,
@@ -18551,6 +18564,22 @@ pub const DB = struct {
             }
             return err;
         };
+    }
+
+    fn validateDenseCoordinateFingerprint(
+        self: *DB,
+        index_name: ?[]const u8,
+        dense: types.DenseKnnQuery,
+    ) !void {
+        const entry = self.core.index_manager.denseIndex(index_name) orelse return error.IndexNotFound;
+        const expected = try index_manager_mod.denseConfigCoordinateFingerprint(self.alloc, entry.config);
+        if (expected == null and dense.coordinate_fingerprint == null) return;
+        if (expected == null or dense.coordinate_fingerprint == null) {
+            return error.HypervectorCoordinateSystemMismatch;
+        }
+        if (!std.mem.eql(u8, &expected.?, &dense.coordinate_fingerprint.?)) {
+            return error.HypervectorCoordinateSystemMismatch;
+        }
     }
 
     fn searchSparse(self: *DB, alloc: Allocator, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
@@ -50328,7 +50357,7 @@ test "db preflightSearchRequest validates live lane bindings" {
     try std.testing.expectEqual(@as(u32, 8), cost_summary.shard_result_window);
     try std.testing.expectEqual(@as(u64, 8), cost_summary.shard_result_window_total);
     try std.testing.expectEqual(@as(u64, 8), cost_summary.stored_projection_doc_upper_bound_total);
-    try std.testing.expectEqual(@as(u32, 4), cost_summary.rerank_doc_upper_bound);
+    try std.testing.expectEqual(@as(u32, 8), cost_summary.rerank_doc_upper_bound);
     try std.testing.expect(cost_summary.aggregation_may_scan_full_results);
     try std.testing.expectEqual(@as(?u32, null), cost_summary.positive_id_result_upper_bound);
     try std.testing.expectEqual(@as(?u32, null), cost_summary.result_doc_estimate);
@@ -50336,7 +50365,7 @@ test "db preflightSearchRequest validates live lane bindings" {
     try std.testing.expectEqual(@as(?u64, null), cost_summary.effective_stored_projection_doc_estimate_total);
     try std.testing.expectEqual(@as(u64, 8), cost_summary.effective_stored_projection_doc_upper_bound_total);
     try std.testing.expectEqual(@as(?u32, null), cost_summary.effective_rerank_doc_estimate);
-    try std.testing.expectEqual(@as(u32, 4), cost_summary.effective_rerank_doc_upper_bound);
+    try std.testing.expectEqual(@as(u32, 8), cost_summary.effective_rerank_doc_upper_bound);
     try std.testing.expectEqual(@as(?u32, null), cost_summary.aggregation_second_pass_doc_estimate);
     try std.testing.expectEqual(@as(?u32, null), cost_summary.aggregation_second_pass_doc_upper_bound);
 
@@ -50932,6 +50961,227 @@ test "db asset enrichment full_text_index feeds default full text index after fu
     defer after_delete.deinit();
 
     try std.testing.expectEqual(@as(u32, 0), after_delete.total_hits);
+}
+
+const TestHdcProjectedDenseEmbedder = struct {
+    source: embedder_mod.DeterministicDenseEmbedder = .{},
+    source_dimensions: u32 = 3,
+    output_dimensions: u32 = 64,
+    projection_seed: u64 = 17,
+
+    fn embedDense(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        embedding_name: []const u8,
+        text: []const u8,
+        dims: u32,
+    ) ![]f32 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (dims != self.output_dimensions) return error.InvalidEmbeddingDimensions;
+        const source = try embedder_mod.DeterministicDenseEmbedder.embedDense(
+            &self.source,
+            alloc,
+            embedding_name,
+            text,
+            self.source_dimensions,
+        );
+        defer alloc.free(source);
+        const out = try alloc.alloc(f32, self.output_dimensions);
+        errdefer alloc.free(out);
+        try (hdc.Projection{
+            .input_dimensions = self.source_dimensions,
+            .output_dimensions = self.output_dimensions,
+            .seed = self.projection_seed,
+        }).project(source, out);
+        return out;
+    }
+
+    fn interface(self: *@This()) embedder_mod.DenseEmbedder {
+        return .{
+            .ptr = self,
+            .dense_embed_fn = embedDense,
+        };
+    }
+};
+
+test "db HDC managed enrichment backfills and seeds exact graph traversal" {
+    const alloc = std.testing.allocator;
+    const coordinate_fingerprint = [_]u8{0x11} ** 32;
+    const config_json =
+        \\{"field":"embedding","dims":64,"metric":"cosine","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"location_hdc","hdc":{"dimensions":64,"seed":17,"projection_seed":17,"semantic_weight":4,"structural_paths":["region"],"identity_fingerprint":"1111111111111111111111111111111111111111111111111111111111111111"}},"hdc":{"dimensions":64,"seed":17,"projection_seed":17,"semantic_weight":4,"structural_paths":["region"],"identity_fingerprint":"1111111111111111111111111111111111111111111111111111111111111111"}}
+    ;
+    const first_document = "{\"body\":\"cities on the Pacific coast\",\"region\":\"west\"}";
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var projected = TestHdcProjectedDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = projected.interface(),
+        },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+
+    try db.addIndex(.{
+        .name = "travel_graph",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "location:seattle", .value = first_document },
+            .{
+                .key = "person:ada",
+                .value = "{\"name\":\"Ada\",\"_edges\":{\"travel_graph\":{\"VISITED\":[{\"target\":\"location:seattle\",\"weight\":1.0}]}}}",
+            },
+        },
+        .sync_level = .write,
+    });
+    try db.addIndex(.{
+        .name = "location_hdc",
+        .kind = .dense_vector,
+        .config_json = config_json,
+    });
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try waitForDerivedReplayTarget(&db);
+
+    const query_vector = try projected.interface().embedDense(
+        alloc,
+        "location_hdc",
+        "cities on the Pacific coast",
+        64,
+    );
+    defer alloc.free(query_vector);
+
+    const artifact_key = try internal_keys.artifactNamedPrefixAlloc(
+        alloc,
+        "location:seattle",
+        "embedding",
+        "location_hdc",
+    );
+    defer alloc.free(artifact_key);
+    const artifact = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact);
+    const stored_vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, artifact);
+    defer alloc.free(stored_vector);
+
+    var parsed_config = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"dimensions\":64,\"seed\":17,\"projection_seed\":17,\"semantic_weight\":4,\"structural_paths\":[\"region\"],\"identity_fingerprint\":\"1111111111111111111111111111111111111111111111111111111111111111\"}",
+        .{},
+    );
+    defer parsed_config.deinit();
+    var config = try hdc.UserConfig.parseValue(alloc, parsed_config.value);
+    defer config.deinit();
+    const expected_vector = try hdc.composeJsonDocument(alloc, config, first_document, query_vector);
+    defer alloc.free(expected_vector);
+    try std.testing.expectEqualSlices(f32, expected_vector, stored_vector);
+
+    try std.testing.expectError(error.HypervectorCoordinateSystemMismatch, db.search(alloc, .{
+        .index_name = "location_hdc",
+        .dense = .{ .vector = query_vector, .k = 1 },
+    }));
+    var wrong_fingerprint = coordinate_fingerprint;
+    wrong_fingerprint[0] ^= 1;
+    try std.testing.expectError(error.HypervectorCoordinateSystemMismatch, db.search(alloc, .{
+        .index_name = "location_hdc",
+        .dense = .{ .vector = query_vector, .k = 1, .coordinate_fingerprint = wrong_fingerprint },
+    }));
+
+    {
+        var result = try db.search(alloc, .{
+            .index_name = "location_hdc",
+            .dense = .{ .vector = query_vector, .k = 1, .coordinate_fingerprint = coordinate_fingerprint },
+            .graph_queries = &.{
+                .{
+                    .name = "visitors",
+                    .query = .{
+                        .query_type = .neighbors,
+                        .index_name = "travel_graph",
+                        .start_nodes = .{ .result_ref = .{ .ref = "$embeddings_results", .limit = 1 } },
+                        .params = .{ .direction = .in, .edge_types = &.{"VISITED"} },
+                    },
+                },
+            },
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqualStrings("location:seattle", result.hits[0].id);
+        try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+        try std.testing.expectEqualStrings("visitors", result.graph_results[0].name);
+        try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
+        try std.testing.expectEqualStrings("person:ada", result.graph_results[0].hits[0].id);
+    }
+
+    db.close();
+    db_open = false;
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-b",
+            .dense_embedder = projected.interface(),
+        },
+    });
+    defer reopened.close();
+
+    var reopened_result = try reopened.search(alloc, .{
+        .index_name = "location_hdc",
+        .dense = .{ .vector = query_vector, .k = 1, .coordinate_fingerprint = coordinate_fingerprint },
+        .graph_queries = &.{
+            .{
+                .name = "visitors",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "travel_graph",
+                    .start_nodes = .{ .result_ref = .{ .ref = "$embeddings_results", .limit = 1 } },
+                    .params = .{ .direction = .in, .edge_types = &.{"VISITED"} },
+                },
+            },
+        },
+    });
+    defer reopened_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), reopened_result.total_hits);
+    try std.testing.expectEqualStrings("location:seattle", reopened_result.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 1), reopened_result.graph_results.len);
+    try std.testing.expectEqual(@as(u32, 1), reopened_result.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("person:ada", reopened_result.graph_results[0].hits[0].id);
+
+    const second_document = "{\"body\":\"a rainy city beside two rivers\",\"region\":\"northwest\"}";
+    try reopened.batch(.{
+        .writes = &.{
+            .{ .key = "location:portland", .value = second_document },
+        },
+        .sync_level = .write,
+    });
+    try reopened.enrichment_runtime.?.waitForApplied(2);
+    try waitForDerivedReplayTarget(&reopened);
+
+    const second_query_vector = try projected.interface().embedDense(
+        alloc,
+        "location_hdc",
+        "a rainy city beside two rivers",
+        64,
+    );
+    defer alloc.free(second_query_vector);
+    const second_artifact_key = try internal_keys.artifactNamedPrefixAlloc(
+        alloc,
+        "location:portland",
+        "embedding",
+        "location_hdc",
+    );
+    defer alloc.free(second_artifact_key);
+    const second_artifact = try reopened.core.store.get(alloc, second_artifact_key);
+    defer alloc.free(second_artifact);
+    const second_stored_vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, second_artifact);
+    defer alloc.free(second_stored_vector);
+    const second_expected_vector = try hdc.composeJsonDocument(alloc, config, second_document, second_query_vector);
+    defer alloc.free(second_expected_vector);
+    try std.testing.expectEqualSlices(f32, second_expected_vector, second_stored_vector);
 }
 
 test "db dense index can reference existing whole-doc embedding enrichment" {

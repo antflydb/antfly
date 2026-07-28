@@ -425,7 +425,7 @@ pub const EmbeddingsIndexConfig = struct {
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
     sparse: ?bool = null,
-    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    /// Stored vector dimension for dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
@@ -975,6 +975,48 @@ pub const GraphResultNode = struct {
     edges: ?[]const Edge = null,
 };
 
+/// Deterministic hypervector encoding configuration.
+pub const HypervectorEncodingConfig = struct {
+    /// Encoding algorithm. MAP is the only supported algorithm.
+    type: ?[]const u8 = null,
+    /// Seed for deterministic typed structural symbols.
+    seed: ?i64 = null,
+    /// Seed for deterministic semantic projection. Defaults to seed.
+    projection_seed: ?i64 = null,
+};
+
+/// Logical hypervector index. Antfly deterministically combines a projected semantic embedding with typed structural associations, then lowers the result to the existing dense-vector storage, HBC/RaBitQ, coverage, and rebuild machinery. This does not create a graph index.
+pub const HypervectorIndexConfig = struct {
+    /// Stored hypervector dimensions. This never means provider embedding dimensions.
+    dimensions: i64,
+    encoding: ?HypervectorEncodingConfig = null,
+    semantic: HypervectorSemanticConfig,
+    structural: ?HypervectorStructuralConfig = null,
+    coverage_policy: ?DerivedCoveragePolicy = null,
+    /// Whether to use in-memory-only dense-vector storage.
+    mem_only: ?bool = null,
+    /// Non-semantic execution policy for managed hypervector enrichment.
+    execution: ?IndexExecutionConfig = null,
+};
+
+/// Semantic channel projected into the hypervector coordinate system.
+pub const HypervectorSemanticConfig = struct {
+    /// Document field embedded for both document and natural-language query encoding.
+    field: []const u8,
+    /// Positive contribution of the semantic channel. Zero is rejected so text queries cannot produce useless vectors.
+    weight: ?f32 = null,
+    /// Immutable provider model revision or content digest included in the persisted encoder identity. Mutable aliases must be resolved before index creation.
+    model_digest: []const u8,
+    /// Managed embedding provider configuration. Its dimension is the provider embedding dimension, distinct from the stored hypervector dimensions.
+    embedder: antfly_embeddings_openapi.EmbedderConfig,
+};
+
+/// Typed document paths that can participate in document and structured-query composition.
+pub const HypervectorStructuralConfig = struct {
+    /// Dot-separated document paths bound into the vector. Paths are canonicalized in sorted order; arrays are encoded as order-independent multisets.
+    paths: ?[]const []const u8 = null,
+};
+
 /// Configuration for an index
 pub const IndexConfig = struct {
     /// Name of the index
@@ -994,7 +1036,7 @@ pub const IndexConfig = struct {
     external: ?bool = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
     sparse: ?bool = null,
-    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    /// Stored vector dimension for dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
@@ -1019,6 +1061,11 @@ pub const IndexConfig = struct {
     chunk_size: ?i64 = null,
     /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
+    /// Stored hypervector dimensions. This never means provider embedding dimensions.
+    dimensions: ?i64 = null,
+    encoding: ?HypervectorEncodingConfig = null,
+    semantic: ?HypervectorSemanticConfig = null,
+    structural: ?HypervectorStructuralConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
@@ -1112,6 +1159,22 @@ pub const IndexConfig = struct {
             try jw.objectField("execution");
             try jw.write(value);
         }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.encoding) |value| {
+            try jw.objectField("encoding");
+            try jw.write(value);
+        }
+        if (self.semantic) |value| {
+            try jw.objectField("semantic");
+            try jw.write(value);
+        }
+        if (self.structural) |value| {
+            try jw.objectField("structural");
+            try jw.write(value);
+        }
         if (self.edge_types) |value| {
             try jw.objectField("edge_types");
             try jw.write(value);
@@ -1192,6 +1255,7 @@ pub const IndexStats = union(enum) {
 pub const IndexType = enum {
     full_text,
     embeddings,
+    hypervector,
     graph,
     algebraic,
 
@@ -1199,6 +1263,7 @@ pub const IndexType = enum {
         const s = switch (self) {
             .full_text => "full_text",
             .embeddings => "embeddings",
+            .hypervector => "hypervector",
             .graph => "graph",
             .algebraic => "algebraic",
         };
@@ -1213,6 +1278,7 @@ pub const IndexType = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "full_text", .full_text },
             .{ "embeddings", .embeddings },
+            .{ "hypervector", .hypervector },
             .{ "graph", .graph },
             .{ "algebraic", .algebraic },
         });
@@ -1220,18 +1286,18 @@ pub const IndexType = enum {
     }
 };
 
-/// Configuration for result fusion when combining multiple search indexes.
+/// Configuration for bounded, explainable fusion of named query sources. `window_size` controls the candidate budget for each ranked source; `limit` is the final result count unless a reranker is configured, in which case `limit` is the fused candidate pool and `reranker.top_n` is the final result count.
 pub const MergeConfig = struct {
     strategy: ?MergeStrategy = null,
-    /// Named weights keyed by index name. `full_text` for the full-text search index; embedding index names for vector indexes. Unspecified indexes default to 1.0. Applied in both RRF and RSF.
+    /// Non-negative weights keyed by source name: `full_text` for the default lexical source, an index name for a dense or sparse source, a `with` binding name for exact candidate-level structured membership, or a `graph_searches` name for an exact graph-derived ranked result set. Unspecified sources default to 1.0. Unknown or duplicate names and configurations with no positive effective source weight fail closed. Applied in both RRF and RSF.
     weights: ?std.json.ArrayHashMap(f64) = null,
-    /// RSF normalization window size. Defaults to `limit`.
+    /// Per-ranked-source candidate and RSF calibration window. Defaults to `limit`. This is independent from the final result count.
     window_size: ?i64 = null,
     /// RRF k constant (1/(k+rank)). Defaults to 60.0.
     rank_constant: ?f64 = null,
 };
 
-/// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores failover: Use full_text_search if embedding generation fails
+/// Merge strategy for combining named lexical, semantic, structured, and graph result sources. rrf: Reciprocal Rank Fusion - combines ranked sources using reciprocal rank; exact binary structured sources contribute their full weight. rsf: Relative Score Fusion - min/max calibrates ranked scores within the candidate window and combines weighted scores; exact binary structured sources contribute either their full weight or zero. failover: Use full_text_search if embedding generation fails
 pub const MergeStrategy = enum {
     rrf,
     rsf,

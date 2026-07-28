@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "decision": "no_go",
+  "recorded_at": "2026-07-27",
+  "host": {
+    "architecture": "arm64",
+    "optimize": "ReleaseFast"
+  },
+  "fixture": {
+    "baseline": "hdc-wands-bge-small-2026-07-26.json",
+    "products": 42994,
+    "queries_with_relevance": 479,
+    "holdout_queries_with_relevance": 383,
+    "embedding_dimensions": 384,
+    "hdc_dimensions": 10000,
+    "hdc_seed": 13,
+    "hdc_semantic_weight": 4,
+    "fusion_weight": 0.075
+  },
+  "candidate_protocol": {
+    "budgets": [
+      50,
+      100,
+      200
+    ],
+    "packed_mapping": "sign_ge_zero_le_u64_v1",
+    "packed_word_order": "low-coordinate-first",
+    "packed_candidate_score": "negative_hamming_distance",
+    "rerank": "authoritative_f32_exact_cosine",
+    "scope": "full-corpus candidate scan; not HBC tree topology"
+  },
+  "index": {
+    "complete_hdc_rabitq": {
+      "build_ms": 625.852,
+      "bytes": 54728368
+    },
+    "complete_hdc_packed_bipolar": {
+      "build_ms": 1587.63,
+      "bytes": 54000464,
+      "words_per_vector": 157
+    },
+    "embedding_rabitq": {
+      "bytes": 2753152
+    }
+  },
+  "holdout_50_candidates": {
+    "embedding_candidates_then_structured_rerank": {
+      "ndcg10": 0.7674,
+      "mrr10": 0.9299,
+      "recall10": 0.0597,
+      "top1_relevant": 0.906,
+      "graph_answer_top1": 0.9739,
+      "exact_top10_recall": 0.8825,
+      "approximate_ms_per_query": 3.3271,
+      "rerank_ms_per_query": 0.0078
+    },
+    "complete_hdc_rabitq_then_exact_rerank": {
+      "ndcg10": 0.7643,
+      "mrr10": 0.9294,
+      "recall10": 0.06,
+      "top1_relevant": 0.906,
+      "graph_answer_top1": 0.9739,
+      "exact_top10_recall": 0.9995,
+      "approximate_ms_per_query": 7.6881,
+      "rerank_ms_per_query": 0.0561
+    },
+    "complete_hdc_packed_bipolar_then_exact_rerank": {
+      "ndcg10": 0.7651,
+      "mrr10": 0.9289,
+      "recall10": 0.0598,
+      "top1_relevant": 0.906,
+      "graph_answer_top1": 0.9739,
+      "exact_top10_recall": 0.9582,
+      "approximate_ms_per_query": 5.2488,
+      "rerank_ms_per_query": 0.0552
+    }
+  },
+  "holdout_100_candidates": {
+    "embedding_candidates_then_structured_rerank": {
+      "ndcg10": 0.77,
+      "graph_answer_top1": 0.9765,
+      "exact_top10_recall": 0.9397
+    },
+    "complete_hdc_packed_bipolar_then_exact_rerank": {
+      "ndcg10": 0.7647,
+      "graph_answer_top1": 0.9739,
+      "exact_top10_recall": 0.9802
+    }
+  },
+  "paired_bootstrap_holdout": {
+    "samples": 10000,
+    "comparison": "method minus embedding candidates then structured rerank",
+    "50_candidates": {
+      "complete_hdc_rabitq": {
+        "ndcg10_mean_delta": -0.00313,
+        "ndcg10_ci95": [
+          -0.010202,
+          0.0038
+        ],
+        "graph_answer_top1_mean_delta": 0,
+        "graph_answer_top1_ci95": [
+          0,
+          0
+        ],
+        "significant_advantage": false
+      },
+      "complete_hdc_packed_bipolar": {
+        "ndcg10_mean_delta": -0.002342,
+        "ndcg10_ci95": [
+          -0.008816,
+          0.004046
+        ],
+        "graph_answer_top1_mean_delta": 0,
+        "graph_answer_top1_ci95": [
+          0,
+          0
+        ],
+        "significant_advantage": false
+      }
+    },
+    "100_candidates": {
+      "complete_hdc_rabitq": {
+        "ndcg10_mean_delta": -0.005728,
+        "ndcg10_ci95": [
+          -0.011697,
+          0.00013
+        ],
+        "graph_answer_top1_mean_delta": -0.002611,
+        "graph_answer_top1_ci95": [
+          -0.007833,
+          0
+        ],
+        "significant_advantage": false
+      },
+      "complete_hdc_packed_bipolar": {
+        "ndcg10_mean_delta": -0.005342,
+        "ndcg10_ci95": [
+          -0.010959,
+          0.00052
+        ],
+        "graph_answer_top1_mean_delta": -0.002611,
+        "graph_answer_top1_ci95": [
+          -0.007833,
+          0
+        ],
+        "significant_advantage": false
+      }
+    },
+    "200_candidates": {
+      "complete_hdc_rabitq": {
+        "ndcg10_mean_delta": -0.004716,
+        "ndcg10_ci95": [
+          -0.009929,
+          0.000313
+        ],
+        "graph_answer_top1_mean_delta": 0,
+        "graph_answer_top1_ci95": [
+          0,
+          0
+        ],
+        "significant_advantage": false
+      },
+      "complete_hdc_packed_bipolar": {
+        "ndcg10_mean_delta": -0.005057,
+        "ndcg10_ci95": [
+          -0.010199,
+          0.000175
+        ],
+        "graph_answer_top1_mean_delta": 0,
+        "graph_answer_top1_ci95": [
+          0,
+          0
+        ],
+        "significant_advantage": false
+      }
+    }
+  },
+  "limitations": [
+    "The scalar sign packer and full-corpus popcount scan are experimental benchmark implementations, not an optimized physical index.",
+    "The packed sketch does not replace the authoritative f32 vector required for exact reranking.",
+    "The external workload supplies one structured association.",
+    "Unjudged query-product pairs are treated as irrelevant.",
+    "Graph-answer quality does not time a distributed graph traversal."
+  ],
+  "conclusion": "Packed bipolar candidate selection improves complete-HDC scan latency relative to RaBitQ but is nearly the same size, lowers exact top-10 recall, and remains slower and about 20x larger than the embedding-plus-structured-rerank candidate index. Paired bootstrap intervals show no statistically significant NDCG or graph-answer advantage at 50, 100, or 200 candidates. It does not reverse the HDC no-go decision."
+}

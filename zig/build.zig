@@ -4584,6 +4584,12 @@ pub fn build(b: *std.Build) void {
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
             "provisioned local query reuses resident generation without readonly open",
             "catalog backed router skips non-serving relocation placements",
+            "encode query request carries full hypervector coordinate identity",
+            "query parser forwards structured hypervector associations by index",
+            "query parser rejects orphaned hypervector associations",
+            "internal query parser carries hypervector identity and public parser rejects it",
+            "bound table read source reranks hits after materialization",
+            "hosted cross-range graph query contributes a weighted hybrid source",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -6814,6 +6820,57 @@ pub fn build(b: *std.Build) void {
     }
     const hbc_bench_step = b.step("hbc-bench", "Benchmark HBC kmeans vs hilbert split algorithms");
     hbc_bench_step.dependOn(&run_hbc_bench.step);
+
+    const hdc_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/bench/hdc_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    hdc_bench_mod.addImport("antfly-zig", lib_mod);
+
+    const hdc_bench = b.addExecutable(.{
+        .name = "hdc_bench",
+        .root_module = hdc_bench_mod,
+    });
+
+    const run_hdc_bench = b.addRunArtifact(hdc_bench);
+    if (b.args) |args| {
+        run_hdc_bench.addArgs(args);
+    }
+    const hdc_bench_step = b.step("hdc-bench", "Benchmark deterministic HDC encoding and projection");
+    hdc_bench_step.dependOn(&run_hdc_bench.step);
+
+    const hdc_wands_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/bench/hdc_wands_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    hdc_wands_bench_mod.addImport("antfly-zig", lib_mod);
+
+    const hdc_wands_bench = b.addExecutable(.{
+        .name = "hdc_wands_bench",
+        .root_module = hdc_wands_bench_mod,
+    });
+
+    const run_hdc_wands_bench = b.addRunArtifact(hdc_wands_bench);
+    if (b.args) |args| {
+        run_hdc_wands_bench.addArgs(args);
+    }
+    const hdc_wands_bench_step = b.step(
+        "hdc-wands-bench",
+        "Compare HDC with dense baselines on a prepared WANDS fixture",
+    );
+    hdc_wands_bench_step.dependOn(&run_hdc_wands_bench.step);
+
+    const hdc_wands_bench_tests = b.addTest(.{
+        .root_module = hdc_wands_bench_mod,
+    });
+    const run_hdc_wands_bench_tests = b.addRunArtifact(hdc_wands_bench_tests);
+    const hdc_wands_bench_test_step = b.step(
+        "hdc-wands-bench-test",
+        "Test the WANDS HDC benchmark fixture and ranking helpers",
+    );
+    hdc_wands_bench_test_step.dependOn(&run_hdc_wands_bench_tests.step);
 
     const hbc_write_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/hbc_write_bench.zig"),

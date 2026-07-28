@@ -13,16 +13,28 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const db_mod = @import("../storage/db/mod.zig");
 const db_query_search = @import("../storage/db/query/search_exec.zig");
 const runtime_schema_mod = @import("../storage/schema.zig");
 const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const query_contract = @import("query_contract.zig");
+const fusion_mod = @import("../search/fusion.zig");
 
 pub const QueryResponse = query_contract.QueryResponse;
 pub const QueryResponseMeta = query_contract.QueryResponseMeta;
 pub const OwnedQueryRequest = query_contract.OwnedQueryRequest;
+
+pub const testing = if (builtin.is_test) struct {
+    pub fn expectDistributedHybridGlobalCalibration() !void {
+        try expectDistributedHybridGlobalCalibrationForTest();
+    }
+
+    pub fn expectWeightedGraphFusion() !void {
+        try expectWeightedGraphFusionForTest();
+    }
+} else struct {};
 
 pub const parseQueryRequest = query_contract.parseQueryRequest;
 pub const parsePublicQueryRequest = query_contract.parsePublicQueryRequest;
@@ -47,12 +59,16 @@ const FakeSemanticResolver = struct {
         index_name: []const u8,
         semantic_search: []const u8,
         embedding_template: ?[]const u8,
+        hypervector_associations_json: ?[]const u8,
         limit: u32,
     ) !db_mod.types.DenseKnnQuery {
         try std.testing.expectEqualStrings("docs", table_name);
         try std.testing.expectEqualStrings("semantic_idx", index_name);
         try std.testing.expectEqualStrings("alpha concept", semantic_search);
         try std.testing.expect(embedding_template == null or std.mem.eql(u8, embedding_template.?, "{{remotePDF url=this}}"));
+        if (hypervector_associations_json) |raw| {
+            try std.testing.expectEqualStrings("{\"region\":\"west\"}", raw);
+        }
         const vector = try alloc.alloc(f32, 3);
         vector[0] = 0.25;
         vector[1] = 0.5;
@@ -134,6 +150,18 @@ pub fn mergeSearchResultsWithRuntimeSchema(
         };
     }
 
+    if (results.len > 1 and req.merge_config != null and distributedFusionDetailsAvailable(results)) {
+        return try mergeDistributedFusionResults(
+            alloc,
+            req,
+            results,
+            offset,
+            limit,
+            total_hits_relation,
+            has_graph_results,
+        );
+    }
+
     var merged_hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
     defer {
         for (merged_hits.items) |*hit| hit.deinit(alloc);
@@ -202,6 +230,254 @@ pub fn mergeSearchResultsWithRuntimeSchema(
         .identity_read_generation = mergedSearchResultIdentityReadGeneration(req, results),
         .graph_results = graph_results,
     };
+}
+
+fn distributedFusionDetailsAvailable(results: []const db_mod.types.SearchResult) bool {
+    var saw_hit = false;
+    for (results) |result| {
+        for (result.hits) |hit| {
+            saw_hit = true;
+            if (hit.index_scores.len == 0) return false;
+        }
+    }
+    return saw_hit;
+}
+
+const DistributedFusionSource = struct {
+    name: []const u8,
+    kind: fusion_mod.SourceKind,
+    hits: std.ArrayListUnmanaged(fusion_mod.RankedHit) = .empty,
+};
+
+fn mergeDistributedFusionResults(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    results: []const db_mod.types.SearchResult,
+    offset: u32,
+    limit: u32,
+    input_total_hits_relation: db_mod.types.TotalHitsRelation,
+    has_graph_results: bool,
+) !db_mod.types.SearchResult {
+    var sources = std.ArrayListUnmanaged(DistributedFusionSource).empty;
+    defer {
+        for (sources.items) |*source| source.hits.deinit(alloc);
+        sources.deinit(alloc);
+    }
+
+    for (results) |result| {
+        for (result.hits) |hit| {
+            for (hit.index_scores) |score| {
+                const source_index = blk: {
+                    for (sources.items, 0..) |source, i| {
+                        if (std.mem.eql(u8, source.name, score.index_name)) break :blk i;
+                    }
+                    try sources.append(alloc, .{
+                        .name = score.index_name,
+                        .kind = distributedFusionSourceKind(req, score.index_name),
+                    });
+                    break :blk sources.items.len - 1;
+                };
+                var source = &sources.items[source_index];
+                var existing_index: ?usize = null;
+                for (source.hits.items, 0..) |candidate, i| {
+                    if (std.mem.eql(u8, candidate.doc_id, hit.id)) {
+                        existing_index = i;
+                        break;
+                    }
+                }
+                if (existing_index) |i| {
+                    source.hits.items[i].score = @max(source.hits.items[i].score, score.score);
+                } else {
+                    try source.hits.append(alloc, .{
+                        .doc_id = hit.id,
+                        .score = score.score,
+                    });
+                }
+            }
+        }
+    }
+
+    const ranked_results = try alloc.alloc(fusion_mod.RankedResult, sources.items.len);
+    defer alloc.free(ranked_results);
+    for (sources.items, 0..) |*source, i| {
+        std.sort.pdq(fusion_mod.RankedHit, source.hits.items, {}, struct {
+            fn lessThan(_: void, left: fusion_mod.RankedHit, right: fusion_mod.RankedHit) bool {
+                if (left.score != right.score) return left.score > right.score;
+                return std.mem.order(u8, left.doc_id, right.doc_id) == .lt;
+            }
+        }.lessThan);
+        ranked_results[i] = .{
+            .index_name = source.name,
+            .hits = source.hits.items,
+            .kind = source.kind,
+        };
+    }
+
+    const merge_config = req.merge_config.?;
+    const fused = try fusion_mod.fuse(alloc, ranked_results, .{
+        .strategy = merge_config.strategy,
+        .rank_constant = merge_config.rank_constant,
+        .window_size = merge_config.window_size,
+        .weights = merge_config.weights,
+    });
+    defer fusion_mod.freeHits(alloc, fused);
+    const pruned = if (req.pruner) |pruner| pruner.prune(fused) else fused;
+    const start: usize = @min(offset, pruned.len);
+    const count: usize = if (limit == 0)
+        pruned.len - start
+    else
+        @min(limit, pruned.len - start);
+
+    const final_hits = try alloc.alloc(db_mod.types.SearchHit, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (final_hits[0..initialized]) |*hit| hit.deinit(alloc);
+        if (final_hits.len > 0) alloc.free(final_hits);
+    }
+    for (pruned[start .. start + count], 0..) |fused_hit, i| {
+        const representative = findDistributedFusionRepresentative(results, fused_hit.doc_id) orelse
+            return error.InvalidQueryRequest;
+        var cloned = try representative.clone(alloc);
+        errdefer cloned.deinit(alloc);
+        db_mod.types.freeIndexScores(alloc, cloned.index_scores);
+        cloned.index_scores = &.{};
+        cloned.index_scores = try db_mod.types.cloneIndexScores(alloc, fused_hit.index_scores);
+        cloned.score = @floatCast(fused_hit.score);
+        final_hits[i] = cloned;
+        initialized += 1;
+    }
+
+    const graph_results = if (has_graph_results)
+        try mergeGraphSearchResults(alloc, results)
+    else
+        @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]);
+    errdefer {
+        for (graph_results) |*graph_result| graph_result.deinit(alloc);
+        if (graph_results.len > 0) alloc.free(graph_results);
+    }
+
+    clearMergedDocOrdinals(final_hits);
+    for (graph_results) |*graph_result| clearMergedDocOrdinals(graph_result.hits);
+    return .{
+        .alloc = alloc,
+        .hits = final_hits,
+        .total_hits = @intCast(@min(pruned.len, std.math.maxInt(u32))),
+        .total_hits_relation = input_total_hits_relation,
+        .identity_read_generation = mergedSearchResultIdentityReadGeneration(req, results),
+        .graph_results = graph_results,
+    };
+}
+
+fn distributedFusionSourceKind(req: db_mod.types.SearchRequest, name: []const u8) fusion_mod.SourceKind {
+    for (req.doc_filter_bindings) |binding| {
+        if (std.mem.eql(u8, binding.name, name)) return .binary;
+    }
+    for (req.full_text_queries) |query| {
+        if (!std.mem.eql(u8, query.name, name)) continue;
+        return if (textQueryIsScoreBearing(query.query)) .ranked else .binary;
+    }
+    if (std.mem.eql(u8, name, "full_text")) {
+        if (req.full_text) |query| {
+            return if (textQueryIsScoreBearing(query)) .ranked else .binary;
+        }
+    }
+    return .ranked;
+}
+
+fn findDistributedFusionRepresentative(
+    results: []const db_mod.types.SearchResult,
+    doc_id: []const u8,
+) ?db_mod.types.SearchHit {
+    for (results) |result| {
+        for (result.hits) |hit| {
+            if (std.mem.eql(u8, hit.id, doc_id)) return hit;
+        }
+    }
+    return null;
+}
+
+pub fn fuseWeightedGraphResults(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    base: *db_mod.types.SearchResult,
+) !void {
+    if (req.merge_config == null or base.graph_results.len == 0) return;
+
+    var weighted_hit_count: usize = 0;
+    var weighted_total_hits: u32 = 0;
+    var weighted_total_hits_relation: db_mod.types.TotalHitsRelation = .exact;
+    for (base.graph_results) |graph_result| {
+        if (fusionWeight(req, graph_result.name) > 0) {
+            weighted_hit_count += graph_result.hits.len;
+            weighted_total_hits +|= graph_result.total_hits;
+            if (@as(usize, graph_result.total_hits) > graph_result.hits.len) {
+                weighted_total_hits_relation = .gte;
+            }
+        }
+    }
+    if (weighted_hit_count == 0) return;
+
+    const graph_hits = try alloc.alloc(db_mod.types.SearchHit, weighted_hit_count);
+    defer alloc.free(graph_hits);
+    const graph_scores = try alloc.alloc(fusion_mod.IndexScore, weighted_hit_count);
+    defer alloc.free(graph_scores);
+
+    var next: usize = 0;
+    for (base.graph_results) |graph_result| {
+        if (fusionWeight(req, graph_result.name) <= 0) continue;
+        for (graph_result.hits) |hit| {
+            const raw_score: f64 = if (graphFusionUsesDistance(req, graph_result.name))
+                -@as(f64, hit.score orelse 0)
+            else
+                hit.score orelse 0;
+            graph_scores[next] = .{
+                .index_name = graph_result.name,
+                .score = raw_score,
+            };
+            graph_hits[next] = hit;
+            graph_hits[next].index_scores = graph_scores[next .. next + 1];
+            next += 1;
+        }
+    }
+
+    const synthetic_graph_result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = graph_hits,
+        .total_hits = weighted_total_hits,
+        .total_hits_relation = weighted_total_hits_relation,
+    };
+    const inputs = [_]db_mod.types.SearchResult{ base.*, synthetic_graph_result };
+    var fused = try mergeDistributedFusionResults(
+        alloc,
+        req,
+        &inputs,
+        req.offset,
+        req.limit,
+        if (base.total_hits_relation == .gte or weighted_total_hits_relation == .gte)
+            .gte
+        else
+            .exact,
+        true,
+    );
+    errdefer fused.deinit();
+    base.deinit();
+    base.* = fused;
+}
+
+fn fusionWeight(req: db_mod.types.SearchRequest, name: []const u8) f64 {
+    const merge_config = req.merge_config orelse return 0;
+    for (merge_config.weights) |weight| {
+        if (std.mem.eql(u8, weight.name, name)) return weight.weight;
+    }
+    return 0;
+}
+
+fn graphFusionUsesDistance(req: db_mod.types.SearchRequest, name: []const u8) bool {
+    for (req.graph_queries) |graph_query| {
+        if (!std.mem.eql(u8, graph_query.name, name)) continue;
+        return graph_query.query.params.weight_mode != .max_weight;
+    }
+    return false;
 }
 
 fn mergedSearchResultIdentityReadGeneration(
@@ -337,6 +613,169 @@ fn isPureDenseRequest(req: db_mod.types.SearchRequest) bool {
         req.graph_queries.len == 0 and
         req.sparse == null and
         req.merge_config == null;
+}
+
+fn expectDistributedHybridGlobalCalibrationForTest() !void {
+    const alloc = std.testing.allocator;
+    const shard_one_hits = [_]db_mod.types.SearchHit{
+        .{
+            .id = @constCast("doc:a"),
+            .score = 1,
+            .index_scores = @constCast(&[_]fusion_mod.IndexScore{.{
+                .index_name = @constCast("semantic"),
+                .score = 100,
+                .normalized_score = 1,
+                .contribution = 1,
+            }}),
+        },
+        .{
+            .id = @constCast("doc:b"),
+            .score = 0,
+            .index_scores = @constCast(&[_]fusion_mod.IndexScore{.{
+                .index_name = @constCast("semantic"),
+                .score = 90,
+            }}),
+        },
+    };
+    const shard_two_hits = [_]db_mod.types.SearchHit{
+        .{
+            .id = @constCast("doc:c"),
+            .score = 1,
+            .index_scores = @constCast(&[_]fusion_mod.IndexScore{.{
+                .index_name = @constCast("semantic"),
+                .score = 80,
+                .normalized_score = 1,
+                .contribution = 1,
+            }}),
+        },
+        .{
+            .id = @constCast("doc:d"),
+            .score = 0,
+            .index_scores = @constCast(&[_]fusion_mod.IndexScore{.{
+                .index_name = @constCast("semantic"),
+                .score = 0,
+            }}),
+        },
+    };
+    const shards = [_]db_mod.types.SearchResult{
+        .{ .alloc = alloc, .hits = @constCast(&shard_one_hits), .total_hits = 2 },
+        .{ .alloc = alloc, .hits = @constCast(&shard_two_hits), .total_hits = 2 },
+    };
+
+    var merged = try mergeSearchResults(alloc, .{
+        .merge_config = .{
+            .strategy = .rsf,
+            .window_size = 4,
+            .weights = &.{.{ .name = "semantic", .weight = 1 }},
+        },
+        .limit = 4,
+    }, &shards, 0, 4);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), merged.hits.len);
+    try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", merged.hits[1].id);
+    try std.testing.expectEqualStrings("doc:c", merged.hits[2].id);
+    try std.testing.expectEqualStrings("doc:d", merged.hits[3].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), merged.hits[1].index_scores[0].normalized_score, 0.000001);
+    try std.testing.expectEqual(@as(u32, 2), merged.hits[1].index_scores[0].rank);
+
+    try std.testing.expectEqual(
+        fusion_mod.SourceKind.binary,
+        distributedFusionSourceKind(.{
+            .full_text_queries = &.{.{
+                .name = "eligible",
+                .index_name = "text",
+                .query = .{ .term_range = .{ .field = "year", .min = "2020" } },
+            }},
+        }, "eligible"),
+    );
+    try std.testing.expectEqual(
+        fusion_mod.SourceKind.ranked,
+        distributedFusionSourceKind(.{
+            .full_text_queries = &.{.{
+                .name = "lexical",
+                .index_name = "text",
+                .query = .{ .match = .{ .field = "body", .text = "graph database" } },
+            }},
+        }, "lexical"),
+    );
+    try std.testing.expectEqual(
+        fusion_mod.SourceKind.binary,
+        distributedFusionSourceKind(.{
+            .full_text = .{ .match_all = {} },
+        }, "full_text"),
+    );
+}
+
+fn expectWeightedGraphFusionForTest() !void {
+    const alloc = std.testing.allocator;
+    const base_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    base_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 1,
+        .index_scores = try db_mod.types.cloneIndexScores(alloc, &.{.{
+            .index_name = "semantic",
+            .score = 1,
+        }}),
+    };
+    base_hits[1] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .score = 0,
+        .index_scores = try db_mod.types.cloneIndexScores(alloc, &.{.{
+            .index_name = "semantic",
+            .score = 0.8,
+        }}),
+    };
+    const graph_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    graph_hits[0] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 1 };
+    graph_hits[1] = .{ .id = try alloc.dupe(u8, "doc:c"), .score = 2 };
+    const graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    graph_results[0] = .{
+        .name = try alloc.dupe(u8, "nearby"),
+        .hits = graph_hits,
+        .total_hits = 3,
+    };
+    var base = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = base_hits,
+        .total_hits = 2,
+        .graph_results = graph_results,
+    };
+    defer base.deinit();
+
+    try fuseWeightedGraphResults(alloc, .{
+        .dense_queries = &.{.{
+            .name = "semantic",
+            .index_name = "semantic",
+            .query = .{ .vector = &.{ 1, 0 }, .k = 3 },
+        }},
+        .graph_queries = &.{.{
+            .name = "nearby",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph",
+                .start_nodes = .{ .keys = &.{"hub"} },
+                .params = .{ .weight_mode = .min_hops },
+            },
+        }},
+        .merge_config = .{
+            .strategy = .rsf,
+            .window_size = 3,
+            .weights = &.{
+                .{ .name = "semantic", .weight = 1 },
+                .{ .name = "nearby", .weight = 2 },
+            },
+        },
+        .limit = 3,
+    }, &base);
+
+    try std.testing.expectEqualStrings("doc:b", base.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 2), base.hits[0].index_scores.len);
+    try std.testing.expectEqualStrings("nearby", base.hits[0].index_scores[1].index_name);
+    try std.testing.expectApproxEqAbs(@as(f64, 2), base.hits[0].index_scores[1].contribution, 0.000001);
+    try std.testing.expectEqual(@as(usize, 1), base.graph_results.len);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, base.total_hits_relation);
 }
 
 const GraphSearchResultBuilder = struct {
@@ -909,6 +1348,22 @@ test "query parser resolves semantic search into dense query" {
     try std.testing.expectEqual(@as(usize, 3), owned.req.dense_queries[0].query.vector.len);
 }
 
+test "query parser forwards structured hypervector associations by index" {
+    var owned = try parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"hypervector_queries":{"semantic_idx":{"region":"west"}},"limit":4}
+    );
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
+    try std.testing.expectEqualStrings("semantic_idx", owned.req.dense_queries[0].index_name);
+}
+
+test "query parser rejects orphaned hypervector associations" {
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"hypervector_queries":{"other_idx":{"region":"west"}},"limit":4}
+    ));
+}
+
 test "query parser preserves search effort for semantic search" {
     var owned = try parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
         \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":4,"search_effort":0.3}
@@ -940,6 +1395,23 @@ test "query parser accepts precomputed embedding payload" {
     try std.testing.expectEqual(@as(u32, 6), owned.req.dense_queries[0].query.k);
     try std.testing.expectEqual(@as(usize, 3), owned.req.dense_queries[0].query.vector.len);
     try std.testing.expectEqual(@as(f32, 1.5), owned.req.dense_queries[0].query.vector[1]);
+}
+
+test "internal query parser carries hypervector identity and public parser rejects it" {
+    const raw =
+        \\{"embeddings":{"semantic_idx":[0.5,1.5,2.5]},"indexes":["semantic_idx"],"_hypervector_identities":{"semantic_idx":"abababababababababababababababababababababababababababababababab"},"limit":6}
+    ;
+    var owned = try parseQueryRequest(std.testing.allocator, null, "docs", raw);
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(
+        u8,
+        &([_]u8{0xab} ** 32),
+        &owned.req.dense_queries[0].query.coordinate_fingerprint.?,
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parsePublicQueryRequest(std.testing.allocator, null, "docs", raw),
+    );
 }
 
 test "query parser accepts packed dense embedding payload" {

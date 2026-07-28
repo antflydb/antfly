@@ -27,6 +27,8 @@ pub const NamedResultSet = struct {
     name: []const u8,
     hits: []const types.SearchHit,
     total_hits: u32,
+    total_hits_relation: types.TotalHitsRelation = .exact,
+    fusion_kind: fusion_mod.SourceKind = .ranked,
     resolved_doc_set: ?*const doc_set.ResolvedDocSet = null,
     resolved_doc_set_complete: bool = false,
 };
@@ -640,6 +642,7 @@ pub fn cloneNamedSetAsResult(alloc: Allocator, set: NamedResultSet, include_stor
         .alloc = alloc,
         .hits = hits,
         .total_hits = set.total_hits,
+        .total_hits_relation = set.total_hits_relation,
         .graph_results = &.{},
     };
 }
@@ -661,7 +664,11 @@ pub fn fuseNamedSets(
     var ordinal_by_id = std.StringHashMapUnmanaged(?doc_set.DocOrdinal).empty;
     defer ordinal_by_id.deinit(alloc);
 
+    var candidate_window_incomplete = false;
     for (named_sets, 0..) |set, i| {
+        if (set.total_hits_relation == .gte or @as(usize, set.total_hits) > set.hits.len) {
+            candidate_window_incomplete = true;
+        }
         var ranked_hits = try alloc.alloc(fusion_mod.RankedHit, set.hits.len);
         errdefer alloc.free(ranked_hits);
         const distance_ordered = fusionUsesDistanceScore(req, set.name);
@@ -689,11 +696,12 @@ pub fn fuseNamedSets(
         ranked_results[i] = .{
             .index_name = fusionWeightName(set.name),
             .hits = ranked_hits,
+            .kind = set.fusion_kind,
         };
     }
     defer for (ranked_results) |result| alloc.free(result.hits);
 
-    if (req.merge_config) |config| try validateFusionWeights(config.weights, ranked_results);
+    if (req.merge_config) |config| try validateFusionWeights(req, config.weights, ranked_results);
 
     const merge_config = if (req.merge_config) |config|
         fusion_mod.FusionConfig{
@@ -749,6 +757,7 @@ pub fn fuseNamedSets(
         .alloc = alloc,
         .hits = hits,
         .total_hits = @intCast(pruned.len),
+        .total_hits_relation = if (candidate_window_incomplete) .gte else .exact,
         .graph_results = &.{},
     };
 }
@@ -1208,7 +1217,7 @@ fn fusionWeightName(name: []const u8) []const u8 {
     return name;
 }
 
-fn validateFusionWeights(weights: []const fusion_mod.NamedWeight, results: []const fusion_mod.RankedResult) !void {
+fn validateFusionWeights(req: types.SearchRequest, weights: []const fusion_mod.NamedWeight, results: []const fusion_mod.RankedResult) !void {
     for (weights, 0..) |weight, i| {
         for (weights[0..i]) |previous| {
             if (std.mem.eql(u8, previous.name, weight.name)) return error.InvalidQueryRequest;
@@ -1220,8 +1229,18 @@ fn validateFusionWeights(weights: []const fusion_mod.NamedWeight, results: []con
                 break;
             }
         }
-        if (!found) return error.InvalidQueryRequest;
+        if (!found and !isDeferredFusionSource(req, weight.name)) return error.InvalidQueryRequest;
     }
+}
+
+fn isDeferredFusionSource(req: types.SearchRequest, name: []const u8) bool {
+    for (req.doc_filter_bindings) |binding| {
+        if (std.mem.eql(u8, binding.name, name)) return true;
+    }
+    for (req.graph_queries) |query| {
+        if (std.mem.eql(u8, query.name, name)) return true;
+    }
+    return false;
 }
 
 fn fusionUsesDistanceScore(req: types.SearchRequest, name: []const u8) bool {
@@ -1230,6 +1249,10 @@ fn fusionUsesDistanceScore(req: types.SearchRequest, name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "$aknn_results.")) return true;
     for (req.dense_queries) |dense_query| {
         if (std.mem.eql(u8, dense_query.name, name)) return true;
+    }
+    for (req.graph_queries) |graph_query| {
+        if (!std.mem.eql(u8, graph_query.name, name)) continue;
+        return graph_query.query.params.weight_mode != .max_weight;
     }
     return false;
 }
@@ -3317,7 +3340,7 @@ test "fuseNamedSets preserves source hit ordinals" {
     const named_sets = [_]NamedResultSet{.{
         .name = "dense",
         .hits = &hits,
-        .total_hits = hits.len,
+        .total_hits = hits.len + 1,
     }};
 
     const Harness = struct {
@@ -3345,6 +3368,7 @@ test "fuseNamedSets preserves source hit ordinals" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 11), result.hits[0].doc_ordinal);
     try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), result.hits[1].doc_ordinal);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
 }
 
 test "fuseNamedSets rejects unknown merge weights" {

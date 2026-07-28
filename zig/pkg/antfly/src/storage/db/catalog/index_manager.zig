@@ -61,6 +61,7 @@ const vector_mod = @import("antfly_vector").vector;
 const graph_mod = @import("../../../graph/graph.zig");
 const segment_mod = @import("../../../segment.zig");
 const chunking_types = @import("../../../chunking/types.zig");
+const hdc = @import("../../../hdc.zig");
 const roaring = @import("../../../encoding/roaring.zig");
 const introducer_mod = @import("../../../introducer.zig");
 const sim_fixture = @import("../../sim_fixture.zig");
@@ -4406,7 +4407,7 @@ pub const IndexManager = struct {
                         .execution_json = if (chunk_cfg.chunking_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunking_execution_json) else "",
                     });
                 }
-                if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name, embedding_name)) {
+                if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name, embedding_name, chunk_cfg.hdc_json)) {
                     try requests.append(alloc, .{
                         .kind = .dense_embedding,
                         .index_name = try alloc.dupe(u8, entry.config.name),
@@ -4420,6 +4421,7 @@ pub const IndexManager = struct {
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                         .full_text_index = chunk_cfg.full_text_index,
+                        .producer_json = if (chunk_cfg.hdc_json.len > 0) try alloc.dupe(u8, chunk_cfg.hdc_json) else "",
                         .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.embedding_execution_json) else "",
                     });
                 }
@@ -4443,7 +4445,7 @@ pub const IndexManager = struct {
                             .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
                         });
                     }
-                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
+                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name, "")) {
                         try requests.append(alloc, .{
                             .kind = .dense_embedding,
                             .index_name = try alloc.dupe(u8, entry.config.name),
@@ -4461,7 +4463,7 @@ pub const IndexManager = struct {
                         });
                     }
                 } else {
-                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
+                    if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name, "")) {
                         try requests.append(alloc, .{
                             .kind = .dense_embedding,
                             .index_name = try alloc.dupe(u8, entry.config.name),
@@ -14371,6 +14373,27 @@ pub fn denseConfigArtifactNameAlloc(alloc: Allocator, cfg: types.IndexConfig) ![
     return try alloc.dupe(u8, dense_cfg.embedding_name orelse cfg.name);
 }
 
+pub fn denseConfigCoordinateFingerprint(
+    alloc: Allocator,
+    cfg: types.IndexConfig,
+) !?[32]u8 {
+    if (cfg.kind != .dense_vector) return error.InvalidIndexConfiguration;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cfg.config_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidIndexConfiguration;
+    const hdc_value = parsed.value.object.get("hdc") orelse return null;
+    if (hdc_value != .object) return error.InvalidIndexConfiguration;
+    const fingerprint_value = hdc_value.object.get("identity_fingerprint") orelse
+        return error.InvalidIndexConfiguration;
+    if (fingerprint_value != .string or fingerprint_value.string.len != 64) {
+        return error.InvalidIndexConfiguration;
+    }
+    var fingerprint: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&fingerprint, fingerprint_value.string) catch
+        return error.InvalidIndexConfiguration;
+    return fingerprint;
+}
+
 const TextConfig = struct {
     source_artifact_name: ?[]u8 = null,
 
@@ -14389,6 +14412,7 @@ const GeneratorConfig = struct {
     chunker_json: []u8 = &.{},
     chunking_execution_json: []u8 = &.{},
     embedding_execution_json: []u8 = &.{},
+    hdc_json: []u8 = &.{},
     full_text_index: bool = false,
 
     fn deinit(self: *const GeneratorConfig, alloc: Allocator) void {
@@ -14399,6 +14423,7 @@ const GeneratorConfig = struct {
         if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
         if (self.chunking_execution_json.len > 0) alloc.free(self.chunking_execution_json);
         if (self.embedding_execution_json.len > 0) alloc.free(self.embedding_execution_json);
+        if (self.hdc_json.len > 0) alloc.free(self.hdc_json);
     }
 };
 
@@ -15049,6 +15074,19 @@ fn parseDenseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConfi
         try chunking_types.parseHasFullTextIndexFromSlice(alloc, chunker_json)
     else
         false;
+    const hdc_json: []u8 = if (generator.object.get("hdc")) |value| blk: {
+        var config = hdc.UserConfig.parseValue(alloc, value) catch return error.InvalidIndexConfig;
+        defer config.deinit();
+        if (chunker_json.len > 0 or
+            generator.object.get("source_template") != null or
+            generator.object.get("chunk_size") != null or
+            generator.object.get("chunk_overlap") != null)
+        {
+            return error.InvalidIndexConfig;
+        }
+        break :blk config.stringifyAlloc(alloc) catch |err| return err;
+    } else &.{};
+    errdefer if (hdc_json.len > 0) alloc.free(hdc_json);
 
     return .{
         .source_field = try alloc.dupe(u8, source_field.string),
@@ -15077,6 +15115,7 @@ fn parseDenseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConfi
         .chunker_json = chunker_json,
         .chunking_execution_json = chunking_execution_json,
         .embedding_execution_json = embedding_execution_json,
+        .hdc_json = hdc_json,
         .full_text_index = full_text_index,
     };
 }
@@ -15215,6 +15254,7 @@ fn hasGeneratedDenseEmbeddingRequest(
     source_template: []const u8,
     artifact_name: []const u8,
     embedding_name: []const u8,
+    producer_json: []const u8,
 ) bool {
     for (requests) |request| {
         if (request.kind != .dense_embedding) continue;
@@ -15223,6 +15263,7 @@ fn hasGeneratedDenseEmbeddingRequest(
         if (!std.mem.eql(u8, request.source_template, source_template)) continue;
         if (!std.mem.eql(u8, request.artifact_name, artifact_name)) continue;
         if (!std.mem.eql(u8, request.embedding_name, embedding_name)) continue;
+        if (!std.mem.eql(u8, request.producer_json, producer_json)) continue;
         return true;
     }
     return false;
@@ -15249,6 +15290,7 @@ fn hasGeneratedSparseEmbeddingRequest(
 }
 
 fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) GeneratorConfig {
+    if (generator.hdc_json.len > 0) return generator;
     if (self.getEnrichment(.chunk, generator.artifact_name)) |cfg| {
         return .{
             .source_field = @constCast(cfg.source_field),
@@ -15260,6 +15302,7 @@ fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) 
             .chunker_json = if (cfg.chunker_json.len > 0) @constCast(cfg.chunker_json) else &.{},
             .chunking_execution_json = if (cfg.execution_json.len > 0) @constCast(cfg.execution_json) else &.{},
             .embedding_execution_json = generator.embedding_execution_json,
+            .hdc_json = generator.hdc_json,
             .full_text_index = cfg.full_text_index,
         };
     }
@@ -17662,6 +17705,24 @@ test "parseDenseGeneratorConfig without source_template" {
     try std.testing.expectEqual(@as(usize, 0), generator.source_template.len);
 }
 
+test "parseDenseGeneratorConfig canonicalizes HDC identity and rejects chunking" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"field":"embedding","dims":64,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic_idx","hdc":{"structural_paths":["region","name"],"semantic_weight":4,"seed":17,"dimensions":64}}}
+    ;
+    const generator = try parseDenseGeneratorConfig(alloc, json) orelse return error.TestUnexpectedResult;
+    defer generator.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "{\"dimensions\":64,\"seed\":17,\"projection_seed\":17,\"semantic_weight\":4,\"structural_paths\":[\"name\",\"region\"]}",
+        generator.hdc_json,
+    );
+
+    const chunked =
+        \\{"field":"embedding","dims":64,"generator":{"kind":"dense_embedding","source_field":"body","chunk_size":256,"hdc":{"dimensions":64}}}
+    ;
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseGeneratorConfig(alloc, chunked));
+}
+
 test "parseDenseGeneratorConfig promotes chunker full text flag" {
     const alloc = std.testing.allocator;
     const json =
@@ -17803,8 +17864,8 @@ test "generated enrichment request identity includes source_template" {
     try std.testing.expect(hasGeneratedChunkRequest(requests[0..], "doc:1", "body", "{{title}} {{body}}", "body_chunks"));
     try std.testing.expect(!hasGeneratedChunkRequest(requests[0..], "doc:1", "body", "{{body}}", "body_chunks"));
 
-    try std.testing.expect(hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{title}} {{body}}", "body_chunks", "body_embedding"));
-    try std.testing.expect(!hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{body}}", "body_chunks", "body_embedding"));
+    try std.testing.expect(hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{title}} {{body}}", "body_chunks", "body_embedding", ""));
+    try std.testing.expect(!hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{body}}", "body_chunks", "body_embedding", ""));
 }
 
 test "parseTextConfig prefers source artifact name and accepts legacy chunk name" {

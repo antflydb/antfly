@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "decision": "no_go",
+  "recorded_at": "2026-07-27",
+  "host": {
+    "architecture": "arm64",
+    "optimize": "ReleaseFast"
+  },
+  "dataset": {
+    "base_fixture": "hdc-wands-bge-small-2026-07-26.json",
+    "association_fixture": "hdc-wands-compositional-2026-07-27.json",
+    "products": 42994,
+    "queries_with_explicit_attributes": 116,
+    "validation_queries": 23,
+    "holdout_queries": 93
+  },
+  "protocol": {
+    "candidate_generator": "384-dimensional BGE embeddings with RaBitQ",
+    "candidate_budgets": [
+      50,
+      100,
+      200
+    ],
+    "transparent_baseline": "exact embedding cosine plus 0.075 times exact structured match count inside the embedding candidate set",
+    "learned_baseline": "12-epoch pairwise-logistic linear ranker over exact embedding cosine and normalized exact structured match count",
+    "hdc_method": "the same pairwise ranker with normalized Hamming similarity from an 8000-dimensional packed-bipolar structural bundle",
+    "training_split": "query_id % 5 == 0",
+    "evaluation_split": "query_id % 5 != 0",
+    "bootstrap_samples": 10000,
+    "labels": "original WANDS human relevance judgments; unjudged candidate pairs are treated as gain zero"
+  },
+  "trained_weights": {
+    "learned": {
+      "semantic": 8.731585,
+      "structured": 0.886839,
+      "hdc": 0
+    },
+    "learned_plus_hdc": {
+      "semantic": 8.719717,
+      "structured": 0.505783,
+      "hdc": 0.713909
+    }
+  },
+  "packed_hdc": {
+    "dimensions": 8000,
+    "bytes": 42994000,
+    "build_ms": 954.772,
+    "candidate_feature_ms_per_query_at_200": 0.0674,
+    "mapping": "sign_ge_zero_le_u64_v1",
+    "role": "candidate_rerank_feature"
+  },
+  "holdout": {
+    "50": {
+      "transparent_hybrid_ndcg10": 0.7472,
+      "learned_ndcg10": 0.7476,
+      "learned_graph_answer_top1": 0.9785,
+      "learned_plus_hdc_ndcg10": 0.7385,
+      "learned_plus_hdc_graph_answer_top1": 0.9677,
+      "hdc_ndcg10_delta_vs_learned": -0.009063,
+      "hdc_ndcg10_ci95_vs_learned": [
+        -0.017478,
+        -0.000973
+      ],
+      "hdc_graph_answer_delta_vs_learned": -0.010753,
+      "hdc_graph_answer_ci95_vs_learned": [
+        -0.032258,
+        0
+      ]
+    },
+    "100": {
+      "transparent_hybrid_ndcg10": 0.7574,
+      "learned_ndcg10": 0.7599,
+      "learned_graph_answer_top1": 0.9785,
+      "learned_plus_hdc_ndcg10": 0.7521,
+      "learned_plus_hdc_graph_answer_top1": 0.9677,
+      "hdc_ndcg10_delta_vs_learned": -0.007775,
+      "hdc_ndcg10_ci95_vs_learned": [
+        -0.015767,
+        -0.000181
+      ],
+      "hdc_graph_answer_delta_vs_learned": -0.010753,
+      "hdc_graph_answer_ci95_vs_learned": [
+        -0.032258,
+        0
+      ]
+    },
+    "200": {
+      "transparent_hybrid_ndcg10": 0.7521,
+      "learned_ndcg10": 0.7613,
+      "learned_graph_answer_top1": 0.9785,
+      "learned_plus_hdc_ndcg10": 0.7541,
+      "learned_plus_hdc_graph_answer_top1": 0.9677,
+      "learned_ndcg10_delta_vs_transparent": 0.009121,
+      "learned_ndcg10_ci95_vs_transparent": [
+        0.002248,
+        0.017206
+      ],
+      "hdc_ndcg10_delta_vs_learned": -0.007121,
+      "hdc_ndcg10_ci95_vs_learned": [
+        -0.01623,
+        0.001916
+      ],
+      "hdc_graph_answer_delta_vs_learned": -0.010753,
+      "hdc_graph_answer_ci95_vs_learned": [
+        -0.032258,
+        0
+      ]
+    }
+  },
+  "limitations": [
+    "The learned baseline is a small deterministic pairwise linear ranker, not a cross-encoder or production learning-to-rank model.",
+    "The compositional slice has only 93 holdout queries and only 13 queries state more than one extracted attribute beyond class.",
+    "The workload tests explicit product attributes and category-derived graph answers, not inferred relations or contradictory evidence.",
+    "Packed-HDC feature timing is reported separately from candidate generation and final linear scoring.",
+    "A second external compositional or relational domain is still required by the graduation rule."
+  ],
+  "conclusion": "Candidate-local packed-bipolar HDC does not improve the learned reranker. It is significantly worse on NDCG@10 at 50 and 100 candidates, has no significant advantage at 200 candidates, and reduces graph-answer top-1 by one holdout query. The transparent hybrid path remains simpler, while the learned non-HDC reranker is significantly better than fixed fusion at 200 candidates. The evidence strengthens the no-go decision for HDC and supports investing in hybrid candidate generation and reranking."
+}

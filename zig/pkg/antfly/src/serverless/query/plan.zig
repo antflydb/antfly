@@ -121,6 +121,8 @@ fn parsePublicSearchPlanAlloc(
         query_request.join != null or
         query_request.foreign_sources != null or
         query_request.merge_config != null or
+        query_request.with != null or
+        query_request.explain == true or
         query_request.pruner != null or
         query_request.reranker != null or
         query_request.graph_searches != null or
@@ -697,6 +699,21 @@ test "search plan accepts public dense and sparse embeddings map together" {
 test "search plan rejects invalid hybrid requests with fewer than two lanes" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidQueryRequest, parseSearchPlanAlloc(alloc, "{\"mode\":\"hybrid\",\"text\":\"only-text\"}", search_sources.defaultPublishedSearchSources()));
+}
+
+test "serverless search plan fails closed for provisioned hybrid scoring controls" {
+    const alloc = std.testing.allocator;
+    const sources = search_sources.defaultPublishedSearchSources();
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"full_text_search\":{\"query\":\"body:alpha\"},\"explain\":true}",
+        sources,
+    ));
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"full_text_search\":{\"query\":\"body:alpha\"},\"with\":{\"preferred\":{\"match_all\":{}}}}",
+        sources,
+    ));
 }
 
 test "search plan reports active lanes" {

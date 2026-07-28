@@ -605,8 +605,12 @@ test "schema and indexes openapi modules are generated and wired" {
     try std.testing.expect(@hasDecl(schema_generated, "AntflyType"));
     try std.testing.expect(@hasDecl(indexes_generated, "IndexConfig"));
     try std.testing.expect(@hasDecl(indexes_generated, "EmbeddingsIndexConfig"));
+    try std.testing.expect(@hasDecl(indexes_generated, "HypervectorIndexConfig"));
     try std.testing.expect(@hasDecl(indexes_generated, "ExecutionPolicy"));
     try std.testing.expect(@hasDecl(indexes_generated, "IndexExecutionConfig"));
+    try std.testing.expect(!@hasField(indexes_generated.EmbeddingsIndexConfig, "hdc"));
+    try std.testing.expect(@hasField(indexes_generated.HypervectorIndexConfig, "semantic"));
+    try std.testing.expect(@hasField(metadata_generated.QueryRequest, "hypervector_queries"));
     try std.testing.expect(@hasField(indexes_generated.EmbeddingsIndexConfig, "execution"));
     try std.testing.expect(@hasField(indexes_generated.GraphIndexConfig, "execution"));
     try std.testing.expect(@hasDecl(indexes_generated, "SortField"));

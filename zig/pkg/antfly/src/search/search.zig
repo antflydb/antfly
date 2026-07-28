@@ -413,6 +413,10 @@ fn cloneIndexScores(alloc: Allocator, scores: []const fusion_mod.IndexScore) ![]
         cloned[i] = .{
             .index_name = try alloc.dupe(u8, score.index_name),
             .score = score.score,
+            .rank = score.rank,
+            .normalized_score = score.normalized_score,
+            .weight = score.weight,
+            .contribution = score.contribution,
         };
         initialized += 1;
     }

@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "decision": "no_go",
+  "recorded_at": "2026-07-26",
+  "host": {
+    "architecture": "arm64",
+    "optimize": "ReleaseFast"
+  },
+  "dataset": {
+    "name": "WANDS",
+    "revision": "3b74dcf4ba29ab8ff3e6a50b5b09fc627cb882b5",
+    "products": 42994,
+    "queries": 480,
+    "judgments": 233448,
+    "sha256": {
+      "product.csv": "d993926254572e6eba96c8fd87cc549a17fb91ad3748308036eee4cf92b10ac6",
+      "query.csv": "63b61660560fecc33ec490804c7e2b81402ee3e7c31a9cbb5e03736639f68e95",
+      "label.csv": "c11fe81ad62f17f56f316b0ec9630ebe8fbe1393578cb0ca4f05c17253a180ef"
+    }
+  },
+  "embedding": {
+    "model": "BAAI/bge-small-en-v1.5",
+    "revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+    "dimensions": 384,
+    "max_tokens": 128,
+    "query_prefix": "Represent this sentence for searching relevant passages: ",
+    "sha256": {
+      "onnx/model.onnx": "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35",
+      "tokenizer.json": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
+    }
+  },
+  "protocol": {
+    "semantic_document": "product_name + product_description",
+    "structured_association": "product_class/query_class",
+    "graph_answer": "stored category hierarchy",
+    "gains": {
+      "Exact": 2,
+      "Partial": 1,
+      "Irrelevant": 0,
+      "unjudged": 0
+    },
+    "validation": "query_id % 5 == 0",
+    "validation_queries_with_relevance": 96,
+    "holdout_queries_with_relevance": 383,
+    "selection_metric": "validation_ndcg10",
+    "fusion_weight_candidates": [
+      0,
+      0.01,
+      0.025,
+      0.05,
+      0.075,
+      0.1,
+      0.15,
+      0.2,
+      0.25,
+      0.35,
+      0.5,
+      0.75,
+      1
+    ],
+    "selected_fusion_weight": 0.075,
+    "hdc_semantic_weight_candidates": [
+      4,
+      8,
+      12,
+      16,
+      24,
+      32
+    ],
+    "selected_hdc_semantic_weight": 4,
+    "hdc_dimensions": 10000,
+    "hdc_seed": 13
+  },
+  "exact_holdout": {
+    "embedding": {
+      "ndcg10": 0.7387,
+      "mrr10": 0.9139,
+      "recall10": 0.0576,
+      "top1_relevant": 0.8799,
+      "graph_answer_top1": 0.9426,
+      "score_ms_per_query": 0.9407
+    },
+    "embedding_exact_filter": {
+      "ndcg10": 0.7293,
+      "mrr10": 0.8974,
+      "recall10": 0.0542,
+      "top1_relevant": 0.8695,
+      "graph_answer_top1": 0.9582,
+      "score_ms_per_query": 0.0526
+    },
+    "embedding_structured_fusion": {
+      "ndcg10": 0.7688,
+      "mrr10": 0.9256,
+      "recall10": 0.061,
+      "top1_relevant": 0.8982,
+      "graph_answer_top1": 0.9739,
+      "score_ms_per_query": 0.9368
+    },
+    "complete_hdc_structured": {
+      "ndcg10": 0.7643,
+      "mrr10": 0.9294,
+      "recall10": 0.06,
+      "top1_relevant": 0.906,
+      "graph_answer_top1": 0.9739,
+      "score_ms_per_query": 24.5092,
+      "projection_ms_per_query": 1.089
+    }
+  },
+  "storage": {
+    "embedding": {
+      "authoritative_bytes": 66038784,
+      "rabitq_bytes": 2753152,
+      "quantize_ms": 13.6
+    },
+    "complete_hdc": {
+      "authoritative_bytes": 1719760000,
+      "rabitq_bytes": 54728368,
+      "quantize_ms": 552.054
+    }
+  },
+  "rabitq_holdout_50_candidates": {
+    "embedding_candidates_then_structured_rerank": {
+      "ndcg10": 0.7674,
+      "mrr10": 0.9299,
+      "recall10": 0.0597,
+      "top1_relevant": 0.906,
+      "graph_answer_top1": 0.9739,
+      "exact_top10_recall": 0.8825,
+      "approximate_ms_per_query": 3.4683,
+      "rerank_ms_per_query": 0.0075
+    },
+    "complete_hdc_candidates_then_exact_rerank": {
+      "ndcg10": 0.7643,
+      "mrr10": 0.9294,
+      "recall10": 0.06,
+      "top1_relevant": 0.906,
+      "graph_answer_top1": 0.9739,
+      "exact_top10_recall": 0.9995,
+      "approximate_ms_per_query": 7.6304,
+      "rerank_ms_per_query": 0.0561
+    }
+  },
+  "limitations": [
+    "Unjudged query-product pairs are treated as irrelevant.",
+    "The external workload supplies one structured association.",
+    "The ANN measurement isolates RaBitQ full-corpus candidate selection and reranking rather than HBC tree topology.",
+    "Graph-answer quality uses the exact stored category hierarchy of the selected product; it does not time a distributed graph traversal."
+  ],
+  "conclusion": "Validation-tuned complete HDC does not provide a material application-quality advantage over validation-tuned embedding score fusion or semantic candidates followed by structured reranking. Its authoritative vectors are about 26x larger, its RaBitQ representation about 20x larger, and its exact scoring about 26x slower. Do not graduate the public hypervector API on this evidence."
+}

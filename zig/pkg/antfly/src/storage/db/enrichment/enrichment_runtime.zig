@@ -61,6 +61,7 @@ const scraping = if (builtin.os.tag == .freestanding or build_options.bench_mini
 else
     @import("antfly_scraping");
 const mapper = @import("../document_mapper.zig");
+const hdc = @import("../../../hdc.zig");
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
@@ -827,6 +828,7 @@ const StaleEmbeddingDeletes = struct {
 const PlainDenseBatchItem = struct {
     request: enrichment_types.GeneratedEnrichmentRequest,
     source_text: []const u8,
+    raw_document: ?[]u8 = null,
     source_hash: u64,
     artifact_key: []u8,
 };
@@ -856,6 +858,7 @@ const AssetProducerBatchItem = struct {
 fn freePlainDenseBatchItems(alloc: Allocator, items: []PlainDenseBatchItem) void {
     for (items) |item| {
         alloc.free(@constCast(item.source_text));
+        if (item.raw_document) |raw| alloc.free(raw);
         alloc.free(item.artifact_key);
     }
 }
@@ -910,6 +913,7 @@ fn samePlainDenseBatchKey(
 ) bool {
     return lhs.expected_dims == rhs.expected_dims and
         std.mem.eql(u8, requestEmbeddingName(lhs), requestEmbeddingName(rhs)) and
+        std.mem.eql(u8, lhs.producer_json, rhs.producer_json) and
         std.mem.eql(u8, lhs.execution_json, rhs.execution_json);
 }
 
@@ -4956,6 +4960,69 @@ fn processMaterializedChunkSparseRequest(
     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
 
+fn denseRequestSourceHash(
+    alloc: Allocator,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    raw_document: []const u8,
+    source_text: []const u8,
+) !u64 {
+    if (request.producer_json.len == 0) return enrichment_artifact_codec.hashSource(source_text);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, request.producer_json, .{});
+    defer parsed.deinit();
+    var config = try hdc.UserConfig.parseValue(alloc, parsed.value);
+    defer config.deinit();
+    return config.sourceHash(raw_document, source_text);
+}
+
+fn composeDenseRequestVectorAlloc(
+    alloc: Allocator,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    raw_document: []const u8,
+    semantic_vector: []const f32,
+) !?[]f32 {
+    if (request.producer_json.len == 0) return null;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, request.producer_json, .{});
+    defer parsed.deinit();
+    var config = try hdc.UserConfig.parseValue(alloc, parsed.value);
+    defer config.deinit();
+    if (semantic_vector.len != config.dimensions) return error.InvalidEmbeddingResponse;
+    return try hdc.composeJsonDocument(alloc, config, raw_document, semantic_vector);
+}
+
+test "enrichment HDC request identity and structural composition are deterministic" {
+    const request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "semantic_idx",
+        .embedding_name = "semantic_idx",
+        .doc_key = "doc:1",
+        .source_field = "body",
+        .expected_dims = 8,
+        .producer_json = "{\"dimensions\":8,\"seed\":17,\"projection_seed\":17,\"semantic_weight\":4,\"structural_paths\":[\"region\"]}",
+    };
+    const first_doc = "{\"body\":\"graph database\",\"region\":\"west\"}";
+    const reordered_doc = "{\"region\":\"west\",\"body\":\"graph database\"}";
+    const unrelated_doc = "{\"body\":\"graph database\",\"region\":\"west\",\"ignored\":42}";
+    const changed_doc = "{\"body\":\"graph database\",\"region\":\"east\"}";
+    const semantic = [_]f32{ 1, -1, 1, -1, 1, -1, 1, -1 };
+
+    const first_hash = try denseRequestSourceHash(std.testing.allocator, request, first_doc, "graph database");
+    const reordered_hash = try denseRequestSourceHash(std.testing.allocator, request, reordered_doc, "graph database");
+    const unrelated_hash = try denseRequestSourceHash(std.testing.allocator, request, unrelated_doc, "graph database");
+    const changed_hash = try denseRequestSourceHash(std.testing.allocator, request, changed_doc, "graph database");
+    try std.testing.expectEqual(first_hash, reordered_hash);
+    try std.testing.expectEqual(first_hash, unrelated_hash);
+    try std.testing.expect(first_hash != changed_hash);
+
+    const first = (try composeDenseRequestVectorAlloc(std.testing.allocator, request, first_doc, &semantic)).?;
+    defer std.testing.allocator.free(first);
+    const reordered = (try composeDenseRequestVectorAlloc(std.testing.allocator, request, reordered_doc, &semantic)).?;
+    defer std.testing.allocator.free(reordered);
+    const changed = (try composeDenseRequestVectorAlloc(std.testing.allocator, request, changed_doc, &semantic)).?;
+    defer std.testing.allocator.free(changed);
+    try std.testing.expectEqualSlices(f32, first, reordered);
+    try std.testing.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(first), std.mem.sliceAsBytes(changed)));
+}
+
 fn collectPlainDenseBatchItem(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -4976,7 +5043,12 @@ fn collectPlainDenseBatchItem(
         return null;
     };
     errdefer runtime.alloc.free(@constCast(source_text));
-    const source_hash = enrichment_artifact_codec.hashSource(source_text);
+    const source_hash = try denseRequestSourceHash(runtime.alloc, request, raw, source_text);
+    const raw_document = if (request.producer_json.len > 0)
+        try runtime.alloc.dupe(u8, raw)
+    else
+        null;
+    errdefer if (raw_document) |owned| runtime.alloc.free(owned);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     errdefer runtime.alloc.free(artifact_key);
@@ -4985,6 +5057,7 @@ fn collectPlainDenseBatchItem(
             try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
         }
         runtime.alloc.free(@constCast(source_text));
+        if (raw_document) |owned| runtime.alloc.free(owned);
         runtime.alloc.free(artifact_key);
         return null;
     }
@@ -4992,6 +5065,7 @@ fn collectPlainDenseBatchItem(
     return .{
         .request = request,
         .source_text = source_text,
+        .raw_document = raw_document,
         .source_hash = source_hash,
         .artifact_key = artifact_key,
     };
@@ -5030,6 +5104,12 @@ fn flushPlainDenseItems(
     if (vectors.len != items.len) return error.InvalidEmbeddingResponse;
 
     for (items, vectors) |item, vector| {
+        const composed = if (item.raw_document) |raw|
+            try composeDenseRequestVectorAlloc(runtime.alloc, item.request, raw, vector)
+        else
+            null;
+        defer if (composed) |owned| runtime.alloc.free(owned);
+        const complete_vector = if (composed) |owned| owned else vector;
         try writeEmbeddingArtifact(runtime, .{
             .base_key = item.request.doc_key,
             .parent_doc_key = item.request.doc_key,
@@ -5037,11 +5117,11 @@ fn flushPlainDenseItems(
             .source_field = item.request.source_field,
             .source_key = null,
             .source_hash = item.source_hash,
-            .vector = vector,
+            .vector = complete_vector,
         });
         try queueDerivedCoverageProduced(runtime, window, item.request.doc_key, consumer_indexes);
 
-        var embeddings = try singleDenseEmbeddingForConsumers(runtime, item.request.doc_key, item.artifact_key, vector, consumer_indexes);
+        var embeddings = try singleDenseEmbeddingForConsumers(runtime, item.request.doc_key, item.artifact_key, complete_vector, consumer_indexes);
         defer {
             for (embeddings) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
             if (embeddings.len > 0) runtime.alloc.free(embeddings);
@@ -5686,7 +5766,7 @@ fn processDenseEmbedding(
         return;
     };
     defer runtime.alloc.free(source_text);
-    const source_hash = enrichment_artifact_codec.hashSource(source_text);
+    const source_hash = try denseRequestSourceHash(runtime.alloc, request, raw, source_text);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
@@ -5697,8 +5777,11 @@ fn processDenseEmbedding(
         return;
     }
 
-    const vector = try embedDenseWithRetry(dense_embedder, runtime, embedding_artifact_name, source_text, request.expected_dims);
-    defer runtime.alloc.free(vector);
+    const semantic_vector = try embedDenseWithRetry(dense_embedder, runtime, embedding_artifact_name, source_text, request.expected_dims);
+    defer runtime.alloc.free(semantic_vector);
+    const composed = try composeDenseRequestVectorAlloc(runtime.alloc, request, raw, semantic_vector);
+    defer if (composed) |owned| runtime.alloc.free(owned);
+    const vector = if (composed) |owned| owned else semantic_vector;
 
     try writeEmbeddingArtifact(runtime, .{
         .base_key = request.doc_key,

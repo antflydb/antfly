@@ -64,6 +64,46 @@ pub const testing = if (builtin.is_test) struct {
         try expectPublicExactSortRejectionMappingForTest();
     }
 
+    pub fn expectScoreExplanationSerialization() !void {
+        try expectScoreExplanationSerializationForTest();
+    }
+
+    pub fn expectFusionSourceValidation() !void {
+        const alloc = std.testing.allocator;
+        var valid = try parseQueryRequest(alloc, null, "docs",
+            \\{
+            \\  "embeddings":{"dense_idx":"AACAPwAAAEAAAEBA"},
+            \\  "indexes":["dense_idx"],
+            \\  "with":{"preferred":{"term":{"path":"/tier","value":"gold"}}},
+            \\  "merge_config":{"strategy":"rsf","weights":{"dense_idx":1.0,"preferred":0.2}}
+            \\}
+        );
+        defer valid.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), valid.req.doc_filter_bindings.len);
+
+        try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+            \\{
+            \\  "embeddings":{"dense_idx":"AACAPwAAAEAAAEBA"},
+            \\  "indexes":["dense_idx"],
+            \\  "merge_config":{"strategy":"rsf","weights":{"missing":1.0}}
+            \\}
+        ));
+        try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+            \\{
+            \\  "embeddings":{"dense_idx":"AACAPwAAAEAAAEBA"},
+            \\  "indexes":["dense_idx"],
+            \\  "with":{"dense_idx":{"term":{"path":"/tier","value":"gold"}}},
+            \\  "merge_config":{"strategy":"rsf","weights":{"dense_idx":1.0}}
+            \\}
+        ));
+        try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+            \\{
+            \\  "with":{"preferred":{"term":{"path":"/tier","value":"gold"}}},
+            \\  "merge_config":{"strategy":"rsf","weights":{"preferred":1.0}}
+            \\}
+        ));
+    }
+
     pub fn expectFilterOnlyQueryStringFilterPreserved() !void {
         var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
             \\{"filter_query":{"query":"status:active"},"limit":5}
@@ -1268,6 +1308,10 @@ fn appendAlgebraicVectorWorkerQuery(
             try appendJsonFieldUsize(alloc, out, &first, "k", dense.k);
             try appendJsonFieldName(alloc, out, &first, "vector");
             try appendF32Array(alloc, out, dense.vector);
+            if (dense.coordinate_fingerprint) |fingerprint| {
+                const hex = std.fmt.bytesToHex(fingerprint, .lower);
+                try appendJsonFieldString(alloc, out, &first, "coordinate_fingerprint", &hex);
+            }
         },
         .sparse => |sparse| {
             try appendJsonFieldString(alloc, out, &first, "kind", "sparse");
@@ -1457,9 +1501,19 @@ fn parseAlgebraicVectorWorkerQueryAlloc(
     const k = try parseOptionalU32Json(value.object.get("k"), 10);
     if (std.mem.eql(u8, kind_value.string, "dense")) {
         if (layout != .dense_vector) return error.InvalidQueryRequest;
+        const coordinate_fingerprint = if (value.object.get("coordinate_fingerprint")) |fingerprint_value| blk: {
+            if (fingerprint_value != .string or fingerprint_value.string.len != 64) {
+                return error.InvalidQueryRequest;
+            }
+            var fingerprint: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&fingerprint, fingerprint_value.string) catch
+                return error.InvalidQueryRequest;
+            break :blk fingerprint;
+        } else null;
         return .{ .dense = .{
             .vector = try parseF32JsonArrayAlloc(alloc, value.object.get("vector") orelse return error.InvalidQueryRequest),
             .k = k,
+            .coordinate_fingerprint = coordinate_fingerprint,
         } };
     }
     if (std.mem.eql(u8, kind_value.string, "sparse")) {
@@ -1913,6 +1967,7 @@ pub const SemanticResolver = struct {
             index_name: []const u8,
             semantic_search: []const u8,
             embedding_template: ?[]const u8,
+            hypervector_associations_json: ?[]const u8,
             limit: u32,
         ) anyerror!db_mod.types.DenseKnnQuery,
     };
@@ -1924,9 +1979,19 @@ pub const SemanticResolver = struct {
         index_name: []const u8,
         semantic_search: []const u8,
         embedding_template: ?[]const u8,
+        hypervector_associations_json: ?[]const u8,
         limit: u32,
     ) !db_mod.types.DenseKnnQuery {
-        return try self.vtable.resolve_dense_query(self.ptr, alloc, table_name, index_name, semantic_search, embedding_template, limit);
+        return try self.vtable.resolve_dense_query(
+            self.ptr,
+            alloc,
+            table_name,
+            index_name,
+            semantic_search,
+            embedding_template,
+            hypervector_associations_json,
+            limit,
+        );
     }
 };
 
@@ -1948,6 +2013,7 @@ fn applyCommonSearchRequestOptions(
         return error.UnsupportedQueryRequest;
     }
     if (request.profile) |profile| req.profile = profile;
+    if (request.explain) |explain| req.explain = explain;
     if (request.aggregations) |aggregations| {
         req.aggregations_json = try jsonStringifyAlloc(alloc, aggregations);
     }
@@ -2179,6 +2245,7 @@ pub fn parseQueryRequest(
     try applyPublicHierarchyControls(alloc, body, &req);
     req.distributed_text_stats = try parseDistributedTextStatsAlloc(alloc, body);
     try parseInternalDocIdConstraintsAlloc(alloc, body, &req);
+    try parseInternalFusionCandidateWindow(alloc, body, &req);
 
     const fields = try applySearchRequestFields(alloc, request.fields, &req);
     errdefer freeClonedFields(alloc, fields);
@@ -2204,14 +2271,18 @@ pub fn parseQueryRequest(
     try parseInternalFilterQueryJsonAlloc(alloc, body, &req);
     req.doc_filter_bindings = try parsePublicDocFilterBindingsAlloc(alloc, body, req.limit);
 
-    const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, req.limit);
+    var vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, req.limit);
     errdefer vector_queries.deinit(alloc);
     req.dense_queries = vector_queries.dense;
     req.sparse_queries = vector_queries.sparse;
+    vector_queries.dense = &.{};
+    vector_queries.sparse = &.{};
+    try applyInternalHypervectorIdentities(alloc, body, req.dense_queries);
     req.graph_queries = try buildGraphQueries(alloc, request);
     if (request.expand_strategy) |expand_strategy| {
         req.expand_strategy = try parseExpandStrategy(expand_strategy);
     }
+    try validateFusionSourceNames(alloc, req);
     try validateScoreSortHasScoreBearingSource(req);
 
     return .{
@@ -2311,10 +2382,12 @@ fn buildPreflightSearchRequestAlloc(
     req.exclusion_query_json = normalized_query.exclusion_query_json;
     normalized_query.exclusion_query_json = "";
 
-    const vector_queries = try buildPreflightSemanticVectorQueries(alloc, request, req.limit);
+    var vector_queries = try buildPreflightSemanticVectorQueries(alloc, request, req.limit);
     errdefer vector_queries.deinit(alloc);
     req.dense_queries = vector_queries.dense;
     req.sparse_queries = vector_queries.sparse;
+    vector_queries.dense = &.{};
+    vector_queries.sparse = &.{};
     req.graph_queries = try buildGraphQueries(alloc, request);
     if (request.expand_strategy) |expand_strategy| {
         req.expand_strategy = try parseExpandStrategy(expand_strategy);
@@ -2463,6 +2536,7 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"filter_query\"",
         "\"exclusion_query\"",
         "\"merge_config\"",
+        "\"explain\"",
         "\"reranker\"",
         "\"pruner\"",
         "\"semantic_search\"",
@@ -2473,6 +2547,7 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"hierarchy\"",
         "\"_filter_query_json\"",
         "\"_exclusion_query_json\"",
+        "\"_hypervector_identities\"",
         db_mod.doc_filter_wire.field_name,
     };
     for (disallowed) |needle| {
@@ -2638,6 +2713,7 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         ._id = hit.id,
         ._score = if (hit.score) |score| finiteScoreOrZero(score) else 0,
         ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
+        ._score_explanation = try scoreExplanationJsonValue(alloc, req, hit),
         ._sort = if (hit.sort_values.len > 0) hit.sort_values else null,
         ._source = if (hit.stored_data) |stored_data|
             if (req.defer_stored_projection)
@@ -2983,6 +3059,42 @@ fn indexScoresJsonValue(alloc: std.mem.Allocator, scores: []const fusion_mod.Ind
     return .{ .object = obj };
 }
 
+fn scoreExplanationJsonValue(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    hit: db_mod.types.SearchHit,
+) !?std.json.Value {
+    if (!req.explain or hit.index_scores.len == 0) return null;
+
+    var sources = std.json.ObjectMap.empty;
+    errdefer sources.deinit(alloc);
+    var fusion_score: f64 = 0;
+    for (hit.index_scores) |score| {
+        var detail = std.json.ObjectMap.empty;
+        errdefer detail.deinit(alloc);
+        try detail.put(alloc, "raw_score", .{ .float = score.score });
+        try detail.put(alloc, "rank", .{ .integer = score.rank });
+        try detail.put(alloc, "calibrated_score", .{ .float = score.normalized_score });
+        try detail.put(alloc, "weight", .{ .float = score.weight });
+        try detail.put(alloc, "contribution", .{ .float = score.contribution });
+        try sources.put(alloc, score.index_name, .{ .object = detail });
+        fusion_score += score.contribution;
+    }
+
+    const final_score: f64 = if (hit.score) |score| score else fusion_score;
+    var explanation = std.json.ObjectMap.empty;
+    errdefer explanation.deinit(alloc);
+    try explanation.put(alloc, "strategy", .{ .string = switch (if (req.merge_config) |config| config.strategy else .rrf) {
+        .rrf => "rrf",
+        .rsf => "rsf",
+    } });
+    try explanation.put(alloc, "fusion_score", .{ .float = fusion_score });
+    try explanation.put(alloc, "final_score", .{ .float = final_score });
+    try explanation.put(alloc, "reranked", .{ .bool = hit.reranked });
+    try explanation.put(alloc, "sources", .{ .object = sources });
+    return .{ .object = explanation };
+}
+
 test "api query contract serializes fused index scores" {
     const alloc = std.testing.allocator;
     const scores = [_]fusion_mod.IndexScore{
@@ -3000,6 +3112,66 @@ test "api query contract serializes fused index scores" {
     try std.testing.expectEqual(@as(usize, 2), object.count());
     try std.testing.expectEqual(@as(f64, 0.75), object.get("text_idx").?.float);
     try std.testing.expectEqual(@as(f64, 0.25), object.get("semantic_idx").?.float);
+}
+
+fn expectScoreExplanationSerializationForTest() !void {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const alloc = arena_impl.allocator();
+    const scores = [_]fusion_mod.IndexScore{
+        .{
+            .index_name = "full_text",
+            .score = 8.0,
+            .rank = 2,
+            .normalized_score = 0.75,
+            .weight = 0.4,
+            .contribution = 0.3,
+        },
+        .{
+            .index_name = "semantic_idx",
+            .score = 0.9,
+            .rank = 1,
+            .normalized_score = 1.0,
+            .weight = 0.7,
+            .contribution = 0.7,
+        },
+    };
+    const hit = db_mod.types.SearchHit{
+        .id = @constCast("doc:a"),
+        .score = 1.25,
+        .reranked = true,
+        .index_scores = @constCast(&scores),
+    };
+    const value = (try scoreExplanationJsonValue(alloc, .{
+        .explain = true,
+        .merge_config = .{ .strategy = .rsf },
+    }, hit)).?;
+
+    const explanation = value.object;
+    try std.testing.expectEqualStrings("rsf", explanation.get("strategy").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), explanation.get("fusion_score").?.float, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.25), explanation.get("final_score").?.float, 1e-12);
+    try std.testing.expect(explanation.get("reranked").?.bool);
+    const sources = explanation.get("sources").?.object;
+    const semantic = sources.get("semantic_idx").?.object;
+    try std.testing.expectEqual(@as(i64, 1), semantic.get("rank").?.integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.7), semantic.get("contribution").?.float, 1e-12);
+
+    var parsed_request = try parseQueryRequest(alloc, null, "docs",
+        \\{"full_text_search":{"match":{"field":"body","text":"raft"}},"explain":true}
+    );
+    defer parsed_request.deinit(alloc);
+    try std.testing.expect(parsed_request.req.explain);
+
+    const unrequested_hit = db_mod.types.SearchHit{
+        .id = @constCast("doc:a"),
+        .score = 1,
+        .index_scores = @constCast(&[_]fusion_mod.IndexScore{.{
+            .index_name = "semantic",
+            .score = 1,
+        }}),
+    };
+    try std.testing.expect((try scoreExplanationJsonValue(alloc, .{}, unrequested_hit)) == null);
 }
 
 fn expectSortProfileDiagnosticsSerializationForTest() !void {
@@ -4601,9 +4773,13 @@ fn parseMergeConfig(alloc: std.mem.Allocator, generated: indexes_openapi.MergeCo
             .failover => return error.UnsupportedQueryRequest,
         };
     }
-    if (generated.rank_constant) |rank_constant| config.rank_constant = rank_constant;
+    if (generated.rank_constant) |rank_constant| {
+        if (!std.math.isFinite(rank_constant) or rank_constant <= 0) return error.InvalidQueryRequest;
+        config.rank_constant = rank_constant;
+    }
     if (generated.window_size) |window_size| {
         config.window_size = std.math.cast(u32, window_size) orelse return error.InvalidQueryRequest;
+        if (config.window_size == 0) return error.InvalidQueryRequest;
     }
     if (generated.weights) |weights| {
         var named = try alloc.alloc(fusion_mod.NamedWeight, weights.map.count());
@@ -4613,6 +4789,7 @@ fn parseMergeConfig(alloc: std.mem.Allocator, generated: indexes_openapi.MergeCo
             alloc.free(named);
         }
         for (weights.map.keys(), weights.map.values()) |name, weight| {
+            if (name.len == 0 or !std.math.isFinite(weight) or weight < 0) return error.InvalidQueryRequest;
             named[initialized] = .{
                 .name = try alloc.dupe(u8, name),
                 .weight = weight,
@@ -4622,6 +4799,81 @@ fn parseMergeConfig(alloc: std.mem.Allocator, generated: indexes_openapi.MergeCo
         config.weights = named;
     }
     return config;
+}
+
+fn validateFusionSourceNames(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) !void {
+    var names = std.StringHashMapUnmanaged(void).empty;
+    defer names.deinit(alloc);
+
+    if (req.full_text_queries.len > 0) {
+        for (req.full_text_queries) |query| try putUniqueFusionSourceName(alloc, &names, query.name);
+    } else if (req.full_text != null) {
+        try putUniqueFusionSourceName(alloc, &names, "full_text");
+    }
+
+    if (req.dense_queries.len > 0) {
+        for (req.dense_queries) |query| try putUniqueFusionSourceName(alloc, &names, query.name);
+    } else if (req.dense != null) {
+        try putUniqueFusionSourceName(alloc, &names, "$embeddings_results");
+    }
+    if (req.sparse_queries.len > 0) {
+        for (req.sparse_queries) |query| try putUniqueFusionSourceName(alloc, &names, query.name);
+    } else if (req.sparse != null) {
+        try putUniqueFusionSourceName(alloc, &names, "$embeddings_results");
+    }
+
+    for (req.doc_filter_bindings) |binding| {
+        try putUniqueFusionSourceName(alloc, &names, binding.name);
+    }
+    for (req.graph_queries) |query| {
+        try putUniqueFusionSourceName(alloc, &names, query.name);
+    }
+
+    if (req.merge_config) |merge_config| {
+        for (merge_config.weights) |weight| {
+            if (!names.contains(weight.name)) return error.InvalidQueryRequest;
+        }
+
+        var has_base_candidate_source = req.full_text != null or
+            req.full_text_queries.len > 0 or
+            req.dense != null or
+            req.sparse != null or
+            req.dense_queries.len > 0 or
+            req.sparse_queries.len > 0;
+        if (!has_base_candidate_source) {
+            for (req.graph_queries) |query| {
+                if (fusionWeightForName(merge_config.weights, query.name) > 0) {
+                    has_base_candidate_source = true;
+                    break;
+                }
+            }
+        }
+        if (!has_base_candidate_source) {
+            for (req.doc_filter_bindings) |binding| {
+                if (fusionWeightForName(merge_config.weights, binding.name) > 0) {
+                    return error.InvalidQueryRequest;
+                }
+            }
+        }
+    }
+}
+
+fn putUniqueFusionSourceName(
+    alloc: std.mem.Allocator,
+    names: *std.StringHashMapUnmanaged(void),
+    name: []const u8,
+) !void {
+    if (name.len == 0) return error.InvalidQueryRequest;
+    const entry = try names.getOrPut(alloc, name);
+    if (entry.found_existing) return error.InvalidQueryRequest;
+    entry.value_ptr.* = {};
+}
+
+fn fusionWeightForName(weights: []const fusion_mod.NamedWeight, name: []const u8) f64 {
+    for (weights) |weight| {
+        if (std.mem.eql(u8, weight.name, name)) return weight.weight;
+    }
+    return 0;
 }
 
 fn parsePruner(generated: indexes_openapi.Pruner) !fusion_mod.Pruner {
@@ -5774,7 +6026,9 @@ fn buildSemanticVectorQueries(
     request: metadata_openapi.QueryRequest,
     limit: u32,
 ) !NamedVectorQueries {
-    if (request.semantic_search == null and request.embeddings == null) return .{};
+    if (request.semantic_search == null and request.embeddings == null and request.hypervector_queries == null) return .{};
+    if (request.hypervector_queries != null and request.semantic_search == null) return error.UnsupportedQueryRequest;
+    if (request.hypervector_queries != null and request.embeddings != null) return error.UnsupportedQueryRequest;
 
     var parsed_embeddings = try public_search_request_mod.parseEmbeddingsAlloc(alloc, request, limit);
     defer parsed_embeddings.deinit(alloc);
@@ -5786,6 +6040,19 @@ fn buildSemanticVectorQueries(
     }
 
     if (index_names.len == 0) return error.UnsupportedQueryRequest;
+    if (request.hypervector_queries) |queries| {
+        var query_iterator = queries.map.iterator();
+        while (query_iterator.next()) |entry| {
+            var found = false;
+            for (index_names) |index_name| {
+                if (std.mem.eql(u8, index_name, entry.key_ptr.*)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnsupportedQueryRequest;
+        }
+    }
 
     var dense_queries = std.ArrayListUnmanaged(db_mod.types.NamedDenseQuery).empty;
     errdefer freeNamedDenseQueries(alloc, dense_queries.items);
@@ -5817,10 +6084,24 @@ fn buildSemanticVectorQueries(
         }
         if (request.semantic_search) |semantic_search| {
             const resolver = semantic_resolver orelse return error.UnsupportedQueryRequest;
+            const hypervector_associations_json = if (request.hypervector_queries) |queries| blk: {
+                const associations = queries.map.get(index_name) orelse break :blk null;
+                if (associations != .object) return error.UnsupportedQueryRequest;
+                break :blk try std.json.Stringify.valueAlloc(alloc, associations, .{});
+            } else null;
+            defer if (hypervector_associations_json) |raw| alloc.free(raw);
             try dense_queries.append(alloc, .{
                 .name = try alloc.dupe(u8, index_name),
                 .index_name = try alloc.dupe(u8, index_name),
-                .query = try resolver.resolveDenseQuery(alloc, table_name, index_name, semantic_search, request.embedding_template, limit),
+                .query = try resolver.resolveDenseQuery(
+                    alloc,
+                    table_name,
+                    index_name,
+                    semantic_search,
+                    request.embedding_template,
+                    hypervector_associations_json,
+                    limit,
+                ),
             });
             continue;
         }
@@ -5838,7 +6119,9 @@ fn buildPreflightSemanticVectorQueries(
     request: metadata_openapi.QueryRequest,
     limit: u32,
 ) !NamedVectorQueries {
-    if (request.semantic_search == null and request.embeddings == null) return .{};
+    if (request.semantic_search == null and request.embeddings == null and request.hypervector_queries == null) return .{};
+    if (request.hypervector_queries != null and request.semantic_search == null) return error.UnsupportedQueryRequest;
+    if (request.hypervector_queries != null and request.embeddings != null) return error.UnsupportedQueryRequest;
 
     var parsed_embeddings = try public_search_request_mod.parseEmbeddingsAlloc(alloc, request, limit);
     defer parsed_embeddings.deinit(alloc);
@@ -6237,6 +6520,25 @@ fn queryBodyHasPublicDocFilterBindings(alloc: std.mem.Allocator, body: []const u
     return parsed.value.object.get("with") != null;
 }
 
+fn parseInternalFusionCandidateWindow(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    req: *db_mod.types.SearchRequest,
+) !void {
+    if (std.mem.indexOf(u8, body, "\"_fusion_candidate_window\"") == null) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const value = parsed.value.object.get("_fusion_candidate_window") orelse return;
+    const window: u32 = switch (value) {
+        .integer => |number| std.math.cast(u32, number) orelse return error.InvalidQueryRequest,
+        .number_string => |number| std.fmt.parseUnsigned(u32, number, 10) catch return error.InvalidQueryRequest,
+        else => return error.InvalidQueryRequest,
+    };
+    if (window == 0) return error.InvalidQueryRequest;
+    req.fusion_candidate_window = window;
+}
+
 fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
@@ -6302,6 +6604,8 @@ fn objectHasInternalShardField(object: std.json.ObjectMap) bool {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_hypervector_identities",
+        "_fusion_candidate_window",
         db_mod.doc_filter_wire.field_name,
         "_filter_doc_ids",
         "_filter_doc_ids_positive",
@@ -6418,6 +6722,8 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_hypervector_identities",
+        "_fusion_candidate_window",
         db_mod.doc_filter_wire.field_name,
         "_filter_doc_ids",
         "_filter_doc_ids_positive",
@@ -6538,6 +6844,37 @@ fn parseInternalDocIdConstraintsAlloc(
             if (generation == null or generation.? != ctx.identity_read_generation) return error.InvalidQueryRequest;
         }
         req.identity_read_generation = generation;
+    }
+}
+
+fn applyInternalHypervectorIdentities(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    dense_queries: []const db_mod.types.NamedDenseQuery,
+) !void {
+    if (std.mem.indexOf(u8, body, "\"_hypervector_identities\"") == null) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const identities = parsed.value.object.get("_hypervector_identities") orelse return;
+    if (identities != .object) return error.InvalidQueryRequest;
+
+    var iterator = identities.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != .string or entry.value_ptr.string.len != 64) {
+            return error.InvalidQueryRequest;
+        }
+        var fingerprint: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&fingerprint, entry.value_ptr.string) catch return error.InvalidQueryRequest;
+        var found = false;
+        for (@constCast(dense_queries)) |*dense_query| {
+            if (!std.mem.eql(u8, dense_query.index_name, entry.key_ptr.*)) continue;
+            if (dense_query.query.coordinate_fingerprint != null) return error.InvalidQueryRequest;
+            dense_query.query.coordinate_fingerprint = fingerprint;
+            found = true;
+            break;
+        }
+        if (!found) return error.InvalidQueryRequest;
     }
 }
 
