@@ -2236,6 +2236,7 @@ fn attachSessionRunAdmission(
     backend_runtime: backends.BackendRuntime,
     limits: runtime.tier.memory.Limits,
     resident: runtime.tier.memory.AdmissionAmounts,
+    man: ?*const manifest_mod.ModelManifest,
 ) void {
     const weight_bytes = std.math.add(
         usize,
@@ -2250,6 +2251,13 @@ fn attachSessionRunAdmission(
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
         .backend_workspace_reserved = backend_runtime.backend == .onnx and
             backend_runtime.onnx_execution_provider == .cuda,
+        .model_profile = if (man) |manifest| .{
+            .hidden_size = manifest.hidden_size,
+            .intermediate_size = manifest.intermediate_size,
+            .attention_heads = manifest.num_attention_heads,
+            .quadratic_attention = backend_runtime.backend == .onnx and
+                backend_runtime.onnx_execution_provider != .cuda,
+        } else .{},
     };
 }
 
@@ -2994,6 +3002,7 @@ pub const ModelManager = struct {
                         backend_runtime,
                         admission_limits,
                         resident_amounts,
+                        null,
                     );
                 }
                 return .{
@@ -4347,6 +4356,7 @@ fn loadSessionForPreferredBackends(
                     backend_runtime,
                     admission_limits,
                     resident_amounts,
+                    &man,
                 );
             }
             return .{ .session = session, .resource_lease = resource_lease };

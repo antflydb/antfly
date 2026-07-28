@@ -42,6 +42,14 @@ pub const TensorInfo = struct {
     shape: []const i64,
 };
 
+/// Optional ownership hook for resources whose lifetime must cover the tensor.
+/// Session output admission uses one shared ref-counted hook across a returned
+/// tensor batch, without coupling this low-level type to the memory controller.
+pub const Lifetime = struct {
+    context: *anyopaque,
+    release: *const fn (*anyopaque) void,
+};
+
 /// A multi-dimensional tensor backed by a flat buffer.
 pub const Tensor = struct {
     data: []u8,
@@ -53,6 +61,7 @@ pub const Tensor = struct {
     owns_shape: bool,
     /// When set, `data` is a slice inside this stable mmap-backed byte range.
     mmap_source_bytes: ?[]const u8 = null,
+    lifetime: ?Lifetime = null,
 
     pub fn initFloat32(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const f32) !Tensor {
         const bytes = std.mem.sliceAsBytes(data);
@@ -198,6 +207,10 @@ pub const Tensor = struct {
     pub fn deinit(self: *Tensor) void {
         if (self.owns_data) self.allocator.free(self.data);
         if (self.owns_shape) self.allocator.free(self.shape);
+        if (self.lifetime) |lifetime| {
+            self.lifetime = null;
+            lifetime.release(lifetime.context);
+        }
     }
 };
 

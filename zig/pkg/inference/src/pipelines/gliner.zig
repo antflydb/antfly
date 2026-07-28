@@ -375,7 +375,31 @@ pub const GlinerPipeline = struct {
         }
 
         const batch = texts.len;
-        const batch_num_spans = max_num_words * max_width;
+        const batch_num_spans = std.math.mul(usize, max_num_words, max_width) catch
+            return error.ResourceLimitExceeded;
+        const token_elements = std.math.mul(usize, batch, max_seq_len) catch
+            return error.ResourceLimitExceeded;
+        const span_elements = std.math.mul(
+            usize,
+            std.math.mul(usize, batch, batch_num_spans) catch
+                return error.ResourceLimitExceeded,
+            2,
+        ) catch return error.ResourceLimitExceeded;
+        const input_elements = std.math.add(
+            usize,
+            std.math.mul(usize, token_elements, 3) catch
+                return error.ResourceLimitExceeded,
+            span_elements,
+        ) catch return error.ResourceLimitExceeded;
+        const input_bytes = std.math.mul(usize, input_elements, @sizeOf(i64)) catch
+            return error.ResourceLimitExceeded;
+        var run_permit = try self.session.admit(.{
+            .batch = batch,
+            .sequence = max_seq_len,
+            .input_bytes = input_bytes,
+            .host_preprocess_bytes = input_bytes,
+        });
+        defer run_permit.deinit();
         const pack_start_ns = glinerProfileStart(profile_enabled);
         const input_ids_buf = try alloc.alloc(i64, batch * max_seq_len);
         defer alloc.free(input_ids_buf);
@@ -421,7 +445,7 @@ pub const GlinerPipeline = struct {
         const pack_ms = glinerProfileElapsedMs(pack_start_ns);
 
         const session_start_ns = glinerProfileStart(profile_enabled);
-        const outputs = try self.session.run(&.{
+        const outputs = try run_permit.run(&.{
             input_ids_tensor,
             attention_mask_tensor,
             words_mask_tensor,
@@ -540,6 +564,32 @@ pub const GlinerPipeline = struct {
         flat_ner: bool,
     ) ![]Entity {
         const alloc = self.allocator;
+        const input_elements = std.math.add(
+            usize,
+            std.math.add(
+                usize,
+                row.input_ids.len,
+                row.attention_mask.len,
+            ) catch return error.ResourceLimitExceeded,
+            std.math.add(
+                usize,
+                std.math.add(
+                    usize,
+                    row.text_positions.len,
+                    row.schema_positions.len,
+                ) catch return error.ResourceLimitExceeded,
+                row.span_idx.len,
+            ) catch return error.ResourceLimitExceeded,
+        ) catch return error.ResourceLimitExceeded;
+        const input_bytes = std.math.mul(usize, input_elements, @sizeOf(i64)) catch
+            return error.ResourceLimitExceeded;
+        var run_permit = try self.session.admit(.{
+            .batch = 1,
+            .sequence = row.input_ids.len,
+            .input_bytes = input_bytes,
+            .host_preprocess_bytes = input_bytes,
+        });
+        defer run_permit.deinit();
         const seq: i64 = @intCast(row.input_ids.len);
         const shape_2d = [_]i64{ 1, seq };
         var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape_2d, row.input_ids);
@@ -559,7 +609,7 @@ pub const GlinerPipeline = struct {
         var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, row.span_idx);
         defer span_idx_tensor.deinit();
 
-        const outputs = try self.session.run(&.{
+        const outputs = try run_permit.run(&.{
             input_ids_tensor,
             attention_mask_tensor,
             text_positions_tensor,
@@ -1058,6 +1108,30 @@ pub const GlinerPipeline = struct {
 
         var seq_len = schema_len + text_ids.items.len;
         if (seq_len > max_len) seq_len = max_len;
+        const admitted_span_elements = std.math.mul(
+            usize,
+            std.math.mul(usize, num_words, max_width) catch
+                return error.ResourceLimitExceeded,
+            2,
+        ) catch return error.ResourceLimitExceeded;
+        const admitted_input_elements = std.math.add(
+            usize,
+            std.math.mul(usize, seq_len, 3) catch
+                return error.ResourceLimitExceeded,
+            admitted_span_elements,
+        ) catch return error.ResourceLimitExceeded;
+        const admitted_input_bytes = std.math.mul(
+            usize,
+            admitted_input_elements,
+            @sizeOf(i64),
+        ) catch return error.ResourceLimitExceeded;
+        var run_permit = try self.session.admit(.{
+            .batch = 1,
+            .sequence = seq_len,
+            .input_bytes = admitted_input_bytes,
+            .host_preprocess_bytes = admitted_input_bytes,
+        });
+        defer run_permit.deinit();
 
         const input_ids_buf = try alloc.alloc(i64, seq_len);
         defer alloc.free(input_ids_buf);
@@ -1129,7 +1203,7 @@ pub const GlinerPipeline = struct {
         var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, span_idx_buf);
         defer span_idx_tensor.deinit();
 
-        const outputs = try self.session.run(&.{
+        const outputs = try run_permit.run(&.{
             input_ids_tensor,
             attention_mask_tensor,
             words_mask_tensor,
