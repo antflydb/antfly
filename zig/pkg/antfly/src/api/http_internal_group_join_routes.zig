@@ -107,6 +107,7 @@ fn joinRouteErrorResponse(alloc: std.mem.Allocator, err: anyerror, invalid_messa
     return switch (err) {
         error.InvalidQueryRequest, error.UnsupportedQueryRequest => try http_route_helpers.textResponse(alloc, 400, invalid_message),
         error.TableNotFound, error.UnknownGroup => try http_route_helpers.textResponse(alloc, 404, "not found"),
+        error.Timeout => try http_route_helpers.textResponse(alloc, 408, "query timeout"),
         error.TopologyChanged => try http_route_helpers.textResponse(alloc, 409, "topology changed"),
         error.DocIdentityNamespaceMismatch => try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
         else => err,

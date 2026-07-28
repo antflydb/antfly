@@ -64,6 +64,7 @@ pub const QueryParams = struct {
     limit: ?usize = null,
     offset: usize = 0,
     order_by: []SortField = &.{},
+    execution_deadline_ns: ?u64 = null,
 
     pub fn deinit(self: *QueryParams, alloc: Allocator) void {
         alloc.free(self.table);
@@ -95,6 +96,7 @@ pub const AggregateParams = struct {
     filter_query_json: ?[]u8 = null,
     columns: []Column = &.{},
     aggregations: []NamedAggregation = &.{},
+    execution_deadline_ns: ?u64 = null,
 
     pub fn deinit(self: *AggregateParams, alloc: Allocator) void {
         alloc.free(self.table);

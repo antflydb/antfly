@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const platform_time = @import("antfly_platform").time;
 const builtin = @import("builtin");
 const filter = @import("filter.zig");
 const foreign_source = @import("source.zig");
@@ -37,11 +38,20 @@ const PGRES_FATAL_ERROR: ExecStatusType = 7;
 const PG_DIAG_SQLSTATE: c_int = 'C';
 
 const FnPQconnectdb = *const fn ([*:0]const u8) callconv(.c) ?*PGconn;
+const FnPQconnectStart = *const fn ([*:0]const u8) callconv(.c) ?*PGconn;
+const FnPQconnectPoll = *const fn (?*PGconn) callconv(.c) c_uint;
 const FnPQexec = *const fn (?*PGconn, [*:0]const u8) callconv(.c) ?*PGresult;
 const FnPQstatus = *const fn (?*PGconn) callconv(.c) ConnStatusType;
 const FnPQerrorMessage = *const fn (?*PGconn) callconv(.c) [*:0]const u8;
 const FnPQfinish = *const fn (?*PGconn) callconv(.c) void;
 const FnPQexecParams = *const fn (?*PGconn, [*:0]const u8, c_int, ?[*]const Oid, ?[*]const ?[*:0]const u8, ?[*]const c_int, ?[*]const c_int, c_int) callconv(.c) ?*PGresult;
+const FnPQsendQueryParams = *const fn (?*PGconn, [*:0]const u8, c_int, ?[*]const Oid, ?[*]const ?[*:0]const u8, ?[*]const c_int, ?[*]const c_int, c_int) callconv(.c) c_int;
+const FnPQsetnonblocking = *const fn (?*PGconn, c_int) callconv(.c) c_int;
+const FnPQflush = *const fn (?*PGconn) callconv(.c) c_int;
+const FnPQconsumeInput = *const fn (?*PGconn) callconv(.c) c_int;
+const FnPQisBusy = *const fn (?*PGconn) callconv(.c) c_int;
+const FnPQgetResult = *const fn (?*PGconn) callconv(.c) ?*PGresult;
+const FnPQsocket = *const fn (?*PGconn) callconv(.c) c_int;
 const FnPQresultStatus = *const fn (?*PGresult) callconv(.c) ExecStatusType;
 const FnPQresultErrorMessage = *const fn (?*PGresult) callconv(.c) [*:0]const u8;
 const FnPQresultErrorField = *const fn (?*PGresult, c_int) callconv(.c) ?[*:0]const u8;
@@ -75,11 +85,20 @@ pub const Executor = struct {
     connections: std.StringHashMapUnmanaged(*PGconn) = .empty,
 
     pqconnectdb: FnPQconnectdb,
+    pqconnectStart: FnPQconnectStart,
+    pqconnectPoll: FnPQconnectPoll,
     pqexec: FnPQexec,
     pqstatus: FnPQstatus,
     pqerrorMessage: FnPQerrorMessage,
     pqfinish: FnPQfinish,
     pqexecParams: FnPQexecParams,
+    pqsendQueryParams: FnPQsendQueryParams,
+    pqsetnonblocking: FnPQsetnonblocking,
+    pqflush: FnPQflush,
+    pqconsumeInput: FnPQconsumeInput,
+    pqisBusy: FnPQisBusy,
+    pqgetResult: FnPQgetResult,
+    pqsocket: FnPQsocket,
     pqresultStatus: FnPQresultStatus,
     pqresultErrorMessage: FnPQresultErrorMessage,
     pqresultErrorField: FnPQresultErrorField,
@@ -99,11 +118,20 @@ pub const Executor = struct {
             .alloc = alloc,
             .lib = lib,
             .pqconnectdb = try lookupRequired(&lib, FnPQconnectdb, "PQconnectdb"),
+            .pqconnectStart = try lookupRequired(&lib, FnPQconnectStart, "PQconnectStart"),
+            .pqconnectPoll = try lookupRequired(&lib, FnPQconnectPoll, "PQconnectPoll"),
             .pqexec = try lookupRequired(&lib, FnPQexec, "PQexec"),
             .pqstatus = try lookupRequired(&lib, FnPQstatus, "PQstatus"),
             .pqerrorMessage = try lookupRequired(&lib, FnPQerrorMessage, "PQerrorMessage"),
             .pqfinish = try lookupRequired(&lib, FnPQfinish, "PQfinish"),
             .pqexecParams = try lookupRequired(&lib, FnPQexecParams, "PQexecParams"),
+            .pqsendQueryParams = try lookupRequired(&lib, FnPQsendQueryParams, "PQsendQueryParams"),
+            .pqsetnonblocking = try lookupRequired(&lib, FnPQsetnonblocking, "PQsetnonblocking"),
+            .pqflush = try lookupRequired(&lib, FnPQflush, "PQflush"),
+            .pqconsumeInput = try lookupRequired(&lib, FnPQconsumeInput, "PQconsumeInput"),
+            .pqisBusy = try lookupRequired(&lib, FnPQisBusy, "PQisBusy"),
+            .pqgetResult = try lookupRequired(&lib, FnPQgetResult, "PQgetResult"),
+            .pqsocket = try lookupRequired(&lib, FnPQsocket, "PQsocket"),
             .pqresultStatus = try lookupRequired(&lib, FnPQresultStatus, "PQresultStatus"),
             .pqresultErrorMessage = try lookupRequired(&lib, FnPQresultErrorMessage, "PQresultErrorMessage"),
             .pqresultErrorField = try lookupRequired(&lib, FnPQresultErrorField, "PQresultErrorField"),
@@ -161,11 +189,15 @@ pub const Executor = struct {
         alloc.destroy(self);
     }
 
-    fn query(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+    fn query(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64) !foreign_source.QueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        lock(&self.exec_mutex);
+        lockUntil(&self.exec_mutex, execution_deadline_ns) catch |err| {
+            var owned = prepared;
+            owned.deinit(alloc);
+            return err;
+        };
         defer self.exec_mutex.unlock();
-        return try self.queryPreparedAlloc(alloc, dsn, prepared);
+        return try self.queryPreparedAllocWithDeadline(alloc, dsn, prepared, execution_deadline_ns);
     }
 
     fn statistics(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8) !foreign_source.TableStatistics {
@@ -181,11 +213,11 @@ pub const Executor = struct {
         return .{};
     }
 
-    fn discoverColumns(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8) ![]foreign_source.Column {
+    fn discoverColumns(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) ![]foreign_source.Column {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        lock(&self.exec_mutex);
+        try lockUntil(&self.exec_mutex, execution_deadline_ns);
         defer self.exec_mutex.unlock();
-        return try self.discoverColumnsAlloc(alloc, dsn, table);
+        return try self.discoverColumnsAllocWithDeadline(alloc, dsn, table, execution_deadline_ns);
     }
 
     const SnapshotQuery = struct {
@@ -204,24 +236,38 @@ pub const Executor = struct {
 
         fn destroy(ptr: *anyopaque, alloc: Allocator) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const exec_mutex = &self.executor.exec_mutex;
-            lock(exec_mutex);
-            _ = self.executor.execSimpleAllowCommand(self.conn, alloc, "ROLLBACK") catch {};
-            self.executor.pqfinish(self.conn);
-            exec_mutex.unlock();
+            if (self.conn) |conn| {
+                const exec_mutex = &self.executor.exec_mutex;
+                lock(exec_mutex);
+                _ = self.executor.execSimpleAllowCommand(conn, alloc, "ROLLBACK") catch {};
+                self.executor.pqfinish(conn);
+                exec_mutex.unlock();
+            }
             alloc.destroy(self);
         }
 
-        fn query(ptr: *anyopaque, alloc: Allocator, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+        fn query(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            prepared: sql.PreparedQuery,
+            execution_deadline_ns: ?u64,
+        ) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            lock(&self.executor.exec_mutex);
-            defer self.executor.exec_mutex.unlock();
-
             var owned = prepared;
             defer owned.deinit(alloc);
-            const result = try self.executor.execPrepared(self.conn, alloc, owned);
+            try lockUntil(&self.executor.exec_mutex, execution_deadline_ns);
+            defer self.executor.exec_mutex.unlock();
+
+            const conn = self.conn orelse return error.ForeignConnectionFailed;
+            const result = self.executor.execPreparedWithDeadline(conn, alloc, owned, execution_deadline_ns) catch |err| {
+                if (invalidatesConnection(err)) {
+                    self.executor.pqfinish(conn);
+                    self.conn = null;
+                }
+                return err;
+            };
             defer self.executor.pqclear(result);
-            return try self.executor.readQueryResultAlloc(alloc, result);
+            return try self.executor.readQueryResultAllocWithDeadline(alloc, result, execution_deadline_ns);
         }
     };
 
@@ -315,16 +361,29 @@ pub const Executor = struct {
     }
 
     fn queryPreparedAlloc(self: *@This(), alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+        return try self.queryPreparedAllocWithDeadline(alloc, dsn, prepared, null);
+    }
+
+    fn queryPreparedAllocWithDeadline(
+        self: *@This(),
+        alloc: Allocator,
+        dsn: []const u8,
+        prepared: sql.PreparedQuery,
+        execution_deadline_ns: ?u64,
+    ) !foreign_source.QueryResult {
         var owned = prepared;
         defer owned.deinit(alloc);
 
         std.log.info("postgres libpq query begin sql_len={d}", .{owned.sql_text.len});
-        const conn = try self.connect(dsn);
+        const conn = try self.connectWithDeadline(dsn, execution_deadline_ns);
         std.log.info("postgres libpq query connected sql_len={d}", .{owned.sql_text.len});
-        const result = try self.execPrepared(conn, alloc, owned);
+        const result = self.execPreparedWithDeadline(conn, alloc, owned, execution_deadline_ns) catch |err| {
+            if (invalidatesConnection(err)) self.invalidateConnection(dsn, conn);
+            return err;
+        };
         defer self.pqclear(result);
 
-        return try self.readQueryResultAlloc(alloc, result);
+        return try self.readQueryResultAllocWithDeadline(alloc, result, execution_deadline_ns);
     }
 
     fn statisticsAlloc(self: *@This(), alloc: Allocator, dsn: []const u8, table: []const u8) !foreign_source.TableStatistics {
@@ -351,12 +410,28 @@ pub const Executor = struct {
     }
 
     fn discoverColumnsAlloc(self: *@This(), alloc: Allocator, dsn: []const u8, table: []const u8) ![]foreign_source.Column {
-        lock(&self.cache_mutex);
+        return try self.discoverColumnsAllocWithDeadline(alloc, dsn, table, null);
+    }
+
+    fn discoverColumnsAllocWithDeadline(
+        self: *@This(),
+        alloc: Allocator,
+        dsn: []const u8,
+        table: []const u8,
+        execution_deadline_ns: ?u64,
+    ) ![]foreign_source.Column {
+        try lockUntil(&self.cache_mutex, execution_deadline_ns);
         defer self.cache_mutex.unlock();
 
-        if (self.columns_cache.get(table)) |cached| return try cloneColumnsAlloc(alloc, cached);
+        if (self.columns_cache.get(table)) |cached| {
+            if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
+            const cloned = try cloneColumnsAlloc(alloc, cached);
+            errdefer freeColumns(alloc, cloned);
+            if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
+            return cloned;
+        }
 
-        const conn = try self.connect(dsn);
+        const conn = try self.connectWithDeadline(dsn, execution_deadline_ns);
         const args = try alloc.alloc(sql.ParameterValue, 1);
         args[0] = .{ .string = try alloc.dupe(u8, table) };
 
@@ -366,15 +441,28 @@ pub const Executor = struct {
         };
         defer prepared.deinit(alloc);
 
-        const result = try self.execPrepared(conn, alloc, prepared);
+        const result = self.execPreparedWithDeadline(conn, alloc, prepared, execution_deadline_ns) catch |err| {
+            if (invalidatesConnection(err)) self.invalidateConnection(dsn, conn);
+            return err;
+        };
         defer self.pqclear(result);
 
         const column_count: usize = @intCast(self.pqntuples(result));
         if (column_count == 0) return error.ForeignTableNotFound;
 
         const discovered = try alloc.alloc(foreign_source.Column, column_count);
-        errdefer freeColumns(alloc, discovered);
+        var initialized_columns: usize = 0;
+        errdefer {
+            for (discovered[0..initialized_columns]) |*column| column.deinit(alloc);
+            alloc.free(discovered);
+        }
+        var rows_until_deadline_check: u8 = 1;
         for (0..column_count) |row_idx| {
+            rows_until_deadline_check -|= 1;
+            if (rows_until_deadline_check == 0) {
+                rows_until_deadline_check = 64;
+                if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
+            }
             const row: c_int = @intCast(row_idx);
             const name = try copyCellAlloc(alloc, self.pqgetvalue(result, row, 0), @intCast(self.pqgetlength(result, row, 0)));
             errdefer alloc.free(name);
@@ -387,12 +475,14 @@ pub const Executor = struct {
                 .data_type = data_type,
                 .nullable = std.mem.eql(u8, nullable_text, "YES"),
             };
+            initialized_columns += 1;
         }
 
         const cache_key = try self.alloc.dupe(u8, table);
         errdefer self.alloc.free(cache_key);
         const cached_columns = try cloneColumnsAlloc(self.alloc, discovered);
         errdefer freeColumns(self.alloc, cached_columns);
+        if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
         try self.columns_cache.put(self.alloc, cache_key, cached_columns);
 
         return discovered;
@@ -421,6 +511,74 @@ pub const Executor = struct {
         return conn;
     }
 
+    fn connectWithDeadline(self: *@This(), dsn: []const u8, execution_deadline_ns: ?u64) !?*PGconn {
+        const deadline_ns = execution_deadline_ns orelse return try self.connect(dsn);
+        try ensureDeadline(deadline_ns);
+        if (self.connections.get(dsn)) |cached| {
+            if (self.pqstatus(cached) == CONNECTION_OK) return cached;
+            self.invalidateConnection(dsn, cached);
+        }
+
+        const dsn_z = try self.alloc.dupeZ(u8, dsn);
+        defer self.alloc.free(dsn_z);
+        const conn = self.pqconnectStart(dsn_z.ptr) orelse return error.ForeignConnectionFailed;
+        errdefer self.pqfinish(conn);
+        if (self.pqsetnonblocking(conn, 1) != 0) return error.ForeignConnectionFailed;
+
+        while (true) {
+            const polling_status = self.pqconnectPoll(conn);
+            switch (polling_status) {
+                0 => return error.ForeignConnectionFailed,
+                1 => try self.waitForSocket(conn, std.posix.POLL.IN, deadline_ns),
+                2 => try self.waitForSocket(conn, std.posix.POLL.OUT, deadline_ns),
+                3 => break,
+                4 => {
+                    try ensureDeadline(deadline_ns);
+                    spinOrYield();
+                },
+                else => return error.ForeignConnectionFailed,
+            }
+        }
+        if (self.pqstatus(conn) != CONNECTION_OK) return error.ForeignConnectionFailed;
+        if (self.pqsetnonblocking(conn, 0) != 0) return error.ForeignConnectionFailed;
+
+        const owned_dsn = try self.alloc.dupe(u8, dsn);
+        errdefer self.alloc.free(owned_dsn);
+        try self.connections.put(self.alloc, owned_dsn, conn);
+        return conn;
+    }
+
+    fn invalidateConnection(self: *@This(), dsn: []const u8, conn: ?*PGconn) void {
+        if (self.connections.get(dsn)) |cached| {
+            if (cached == conn) {
+                if (self.connections.fetchRemove(dsn)) |removed| {
+                    self.alloc.free(removed.key);
+                    self.pqfinish(removed.value);
+                }
+                return;
+            }
+        }
+        self.pqfinish(conn);
+    }
+
+    fn waitForSocket(self: *@This(), conn: ?*PGconn, events: i16, deadline_ns: u64) !void {
+        const socket = self.pqsocket(conn);
+        if (socket < 0) return error.ForeignConnectionFailed;
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= deadline_ns) return error.Timeout;
+        const remaining_ns = deadline_ns - now_ns;
+        const remaining_ms = @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+        const timeout_ms: i32 = @intCast(@min(remaining_ms, @as(u64, std.math.maxInt(i32))));
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = socket,
+            .events = events,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&poll_fds, timeout_ms) == 0) return error.Timeout;
+        if (poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0)
+            return error.ForeignConnectionFailed;
+    }
+
     fn connectFresh(self: *@This(), alloc: Allocator, dsn: []const u8) !?*PGconn {
         const dsn_z = try alloc.dupeZ(u8, dsn);
         defer alloc.free(dsn_z);
@@ -441,6 +599,65 @@ pub const Executor = struct {
 
     fn execPrepared(self: *@This(), conn: ?*PGconn, alloc: Allocator, prepared: sql.PreparedQuery) !?*PGresult {
         return try self.execPreparedInternal(conn, alloc, prepared, false);
+    }
+
+    fn execPreparedWithDeadline(
+        self: *@This(),
+        conn: ?*PGconn,
+        alloc: Allocator,
+        prepared: sql.PreparedQuery,
+        execution_deadline_ns: ?u64,
+    ) !?*PGresult {
+        const deadline_ns = execution_deadline_ns orelse return try self.execPrepared(conn, alloc, prepared);
+        try ensureDeadline(deadline_ns);
+        var owned_args = try OwnedArgs.init(alloc, prepared.args);
+        defer owned_args.deinit(alloc);
+        const sql_text_z = try alloc.dupeZ(u8, prepared.sql_text);
+        defer alloc.free(sql_text_z);
+
+        if (self.pqsetnonblocking(conn, 1) != 0) return error.ForeignQueryFailed;
+        if (self.pqsendQueryParams(
+            conn,
+            sql_text_z.ptr,
+            @intCast(prepared.args.len),
+            null,
+            if (owned_args.values.len > 0) owned_args.values.ptr else null,
+            if (owned_args.lengths.len > 0) owned_args.lengths.ptr else null,
+            if (owned_args.formats.len > 0) owned_args.formats.ptr else null,
+            0,
+        ) != 1) return error.ForeignQueryFailed;
+
+        while (true) {
+            const flush_status = self.pqflush(conn);
+            if (flush_status == 0) break;
+            if (flush_status < 0) return error.ForeignQueryFailed;
+            try self.waitForSocket(conn, std.posix.POLL.OUT, deadline_ns);
+        }
+        while (self.pqisBusy(conn) != 0) {
+            try self.waitForSocket(conn, std.posix.POLL.IN, deadline_ns);
+            if (self.pqconsumeInput(conn) != 1) return error.ForeignQueryFailed;
+        }
+
+        const result = self.pqgetResult(conn) orelse return error.ForeignQueryFailed;
+        var saw_extra_result = false;
+        while (self.pqgetResult(conn)) |extra_result| {
+            saw_extra_result = true;
+            self.pqclear(extra_result);
+        }
+        if (self.pqsetnonblocking(conn, 0) != 0) {
+            self.pqclear(result);
+            return error.ForeignQueryFailed;
+        }
+        if (saw_extra_result) {
+            self.pqclear(result);
+            return error.ForeignQueryFailed;
+        }
+        const status = self.pqresultStatus(result);
+        if (status != PGRES_TUPLES_OK) {
+            defer self.pqclear(result);
+            return mapResultError(self.pqresultErrorField(result, PG_DIAG_SQLSTATE), self.pqresultErrorMessage(result));
+        }
+        return result;
     }
 
     fn execPreparedAllowCommand(self: *@This(), conn: ?*PGconn, alloc: Allocator, prepared: sql.PreparedQuery) !?*PGresult {
@@ -495,19 +712,27 @@ pub const Executor = struct {
     }
 
     fn readQueryResultAlloc(self: *@This(), alloc: Allocator, result: ?*PGresult) !foreign_source.QueryResult {
+        return try self.readQueryResultAllocWithDeadline(alloc, result, null);
+    }
+
+    fn readQueryResultAllocWithDeadline(
+        self: *@This(),
+        alloc: Allocator,
+        result: ?*PGresult,
+        execution_deadline_ns: ?u64,
+    ) !foreign_source.QueryResult {
         const rows_len: usize = @intCast(self.pqntuples(result));
         const cols_len: usize = @intCast(self.pqnfields(result));
         const rows = try alloc.alloc(std.json.Value, rows_len);
-        errdefer {
-            for (rows[0..rows_len]) |*row| foreign_source.deinitJsonValue(alloc, row);
-            alloc.free(rows);
-        }
+        errdefer alloc.free(rows);
 
         var row_idx: usize = 0;
         errdefer {
             for (rows[0..row_idx]) |*row| foreign_source.deinitJsonValue(alloc, row);
         }
+        var cells_until_deadline_check: u8 = 1;
         while (row_idx < rows_len) : (row_idx += 1) {
+            if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
             var object = std.json.ObjectMap.empty;
             errdefer {
                 var it = object.iterator();
@@ -518,6 +743,11 @@ pub const Executor = struct {
                 object.deinit(alloc);
             }
             for (0..cols_len) |col_idx| {
+                cells_until_deadline_check -|= 1;
+                if (cells_until_deadline_check == 0) {
+                    cells_until_deadline_check = 64;
+                    if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
+                }
                 const col: c_int = @intCast(col_idx);
                 const key_z = self.pqfname(result, col) orelse return error.ForeignQueryFailed;
                 const key = try alloc.dupe(u8, std.mem.span(key_z));
@@ -884,8 +1114,8 @@ const LazyExecutor = struct {
         };
     }
 
-    fn ensureExecutor(self: *@This()) !*Executor {
-        lock(&self.mutex);
+    fn ensureExecutor(self: *@This(), execution_deadline_ns: ?u64) !*Executor {
+        try lockUntil(&self.mutex, execution_deadline_ns);
         defer self.mutex.unlock();
         if (self.executor) |executor| return executor;
 
@@ -908,27 +1138,31 @@ const LazyExecutor = struct {
         alloc.destroy(self);
     }
 
-    fn query(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+    fn query(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64) !foreign_source.QueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const executor = try self.ensureExecutor();
-        return try executor.asQueryExecutor().query(alloc, dsn, prepared);
+        const executor = self.ensureExecutor(execution_deadline_ns) catch |err| {
+            var owned = prepared;
+            owned.deinit(alloc);
+            return err;
+        };
+        return try executor.asQueryExecutor().query(alloc, dsn, prepared, execution_deadline_ns);
     }
 
     fn statistics(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8) !foreign_source.TableStatistics {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const executor = try self.ensureExecutor();
+        const executor = try self.ensureExecutor(null);
         return try executor.asQueryExecutor().statistics(alloc, dsn, table);
     }
 
-    fn discoverColumns(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8) ![]foreign_source.Column {
+    fn discoverColumns(ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) ![]foreign_source.Column {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const executor = try self.ensureExecutor();
-        return try executor.asQueryExecutor().discoverColumns(alloc, dsn, table);
+        const executor = try self.ensureExecutor(execution_deadline_ns);
+        return try executor.asQueryExecutor().discoverColumns(alloc, dsn, table, execution_deadline_ns);
     }
 
     fn beginSnapshotQuery(ptr: *anyopaque, alloc: Allocator, dsn: []const u8) !postgres_source.QueryExecutor.SnapshotQuery {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const executor = try self.ensureExecutor();
+        const executor = try self.ensureExecutor(null);
         return try executor.asQueryExecutor().beginSnapshotQuery(alloc, dsn);
     }
 
@@ -939,7 +1173,7 @@ const LazyExecutor = struct {
         params: foreign_source.ReplicationPollParams,
     ) !postgres_source.QueryExecutor.PreparedReplicationSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const executor = try self.ensureExecutor();
+        const executor = try self.ensureExecutor(null);
         return try executor.asQueryExecutor().beginPreparedReplicationSnapshot(alloc, dsn, params);
     }
 
@@ -950,7 +1184,7 @@ const LazyExecutor = struct {
         params: foreign_source.ReplicationPollParams,
     ) !foreign_source.ReplicationPrepareResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const executor = try self.ensureExecutor();
+        const executor = try self.ensureExecutor(null);
         return try executor.asQueryExecutor().prepareReplication(alloc, dsn, params);
     }
 
@@ -961,7 +1195,7 @@ const LazyExecutor = struct {
         params: foreign_source.ReplicationPollParams,
     ) !foreign_source.ReplicationPollResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const executor = try self.ensureExecutor();
+        const executor = try self.ensureExecutor(null);
         return try executor.asQueryExecutor().pollChanges(alloc, dsn, params);
     }
 
@@ -972,7 +1206,7 @@ const LazyExecutor = struct {
         params: foreign_source.ReplicationCleanupParams,
     ) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const executor = try self.ensureExecutor();
+        const executor = try self.ensureExecutor(null);
         return try executor.asQueryExecutor().cleanupReplication(alloc, dsn, params);
     }
 };
@@ -988,8 +1222,9 @@ fn appendReplicationModeAlloc(alloc: Allocator, dsn: []const u8) ![]u8 {
 fn cloneParameterValuesAlloc(alloc: Allocator, args: []const sql.ParameterValue) ![]sql.ParameterValue {
     if (args.len == 0) return &.{};
     const out = try alloc.alloc(sql.ParameterValue, args.len);
+    var initialized: usize = 0;
     errdefer {
-        for (out[0..]) |*arg| arg.deinit(alloc);
+        for (out[0..initialized]) |*arg| arg.deinit(alloc);
         alloc.free(out);
     }
     for (args, 0..) |arg, i| {
@@ -1000,6 +1235,7 @@ fn cloneParameterValuesAlloc(alloc: Allocator, args: []const sql.ParameterValue)
             .bool => |value| .{ .bool = value },
             .null => .null,
         };
+        initialized += 1;
     }
     return out;
 }
@@ -1327,10 +1563,6 @@ const OwnedArgs = struct {
             for (owned_strings[0..initialized]) |maybe_buffer| {
                 if (maybe_buffer) |buffer| alloc.free(buffer);
             }
-            alloc.free(owned_strings);
-            alloc.free(formats);
-            alloc.free(lengths);
-            alloc.free(values);
         }
 
         for (args, 0..) |arg, idx| {
@@ -1489,7 +1721,13 @@ fn cloneJsonValueAlloc(alloc: Allocator, value: std.json.Value) !std.json.Value 
             }
             var it = obj.iterator();
             while (it.next()) |entry| {
-                try out.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try cloneJsonValueAlloc(alloc, entry.value_ptr.*));
+                {
+                    const key = try alloc.dupe(u8, entry.key_ptr.*);
+                    errdefer alloc.free(key);
+                    var item = try cloneJsonValueAlloc(alloc, entry.value_ptr.*);
+                    errdefer foreign_source.deinitJsonValue(alloc, &item);
+                    try out.put(alloc, key, item);
+                }
             }
             break :blk .{ .object = out };
         },
@@ -1499,13 +1737,22 @@ fn cloneJsonValueAlloc(alloc: Allocator, value: std.json.Value) !std.json.Value 
 fn cloneColumnsAlloc(alloc: Allocator, columns: []const foreign_source.Column) ![]foreign_source.Column {
     if (columns.len == 0) return &.{};
     const out = try alloc.alloc(foreign_source.Column, columns.len);
-    errdefer freeColumns(alloc, out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*column| column.deinit(alloc);
+        alloc.free(out);
+    }
     for (columns, 0..) |column, idx| {
+        const name = try alloc.dupe(u8, column.name);
+        errdefer alloc.free(name);
+        const data_type = try alloc.dupe(u8, column.data_type);
+        errdefer alloc.free(data_type);
         out[idx] = .{
-            .name = try alloc.dupe(u8, column.name),
-            .data_type = try alloc.dupe(u8, column.data_type),
+            .name = name,
+            .data_type = data_type,
             .nullable = column.nullable,
         };
+        initialized += 1;
     }
     return out;
 }
@@ -1517,6 +1764,40 @@ fn freeColumns(alloc: Allocator, columns: []foreign_source.Column) void {
 
 fn lock(mutex: *Mutex) void {
     platform_sync.lockYielding(mutex);
+}
+
+fn ensureDeadline(deadline_ns: u64) !void {
+    if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+}
+
+fn invalidatesConnection(err: anyerror) bool {
+    return err == error.Timeout or
+        err == error.ForeignConnectionFailed or
+        err == error.ForeignQueryFailed;
+}
+
+fn lockUntil(mutex: *Mutex, deadline_ns: ?u64) !void {
+    const deadline = deadline_ns orelse {
+        lock(mutex);
+        return;
+    };
+    while (!mutex.tryLock()) {
+        try ensureDeadline(deadline);
+        spinOrYield();
+    }
+    // Winning the race at the deadline must not start new foreign work.
+    ensureDeadline(deadline) catch |err| {
+        mutex.unlock();
+        return err;
+    };
+}
+
+fn spinOrYield() void {
+    if (builtin.os.tag == .freestanding) {
+        std.atomic.spinLoopHint();
+    } else {
+        std.Thread.yield() catch {};
+    }
 }
 
 pub fn registerDefaultExecutor(alloc: Allocator, registry: *foreign_source.Registry) !void {
@@ -1556,6 +1837,44 @@ test "postgres libpq registration succeeds without libpq and fails on first use"
     defer source.deinit(alloc);
 
     try std.testing.expectError(error.LibpqUnavailable, source.statistics("users"));
+}
+
+test "postgres libpq bounded lock rejects an expired deadline" {
+    var mutex: Mutex = .unlocked;
+    lock(&mutex);
+    defer mutex.unlock();
+    try std.testing.expectError(
+        error.Timeout,
+        lockUntil(&mutex, platform_time.monotonicNs()),
+    );
+}
+
+test "postgres libpq clone helpers are allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var args = [_]sql.ParameterValue{
+                .{ .string = @constCast("value") },
+                .{ .integer = 7 },
+            };
+            const cloned_args = try cloneParameterValuesAlloc(alloc, &args);
+            defer {
+                for (cloned_args) |*arg| arg.deinit(alloc);
+                if (cloned_args.len > 0) alloc.free(cloned_args);
+            }
+            var owned_args = try OwnedArgs.init(alloc, &args);
+            defer owned_args.deinit(alloc);
+
+            var columns = [_]foreign_source.Column{.{
+                .name = @constCast("id"),
+                .data_type = @constCast("uuid"),
+                .nullable = false,
+            }};
+            const cloned_columns = try cloneColumnsAlloc(alloc, &columns);
+            defer freeColumns(alloc, cloned_columns);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "postgres libpq parser decodes pgoutput relation and row changes" {
@@ -2055,7 +2374,7 @@ test "postgres libpq consistent snapshot query holds repeatable read view" {
 
     var first_result = try snapshot.queryPrepared(alloc, .{
         .sql_text = try alloc.dupe(u8, select_sql),
-    });
+    }, null);
     defer first_result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), first_result.rows.len);
 
@@ -2063,7 +2382,7 @@ test "postgres libpq consistent snapshot query holds repeatable read view" {
 
     var second_result = try snapshot.queryPrepared(alloc, .{
         .sql_text = try alloc.dupe(u8, select_sql),
-    });
+    }, null);
     defer second_result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), second_result.rows.len);
     try std.testing.expectEqualStrings("u0", second_result.rows[0].object.get("id").?.string);
@@ -2137,7 +2456,7 @@ test "postgres libpq prepared replication snapshot bridges initial cutover" {
 
     var snapshot_result = try prepared.snapshot_query.queryPrepared(alloc, .{
         .sql_text = try std.fmt.allocPrint(alloc, "SELECT id, name FROM {s} ORDER BY id ASC", .{table_name}),
-    });
+    }, null);
     defer snapshot_result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), snapshot_result.rows.len);
     try std.testing.expectEqualStrings("u0", snapshot_result.rows[0].object.get("id").?.string);

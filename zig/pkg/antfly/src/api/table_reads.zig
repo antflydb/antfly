@@ -13517,6 +13517,18 @@ fn algebraicPartialsRemote(
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
 
+fn internalJoinRequestTimeoutMs(alloc: std.mem.Allocator, body: []const u8) ?u32 {
+    const Envelope = struct {
+        remaining_timeout_ms: ?u64 = null,
+    };
+    var parsed = std.json.parseFromSlice(Envelope, alloc, body, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    const value = parsed.value.remaining_timeout_ms orelse return null;
+    return @intCast(@min(@max(value, 1), std.math.maxInt(u32)));
+}
+
 fn joinPartitionRemote(
     executor: http_common.RequestExecutor,
     alloc: std.mem.Allocator,
@@ -13526,7 +13538,13 @@ fn joinPartitionRemote(
     body: []const u8,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupJoinPartition(base_uri, group_id, table_name, body);
+    var result = try client.fetchGroupJoinPartitionWithTimeout(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        internalJoinRequestTimeoutMs(alloc, body),
+    );
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
@@ -13540,7 +13558,13 @@ fn joinRowsRemote(
     body: []const u8,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupJoinRows(base_uri, group_id, table_name, body);
+    var result = try client.fetchGroupJoinRowsWithTimeout(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        internalJoinRequestTimeoutMs(alloc, body),
+    );
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
@@ -13554,7 +13578,13 @@ fn joinUnmatchedRemote(
     body: []const u8,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupJoinUnmatched(base_uri, group_id, table_name, body);
+    var result = try client.fetchGroupJoinUnmatchedWithTimeout(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        internalJoinRequestTimeoutMs(alloc, body),
+    );
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
@@ -13568,7 +13598,13 @@ fn joinFinalizeRemote(
     body: []const u8,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupJoinFinalize(base_uri, group_id, table_name, body);
+    var result = try client.fetchGroupJoinFinalizeWithTimeout(
+        base_uri,
+        group_id,
+        table_name,
+        body,
+        internalJoinRequestTimeoutMs(alloc, body),
+    );
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }

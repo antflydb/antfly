@@ -1472,7 +1472,7 @@ pub const ApiHttpServer = struct {
         partition_count: usize,
         right_group_ids: []const u64,
     ) ![]u8 {
-        return distributed_join.encodeJoinPartitionRequest(alloc, job_id, join, left_hits, appended_left_field, partition_index, partition_count, right_group_ids);
+        return distributed_join.encodeJoinPartitionRequest(alloc, job_id, join, left_hits, appended_left_field, partition_index, partition_count, right_group_ids, null);
     }
 
     fn encodeJoinFinalizeRequest(
@@ -1486,7 +1486,7 @@ pub const ApiHttpServer = struct {
         appended_left_field: bool,
         shuffle_partitions: usize,
     ) ![]u8 {
-        return distributed_join.encodeJoinFinalizeRequest(alloc, job_id, handoff_owner_group_id, join, left_hits, left_fields, appended_left_field, shuffle_partitions);
+        return distributed_join.encodeJoinFinalizeRequest(alloc, job_id, handoff_owner_group_id, join, left_hits, left_fields, appended_left_field, shuffle_partitions, null);
     }
     fn encodeJoinJobState(_: *const ApiHttpServer, alloc: std.mem.Allocator, job_id: u64, state: JoinShuffleJobState) ![]u8 {
         return distributed_join.encodeJoinJobState(alloc, job_id, state);
@@ -8429,6 +8429,7 @@ pub const ApiHttpServer = struct {
             .order_by = foreign_order_by,
         });
         defer params.deinit(alloc);
+        params.execution_deadline_ns = request_deadline_ns;
         try ensureRequestDeadline(request_deadline_ns);
 
         const source_config = try foreign_source.toSourceConfig(alloc);
@@ -8447,6 +8448,7 @@ pub const ApiHttpServer = struct {
                 filter_query_json,
             );
             defer aggregate_params.deinit(alloc);
+            aggregate_params.execution_deadline_ns = request_deadline_ns;
             var aggregate_result = foreign_query_source.aggregate(alloc, aggregate_params) catch |err| switch (err) {
                 error.UnsupportedAggregate => return error.UnsupportedQueryRequest,
                 else => return err,
@@ -8463,7 +8465,7 @@ pub const ApiHttpServer = struct {
         const result_hits = if (request.count == true)
             try alloc.alloc(db_mod.types.SearchHit, 0)
         else
-            try buildForeignSearchHitsAlloc(alloc, foreign_source, query_result.rows);
+            try buildForeignSearchHitsAlloc(alloc, foreign_source, query_result.rows, request_deadline_ns);
         var result: db_mod.types.SearchResult = .{
             .alloc = alloc,
             .hits = result_hits,
@@ -8541,7 +8543,8 @@ pub const ApiHttpServer = struct {
         const plan = try distributed_join.planSupportedJoinExecution(ctx, alloc, table_name, join, hits_ptr.items, foreign_sources);
         var right_result = try distributed_join.executeSupportedRightJoinQueryCoordinatorOnly(ctx, &self.join_job_store, alloc, source, join, hits_ptr.items, plan, foreign_sources);
         defer right_result.deinit(alloc);
-        const stats = try distributed_join.applyJoinedRightHitsToResponse(
+        const stats = try distributed_join.applyJoinedRightHitsToResponseWithContext(
+            ctx,
             alloc,
             &owned_response,
             hits_ptr.items,
@@ -8619,6 +8622,7 @@ pub const ApiHttpServer = struct {
         alloc: std.mem.Allocator,
         foreign_source: foreign_mod.PostgresConfig,
         rows: []const std.json.Value,
+        execution_deadline_ns: ?u64,
     ) ![]db_mod.types.SearchHit {
         if (rows.len == 0) return &.{};
 
@@ -8629,7 +8633,13 @@ pub const ApiHttpServer = struct {
             alloc.free(hits);
         }
 
+        var rows_until_deadline_check: u8 = 1;
         for (rows, 0..) |row, idx| {
+            rows_until_deadline_check -|= 1;
+            if (rows_until_deadline_check == 0) {
+                rows_until_deadline_check = 64;
+                try ensureRequestDeadline(execution_deadline_ns);
+            }
             if (row != .object) return error.InvalidQueryRequest;
             const id = if (try foreign_sources_api.deriveSearchIdAlloc(alloc, foreign_source, row)) |value|
                 value

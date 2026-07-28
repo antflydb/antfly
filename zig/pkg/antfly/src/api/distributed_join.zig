@@ -65,6 +65,31 @@ pub const JoinContext = struct {
         return out;
     }
 
+    /// Converts a transport-relative budget into this process's monotonic
+    /// clock domain. Absolute monotonic timestamps must never cross hosts.
+    pub fn withRemainingExecutionBudgetMs(self: JoinContext, remaining_ms: ?u64) !JoinContext {
+        const budget_ms = remaining_ms orelse return self;
+        if (budget_ms == 0) return error.Timeout;
+        const remote_deadline_ns = platform_time.monotonicNs() +| budget_ms *| std.time.ns_per_ms;
+        var out = self;
+        out.execution_deadline_ns = if (self.execution_deadline_ns) |local_deadline|
+            @min(local_deadline, remote_deadline_ns)
+        else
+            remote_deadline_ns;
+        try out.ensureExecutionDeadline();
+        return out;
+    }
+
+    /// Returns a ceiling-rounded relative budget so serialization cannot make
+    /// a live sub-millisecond deadline expire early on the receiving node.
+    pub fn remainingExecutionBudgetMs(self: JoinContext) !?u64 {
+        const deadline_ns = self.execution_deadline_ns orelse return null;
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= deadline_ns) return error.Timeout;
+        const remaining_ns = deadline_ns - now_ns;
+        return @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+    }
+
     pub fn ensureExecutionDeadline(self: JoinContext) !void {
         const deadline_ns = self.execution_deadline_ns orelse return;
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
@@ -518,6 +543,7 @@ pub const JoinPartitionRequest = struct {
     partition_index: usize = 0,
     partition_count: usize = 1,
     right_group_ids: []const u64 = &.{},
+    remaining_timeout_ms: ?u64 = null,
     parsed: std.json.Parsed(EncodedJoinPartitionRequest),
 
     pub fn deinit(self: *JoinPartitionRequest, alloc: std.mem.Allocator) void {
@@ -532,6 +558,7 @@ pub const JoinRowsRequest = struct {
     join: SupportedJoinRequest,
     partition_index: usize = 0,
     partition_count: usize = 1,
+    remaining_timeout_ms: ?u64 = null,
     parsed: std.json.Parsed(EncodedJoinRowsRequest),
 
     pub fn deinit(self: *JoinRowsRequest, alloc: std.mem.Allocator) void {
@@ -547,6 +574,7 @@ pub const JoinUnmatchedRequest = struct {
     left_fields: []const []const u8 = &.{},
     appended_left_field: bool = false,
     matched_right_ids: []const []const u8 = &.{},
+    remaining_timeout_ms: ?u64 = null,
     parsed: std.json.Parsed(EncodedJoinUnmatchedRequest),
 
     pub fn deinit(self: *JoinUnmatchedRequest, alloc: std.mem.Allocator) void {
@@ -564,6 +592,7 @@ pub const JoinFinalizeRequest = struct {
     left_fields: []const std.json.Value = &.{},
     appended_left_field: bool = false,
     shuffle_partitions: usize = 1,
+    remaining_timeout_ms: ?u64 = null,
     parsed: std.json.Parsed(EncodedJoinFinalizeRequest),
 
     pub fn deinit(self: *JoinFinalizeRequest, alloc: std.mem.Allocator) void {
@@ -581,6 +610,7 @@ pub const EncodedJoinPartitionRequest = struct {
     partition_index: ?u64 = null,
     partition_count: ?u64 = null,
     right_group_ids: ?[]const u64 = null,
+    remaining_timeout_ms: ?u64 = null,
 };
 
 pub const EncodedJoinRowsRequest = struct {
@@ -588,6 +618,7 @@ pub const EncodedJoinRowsRequest = struct {
     join: metadata_openapi.JoinClause,
     partition_index: ?u64 = null,
     partition_count: ?u64 = null,
+    remaining_timeout_ms: ?u64 = null,
 };
 
 pub const EncodedJoinUnmatchedRequest = struct {
@@ -596,6 +627,7 @@ pub const EncodedJoinUnmatchedRequest = struct {
     left_fields: ?[]const []const u8 = null,
     appended_left_field: ?bool = null,
     matched_right_ids: ?[]const []const u8 = null,
+    remaining_timeout_ms: ?u64 = null,
 };
 
 pub const EncodedJoinFinalizeRequest = struct {
@@ -606,6 +638,7 @@ pub const EncodedJoinFinalizeRequest = struct {
     left_fields: ?[]const std.json.Value = null,
     appended_left_field: ?bool = null,
     shuffle_partitions: ?u64 = null,
+    remaining_timeout_ms: ?u64 = null,
 };
 
 pub const EncodedJoinRowsResponse = struct {
@@ -1491,7 +1524,8 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         else => return error.InternalFailure,
     };
     defer right_result.deinit(alloc);
-    const stats = applyJoinedRightHitsToResponse(
+    const stats = applyJoinedRightHitsToResponseWithContext(
+        ctx,
         alloc,
         &owned_response,
         hits_ptr.items,
@@ -2128,6 +2162,7 @@ const StatefulDistributedShuffleEngine = struct {
         job_id: ?u64,
         resume_state: ?JoinShuffleResumeState,
     ) !?JoinPartitionExecutionResult {
+        try self.ctx.ensureExecutionDeadline();
         const worker_group_ids = (try self.loadWorkerGroupIdsAlloc()) orelse return null;
         defer self.alloc.free(worker_group_ids);
 
@@ -2139,6 +2174,7 @@ const StatefulDistributedShuffleEngine = struct {
         }
 
         for (state.next_partition_index..partition_count) |partition_index| {
+            try self.ctx.ensureExecutionDeadline();
             const partition_left_hits = try self.collectPartitionLeftHitsAlloc(partition_index, partition_count);
             defer if (partition_left_hits.len > 0) self.alloc.free(partition_left_hits);
 
@@ -2248,6 +2284,7 @@ const StatefulDistributedShuffleEngine = struct {
         var out: DistributedJoinPartitionDispatch = .{};
         var last_err: ?anyerror = null;
         for (0..worker_group_ids.len) |attempt| {
+            try self.ctx.ensureExecutionDeadline();
             const worker_group_id = worker_group_ids[(partition_index + attempt) % worker_group_ids.len];
             try state.seen_groups.put(self.alloc, worker_group_id, {});
             out.result = dispatchJoinPartitionToWorker(
@@ -2275,6 +2312,7 @@ const StatefulDistributedShuffleEngine = struct {
                     .worker_group_id = worker_group_id,
                     .succeeded = false,
                 });
+                if (err == error.Timeout) return error.Timeout;
                 continue;
             };
             try state.worker_attempts.append(self.alloc, .{
@@ -2317,6 +2355,7 @@ const StatefulDistributedShuffleEngine = struct {
     ) !?JoinPartitionExecutionResult {
         const start_index = coordinator.startIndex(self.job_store, worker_group_ids);
         for (0..worker_group_ids.len) |attempt| {
+            try self.ctx.ensureExecutionDeadline();
             const finalizer_group_id = worker_group_ids[(start_index + attempt) % worker_group_ids.len];
             const body = try encodeJoinFinalizeRequest(
                 self.alloc,
@@ -2327,6 +2366,7 @@ const StatefulDistributedShuffleEngine = struct {
                 left_fields,
                 self.appended_left_field,
                 self.plan.shuffle_partitions,
+                try self.ctx.remainingExecutionBudgetMs(),
             );
             defer self.alloc.free(body);
             if (try self.source.joinFinalizeGroupLocal(self.alloc, finalizer_group_id, self.join.right_table, body)) |response_value| {
@@ -2364,6 +2404,7 @@ const StatefulDistributedShuffleEngine = struct {
             left_fields,
             self.appended_left_field,
             self.plan.shuffle_partitions,
+            try self.ctx.remainingExecutionBudgetMs(),
         );
         defer self.alloc.free(fallback_body);
         var result = try executeJoinFinalizeWorkerLocal(
@@ -2536,6 +2577,7 @@ pub fn executeForeignRightJoinQuery(
         .limit = if (join.right_filters) |filters| filters.limit else null,
     });
     defer params.deinit(alloc);
+    params.execution_deadline_ns = ctx.execution_deadline_ns;
 
     const source_config = try foreign_source.toSourceConfig(alloc);
     var foreign_query_source = try registry.create(alloc, source_config);
@@ -2550,27 +2592,41 @@ pub fn executeForeignRightJoinQuery(
         hits.deinit(alloc);
     }
 
-    var rows_until_deadline_check: u8 = 1;
+    var left_equality_index: ?EqualityJoinIndex = if (join.join_type != .right and join.operator == .eq and left_hits.len >= 16)
+        try EqualityJoinIndex.init(alloc, left_hits, join.left_field, ctx.execution_deadline_ns)
+    else
+        null;
+    defer if (left_equality_index) |*index| index.deinit(alloc);
+    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.execution_deadline_ns };
     for (result.rows) |row| {
-        rows_until_deadline_check -|= 1;
-        if (rows_until_deadline_check == 0) {
-            rows_until_deadline_check = 64;
-            try ctx.ensureExecutionDeadline();
-        }
+        try deadline_poller.poll();
         if (row != .object) return error.UnsupportedQueryRequest;
         const match_value = extractJsonPathValue(row, join.right_field) orelse continue;
         if (join.join_type != .right) {
-            var matched = false;
-            for (left_hits) |left_hit| {
-                const left_value = extractJoinValueFromHit(left_hit, join.left_field) orelse continue;
-                if (jsonValuesCompare(left_value, match_value, join.operator)) {
-                    matched = true;
-                    break;
+            const matched = if (left_equality_index) |*index|
+                if (EqualityJoinIndex.supports(match_value))
+                    index.lookupIndex(match_value) != null
+                else blk: {
+                    for (left_hits) |left_hit| {
+                        try deadline_poller.poll();
+                        const left_value = extractJoinValueFromHit(left_hit, join.left_field) orelse continue;
+                        if (jsonValuesCompare(left_value, match_value, join.operator)) break :blk true;
+                    }
+                    break :blk false;
                 }
-            }
+            else blk: {
+                for (left_hits) |left_hit| {
+                    try deadline_poller.poll();
+                    const left_value = extractJoinValueFromHit(left_hit, join.left_field) orelse continue;
+                    if (jsonValuesCompare(left_value, match_value, join.operator)) break :blk true;
+                }
+                break :blk false;
+            };
             if (!matched) continue;
         }
-        try hits.append(alloc, try buildForeignRightJoinHit(alloc, foreign_source, row, match_value));
+        var hit = try buildForeignRightJoinHit(alloc, foreign_source, row, match_value);
+        errdefer deinitJsonValue(alloc, &hit);
+        try hits.append(alloc, hit);
     }
 
     const owned_slice = try hits.toOwnedSlice(alloc);
@@ -2735,9 +2791,11 @@ pub fn executeJoinFinalizeWorkerLocal(
 ) !JoinPartitionExecutionResult {
     var req = try parseJoinFinalizeRequest(alloc, body);
     defer req.deinit(alloc);
+    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
     const engine: StatefulDistributedShuffleEngine = .{
-        .ctx = ctx,
+        .ctx = worker_ctx,
         .job_store = job_store,
         .alloc = alloc,
         .source = source,
@@ -2785,6 +2843,8 @@ fn executeJoinRowsLocal(
 ) ![]std.json.Value {
     var req = try parseJoinRowsRequest(alloc, body);
     defer req.deinit(alloc);
+    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
     if (req.join.nested_join != null) return error.UnsupportedQueryRequest;
 
@@ -2792,7 +2852,7 @@ fn executeJoinRowsLocal(
     defer deinitJsonValue(alloc, &query_value);
     const query_body_for_log = try stringifyJsonValueAlloc(alloc, query_value);
     defer alloc.free(query_body_for_log);
-    var owned_req = ctx.buildOwnedSearchRequest(alloc, req.join.right_table, query_value) catch |err| {
+    var owned_req = worker_ctx.buildOwnedSearchRequest(alloc, req.join.right_table, query_value) catch |err| {
         std.log.err("join rows search request build failed group_id={d} table={s} err={} query={s}", .{
             group_id,
             req.join.right_table,
@@ -2809,6 +2869,7 @@ fn executeJoinRowsLocal(
         hits.deinit();
     }
     if (!try appendGroupLocalJoinHits(alloc, source, group_id, req.join.right_table, owned_req.req, false, &hits)) return error.UnknownGroup;
+    try worker_ctx.ensureExecutionDeadline();
 
     var partition_hits = std.json.Array.init(alloc);
     errdefer {
@@ -2816,6 +2877,7 @@ fn executeJoinRowsLocal(
         partition_hits.deinit();
     }
     for (hits.items) |hit| {
+        try worker_ctx.ensureExecutionDeadline();
         const right_value = extractJoinValueFromHit(hit, req.join.right_field) orelse continue;
         if (partitionForJoinValue(right_value, req.partition_count) != req.partition_index) continue;
         try partition_hits.append(try cloneJsonValue(alloc, hit));
@@ -2833,12 +2895,14 @@ fn executeJoinUnmatchedLocal(
 ) !EncodedJoinUnmatchedResponse {
     var req = try parseJoinUnmatchedRequest(alloc, body);
     defer req.deinit(alloc);
+    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
     if (req.join.nested_join != null) return error.UnsupportedQueryRequest;
 
     var query_value = try buildRightJoinUnmatchedQueryValue(alloc, req.join, req.left_hit_count);
     defer deinitJsonValue(alloc, &query_value);
-    var owned_req = try ctx.buildOwnedSearchRequest(alloc, req.join.right_table, query_value);
+    var owned_req = try worker_ctx.buildOwnedSearchRequest(alloc, req.join.right_table, query_value);
     defer owned_req.deinit(alloc);
 
     var matched_right_ids = try loadMatchedRightIdsAlloc(alloc, req.matched_right_ids);
@@ -2862,6 +2926,7 @@ fn executeJoinUnmatchedLocal(
         &matched_right_ids,
         &hits,
     )) orelse return error.UnknownGroup;
+    try worker_ctx.ensureExecutionDeadline();
 
     return .{
         .hits = try hits.toOwnedSlice(alloc),
@@ -2940,6 +3005,8 @@ pub fn executeJoinPartitionWorkerLocal(
         return err;
     };
     defer req.deinit(alloc);
+    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
 
     var right_hits_owned: ?[]std.json.Value = null;
@@ -2948,7 +3015,7 @@ pub fn executeJoinPartitionWorkerLocal(
         alloc.free(owned);
     };
     const right_hits = if (req.right_group_ids.len > 0 and req.join.nested_join == null)
-        collectJoinPartitionRightRows(ctx, job_store, alloc, source, worker_group_id, req) catch |err| {
+        collectJoinPartitionRightRows(worker_ctx, job_store, alloc, source, worker_group_id, req) catch |err| {
             std.log.warn("join partition right-row collection failed worker_group_id={d} partition_index={d} err={}", .{
                 worker_group_id,
                 req.partition_index,
@@ -2957,14 +3024,14 @@ pub fn executeJoinPartitionWorkerLocal(
             return err;
         }
     else blk: {
-        var right_result = try executeRightJoinBroadcastQueryLocal(ctx, job_store, alloc, source, req.join, req.left_hits, .{});
+        var right_result = try executeRightJoinBroadcastQueryLocal(worker_ctx, job_store, alloc, source, req.join, req.left_hits, .{});
         defer right_result.deinit(alloc);
         right_hits_owned = try alloc.alloc(std.json.Value, right_result.hits.len);
         for (right_result.hits, 0..) |hit, i| right_hits_owned.?[i] = try cloneJsonValue(alloc, hit);
         break :blk right_hits_owned.?;
     };
 
-    var merged = mergeJoinedRightHitsAlloc(alloc, req.left_hits, req.join, right_hits, &.{}, req.appended_left_field) catch |err| {
+    var merged = mergeJoinedRightHitsAllocWithContext(worker_ctx, alloc, req.left_hits, req.join, right_hits, &.{}, req.appended_left_field) catch |err| {
         std.log.err("join partition merge failed worker_group_id={d} partition_index={d} err={}", .{
             worker_group_id,
             req.partition_index,
@@ -2990,10 +3057,17 @@ fn collectJoinPartitionRightRows(
         out.deinit();
     }
 
-    const body = try encodeJoinRowsRequest(alloc, req.job_id, req.join, req.partition_index, req.partition_count);
-    defer alloc.free(body);
-
     for (req.right_group_ids) |target_group_id| {
+        try ctx.ensureExecutionDeadline();
+        const body = try encodeJoinRowsRequest(
+            alloc,
+            req.job_id,
+            req.join,
+            req.partition_index,
+            req.partition_count,
+            try ctx.remainingExecutionBudgetMs(),
+        );
+        defer alloc.free(body);
         if (target_group_id == worker_group_id) {
             const local_hits = try executeJoinRowsLocal(ctx, alloc, source, target_group_id, req.join.right_table, body);
             defer {
@@ -3041,7 +3115,18 @@ fn dispatchJoinPartitionToWorker(
     left_hits: []const std.json.Value,
     appended_left_field: bool,
 ) !?JoinPartitionExecutionResult {
-    const body = try encodeJoinPartitionRequest(alloc, job_id, join, left_hits, appended_left_field, partition_index, partition_count, right_group_ids);
+    try ctx.ensureExecutionDeadline();
+    const body = try encodeJoinPartitionRequest(
+        alloc,
+        job_id,
+        join,
+        left_hits,
+        appended_left_field,
+        partition_index,
+        partition_count,
+        right_group_ids,
+        try ctx.remainingExecutionBudgetMs(),
+    );
     defer alloc.free(body);
 
     const partition_response_opt = try source.joinPartitionGroupLocal(alloc, worker_group_id, join.right_table, body);
@@ -3175,9 +3260,6 @@ fn buildDistributedRightJoinUnmatchedCompletionAcrossGroupsAlloc(
     var groups = (try DistributedRightJoinGroups.init(ctx, alloc, join.right_table, 2)) orelse return null;
     defer groups.deinit();
 
-    const body = try encodeJoinUnmatchedRequest(alloc, join, left_hits.len, left_fields, appended_left_field, matched_ids);
-    defer alloc.free(body);
-
     var appended_hits = std.ArrayListUnmanaged(std.json.Value).empty;
     var completed = false;
     defer if (!completed) {
@@ -3188,6 +3270,17 @@ fn buildDistributedRightJoinUnmatchedCompletionAcrossGroupsAlloc(
     var groups_queried: usize = 0;
     var right_rows_scanned: usize = 0;
     for (groups.group_ids) |group_id| {
+        try ctx.ensureExecutionDeadline();
+        const body = try encodeJoinUnmatchedRequest(
+            alloc,
+            join,
+            left_hits.len,
+            left_fields,
+            appended_left_field,
+            matched_ids,
+            try ctx.remainingExecutionBudgetMs(),
+        );
+        defer alloc.free(body);
         const response_value = if (try source.joinUnmatchedGroupLocal(alloc, group_id, join.right_table, body)) |response|
             response
         else blk: {
@@ -3920,18 +4013,26 @@ fn applyNestedJoinToRightHits(
     var nested_result = try executeSupportedRightJoinQuery(ctx, job_store, alloc, source, nested_join.*, right_hits, plan, foreign_sources);
     defer nested_result.deinit(alloc);
 
-    var hits_until_deadline_check: u8 = 1;
+    var equality_index: ?EqualityJoinIndex = if (nested_join.operator == .eq and nested_result.hits.len >= 16)
+        try EqualityJoinIndex.init(alloc, nested_result.hits, nested_join.right_field, ctx.execution_deadline_ns)
+    else
+        null;
+    defer if (equality_index) |*index| index.deinit(alloc);
+    var deadline_poller: JoinDeadlinePoller = .{ .deadline_ns = ctx.execution_deadline_ns };
     for (right_hits) |*hit| {
-        hits_until_deadline_check -|= 1;
-        if (hits_until_deadline_check == 0) {
-            hits_until_deadline_check = 64;
-            try ctx.ensureExecutionDeadline();
-        }
+        try deadline_poller.poll();
         const left_value = extractJoinValueFromHit(hit.*, nested_join.left_field) orelse continue;
-        const matched_right = findFirstMatchingRightHit(nested_join.*, left_value, nested_result.hits) orelse continue;
+        const matched_right = if (equality_index) |*index|
+            if (EqualityJoinIndex.supports(left_value))
+                if (index.lookupIndex(left_value)) |match_index| nested_result.hits[match_index] else null
+            else
+                try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.execution_deadline_ns)
+        else
+            try findFirstMatchingRightHitWithDeadline(nested_join.*, left_value, nested_result.hits, ctx.execution_deadline_ns);
+        const effective_matched_right = matched_right orelse continue;
         const source_value = hit.object.getPtr("_source") orelse return error.InvalidQueryRequest;
         if (source_value.* != .object) return error.InvalidQueryRequest;
-        try mergeRightHitIntoSource(alloc, source_value, nested_join.*, matched_right);
+        try mergeRightHitIntoSource(alloc, source_value, nested_join.*, effective_matched_right);
     }
 }
 
@@ -4145,6 +4246,7 @@ pub fn encodeJoinPartitionRequest(
     partition_index: usize,
     partition_count: usize,
     right_group_ids: []const u64,
+    remaining_timeout_ms: ?u64,
 ) ![]u8 {
     var root = std.json.Value{ .object = std.json.ObjectMap.empty };
     defer deinitJsonValue(alloc, &root);
@@ -4165,6 +4267,7 @@ pub fn encodeJoinPartitionRequest(
         try groups_value.array.append(try jsonU64ValueAlloc(alloc, group_id));
     }
     try putOwnedJsonField(alloc, &root.object, "right_group_ids", groups_value);
+    if (remaining_timeout_ms) |value| try putOwnedJsonU64Field(alloc, &root.object, "remaining_timeout_ms", value);
     return try stringifyJsonValueAlloc(alloc, root);
 }
 
@@ -4203,6 +4306,7 @@ fn parseJoinPartitionRequest(
         else
             1,
         .right_group_ids = parsed.value.right_group_ids orelse &.{},
+        .remaining_timeout_ms = parsed.value.remaining_timeout_ms,
         .parsed = parsed,
     };
 }
@@ -4213,6 +4317,7 @@ fn encodeJoinRowsRequest(
     join: SupportedJoinRequest,
     partition_index: usize,
     partition_count: usize,
+    remaining_timeout_ms: ?u64,
 ) ![]u8 {
     var root = std.json.Value{ .object = std.json.ObjectMap.empty };
     defer deinitJsonValue(alloc, &root);
@@ -4220,6 +4325,7 @@ fn encodeJoinRowsRequest(
     try putOwnedJsonField(alloc, &root.object, "join", try encodeSupportedJoinClauseValue(alloc, join));
     try putOwnedJsonField(alloc, &root.object, "partition_index", .{ .integer = @intCast(partition_index) });
     try putOwnedJsonField(alloc, &root.object, "partition_count", .{ .integer = @intCast(partition_count) });
+    if (remaining_timeout_ms) |value| try putOwnedJsonU64Field(alloc, &root.object, "remaining_timeout_ms", value);
     return try stringifyJsonValueAlloc(alloc, root);
 }
 
@@ -4230,6 +4336,7 @@ fn encodeJoinUnmatchedRequest(
     left_fields: []const []const u8,
     appended_left_field: bool,
     matched_right_ids: []const []const u8,
+    remaining_timeout_ms: ?u64,
 ) ![]u8 {
     var root = std.json.Value{ .object = std.json.ObjectMap.empty };
     defer deinitJsonValue(alloc, &root);
@@ -4246,6 +4353,7 @@ fn encodeJoinUnmatchedRequest(
     errdefer deinitJsonValue(alloc, &matched_ids_value);
     for (matched_right_ids) |matched_id| try matched_ids_value.array.append(.{ .string = try alloc.dupe(u8, matched_id) });
     try putOwnedJsonField(alloc, &root.object, "matched_right_ids", matched_ids_value);
+    if (remaining_timeout_ms) |value| try putOwnedJsonU64Field(alloc, &root.object, "remaining_timeout_ms", value);
 
     return try stringifyJsonValueAlloc(alloc, root);
 }
@@ -4259,6 +4367,7 @@ pub fn encodeJoinFinalizeRequest(
     left_fields: []const std.json.Value,
     appended_left_field: bool,
     shuffle_partitions: usize,
+    remaining_timeout_ms: ?u64,
 ) ![]u8 {
     var root = std.json.Value{ .object = std.json.ObjectMap.empty };
     defer deinitJsonValue(alloc, &root);
@@ -4279,6 +4388,7 @@ pub fn encodeJoinFinalizeRequest(
         try left_fields_value.array.append(try cloneJsonValue(alloc, field));
     }
     try putOwnedJsonField(alloc, &root.object, "left_fields", left_fields_value);
+    if (remaining_timeout_ms) |value| try putOwnedJsonU64Field(alloc, &root.object, "remaining_timeout_ms", value);
     return try stringifyJsonValueAlloc(alloc, root);
 }
 
@@ -4304,6 +4414,7 @@ fn parseJoinRowsRequest(
                 std.math.cast(usize, value) orelse return error.InvalidQueryRequest
         else
             1,
+        .remaining_timeout_ms = parsed.value.remaining_timeout_ms,
         .parsed = parsed,
     };
 }
@@ -4325,6 +4436,7 @@ fn parseJoinUnmatchedRequest(
         .left_fields = parsed.value.left_fields orelse &.{},
         .appended_left_field = parsed.value.appended_left_field orelse false,
         .matched_right_ids = parsed.value.matched_right_ids orelse &.{},
+        .remaining_timeout_ms = parsed.value.remaining_timeout_ms,
         .parsed = parsed,
     };
 }
@@ -4351,6 +4463,7 @@ fn parseJoinFinalizeRequest(
                 std.math.cast(usize, value) orelse return error.InvalidQueryRequest
         else
             1,
+        .remaining_timeout_ms = parsed.value.remaining_timeout_ms,
         .parsed = parsed,
     };
 }
@@ -4534,6 +4647,104 @@ pub fn extractJsonPathValue(value: std.json.Value, path: []const u8) ?std.json.V
 
 // -- join merge/apply helpers --
 
+const JoinDeadlinePoller = struct {
+    deadline_ns: ?u64,
+    work_until_check: u8 = 1,
+
+    fn poll(self: *@This()) !void {
+        self.work_until_check -|= 1;
+        if (self.work_until_check != 0) return;
+        self.work_until_check = 64;
+        const deadline_ns = self.deadline_ns orelse return;
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+    }
+};
+
+/// A borrowed-key index of the first right-side row for each scalar equality
+/// key. Join input owns the key storage for the index lifetime.
+const EqualityJoinIndex = struct {
+    strings: std.StringHashMapUnmanaged(usize) = .{},
+    number_strings: std.StringHashMapUnmanaged(usize) = .{},
+    integers: std.AutoHashMapUnmanaged(i64, usize) = .{},
+    floats: std.AutoHashMapUnmanaged(u64, usize) = .{},
+    bools: [2]?usize = .{ null, null },
+    null_index: ?usize = null,
+
+    fn init(
+        alloc: std.mem.Allocator,
+        hits: []const std.json.Value,
+        field_name: []const u8,
+        deadline_ns: ?u64,
+    ) !EqualityJoinIndex {
+        var out: EqualityJoinIndex = .{};
+        errdefer out.deinit(alloc);
+        var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns };
+        for (hits, 0..) |hit, index| {
+            try poller.poll();
+            const value = extractJoinValueFromHit(hit, field_name) orelse continue;
+            switch (value) {
+                .null => if (out.null_index == null) {
+                    out.null_index = index;
+                },
+                .bool => |item| if (out.bools[@intFromBool(item)] == null) {
+                    out.bools[@intFromBool(item)] = index;
+                },
+                .integer => |item| {
+                    const result = try out.integers.getOrPut(alloc, item);
+                    if (!result.found_existing) result.value_ptr.* = index;
+                },
+                .float => |item| {
+                    if (std.math.isNan(item)) continue;
+                    const bits: u64 = if (item == 0) 0 else @bitCast(item);
+                    const result = try out.floats.getOrPut(alloc, bits);
+                    if (!result.found_existing) result.value_ptr.* = index;
+                },
+                .number_string => |item| {
+                    const result = try out.number_strings.getOrPut(alloc, item);
+                    if (!result.found_existing) result.value_ptr.* = index;
+                },
+                .string => |item| {
+                    const result = try out.strings.getOrPut(alloc, item);
+                    if (!result.found_existing) result.value_ptr.* = index;
+                },
+                .array, .object => {},
+            }
+        }
+        return out;
+    }
+
+    fn deinit(self: *EqualityJoinIndex, alloc: std.mem.Allocator) void {
+        self.strings.deinit(alloc);
+        self.number_strings.deinit(alloc);
+        self.integers.deinit(alloc);
+        self.floats.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn lookupIndex(self: *const EqualityJoinIndex, value: std.json.Value) ?usize {
+        return switch (value) {
+            .null => self.null_index,
+            .bool => |item| self.bools[@intFromBool(item)],
+            .integer => |item| self.integers.get(item),
+            .float => |item| self.floats.get(if (item == 0) 0 else @as(u64, @bitCast(item))),
+            .number_string => |item| self.number_strings.get(item),
+            .string => |item| self.strings.get(item),
+            .array, .object => null,
+        };
+    }
+
+    fn supports(value: std.json.Value) bool {
+        return switch (value) {
+            .array, .object => false,
+            // JSON values constructed from database rows may carry NaN even
+            // though wire JSON cannot. NaN is never equal under the canonical
+            // comparator, so a bit-pattern hash lookup would be incorrect.
+            .float => |item| !std.math.isNan(item),
+            else => true,
+        };
+    }
+};
+
 pub fn applyJoinedRightHitsToResponse(
     alloc: std.mem.Allocator,
     root: *std.json.Value,
@@ -4543,7 +4754,52 @@ pub fn applyJoinedRightHitsToResponse(
     requested_left_fields: anytype,
     appended_left_field: bool,
 ) !JoinedQueryStats {
-    var merged = try mergeJoinedRightHitsAlloc(
+    return try applyJoinedRightHitsToResponseWithDeadline(
+        null,
+        alloc,
+        root,
+        left_hits,
+        join,
+        right_hits,
+        requested_left_fields,
+        appended_left_field,
+    );
+}
+
+pub fn applyJoinedRightHitsToResponseWithContext(
+    ctx: JoinContext,
+    alloc: std.mem.Allocator,
+    root: *std.json.Value,
+    left_hits: []const std.json.Value,
+    join: SupportedJoinRequest,
+    right_hits: []const std.json.Value,
+    requested_left_fields: anytype,
+    appended_left_field: bool,
+) !JoinedQueryStats {
+    return try applyJoinedRightHitsToResponseWithDeadline(
+        ctx.execution_deadline_ns,
+        alloc,
+        root,
+        left_hits,
+        join,
+        right_hits,
+        requested_left_fields,
+        appended_left_field,
+    );
+}
+
+fn applyJoinedRightHitsToResponseWithDeadline(
+    deadline_ns: ?u64,
+    alloc: std.mem.Allocator,
+    root: *std.json.Value,
+    left_hits: []const std.json.Value,
+    join: SupportedJoinRequest,
+    right_hits: []const std.json.Value,
+    requested_left_fields: anytype,
+    appended_left_field: bool,
+) !JoinedQueryStats {
+    var merged = try mergeJoinedRightHitsAllocWithDeadline(
+        deadline_ns,
         alloc,
         left_hits,
         join,
@@ -4564,6 +4820,46 @@ pub fn mergeJoinedRightHitsAlloc(
     requested_left_fields: anytype,
     appended_left_field: bool,
 ) !JoinedRightMergeResult {
+    return try mergeJoinedRightHitsAllocWithDeadline(
+        null,
+        alloc,
+        left_hits,
+        join,
+        right_hits,
+        requested_left_fields,
+        appended_left_field,
+    );
+}
+
+fn mergeJoinedRightHitsAllocWithContext(
+    ctx: JoinContext,
+    alloc: std.mem.Allocator,
+    left_hits: []const std.json.Value,
+    join: SupportedJoinRequest,
+    right_hits: []const std.json.Value,
+    requested_left_fields: anytype,
+    appended_left_field: bool,
+) !JoinedRightMergeResult {
+    return try mergeJoinedRightHitsAllocWithDeadline(
+        ctx.execution_deadline_ns,
+        alloc,
+        left_hits,
+        join,
+        right_hits,
+        requested_left_fields,
+        appended_left_field,
+    );
+}
+
+fn mergeJoinedRightHitsAllocWithDeadline(
+    deadline_ns: ?u64,
+    alloc: std.mem.Allocator,
+    left_hits: []const std.json.Value,
+    join: SupportedJoinRequest,
+    right_hits: []const std.json.Value,
+    requested_left_fields: anytype,
+    appended_left_field: bool,
+) !JoinedRightMergeResult {
     var stats: JoinedQueryStats = .{
         .left_rows_scanned = @intCast(left_hits.len),
         .right_rows_scanned = @intCast(right_hits.len),
@@ -4577,7 +4873,15 @@ pub fn mergeJoinedRightHitsAlloc(
         joined_hits.deinit();
     }
 
+    var equality_index: ?EqualityJoinIndex = if (join.operator == .eq and right_hits.len >= 16)
+        try EqualityJoinIndex.init(alloc, right_hits, join.right_field, deadline_ns)
+    else
+        null;
+    defer if (equality_index) |*index| index.deinit(alloc);
+    var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns };
+
     for (left_hits) |hit_value| {
+        try poller.poll();
         var joined_hit = try cloneJsonValue(alloc, hit_value);
         errdefer deinitJsonValue(alloc, &joined_hit);
         const source_value = joined_hit.object.getPtr("_source") orelse return error.InvalidQueryRequest;
@@ -4593,7 +4897,14 @@ pub fn mergeJoinedRightHitsAlloc(
             }
             continue;
         };
-        const matched_right = findFirstMatchingRightHit(join, left_value, right_hits) orelse {
+        const matched_right = if (equality_index) |*index|
+            if (EqualityJoinIndex.supports(left_value))
+                if (index.lookupIndex(left_value)) |match_index| right_hits[match_index] else null
+            else
+                try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns)
+        else
+            try findFirstMatchingRightHitWithDeadline(join, left_value, right_hits, deadline_ns);
+        const effective_matched_right = matched_right orelse {
             stats.rows_unmatched_left += 1;
             if (join.join_type == .left) {
                 try joined_hits.append(joined_hit);
@@ -4603,8 +4914,8 @@ pub fn mergeJoinedRightHitsAlloc(
             continue;
         };
 
-        try mergeRightHitIntoSource(alloc, source_value, join, matched_right);
-        if (join_model.rightHitIdentityKey(matched_right)) |matched_id| {
+        try mergeRightHitIntoSource(alloc, source_value, join, effective_matched_right);
+        if (join_model.rightHitIdentityKey(effective_matched_right)) |matched_id| {
             try matched_right_ids.put(alloc, matched_id, {});
         }
         try joined_hits.append(joined_hit);
@@ -4612,15 +4923,21 @@ pub fn mergeJoinedRightHitsAlloc(
     }
 
     if (join.join_type == .right) {
-        stats.rows_unmatched_right += @intCast(try join_model.appendUnmatchedRightJoinHitsAlloc(
-            alloc,
-            &joined_hits,
-            right_hits,
-            join,
-            requested_left_fields,
-            appended_left_field,
-            &matched_right_ids,
-        ));
+        for (right_hits) |right_hit| {
+            try poller.poll();
+            const right_id = join_model.rightHitIdentityKey(right_hit) orelse continue;
+            if (matched_right_ids.contains(right_id)) continue;
+            var unmatched_hit = try join_model.buildUnmatchedRightJoinHitAlloc(
+                alloc,
+                right_hit,
+                join,
+                requested_left_fields,
+                appended_left_field,
+            );
+            errdefer deinitJsonValue(alloc, &unmatched_hit);
+            try joined_hits.append(unmatched_hit);
+            stats.rows_unmatched_right += 1;
+        }
     }
 
     return try join_model.adoptOwnedJoinShellAlloc(
@@ -5232,6 +5549,21 @@ fn findFirstMatchingRightHit(
     );
 }
 
+fn findFirstMatchingRightHitWithDeadline(
+    join: SupportedJoinRequest,
+    left_value: std.json.Value,
+    right_hits: []const std.json.Value,
+    deadline_ns: ?u64,
+) !?std.json.Value {
+    var poller: JoinDeadlinePoller = .{ .deadline_ns = deadline_ns };
+    for (right_hits) |hit_value| {
+        try poller.poll();
+        const right_value = extractJoinValueFromHit(hit_value, join.right_field) orelse continue;
+        if (jsonValuesCompare(left_value, right_value, join.operator)) return hit_value;
+    }
+    return null;
+}
+
 fn mergeRightHitIntoSource(
     alloc: std.mem.Allocator,
     source_value: *std.json.Value,
@@ -5378,6 +5710,42 @@ test "distributed join context forwards one absolute deadline to every query cal
         error.TestDeadlineForwarded,
         ctx.buildOwnedSearchRequest(std.testing.allocator, "right", .null),
     );
+}
+
+test "distributed join transports relative budgets and rejects exhausted handoffs" {
+    var state: u8 = 0;
+    const ctx = JoinContext{
+        .ptr = &state,
+        .vtable = undefined,
+        .execution_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+    };
+    const remaining_ms = (try ctx.remainingExecutionBudgetMs()).?;
+    try std.testing.expect(remaining_ms > 0);
+    try std.testing.expect(remaining_ms <= 1_000);
+    try std.testing.expectError(error.Timeout, ctx.withRemainingExecutionBudgetMs(0));
+
+    const alloc = std.testing.allocator;
+    var join = SupportedJoinRequest{
+        .right_table = try alloc.dupe(u8, "customers"),
+        .left_field = try alloc.dupe(u8, "customer_id"),
+        .right_field = try alloc.dupe(u8, "_id"),
+    };
+    defer join.deinit(alloc);
+    const body = try encodeJoinPartitionRequest(
+        alloc,
+        null,
+        join,
+        &.{},
+        false,
+        0,
+        1,
+        &.{1},
+        remaining_ms,
+    );
+    defer alloc.free(body);
+    var parsed = try parseJoinPartitionRequest(alloc, body);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, remaining_ms), parsed.remaining_timeout_ms);
 }
 
 fn appendSearchHitAsJsonHit(
@@ -5893,6 +6261,79 @@ test "distributed inner join releases cloned unmatched rows" {
     try std.testing.expectEqual(@as(i64, 1), result.stats.rows_unmatched_left);
 }
 
+test "distributed equality join index preserves first-match semantics" {
+    const alloc = std.testing.allocator;
+    var join = SupportedJoinRequest{
+        .right_table = try alloc.dupe(u8, "customers"),
+        .join_type = .inner,
+        .left_field = try alloc.dupe(u8, "id"),
+        .right_field = try alloc.dupe(u8, "id"),
+    };
+    defer join.deinit(alloc);
+
+    var left_hit = try testJoinHitAlloc(alloc, "left", 1, "shared");
+    defer deinitJsonValue(alloc, &left_hit);
+    const right_hits = try alloc.alloc(std.json.Value, 20);
+    var initialized: usize = 0;
+    errdefer {
+        for (right_hits[0..initialized]) |*hit| deinitJsonValue(alloc, hit);
+        alloc.free(right_hits);
+    }
+    defer {
+        for (right_hits) |*hit| deinitJsonValue(alloc, hit);
+        alloc.free(right_hits);
+    }
+    for (right_hits, 0..) |*hit, index| {
+        hit.* = try testJoinHitAlloc(
+            alloc,
+            if (index == 0) "right:first" else "right:later",
+            1,
+            if (index < 2) "shared" else "other",
+        );
+        initialized += 1;
+        const source = hit.object.getPtr("_source").?;
+        try source.object.put(
+            alloc,
+            try alloc.dupe(u8, "name"),
+            .{ .string = try alloc.dupe(u8, if (index == 0) "first" else "later") },
+        );
+    }
+
+    var result = try mergeJoinedRightHitsAlloc(alloc, &.{left_hit}, join, right_hits, &.{}, false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings(
+        "first",
+        extractJoinValueFromHit(result.hits[0], "customers.name").?.string,
+    );
+    try std.testing.expect(!EqualityJoinIndex.supports(.{ .float = std.math.nan(f64) }));
+}
+
+test "distributed join merge rejects an expired deadline before scanning" {
+    const alloc = std.testing.allocator;
+    var join = SupportedJoinRequest{
+        .right_table = try alloc.dupe(u8, "customers"),
+        .join_type = .inner,
+        .left_field = try alloc.dupe(u8, "id"),
+        .right_field = try alloc.dupe(u8, "id"),
+    };
+    defer join.deinit(alloc);
+    var left_hit = try testJoinHitAlloc(alloc, "left", 1, "shared");
+    defer deinitJsonValue(alloc, &left_hit);
+    try std.testing.expectError(
+        error.Timeout,
+        mergeJoinedRightHitsAllocWithDeadline(
+            platform_time.monotonicNs(),
+            alloc,
+            &.{left_hit},
+            join,
+            &.{},
+            &.{},
+            false,
+        ),
+    );
+}
+
 /// Ordered comparison of two JSON values. Returns -1 (less), 0 (equal), or
 /// 1 (greater). Handles cross-type integer/float coercion to match Go's
 /// evaluator.CompareOrdered semantics.
@@ -6209,7 +6650,7 @@ test "distributed join unmatched worker returns only unmatched synthetic hits" {
     left_hits[0] = try testJoinHitAlloc(alloc, "doc:left", 1.0, "cust:a");
 
     const left_fields = [_][]const u8{"title"};
-    const body = try encodeJoinUnmatchedRequest(alloc, join, left_hits.len, &left_fields, false, &.{"cust:a"});
+    const body = try encodeJoinUnmatchedRequest(alloc, join, left_hits.len, &left_fields, false, &.{"cust:a"}, null);
     defer alloc.free(body);
 
     const response = try executeJoinUnmatchedLocal(ctx_source.ctx(), alloc, reads.source(), 201, "customers", body);
@@ -6355,7 +6796,7 @@ test "distributed join unmatched worker pages group-local right hits" {
     join.join_type = .right;
 
     const left_fields = [_][]const u8{"title"};
-    const body = try encodeJoinUnmatchedRequest(alloc, join, 1, &left_fields, false, &.{"cust:0"});
+    const body = try encodeJoinUnmatchedRequest(alloc, join, 1, &left_fields, false, &.{"cust:0"}, null);
     defer alloc.free(body);
 
     const response = try executeJoinUnmatchedLocal(ctx_source.ctx(), alloc, reads.source(), 201, "customers", body);
@@ -6639,7 +7080,7 @@ test "distributed join unmatched worker prefers local search results over query 
     join.join_type = .right;
 
     const left_fields = [_][]const u8{"title"};
-    const body = try encodeJoinUnmatchedRequest(alloc, join, 1, &left_fields, false, &.{"cust:0"});
+    const body = try encodeJoinUnmatchedRequest(alloc, join, 1, &left_fields, false, &.{"cust:0"}, null);
     defer alloc.free(body);
 
     const response = try executeJoinUnmatchedLocal(ctx_source.ctx(), alloc, reads.source(), 201, "customers", body);

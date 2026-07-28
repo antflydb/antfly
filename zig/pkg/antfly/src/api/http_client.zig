@@ -754,6 +754,17 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !QueryResponse {
+        return self.fetchGroupJoinPartitionWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupJoinPartitionWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -770,10 +781,12 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
@@ -786,6 +799,17 @@ pub const ApiHttpClient = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+    ) !QueryResponse {
+        return self.fetchGroupJoinRowsWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupJoinRowsWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
     ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -803,10 +827,12 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
@@ -819,6 +845,17 @@ pub const ApiHttpClient = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+    ) !QueryResponse {
+        return self.fetchGroupJoinUnmatchedWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupJoinUnmatchedWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
     ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -836,10 +873,12 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
@@ -919,6 +958,17 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !QueryResponse {
+        return self.fetchGroupJoinFinalizeWithTimeout(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupJoinFinalizeWithTimeout(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -935,10 +985,12 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
@@ -2626,6 +2678,39 @@ test "api http client bounds transition control RPCs" {
             .destination_group_id = 8,
         },
     ));
+}
+
+test "api http client forwards distributed join budgets and maps remote timeout" {
+    const TimeoutExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u32, 37), req.timeout_ms.?);
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            return .{
+                .status = 408,
+                .body = try alloc.dupe(u8, "query timeout"),
+            };
+        }
+    };
+
+    var executor = TimeoutExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    const base_uri = "http://127.0.0.1:1";
+    try std.testing.expectError(error.Timeout, client.fetchGroupJoinPartitionWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.Timeout, client.fetchGroupJoinRowsWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.Timeout, client.fetchGroupJoinUnmatchedWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.Timeout, client.fetchGroupJoinFinalizeWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
 }
 
 test "api http client encodes table name for repair cancel callback" {

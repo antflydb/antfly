@@ -2110,7 +2110,6 @@ fn freeClonedJsonValues(alloc: std.mem.Allocator, values: []const std.json.Value
 }
 
 fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
-    if (std.mem.indexOf(u8, body, "\"timeout_ms\"") == null) return null;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -2121,6 +2120,25 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
         .float => error.InvalidQueryRequest,
         .number_string => |v| std.fmt.parseUnsigned(u64, v, 10) catch error.InvalidQueryRequest,
         else => error.InvalidQueryRequest,
+    };
+}
+
+const QueryBodyContractFields = struct {
+    has_internal_shard_fields: bool,
+    has_public_doc_filter_bindings: bool,
+    has_public_hierarchy_controls: bool,
+    has_query_timeout: bool,
+};
+
+fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBodyContractFields {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    return .{
+        .has_internal_shard_fields = objectHasInternalShardField(parsed.value.object),
+        .has_public_doc_filter_bindings = parsed.value.object.get("with") != null,
+        .has_public_hierarchy_controls = parsed.value.object.get("hierarchy") != null,
+        .has_query_timeout = parsed.value.object.get("timeout_ms") != null,
     };
 }
 
@@ -2209,18 +2227,18 @@ pub fn parseQueryRequestWithDeadline(
         }
     }
 
-    const has_internal_shard_fields = try queryBodyHasInternalShardFields(alloc, effective_body);
+    // Inspect the generated-contract extensions in one semantic parse. Besides
+    // honoring escaped member names, this avoids repeatedly materializing the
+    // same request tree on the query admission hot path.
+    const contract_fields = try queryBodyContractFields(alloc, effective_body);
     try ensureQueryDeadline(execution_deadline_ns);
-    const has_public_doc_filter_bindings = try queryBodyHasPublicDocFilterBindings(alloc, effective_body);
-    try ensureQueryDeadline(execution_deadline_ns);
-    const has_public_hierarchy_controls = try queryBodyHasPublicHierarchyControls(alloc, effective_body);
-    try ensureQueryDeadline(execution_deadline_ns);
-    const has_query_timeout = std.mem.indexOf(u8, effective_body, "\"timeout_ms\"") != null;
     const contract_body = try queryBodyForGeneratedContractAlloc(alloc, effective_body, .{
-        .strip_internal_shard_fields = has_internal_shard_fields,
-        .strip_public_doc_filter_bindings = has_public_doc_filter_bindings,
-        .strip_public_hierarchy_controls = has_public_hierarchy_controls,
-        .strip_query_timeout = has_query_timeout,
+        .strip_internal_shard_fields = contract_fields.has_internal_shard_fields,
+        .strip_public_doc_filter_bindings = contract_fields.has_public_doc_filter_bindings,
+        .strip_public_hierarchy_controls = contract_fields.has_public_hierarchy_controls,
+        // Admission interprets this extension semantically, so escaped JSON
+        // member names and the canonical spelling have identical behavior.
+        .strip_query_timeout = contract_fields.has_query_timeout,
     });
     defer if (contract_body) |owned| alloc.free(owned);
     try ensureQueryDeadline(execution_deadline_ns);
@@ -12592,6 +12610,20 @@ test "api query contract maps timeout_ms to execution deadline" {
     try std.testing.expect(deadline_ns >= after_ns);
     try std.testing.expect(deadline_ns <= before_ns + 250 * std.time.ns_per_ms);
     try std.testing.expect(deadline_ns <= after_ns + 250 * std.time.ns_per_ms);
+}
+
+test "api query contract applies timeout_ms with an escaped member name" {
+    const alloc = std.testing.allocator;
+    const before_ns = platform_time.monotonicNs();
+    var parsed = try parseQueryRequest(alloc, null, "docs",
+        \\{"query":{"match_all":{}},"t\u0069meout_ms":60000}
+    );
+    defer parsed.deinit(alloc);
+    const after_ns = platform_time.monotonicNs();
+
+    const deadline_ns = parsed.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
+    try std.testing.expect(deadline_ns >= before_ns + 60_000 * std.time.ns_per_ms);
+    try std.testing.expect(deadline_ns <= after_ns + 60_000 * std.time.ns_per_ms);
 }
 
 test "api query contract rejects invalid timeout_ms" {
