@@ -159,11 +159,42 @@ const NativeCompanion = struct {
     role: NativeCompanionRole = .generic,
 };
 
+const ProjectorDecoderFamily = enum {
+    gemma3,
+    gemma4,
+    unsupported,
+};
+
+fn projectorDecoderFamilyForArchitecture(architecture: []const u8) ProjectorDecoderFamily {
+    if (std.mem.eql(u8, architecture, "gemma3")) return .gemma3;
+    if (std.mem.eql(u8, architecture, "gemma4") or
+        std.mem.eql(u8, architecture, "gemma4_unified"))
+    {
+        return .gemma4;
+    }
+    return .unsupported;
+}
+
+fn projectorMatchesDecoder(
+    projector: projector_format_mod.Kind,
+    decoder: ProjectorDecoderFamily,
+) bool {
+    return switch (projector) {
+        .antfly_gemma3 => decoder == .gemma3,
+        .clip_gemma4_image,
+        .clip_gemma4_audio,
+        .clip_gemma4_image_audio,
+        => decoder == .gemma4,
+        .unknown => false,
+    };
+}
+
 fn validateGgufCompanionForBackend(
     allocator: std.mem.Allocator,
     path: []const u8,
     backend: backends.BackendType,
     role: NativeCompanionRole,
+    projector_decoder: ProjectorDecoderFamily,
 ) !?CompatibilitySummary {
     var mapped = c_file.MmapRegion.init(allocator, path) catch |err| {
         if (err == error.OutOfMemory) return err;
@@ -201,12 +232,22 @@ fn validateGgufCompanionForBackend(
             .message = "a required companion GGUF contains no tensors",
         };
     }
-    if (role == .projector and projector_format_mod.detectFile(&file) == .unknown) {
-        return .{
-            .level = .incompatible,
-            .code = .unsupported_backend,
-            .message = "a projector GGUF does not declare a supported Antfly Gemma 3 or Gemma 4 CLIP projector format",
-        };
+    if (role == .projector) {
+        const projector = projector_format_mod.detectFile(&file);
+        if (projector == .unknown) {
+            return .{
+                .level = .incompatible,
+                .code = .unsupported_backend,
+                .message = "a projector GGUF does not declare a supported Antfly Gemma 3 or Gemma 4 CLIP projector format",
+            };
+        }
+        if (!projectorMatchesDecoder(projector, projector_decoder)) {
+            return .{
+                .level = .incompatible,
+                .code = .unsupported_backend,
+                .message = "the projector GGUF format does not match the selected decoder architecture",
+            };
+        }
     }
     for (file.tensors) |tensor| {
         if (!session_factory.ggufTensorTypeSupportsBackend(tensor.tensor_type, backend)) {
@@ -225,6 +266,7 @@ fn validateNativeCompanionsForBackend(
     man: *const manifest_mod.ModelManifest,
     candidate: ArtifactCandidateKind,
     backend: backends.BackendType,
+    projector_decoder: ProjectorDecoderFamily,
 ) !?CompatibilitySummary {
     // An ONNX route never consumes native sidecars. Native primary routes can
     // consume a projector, a split GLiNER head, and lazily loaded multimodal
@@ -286,6 +328,7 @@ fn validateNativeCompanionsForBackend(
                 companion.path,
                 backend,
                 companion.role,
+                projector_decoder,
             )) |summary| return summary,
             .safetensors => safetensors_mod.validateArtifactSet(
                 allocator,
@@ -324,6 +367,7 @@ pub fn compatibilitySummaryForBackend(
     const assessment = model_compatibility.assessInspection(&candidate_manifest, inspection);
     if (assessment.level == .incompatible) return summaryFromAssessment(assessment);
 
+    var projector_decoder = projectorDecoderFamilyForArchitecture(man.config_model_arch);
     if (candidate == .gguf) {
         var maybe_report = session_factory.inspectGgufModelForListing(
             allocator,
@@ -332,13 +376,17 @@ pub fn compatibilitySummaryForBackend(
         ) catch |err| {
             if (err == error.OutOfMemory) return err;
             return .{
-                .level = .unknown,
+                .level = .incompatible,
                 .code = .artifact_unreadable,
-                .message = "GGUF tensor metadata could not be inspected",
+                .message = "GGUF structure or tensor metadata is invalid or unreadable",
             };
         };
         if (maybe_report) |*report| {
             defer report.deinit();
+            projector_decoder = projectorDecoderFamilyForArchitecture(report.architecture);
+            if (report.gpt_config) |config| {
+                if (!config.isMultimodal()) projector_decoder = .unsupported;
+            }
             if (report.missing_required_tensors.len > 0) {
                 return .{
                     .level = .incompatible,
@@ -374,6 +422,7 @@ pub fn compatibilitySummaryForBackend(
         man,
         candidate,
         backend,
+        projector_decoder,
     )) |summary| return summary;
 
     // Validate only ONNX graphs reachable from the selected artifact route.
@@ -547,6 +596,13 @@ const ComponentInspection = struct {
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
         try self.dependencies.append(self.allocator, owned_path);
+    }
+
+    fn hasDependency(self: *const ComponentInspection, path: []const u8) bool {
+        for (self.dependencies.items) |existing| {
+            if (std.mem.eql(u8, existing, path)) return true;
+        }
+        return false;
     }
 
     fn mergeNativeSummary(
@@ -802,6 +858,41 @@ fn addNativeComponentDependencies(
     for (native_paths) |maybe_native_path| {
         if (maybe_native_path) |native_path| try result.addDependency(native_path);
     }
+
+    // Native sessions can lazily open these companions after the primary
+    // session has been admitted. They therefore participate in the cached
+    // compatibility decision just as much as the primary weight artifact.
+    // For ONNX companions, retain every referenced external-data file too.
+    const lazy_component_paths = [_]?[]const u8{
+        native_manifest.visual_model_path,
+        native_manifest.audio_model_path,
+        native_manifest.text_projection_path,
+        native_manifest.visual_projection_path,
+        native_manifest.audio_projection_path,
+    };
+    for (lazy_component_paths) |maybe_path| {
+        const path = maybe_path orelse continue;
+        const already_collected = result.hasDependency(path);
+        try result.addDependency(path);
+        if (already_collected or !std.mem.endsWith(u8, path, ".onnx")) continue;
+
+        var artifacts = backends.imported_onnx_session.inspectArtifactSet(
+            allocator,
+            path,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            result.invalid_summary = .{
+                .level = .incompatible,
+                .code = .invalid_graph,
+                .message = "a directory-backed component ONNX companion or its external tensor data is invalid or unreadable",
+            };
+            return;
+        };
+        defer artifacts.deinit();
+        for (artifacts.external_paths) |external_path|
+            try result.addDependency(external_path);
+    }
+
     if (artifactCandidateForBackend(native_manifest, .native) == .safetensors) {
         var safetensors_dependencies = safetensors_mod.inspectArtifactDependencies(
             allocator,
@@ -3904,6 +3995,51 @@ test "native compatibility ignores an unrelated primary ONNX graph" {
     try std.testing.expectEqual(model_compatibility.Level.compatible, summary.level);
 }
 
+test "unknown opt in rejects a structurally invalid primary GGUF" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "model.gguf",
+        .data = "not a GGUF",
+    });
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "brand_new_decoder"),
+        .gguf_path = try std.fs.path.join(allocator, &.{ root, "model.gguf" }),
+    };
+    defer man.deinit();
+
+    const summary = (try compatibilitySummaryForBackend(
+        allocator,
+        root,
+        &man,
+        .native,
+    )).?;
+    try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
+    try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
+
+    var allowed_scratch: [7]backends.BackendType = undefined;
+    try std.testing.expectError(
+        error.IncompatibleModel,
+        policyAllowedBackends(
+            allocator,
+            &allowed_scratch,
+            root,
+            &man,
+            &.{.native},
+            .{ .allow_unknown = true },
+        ),
+    );
+}
+
 test "safetensors compatibility rejects a missing referenced shard" {
     const allocator = std.testing.allocator;
     var dir = std.testing.tmpDir(.{});
@@ -4052,6 +4188,68 @@ test "native compatibility rejects an unrecognized GGUF projector format" {
     try std.testing.expectEqual(model_compatibility.Code.unsupported_backend, summary.code);
 }
 
+test "native compatibility rejects a projector for a different decoder family" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeTinyHeadSafetensorsForModelManagerTest(
+        dir.dir,
+        allocator,
+        "model.safetensors",
+    );
+    try writeTinyProjectorGgufForModelManagerTest(
+        dir.dir,
+        allocator,
+        "mmproj.gguf",
+        .gemma4_image,
+    );
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var mismatched = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "gemma3"),
+        .safetensors_path = try std.fs.path.join(allocator, &.{ root, "model.safetensors" }),
+        .gguf_projector_path = try std.fs.path.join(allocator, &.{ root, "mmproj.gguf" }),
+    };
+    defer mismatched.deinit();
+
+    const mismatched_summary = (try compatibilitySummaryForBackend(
+        allocator,
+        root,
+        &mismatched,
+        .native,
+    )).?;
+    try std.testing.expectEqual(
+        model_compatibility.Level.incompatible,
+        mismatched_summary.level,
+    );
+    try std.testing.expectEqual(
+        model_compatibility.Code.unsupported_backend,
+        mismatched_summary.code,
+    );
+
+    var matched = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "gemma4"),
+        .safetensors_path = try std.fs.path.join(allocator, &.{ root, "model.safetensors" }),
+        .gguf_projector_path = try std.fs.path.join(allocator, &.{ root, "mmproj.gguf" }),
+    };
+    defer matched.deinit();
+    const matched_summary = (try compatibilitySummaryForBackend(
+        allocator,
+        root,
+        &matched,
+        .native,
+    )).?;
+    try std.testing.expectEqual(model_compatibility.Level.compatible, matched_summary.level);
+}
+
 test "native compatibility rejects unsupported companion GGUF tensor types" {
     const allocator = std.testing.allocator;
     var dir = std.testing.tmpDir(.{});
@@ -4102,6 +4300,7 @@ test "native compatibility rejects a malformed split GLiNER safetensors head" {
         },
         .gguf,
         .native,
+        .unsupported,
     )).?;
     try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
     try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
@@ -4326,6 +4525,105 @@ test "component plan invalidates when a referenced safetensors shard changes" {
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "model-00001-of-00001.safetensors",
         .data = "invalidated shard",
+    });
+    try std.testing.expectError(
+        error.IncompatibleModel,
+        manager.componentLoaderForPathsWithContract(
+            root,
+            &.{.native},
+            &.{root},
+            .multistage_ocr,
+        ),
+    );
+}
+
+test "component plan invalidates lazy ONNX graphs and their external data" {
+    const allocator = std.testing.allocator;
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const weight = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{4}));
+    const output = try builder.add(input, weight);
+    try graph.markOutput(output);
+    const values = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    const initializer = onnx_graph.ParameterInitializer{
+        .name = "weight",
+        .shape = ml.graph.Shape.init(.f32, &.{4}),
+        .data = .{ .raw_bytes = std.mem.asBytes(&values) },
+    };
+    var exported = try onnx_graph.exportGraphWithExternalData(
+        allocator,
+        &graph,
+        .{ .parameter_initializers = &.{initializer} },
+        "visual_model.data",
+    );
+    defer exported.deinit(allocator);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeTinyHeadSafetensorsForModelManagerTest(
+        dir.dir,
+        allocator,
+        "model.safetensors",
+    );
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "visual_model.onnx",
+        .data = exported.model_bytes,
+    });
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "visual_model.data",
+        .data = exported.external_data.?.bytes,
+    });
+    const root = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", dir.sub_path[0..] },
+    );
+    defer allocator.free(root);
+
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    _ = try manager.componentLoaderForPathsWithContract(
+        root,
+        &.{.native},
+        &.{root},
+        .multistage_ocr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), manager.component_plan_cache.count());
+
+    // Updating a child in place does not change the component directory's
+    // identity. The external-data file itself must invalidate the cached plan.
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "visual_model.data",
+        .data = "truncated",
+    });
+    try std.testing.expectError(
+        error.IncompatibleModel,
+        manager.componentLoaderForPathsWithContract(
+            root,
+            &.{.native},
+            &.{root},
+            .multistage_ocr,
+        ),
+    );
+
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "visual_model.data",
+        .data = exported.external_data.?.bytes,
+    });
+    _ = try manager.componentLoaderForPathsWithContract(
+        root,
+        &.{.native},
+        &.{root},
+        .multistage_ocr,
+    );
+
+    // The lazy graph itself is also a dependency, independently of its external
+    // tensor storage.
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "visual_model.onnx",
+        .data = "invalidated graph",
     });
     try std.testing.expectError(
         error.IncompatibleModel,
@@ -4918,12 +5216,60 @@ fn writeTinyHeadGgufWithTensorTypeForModelManagerTest(
         .{ .key = "general.architecture", .value = .{ .string = "antfly-gliner-head" } },
         .{ .key = "general.alignment", .value = .{ .u32 = @intCast(gguf_format.default_alignment) } },
     };
+    return writeTinyGgufForModelManagerTest(
+        dir,
+        allocator,
+        sub_path,
+        &metadata,
+        tensor_type,
+    );
+}
+
+const TestProjectorKind = enum {
+    gemma3,
+    gemma4_image,
+};
+
+fn writeTinyProjectorGgufForModelManagerTest(
+    dir: anytype,
+    allocator: std.mem.Allocator,
+    sub_path: []const u8,
+    kind: TestProjectorKind,
+) !void {
+    const metadata = switch (kind) {
+        .gemma3 => [_]gguf_format.MetadataEntry{
+            .{ .key = "general.architecture", .value = .{ .string = "antfly-projector" } },
+            .{ .key = "inference.projector.source_architecture", .value = .{ .string = "gemma3" } },
+            .{ .key = "general.alignment", .value = .{ .u32 = @intCast(gguf_format.default_alignment) } },
+        },
+        .gemma4_image => [_]gguf_format.MetadataEntry{
+            .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+            .{ .key = "clip.vision.projector_type", .value = .{ .string = "gemma4v" } },
+            .{ .key = "general.alignment", .value = .{ .u32 = @intCast(gguf_format.default_alignment) } },
+        },
+    };
+    return writeTinyGgufForModelManagerTest(
+        dir,
+        allocator,
+        sub_path,
+        &metadata,
+        .{ .known = .F32 },
+    );
+}
+
+fn writeTinyGgufForModelManagerTest(
+    dir: anytype,
+    allocator: std.mem.Allocator,
+    sub_path: []const u8,
+    metadata: []const gguf_format.MetadataEntry,
+    tensor_type: gguf_tensor_types.TensorType,
+) !void {
     const dims = [_]u64{2};
     const tensors = [_]gguf_writer.TensorSpec{
         .{ .name = "span_rep.test", .dimensions = &dims, .tensor_type = tensor_type },
     };
 
-    var layout = try gguf_writer.buildLayout(allocator, &metadata, &tensors);
+    var layout = try gguf_writer.buildLayout(allocator, metadata, &tensors);
     defer layout.deinit(allocator);
 
     var data = std.ArrayListUnmanaged(u8).empty;
