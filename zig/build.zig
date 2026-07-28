@@ -4588,6 +4588,8 @@ pub fn build(b: *std.Build) void {
             "query parser forwards structured hypervector associations by index",
             "query parser rejects orphaned hypervector associations",
             "internal query parser carries hypervector identity and public parser rejects it",
+            "bound table read source reranks hits after materialization",
+            "hosted cross-range graph query contributes a weighted hybrid source",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

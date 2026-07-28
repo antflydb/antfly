@@ -48,11 +48,28 @@ pub const RankedHit = struct {
 pub const RankedResult = struct {
     index_name: []const u8,
     hits: []const RankedHit,
+    kind: SourceKind = .ranked,
+};
+
+pub const SourceKind = enum {
+    /// Ordered retrieval source: contribution depends on rank or calibrated score.
+    ranked,
+    /// Exact membership signal: every matching candidate receives the same contribution.
+    binary,
 };
 
 pub const IndexScore = struct {
     index_name: []const u8,
+    /// Score reported by the source before fusion calibration.
     score: f64,
+    /// One-based rank within the source's candidate window.
+    rank: u32 = 0,
+    /// Source score after strategy-specific calibration and before weighting.
+    normalized_score: f64 = 0,
+    /// Configured source weight.
+    weight: f64 = 1,
+    /// Additive contribution to the final fused score.
+    contribution: f64 = 0,
 };
 
 pub const FusionHit = struct {
@@ -69,6 +86,7 @@ pub const FusionHit = struct {
 /// Fuse multiple ranked result sets into a single scored list.
 /// Caller owns the returned slice and all nested allocations (use freeHits).
 pub fn fuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig) ![]FusionHit {
+    try validateConfigAndResults(results, config);
     return switch (config.strategy) {
         .rrf => rrfFuse(alloc, results, config),
         .rsf => rsfFuse(alloc, results, config),
@@ -94,6 +112,32 @@ fn getWeight(config: FusionConfig, index_name: []const u8) f64 {
     return 1.0;
 }
 
+fn validateConfigAndResults(results: []const RankedResult, config: FusionConfig) !void {
+    if (!std.math.isFinite(config.rank_constant) or config.rank_constant <= 0) {
+        return error.InvalidFusionConfig;
+    }
+    for (config.weights) |weight| {
+        if (weight.name.len == 0 or !std.math.isFinite(weight.weight) or weight.weight < 0) {
+            return error.InvalidFusionConfig;
+        }
+    }
+    for (results) |result| {
+        if (result.index_name.len == 0) return error.InvalidFusionInput;
+        for (result.hits) |hit| {
+            if (hit.doc_id.len == 0 or !std.math.isFinite(hit.score)) {
+                return error.InvalidFusionInput;
+            }
+        }
+    }
+    if (results.len > 0) {
+        for (results) |result| {
+            if (getWeight(config, result.index_name) > 0) break;
+        } else {
+            return error.InvalidFusionConfig;
+        }
+    }
+}
+
 // ============================================================================
 // RRF: Reciprocal Rank Fusion
 // ============================================================================
@@ -116,7 +160,11 @@ fn rrfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
     for (results) |result| {
         const w = getWeight(config, result.index_name);
         for (result.hits, 0..) |hit, rank| {
-            const rrf_score = w * (1.0 / (k + @as(f64, @floatFromInt(rank)) + 1.0));
+            const normalized_score = switch (result.kind) {
+                .ranked => 1.0 / (k + @as(f64, @floatFromInt(rank)) + 1.0),
+                .binary => 1.0,
+            };
+            const rrf_score = w * normalized_score;
 
             const gop = try score_map.getOrPut(alloc, hit.doc_id);
             if (!gop.found_existing) {
@@ -132,6 +180,10 @@ fn rrfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
             try gop.value_ptr.index_scores.append(alloc, .{
                 .index_name = try alloc.dupe(u8, result.index_name),
                 .score = hit.score,
+                .rank = @intCast(rank + 1),
+                .normalized_score = normalized_score,
+                .weight = w,
+                .contribution = rrf_score,
             });
         }
     }
@@ -174,13 +226,18 @@ fn rsfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
 
         const score_range = max_score - min_score;
 
-        for (result.hits) |hit| {
-            const normalized = if (score_range > 0)
-                (hit.score - min_score) / score_range
-            else
-                1.0; // all same score
+        for (result.hits, 0..) |hit, rank| {
+            // Values beyond the calibration window may be below its minimum.
+            // Clamp them so a source can never subtract relevance accidentally.
+            const normalized = switch (result.kind) {
+                .binary => 1.0,
+                .ranked => if (score_range > 0)
+                    std.math.clamp((hit.score - min_score) / score_range, 0.0, 1.0)
+                else
+                    1.0, // all same score
+            };
 
-            const rsf_score = w * normalized;
+            const contribution = w * normalized;
 
             const gop = try score_map.getOrPut(alloc, hit.doc_id);
             if (!gop.found_existing) {
@@ -191,11 +248,15 @@ fn rsfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
                     .index_count = 0,
                 };
             }
-            gop.value_ptr.score += rsf_score;
+            gop.value_ptr.score += contribution;
             gop.value_ptr.index_count += 1;
             try gop.value_ptr.index_scores.append(alloc, .{
                 .index_name = try alloc.dupe(u8, result.index_name),
                 .score = hit.score,
+                .rank = @intCast(rank + 1),
+                .normalized_score = normalized,
+                .weight = w,
+                .contribution = contribution,
             });
         }
     }
@@ -242,6 +303,10 @@ fn buildSortedHits(alloc: Allocator, score_map: *std.StringHashMapUnmanaged(Accu
             copied_index_scores[j] = .{
                 .index_name = try alloc.dupe(u8, is.index_name),
                 .score = is.score,
+                .rank = is.rank,
+                .normalized_score = is.normalized_score,
+                .weight = is.weight,
+                .contribution = is.contribution,
             };
         }
         hits[i] = .{
@@ -257,7 +322,8 @@ fn buildSortedHits(alloc: Allocator, score_map: *std.StringHashMapUnmanaged(Accu
     // Sort descending by score
     std.mem.sort(FusionHit, hits, {}, struct {
         fn cmp(_: void, a: FusionHit, b: FusionHit) bool {
-            return a.score > b.score;
+            if (a.score != b.score) return a.score > b.score;
+            return std.mem.order(u8, a.doc_id, b.doc_id) == .lt;
         }
     }.cmp);
 
@@ -460,6 +526,113 @@ test "weighted fusion" {
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     // doc1 has weight 2.0 → should score higher
     try std.testing.expectEqualStrings("doc1", hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 1), hits[0].index_scores[0].rank);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0 / 61.0), hits[0].index_scores[0].contribution, 1e-12);
+    try std.testing.expectApproxEqAbs(hits[0].score, hits[0].index_scores[0].contribution, 1e-12);
+}
+
+test "rsf clamps scores below the calibration window" {
+    const alloc = std.testing.allocator;
+
+    const source_hits: []const RankedHit = &.{
+        .{ .doc_id = "top", .score = 10.0 },
+        .{ .doc_id = "boundary", .score = 8.0 },
+        .{ .doc_id = "tail", .score = 1.0 },
+    };
+    const results: []const RankedResult = &.{
+        .{ .index_name = "semantic", .hits = source_hits },
+    };
+
+    const hits = try fuse(alloc, results, .{
+        .strategy = .rsf,
+        .window_size = 2,
+        .weights = &.{.{ .name = "semantic", .weight = 0.5 }},
+    });
+    defer freeHits(alloc, hits);
+
+    try std.testing.expectEqual(@as(usize, 3), hits.len);
+    try std.testing.expectEqualStrings("top", hits[0].doc_id);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), hits[0].score, 1e-12);
+    try std.testing.expectEqualStrings("boundary", hits[1].doc_id);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), hits[1].score, 1e-12);
+    try std.testing.expectEqualStrings("tail", hits[2].doc_id);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), hits[2].score, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), hits[2].index_scores[0].normalized_score, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), hits[2].index_scores[0].contribution, 1e-12);
+}
+
+test "fusion uses document id as deterministic equal-score tie breaker" {
+    const alloc = std.testing.allocator;
+
+    const source_hits: []const RankedHit = &.{
+        .{ .doc_id = "doc-b", .score = 1.0 },
+        .{ .doc_id = "doc-a", .score = 1.0 },
+    };
+    const results: []const RankedResult = &.{
+        .{ .index_name = "semantic", .hits = source_hits },
+    };
+
+    const hits = try fuse(alloc, results, .{ .strategy = .rsf });
+    defer freeHits(alloc, hits);
+
+    try std.testing.expectEqualStrings("doc-a", hits[0].doc_id);
+    try std.testing.expectEqualStrings("doc-b", hits[1].doc_id);
+}
+
+test "binary signal contributes a constant weight independent of rank" {
+    const alloc = std.testing.allocator;
+
+    const signal_hits: []const RankedHit = &.{
+        .{ .doc_id = "doc-b", .score = 1.0 },
+        .{ .doc_id = "doc-a", .score = 1.0 },
+    };
+    const results: []const RankedResult = &.{
+        .{ .index_name = "in_stock", .hits = signal_hits, .kind = .binary },
+    };
+    const weights = [_]NamedWeight{.{ .name = "in_stock", .weight = 0.2 }};
+
+    inline for ([_]FusionStrategy{ .rrf, .rsf }) |strategy| {
+        const hits = try fuse(alloc, results, .{
+            .strategy = strategy,
+            .weights = &weights,
+        });
+        defer freeHits(alloc, hits);
+
+        try std.testing.expectEqual(@as(usize, 2), hits.len);
+        for (hits) |hit| {
+            try std.testing.expectApproxEqAbs(@as(f64, 0.2), hit.score, 1e-12);
+            try std.testing.expectApproxEqAbs(@as(f64, 1.0), hit.index_scores[0].normalized_score, 1e-12);
+            try std.testing.expectApproxEqAbs(@as(f64, 0.2), hit.index_scores[0].contribution, 1e-12);
+        }
+    }
+}
+
+test "fusion rejects nonfinite scores and invalid calibration" {
+    const alloc = std.testing.allocator;
+
+    const invalid_hits: []const RankedHit = &.{
+        .{ .doc_id = "doc", .score = std.math.nan(f64) },
+    };
+    const invalid_results: []const RankedResult = &.{
+        .{ .index_name = "semantic", .hits = invalid_hits },
+    };
+    try std.testing.expectError(error.InvalidFusionInput, fuse(alloc, invalid_results, .{}));
+
+    const valid_hits: []const RankedHit = &.{
+        .{ .doc_id = "doc", .score = 1.0 },
+    };
+    const valid_results: []const RankedResult = &.{
+        .{ .index_name = "semantic", .hits = valid_hits },
+    };
+    try std.testing.expectError(error.InvalidFusionConfig, fuse(alloc, valid_results, .{
+        .rank_constant = 0,
+    }));
+    try std.testing.expectError(error.InvalidFusionConfig, fuse(alloc, valid_results, .{
+        .weights = &.{.{ .name = "semantic", .weight = -1 }},
+    }));
+    try std.testing.expectError(error.InvalidFusionConfig, fuse(alloc, valid_results, .{
+        .weights = &.{.{ .name = "semantic", .weight = 0 }},
+    }));
 }
 
 test "pruner min_score_ratio" {

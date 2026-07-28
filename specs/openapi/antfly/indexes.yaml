@@ -1234,13 +1234,22 @@ components:
         - failover
       default: rrf
       description: |
-        Merge strategy for combining results from the semantic_search and full_text_search.
-        rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
-        rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
+        Merge strategy for combining named lexical, semantic, structured, and
+        graph result sources.
+        rrf: Reciprocal Rank Fusion - combines ranked sources using reciprocal
+          rank; exact binary structured sources contribute their full weight.
+        rsf: Relative Score Fusion - min/max calibrates ranked scores within the
+          candidate window and combines weighted scores; exact binary
+          structured sources contribute either their full weight or zero.
         failover: Use full_text_search if embedding generation fails
     MergeConfig:
       type: object
-      description: Configuration for result fusion when combining multiple search indexes.
+      description: |
+        Configuration for bounded, explainable fusion of named query sources.
+        `window_size` controls the candidate budget for each ranked source;
+        `limit` is the final result count unless a reranker is configured, in
+        which case `limit` is the fused candidate pool and `reranker.top_n` is
+        the final result count.
       properties:
         strategy:
           $ref: "#/components/schemas/MergeStrategy"
@@ -1250,17 +1259,24 @@ components:
             type: number
             format: double
           description: |
-            Named weights keyed by index name. `full_text` for the full-text search index;
-            embedding index names for vector indexes.
-            Unspecified indexes default to 1.0. Applied in both RRF and RSF.
+            Non-negative weights keyed by source name: `full_text` for the
+            default lexical source, an index name for a dense or sparse source,
+            a `with` binding name for exact candidate-level structured
+            membership, or a `graph_searches` name for an exact graph-derived
+            ranked result set. Unspecified sources default to 1.0. Unknown or
+            duplicate names and configurations with no positive effective
+            source weight fail closed. Applied in both RRF and RSF.
           example:
             full_text: 0.3
             title_embedding: 1.0
+            preferred_region: 0.2
         window_size:
           x-go-type-skip-optional-pointer: true
           type: integer
           minimum: 1
-          description: RSF normalization window size. Defaults to `limit`.
+          description: |
+            Per-ranked-source candidate and RSF calibration window. Defaults to
+            `limit`. This is independent from the final result count.
         rank_constant:
           x-go-type-skip-optional-pointer: true
           type: number

@@ -6203,7 +6203,10 @@ components:
         limit:
           type: integer
           description: |
-            Maximum number of results to return. For semantic_search, this is the topk parameter.
+            Maximum number of results to return. For semantic_search, this is
+            the top-k candidate count. When a reranker is configured, all
+            `limit` candidates are scored by the reranker and
+            `reranker.top_n`, when set, becomes the final result count.
             Default varies by query type (typically 10).
           example: 20
         offset:
@@ -6298,8 +6301,21 @@ components:
         merge_config:
           $ref: "indexes.yaml#/components/schemas/MergeConfig"
           description: |
-            Configuration for merging full-text and semantic search results.
-            Only applies when both `full_text_search` and `semantic_search` are specified.
+            Configuration for merging named lexical, dense, sparse, structured,
+            and graph-derived result sources.
+        with:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: true
+          description: |
+            Named exact structured filter bindings. Referencing a binding from
+            the boolean query applies it as a hard predicate. Giving its name a
+            positive `merge_config.weights` entry also evaluates it as a binary
+            soft signal over the bounded lexical/semantic candidate union: an
+            exact match contributes the configured weight and a non-match
+            contributes zero. A weighted binding does not generate candidates
+            by itself.
         count:
           type: boolean
           description: |
@@ -6316,6 +6332,16 @@ components:
             join metadata, reranker stats, and merge details.
             Has minor performance overhead — not recommended for production traffic.
           example: false
+        explain:
+          type: boolean
+          default: false
+          description: |
+            If true, each hybrid hit includes `_score_explanation` with the raw
+            source score, source rank, calibrated score, configured weight, and
+            additive contribution used to produce the fused score. Explanation
+            data is deterministic but adds response bytes; omit it on latency-
+            sensitive production traffic unless the trace is needed.
+          example: false
         reranker:
           $ref: "reranking.yaml#/components/schemas/RerankerConfig"
           description: |
@@ -6329,7 +6355,8 @@ components:
             - You have semantic or hybrid search results to refine
             - Latency trade-off is acceptable (reranking adds 100-500ms typically)
 
-            **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size.
+            **Best practice:** Set `limit` to a 50-100 candidate pool and
+            `reranker.top_n` to the final result count.
 
             Example:
             ```json
@@ -6987,8 +7014,16 @@ components:
         _index_scores:
           type: object # map[string]float64
           additionalProperties: true
-          description: Scores partitioned by index when using RRF search.
+          description: Backwards-compatible raw scores partitioned by source when using hybrid search.
           x-go-name: indexScores
+        _score_explanation:
+          type: object
+          additionalProperties: true
+          description: |
+            Present when `explain: true` for a fused hit. Contains the final and
+            pre-rerank fusion scores plus per-source rank, raw score, calibrated
+            score, weight, and contribution.
+          x-go-name: scoreExplanation
         _source:
           type: object
           additionalProperties: true # map[string]any for field values

@@ -12632,7 +12632,13 @@ components:
         limit:
           type: integer
           description: >
-            Maximum number of results to return. For semantic_search, this is the topk parameter.
+            Maximum number of results to return. For semantic_search, this is
+
+            the top-k candidate count. When a reranker is configured, all
+
+            `limit` candidates are scored by the reranker and
+
+            `reranker.top_n`, when set, becomes the final result count.
 
             Default varies by query type (typically 10).
           example: 20
@@ -12769,9 +12775,28 @@ components:
         merge_config:
           $ref: '#/components/schemas/MergeConfig'
           description: >
-            Configuration for merging full-text and semantic search results.
+            Configuration for merging named lexical, dense, sparse, structured,
 
-            Only applies when both `full_text_search` and `semantic_search` are specified.
+            and graph-derived result sources.
+        with:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: true
+          description: >
+            Named exact structured filter bindings. Referencing a binding from
+
+            the boolean query applies it as a hard predicate. Giving its name a
+
+            positive `merge_config.weights` entry also evaluates it as a binary
+
+            soft signal over the bounded lexical/semantic candidate union: an
+
+            exact match contributes the configured weight and a non-match
+
+            contributes zero. A weighted binding does not generate candidates
+
+            by itself.
         count:
           type: boolean
           description: >
@@ -12795,6 +12820,20 @@ components:
 
             Has minor performance overhead — not recommended for production traffic.
           example: false
+        explain:
+          type: boolean
+          default: false
+          description: >
+            If true, each hybrid hit includes `_score_explanation` with the raw
+
+            source score, source rank, calibrated score, configured weight, and
+
+            additive contribution used to produce the fused score. Explanation
+
+            data is deterministic but adds response bytes; omit it on latency-
+
+            sensitive production traffic unless the trace is needed.
+          example: false
         reranker:
           $ref: '#/components/schemas/RerankerConfig'
           description: >
@@ -12815,7 +12854,9 @@ components:
             - Latency trade-off is acceptable (reranking adds 100-500ms typically)
 
 
-            **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size.
+            **Best practice:** Set `limit` to a 50-100 candidate pool and
+
+            `reranker.top_n` to the final result count.
 
 
             Example:
@@ -13669,8 +13710,18 @@ components:
         _index_scores:
           type: object
           additionalProperties: true
-          description: Scores partitioned by index when using RRF search.
+          description: Backwards-compatible raw scores partitioned by source when using hybrid search.
           x-go-name: indexScores
+        _score_explanation:
+          type: object
+          additionalProperties: true
+          description: >
+            Present when `explain: true` for a fused hit. Contains the final and
+
+            pre-rerank fusion scores plus per-source rank, raw score, calibrated
+
+            score, weight, and contribution.
+          x-go-name: scoreExplanation
         _source:
           type: object
           additionalProperties: true
@@ -19501,17 +19552,28 @@ components:
         - failover
       default: rrf
       description: >
-        Merge strategy for combining results from the semantic_search and full_text_search.
+        Merge strategy for combining named lexical, semantic, structured, and
 
-        rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
+        graph result sources.
 
-        rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted
-        scores
-
+        rrf: Reciprocal Rank Fusion - combines ranked sources using reciprocal
+          rank; exact binary structured sources contribute their full weight.
+        rsf: Relative Score Fusion - min/max calibrates ranked scores within the
+          candidate window and combines weighted scores; exact binary
+          structured sources contribute either their full weight or zero.
         failover: Use full_text_search if embedding generation fails
     MergeConfig:
       type: object
-      description: Configuration for result fusion when combining multiple search indexes.
+      description: >
+        Configuration for bounded, explainable fusion of named query sources.
+
+        `window_size` controls the candidate budget for each ranked source;
+
+        `limit` is the final result count unless a reranker is configured, in
+
+        which case `limit` is the fused candidate pool and `reranker.top_n` is
+
+        the final result count.
       properties:
         strategy:
           $ref: '#/components/schemas/MergeStrategy'
@@ -19521,19 +19583,31 @@ components:
             type: number
             format: double
           description: >
-            Named weights keyed by index name. `full_text` for the full-text search index;
+            Non-negative weights keyed by source name: `full_text` for the
 
-            embedding index names for vector indexes.
+            default lexical source, an index name for a dense or sparse source,
 
-            Unspecified indexes default to 1.0. Applied in both RRF and RSF.
+            a `with` binding name for exact candidate-level structured
+
+            membership, or a `graph_searches` name for an exact graph-derived
+
+            ranked result set. Unspecified sources default to 1.0. Unknown or
+
+            duplicate names and configurations with no positive effective
+
+            source weight fail closed. Applied in both RRF and RSF.
           example:
             full_text: 0.3
             title_embedding: 1.0
+            preferred_region: 0.2
         window_size:
           x-go-type-skip-optional-pointer: true
           type: integer
           minimum: 1
-          description: RSF normalization window size. Defaults to `limit`.
+          description: >
+            Per-ranked-source candidate and RSF calibration window. Defaults to
+
+            `limit`. This is independent from the final result count.
         rank_constant:
           x-go-type-skip-optional-pointer: true
           type: number

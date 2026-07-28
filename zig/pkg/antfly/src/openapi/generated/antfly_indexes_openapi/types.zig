@@ -1286,18 +1286,18 @@ pub const IndexType = enum {
     }
 };
 
-/// Configuration for result fusion when combining multiple search indexes.
+/// Configuration for bounded, explainable fusion of named query sources. `window_size` controls the candidate budget for each ranked source; `limit` is the final result count unless a reranker is configured, in which case `limit` is the fused candidate pool and `reranker.top_n` is the final result count.
 pub const MergeConfig = struct {
     strategy: ?MergeStrategy = null,
-    /// Named weights keyed by index name. `full_text` for the full-text search index; embedding index names for vector indexes. Unspecified indexes default to 1.0. Applied in both RRF and RSF.
+    /// Non-negative weights keyed by source name: `full_text` for the default lexical source, an index name for a dense or sparse source, a `with` binding name for exact candidate-level structured membership, or a `graph_searches` name for an exact graph-derived ranked result set. Unspecified sources default to 1.0. Unknown or duplicate names and configurations with no positive effective source weight fail closed. Applied in both RRF and RSF.
     weights: ?std.json.ArrayHashMap(f64) = null,
-    /// RSF normalization window size. Defaults to `limit`.
+    /// Per-ranked-source candidate and RSF calibration window. Defaults to `limit`. This is independent from the final result count.
     window_size: ?i64 = null,
     /// RRF k constant (1/(k+rank)). Defaults to 60.0.
     rank_constant: ?f64 = null,
 };
 
-/// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores failover: Use full_text_search if embedding generation fails
+/// Merge strategy for combining named lexical, semantic, structured, and graph result sources. rrf: Reciprocal Rank Fusion - combines ranked sources using reciprocal rank; exact binary structured sources contribute their full weight. rsf: Relative Score Fusion - min/max calibrates ranked scores within the candidate window and combines weighted scores; exact binary structured sources contribute either their full weight or zero. failover: Use full_text_search if embedding generation fails
 pub const MergeStrategy = enum {
     rrf,
     rsf,

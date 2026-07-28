@@ -44,6 +44,10 @@ This worktree now contains the first engine-owned Phase 1 slice:
   color, material, style, shape, finish, pattern, and size evidence without
   consulting relevance labels, plus a 116-query real compositional slice,
   packed-bipolar comparison, and paired holdout confidence intervals;
+- a candidate-local follow-up that keeps embedding RaBitQ as the candidate
+  generator, trains a pairwise linear reranker on the validation split, and
+  compares transparent hybrid scoring, learned scoring, and learned scoring
+  with packed-bipolar HDC on the untouched holdout;
 - a managed backfill-to-retrieval fixture that uses natural-language HDC search
   to select a location and then follows only the exact stored graph edge, closes
   and reopens the database, repeats the query, and verifies resumed HDC
@@ -63,55 +67,105 @@ before any later attempt to reverse the no-go.
 | Canonical document-to-association projection | implemented for selected JSON paths | replay fixtures against stored typed/schema values |
 | Managed ingest, backfill, rebuild, and quarantine | ingest/backfill and close/reopen/resumed writes tested through existing dense lifecycle; HDC seed/model drift receives a distinct artifact namespace | interrupted-backfill and config-drift rebuild fault injection |
 | Text and structured query composition | implemented | managed local-provider projection, exact-path validation, and public query forwarding tests |
-| Dense HBC/RaBitQ retrieval quality | pinned WANDS exact, RaBitQ, packed-bipolar, dimension/seed, and real compositional evaluations find no statistically significant quality/cost win over tuned embedding score fusion | HBC-tree confirmation only if a later workload reverses the no-go result |
+| Dense HBC/RaBitQ retrieval quality | pinned WANDS exact, RaBitQ, packed-bipolar, dimension/seed, real compositional, and candidate-local learned-reranker evaluations find no quality/cost win over the non-HDC baselines | HBC-tree confirmation only if a later workload reverses the no-go result |
 | Fuzzy seed to exact graph result | managed HDC backfill/retrieval fixture plus 23 generic fail-closed and cross-range distributed graph tests pass | combined distributed HDC seed fixture and public HTTP contract only if the experiment is revived |
 | Operational status and resource counters | normal index status exposes public hypervector config, semantic config fingerprint, coverage outcomes, replay target, backfill progress/state, cardinality, and disk use | HDC encode/query/resource/fallback counters and pressure tests |
 
 ## Product Goal
 
-For users, hypervector retrieval should be a distinct logical capability
-without becoming a second physical database subsystem:
+The production goal is the hybrid query path, not HDC itself:
 
-> Declare one `hypervector` index, write normal documents, query with text and
-> optional structured associations, and let Antfly deterministically derive,
-> backfill, rebuild, cache, and search complete hypervectors through the
-> existing dense-vector machinery.
+> Build a production-quality hybrid query path that combines semantic,
+> lexical, structured, and graph evidence through bounded candidate
+> generation, calibrated fusion, exact candidate-level scoring, optional
+> learned reranking, and explainable final scores. Evaluate compact
+> packed-bipolar HDC only as an optional candidate-level structural interaction
+> feature—not as a primary index—and promote it only if it delivers a
+> statistically significant quality gain on representative compositional and
+> relational workloads beyond strong hybrid and learned-reranking baselines,
+> while meeting latency, memory, lifecycle, and UX requirements.
 
-Production success means fast fuzzy-to-exact graph queries, predictable memory
-and storage, no manual vector materialization, fail-closed coordinate-system
-drift, and lifecycle/status behavior identical to other managed derived
-indexes. The graph remains exact: HDC only chooses ranked seed nodes.
+This makes the main product outcome useful even if HDC remains a no-go. Users
+keep their existing full-text, dense, sparse, structured, and explicit graph
+indexes. A query names the evidence sources and weights it wants; Antfly
+retrieves a bounded union of candidates, calibrates unlike score domains,
+applies exact structured and graph-owned evidence only to that candidate
+window, optionally reranks, and can explain every additive contribution.
+
+HDC has a deliberately narrower burden of proof. It may encode interactions
+that transparent independent features cannot express, but it does not own
+candidate retrieval, graph truth, authorization, or hard filtering. Its packed
+sign sketch is candidate-local derived state with a complete encoder identity,
+and ordinary hybrid search must remain the fallback and baseline.
+
+Production success therefore means:
+
+- materially better relevance than semantic-only retrieval through a strong,
+  understandable hybrid path;
+- deterministic global fusion across shards, stable tie-breaking, and exact
+  filters and graph facts;
+- one candidate-window control with bounded source retrieval, exact scoring,
+  reranking, memory, and response size;
+- score explanations that distinguish raw source scores, calibrated values,
+  configured weights, additive contributions, and any final reranker score;
+- explicit graph-index creation and normal managed-index lifecycle/status
+  behavior; and
+- no public HDC index unless the optional packed-bipolar feature independently
+  clears the quality, cost, lifecycle, and UX graduation gates below.
+
+### Hybrid path implementation status
+
+This branch now implements the first production-shaped hybrid slice, separately
+from the experimental `hypervector` index:
+
+| Capability | Current branch behavior | Remaining production evidence |
+| --- | --- | --- |
+| bounded candidate generation | lexical, dense, and sparse sources retrieve per-source `window_size` candidates; distributed shards return a bounded union large enough for global fusion | load tests at representative source counts and skew |
+| calibrated fusion | RRF and RSF accept non-negative named weights, deterministic document-id tie breaks, binary exact signals, and globally rebuilt cross-shard ranks/calibration | offline relevance tuning guidance and production latency histograms |
+| exact structured evidence | a weighted `with` binding evaluates exact membership only over the retrieved candidate union and contributes either its full weight or zero | authorization/tenant fixtures and high-cardinality pressure tests |
+| graph evidence | a positively weighted named graph result is an explicit ranked source; graph index creation remains separate; unsupported multi-range graph shapes fail closed; a cross-range weighted hybrid fixture passes | graph fanout SLOs |
+| reranking | every fused candidate competes; `reranker.top_n` truncates only after scoring and sorting | provider failure policy, concurrency limits, and representative quality/cost baselines |
+| explanations | `explain: true` returns raw score, global rank, calibrated score, weight, contribution, fusion score, final score, and reranked state | SDK rendering and response-size budgets |
+| count semantics | truncated source windows propagate `total.relation: "gte"` instead of presenting the candidate union as exhaustive | public pagination contract tests |
+| deployment parity | provisioned local and distributed paths implement the slice; serverless rejects `with`, `merge_config`, graph scoring, reranking, and `explain` rather than silently changing semantics | implement serverless parity before advertising one cross-deployment contract |
+
+This is meaningful product progress, but it does not complete the goal. The
+branch now includes the held-out learned-reranker and candidate-local
+packed-bipolar comparison described below. It still lacks a second external
+compositional or relational workload and production
+latency/memory/lifecycle campaigns. Until those exist, the correct claim is
+“stronger hybrid execution prototype,” not “productionized hybrid retrieval.”
 
 ## Experiment Goal
 
-This experiment must determine whether complete hypervectors provide a
-meaningful retrieval advantage over ordinary embeddings plus exact filters or a
-simple structured-score baseline, without introducing a new physical index
-engine or weakening graph correctness.
+This experiment must determine whether a compact packed-bipolar HDC interaction
+feature improves the candidate-level hybrid scorer beyond ordinary embeddings,
+lexical retrieval, exact structured signals, graph-derived result sets, and a
+learned reranker, without introducing a new primary index engine or weakening
+graph correctness.
 
 Concretely, it must answer:
 
-> Can Antfly combine semantic and structured evidence into one managed
-> hypervector that selects better graph entry points while meeting production
-> requirements for latency, recall, storage, rebuilds, and a simple user
-> experience?
+> After the strong hybrid path has generated candidates, can packed-bipolar HDC
+> capture useful structural interactions that the transparent and learned
+> baselines miss, at acceptable incremental cost?
 
 Success requires all of the following:
 
-- measurably better retrieval, or uniquely useful composition, on
-  representative workloads;
+- a statistically significant paired quality gain on held-out compositional
+  and relational workloads beyond both tuned hybrid and learned-reranking
+  baselines;
 - exact graph facts, authorization constraints, and filters remaining
   authoritative;
-- competitive HBC/RaBitQ performance and bounded resource use;
+- bounded candidate-local latency, memory, storage, and distributed-query cost;
 - deterministic, fail-closed encoder identity and lifecycle behavior;
-- a straightforward UX: declare a hypervector index, write normal documents,
-  and query with text plus optional structured associations.
+- a straightforward UX in which HDC is an optional scoring feature and never
+  silently creates an index or graph.
 
-The experiment is allowed to reject HDC. If complete hypervectors cannot
-outperform ordinary embeddings with exact filtering or transparent structured
-score fusion enough to justify their additional dimensions, scoring cost, and
-lifecycle surface, Antfly should prefer the simpler existing approach. A
-successful implementation of the primitive is not, by itself, a successful
+The experiment is allowed to reject HDC. If packed-bipolar interaction scoring
+cannot outperform the strong hybrid and learned baselines enough to justify its
+encoding and lifecycle surface, Antfly should ship the hybrid path without it.
+A successful implementation of the primitive is not, by itself, a successful
 product experiment.
 
 ### Current decision
@@ -123,6 +177,13 @@ shown a statistically significant quality advantage over validation-tuned
 embedding score fusion. The embedding baseline is materially smaller and
 faster, and structured evidence can be applied during candidate scoring or
 reranking without adding a new physical index.
+
+The candidate-local follow-up strengthens that decision. A validation-trained
+pairwise linear reranker improves over fixed transparent fusion at the
+200-candidate budget, while adding packed-bipolar HDC to the same learner makes
+holdout NDCG worse at every tested budget. The HDC regression is statistically
+significant at 50 and 100 candidates. HDC therefore has not earned even the
+narrower optional reranking role on this workload.
 
 This does not invalidate the deterministic HDC primitive or its lifecycle
 tests. It means the primitive has not earned the public API, dimensions, or
@@ -137,7 +198,7 @@ without claiming that every production-hardening gate passed:
 
 | Graduation condition | Evidence | Verdict |
 | --- | --- | --- |
-| statistically significant retrieval or graph-answer advantage | full WANDS and real class-plus-attribute slice; paired 10,000-sample bootstrap at 50/100/200 candidates | **not demonstrated** |
+| statistically significant retrieval or graph-answer advantage | full WANDS, real class-plus-attribute slice, and candidate-local packed-HDC feature beyond a validation-trained reranker; paired 10,000-sample bootstrap at 50/100/200 candidates | **failed**: no positive interval; candidate-local HDC is significantly worse at 50 and 100 candidates |
 | competitive representation and query cost | tuned 8,000-dimensional HDC, RaBitQ and packed bipolar, equal candidate budgets | **failed**: about 16x candidate bytes; 1.3x–1.8x candidate-scan latency |
 | exact graph semantics | local managed HDC seed-to-edge fixture; generic distributed result-ref, identity, retry, cross-range, and fail-closed suites | preserved at the existing handoff boundary; combined distributed fixture remains unbuilt |
 | fail-closed lifecycle | full coordinate identity, mismatch rejection, backfill, close/reopen, resumed enrichment | prototype evidence passes; production fault injection and resource attribution remain unbuilt |
@@ -148,7 +209,124 @@ multi-node HDC traversal, interrupted-backfill campaigns, and production SLO
 work cannot change the present decision. They are revival gates, not evidence
 needed to reject the current proposal.
 
-## User Experience
+## Hybrid Query User Experience
+
+The production path extends the existing query contract instead of adding an
+HDC-specific query language. The source name is the contract between retrieval
+and fusion:
+
+- `full_text` is the lexical result set;
+- an embeddings index name is a dense or sparse semantic result set;
+- a name under `with` is an exact binary structured signal;
+- a name under `graph_searches` is an exact graph-derived ranked result set.
+
+A `with` clause remains a hard predicate when referenced by the query's boolean
+filter. It becomes a soft candidate-level signal only when the same name is
+given a positive `merge_config.weights` entry. The exact match contributes the
+configured weight; a non-match contributes zero. Antfly evaluates this signal
+only for the bounded union of lexical and semantic candidates.
+
+A graph query likewise remains a separately declared exact operation. Giving
+its result name a fusion weight explicitly adds its returned documents to the
+ranked candidate union. It does not score the fuzzy seed, synthesize an edge,
+or auto-create a graph index.
+
+For example:
+
+```json
+{
+  "query": {
+    "match": {
+      "field": "description",
+      "text": "quiet waterfront city with mountain access"
+    }
+  },
+  "semantic_search": "quiet waterfront city with mountain access",
+  "indexes": ["location_embedding"],
+  "with": {
+    "pacific_region": {
+      "term": {
+        "path": "/region",
+        "value": "pacific_northwest"
+      }
+    }
+  },
+  "graph_searches": {
+    "near_transit_hub": {
+      "type": "neighbors",
+      "index_name": "travel_graph",
+      "start_nodes": {
+        "keys": ["hub:west-coast"]
+      },
+      "params": {
+        "edge_types": ["SERVES"],
+        "direction": "out",
+        "max_depth": 1
+      }
+    }
+  },
+  "merge_config": {
+    "strategy": "rsf",
+    "window_size": 100,
+    "weights": {
+      "full_text": 0.35,
+      "location_embedding": 1.0,
+      "pacific_region": 0.2,
+      "near_transit_hub": 0.15
+    }
+  },
+  "reranker": {
+    "provider": "antfly",
+    "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    "field": "description",
+    "top_n": 10
+  },
+  "explain": true,
+  "limit": 100
+}
+```
+
+Execution is staged and bounded:
+
+```text
+lexical/dense/sparse top-window retrieval
+  -> deduplicated candidate union
+  -> per-source calibration and weighted fusion
+  -> exact structured membership on candidates
+  -> explicit graph-derived candidate sets
+  -> global cross-shard fusion with stable document-id tie-breaks
+  -> optional exact/cross-encoder reranking
+  -> final page and optional score explanation
+```
+
+`window_size` is the per-source retrieval and calibration budget. Without a
+reranker, `limit` is the final page size. With a reranker, `limit` is the fused
+candidate pool sent to the reranker and `reranker.top_n` is the final result
+count. All `limit` candidates compete; `top_n` must never be interpreted as a
+prefix to score.
+
+The returned total describes the observed fused candidate union, not an
+estimate that every source would have produced without its window. If any
+source was truncated, `total.relation` is `gte`; clients must not infer an
+exhaustive result count from a bounded hybrid query.
+
+With `explain: true`, each hit reports the fusion strategy and, for every source
+that matched, its raw score, one-based source rank, calibrated value, configured
+weight, and additive contribution. It also reports the fused score, final score,
+and whether reranking changed the final score. Explanations are deterministic
+diagnostics, not probabilities.
+
+Hard filters, tenant/authorization constraints, deletion visibility, and graph
+facts are never softened by this path. Unknown weight names, duplicate source
+names, non-finite or negative weights, configurations without a positive
+effective source, unsupported distributed execution, and incompatible score
+identities fail closed.
+
+Serverless does not yet implement this scoring contract. Requests using these
+provisioned-only controls are rejected explicitly so the same JSON cannot
+silently produce a different ranking.
+
+## Experimental HDC User Experience
 
 HDC is exposed as a logical `hypervector` index and operated through the same
 managed-index lifecycle as embeddings. Users do not create projection matrices,
@@ -1550,6 +1728,51 @@ attribute beyond class. A later revival should start by reproducing this signal
 on a larger external graph workload, not by building a specialized physical
 index first.
 
+#### Candidate-local packed-HDC feature versus a learned reranker
+
+The preceding runs still allowed HDC to own candidate retrieval. The
+production-goal follow-up instead fixes the engine boundary:
+
+```text
+embedding RaBitQ candidates
+  -> exact semantic and structured candidate features
+  -> optional packed-bipolar structural HDC similarity
+  -> learned candidate reranker
+```
+
+The HDC sketch is not searched across the corpus. The experiment computes
+Hamming similarity only for the 50, 100, or 200 candidates already selected by
+the ordinary 384-dimensional embedding path. The 8,000-bit product sketch is
+42,994,000 bytes for this corpus and costs 0.0674 ms/query to score 200
+candidates on the measured host.
+
+Two deterministic pairwise-logistic linear rankers are trained only on the 23
+validation queries for 12 epochs. The baseline learns from exact semantic
+cosine and normalized exact structured-match count. The treatment receives
+those same features plus packed-HDC similarity. This small ranker is not a
+substitute for a production cross-encoder, but it is a leakage-free learned
+baseline that can absorb correlations between the transparent features.
+
+Holdout results over 93 queries are:
+
+| Candidates | Fixed hybrid NDCG@10 | Learned NDCG@10 | Learned + packed HDC NDCG@10 | HDC delta vs learned (95% CI) |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 0.7472 | **0.7476** | 0.7385 | **-0.009063** `[-0.017478, -0.000973]` |
+| 100 | 0.7574 | **0.7599** | 0.7521 | **-0.007775** `[-0.015767, -0.000181]` |
+| 200 | 0.7521 | **0.7613** | 0.7541 | -0.007121 `[-0.016230, 0.001916]` |
+
+At 200 candidates the learned non-HDC reranker improves over fixed fusion by
+`0.009121` NDCG@10 with interval `[0.002248, 0.017206]`. Adding HDC does not
+improve graph-answer top-1 at any budget; it changes the learned result from
+0.9785 to 0.9677, a one-query regression whose interval includes zero.
+
+This is the most decision-relevant HDC result in the branch: the cheaper,
+transparent candidate features become more useful when learned, while the HDC
+feature adds storage and latency and overfits the small validation split. It
+supports shipping and tuning the hybrid/reranking path without an HDC API.
+The remaining experiment gap is a second external domain with richer
+compositional or relational interactions, not another WANDS parameter sweep.
+
 The RaBitQ measurement deliberately isolates quantization, candidate selection,
 and exact reranking over the entire corpus. It is not an HBC tree-topology
 benchmark. Because the application result is already a no-go, building a
@@ -1623,6 +1846,7 @@ The benchmark implementation and fixture helper are:
 - [machine-readable packed-bipolar follow-up](bench/baselines/hdc-wands-packed-bipolar-2026-07-27.json)
 - [machine-readable dimension/seed follow-up](bench/baselines/hdc-wands-tuned-representation-2026-07-27.json)
 - [machine-readable compositional follow-up](bench/baselines/hdc-wands-compositional-2026-07-27.json)
+- [machine-readable candidate-local learned-reranker follow-up](bench/baselines/hdc-wands-candidate-reranker-2026-07-27.json)
 
 ### Graduation criteria
 

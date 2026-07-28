@@ -17698,6 +17698,7 @@ pub const DB = struct {
             .fuse_named_sets = fuseNamedSetsCallback,
             .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
             .attach_graph_results = attachGraphResultsCallback,
+            .apply_graph_expand_strategy = applyGraphExpandStrategyCallback,
         });
         if (result.sort_profile != null) {
             db_query_metrics.observeSortProfile(metric_name, .search, platform_time.monotonicNs() -| start_ns, result.sort_profile);
@@ -18117,7 +18118,16 @@ pub const DB = struct {
     ) anyerror!void {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         base.graph_results = try self.executeGraphQueriesWithSets(alloc, req, req.graph_queries, named_sets);
-        try self.applyGraphExpandStrategy(alloc, base, req.expand_strategy);
+    }
+
+    fn applyGraphExpandStrategyCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        base: *types.SearchResult,
+        strategy: ?graph_query_mod.ExpandStrategy,
+    ) anyerror!void {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        try self.applyGraphExpandStrategy(alloc, base, strategy);
     }
 
     fn hbcSearchCallback(
@@ -50347,7 +50357,7 @@ test "db preflightSearchRequest validates live lane bindings" {
     try std.testing.expectEqual(@as(u32, 8), cost_summary.shard_result_window);
     try std.testing.expectEqual(@as(u64, 8), cost_summary.shard_result_window_total);
     try std.testing.expectEqual(@as(u64, 8), cost_summary.stored_projection_doc_upper_bound_total);
-    try std.testing.expectEqual(@as(u32, 4), cost_summary.rerank_doc_upper_bound);
+    try std.testing.expectEqual(@as(u32, 8), cost_summary.rerank_doc_upper_bound);
     try std.testing.expect(cost_summary.aggregation_may_scan_full_results);
     try std.testing.expectEqual(@as(?u32, null), cost_summary.positive_id_result_upper_bound);
     try std.testing.expectEqual(@as(?u32, null), cost_summary.result_doc_estimate);
@@ -50355,7 +50365,7 @@ test "db preflightSearchRequest validates live lane bindings" {
     try std.testing.expectEqual(@as(?u64, null), cost_summary.effective_stored_projection_doc_estimate_total);
     try std.testing.expectEqual(@as(u64, 8), cost_summary.effective_stored_projection_doc_upper_bound_total);
     try std.testing.expectEqual(@as(?u32, null), cost_summary.effective_rerank_doc_estimate);
-    try std.testing.expectEqual(@as(u32, 4), cost_summary.effective_rerank_doc_upper_bound);
+    try std.testing.expectEqual(@as(u32, 8), cost_summary.effective_rerank_doc_upper_bound);
     try std.testing.expectEqual(@as(?u32, null), cost_summary.aggregation_second_pass_doc_estimate);
     try std.testing.expectEqual(@as(?u32, null), cost_summary.aggregation_second_pass_doc_upper_bound);
 

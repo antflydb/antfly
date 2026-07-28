@@ -1190,6 +1190,7 @@ pub const SearchRequest = struct {
     aggregations_json: []const u8 = "",
     count_only: bool = false,
     profile: bool = false,
+    explain: bool = false,
     full_text: ?TextQuery = null,
     filter_query_json: []const u8 = "",
     exclusion_query_json: []const u8 = "",
@@ -1239,6 +1240,9 @@ pub const SearchRequest = struct {
     execution_deadline_ns: ?u64 = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+    // Internal distributed-execution control. Component sources retrieve this
+    // many candidates even when the shard must return a larger union window.
+    fusion_candidate_window: u32 = 0,
 };
 
 pub const SortField = struct {
@@ -1303,6 +1307,7 @@ pub const SearchHit = struct {
     doc_ordinal: ?u32 = null,
     native_text_doc_id: ?u32 = null,
     score: ?f32 = null,
+    reranked: bool = false,
     index_scores: []fusion_mod.IndexScore = &.{},
     sort_values: []std.json.Value = &.{},
     stored_data: ?[]u8 = null,
@@ -1317,6 +1322,7 @@ pub const SearchHit = struct {
             .doc_ordinal = self.doc_ordinal,
             .native_text_doc_id = self.native_text_doc_id,
             .score = self.score,
+            .reranked = self.reranked,
             .index_scores = try cloneIndexScores(alloc, self.index_scores),
             .sort_values = try cloneJsonValues(alloc, self.sort_values),
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
@@ -1477,6 +1483,10 @@ pub fn cloneIndexScores(alloc: Allocator, scores: []const fusion_mod.IndexScore)
         cloned[i] = .{
             .index_name = try alloc.dupe(u8, score.index_name),
             .score = score.score,
+            .rank = score.rank,
+            .normalized_score = score.normalized_score,
+            .weight = score.weight,
+            .contribution = score.contribution,
         };
         initialized += 1;
     }

@@ -24,6 +24,7 @@ const doc_set = @import("../doc_set.zig");
 const doc_identity = @import("../doc_identity.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
 const graph_exec = @import("graph_exec.zig");
+const graph_query_mod = @import("../../../graph/query.zig");
 const result_shape = @import("result_shape.zig");
 const search_mod = @import("../../../search/search.zig");
 const query_mod = @import("../../../search/query.zig");
@@ -33,6 +34,7 @@ const typed_dv = @import("../../../section/typed_doc_values.zig");
 const roaring = @import("../../../encoding/roaring.zig");
 const snappy = @import("../../../encoding/snappy.zig");
 const distributed_stats_mod = @import("../../../search/distributed_stats.zig");
+const fusion_mod = @import("../../../search/fusion.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const introducer_mod = @import("../../../introducer.zig");
 const mapper_mod = @import("../document_mapper.zig");
@@ -784,6 +786,12 @@ pub const ComposedSearchExecutor = struct {
         base: *types.SearchResult,
         named_sets: []const graph_exec.NamedResultSet,
     ) anyerror!void,
+    apply_graph_expand_strategy: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        base: *types.SearchResult,
+        strategy: ?graph_query_mod.ExpandStrategy,
+    ) anyerror!void = null,
 };
 
 const TextDocNumSet = union(enum) {
@@ -1098,6 +1106,9 @@ pub fn searchComposed(
     if (shared_text_filter) |*filter| {
         shared_req.resolved_text_doc_filter = filter;
     }
+    const has_deferred_fusion_sources = requestHasWeightedDeferredFusionSources(shared_req);
+    const final_include_stored = shared_req.include_stored;
+    if (has_deferred_fusion_sources) shared_req.include_stored = false;
     if (collect_sort_profile and requestHasSortPageOptions(shared_req)) {
         shared_req.profile = true;
     }
@@ -1117,6 +1128,8 @@ pub fn searchComposed(
                 .name = "$full_text_results",
                 .hits = text_result.hits,
                 .total_hits = text_result.total_hits,
+                .total_hits_relation = text_result.total_hits_relation,
+                .fusion_kind = if (textQueryIsScoreBearing(text)) .ranked else .binary,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
@@ -1134,6 +1147,7 @@ pub fn searchComposed(
                 .name = "$full_text_results",
                 .hits = text_result.hits,
                 .total_hits = text_result.total_hits,
+                .total_hits_relation = text_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
@@ -1155,6 +1169,8 @@ pub fn searchComposed(
                 .name = full_text_query.name,
                 .hits = text_result.hits,
                 .total_hits = text_result.total_hits,
+                .total_hits_relation = text_result.total_hits_relation,
+                .fusion_kind = if (textQueryIsScoreBearing(full_text_query.query)) .ranked else .binary,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
@@ -1174,6 +1190,7 @@ pub fn searchComposed(
             .name = if (vector_req.sparse == null) "$embeddings_results" else "dense",
             .hits = dense_result.hits,
             .total_hits = dense_result.total_hits,
+            .total_hits_relation = dense_result.total_hits_relation,
             .resolved_doc_set = resolved_doc_set,
         });
         try owned_results.append(alloc, dense_result);
@@ -1190,6 +1207,7 @@ pub fn searchComposed(
                 .name = dense_query.name,
                 .hits = dense_result.hits,
                 .total_hits = dense_result.total_hits,
+                .total_hits_relation = dense_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, dense_result);
@@ -1206,6 +1224,7 @@ pub fn searchComposed(
             .name = if (vector_req.dense == null) "$embeddings_results" else "sparse",
             .hits = sparse_result.hits,
             .total_hits = sparse_result.total_hits,
+            .total_hits_relation = sparse_result.total_hits_relation,
             .resolved_doc_set = resolved_doc_set,
         });
         try owned_results.append(alloc, sparse_result);
@@ -1222,19 +1241,34 @@ pub fn searchComposed(
                 .name = sparse_query.name,
                 .hits = sparse_result.hits,
                 .total_hits = sparse_result.total_hits,
+                .total_hits_relation = sparse_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, sparse_result);
         }
     }
 
+    var fusion_sets = std.ArrayListUnmanaged(graph_exec.NamedResultSet).empty;
+    defer fusion_sets.deinit(alloc);
+    try fusion_sets.appendSlice(alloc, named_sets.items);
+    const initial_fusion_source_count = fusion_sets.items.len;
+    var final_req = shared_req;
+    final_req.include_stored = final_include_stored;
+
+    var candidate_req = shared_req;
+    if (has_deferred_fusion_sources) {
+        candidate_req.limit = candidateUnionLimit(shared_req, named_sets.items.len);
+        candidate_req.offset = 0;
+        candidate_req.include_stored = false;
+    }
+
     const fuse_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var base = if (named_sets.items.len == 0)
         try emptySearchResult(alloc)
-    else if (named_sets.items.len == 1)
-        try executor.clone_named_set(executor.ctx, alloc, named_sets.items[0], shared_req.include_stored)
+    else if (named_sets.items.len == 1 and shared_req.fusion_candidate_window == 0)
+        try executor.clone_named_set(executor.ctx, alloc, named_sets.items[0], candidate_req.include_stored)
     else
-        try executor.fuse_named_sets(executor.ctx, alloc, shared_req, named_sets.items);
+        try executor.fuse_named_sets(executor.ctx, alloc, candidate_req, named_sets.items);
     if (bench_query_profile) fuse_ns = platform_time.monotonicNs() - fuse_start_ns;
     errdefer base.deinit();
 
@@ -1243,15 +1277,41 @@ pub fn searchComposed(
         .name = "$fused_results",
         .hits = base.hits,
         .total_hits = base.total_hits,
+        .total_hits_relation = base.total_hits_relation,
         .resolved_doc_set = fused_resolved_doc_set,
     });
 
     try appendEmbeddingsResultAlias(alloc, shared_req, executor, &named_sets, &owned_results, &owned_resolved_sets);
+    try appendStructuredFusionSignals(
+        alloc,
+        final_req,
+        executor,
+        base.hits,
+        &named_sets,
+        &fusion_sets,
+        &owned_results,
+        &owned_resolved_sets,
+    );
 
     if (shared_req.graph_queries.len > 0) {
         const graph_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-        try executor.attach_graph_results(executor.ctx, alloc, shared_req, &base, named_sets.items);
+        try executor.attach_graph_results(executor.ctx, alloc, final_req, &base, named_sets.items);
         if (bench_query_profile) graph_ns = platform_time.monotonicNs() - graph_start_ns;
+        try appendWeightedGraphFusionSignals(final_req, base.graph_results, &fusion_sets, alloc);
+    }
+
+    if (fusion_sets.items.len > initial_fusion_source_count) {
+        var rescored = try executor.fuse_named_sets(executor.ctx, alloc, final_req, fusion_sets.items);
+        errdefer rescored.deinit();
+        rescored.graph_results = base.graph_results;
+        base.graph_results = &.{};
+        base.deinit();
+        base = rescored;
+    }
+    if (base.graph_results.len > 0) {
+        if (executor.apply_graph_expand_strategy) |apply| {
+            try apply(executor.ctx, alloc, &base, final_req.expand_strategy);
+        }
     }
     if (collect_sort_profile) {
         base.sort_profile = if (requestHasSortPageOptions(shared_req))
@@ -1276,6 +1336,129 @@ pub fn searchComposed(
         );
     }
     return base;
+}
+
+fn requestFusionWeight(req: types.SearchRequest, name: []const u8) ?f64 {
+    const merge = req.merge_config orelse return null;
+    for (merge.weights) |weight| {
+        if (std.mem.eql(u8, weight.name, name)) return weight.weight;
+    }
+    return null;
+}
+
+fn requestHasWeightedDeferredFusionSources(req: types.SearchRequest) bool {
+    for (req.doc_filter_bindings) |binding| {
+        if ((requestFusionWeight(req, binding.name) orelse 0) > 0) return true;
+    }
+    for (req.graph_queries) |query| {
+        if ((requestFusionWeight(req, query.name) orelse 0) > 0) return true;
+    }
+    return false;
+}
+
+fn namedFusionSetExists(sets: []const graph_exec.NamedResultSet, name: []const u8) bool {
+    for (sets) |set| {
+        if (std.mem.eql(u8, set.name, name)) return true;
+    }
+    return false;
+}
+
+fn appendStructuredFusionSignals(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: ComposedSearchExecutor,
+    candidate_hits: []const types.SearchHit,
+    named_sets: *std.ArrayListUnmanaged(graph_exec.NamedResultSet),
+    fusion_sets: *std.ArrayListUnmanaged(graph_exec.NamedResultSet),
+    owned_results: *std.ArrayListUnmanaged(types.SearchResult),
+    owned_resolved_sets: *std.ArrayListUnmanaged(*doc_set.ResolvedDocSet),
+) !void {
+    if (candidate_hits.len == 0) return;
+
+    const candidate_ids = try alloc.alloc([]const u8, candidate_hits.len);
+    defer alloc.free(candidate_ids);
+    for (candidate_hits, 0..) |hit, i| candidate_ids[i] = hit.id;
+
+    for (req.doc_filter_bindings) |binding| {
+        if ((requestFusionWeight(req, binding.name) orelse 0) <= 0) continue;
+        if (namedFusionSetExists(fusion_sets.items, binding.name)) return error.InvalidQueryRequest;
+
+        var signal_req = req;
+        signal_req.query = .{ .match_all = {} };
+        signal_req.full_text = null;
+        signal_req.full_text_queries = &.{};
+        signal_req.dense = null;
+        signal_req.sparse = null;
+        signal_req.dense_queries = &.{};
+        signal_req.sparse_queries = &.{};
+        signal_req.graph_queries = &.{};
+        signal_req.merge_config = null;
+        signal_req.reranker = null;
+        signal_req.pruner = null;
+        signal_req.expand_strategy = null;
+        signal_req.filter_query_json = binding.filter_query_json;
+        signal_req.exclusion_query_json = "";
+        signal_req.resolved_doc_filter = null;
+        signal_req.resolved_text_doc_filter = null;
+        signal_req.filter_doc_ids = candidate_ids;
+        signal_req.filter_doc_ids_positive = true;
+        signal_req.exclude_doc_ids = &.{};
+        signal_req.filter_ids = &.{};
+        signal_req.exclude_ids = &.{};
+        signal_req.require_algebraic_filter_resolution = true;
+        signal_req.limit = @intCast(@min(candidate_hits.len, std.math.maxInt(u32)));
+        signal_req.offset = 0;
+        signal_req.count_only = false;
+        signal_req.include_stored = false;
+        signal_req.fields = &.{};
+        signal_req.include_all_fields = false;
+        signal_req.order_by = &.{};
+        signal_req.search_after = &.{};
+        signal_req.search_before = &.{};
+
+        var signal_result = try executor.search_text_query(
+            executor.ctx,
+            alloc,
+            signal_req,
+            .{ .match_all = {} },
+        );
+        errdefer signal_result.deinit();
+        const resolved_doc_set = try resolveComposedHitsToDocSet(
+            alloc,
+            req,
+            executor,
+            owned_resolved_sets,
+            signal_result.hits,
+        );
+        const signal_set = graph_exec.NamedResultSet{
+            .name = binding.name,
+            .hits = signal_result.hits,
+            .total_hits = signal_result.total_hits,
+            .total_hits_relation = signal_result.total_hits_relation,
+            .fusion_kind = .binary,
+            .resolved_doc_set = resolved_doc_set,
+        };
+        try named_sets.append(alloc, signal_set);
+        try fusion_sets.append(alloc, signal_set);
+        try owned_results.append(alloc, signal_result);
+    }
+}
+
+fn appendWeightedGraphFusionSignals(
+    req: types.SearchRequest,
+    graph_results: []const types.GraphSearchResult,
+    fusion_sets: *std.ArrayListUnmanaged(graph_exec.NamedResultSet),
+    alloc: Allocator,
+) !void {
+    for (graph_results) |result| {
+        if ((requestFusionWeight(req, result.name) orelse 0) <= 0) continue;
+        if (namedFusionSetExists(fusion_sets.items, result.name)) return error.InvalidQueryRequest;
+        try fusion_sets.append(alloc, .{
+            .name = result.name,
+            .hits = result.hits,
+            .total_hits = result.total_hits,
+        });
+    }
 }
 
 fn validateComposedExactSortComponent(req: types.SearchRequest, result: types.SearchResult) !void {
@@ -1405,6 +1588,7 @@ fn appendEmbeddingsResultAlias(
             .name = "$embeddings_results",
             .hits = embedding_sets.items[0].hits,
             .total_hits = embedding_sets.items[0].total_hits,
+            .total_hits_relation = embedding_sets.items[0].total_hits_relation,
             .resolved_doc_set = embedding_sets.items[0].resolved_doc_set,
         });
         return;
@@ -1419,6 +1603,7 @@ fn appendEmbeddingsResultAlias(
         .name = "$embeddings_results",
         .hits = embeddings_result.hits,
         .total_hits = embeddings_result.total_hits,
+        .total_hits_relation = embeddings_result.total_hits_relation,
         .resolved_doc_set = resolved_doc_set,
     });
     try owned_results.append(alloc, embeddings_result);
@@ -1649,6 +1834,12 @@ const ComponentPaging = struct {
 };
 
 fn componentPaging(req: types.SearchRequest) ComponentPaging {
+    if (req.fusion_candidate_window > 0 and req.merge_config != null) {
+        return .{
+            .offset = 0,
+            .limit = req.fusion_candidate_window,
+        };
+    }
     var limit = req.limit +| req.offset;
     const needs_component_window = requestHasPostprocessPageTransforms(req);
 
@@ -1662,16 +1853,27 @@ fn componentPaging(req: types.SearchRequest) ComponentPaging {
     if (req.merge_config) |merge_config| {
         if (merge_config.window_size > limit) limit = merge_config.window_size;
     }
-    if (req.reranker) |reranker| {
-        if (reranker.top_n) |top_n| {
-            if (top_n > limit) limit = top_n;
-        }
-    }
-
     return .{
         .offset = 0,
         .limit = limit,
     };
+}
+
+fn candidateUnionLimit(req: types.SearchRequest, source_count: usize) u32 {
+    if (source_count == 0) return 0;
+    const bounded_source_count: u32 = @intCast(@min(source_count, std.math.maxInt(u32)));
+    return componentPaging(req).limit *| bounded_source_count;
+}
+
+test "deferred hybrid signals retain the bounded per-source candidate union" {
+    try std.testing.expectEqual(@as(u32, 300), candidateUnionLimit(.{
+        .limit = 10,
+        .merge_config = .{ .window_size = 100 },
+    }, 3));
+    try std.testing.expectEqual(@as(u32, 60), candidateUnionLimit(.{
+        .limit = 20,
+        .merge_config = .{ .window_size = 10 },
+    }, 3));
 }
 
 fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {
@@ -26822,6 +27024,212 @@ test "composed search carries resolved doc sets for graph attachment" {
     try std.testing.expect(harness.saw_attach);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:fused", result.hits[0].id);
+}
+
+test "composed search scores exact structured and graph signals inside candidate window" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        saw_structured_candidate_window: bool = false,
+        saw_graph_signal: bool = false,
+        saw_expand: bool = false,
+
+        fn searchTextQuery(
+            ctx: ?*anyopaque,
+            alloc_inner: Allocator,
+            req: types.SearchRequest,
+            query: types.TextQuery,
+        ) anyerror!types.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            try std.testing.expect(query == .match_all);
+            try std.testing.expect(req.require_algebraic_filter_resolution);
+            try std.testing.expect(req.filter_doc_ids_positive);
+            try std.testing.expectEqual(@as(usize, 2), req.filter_doc_ids.len);
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/preferred\",\"value\":true}}", req.filter_query_json);
+            try std.testing.expect(!req.include_stored);
+            self.saw_structured_candidate_window = true;
+
+            const hits = try alloc_inner.alloc(types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc_inner.dupe(u8, "doc:b"),
+                .doc_ordinal = 2,
+                .score = 1,
+            };
+            return .{
+                .alloc = alloc_inner,
+                .hits = hits,
+                .total_hits = 1,
+            };
+        }
+
+        fn searchText(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn searchDense(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            req: types.SearchRequest,
+            _: types.DenseKnnQuery,
+        ) anyerror!types.SearchResult {
+            try std.testing.expect(!req.include_stored);
+            const hits = try alloc_inner.alloc(types.SearchHit, 2);
+            hits[0] = .{
+                .id = try alloc_inner.dupe(u8, "doc:a"),
+                .doc_ordinal = 1,
+                .score = 0.1,
+            };
+            hits[1] = .{
+                .id = try alloc_inner.dupe(u8, "doc:b"),
+                .doc_ordinal = 2,
+                .score = 0.2,
+            };
+            return .{
+                .alloc = alloc_inner,
+                .hits = hits,
+                .total_hits = 2,
+            };
+        }
+
+        fn searchSparse(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: types.SparseKnnQuery,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn cloneNamedSet(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            set: graph_exec.NamedResultSet,
+            include_stored: bool,
+        ) anyerror!types.SearchResult {
+            return try graph_exec.cloneNamedSetAsResult(alloc_inner, set, include_stored);
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return null;
+        }
+
+        fn fuseNamedSets(
+            ctx: ?*anyopaque,
+            alloc_inner: Allocator,
+            req: types.SearchRequest,
+            named_sets: []const graph_exec.NamedResultSet,
+        ) anyerror!types.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (findComposedNamedSet(named_sets, "related")) |related| {
+                try std.testing.expectEqual(fusion_mod.SourceKind.ranked, related.fusion_kind);
+                self.saw_graph_signal = true;
+            }
+            return try graph_exec.fuseNamedSets(alloc_inner, req, named_sets, .{
+                .ctx = null,
+                .load_projected_document = loadProjectedDocument,
+            });
+        }
+
+        fn attachGraphResults(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: types.SearchRequest,
+            base: *types.SearchResult,
+            named_sets: []const graph_exec.NamedResultSet,
+        ) anyerror!void {
+            const preferred = findComposedNamedSet(named_sets, "preferred") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(fusion_mod.SourceKind.binary, preferred.fusion_kind);
+
+            base.graph_results = try alloc_inner.alloc(types.GraphSearchResult, 1);
+            base.graph_results[0] = .{
+                .name = try alloc_inner.dupe(u8, "related"),
+                .hits = try alloc_inner.alloc(types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            base.graph_results[0].hits[0] = .{
+                .id = try alloc_inner.dupe(u8, "doc:b"),
+                .doc_ordinal = 2,
+                .score = 1,
+            };
+        }
+
+        fn applyGraphExpand(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: *types.SearchResult,
+            _: ?graph_query_mod.ExpandStrategy,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.saw_expand = true;
+        }
+    };
+
+    const dense_vector = [_]f32{1.0};
+    const dense_queries = [_]types.NamedDenseQuery{.{
+        .name = "semantic",
+        .index_name = "semantic",
+        .query = .{ .vector = &dense_vector, .k = 2 },
+    }};
+    const bindings = [_]types.NamedDocFilterBinding{.{
+        .name = "preferred",
+        .filter_query_json = "{\"term\":{\"path\":\"/preferred\",\"value\":true}}",
+    }};
+    const graph_queries = [_]types.NamedGraphQuery{.{
+        .name = "related",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph",
+            .start_nodes = .{ .result_ref = .{ .ref = "$fused_results", .limit = 2 } },
+            .params = .{},
+        },
+    }};
+    const weights = [_]fusion_mod.NamedWeight{
+        .{ .name = "semantic", .weight = 0.5 },
+        .{ .name = "preferred", .weight = 0.4 },
+        .{ .name = "related", .weight = 0.4 },
+    };
+
+    var harness = Harness{};
+    var result = try searchComposed(alloc, .{
+        .dense_queries = &dense_queries,
+        .doc_filter_bindings = &bindings,
+        .graph_queries = &graph_queries,
+        .merge_config = .{
+            .strategy = .rsf,
+            .window_size = 2,
+            .weights = &weights,
+        },
+        .limit = 2,
+        .include_stored = true,
+    }, .{
+        .ctx = &harness,
+        .search_text_query = Harness.searchTextQuery,
+        .search_text = Harness.searchText,
+        .search_dense = Harness.searchDense,
+        .search_sparse = Harness.searchSparse,
+        .clone_named_set = Harness.cloneNamedSet,
+        .fuse_named_sets = Harness.fuseNamedSets,
+        .attach_graph_results = Harness.attachGraphResults,
+        .apply_graph_expand_strategy = Harness.applyGraphExpand,
+    });
+    defer result.deinit();
+
+    try std.testing.expect(harness.saw_structured_candidate_window);
+    try std.testing.expect(harness.saw_graph_signal);
+    try std.testing.expect(harness.saw_expand);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 3), result.hits[0].index_scores.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.4), result.hits[0].index_scores[1].contribution, 1e-12);
 }
 
 test "composed search skips resolved doc-set materialization without graph queries" {

@@ -2003,8 +2003,10 @@ pub const QueryHit = struct {
     _id: []const u8,
     /// Relevance score of the hit.
     _score: f32,
-    /// Scores partitioned by index when using RRF search.
+    /// Backwards-compatible raw scores partitioned by source when using hybrid search.
     _index_scores: ?std.json.Value = null,
+    /// Present when `explain: true` for a fused hit. Contains the final and pre-rerank fusion scores plus per-source rank, raw score, calibrated score, weight, and contribution.
+    _score_explanation: ?std.json.Value = null,
     _source: ?std.json.Value = null,
     /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
     hierarchy: ?std.json.Value = null,
@@ -2072,7 +2074,7 @@ pub const QueryRequest = struct {
     search_effort: ?f32 = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
     fields: ?[]const []const u8 = null,
-    /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
+    /// Maximum number of results to return. For semantic_search, this is the top-k candidate count. When a reranker is configured, all `limit` candidates are scored by the reranker and `reranker.top_n`, when set, becomes the final result count. Default varies by query type (typically 10).
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
@@ -2088,13 +2090,17 @@ pub const QueryRequest = struct {
     distance_under: ?f32 = null,
     /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
     distance_over: ?f32 = null,
-    /// Configuration for merging full-text and semantic search results. Only applies when both `full_text_search` and `semantic_search` are specified.
+    /// Configuration for merging named lexical, dense, sparse, structured, and graph-derived result sources.
     merge_config: ?antfly_indexes_openapi.MergeConfig = null,
+    /// Named exact structured filter bindings. Referencing a binding from the boolean query applies it as a hard predicate. Giving its name a positive `merge_config.weights` entry also evaluates it as a binary soft signal over the bounded lexical/semantic candidate union: an exact match contributes the configured weight and a non-match contributes zero. A weighted binding does not generate candidates by itself.
+    with: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// If true, returns only the total count of matching documents without retrieving the actual documents. Useful for pagination and displaying result counts. Count-only requests do not return an ordered result page, so `order_by`, `search_after`, and `search_before` are not supported when this is true.
     count: ?bool = null,
     /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
     profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    /// If true, each hybrid hit includes `_score_explanation` with the raw source score, source rank, calibrated score, configured weight, and additive contribution used to produce the fused score. Explanation data is deterministic but adds response bytes; omit it on latency- sensitive production traffic unless the trace is needed.
+    explain: ?bool = null,
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `limit` to a 50-100 candidate pool and `reranker.top_n` to the final result count. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
@@ -2514,7 +2520,7 @@ pub const RetrievalQueryRequest = struct {
     search_effort: ?f32 = null,
     /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
     fields: ?[]const []const u8 = null,
-    /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
+    /// Maximum number of results to return. For semantic_search, this is the top-k candidate count. When a reranker is configured, all `limit` candidates are scored by the reranker and `reranker.top_n`, when set, becomes the final result count. Default varies by query type (typically 10).
     limit: ?i64 = null,
     /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Not supported for semantic_search due to vector index limitations.
     offset: ?i64 = null,
@@ -2530,13 +2536,17 @@ pub const RetrievalQueryRequest = struct {
     distance_under: ?f32 = null,
     /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
     distance_over: ?f32 = null,
-    /// Configuration for merging full-text and semantic search results. Only applies when both `full_text_search` and `semantic_search` are specified.
+    /// Configuration for merging named lexical, dense, sparse, structured, and graph-derived result sources.
     merge_config: ?antfly_indexes_openapi.MergeConfig = null,
+    /// Named exact structured filter bindings. Referencing a binding from the boolean query applies it as a hard predicate. Giving its name a positive `merge_config.weights` entry also evaluates it as a binary soft signal over the bounded lexical/semantic candidate union: an exact match contributes the configured weight and a non-match contributes zero. A weighted binding does not generate candidates by itself.
+    with: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// If true, returns only the total count of matching documents without retrieving the actual documents. Useful for pagination and displaying result counts. Count-only requests do not return an ordered result page, so `order_by`, `search_after`, and `search_before` are not supported when this is true.
     count: ?bool = null,
     /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
     profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    /// If true, each hybrid hit includes `_score_explanation` with the raw source score, source rank, calibrated score, configured weight, and additive contribution used to produce the fused score. Explanation data is deterministic but adds response bytes; omit it on latency- sensitive production traffic unless the trace is needed.
+    explain: ?bool = null,
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `limit` to a 50-100 candidate pool and `reranker.top_n` to the final result count. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.

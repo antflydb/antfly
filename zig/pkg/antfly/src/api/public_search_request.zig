@@ -66,6 +66,7 @@ pub fn looksLikePublicSearchRequest(value: std.json.Value) bool {
         hasNonNullField(obj, "filter_query") or
         hasNonNullField(obj, "exclusion_query") or
         hasNonNullField(obj, "profile") or
+        hasNonNullField(obj, "explain") or
         hasNonNullField(obj, "aggregations") or
         hasNonNullField(obj, "analyses") or
         hasNonNullField(obj, "order_by") or

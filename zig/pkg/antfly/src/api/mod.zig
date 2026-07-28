@@ -105,6 +105,42 @@ test "api query contract maps public exact sort rejection diagnostics" {
     try query_contract.testing.expectPublicExactSortRejectionMapping();
 }
 
+test "api query contract explains calibrated fusion contributions" {
+    try query_contract.testing.expectScoreExplanationSerialization();
+}
+
+test "api query contract validates hybrid fusion source names" {
+    try query_contract.testing.expectFusionSourceValidation();
+}
+
+test "api table reads preserve remote hybrid score explanations" {
+    try table_reads.testing.expectRemoteScoreExplanationRoundtrip();
+}
+
+test "api table reads preserve explain across distributed fanout" {
+    try table_reads.testing.expectExplainRequestFanoutRoundtrip();
+}
+
+test "api table reads preserve structured hybrid sources across distributed fanout" {
+    try table_reads.testing.expectHybridRequestFanoutRoundtrip();
+}
+
+test "api table reads bound distributed hybrid source and union windows" {
+    try table_reads.testing.expectDistributedFusionWindow();
+}
+
+test "api table reads fail closed for shard-local weighted graph fusion" {
+    try table_reads.testing.expectDistributedWeightedGraphFusionValidation();
+}
+
+test "api distributed hybrid fusion calibrates raw source scores globally" {
+    try query.testing.expectDistributedHybridGlobalCalibration();
+}
+
+test "api hybrid fusion includes weighted exact graph result sources" {
+    try query.testing.expectWeightedGraphFusion();
+}
+
 test "api query contract preserves filter-only query string filters" {
     try query_contract.testing.expectFilterOnlyQueryStringFilterPreserved();
 }

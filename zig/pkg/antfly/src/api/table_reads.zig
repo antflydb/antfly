@@ -168,6 +168,88 @@ pub const testing = if (builtin.is_test) struct {
     ) !void {
         return tableReadsValidateDocIdentityReadyForMultiGroup(alloc, catalog, table_name, group_count);
     }
+
+    pub fn expectRemoteScoreExplanationRoundtrip() !void {
+        try expectRemoteScoreExplanationRoundtripForTest();
+    }
+
+    pub fn expectExplainRequestFanoutRoundtrip() !void {
+        const alloc = std.testing.allocator;
+        const body = try encodeQueryRequest(alloc, .{ .explain = true });
+        defer alloc.free(body);
+        var parsed = try query_contract.parseQueryRequest(alloc, null, "docs", body);
+        defer parsed.deinit(alloc);
+        try std.testing.expect(parsed.req.explain);
+    }
+
+    pub fn expectHybridRequestFanoutRoundtrip() !void {
+        const alloc = std.testing.allocator;
+        const body = try encodeQueryRequest(alloc, .{
+            .dense_queries = &.{.{
+                .name = "semantic_idx",
+                .index_name = "semantic_idx",
+                .query = .{ .vector = &.{ 1, 0, -1 }, .k = 25 },
+            }},
+            .doc_filter_bindings = &.{.{
+                .name = "preferred",
+                .filter_query_json = "{\"term\":{\"path\":\"/tier\",\"value\":\"gold\"}}",
+            }},
+            .merge_config = .{
+                .strategy = .rsf,
+                .window_size = 25,
+                .weights = &.{
+                    .{ .name = "semantic_idx", .weight = 1 },
+                    .{ .name = "preferred", .weight = 0.2 },
+                },
+            },
+            .fusion_candidate_window = 25,
+        });
+        defer alloc.free(body);
+        var parsed = try query_contract.parseQueryRequest(alloc, null, "docs", body);
+        defer parsed.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 25), parsed.req.fusion_candidate_window);
+        try std.testing.expectEqual(@as(usize, 1), parsed.req.doc_filter_bindings.len);
+        try std.testing.expectEqualStrings("preferred", parsed.req.doc_filter_bindings[0].name);
+    }
+
+    pub fn expectDistributedFusionWindow() !void {
+        const req = distributedSearchShardRequest(.{
+            .limit = 10,
+            .dense_queries = &.{.{
+                .name = "semantic_idx",
+                .index_name = "semantic_idx",
+                .query = .{ .vector = &.{ 1, 0 }, .k = 100 },
+            }},
+            .sparse_queries = &.{.{
+                .name = "lexical_sparse",
+                .index_name = "lexical_sparse",
+                .query = .{
+                    .indices = &.{ 1, 2 },
+                    .values = &.{ 0.75, 0.25 },
+                    .k = 100,
+                },
+            }},
+            .doc_filter_bindings = &.{.{
+                .name = "preferred",
+                .filter_query_json = "{\"match_all\":{}}",
+            }},
+            .merge_config = .{
+                .strategy = .rsf,
+                .window_size = 100,
+                .weights = &.{
+                    .{ .name = "semantic_idx", .weight = 1 },
+                    .{ .name = "lexical_sparse", .weight = 0.5 },
+                    .{ .name = "preferred", .weight = 0.2 },
+                },
+            },
+        }, &.{});
+        try std.testing.expectEqual(@as(u32, 100), req.fusion_candidate_window);
+        try std.testing.expectEqual(@as(u32, 200), req.limit);
+    }
+
+    pub fn expectDistributedWeightedGraphFusionValidation() !void {
+        try expectDistributedWeightedGraphFusionValidationForTest();
+    }
 } else struct {};
 
 pub const ProvisionedTableReadCache = struct {
@@ -2857,7 +2939,10 @@ pub const ProvisionedTableReadSource = struct {
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-        if (group_ids.len > 1) try distributed_graph.rejectUnstampedResultRefs(req);
+        if (group_ids.len > 1) {
+            try distributed_graph.rejectUnstampedResultRefs(req);
+            try validateDistributedWeightedGraphFusion(req);
+        }
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             const execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, consistency);
@@ -2878,17 +2963,21 @@ pub const ProvisionedTableReadSource = struct {
         }
 
         if (group_ids.len > 1 and distributed_graph.supportsCrossRange(req)) {
-            var base_req = req;
-            base_req.graph_queries = &.{};
-            base_req.expand_strategy = null;
+            var base_weights = std.ArrayListUnmanaged(fusion_mod.NamedWeight).empty;
+            defer base_weights.deinit(alloc);
+            const base_req = try crossRangeGraphBaseRequest(alloc, req, &base_weights);
             var merged = try queryProvisionedAcrossGroups(self, alloc, group_ids, base_req, table_name, consistency);
             try checkQueryDeadline(base_req);
             defer merged.deinit();
-            const graph_req = requestWithResultIdentityGeneration(req, merged);
+            const hydrated_graph_queries = try weightedGraphHydrationQueriesAlloc(alloc, req);
+            defer if (hydrated_graph_queries.len > 0) alloc.free(hydrated_graph_queries);
+            var graph_req = requestWithResultIdentityGeneration(req, merged);
+            if (hydrated_graph_queries.len > 0) graph_req.graph_queries = hydrated_graph_queries;
 
             const worker = provisionedGraphWorker(self);
             const graph_results = try distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency);
             merged.graph_results = graph_results;
+            try query_api.fuseWeightedGraphResults(alloc, graph_req, &merged);
 
             var meta: query_api.QueryResponseMeta = .{
                 .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
@@ -3703,7 +3792,10 @@ pub const HostedProvisionedTableReadSource = struct {
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-        if (group_ids.len > 1) try distributed_graph.rejectUnstampedResultRefs(req);
+        if (group_ids.len > 1) {
+            try distributed_graph.rejectUnstampedResultRefs(req);
+            try validateDistributedWeightedGraphFusion(req);
+        }
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
@@ -3729,17 +3821,21 @@ pub const HostedProvisionedTableReadSource = struct {
         }
 
         if (group_ids.len > 1 and distributed_graph.supportsCrossRange(req)) {
-            var base_req = req;
-            base_req.graph_queries = &.{};
-            base_req.expand_strategy = null;
+            var base_weights = std.ArrayListUnmanaged(fusion_mod.NamedWeight).empty;
+            defer base_weights.deinit(alloc);
+            const base_req = try crossRangeGraphBaseRequest(alloc, req, &base_weights);
             var merged = try queryHostedAcrossGroups(self, alloc, group_ids, base_req, table_name, consistency);
             try checkQueryDeadline(base_req);
             defer merged.deinit();
-            const graph_req = requestWithResultIdentityGeneration(req, merged);
+            const hydrated_graph_queries = try weightedGraphHydrationQueriesAlloc(alloc, req);
+            defer if (hydrated_graph_queries.len > 0) alloc.free(hydrated_graph_queries);
+            var graph_req = requestWithResultIdentityGeneration(req, merged);
+            if (hydrated_graph_queries.len > 0) graph_req.graph_queries = hydrated_graph_queries;
 
             const worker = hostedGraphWorker(self);
             const graph_results = try distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency);
             merged.graph_results = graph_results;
+            try query_api.fuseWeightedGraphResults(alloc, graph_req, &merged);
 
             var meta: query_api.QueryResponseMeta = .{
                 .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
@@ -4581,8 +4677,148 @@ fn distributedSearchShardRequest(
     var copy = req;
     copy.offset = 0;
     copy.limit = distributedSearchShardLimit(req);
+    if (req.merge_config != null) {
+        copy.pruner = null;
+        const candidate_window = distributedFusionCandidateWindow(req);
+        const source_count = distributedFusionSourceCount(req);
+        if (candidate_window > 0 and source_count > 0) {
+            copy.fusion_candidate_window = candidate_window;
+        }
+        if (candidate_window > 0 and source_count > 1) {
+            copy.limit = @max(
+                copy.limit,
+                candidate_window *| @as(u32, @intCast(@min(source_count, std.math.maxInt(u32)))),
+            );
+        }
+    }
     copy.distributed_text_stats = distributed_text_stats;
     return copy;
+}
+
+fn crossRangeGraphBaseRequest(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    base_weights: *std.ArrayListUnmanaged(fusion_mod.NamedWeight),
+) !db_mod.types.SearchRequest {
+    var base_req = req;
+    base_req.graph_queries = &.{};
+    base_req.expand_strategy = null;
+
+    const merge_config = req.merge_config orelse return base_req;
+    var has_weighted_graph = false;
+    for (merge_config.weights) |weight| {
+        if (isGraphFusionSource(req, weight.name)) {
+            if (weight.weight > 0) has_weighted_graph = true;
+            continue;
+        }
+        try base_weights.append(alloc, weight);
+    }
+    var base_merge_config = merge_config;
+    base_merge_config.weights = base_weights.items;
+    base_req.merge_config = base_merge_config;
+    if (has_weighted_graph) {
+        base_req.offset = 0;
+        base_req.limit = distributedFusionCandidateWindow(req);
+        base_req.pruner = null;
+    }
+    return base_req;
+}
+
+fn weightedGraphHydrationQueriesAlloc(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+) ![]db_mod.types.NamedGraphQuery {
+    var has_weighted_graph = false;
+    for (req.graph_queries) |query| {
+        if (requestFusionWeight(req, query.name) > 0) {
+            has_weighted_graph = true;
+            break;
+        }
+    }
+    if (!has_weighted_graph) return &.{};
+
+    const queries = try alloc.dupe(db_mod.types.NamedGraphQuery, req.graph_queries);
+    for (queries) |*query| {
+        if (requestFusionWeight(req, query.name) > 0) {
+            query.query.include_documents = true;
+        }
+    }
+    return queries;
+}
+
+fn isGraphFusionSource(req: db_mod.types.SearchRequest, name: []const u8) bool {
+    for (req.graph_queries) |query| {
+        if (std.mem.eql(u8, query.name, name)) return true;
+    }
+    return false;
+}
+
+fn distributedFusionCandidateWindow(req: db_mod.types.SearchRequest) u32 {
+    var window = req.limit +| req.offset;
+    if (req.merge_config) |merge_config| {
+        window = @max(window, merge_config.window_size);
+    }
+    return window;
+}
+
+fn distributedFusionSourceCount(req: db_mod.types.SearchRequest) usize {
+    var count: usize = 0;
+    if (req.full_text_queries.len > 0) {
+        count += req.full_text_queries.len;
+    } else if (req.full_text != null) {
+        count += 1;
+    }
+    count += if (req.dense_queries.len > 0) req.dense_queries.len else if (req.dense != null) @as(usize, 1) else 0;
+    count += if (req.sparse_queries.len > 0) req.sparse_queries.len else if (req.sparse != null) @as(usize, 1) else 0;
+    return count;
+}
+
+fn requestFusionWeight(req: db_mod.types.SearchRequest, name: []const u8) f64 {
+    const merge_config = req.merge_config orelse return 0;
+    for (merge_config.weights) |weight| {
+        if (std.mem.eql(u8, weight.name, name)) return weight.weight;
+    }
+    return 0;
+}
+
+fn validateDistributedWeightedGraphFusion(req: db_mod.types.SearchRequest) !void {
+    for (req.graph_queries) |query| {
+        if (requestFusionWeight(req, query.name) <= 0) continue;
+        if (!distributed_graph.supportsCrossRange(req)) return error.UnsupportedQueryRequest;
+        return;
+    }
+}
+
+fn expectDistributedWeightedGraphFusionValidationForTest() !void {
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateDistributedWeightedGraphFusion(.{
+        .graph_queries = &.{.{
+            .name = "nearby",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph",
+                .start_nodes = .{ .keys = &.{"hub"} },
+                .params = .{
+                    .direction = .both,
+                },
+            },
+        }},
+        .merge_config = .{
+            .weights = &.{.{ .name = "nearby", .weight = 1 }},
+        },
+    }));
+    try validateDistributedWeightedGraphFusion(.{
+        .graph_queries = &.{.{
+            .name = "nearby",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph",
+                .start_nodes = .{ .keys = &.{"hub"} },
+            },
+        }},
+        .merge_config = .{
+            .weights = &.{.{ .name = "nearby", .weight = 1 }},
+        },
+    });
 }
 
 test "distributed query shard request preserves sorted cursor contract" {
@@ -12855,10 +13091,9 @@ fn applyReranker(
         try std.fmt.allocPrint(alloc, "{{{{{s}}}}}", .{cfg.field});
     defer alloc.free(doc_template);
 
-    const rerank_count: usize = if (cfg.top_n) |top_n|
-        @min(result.hits.len, top_n)
-    else
-        result.hits.len;
+    // Score the complete retrieved candidate window. `top_n` is the output
+    // cutoff, not a prefix of candidates that are allowed to compete.
+    const rerank_count = result.hits.len;
 
     const documents = try alloc.alloc([]const u8, rerank_count);
     defer alloc.free(documents);
@@ -12891,9 +13126,13 @@ fn applyReranker(
     };
     defer alloc.free(scores);
     if (scores.len != rerank_count) return error.InvalidRerankerResponse;
+    for (scores) |score| {
+        if (!std.math.isFinite(score)) return error.InvalidRerankerResponse;
+    }
 
     for (result.hits[0..rerank_count], 0..) |*hit, i| {
         hit.score = scores[i];
+        hit.reranked = true;
     }
     std.sort.pdq(db_mod.types.SearchHit, result.hits[0..rerank_count], {}, struct {
         fn lessThan(_: void, a: db_mod.types.SearchHit, b: db_mod.types.SearchHit) bool {
@@ -12906,7 +13145,6 @@ fn applyReranker(
 
     if (cfg.top_n) |top_n| {
         try truncateSearchHits(alloc, result, @min(top_n, result.hits.len));
-        result.total_hits = @min(result.total_hits, top_n);
     }
 
     meta.reranker = .{
@@ -13430,6 +13668,12 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     if (req.profile) {
         try appendJsonFieldBool(alloc, &out, &first, "profile", true);
     }
+    if (req.explain) {
+        try appendJsonFieldBool(alloc, &out, &first, "explain", true);
+    }
+    if (req.fusion_candidate_window > 0) {
+        try appendJsonFieldU32(alloc, &out, &first, "_fusion_candidate_window", req.fusion_candidate_window);
+    }
     if (req.filter_prefix.len > 0) {
         try appendJsonFieldString(alloc, &out, &first, "filter_prefix", req.filter_prefix);
     }
@@ -13464,6 +13708,9 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     if (req.exclusion_query_json.len > 0) {
         try appendJsonFieldString(alloc, &out, &first, "_exclusion_query_json", req.exclusion_query_json);
     }
+    if (req.doc_filter_bindings.len > 0) {
+        try appendDocFilterBindingsField(alloc, &out, &first, req.doc_filter_bindings);
+    }
     if (req.graph_queries.len > 0) {
         try appendGraphQueriesField(alloc, &out, &first, req.graph_queries);
     }
@@ -13485,6 +13732,23 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
 
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendDocFilterBindingsField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    bindings: []const db_mod.types.NamedDocFilterBinding,
+) !void {
+    try appendJsonFieldName(alloc, out, first, "with");
+    try out.append(alloc, '{');
+    for (bindings, 0..) |binding, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, binding.name);
+        try out.append(alloc, ':');
+        try out.appendSlice(alloc, binding.filter_query_json);
+    }
+    try out.append(alloc, '}');
 }
 
 fn appendNativeDocIdConstraintsField(
@@ -14054,12 +14318,16 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
         alloc.free(hits);
     }
     for (hits_value, 0..) |item, i| {
+        var index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores);
+        errdefer db_mod.types.freeIndexScores(alloc, index_scores);
+        try applyRemoteScoreExplanation(item._score_explanation, index_scores);
         hits[i] = .{
             .id = try alloc.dupe(u8, item._id),
             .score = item._score,
-            .index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores),
+            .index_scores = index_scores,
             .stored_data = if (item._source) |value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}) else null,
         };
+        index_scores = &.{};
         initialized += 1;
     }
 
@@ -14117,10 +14385,50 @@ fn parseRemoteIndexScoresAlloc(
     return trimmed;
 }
 
-test "parseRemoteSearchResult preserves fused index scores" {
+fn applyRemoteScoreExplanation(
+    maybe_value: ?std.json.Value,
+    scores: []fusion_mod.IndexScore,
+) !void {
+    const value = maybe_value orelse return;
+    if (value != .object) return;
+    const sources_value = value.object.get("sources") orelse return;
+    if (sources_value != .object) return;
+
+    for (scores) |*score| {
+        const detail_value = sources_value.object.get(score.index_name) orelse continue;
+        if (detail_value != .object) continue;
+        score.rank = (try remoteExplanationU32(detail_value.object.get("rank"))) orelse score.rank;
+        score.normalized_score = (try remoteExplanationF64(detail_value.object.get("calibrated_score"))) orelse score.normalized_score;
+        score.weight = (try remoteExplanationF64(detail_value.object.get("weight"))) orelse score.weight;
+        score.contribution = (try remoteExplanationF64(detail_value.object.get("contribution"))) orelse score.contribution;
+    }
+}
+
+fn remoteExplanationU32(value: ?std.json.Value) !?u32 {
+    const item = value orelse return null;
+    return switch (item) {
+        .integer => |number| std.math.cast(u32, number) orelse return error.InvalidQueryRequest,
+        .number_string => |number| std.fmt.parseUnsigned(u32, number, 10) catch return error.InvalidQueryRequest,
+        else => error.InvalidQueryRequest,
+    };
+}
+
+fn remoteExplanationF64(value: ?std.json.Value) !?f64 {
+    const item = value orelse return null;
+    const number: f64 = switch (item) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidQueryRequest,
+        else => return error.InvalidQueryRequest,
+    };
+    if (!std.math.isFinite(number)) return error.InvalidQueryRequest;
+    return number;
+}
+
+fn expectRemoteScoreExplanationRoundtripForTest() !void {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":1,"relation":"gte"},"hits":[{"_id":"doc:a","_score":0.9,"_index_scores":{"full_text":0.75,"semantic_idx":0.25},"_source":{"title":"alpha"}}],"max_score":0.9},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":1,"relation":"gte"},"hits":[{"_id":"doc:a","_score":0.9,"_index_scores":{"full_text":0.75,"semantic_idx":0.25},"_score_explanation":{"strategy":"rsf","fusion_score":0.9,"final_score":0.9,"reranked":false,"sources":{"full_text":{"raw_score":0.75,"rank":2,"calibrated_score":0.5,"weight":0.4,"contribution":0.2},"semantic_idx":{"raw_score":0.25,"rank":1,"calibrated_score":1.0,"weight":0.7,"contribution":0.7}}},"_source":{"title":"alpha"}}],"max_score":0.9},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
@@ -14130,8 +14438,14 @@ test "parseRemoteSearchResult preserves fused index scores" {
     try std.testing.expectEqual(@as(usize, 2), result.hits[0].index_scores.len);
     try std.testing.expectEqualStrings("full_text", result.hits[0].index_scores[0].index_name);
     try std.testing.expectEqual(@as(f64, 0.75), result.hits[0].index_scores[0].score);
+    try std.testing.expectEqual(@as(u32, 2), result.hits[0].index_scores[0].rank);
+    try std.testing.expectEqual(@as(f64, 0.5), result.hits[0].index_scores[0].normalized_score);
+    try std.testing.expectEqual(@as(f64, 0.4), result.hits[0].index_scores[0].weight);
+    try std.testing.expectEqual(@as(f64, 0.2), result.hits[0].index_scores[0].contribution);
     try std.testing.expectEqualStrings("semantic_idx", result.hits[0].index_scores[1].index_name);
     try std.testing.expectEqual(@as(f64, 0.25), result.hits[0].index_scores[1].score);
+    try std.testing.expectEqual(@as(u32, 1), result.hits[0].index_scores[1].rank);
+    try std.testing.expectEqual(@as(f64, 0.7), result.hits[0].index_scores[1].contribution);
 }
 
 fn parseRemoteGraphResults(
@@ -14878,11 +15192,13 @@ test "bound table read source reranks hits after materialization" {
                 .query = .{ .match = .{ .field = "body", .text = "hello" } },
                 .limit = 10,
                 .profile = true,
+                .explain = true,
                 .reranker = .{
                     .provider = .antfly,
                     .model = "cross-encoder/ms-marco-MiniLM-L-6-v2",
                     .field = "body",
                     .url = reranker_url,
+                    .top_n = 1,
                 },
                 .reranker_query_text = "hello",
             }, .read_index) catch |err| {
@@ -14901,7 +15217,13 @@ test "bound table read source reranks hits after materialization" {
     const RerankResponse = struct {
         responses: []struct {
             hits: ?struct {
-                hits: ?[]struct { _id: []const u8 } = null,
+                total: ?struct {
+                    value: u32,
+                } = null,
+                hits: ?[]struct {
+                    _id: []const u8,
+                    _score_explanation: ?std.json.Value = null,
+                } = null,
             } = null,
             profile: ?struct {
                 reranker: ?struct {
@@ -14910,11 +15232,20 @@ test "bound table read source reranks hits after materialization" {
             } = null,
         },
     };
-    var parsed = try parseJsonTestBody(RerankResponse, alloc, response.?.json);
+    var parsed = try std.json.parseFromSlice(
+        RerankResponse,
+        alloc,
+        response.?.json,
+        .{ .ignore_unknown_fields = true },
+    );
     defer parsed.deinit();
     const inner = parsed.value.responses[0];
+    try std.testing.expectEqual(@as(usize, 1), inner.hits.?.hits.?.len);
+    try std.testing.expectEqual(@as(u32, 2), inner.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:b", inner.hits.?.hits.?[0]._id);
-    try std.testing.expectEqualStrings("doc:a", inner.hits.?.hits.?[1]._id);
+    // A lexical-only result has no fusion explanation, but the output cutoff
+    // still proves both candidates competed: doc:b began second.
+    try std.testing.expect(inner.hits.?.hits.?[0]._score_explanation == null);
     try std.testing.expectEqualStrings("cross-encoder/ms-marco-MiniLM-L-6-v2", inner.profile.?.reranker.?.model);
 }
 
@@ -19639,7 +19970,7 @@ test "hosted table read source preflights mixed local and remote groups" {
     try std.testing.expectEqual(@as(usize, 1), executor_state.call_count);
 }
 
-test "hosted cross-range graph query expands explicit local start keys" {
+test "hosted cross-range graph query contributes a weighted hybrid source" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-hosted-cross-range-graph-explicit";
 
@@ -19654,23 +19985,29 @@ test "hosted cross-range graph query expands explicit local start keys" {
     defer alloc.free(right_path);
 
     const graph_indexes_json =
-        \\{"relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
+        \\{"full_text_index_v0":{"type":"full_text"},"relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
     ;
 
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
+    var left_db = try db_mod.DB.open(alloc, left_path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+    });
     defer left_db.close();
+    try left_db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
     try left_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
     try left_db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"left\"}" }},
-        .sync_level = .write,
+        .sync_level = .full_index,
     });
 
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
+    var right_db = try db_mod.DB.open(alloc, right_path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
+    });
     defer right_db.close();
+    try right_db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
     try right_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
     try right_db.batch(.{
         .writes = &.{.{ .key = "zdoc:a", .value = "{\"title\":\"right\"}" }},
-        .sync_level = .write,
+        .sync_level = .full_index,
     });
     const graph_entry = right_db.core.graphIndex("relations_graph") orelse return error.IndexNotFound;
     try graph_entry.index.addEdge("zdoc:a", "entity:ada", "mentions", 1.0, 0, 0, "{\"target_table\":\"entities\"}");
@@ -19799,7 +20136,17 @@ test "hosted cross-range graph query expands explicit local start keys" {
 
     var response = (try hosted.source().query(alloc, "docs", .{
         .query = .{ .match_all = {} },
+        .full_text = .{ .match_all = {} },
         .limit = 10,
+        .explain = true,
+        .merge_config = .{
+            .strategy = .rsf,
+            .window_size = 10,
+            .weights = &.{
+                .{ .name = "full_text", .weight = 0.1 },
+                .{ .name = "mentions", .weight = 1 },
+            },
+        },
         .graph_queries = &.{.{
             .name = "mentions",
             .query = .{
@@ -19814,6 +20161,8 @@ test "hosted cross-range graph query expands explicit local start keys" {
 
     try std.testing.expect(std.mem.indexOf(u8, response.json, "\"graph_results\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.json, "\"entity:ada\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"_score_explanation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"mentions\"") != null);
 }
 
 test "provisioned read cache keys entries by lsm root generation" {

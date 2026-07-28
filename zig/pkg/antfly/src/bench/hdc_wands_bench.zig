@@ -401,6 +401,20 @@ pub fn main(init: std.process.Init) !void {
                 (structural_products.len + structural_queries.len) * @sizeOf(f32),
             },
         );
+        if (config.ann_candidates.len > 0) {
+            try evaluateCandidateLocalPackedInteraction(
+                alloc,
+                fixture,
+                qrel_offsets,
+                structural_products,
+                structural_queries,
+                config.hdc_dimensions,
+                config.fusion_weight,
+                config.ann_candidates,
+                config.ann_seed,
+                config.seed,
+            );
+        }
     }
 
     const complete_products = try alloc.alloc(f32, projected_products.len);
@@ -658,6 +672,479 @@ const PerQueryQuality = struct {
     ndcg10: f64 = std.math.nan(f64),
     graph_answer_top1: f64 = std.math.nan(f64),
 };
+
+const CandidateFeature = struct {
+    product_index: usize,
+    gain: u8,
+    semantic: f32,
+    structured_count: f32,
+    structured_normalized: f32,
+    hdc_similarity: f32,
+};
+
+const CandidateRerankerWeights = struct {
+    semantic: f64 = 0,
+    structured: f64 = 0,
+    hdc: f64 = 0,
+
+    fn score(self: CandidateRerankerWeights, feature: CandidateFeature) f64 {
+        return self.semantic * feature.semantic +
+            self.structured * feature.structured_normalized +
+            self.hdc * feature.hdc_similarity;
+    }
+};
+
+const CandidateRerankerKind = enum {
+    transparent,
+    learned,
+    learned_hdc,
+};
+
+/// Evaluates packed bipolar HDC only after the ordinary embedding path has
+/// generated candidates. A pairwise linear ranker is trained on validation
+/// queries twice: once on transparent semantic/structured features, and once
+/// with the packed-HDC similarity feature. Holdout comparisons therefore ask
+/// whether HDC adds signal beyond both fixed hybrid fusion and a learned
+/// reranker without allowing HDC to become the primary candidate index.
+fn evaluateCandidateLocalPackedInteraction(
+    alloc: std.mem.Allocator,
+    fixture: Fixture,
+    qrel_offsets: []const usize,
+    structural_products: []const f32,
+    structural_queries: []const f32,
+    hdc_dimensions: usize,
+    fusion_weight: f32,
+    candidate_budgets: []const usize,
+    ann_seed: u64,
+    experiment_seed: u64,
+) !void {
+    if (candidate_budgets.len == 0 or
+        structural_products.len != fixture.product_count * hdc_dimensions or
+        structural_queries.len != fixture.query_count * hdc_dimensions)
+    {
+        return error.InvalidArgument;
+    }
+    const maximum_candidates = candidate_budgets[candidate_budgets.len - 1];
+    if (maximum_candidates < top_k or maximum_candidates > fixture.product_count) {
+        return error.InvalidArgument;
+    }
+
+    const words_per_vector = packedWordCount(hdc_dimensions);
+    const packed_products = try alloc.alloc(
+        u64,
+        try std.math.mul(usize, fixture.product_count, words_per_vector),
+    );
+    defer alloc.free(packed_products);
+    const pack_started = antfly.platform_time.monotonicNs();
+    for (0..fixture.product_count) |product_index| {
+        try packBipolarSigns(
+            structural_products[product_index * hdc_dimensions ..][0..hdc_dimensions],
+            packed_products[product_index * words_per_vector ..][0..words_per_vector],
+        );
+    }
+    const pack_elapsed = antfly.platform_time.monotonicNs() - pack_started;
+
+    const centroid = try alloc.alloc(f32, fixture.dimensions);
+    defer alloc.free(centroid);
+    @memset(centroid, 0);
+    for (0..fixture.product_count) |product_index| {
+        const vector =
+            fixture.product_embeddings[product_index * fixture.dimensions ..][0..fixture.dimensions];
+        for (centroid, vector) |*mean, value| mean.* += value;
+    }
+    antfly.vector.scale(1.0 / @as(f32, @floatFromInt(fixture.product_count)), centroid);
+
+    var quantizer = try antfly.quantizer.RaBitQuantizer.init(
+        alloc,
+        fixture.dimensions,
+        ann_seed,
+        .cosine,
+    );
+    defer quantizer.deinit();
+    var quantized = try quantizer.quantize(
+        centroid,
+        fixture.product_embeddings,
+        fixture.product_count,
+    );
+    defer quantized.deinit(alloc);
+
+    const feature_count = try std.math.mul(
+        usize,
+        fixture.query_count,
+        maximum_candidates,
+    );
+    const features = try alloc.alloc(CandidateFeature, feature_count);
+    defer alloc.free(features);
+    const included_queries = try alloc.alloc(bool, fixture.query_count);
+    defer alloc.free(included_queries);
+    @memset(included_queries, false);
+    const candidate_generation_ns = try alloc.alloc(u64, fixture.query_count);
+    defer alloc.free(candidate_generation_ns);
+    @memset(candidate_generation_ns, 0);
+    const hdc_feature_ns = try alloc.alloc(u64, fixture.query_count);
+    defer alloc.free(hdc_feature_ns);
+    @memset(hdc_feature_ns, 0);
+
+    const approximate_distances = try alloc.alloc(f32, fixture.product_count);
+    defer alloc.free(approximate_distances);
+    const error_bounds = try alloc.alloc(f32, fixture.product_count);
+    defer alloc.free(error_bounds);
+    var estimate_scratch =
+        try antfly.quantizer.RaBitQuantizer.EstimateScratch.init(alloc, fixture.dimensions);
+    defer estimate_scratch.deinit(alloc);
+    const approximate_ranked = try alloc.alloc(Ranked, fixture.product_count);
+    defer alloc.free(approximate_ranked);
+    const gains = try alloc.alloc(u8, fixture.product_count);
+    defer alloc.free(gains);
+    const packed_query = try alloc.alloc(u64, words_per_vector);
+    defer alloc.free(packed_query);
+
+    for (0..fixture.query_count) |query_index| {
+        if (!queryIncluded(fixture, query_index)) continue;
+        @memset(gains, 0);
+        const qrels = fixture.qrels[qrel_offsets[query_index]..qrel_offsets[query_index + 1]];
+        var relevant_count: usize = 0;
+        for (qrels) |qrel| {
+            gains[qrel.product_index] = @max(gains[qrel.product_index], qrel.gain);
+            if (qrel.gain > 0) relevant_count += 1;
+        }
+        if (relevant_count == 0) continue;
+        included_queries[query_index] = true;
+
+        const query_embedding =
+            fixture.query_embeddings[query_index * fixture.dimensions ..][0..fixture.dimensions];
+        const started = antfly.platform_time.monotonicNs();
+        try quantizer.estimateDistancesWithScratch(
+            &quantized,
+            query_embedding,
+            approximate_distances,
+            error_bounds,
+            &estimate_scratch,
+        );
+        for (approximate_distances, 0..) |distance, product_index| {
+            approximate_ranked[product_index] = .{
+                .index = product_index,
+                .score = 1 - distance,
+            };
+        }
+        std.mem.sort(Ranked, approximate_ranked, {}, rankedGreaterThanContext);
+        candidate_generation_ns[query_index] =
+            antfly.platform_time.monotonicNs() - started;
+
+        const query_structural =
+            structural_queries[query_index * hdc_dimensions ..][0..hdc_dimensions];
+        const hdc_started = antfly.platform_time.monotonicNs();
+        try packBipolarSigns(query_structural, packed_query);
+        const output =
+            features[query_index * maximum_candidates ..][0..maximum_candidates];
+        for (approximate_ranked[0..maximum_candidates], output) |candidate, *feature| {
+            const packed_product =
+                packed_products[candidate.index * words_per_vector ..][0..words_per_vector];
+            const hamming: f32 = @floatFromInt(hammingDistance(packed_query, packed_product));
+            feature.* = .{
+                .product_index = candidate.index,
+                .gain = gains[candidate.index],
+                .semantic = 0,
+                .structured_count = 0,
+                .structured_normalized = 0,
+                .hdc_similarity = 1 - 2 * hamming / @as(f32, @floatFromInt(hdc_dimensions)),
+            };
+        }
+        hdc_feature_ns[query_index] =
+            antfly.platform_time.monotonicNs() - hdc_started;
+
+        const association_count =
+            1 + (fixture.associations orelse return error.InvalidArgument).query(query_index).len / 2;
+        for (approximate_ranked[0..maximum_candidates], output) |candidate, *feature| {
+            const product_embedding =
+                fixture.product_embeddings[candidate.index * fixture.dimensions ..][0..fixture.dimensions];
+            const match_count = structuredMatchCount(fixture, query_index, candidate.index);
+            feature.semantic = antfly.vector.dot(query_embedding, product_embedding);
+            feature.structured_count = @floatFromInt(match_count);
+            feature.structured_normalized = @as(f32, @floatFromInt(match_count)) /
+                @as(f32, @floatFromInt(association_count));
+        }
+    }
+
+    const learned = trainCandidateReranker(
+        fixture,
+        features,
+        included_queries,
+        maximum_candidates,
+        false,
+    );
+    const learned_hdc = trainCandidateReranker(
+        fixture,
+        features,
+        included_queries,
+        maximum_candidates,
+        true,
+    );
+    std.debug.print(
+        "wands_candidate_reranker_training split=validation candidates={d} epochs=12 objective=pairwise_logistic semantic_weight={d:.6} structured_weight={d:.6} hdc_weight={d:.6} learned_hdc_semantic_weight={d:.6} learned_hdc_structured_weight={d:.6} learned_hdc_hdc_weight={d:.6}\n",
+        .{
+            maximum_candidates,
+            learned.semantic,
+            learned.structured,
+            learned.hdc,
+            learned_hdc.semantic,
+            learned_hdc.structured,
+            learned_hdc.hdc,
+        },
+    );
+    var hdc_feature_total_ns: u64 = 0;
+    var included_query_count: usize = 0;
+    for (included_queries, hdc_feature_ns) |included, elapsed| {
+        if (!included) continue;
+        included_query_count += 1;
+        hdc_feature_total_ns += elapsed;
+    }
+    std.debug.print(
+        "wands_candidate_hdc_storage dimensions={d} vectors={d} words_per_vector={d} candidates={d} pack_ms={d:.3} packed_bytes={d} feature_ms_per_query={d:.4} role=candidate_rerank_feature mapping=sign_ge_zero_le_u64_v1\n",
+        .{
+            hdc_dimensions,
+            fixture.product_count,
+            words_per_vector,
+            maximum_candidates,
+            @as(f64, @floatFromInt(pack_elapsed)) / std.time.ns_per_ms,
+            packed_products.len * @sizeOf(u64),
+            @as(f64, @floatFromInt(hdc_feature_total_ns)) /
+                @as(f64, @floatFromInt(included_query_count)) /
+                std.time.ns_per_ms,
+        },
+    );
+
+    const quality_count =
+        try std.math.mul(usize, fixture.query_count, candidate_budgets.len);
+    const transparent_quality = try alloc.alloc(PerQueryQuality, quality_count);
+    defer alloc.free(transparent_quality);
+    const learned_quality = try alloc.alloc(PerQueryQuality, quality_count);
+    defer alloc.free(learned_quality);
+    const learned_hdc_quality = try alloc.alloc(PerQueryQuality, quality_count);
+    defer alloc.free(learned_hdc_quality);
+    for (transparent_quality) |*quality| quality.* = .{};
+    for (learned_quality) |*quality| quality.* = .{};
+    for (learned_hdc_quality) |*quality| quality.* = .{};
+
+    try evaluateCandidateReranker(
+        alloc,
+        fixture,
+        qrel_offsets,
+        features,
+        included_queries,
+        candidate_generation_ns,
+        maximum_candidates,
+        candidate_budgets,
+        .transparent,
+        .{ .semantic = 1, .structured = fusion_weight },
+        transparent_quality,
+        "embedding_structured_fusion_candidate_rerank",
+    );
+    try evaluateCandidateReranker(
+        alloc,
+        fixture,
+        qrel_offsets,
+        features,
+        included_queries,
+        candidate_generation_ns,
+        maximum_candidates,
+        candidate_budgets,
+        .learned,
+        learned,
+        learned_quality,
+        "learned_candidate_reranker",
+    );
+    try evaluateCandidateReranker(
+        alloc,
+        fixture,
+        qrel_offsets,
+        features,
+        included_queries,
+        candidate_generation_ns,
+        maximum_candidates,
+        candidate_budgets,
+        .learned_hdc,
+        learned_hdc,
+        learned_hdc_quality,
+        "learned_candidate_reranker_plus_packed_hdc",
+    );
+
+    for (candidate_budgets, 0..) |candidate_budget, budget_index| {
+        const offset = budget_index * fixture.query_count;
+        inline for (.{ PairedMetric.ndcg10, PairedMetric.graph_answer_top1 }) |metric| {
+            try printPairedBootstrap(
+                alloc,
+                fixture,
+                candidate_budget,
+                "learned_candidate_reranker",
+                "embedding_structured_fusion_candidate_rerank",
+                learned_quality[offset..][0..fixture.query_count],
+                transparent_quality[offset..][0..fixture.query_count],
+                metric,
+                experiment_seed ^ ann_seed ^ @as(u64, @intCast(candidate_budget)) ^
+                    @as(u64, @intFromEnum(metric)) ^ 0x1ea2_0ed,
+            );
+            try printPairedBootstrap(
+                alloc,
+                fixture,
+                candidate_budget,
+                "learned_candidate_reranker_plus_packed_hdc",
+                "learned_candidate_reranker",
+                learned_hdc_quality[offset..][0..fixture.query_count],
+                learned_quality[offset..][0..fixture.query_count],
+                metric,
+                experiment_seed ^ ann_seed ^ @as(u64, @intCast(candidate_budget)) ^
+                    @as(u64, @intFromEnum(metric)) ^ 0xb170_1a2,
+            );
+        }
+    }
+}
+
+fn trainCandidateReranker(
+    fixture: Fixture,
+    features: []const CandidateFeature,
+    included_queries: []const bool,
+    candidates_per_query: usize,
+    include_hdc: bool,
+) CandidateRerankerWeights {
+    var weights = CandidateRerankerWeights{};
+    const epochs: usize = 12;
+    const learning_rate: f64 = 0.025;
+    const regularization: f64 = 0.0001;
+    for (0..epochs) |epoch| {
+        const epoch_rate = learning_rate / @sqrt(@as(f64, @floatFromInt(epoch + 1)));
+        for (included_queries, 0..) |included, query_index| {
+            if (!included or !isValidationQuery(fixture.query_ids[query_index])) continue;
+            const query_features =
+                features[query_index * candidates_per_query ..][0..candidates_per_query];
+            for (query_features) |higher| {
+                if (higher.gain == 0) continue;
+                var compared: usize = 0;
+                for (query_features) |lower| {
+                    if (lower.gain >= higher.gain) continue;
+                    const semantic_delta: f64 = higher.semantic - lower.semantic;
+                    const structured_delta: f64 =
+                        higher.structured_normalized - lower.structured_normalized;
+                    const hdc_delta: f64 = if (include_hdc)
+                        higher.hdc_similarity - lower.hdc_similarity
+                    else
+                        0;
+                    const margin = std.math.clamp(
+                        weights.semantic * semantic_delta +
+                            weights.structured * structured_delta +
+                            weights.hdc * hdc_delta,
+                        -20,
+                        20,
+                    );
+                    const gradient = 1.0 / (1.0 + @exp(margin));
+                    weights.semantic += epoch_rate *
+                        (gradient * semantic_delta - regularization * weights.semantic);
+                    weights.structured += epoch_rate *
+                        (gradient * structured_delta - regularization * weights.structured);
+                    if (include_hdc) {
+                        weights.hdc += epoch_rate *
+                            (gradient * hdc_delta - regularization * weights.hdc);
+                    }
+                    compared += 1;
+                    if (compared == 32) break;
+                }
+            }
+        }
+    }
+    return weights;
+}
+
+fn evaluateCandidateReranker(
+    alloc: std.mem.Allocator,
+    fixture: Fixture,
+    qrel_offsets: []const usize,
+    features: []const CandidateFeature,
+    included_queries: []const bool,
+    candidate_generation_ns: []const u64,
+    candidates_per_query: usize,
+    candidate_budgets: []const usize,
+    kind: CandidateRerankerKind,
+    weights: CandidateRerankerWeights,
+    per_query_quality: []PerQueryQuality,
+    label: []const u8,
+) !void {
+    const validation = try alloc.alloc(Metrics, candidate_budgets.len);
+    defer alloc.free(validation);
+    @memset(validation, .{});
+    const holdout = try alloc.alloc(Metrics, candidate_budgets.len);
+    defer alloc.free(holdout);
+    @memset(holdout, .{});
+    const gains = try alloc.alloc(u8, fixture.product_count);
+    defer alloc.free(gains);
+    const ranked = try alloc.alloc(Ranked, candidates_per_query);
+    defer alloc.free(ranked);
+
+    for (included_queries, 0..) |included, query_index| {
+        if (!included) continue;
+        @memset(gains, 0);
+        const qrels = fixture.qrels[qrel_offsets[query_index]..qrel_offsets[query_index + 1]];
+        var relevant_count: usize = 0;
+        for (qrels) |qrel| {
+            gains[qrel.product_index] = @max(gains[qrel.product_index], qrel.gain);
+            if (qrel.gain > 0) relevant_count += 1;
+        }
+        if (relevant_count == 0) continue;
+        const query_features =
+            features[query_index * candidates_per_query ..][0..candidates_per_query];
+        for (candidate_budgets, 0..) |candidate_budget, budget_index| {
+            const rerank_started = antfly.platform_time.monotonicNs();
+            for (query_features[0..candidate_budget], 0..) |feature, rank_index| {
+                const score = switch (kind) {
+                    .transparent => weights.semantic * feature.semantic +
+                        weights.structured * feature.structured_count,
+                    .learned, .learned_hdc => weights.score(feature),
+                };
+                ranked[rank_index] = .{
+                    .index = feature.product_index,
+                    .score = @floatCast(score),
+                };
+            }
+            std.mem.sort(
+                Ranked,
+                ranked[0..candidate_budget],
+                {},
+                rankedGreaterThanContext,
+            );
+            const rerank_elapsed =
+                antfly.platform_time.monotonicNs() - rerank_started;
+            const observed = observeQuery(
+                fixture,
+                qrels,
+                gains,
+                ranked[0..top_k],
+                relevant_count,
+                candidate_generation_ns[query_index] + rerank_elapsed,
+            );
+            per_query_quality[budget_index * fixture.query_count + query_index] = .{
+                .ndcg10 = observed.ndcg_sum,
+                .graph_answer_top1 = @floatFromInt(observed.graph_answer_top1),
+            };
+            if (isValidationQuery(fixture.query_ids[query_index])) {
+                validation[budget_index].add(observed);
+            } else {
+                holdout[budget_index].add(observed);
+            }
+        }
+    }
+    for (candidate_budgets, 0..) |candidate_budget, budget_index| {
+        var method_buffer: [160]u8 = undefined;
+        const method = try std.fmt.bufPrint(
+            &method_buffer,
+            "{s}_candidates_{d}",
+            .{ label, candidate_budget },
+        );
+        validation[budget_index].print(method, .validation, fixture.dimensions);
+        holdout[budget_index].print(method, .holdout, fixture.dimensions);
+        var all = validation[budget_index];
+        all.add(holdout[budget_index]);
+        all.print(method, .all, fixture.dimensions);
+    }
+}
 
 fn evaluateAnnMethod(
     alloc: std.mem.Allocator,
@@ -1857,6 +2344,57 @@ test "bipolar sign packing rejects non-finite coordinates" {
         error.NonFiniteHypervector,
         packBipolarSigns(&.{ 1, std.math.nan(f32) }, &sign_words),
     );
+}
+
+test "candidate reranker learns held-out HDC feature only when enabled" {
+    const fixture = Fixture{
+        .dimensions = 1,
+        .max_tokens = 1,
+        .product_count = 2,
+        .query_count = 1,
+        .product_embeddings = &.{ 0, 0 },
+        .query_embeddings = &.{0},
+        .product_ids = &.{ 1, 2 },
+        .product_classes = &.{ 0, 0 },
+        .product_categories = &.{ 0, 0 },
+        .query_ids = &.{5},
+        .query_classes = &.{0},
+        .qrels = &.{},
+    };
+    const features = [_]CandidateFeature{
+        .{
+            .product_index = 0,
+            .gain = 2,
+            .semantic = 0,
+            .structured_count = 0,
+            .structured_normalized = 0,
+            .hdc_similarity = 1,
+        },
+        .{
+            .product_index = 1,
+            .gain = 0,
+            .semantic = 0,
+            .structured_count = 0,
+            .structured_normalized = 0,
+            .hdc_similarity = -1,
+        },
+    };
+    const without_hdc = trainCandidateReranker(
+        fixture,
+        &features,
+        &.{true},
+        features.len,
+        false,
+    );
+    const with_hdc = trainCandidateReranker(
+        fixture,
+        &features,
+        &.{true},
+        features.len,
+        true,
+    );
+    try std.testing.expectEqual(@as(f64, 0), without_hdc.hdc);
+    try std.testing.expect(with_hdc.hdc > 0);
 }
 
 test "association fixture exposes compositional rows and exact matching" {
