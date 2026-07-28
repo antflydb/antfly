@@ -30,6 +30,8 @@ const connection_pool_idle_ttl_ns: u64 = 5 * std.time.ns_per_min;
 const max_pool_reclaims_per_acquire: usize = 1;
 const max_column_cache_entries: usize = 1_024;
 const column_cache_ttl_ns: u64 = std.time.ns_per_min;
+const failed_cutover_cleanup_timeout_ns: u64 = 5 * std.time.ns_per_s;
+const exact_cutover_identity_domain = "antfly/postgres-exact-cutover-identity/v1";
 const supports_waitable_pool = builtin.os.tag != .freestanding and
     builtin.link_libc and
     @hasDecl(std.c, "pthread_cond_wait") and
@@ -56,6 +58,43 @@ const uses_relative_condwait = switch (builtin.os.tag) {
     .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
     else => false,
 };
+
+fn exactCutoverProviderIdentity(
+    system_id: []const u8,
+    database: []const u8,
+    database_oid: []const u8,
+) foreign_source.ExactCutoverIntent.ProviderIdentity {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(exact_cutover_identity_domain);
+    hashIdentityField(&hasher, system_id);
+    hashIdentityField(&hasher, database);
+    hashIdentityField(&hasher, database_oid);
+    var identity: foreign_source.ExactCutoverIntent.ProviderIdentity = undefined;
+    hasher.final(&identity);
+    return identity;
+}
+
+fn hashIdentityField(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    value: []const u8,
+) void {
+    var encoded_len: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_len, @intCast(value.len), .big);
+    hasher.update(&encoded_len);
+    hasher.update(value);
+}
+
+test "postgres exact cutover identity binds cluster database and database incarnation" {
+    const baseline = exactCutoverProviderIdentity("734912783", "app", "16384");
+    const same = exactCutoverProviderIdentity("734912783", "app", "16384");
+    const other_cluster = exactCutoverProviderIdentity("734912784", "app", "16384");
+    const other_database = exactCutoverProviderIdentity("734912783", "other", "16384");
+    const recreated_database = exactCutoverProviderIdentity("734912783", "app", "24576");
+    try std.testing.expectEqualSlices(u8, &baseline, &same);
+    try std.testing.expect(!std.mem.eql(u8, &baseline, &other_cluster));
+    try std.testing.expect(!std.mem.eql(u8, &baseline, &other_database));
+    try std.testing.expect(!std.mem.eql(u8, &baseline, &recreated_database));
+}
 
 /// An epoch-based condition avoids missed wakeups between observing pool state
 /// and sleeping. Native timed waits use a monotonic clock (Linux) or a relative
@@ -222,6 +261,7 @@ const FnPQconnectdb = *const fn ([*:0]const u8) callconv(.c) ?*PGconn;
 const FnPQconnectStart = *const fn ([*:0]const u8) callconv(.c) ?*PGconn;
 const FnPQconnectPoll = *const fn (?*PGconn) callconv(.c) c_uint;
 const FnPQexec = *const fn (?*PGconn, [*:0]const u8) callconv(.c) ?*PGresult;
+const FnPQsendQuery = *const fn (?*PGconn, [*:0]const u8) callconv(.c) c_int;
 const FnPQstatus = *const fn (?*PGconn) callconv(.c) ConnStatusType;
 const FnPQerrorMessage = *const fn (?*PGconn) callconv(.c) [*:0]const u8;
 const FnPQfinish = *const fn (?*PGconn) callconv(.c) void;
@@ -244,6 +284,110 @@ const FnPQgetisnull = *const fn (?*PGresult, c_int, c_int) callconv(.c) c_int;
 const FnPQgetlength = *const fn (?*PGresult, c_int, c_int) callconv(.c) c_int;
 const FnPQgetvalue = *const fn (?*PGresult, c_int, c_int) callconv(.c) [*]const u8;
 const FnPQclear = *const fn (?*PGresult) callconv(.c) void;
+
+const TestLibpqStubs = struct {
+    fn unexpected() noreturn {
+        @panic("permit-only test unexpectedly called libpq");
+    }
+
+    fn connectdb(_: [*:0]const u8) callconv(.c) ?*PGconn {
+        unexpected();
+    }
+    fn connectStart(_: [*:0]const u8) callconv(.c) ?*PGconn {
+        unexpected();
+    }
+    fn connectPoll(_: ?*PGconn) callconv(.c) c_uint {
+        unexpected();
+    }
+    fn exec(_: ?*PGconn, _: [*:0]const u8) callconv(.c) ?*PGresult {
+        unexpected();
+    }
+    fn sendQuery(_: ?*PGconn, _: [*:0]const u8) callconv(.c) c_int {
+        unexpected();
+    }
+    fn status(_: ?*PGconn) callconv(.c) ConnStatusType {
+        unexpected();
+    }
+    fn errorMessage(_: ?*PGconn) callconv(.c) [*:0]const u8 {
+        unexpected();
+    }
+    fn finish(_: ?*PGconn) callconv(.c) void {}
+    fn execParams(
+        _: ?*PGconn,
+        _: [*:0]const u8,
+        _: c_int,
+        _: ?[*]const Oid,
+        _: ?[*]const ?[*:0]const u8,
+        _: ?[*]const c_int,
+        _: ?[*]const c_int,
+        _: c_int,
+    ) callconv(.c) ?*PGresult {
+        unexpected();
+    }
+    fn sendQueryParams(
+        _: ?*PGconn,
+        _: [*:0]const u8,
+        _: c_int,
+        _: ?[*]const Oid,
+        _: ?[*]const ?[*:0]const u8,
+        _: ?[*]const c_int,
+        _: ?[*]const c_int,
+        _: c_int,
+    ) callconv(.c) c_int {
+        unexpected();
+    }
+    fn setnonblocking(_: ?*PGconn, _: c_int) callconv(.c) c_int {
+        unexpected();
+    }
+    fn flush(_: ?*PGconn) callconv(.c) c_int {
+        unexpected();
+    }
+    fn consumeInput(_: ?*PGconn) callconv(.c) c_int {
+        unexpected();
+    }
+    fn isBusy(_: ?*PGconn) callconv(.c) c_int {
+        unexpected();
+    }
+    fn getResult(_: ?*PGconn) callconv(.c) ?*PGresult {
+        unexpected();
+    }
+    fn socket(_: ?*PGconn) callconv(.c) c_int {
+        unexpected();
+    }
+    fn resultStatus(_: ?*PGresult) callconv(.c) ExecStatusType {
+        unexpected();
+    }
+    fn resultErrorMessage(_: ?*PGresult) callconv(.c) [*:0]const u8 {
+        unexpected();
+    }
+    fn resultErrorField(_: ?*PGresult, _: c_int) callconv(.c) ?[*:0]const u8 {
+        unexpected();
+    }
+    fn ntuples(_: ?*PGresult) callconv(.c) c_int {
+        unexpected();
+    }
+    fn nfields(_: ?*PGresult) callconv(.c) c_int {
+        unexpected();
+    }
+    fn fname(_: ?*PGresult, _: c_int) callconv(.c) ?[*:0]const u8 {
+        unexpected();
+    }
+    fn ftype(_: ?*PGresult, _: c_int) callconv(.c) Oid {
+        unexpected();
+    }
+    fn getisnull(_: ?*PGresult, _: c_int, _: c_int) callconv(.c) c_int {
+        unexpected();
+    }
+    fn getlength(_: ?*PGresult, _: c_int, _: c_int) callconv(.c) c_int {
+        unexpected();
+    }
+    fn getvalue(_: ?*PGresult, _: c_int, _: c_int) callconv(.c) [*]const u8 {
+        unexpected();
+    }
+    fn clear(_: ?*PGresult) callconv(.c) void {
+        unexpected();
+    }
+};
 
 const TypeOid = struct {
     const boolean = 16;
@@ -292,6 +436,40 @@ pub const Executor = struct {
         count: usize,
         queued: bool = false,
         granted: bool = false,
+        reclaiming: bool = false,
+    };
+
+    const AsyncResultDriver = struct {
+        executor: *Executor,
+        conn: ?*PGconn,
+
+        fn flush(self: @This()) c_int {
+            return self.executor.pqflush(self.conn);
+        }
+
+        fn wait(self: @This(), events: i16, deadline_ns: u64) !i16 {
+            return try self.executor.waitForSocketEvents(self.conn, events, deadline_ns);
+        }
+
+        fn consumeInput(self: @This()) c_int {
+            return self.executor.pqconsumeInput(self.conn);
+        }
+
+        fn isBusy(self: @This()) c_int {
+            return self.executor.pqisBusy(self.conn);
+        }
+
+        fn getResult(self: @This()) ?*PGresult {
+            return self.executor.pqgetResult(self.conn);
+        }
+
+        fn clear(self: @This(), result: ?*PGresult) void {
+            self.executor.pqclear(result);
+        }
+
+        fn restoreBlocking(self: @This()) c_int {
+            return self.executor.pqsetnonblocking(self.conn, 0);
+        }
     };
 
     const ConnectionLease = struct {
@@ -336,7 +514,7 @@ pub const Executor = struct {
     };
 
     alloc: Allocator,
-    lib: std.DynLib,
+    lib: ?std.DynLib,
     pools_mutex: Mutex = .unlocked,
     reclaim_mutex: Mutex = .unlocked,
     pools: std.StringHashMapUnmanaged(*ConnectionPool) = .empty,
@@ -354,6 +532,7 @@ pub const Executor = struct {
     pqconnectStart: FnPQconnectStart,
     pqconnectPoll: FnPQconnectPoll,
     pqexec: FnPQexec,
+    pqsendQuery: FnPQsendQuery,
     pqstatus: FnPQstatus,
     pqerrorMessage: FnPQerrorMessage,
     pqfinish: FnPQfinish,
@@ -387,6 +566,7 @@ pub const Executor = struct {
             .pqconnectStart = try lookupRequired(&lib, FnPQconnectStart, "PQconnectStart"),
             .pqconnectPoll = try lookupRequired(&lib, FnPQconnectPoll, "PQconnectPoll"),
             .pqexec = try lookupRequired(&lib, FnPQexec, "PQexec"),
+            .pqsendQuery = try lookupRequired(&lib, FnPQsendQuery, "PQsendQuery"),
             .pqstatus = try lookupRequired(&lib, FnPQstatus, "PQstatus"),
             .pqerrorMessage = try lookupRequired(&lib, FnPQerrorMessage, "PQerrorMessage"),
             .pqfinish = try lookupRequired(&lib, FnPQfinish, "PQfinish"),
@@ -409,6 +589,44 @@ pub const Executor = struct {
             .pqgetlength = try lookupRequired(&lib, FnPQgetlength, "PQgetlength"),
             .pqgetvalue = try lookupRequired(&lib, FnPQgetvalue, "PQgetvalue"),
             .pqclear = try lookupRequired(&lib, FnPQclear, "PQclear"),
+        };
+    }
+
+    /// Scheduler and pool-registry tests must not depend on a host libpq
+    /// installation. Typed fail-fast stubs keep accidental future libpq use
+    /// deterministic instead of invoking an undefined function pointer.
+    fn initForPermitTests(alloc: Allocator) @This() {
+        if (!builtin.is_test) @compileError("initForPermitTests is test-only");
+        return .{
+            .alloc = alloc,
+            .lib = null,
+            .pqconnectdb = TestLibpqStubs.connectdb,
+            .pqconnectStart = TestLibpqStubs.connectStart,
+            .pqconnectPoll = TestLibpqStubs.connectPoll,
+            .pqexec = TestLibpqStubs.exec,
+            .pqsendQuery = TestLibpqStubs.sendQuery,
+            .pqstatus = TestLibpqStubs.status,
+            .pqerrorMessage = TestLibpqStubs.errorMessage,
+            .pqfinish = TestLibpqStubs.finish,
+            .pqexecParams = TestLibpqStubs.execParams,
+            .pqsendQueryParams = TestLibpqStubs.sendQueryParams,
+            .pqsetnonblocking = TestLibpqStubs.setnonblocking,
+            .pqflush = TestLibpqStubs.flush,
+            .pqconsumeInput = TestLibpqStubs.consumeInput,
+            .pqisBusy = TestLibpqStubs.isBusy,
+            .pqgetResult = TestLibpqStubs.getResult,
+            .pqsocket = TestLibpqStubs.socket,
+            .pqresultStatus = TestLibpqStubs.resultStatus,
+            .pqresultErrorMessage = TestLibpqStubs.resultErrorMessage,
+            .pqresultErrorField = TestLibpqStubs.resultErrorField,
+            .pqntuples = TestLibpqStubs.ntuples,
+            .pqnfields = TestLibpqStubs.nfields,
+            .pqfname = TestLibpqStubs.fname,
+            .pqftype = TestLibpqStubs.ftype,
+            .pqgetisnull = TestLibpqStubs.getisnull,
+            .pqgetlength = TestLibpqStubs.getlength,
+            .pqgetvalue = TestLibpqStubs.getvalue,
+            .pqclear = TestLibpqStubs.clear,
         };
     }
 
@@ -453,7 +671,7 @@ pub const Executor = struct {
         }
         self.columns_cache.deinit(self.alloc);
         self.cache_mutex.unlock();
-        self.lib.close();
+        if (self.lib) |*lib| lib.close();
         self.* = undefined;
     }
 
@@ -576,35 +794,129 @@ pub const Executor = struct {
         alloc: Allocator,
         dsn: []const u8,
         params: foreign_source.ReplicationPollParams,
+        execution_deadline_ns: u64,
     ) !postgres_source.QueryExecutor.PreparedReplicationSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        try ensureDeadline(execution_deadline_ns);
         const slot_name = params.slot_name orelse return error.InvalidQueryRequest;
         const publication_name = params.publication_name orelse return error.InvalidQueryRequest;
+        const exact_cutover_intent = params.exact_cutover_intent orelse
+            return error.InvalidQueryRequest;
 
-        const pool = try self.getOrCreateConnectionPool(dsn, null);
+        const pool = try self.getOrCreateConnectionPool(dsn, execution_deadline_ns);
         defer self.releaseConnectionPool(pool);
-        lock(&pool.control_mutex);
+        try lockUntil(&pool.control_mutex, execution_deadline_ns);
         defer pool.control_mutex.unlock();
 
         // Reserve both sockets atomically. Acquiring the replication socket
         // after opening the SQL socket can deadlock when many cutovers reach
         // the global ceiling together.
-        try self.acquireGlobalConnectionPermits(2, null);
+        try self.acquireGlobalConnectionPermits(2, execution_deadline_ns);
         var release_reserved_permits = true;
         errdefer if (release_reserved_permits) self.releaseGlobalConnections(2);
-        const sql_conn = try self.connectFresh(alloc, dsn);
-        errdefer self.pqfinish(sql_conn);
-        try self.ensurePublicationAlloc(alloc, dsn, sql_conn, publication_name, params.table, params.filter_query_json);
-        if (try self.logicalReplicationSlotExistsAlloc(alloc, sql_conn, slot_name)) {
+        var sql_conn: ?*PGconn = try self.connectFreshWithDeadline(dsn, execution_deadline_ns);
+        errdefer if (sql_conn) |conn| self.pqfinish(conn);
+        const slot_exists = try self.logicalReplicationSlotExistsAlloc(
+            alloc,
+            sql_conn,
+            slot_name,
+            execution_deadline_ns,
+        );
+        if (slot_exists and !params.reclaim_exact_cutover_slot)
             return error.UnsupportedExactCutover;
+
+        var repl_conn: ?*PGconn = try self.connectReplicationFreshWithDeadline(
+            alloc,
+            dsn,
+            execution_deadline_ns,
+        );
+        errdefer if (repl_conn) |conn| self.pqfinish(conn);
+        const provider_identity = try self.identifyExactCutoverProvider(
+            alloc,
+            sql_conn,
+            repl_conn,
+            execution_deadline_ns,
+        );
+
+        // Fence the current authority and authenticate the target before any
+        // persistent provider mutation. A stale leader may know the stable
+        // ownership identity, but cannot get its fresh authority token applied
+        // after losing leadership. Credentials are deliberately absent from
+        // provider_identity, so rotating them cannot invalidate ownership.
+        try ensureDeadline(execution_deadline_ns);
+        try exact_cutover_intent.persist(provider_identity);
+        try ensureDeadline(execution_deadline_ns);
+
+        try self.ensurePublicationAlloc(
+            alloc,
+            dsn,
+            sql_conn,
+            publication_name,
+            params.table,
+            params.filter_query_json,
+            execution_deadline_ns,
+        );
+        if (slot_exists) {
+            try self.dropInactiveLogicalReplicationSlotIfExistsAlloc(
+                alloc,
+                sql_conn,
+                slot_name,
+                execution_deadline_ns,
+            );
+            if (try self.logicalReplicationSlotExistsAlloc(
+                alloc,
+                sql_conn,
+                slot_name,
+                execution_deadline_ns,
+            )) return error.ExactCutoverCleanupPending;
         }
 
-        const repl_conn = try self.connectReplicationFresh(alloc, dsn);
-        errdefer self.pqfinish(repl_conn);
-        var exported = try self.createLogicalReplicationSlotExportSnapshotAlloc(alloc, repl_conn, slot_name);
+        var slot_created = false;
+        errdefer if (slot_created) {
+            // Clean up only a slot whose successful create response this
+            // attempt observed. A timeout is ambiguous and must be recovered
+            // through the durable pending intent: deleting by name here could
+            // otherwise remove a concurrently successful attempt's slot.
+            // Close both possibly-busy sessions, then spend one already-
+            // reserved permit on a bounded idempotent cleanup.
+            if (repl_conn) |conn| {
+                self.pqfinish(conn);
+                repl_conn = null;
+            }
+            if (sql_conn) |conn| {
+                self.pqfinish(conn);
+                sql_conn = null;
+            }
+            const cleanup_deadline_ns =
+                platform_time.monotonicNs() +| failed_cutover_cleanup_timeout_ns;
+            self.dropLogicalReplicationSlotIfExistsWithReservedPermit(
+                alloc,
+                dsn,
+                slot_name,
+                cleanup_deadline_ns,
+            ) catch |cleanup_err| {
+                std.log.err(
+                    "postgres exact cutover cleanup failed slot={s}: {s}",
+                    .{ slot_name, @errorName(cleanup_err) },
+                );
+            };
+        };
+        var exported = try self.createLogicalReplicationSlotExportSnapshotAlloc(
+            alloc,
+            repl_conn,
+            slot_name,
+            execution_deadline_ns,
+            &slot_created,
+        );
         defer exported.deinit(alloc);
 
-        const begin_result = try self.execSimpleAllowCommand(sql_conn, alloc, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+        const begin_result = try self.execSimpleWithDeadline(
+            sql_conn,
+            alloc,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+            execution_deadline_ns,
+            true,
+        );
         self.pqclear(begin_result);
         const quoted_snapshot = try quoteSqlStringLiteralAlloc(alloc, exported.snapshot_name);
         defer alloc.free(quoted_snapshot);
@@ -614,7 +926,13 @@ pub const Executor = struct {
             .{quoted_snapshot},
         );
         defer alloc.free(import_sql);
-        const import_result = try self.execSimpleAllowCommand(sql_conn, alloc, import_sql);
+        const import_result = try self.execSimpleWithDeadline(
+            sql_conn,
+            alloc,
+            import_sql,
+            execution_deadline_ns,
+            true,
+        );
         self.pqclear(import_result);
 
         const snapshot_query = try alloc.create(SnapshotQuery);
@@ -625,8 +943,10 @@ pub const Executor = struct {
         };
         const checkpoint = try alloc.dupe(u8, exported.checkpoint);
         self.pqfinish(repl_conn);
+        repl_conn = null;
         self.releaseGlobalConnections(1);
         release_reserved_permits = false;
+        slot_created = false;
         return .{
             .checkpoint = checkpoint,
             .snapshot_query = snapshot_query.asSnapshotQuery(),
@@ -999,7 +1319,11 @@ pub const Executor = struct {
         }
         self.permit_waiter_tail = waiter;
         waiter.queued = true;
-        _ = self.permit_waiter_count.fetchAdd(1, .release);
+        // Queue publication participates in the zero-waiter notification
+        // handshake. A producer that observed zero before this RMW publishes
+        // its capacity change to the newly queued waiter; a producer after
+        // this RMW must observe a non-zero count and enter the scheduler.
+        _ = self.permit_waiter_count.fetchAdd(1, .seq_cst);
     }
 
     fn removeGlobalPermitWaiterLocked(self: *@This(), waiter: *PermitWaiter) bool {
@@ -1019,14 +1343,32 @@ pub const Executor = struct {
         waiter.previous = null;
         waiter.next = null;
         waiter.queued = false;
-        const old_count = self.permit_waiter_count.fetchSub(1, .acq_rel);
+        const old_count = self.permit_waiter_count.fetchSub(1, .seq_cst);
         std.debug.assert(old_count > 0);
         return true;
+    }
+
+    fn hasPublishedGlobalPermitWaiters(self: *@This()) bool {
+        // Queue membership changes and this advisory gate share the global
+        // sequentially consistent order:
+        //
+        // * a producer ordered after enqueue observes a waiter and schedules it;
+        // * a producer ordered before enqueue may skip the mutex, but the new
+        //   waiter immediately rechecks atomic capacity and idle pools under
+        //   their publication locks before it can sleep.
+        //
+        // A read-only load keeps the common no-waiter path cache-friendly
+        // without allowing a stale zero to strand the FIFO head.
+        return self.permit_waiter_count.load(.seq_cst) != 0;
     }
 
     fn grantAvailableGlobalPermitWaitersLocked(self: *@This()) void {
         var head_changed = false;
         while (self.permit_waiter_head) |waiter| {
+            // The FIFO head remains queued while it reclaims idle sockets
+            // without the scheduler lock. Its reservation is committed by
+            // that thread, so a release must not grant the same waiter twice.
+            if (waiter.reclaiming) break;
             if (!self.reserveGlobalConnections(waiter.count)) break;
             std.debug.assert(self.removeGlobalPermitWaiterLocked(waiter));
             waiter.granted = true;
@@ -1043,7 +1385,7 @@ pub const Executor = struct {
     }
 
     fn notifyGlobalPermitHead(self: *@This()) void {
-        if (self.permit_waiter_count.load(.acquire) == 0) return;
+        if (!self.hasPublishedGlobalPermitWaiters()) return;
         lock(&self.permit_mutex);
         if (self.permit_waiter_head) |waiter| waiter.availability.advance();
         self.permit_mutex.unlock();
@@ -1057,6 +1399,7 @@ pub const Executor = struct {
 
     fn cancelGlobalPermitWaiter(self: *@This(), waiter: *PermitWaiter) void {
         lock(&self.permit_mutex);
+        std.debug.assert(!waiter.reclaiming);
         if (waiter.granted) {
             waiter.granted = false;
             self.releaseGlobalConnectionsRaw(waiter.count);
@@ -1137,43 +1480,95 @@ pub const Executor = struct {
                     return;
                 }
 
-                while (true) {
-                    const reclaim_outcome = self.tryAcquireGlobalConnectionPermitsByReclaiming(
-                        count,
-                        execution_deadline_ns,
-                    ) catch |err| {
+                // Observe the targeted wake epoch before checking idle pools.
+                // Any idle return during the unlocked reclaim phase then
+                // forces another predicate check instead of becoming a lost
+                // notification.
+                const reclaim_observed = waiter.availability.snapshot();
+                waiter.reclaiming = true;
+                self.permit_mutex.unlock();
+                const reclaim_result = self.tryAcquireGlobalConnectionPermitsByReclaiming(
+                    count,
+                    execution_deadline_ns,
+                );
+
+                // Reclaim may close sockets or wait on pool locks, so it never
+                // holds the global scheduler lock. Reacquire without a
+                // deadline to commit or roll back the stack-owned waiter
+                // before returning.
+                lock(&self.permit_mutex);
+                std.debug.assert(waiter.queued);
+                std.debug.assert(self.permit_waiter_head == &waiter);
+                std.debug.assert(waiter.reclaiming);
+                waiter.reclaiming = false;
+
+                const reclaim_outcome = reclaim_result catch |err| {
+                    std.debug.assert(self.removeGlobalPermitWaiterLocked(&waiter));
+                    self.grantAvailableGlobalPermitWaitersLocked();
+                    if (self.permit_waiter_head) |head| head.availability.advance();
+                    self.permit_mutex.unlock();
+                    return err;
+                };
+                if (reclaim_outcome == .acquired) {
+                    std.debug.assert(self.removeGlobalPermitWaiterLocked(&waiter));
+                    self.grantAvailableGlobalPermitWaitersLocked();
+                    if (self.permit_waiter_head) |head| head.availability.advance();
+                    self.permit_mutex.unlock();
+                    if (execution_deadline_ns) |deadline_ns| {
+                        ensureDeadline(deadline_ns) catch |err| {
+                            self.releaseGlobalConnections(count);
+                            return err;
+                        };
+                    }
+                    return;
+                }
+
+                // A release may have supplied capacity while reclamation was
+                // running. The FIFO owner gets first claim before any younger
+                // waiter is considered.
+                if (self.reserveGlobalConnections(count)) {
+                    std.debug.assert(self.removeGlobalPermitWaiterLocked(&waiter));
+                    self.grantAvailableGlobalPermitWaitersLocked();
+                    if (self.permit_waiter_head) |head| head.availability.advance();
+                    self.permit_mutex.unlock();
+                    if (execution_deadline_ns) |deadline_ns| {
+                        ensureDeadline(deadline_ns) catch |err| {
+                            self.releaseGlobalConnections(count);
+                            return err;
+                        };
+                    }
+                    return;
+                }
+
+                if (execution_deadline_ns) |deadline_ns| {
+                    ensureDeadline(deadline_ns) catch |err| {
                         std.debug.assert(self.removeGlobalPermitWaiterLocked(&waiter));
                         self.grantAvailableGlobalPermitWaitersLocked();
                         if (self.permit_waiter_head) |head| head.availability.advance();
                         self.permit_mutex.unlock();
                         return err;
                     };
-                    switch (reclaim_outcome) {
-                        .acquired => {
-                            std.debug.assert(self.removeGlobalPermitWaiterLocked(&waiter));
-                            self.grantAvailableGlobalPermitWaitersLocked();
-                            self.permit_mutex.unlock();
-                            return;
-                        },
-                        .retry => {
-                            if (self.reserveGlobalConnections(count)) {
-                                std.debug.assert(self.removeGlobalPermitWaiterLocked(&waiter));
-                                self.grantAvailableGlobalPermitWaitersLocked();
-                                self.permit_mutex.unlock();
-                                if (execution_deadline_ns) |deadline_ns| {
-                                    ensureDeadline(deadline_ns) catch |err| {
-                                        self.releaseGlobalConnections(count);
-                                        return err;
-                                    };
-                                }
-                                return;
-                            }
-                            continue;
-                        },
-                        .unavailable => break,
-                    }
-                    break;
                 }
+
+                // Partial reclamation freed capacity but not enough for this
+                // weighted request. Continue immediately so the head can
+                // collect the remaining idle sockets.
+                if (reclaim_outcome == .retry) continue;
+                if (waiter.availability.snapshot() != reclaim_observed) continue;
+
+                self.permit_mutex.unlock();
+                waiter.availability.waitForChange(
+                    reclaim_observed,
+                    execution_deadline_ns,
+                ) catch |err| {
+                    self.cancelGlobalPermitWaiter(&waiter);
+                    return err;
+                };
+                lockUntil(&self.permit_mutex, execution_deadline_ns) catch |err| {
+                    self.cancelGlobalPermitWaiter(&waiter);
+                    return err;
+                };
+                continue;
             }
 
             const observed = waiter.availability.snapshot();
@@ -1272,7 +1667,7 @@ pub const Executor = struct {
 
     fn releaseGlobalConnections(self: *@This(), count: usize) void {
         self.releaseGlobalConnectionsRaw(count);
-        if (self.permit_waiter_count.load(.acquire) == 0) return;
+        if (!self.hasPublishedGlobalPermitWaiters()) return;
         lock(&self.permit_mutex);
         self.grantAvailableGlobalPermitWaitersLocked();
         self.permit_mutex.unlock();
@@ -1456,7 +1851,7 @@ pub const Executor = struct {
         self.pqfinish(conn);
     }
 
-    fn waitForSocket(self: *@This(), conn: ?*PGconn, events: i16, deadline_ns: u64) !void {
+    fn waitForSocketEvents(self: *@This(), conn: ?*PGconn, events: i16, deadline_ns: u64) !i16 {
         const socket = self.pqsocket(conn);
         if (socket < 0) return error.ForeignConnectionFailed;
         const now_ns = platform_time.monotonicNs();
@@ -1472,6 +1867,11 @@ pub const Executor = struct {
         if (try std.posix.poll(&poll_fds, timeout_ms) == 0) return error.Timeout;
         if (poll_fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0)
             return error.ForeignConnectionFailed;
+        return poll_fds[0].revents;
+    }
+
+    fn waitForSocket(self: *@This(), conn: ?*PGconn, events: i16, deadline_ns: u64) !void {
+        _ = try self.waitForSocketEvents(conn, events, deadline_ns);
     }
 
     fn connectFresh(self: *@This(), alloc: Allocator, dsn: []const u8) !?*PGconn {
@@ -1511,6 +1911,17 @@ pub const Executor = struct {
         return try self.connectFresh(alloc, repl_dsn);
     }
 
+    fn connectReplicationFreshWithDeadline(
+        self: *@This(),
+        alloc: Allocator,
+        dsn: []const u8,
+        execution_deadline_ns: u64,
+    ) !*PGconn {
+        const repl_dsn = try appendReplicationModeAlloc(alloc, dsn);
+        defer alloc.free(repl_dsn);
+        return try self.connectFreshWithDeadline(repl_dsn, execution_deadline_ns);
+    }
+
     fn execPrepared(self: *@This(), conn: ?*PGconn, alloc: Allocator, prepared: sql.PreparedQuery) !?*PGresult {
         return try self.execPreparedInternal(conn, alloc, prepared, false);
     }
@@ -1523,6 +1934,27 @@ pub const Executor = struct {
         execution_deadline_ns: ?u64,
     ) !?*PGresult {
         const deadline_ns = execution_deadline_ns orelse return try self.execPrepared(conn, alloc, prepared);
+        return try self.execPreparedWithDeadlineInternal(conn, alloc, prepared, deadline_ns, false);
+    }
+
+    fn execPreparedAllowCommandWithDeadline(
+        self: *@This(),
+        conn: ?*PGconn,
+        alloc: Allocator,
+        prepared: sql.PreparedQuery,
+        execution_deadline_ns: u64,
+    ) !?*PGresult {
+        return try self.execPreparedWithDeadlineInternal(conn, alloc, prepared, execution_deadline_ns, true);
+    }
+
+    fn execPreparedWithDeadlineInternal(
+        self: *@This(),
+        conn: ?*PGconn,
+        alloc: Allocator,
+        prepared: sql.PreparedQuery,
+        deadline_ns: u64,
+        allow_command_ok: bool,
+    ) !?*PGresult {
         try ensureDeadline(deadline_ns);
         var owned_args = try OwnedArgs.init(alloc, prepared.args);
         defer owned_args.deinit(alloc);
@@ -1541,33 +1973,21 @@ pub const Executor = struct {
             0,
         ) != 1) return error.ForeignQueryFailed;
 
-        while (true) {
-            const flush_status = self.pqflush(conn);
-            if (flush_status == 0) break;
-            if (flush_status < 0) return error.ForeignQueryFailed;
-            try self.waitForSocket(conn, std.posix.POLL.OUT, deadline_ns);
-        }
-        while (self.pqisBusy(conn) != 0) {
-            try self.waitForSocket(conn, std.posix.POLL.IN, deadline_ns);
-            if (self.pqconsumeInput(conn) != 1) return error.ForeignQueryFailed;
-        }
+        return try self.readAsyncResultWithDeadline(conn, deadline_ns, allow_command_ok);
+    }
 
-        const result = self.pqgetResult(conn) orelse return error.ForeignQueryFailed;
-        var saw_extra_result = false;
-        while (self.pqgetResult(conn)) |extra_result| {
-            saw_extra_result = true;
-            self.pqclear(extra_result);
-        }
-        if (self.pqsetnonblocking(conn, 0) != 0) {
-            self.pqclear(result);
-            return error.ForeignQueryFailed;
-        }
-        if (saw_extra_result) {
-            self.pqclear(result);
-            return error.ForeignQueryFailed;
-        }
+    fn readAsyncResultWithDeadline(
+        self: *@This(),
+        conn: ?*PGconn,
+        deadline_ns: u64,
+        allow_command_ok: bool,
+    ) !?*PGresult {
+        const result = try readSingleAsyncResultWithDeadline(
+            AsyncResultDriver{ .executor = self, .conn = conn },
+            deadline_ns,
+        );
         const status = self.pqresultStatus(result);
-        if (status != PGRES_TUPLES_OK) {
+        if (status != PGRES_TUPLES_OK and !(allow_command_ok and status == PGRES_COMMAND_OK)) {
             defer self.pqclear(result);
             return mapResultError(self.pqresultErrorField(result, PG_DIAG_SQLSTATE), self.pqresultErrorMessage(result));
         }
@@ -1610,6 +2030,27 @@ pub const Executor = struct {
 
     fn execSimpleAllowCommand(self: *@This(), conn: ?*PGconn, alloc: Allocator, sql_text: []const u8) !?*PGresult {
         return try self.execSimpleInternal(conn, alloc, sql_text, true);
+    }
+
+    fn execSimpleWithDeadline(
+        self: *@This(),
+        conn: ?*PGconn,
+        alloc: Allocator,
+        sql_text: []const u8,
+        execution_deadline_ns: u64,
+        allow_command_ok: bool,
+    ) !?*PGresult {
+        try ensureDeadline(execution_deadline_ns);
+        const sql_text_z = try alloc.dupeZ(u8, sql_text);
+        defer alloc.free(sql_text_z);
+
+        if (self.pqsetnonblocking(conn, 1) != 0) return error.ForeignQueryFailed;
+        if (self.pqsendQuery(conn, sql_text_z.ptr) != 1) return error.ForeignQueryFailed;
+        return try self.readAsyncResultWithDeadline(
+            conn,
+            execution_deadline_ns,
+            allow_command_ok,
+        );
     }
 
     fn execSimpleInternal(self: *@This(), conn: ?*PGconn, alloc: Allocator, sql_text: []const u8, allow_command_ok: bool) !?*PGresult {
@@ -1696,9 +2137,22 @@ pub const Executor = struct {
         std.log.info("postgres libpq poll connected table={s} slot={s}", .{ params.table, slot_name });
         var observed_checkpoint: ?[]u8 = null;
         errdefer if (observed_checkpoint) |value| alloc.free(value);
-        try self.ensurePublicationAlloc(alloc, dsn, conn, publication_name, params.table, params.filter_query_json);
+        try self.ensurePublicationAlloc(
+            alloc,
+            dsn,
+            conn,
+            publication_name,
+            params.table,
+            params.filter_query_json,
+            null,
+        );
         if (params.checkpoint) |checkpoint| {
-            if (checkpoint.len > 0 and !try self.logicalReplicationSlotExistsAlloc(alloc, conn, slot_name)) {
+            if (checkpoint.len > 0 and !try self.logicalReplicationSlotExistsAlloc(
+                alloc,
+                conn,
+                slot_name,
+                null,
+            )) {
                 return error.ForeignReplicationSlotMissing;
             }
             if (checkpoint.len > 0) {
@@ -1801,7 +2255,15 @@ pub const Executor = struct {
         std.log.info("postgres libpq prepare replication table={s} slot={s}", .{ params.table, slot_name });
         const conn = try self.connectCountedFresh(alloc, dsn, null);
         defer self.closeCountedConnection(conn);
-        try self.ensurePublicationAlloc(alloc, dsn, conn, publication_name, params.table, params.filter_query_json);
+        try self.ensurePublicationAlloc(
+            alloc,
+            dsn,
+            conn,
+            publication_name,
+            params.table,
+            params.filter_query_json,
+            null,
+        );
         const slot_existed = try self.ensureLogicalReplicationSlotAlloc(alloc, conn, slot_name);
         return .{
             .checkpoint = try self.loadLogicalReplicationSlotCheckpointAlloc(alloc, conn, slot_name),
@@ -1843,6 +2305,7 @@ pub const Executor = struct {
         publication_name: []const u8,
         table: []const u8,
         filter_query_json: ?[]const u8,
+        execution_deadline_ns: ?u64,
     ) !void {
         const check_args = try alloc.alloc(sql.ParameterValue, 1);
         check_args[0] = .{ .string = try alloc.dupe(u8, publication_name) };
@@ -1851,7 +2314,12 @@ pub const Executor = struct {
             .args = check_args,
         };
         defer check_prepared.deinit(alloc);
-        const check_result = try self.execPrepared(conn, alloc, check_prepared);
+        const check_result = try self.execPreparedWithDeadline(
+            conn,
+            alloc,
+            check_prepared,
+            execution_deadline_ns,
+        );
         defer self.pqclear(check_result);
         if (@as(usize, @intCast(self.pqntuples(check_result))) > 0) return;
 
@@ -1868,7 +2336,12 @@ pub const Executor = struct {
         var translated_filter: ?filter.Translation = null;
         defer if (translated_filter) |*value| value.deinit(alloc);
         if (filter_query_json) |query_json| {
-            const columns = try self.discoverColumnsAlloc(alloc, dsn, table);
+            const columns = try self.discoverColumnsAllocWithDeadline(
+                alloc,
+                dsn,
+                table,
+                execution_deadline_ns,
+            );
             defer freeColumns(alloc, columns);
             translated_filter = try filter.translateAlloc(alloc, sql.postgresDialect(), query_json, columns);
             if (translated_filter.?.where_sql.len > 0) {
@@ -1883,7 +2356,15 @@ pub const Executor = struct {
             .args = if (translated_filter) |value| try cloneParameterValuesAlloc(alloc, value.args) else &.{},
         };
         defer create_prepared.deinit(alloc);
-        const create_result = try self.execPreparedAllowCommand(conn, alloc, create_prepared);
+        const create_result = if (execution_deadline_ns) |deadline_ns|
+            try self.execPreparedAllowCommandWithDeadline(
+                conn,
+                alloc,
+                create_prepared,
+                deadline_ns,
+            )
+        else
+            try self.execPreparedAllowCommand(conn, alloc, create_prepared);
         defer self.pqclear(create_result);
     }
 
@@ -1957,7 +2438,13 @@ pub const Executor = struct {
         }
     };
 
-    fn logicalReplicationSlotExistsAlloc(self: *@This(), alloc: Allocator, conn: ?*PGconn, slot_name: []const u8) !bool {
+    fn logicalReplicationSlotExistsAlloc(
+        self: *@This(),
+        alloc: Allocator,
+        conn: ?*PGconn,
+        slot_name: []const u8,
+        execution_deadline_ns: ?u64,
+    ) !bool {
         const args = try alloc.alloc(sql.ParameterValue, 1);
         args[0] = .{ .string = try alloc.dupe(u8, slot_name) };
         var prepared = sql.PreparedQuery{
@@ -1965,9 +2452,103 @@ pub const Executor = struct {
             .args = args,
         };
         defer prepared.deinit(alloc);
-        const result = try self.execPrepared(conn, alloc, prepared);
+        const result = try self.execPreparedWithDeadline(
+            conn,
+            alloc,
+            prepared,
+            execution_deadline_ns,
+        );
         defer self.pqclear(result);
         return @as(usize, @intCast(self.pqntuples(result))) > 0;
+    }
+
+    fn identifyExactCutoverProvider(
+        self: *@This(),
+        alloc: Allocator,
+        sql_conn: ?*PGconn,
+        replication_conn: ?*PGconn,
+        execution_deadline_ns: u64,
+    ) !foreign_source.ExactCutoverIntent.ProviderIdentity {
+        const result = try self.execSimpleWithDeadline(
+            replication_conn,
+            alloc,
+            "IDENTIFY_SYSTEM",
+            execution_deadline_ns,
+            false,
+        );
+        defer self.pqclear(result);
+        if (self.pqntuples(result) != 1 or self.pqnfields(result) < 4)
+            return error.ForeignQueryFailed;
+        if (self.pqgetisnull(result, 0, 0) != 0 or
+            self.pqgetisnull(result, 0, 3) != 0)
+            return error.ForeignQueryFailed;
+        const system_id = self.pqgetvalue(result, 0, 0)[0..@intCast(
+            self.pqgetlength(result, 0, 0),
+        )];
+        const database = self.pqgetvalue(result, 0, 3)[0..@intCast(
+            self.pqgetlength(result, 0, 3),
+        )];
+        if (system_id.len == 0 or database.len == 0)
+            return error.ForeignQueryFailed;
+
+        // Authenticate the SQL and replication sockets as the same database.
+        // The database OID additionally rejects drop/recreate of an identically
+        // named database within the same cluster.
+        const sql_identity_result = try self.execSimpleWithDeadline(
+            sql_conn,
+            alloc,
+            \\SELECT (pg_control_system()).system_identifier::text,
+            \\       current_database(),
+            \\       oid::text
+            \\  FROM pg_database
+            \\ WHERE datname = current_database()
+        ,
+            execution_deadline_ns,
+            false,
+        );
+        defer self.pqclear(sql_identity_result);
+        if (self.pqntuples(sql_identity_result) != 1 or
+            self.pqnfields(sql_identity_result) < 3)
+            return error.ForeignQueryFailed;
+        for (0..3) |column| {
+            if (self.pqgetisnull(sql_identity_result, 0, @intCast(column)) != 0)
+                return error.ForeignQueryFailed;
+        }
+        const sql_system_id =
+            self.pqgetvalue(sql_identity_result, 0, 0)[0..@intCast(
+                self.pqgetlength(sql_identity_result, 0, 0),
+            )];
+        const sql_database =
+            self.pqgetvalue(sql_identity_result, 0, 1)[0..@intCast(
+                self.pqgetlength(sql_identity_result, 0, 1),
+            )];
+        const database_oid =
+            self.pqgetvalue(sql_identity_result, 0, 2)[0..@intCast(
+                self.pqgetlength(sql_identity_result, 0, 2),
+            )];
+        if (!std.mem.eql(u8, system_id, sql_system_id) or
+            !std.mem.eql(u8, database, sql_database) or
+            database_oid.len == 0)
+            return error.ForeignProviderIdentityMismatch;
+        return exactCutoverProviderIdentity(system_id, database, database_oid);
+    }
+
+    fn cloneCreatedReplicationSnapshotAlloc(
+        alloc: Allocator,
+        slot_created: *bool,
+        checkpoint: []const u8,
+        snapshot_name: []const u8,
+    ) !ExportedReplicationSnapshot {
+        // The caller invokes this only after validating a successful
+        // CREATE_REPLICATION_SLOT result. Mark ownership before allocation so
+        // later local failures still trigger cleanup of this attempt's slot.
+        slot_created.* = true;
+        const checkpoint_copy = try alloc.dupe(u8, checkpoint);
+        errdefer alloc.free(checkpoint_copy);
+        return .{
+            .checkpoint = checkpoint_copy,
+            .snapshot_name = try alloc.dupe(u8, snapshot_name),
+        };
     }
 
     fn createLogicalReplicationSlotExportSnapshotAlloc(
@@ -1975,6 +2556,8 @@ pub const Executor = struct {
         alloc: Allocator,
         conn: ?*PGconn,
         slot_name: []const u8,
+        execution_deadline_ns: u64,
+        slot_created: *bool,
     ) !ExportedReplicationSnapshot {
         const quoted_slot = try sql.postgresDialect().quote_identifier(alloc, slot_name);
         defer alloc.free(quoted_slot);
@@ -1984,16 +2567,108 @@ pub const Executor = struct {
             .{quoted_slot},
         );
         defer alloc.free(create_sql);
-        const result = try self.execSimple(conn, alloc, create_sql);
+        const result = try self.execSimpleWithDeadline(
+            conn,
+            alloc,
+            create_sql,
+            execution_deadline_ns,
+            false,
+        );
         defer self.pqclear(result);
         if (self.pqntuples(result) == 0 or self.pqnfields(result) < 3) return error.ForeignQueryFailed;
         if (self.pqgetisnull(result, 0, 1) != 0 or self.pqgetisnull(result, 0, 2) != 0) return error.ForeignQueryFailed;
-        return .{
-            .checkpoint = try copyCellAlloc(alloc, self.pqgetvalue(result, 0, 1), @intCast(self.pqgetlength(result, 0, 1))),
-            .snapshot_name = try copyCellAlloc(alloc, self.pqgetvalue(result, 0, 2), @intCast(self.pqgetlength(result, 0, 2))),
-        };
+        return try cloneCreatedReplicationSnapshotAlloc(
+            alloc,
+            slot_created,
+            self.pqgetvalue(result, 0, 1)[0..@intCast(self.pqgetlength(result, 0, 1))],
+            self.pqgetvalue(result, 0, 2)[0..@intCast(self.pqgetlength(result, 0, 2))],
+        );
+    }
+
+    fn dropInactiveLogicalReplicationSlotIfExistsAlloc(
+        self: *@This(),
+        alloc: Allocator,
+        conn: ?*PGconn,
+        slot_name: []const u8,
+        execution_deadline_ns: u64,
+    ) !void {
+        var prepared = try tableNamePreparedQueryAlloc(
+            alloc,
+            "SELECT pg_drop_replication_slot($1) FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
+            slot_name,
+        );
+        defer prepared.deinit(alloc);
+        const result = try self.execPreparedWithDeadline(
+            conn,
+            alloc,
+            prepared,
+            execution_deadline_ns,
+        );
+        self.pqclear(result);
+    }
+
+    fn dropLogicalReplicationSlotIfExistsWithReservedPermit(
+        self: *@This(),
+        alloc: Allocator,
+        dsn: []const u8,
+        slot_name: []const u8,
+        execution_deadline_ns: u64,
+    ) !void {
+        const conn = try self.connectFreshWithDeadline(dsn, execution_deadline_ns);
+        defer self.pqfinish(conn);
+        try self.dropInactiveLogicalReplicationSlotIfExistsAlloc(
+            alloc,
+            conn,
+            slot_name,
+            execution_deadline_ns,
+        );
     }
 };
+
+/// Drive libpq's nonblocking command protocol without ever calling
+/// PQgetResult while libpq still needs socket input. In particular, flushing
+/// must service readable notices/errors as well as writable output, and every
+/// result (including the final null result) gets its own PQisBusy gate.
+fn readSingleAsyncResultWithDeadline(driver: anytype, deadline_ns: u64) !?*PGresult {
+    while (true) {
+        try ensureDeadline(deadline_ns);
+        const flush_status = driver.flush();
+        if (flush_status == 0) break;
+        if (flush_status < 0) return error.ForeignQueryFailed;
+
+        const ready = try driver.wait(
+            std.posix.POLL.IN | std.posix.POLL.OUT,
+            deadline_ns,
+        );
+        if (ready & std.posix.POLL.IN != 0 and driver.consumeInput() != 1)
+            return error.ForeignQueryFailed;
+    }
+
+    var first_result: ?*PGresult = null;
+    errdefer if (first_result) |result| driver.clear(result);
+    var saw_extra_result = false;
+    while (true) {
+        while (driver.isBusy() != 0) {
+            const ready = try driver.wait(std.posix.POLL.IN, deadline_ns);
+            if (ready & std.posix.POLL.IN == 0) continue;
+            if (driver.consumeInput() != 1) return error.ForeignQueryFailed;
+        }
+
+        try ensureDeadline(deadline_ns);
+        const next_result = driver.getResult() orelse break;
+        if (first_result == null) {
+            first_result = next_result;
+        } else {
+            saw_extra_result = true;
+            driver.clear(next_result);
+        }
+    }
+
+    const result = first_result orelse return error.ForeignQueryFailed;
+    if (driver.restoreBlocking() != 0) return error.ForeignQueryFailed;
+    if (saw_extra_result) return error.ForeignQueryFailed;
+    return result;
+}
 
 const LazyExecutor = struct {
     alloc: Allocator,
@@ -2097,10 +2772,16 @@ const LazyExecutor = struct {
         alloc: Allocator,
         dsn: []const u8,
         params: foreign_source.ReplicationPollParams,
+        execution_deadline_ns: u64,
     ) !postgres_source.QueryExecutor.PreparedReplicationSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const executor = try self.ensureExecutor(null);
-        return try executor.asQueryExecutor().beginPreparedReplicationSnapshot(alloc, dsn, params);
+        const executor = try self.ensureExecutor(execution_deadline_ns);
+        return try executor.asQueryExecutor().beginPreparedReplicationSnapshot(
+            alloc,
+            dsn,
+            params,
+            execution_deadline_ns,
+        );
     }
 
     fn prepareReplication(
@@ -2783,6 +3464,127 @@ pub fn registerDefaultExecutor(alloc: Allocator, registry: *foreign_source.Regis
     try postgres_source.registerExecutor(alloc, registry, executor.asQueryExecutor());
 }
 
+test "postgres libpq async reader services input while flushing and between results" {
+    const Driver = struct {
+        flush_calls: usize = 0,
+        wait_events: [3]i16 = undefined,
+        wait_calls: usize = 0,
+        consume_calls: usize = 0,
+        busy_calls: usize = 0,
+        get_result_calls: usize = 0,
+        restored_blocking: bool = false,
+
+        fn flush(self: *@This()) c_int {
+            defer self.flush_calls += 1;
+            return if (self.flush_calls == 0) 1 else 0;
+        }
+
+        fn wait(self: *@This(), events: i16, _: u64) !i16 {
+            self.wait_events[self.wait_calls] = events;
+            self.wait_calls += 1;
+            return std.posix.POLL.IN;
+        }
+
+        fn consumeInput(self: *@This()) c_int {
+            self.consume_calls += 1;
+            return 1;
+        }
+
+        fn isBusy(self: *@This()) c_int {
+            const sequence = [_]c_int{ 1, 0, 1, 0 };
+            const result = sequence[self.busy_calls];
+            self.busy_calls += 1;
+            return result;
+        }
+
+        fn getResult(self: *@This()) ?*PGresult {
+            defer self.get_result_calls += 1;
+            return if (self.get_result_calls == 0) @ptrFromInt(16) else null;
+        }
+
+        fn clear(_: *@This(), _: ?*PGresult) void {
+            unreachable;
+        }
+
+        fn restoreBlocking(self: *@This()) c_int {
+            self.restored_blocking = true;
+            return 0;
+        }
+    };
+
+    var driver = Driver{};
+    const result = try readSingleAsyncResultWithDeadline(
+        &driver,
+        platform_time.monotonicNs() + std.time.ns_per_s,
+    );
+    try std.testing.expectEqual(@as(?*PGresult, @ptrFromInt(16)), result);
+    try std.testing.expectEqual(@as(usize, 3), driver.wait_calls);
+    try std.testing.expectEqual(
+        @as(i16, std.posix.POLL.IN | std.posix.POLL.OUT),
+        driver.wait_events[0],
+    );
+    try std.testing.expectEqual(@as(i16, std.posix.POLL.IN), driver.wait_events[1]);
+    try std.testing.expectEqual(@as(i16, std.posix.POLL.IN), driver.wait_events[2]);
+    try std.testing.expectEqual(@as(usize, 3), driver.consume_calls);
+    try std.testing.expectEqual(@as(usize, 4), driver.busy_calls);
+    try std.testing.expectEqual(@as(usize, 2), driver.get_result_calls);
+    try std.testing.expect(driver.restored_blocking);
+}
+
+test "postgres libpq async reader rejects and clears additional results" {
+    const Driver = struct {
+        get_result_calls: usize = 0,
+        clear_calls: usize = 0,
+        restored_blocking: bool = false,
+
+        fn flush(_: *@This()) c_int {
+            return 0;
+        }
+
+        fn wait(_: *@This(), _: i16, _: u64) !i16 {
+            unreachable;
+        }
+
+        fn consumeInput(_: *@This()) c_int {
+            unreachable;
+        }
+
+        fn isBusy(_: *@This()) c_int {
+            return 0;
+        }
+
+        fn getResult(self: *@This()) ?*PGresult {
+            defer self.get_result_calls += 1;
+            return switch (self.get_result_calls) {
+                0 => @ptrFromInt(16),
+                1 => @ptrFromInt(32),
+                else => null,
+            };
+        }
+
+        fn clear(self: *@This(), _: ?*PGresult) void {
+            self.clear_calls += 1;
+        }
+
+        fn restoreBlocking(self: *@This()) c_int {
+            self.restored_blocking = true;
+            return 0;
+        }
+    };
+
+    var driver = Driver{};
+    try std.testing.expectError(
+        error.ForeignQueryFailed,
+        readSingleAsyncResultWithDeadline(
+            &driver,
+            platform_time.monotonicNs() + std.time.ns_per_s,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 3), driver.get_result_calls);
+    try std.testing.expectEqual(@as(usize, 2), driver.clear_calls);
+    try std.testing.expect(driver.restored_blocking);
+}
+
 test "postgres libpq registration succeeds without libpq and fails on first use" {
     const alloc = std.testing.allocator;
     const c = struct {
@@ -2825,7 +3627,7 @@ test "postgres libpq bounded lock rejects an expired deadline" {
 
 test "postgres libpq pool registry evicts inactive DSNs at its hard bound" {
     const alloc = std.testing.allocator;
-    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    var executor = Executor.initForPermitTests(alloc);
     defer executor.deinit();
 
     for (0..max_connection_pools + 8) |idx| {
@@ -2839,7 +3641,7 @@ test "postgres libpq pool registry evicts inactive DSNs at its hard bound" {
 
 test "postgres libpq global permits are atomic and bounded" {
     const alloc = std.testing.allocator;
-    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    var executor = Executor.initForPermitTests(alloc);
     defer executor.deinit();
 
     try std.testing.expect(executor.reserveGlobalConnections(max_total_connections));
@@ -2850,7 +3652,7 @@ test "postgres libpq global permits are atomic and bounded" {
 
 test "postgres libpq permit saturation preserves zero-connection pools" {
     const alloc = std.testing.allocator;
-    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    var executor = Executor.initForPermitTests(alloc);
     defer executor.deinit();
 
     const pool_count = 4;
@@ -2875,7 +3677,7 @@ test "postgres libpq permit saturation preserves zero-connection pools" {
 
 test "postgres libpq weighted FIFO preserves a queued two-permit cutover" {
     const alloc = std.testing.allocator;
-    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    var executor = Executor.initForPermitTests(alloc);
     defer executor.deinit();
 
     try std.testing.expect(executor.reserveGlobalConnections(max_total_connections));
@@ -2959,44 +3761,57 @@ test "postgres libpq weighted FIFO preserves a queued two-permit cutover" {
     try std.testing.expect(small_acquired.load(.acquire));
 }
 
-test "postgres libpq timed out FIFO head hands capacity to next waiter" {
+test "postgres libpq timed out weighted head hands released capacity to follower" {
     const alloc = std.testing.allocator;
-    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    var executor = Executor.initForPermitTests(alloc);
     defer executor.deinit();
 
     try std.testing.expect(executor.reserveGlobalConnections(max_total_connections));
     var head_timed_out: std.atomic.Value(bool) = .init(false);
-    var next_acquired: std.atomic.Value(bool) = .init(false);
-    var unexpected_error: std.atomic.Value(bool) = .init(false);
-    const Contender = struct {
-        fn head(inner: *Executor, deadline_ns: u64, timed_out: *std.atomic.Value(bool), failed: *std.atomic.Value(bool)) void {
+    var follower_acquired: std.atomic.Value(bool) = .init(false);
+    var failed: std.atomic.Value(bool) = .init(false);
+
+    const Head = struct {
+        fn run(
+            inner: *Executor,
+            deadline_ns: u64,
+            timed_out: *std.atomic.Value(bool),
+            failure: *std.atomic.Value(bool),
+        ) void {
             inner.acquireGlobalConnectionPermits(2, deadline_ns) catch |err| {
                 if (err == error.Timeout) {
                     timed_out.store(true, .release);
                 } else {
-                    failed.store(true, .release);
+                    failure.store(true, .release);
                 }
                 return;
             };
-            failed.store(true, .release);
+            failure.store(true, .release);
             inner.releaseGlobalConnections(2);
         }
-
-        fn next(inner: *Executor, deadline_ns: u64, acquired: *std.atomic.Value(bool), failed: *std.atomic.Value(bool)) void {
+    };
+    const Follower = struct {
+        fn run(
+            inner: *Executor,
+            deadline_ns: u64,
+            acquired: *std.atomic.Value(bool),
+            failure: *std.atomic.Value(bool),
+        ) void {
             inner.acquireGlobalConnectionPermits(1, deadline_ns) catch {
-                failed.store(true, .release);
+                failure.store(true, .release);
                 return;
             };
             acquired.store(true, .release);
             inner.releaseGlobalConnections(1);
         }
     };
-    const test_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+
     const head_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    const test_deadline_ns = head_deadline_ns + 5 * std.time.ns_per_s;
     const head = try std.Thread.spawn(
         .{},
-        Contender.head,
-        .{ &executor, head_deadline_ns, &head_timed_out, &unexpected_error },
+        Head.run,
+        .{ &executor, head_deadline_ns, &head_timed_out, &failed },
     );
     var head_joined = false;
     defer {
@@ -3004,38 +3819,90 @@ test "postgres libpq timed out FIFO head hands capacity to next waiter" {
         const remaining = executor.total_connections.load(.acquire);
         if (remaining > 0) executor.releaseGlobalConnections(remaining);
     }
+
     while (executor.permit_waiter_count.load(.acquire) != 1) {
         try ensureDeadline(test_deadline_ns);
         spinOrYield();
     }
-    const next = try std.Thread.spawn(
+    const follower = try std.Thread.spawn(
         .{},
-        Contender.next,
-        .{ &executor, test_deadline_ns, &next_acquired, &unexpected_error },
+        Follower.run,
+        .{ &executor, test_deadline_ns, &follower_acquired, &failed },
     );
-    var next_joined = false;
-    defer if (!next_joined) next.join();
+    var follower_joined = false;
+    defer if (!follower_joined) follower.join();
+
     while (executor.permit_waiter_count.load(.acquire) != 2) {
         try ensureDeadline(test_deadline_ns);
         spinOrYield();
     }
+    while (platform_time.monotonicNs() < head_deadline_ns) spinOrYield();
 
+    // This release deliberately races the head's timed wait cleanup. Whether
+    // cancellation or release enters the scheduler first, the expired
+    // two-permit owner must roll back exactly once and the one-permit follower
+    // must receive the available slot.
     executor.releaseGlobalConnections(1);
-    while (!head_timed_out.load(.acquire) or !next_acquired.load(.acquire)) {
-        try ensureDeadline(test_deadline_ns);
-        spinOrYield();
-    }
     head.join();
     head_joined = true;
-    next.join();
-    next_joined = true;
-    try std.testing.expect(!unexpected_error.load(.acquire));
+    follower.join();
+    follower_joined = true;
+
+    try std.testing.expect(head_timed_out.load(.acquire));
+    try std.testing.expect(follower_acquired.load(.acquire));
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, max_total_connections - 1), executor.total_connections.load(.acquire));
+}
+
+test "postgres libpq cancelled FIFO head hands capacity to next waiter" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.initForPermitTests(alloc);
+    defer executor.deinit();
+
+    try std.testing.expect(executor.reserveGlobalConnections(max_total_connections));
+    defer {
+        const remaining = executor.total_connections.load(.acquire);
+        if (remaining > 0) executor.releaseGlobalConnections(remaining);
+    }
+
+    var head_availability = try PoolAvailability.init(alloc);
+    defer head_availability.deinit();
+    var next_availability = try PoolAvailability.init(alloc);
+    defer next_availability.deinit();
+    var head = Executor.PermitWaiter{
+        .availability = head_availability,
+        .count = 2,
+    };
+    var next = Executor.PermitWaiter{
+        .availability = next_availability,
+        .count = 1,
+    };
+
+    lock(&executor.permit_mutex);
+    executor.enqueueGlobalPermitWaiterLocked(&head);
+    executor.enqueueGlobalPermitWaiterLocked(&next);
+    executor.permit_mutex.unlock();
+
+    // One slot cannot satisfy the weighted head, so it remains reserved.
+    executor.releaseGlobalConnections(1);
+    try std.testing.expect(head.queued);
+    try std.testing.expect(next.queued);
+
+    // Timeout cleanup uses this exact cancellation path. Removing the head
+    // must atomically hand the available slot to the next FIFO waiter.
+    executor.cancelGlobalPermitWaiter(&head);
+    try std.testing.expect(!head.queued);
+    try std.testing.expect(!head.granted);
+    try std.testing.expect(!next.queued);
+    try std.testing.expect(next.granted);
     try std.testing.expectEqual(@as(usize, 0), executor.permit_waiter_count.load(.acquire));
+
+    executor.cancelGlobalPermitWaiter(&next);
 }
 
 test "postgres libpq idle reclamation transfers only missing capacity" {
     const alloc = std.testing.allocator;
-    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    var executor = Executor.initForPermitTests(alloc);
     defer executor.deinit();
 
     const Fake = struct {
@@ -3074,6 +3941,127 @@ test "postgres libpq idle reclamation transfers only missing capacity" {
     try std.testing.expectEqual(@as(usize, 0), pool.idle.items.len);
 
     executor.releaseGlobalConnections(2);
+}
+
+test "postgres libpq reclamation leaves permit scheduling responsive" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.initForPermitTests(alloc);
+    defer executor.deinit();
+
+    const Fake = struct {
+        var finish_entered: std.atomic.Value(bool) = .init(false);
+        var allow_finish: std.atomic.Value(bool) = .init(false);
+
+        fn finish(_: ?*PGconn) callconv(.c) void {
+            finish_entered.store(true, .release);
+            while (!allow_finish.load(.acquire)) spinOrYield();
+        }
+    };
+    Fake.finish_entered.store(false, .release);
+    Fake.allow_finish.store(false, .release);
+    executor.pqfinish = Fake.finish;
+
+    const pool = try executor.getOrCreateConnectionPool("postgres://permit-responsive", null);
+    defer executor.releaseConnectionPool(pool);
+    const fake_conn: *PGconn = @ptrFromInt(1);
+    lock(&pool.mutex);
+    pool.idle.append(alloc, fake_conn) catch |err| {
+        pool.mutex.unlock();
+        return err;
+    };
+    pool.total = 1;
+    pool.mutex.unlock();
+
+    try std.testing.expect(executor.reserveGlobalConnections(max_total_connections - 1));
+    defer {
+        const remaining = executor.total_connections.load(.acquire);
+        if (remaining > 0) executor.releaseGlobalConnections(remaining);
+    }
+
+    var head_acquired: std.atomic.Value(bool) = .init(false);
+    var release_head: std.atomic.Value(bool) = .init(false);
+    var head_failed: std.atomic.Value(bool) = .init(false);
+    const Head = struct {
+        fn run(
+            inner: *Executor,
+            acquired: *std.atomic.Value(bool),
+            release_permits: *std.atomic.Value(bool),
+            failed: *std.atomic.Value(bool),
+        ) void {
+            inner.acquireGlobalConnectionPermits(
+                2,
+                platform_time.monotonicNs() + 5 * std.time.ns_per_s,
+            ) catch {
+                failed.store(true, .release);
+                return;
+            };
+            acquired.store(true, .release);
+            while (!release_permits.load(.acquire)) spinOrYield();
+            inner.releaseGlobalConnections(2);
+        }
+    };
+    const head = try std.Thread.spawn(
+        .{},
+        Head.run,
+        .{ &executor, &head_acquired, &release_head, &head_failed },
+    );
+    var head_joined = false;
+    defer {
+        Fake.allow_finish.store(true, .release);
+        release_head.store(true, .release);
+        if (!head_joined) head.join();
+    }
+
+    const deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!Fake.finish_entered.load(.acquire)) {
+        try ensureDeadline(deadline_ns);
+        spinOrYield();
+    }
+
+    // The head is blocked in pqfinish, after atomically transferring its
+    // reclaimed permit. Scheduling must remain independently available.
+    const scheduler_lock_available = executor.permit_mutex.tryLock();
+    if (scheduler_lock_available) executor.permit_mutex.unlock();
+    try std.testing.expect(scheduler_lock_available);
+
+    var next_availability = try PoolAvailability.init(alloc);
+    defer next_availability.deinit();
+    var next = Executor.PermitWaiter{
+        .availability = next_availability,
+        .count = 1,
+    };
+    var next_cancelled = false;
+    defer if (!next_cancelled) executor.cancelGlobalPermitWaiter(&next);
+
+    lock(&executor.permit_mutex);
+    const head_is_reclaiming = if (executor.permit_waiter_head) |queued_head|
+        queued_head.reclaiming
+    else
+        false;
+    if (head_is_reclaiming) executor.enqueueGlobalPermitWaiterLocked(&next);
+    executor.permit_mutex.unlock();
+    try std.testing.expect(head_is_reclaiming);
+
+    // A concurrent release can enter the scheduler, but must leave the permit
+    // for the reclaiming FIFO owner rather than double-granting it or allowing
+    // the younger one-slot waiter to bypass.
+    executor.releaseGlobalConnections(1);
+    try std.testing.expect(next.queued);
+    try std.testing.expect(!next.granted);
+
+    Fake.allow_finish.store(true, .release);
+    while (!head_acquired.load(.acquire) or !next.granted) {
+        try ensureDeadline(deadline_ns);
+        spinOrYield();
+    }
+    try std.testing.expect(!head_failed.load(.acquire));
+    try std.testing.expect(!next.queued);
+
+    executor.cancelGlobalPermitWaiter(&next);
+    next_cancelled = true;
+    release_head.store(true, .release);
+    head.join();
+    head_joined = true;
 }
 
 test "postgres libpq availability broadcast wakes every waiter" {
@@ -3163,6 +4151,29 @@ test "postgres libpq clone helpers are allocation-failure safe" {
             defer prepared.deinit(alloc);
             var relation_prepared = try relationPreparedQueryAlloc(alloc, "SELECT to_regclass($1)", "public.users");
             defer relation_prepared.deinit(alloc);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "postgres libpq created replication snapshot cloning is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var slot_created = false;
+            var snapshot = Executor.cloneCreatedReplicationSnapshotAlloc(
+                alloc,
+                &slot_created,
+                "0/16B6C50",
+                "00000003-0000001B-1",
+            ) catch |err| {
+                // Ownership is recorded before either allocation, ensuring
+                // every post-create local failure selects bounded cleanup.
+                try std.testing.expect(slot_created);
+                return err;
+            };
+            defer snapshot.deinit(alloc);
+            try std.testing.expect(slot_created);
         }
     };
 
@@ -3979,14 +4990,34 @@ test "postgres libpq prepared replication snapshot bridges initial cutover" {
     try execCommandForTest(&executor, conn, alloc, create_table_sql);
     try execCommandForTest(&executor, conn, alloc, seed_sql);
 
+    var intent_persisted = false;
+    const Intent = struct {
+        fn persist(
+            ptr: *anyopaque,
+            _: foreign_source.ExactCutoverIntent.ProviderIdentity,
+        ) !void {
+            const persisted: *bool = @ptrCast(@alignCast(ptr));
+            persisted.* = true;
+        }
+    };
     var begin_params = foreign_source.ReplicationPollParams{
         .table = try alloc.dupe(u8, table_name),
         .slot_name = try alloc.dupe(u8, slot_name),
         .publication_name = try alloc.dupe(u8, publication_name),
+        .exact_cutover_intent = .{
+            .ptr = &intent_persisted,
+            .persist_fn = Intent.persist,
+        },
     };
     defer begin_params.deinit(alloc);
-    var prepared = try executor.asQueryExecutor().beginPreparedReplicationSnapshot(alloc, dsn, begin_params);
+    var prepared = try executor.asQueryExecutor().beginPreparedReplicationSnapshot(
+        alloc,
+        dsn,
+        begin_params,
+        platform_time.monotonicNs() + 30 * std.time.ns_per_s,
+    );
     defer prepared.deinit(alloc);
+    try std.testing.expect(intent_persisted);
     try std.testing.expect(prepared.checkpoint.len > 0);
 
     var snapshot_result = try prepared.snapshot_query.queryPrepared(alloc, .{
@@ -4010,6 +5041,112 @@ test "postgres libpq prepared replication snapshot bridges initial cutover" {
     defer poll_result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), poll_result.changes.len);
     try std.testing.expectEqualStrings("u1", poll_result.changes[0].row.?.object.get("id").?.string);
+}
+
+test "postgres libpq exact cutover authority failure precedes provider mutation" {
+    const alloc = std.testing.allocator;
+    const dsn = try testPgDsnAlloc(alloc);
+    defer alloc.free(dsn);
+
+    var executor = try Executor.init(alloc);
+    defer executor.deinit();
+
+    const conn = executor.connect(dsn) catch return error.SkipZigTest;
+    const wal_level_result = executor.execSimple(conn, alloc, "show wal_level") catch return error.SkipZigTest;
+    defer executor.pqclear(wal_level_result);
+    if (executor.pqntuples(wal_level_result) == 0 or executor.pqgetisnull(wal_level_result, 0, 0) != 0) return error.SkipZigTest;
+    const wal_level = executor.pqgetvalue(wal_level_result, 0, 0)[0..@intCast(executor.pqgetlength(wal_level_result, 0, 0))];
+    if (!std.ascii.eqlIgnoreCase(wal_level, "logical")) return error.SkipZigTest;
+
+    live_poll_test_counter += 1;
+    const suffix = live_poll_test_counter;
+    const table_name = try std.fmt.allocPrint(alloc, "antfly_zig_fenced_cutover_{d}", .{suffix});
+    defer alloc.free(table_name);
+    const slot_name = try std.fmt.allocPrint(alloc, "antfly_zig_fenced_cutover_slot_{d}", .{suffix});
+    defer alloc.free(slot_name);
+    const publication_name = try std.fmt.allocPrint(alloc, "antfly_zig_fenced_cutover_pub_{d}", .{suffix});
+    defer alloc.free(publication_name);
+
+    const drop_publication_sql = try std.fmt.allocPrint(alloc, "drop publication if exists {s}", .{publication_name});
+    defer alloc.free(drop_publication_sql);
+    const drop_slot_sql = try std.fmt.allocPrint(
+        alloc,
+        "select pg_drop_replication_slot('{s}') from pg_replication_slots where slot_name = '{s}' and not active",
+        .{ slot_name, slot_name },
+    );
+    defer alloc.free(drop_slot_sql);
+    const drop_table_sql = try std.fmt.allocPrint(alloc, "drop table if exists {s}", .{table_name});
+    defer alloc.free(drop_table_sql);
+    defer {
+        execCommandForTest(&executor, conn, alloc, drop_publication_sql) catch {};
+        execCommandForTest(&executor, conn, alloc, drop_slot_sql) catch {};
+        execCommandForTest(&executor, conn, alloc, drop_table_sql) catch {};
+    }
+
+    const create_table_sql = try std.fmt.allocPrint(
+        alloc,
+        "create table {s} (id text primary key)",
+        .{table_name},
+    );
+    defer alloc.free(create_table_sql);
+    const create_slot_sql = try std.fmt.allocPrint(
+        alloc,
+        "select * from pg_create_logical_replication_slot('{s}', 'pgoutput')",
+        .{slot_name},
+    );
+    defer alloc.free(create_slot_sql);
+    try execCommandForTest(&executor, conn, alloc, drop_table_sql);
+    try execCommandForTest(&executor, conn, alloc, create_table_sql);
+    try execCommandForTest(&executor, conn, alloc, create_slot_sql);
+
+    var persist_calls: usize = 0;
+    const DeniedIntent = struct {
+        fn persist(
+            ptr: *anyopaque,
+            _: foreign_source.ExactCutoverIntent.ProviderIdentity,
+        ) !void {
+            const calls: *usize = @ptrCast(@alignCast(ptr));
+            calls.* += 1;
+            return error.TestAuthorityDenied;
+        }
+    };
+    var begin_params = foreign_source.ReplicationPollParams{
+        .table = try alloc.dupe(u8, table_name),
+        .slot_name = try alloc.dupe(u8, slot_name),
+        .publication_name = try alloc.dupe(u8, publication_name),
+        .reclaim_exact_cutover_slot = true,
+        .exact_cutover_intent = .{
+            .ptr = &persist_calls,
+            .persist_fn = DeniedIntent.persist,
+        },
+    };
+    defer begin_params.deinit(alloc);
+    try std.testing.expectError(
+        error.TestAuthorityDenied,
+        executor.asQueryExecutor().beginPreparedReplicationSnapshot(
+            alloc,
+            dsn,
+            begin_params,
+            platform_time.monotonicNs() + 30 * std.time.ns_per_s,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), persist_calls);
+    try std.testing.expect(try executor.logicalReplicationSlotExistsAlloc(
+        alloc,
+        conn,
+        slot_name,
+        platform_time.monotonicNs() + 30 * std.time.ns_per_s,
+    ));
+
+    const publication_query = try std.fmt.allocPrint(
+        alloc,
+        "select 1 from pg_publication where pubname = '{s}'",
+        .{publication_name},
+    );
+    defer alloc.free(publication_query);
+    const publication_result = try executor.execSimple(conn, alloc, publication_query);
+    defer executor.pqclear(publication_result);
+    try std.testing.expectEqual(@as(c_int, 0), executor.pqntuples(publication_result));
 }
 
 test "postgres libpq poll resumes from durable checkpoint across multiple transactions" {

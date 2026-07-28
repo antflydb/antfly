@@ -1113,6 +1113,125 @@ fn cloneProjectedReplicationSourceStatusesOwned(
     return out;
 }
 
+fn replicationCutoverIntentApplied(
+    record: metadata_table_manager.ReplicationSourceStatusRecord,
+    expected: metadata_table_manager.ReplicationSourceStatusRecord,
+) bool {
+    return record.table_id == expected.table_id and
+        record.source_ordinal == expected.source_ordinal and
+        record.cutover_intent_id == expected.cutover_intent_id and
+        record.cutover_authority_id == expected.cutover_authority_id and
+        std.mem.eql(
+            u8,
+            &record.cutover_config_fingerprint,
+            &expected.cutover_config_fingerprint,
+        ) and
+        std.mem.eql(
+            u8,
+            &record.cutover_provider_identity,
+            &expected.cutover_provider_identity,
+        ) and
+        std.mem.eql(u8, record.source_kind, expected.source_kind) and
+        std.mem.eql(u8, record.external_table, expected.external_table) and
+        std.mem.eql(u8, record.cutover_mode, expected.cutover_mode) and
+        std.mem.eql(u8, record.slot_name, expected.slot_name) and
+        std.mem.eql(u8, record.publication_name, expected.publication_name) and
+        std.mem.eql(u8, record.phase, expected.phase);
+}
+
+fn isExpectedCdcRoundError(err: anyerror) bool {
+    return switch (err) {
+        error.UnknownReplicationSource,
+        error.UnsupportedReplicationSource,
+        error.UnsupportedReplicationStreaming,
+        error.UnsupportedReplicationTransform,
+        error.UnsupportedReplicationRoute,
+        error.ReplicationExactCutoverRequired,
+        error.InvalidReplicationSourceConfig,
+        error.InvalidReplicationSourceRow,
+        error.LibpqUnavailable,
+        error.ForeignAuthFailed,
+        error.ForeignConnectionFailed,
+        error.ForeignConnectionPoolLimitExceeded,
+        error.ForeignColumnCacheLimitExceeded,
+        error.ForeignQueryFailed,
+        error.ForeignProviderIdentityMismatch,
+        error.ExactCutoverProviderIdentityMismatch,
+        error.ForeignReplicationSlotMissing,
+        error.ForeignTableNotFound,
+        error.ExactCutoverCleanupPending,
+        error.MetadataMutationApplyTimeout,
+        error.Timeout,
+        error.FileNotFound,
+        error.InvalidQueryRequest,
+        error.WriterLocked,
+        error.LmdbUnexpected,
+        error.Corrupted,
+        error.UnknownColumn,
+        => true,
+        else => false,
+    };
+}
+
+test "metadata durable cutover acknowledgement is attempt scoped" {
+    const fingerprint = [_]u8{0x5a} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const expected = metadata_table_manager.ReplicationSourceStatusRecord{
+        .table_id = 41,
+        .source_ordinal = 2,
+        .source_kind = "postgres",
+        .external_table = "public.docs",
+        .cutover_mode = "exported_snapshot_pending",
+        .slot_name = "antfly_docs",
+        .publication_name = "antfly_docs_pub",
+        .phase = "cutover_preparing",
+        .cutover_intent_id = 99,
+        .cutover_authority_id = 1001,
+        .cutover_config_fingerprint = fingerprint,
+        .cutover_provider_identity = [_]u8{0x6b} ** std.crypto.hash.sha2.Sha256.digest_length,
+    };
+    try std.testing.expect(replicationCutoverIntentApplied(expected, expected));
+
+    var stale_attempt = expected;
+    stale_attempt.cutover_intent_id = 98;
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_attempt, expected));
+
+    var stale_authority = expected;
+    stale_authority.cutover_authority_id = 1000;
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_authority, expected));
+
+    var stale_provider = expected;
+    stale_provider.cutover_provider_identity[0] ^= 0xff;
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_provider, expected));
+
+    var stale_config = expected;
+    stale_config.cutover_config_fingerprint[0] ^= 0xff;
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_config, expected));
+
+    var overwritten_phase = expected;
+    overwritten_phase.phase = "failed";
+    try std.testing.expect(!replicationCutoverIntentApplied(overwritten_phase, expected));
+}
+
+test "metadata CDC round error policy isolates expected recovery failures" {
+    const expected_errors = [_]anyerror{
+        error.ExactCutoverCleanupPending,
+        error.MetadataMutationApplyTimeout,
+        error.Timeout,
+        error.ForeignConnectionPoolLimitExceeded,
+        error.ForeignColumnCacheLimitExceeded,
+        error.ForeignConnectionFailed,
+        error.ForeignQueryFailed,
+        error.ForeignProviderIdentityMismatch,
+        error.ExactCutoverProviderIdentityMismatch,
+    };
+    for (expected_errors) |err| try std.testing.expect(isExpectedCdcRoundError(err));
+
+    // Process-health and authority failures remain visible to the lifecycle
+    // owner instead of being mistaken for a source-local retry.
+    try std.testing.expect(!isExpectedCdcRoundError(error.OutOfMemory));
+    try std.testing.expect(!isExpectedCdcRoundError(error.NotLeader));
+}
+
 fn cloneProjectedMergeTransitionsOwned(
     alloc: std.mem.Allocator,
     records: []const transition_state.MergeTransitionRecord,
@@ -1661,6 +1780,40 @@ pub const MetadataService = struct {
 
     pub fn upsertReplicationSourceStatus(self: *MetadataService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
+    }
+
+    /// Persists exact-cutover ownership and fresh authority and does not return
+    /// until this provider attempt is visible in the applied Raft projection.
+    pub fn upsertReplicationSourceStatusDurable(self: *MetadataService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+        if (record.cutover_intent_id == 0 or
+            record.cutover_authority_id == 0 or
+            std.mem.allEqual(u8, &record.cutover_provider_identity, 0))
+            return error.InvalidReplicationCutoverIntent;
+        try self.upsertReplicationSourceStatus(record);
+
+        const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            if (try store.getReplicationSourceStatus(
+                self.alloc,
+                self.metadata_group_id,
+                record.table_id,
+                record.source_ordinal,
+            )) |applied_record| {
+                defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, applied_record);
+                if (replicationCutoverIntentApplied(applied_record, record)) return;
+            }
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                try self.raft.runRaftRoundOnly();
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn removeReplicationSourceStatus(self: *MetadataService, table_id: u64, source_ordinal: u32) !void {
@@ -2629,32 +2782,10 @@ pub const MetadataService = struct {
                 .secret_store = self.secret_store,
             },
         };
-        const summary = coordinator.runRound(self) catch |err| switch (err) {
-            error.UnknownReplicationSource,
-            error.UnsupportedReplicationSource,
-            error.UnsupportedReplicationStreaming,
-            error.UnsupportedReplicationTransform,
-            error.UnsupportedReplicationRoute,
-            error.ReplicationExactCutoverRequired,
-            error.InvalidReplicationSourceConfig,
-            error.InvalidReplicationSourceRow,
-            error.LibpqUnavailable,
-            error.ForeignAuthFailed,
-            error.ForeignConnectionFailed,
-            error.ForeignQueryFailed,
-            error.ForeignReplicationSlotMissing,
-            error.ForeignTableNotFound,
-            error.FileNotFound,
-            error.InvalidQueryRequest,
-            error.WriterLocked,
-            error.LmdbUnexpected,
-            error.Corrupted,
-            error.UnknownColumn,
-            => {
-                std.log.warn("metadata cdc snapshot round skipped: {s}", .{@errorName(err)});
-                return;
-            },
-            else => return err,
+        const summary = coordinator.runRound(self) catch |err| {
+            if (!isExpectedCdcRoundError(err)) return err;
+            std.log.warn("metadata cdc snapshot round skipped: {s}", .{@errorName(err)});
+            return;
         };
         if (summary.sources_considered > 0) {
             std.log.info(
@@ -2677,32 +2808,10 @@ pub const MetadataService = struct {
                 .secret_store = self.secret_store,
             },
         };
-        const stream_summary = streaming.runRound(self) catch |err| switch (err) {
-            error.UnknownReplicationSource,
-            error.UnsupportedReplicationSource,
-            error.UnsupportedReplicationStreaming,
-            error.UnsupportedReplicationTransform,
-            error.UnsupportedReplicationRoute,
-            error.ReplicationExactCutoverRequired,
-            error.InvalidReplicationSourceConfig,
-            error.InvalidReplicationSourceRow,
-            error.LibpqUnavailable,
-            error.ForeignAuthFailed,
-            error.ForeignConnectionFailed,
-            error.ForeignQueryFailed,
-            error.ForeignReplicationSlotMissing,
-            error.ForeignTableNotFound,
-            error.FileNotFound,
-            error.InvalidQueryRequest,
-            error.WriterLocked,
-            error.LmdbUnexpected,
-            error.Corrupted,
-            error.UnknownColumn,
-            => {
-                std.log.warn("metadata cdc streaming round skipped: {s}", .{@errorName(err)});
-                return;
-            },
-            else => return err,
+        const stream_summary = streaming.runRound(self) catch |err| {
+            if (!isExpectedCdcRoundError(err)) return err;
+            std.log.warn("metadata cdc streaming round skipped: {s}", .{@errorName(err)});
+            return;
         };
         if (stream_summary.sources_considered > 0) {
             std.log.info(
@@ -3152,6 +3261,44 @@ pub const MetadataHttpService = struct {
 
     pub fn upsertReplicationSourceStatus(self: *MetadataHttpService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
+    }
+
+    /// Persists exact-cutover ownership and fresh authority and does not return
+    /// until this provider attempt is visible in the applied Raft projection.
+    pub fn upsertReplicationSourceStatusDurable(self: *MetadataHttpService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+        if (record.cutover_intent_id == 0 or
+            record.cutover_authority_id == 0 or
+            std.mem.allEqual(u8, &record.cutover_provider_identity, 0))
+            return error.InvalidReplicationCutoverIntent;
+        try self.upsertReplicationSourceStatus(record);
+
+        const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            if (try store.getReplicationSourceStatus(
+                self.alloc,
+                self.metadata_group_id,
+                record.table_id,
+                record.source_ordinal,
+            )) |applied_record| {
+                defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, applied_record);
+                if (replicationCutoverIntentApplied(applied_record, record)) return;
+            }
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                if (self.raft.pending_updates.items.len > 0) {
+                    _ = try self.raft.syncPendingRaftOnly();
+                } else {
+                    try self.raft.runRaftRoundOnly();
+                }
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn removeReplicationSourceStatus(self: *MetadataHttpService, table_id: u64, source_ordinal: u32) !void {
@@ -4812,35 +4959,13 @@ pub const MetadataHttpService = struct {
                 .secret_store = self.secret_store,
             },
         };
-        const summary = coordinator.runRound(self) catch |err| switch (err) {
-            error.UnknownReplicationSource,
-            error.UnsupportedReplicationSource,
-            error.UnsupportedReplicationStreaming,
-            error.UnsupportedReplicationTransform,
-            error.UnsupportedReplicationRoute,
-            error.ReplicationExactCutoverRequired,
-            error.InvalidReplicationSourceConfig,
-            error.InvalidReplicationSourceRow,
-            error.LibpqUnavailable,
-            error.ForeignAuthFailed,
-            error.ForeignConnectionFailed,
-            error.ForeignQueryFailed,
-            error.ForeignReplicationSlotMissing,
-            error.ForeignTableNotFound,
-            error.FileNotFound,
-            error.InvalidQueryRequest,
-            error.WriterLocked,
-            error.LmdbUnexpected,
-            error.Corrupted,
-            error.UnknownColumn,
-            => {
-                if (comptime builtin.is_test) {
-                    std.debug.print("metadata http cdc snapshot round skipped: {s}\n", .{@errorName(err)});
-                }
-                std.log.warn("metadata http cdc snapshot round skipped: {s}", .{@errorName(err)});
-                return;
-            },
-            else => return err,
+        const summary = coordinator.runRound(self) catch |err| {
+            if (!isExpectedCdcRoundError(err)) return err;
+            if (comptime builtin.is_test) {
+                std.debug.print("metadata http cdc snapshot round skipped: {s}\n", .{@errorName(err)});
+            }
+            std.log.warn("metadata http cdc snapshot round skipped: {s}", .{@errorName(err)});
+            return;
         };
         if (summary.sources_considered > 0) {
             std.log.info(
@@ -4863,32 +4988,10 @@ pub const MetadataHttpService = struct {
                 .secret_store = self.secret_store,
             },
         };
-        const stream_summary = streaming.runRound(self) catch |err| switch (err) {
-            error.UnknownReplicationSource,
-            error.UnsupportedReplicationSource,
-            error.UnsupportedReplicationStreaming,
-            error.UnsupportedReplicationTransform,
-            error.UnsupportedReplicationRoute,
-            error.ReplicationExactCutoverRequired,
-            error.InvalidReplicationSourceConfig,
-            error.InvalidReplicationSourceRow,
-            error.LibpqUnavailable,
-            error.ForeignAuthFailed,
-            error.ForeignConnectionFailed,
-            error.ForeignQueryFailed,
-            error.ForeignReplicationSlotMissing,
-            error.ForeignTableNotFound,
-            error.FileNotFound,
-            error.InvalidQueryRequest,
-            error.WriterLocked,
-            error.LmdbUnexpected,
-            error.Corrupted,
-            error.UnknownColumn,
-            => {
-                std.log.warn("metadata http cdc streaming round skipped: {s}", .{@errorName(err)});
-                return;
-            },
-            else => return err,
+        const stream_summary = streaming.runRound(self) catch |err| {
+            if (!isExpectedCdcRoundError(err)) return err;
+            std.log.warn("metadata http cdc streaming round skipped: {s}", .{@errorName(err)});
+            return;
         };
         if (stream_summary.sources_considered > 0) {
             std.log.info(
@@ -5130,6 +5233,11 @@ fn syncLocalStoreStatus(
     const merge_transitions = admin_snapshot.merge_transitions;
     const split_observations = admin_snapshot.split_observations;
     const merge_observations = admin_snapshot.merge_observations;
+    const backend_runtime = try service.ensureBackendRuntime();
+    const status_io = backend_runtime.io() orelse if (builtin.is_test)
+        std.testing.io
+    else
+        return error.BackendIoUnavailable;
 
     var local_stores = std.ArrayListUnmanaged(metadata_table_manager.StoreRecord).empty;
     defer local_stores.deinit(service.alloc);
@@ -5142,6 +5250,9 @@ fn syncLocalStoreStatus(
     const group_statuses = try collectLocalGroupStatusReportsWithProvider(
         service,
         service.alloc,
+        backend_runtime,
+        status_io,
+        local_node_id,
         replica_root_dir,
         tables,
         ranges,
@@ -5173,6 +5284,7 @@ fn syncLocalStoreStatus(
     const reports = try collectExplicitLocalStoreStatusReports(
         service,
         service.alloc,
+        status_io,
         replica_root_dir,
         local_stores.items,
         ranges,
@@ -5189,6 +5301,7 @@ fn syncLocalStoreStatus(
     const shared_reports = try collectSharedRootLocalStoreStatusReports(
         service,
         service.alloc,
+        status_io,
         replica_root_dir,
         local_node_id,
         local_stores.items,
@@ -5228,15 +5341,13 @@ fn reportStoreStatusesWithProjected(
 fn collectExplicitLocalStoreStatusReports(
     service: anytype,
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     stores: []const metadata_table_manager.StoreRecord,
     ranges: []const metadata_table_manager.RangeRecord,
     group_statuses: []const metadata_table_manager.GroupStatusReport,
     backfill_markers: []const StoreStatusBackfillMarker,
 ) ![]metadata_table_manager.StoreStatusReport {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
     var reports = std.ArrayListUnmanaged(metadata_table_manager.StoreStatusReport).empty;
     errdefer reports.deinit(alloc);
 
@@ -5244,14 +5355,14 @@ fn collectExplicitLocalStoreStatusReports(
         const store_root = try std.fmt.allocPrint(alloc, "{s}/store-{d}", .{ replica_root_dir, store.store_id });
         defer alloc.free(store_root);
 
-        var dir = openDirPath(io_impl.io(), store_root, false) catch |err| switch (err) {
+        var dir = openDirPath(io, store_root, false) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => {
                 reports.deinit(alloc);
                 return try alloc.alloc(metadata_table_manager.StoreStatusReport, 0);
             },
             else => return err,
         };
-        dir.close(io_impl.io());
+        dir.close(io);
 
         try reports.append(alloc, try collectLocalStoreStatusReport(
             service,
@@ -5317,6 +5428,7 @@ fn collectLocalStoreStatusReport(
 fn collectSharedRootLocalStoreStatusReports(
     service: anytype,
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     local_node_id: u64,
     stores: []const metadata_table_manager.StoreRecord,
@@ -5353,7 +5465,7 @@ fn collectSharedRootLocalStoreStatusReports(
     for (backfill_markers) |marker| {
         if (marker.store_id != null) continue;
         const range = findRangeByGroupId(ranges, marker.group_id) orelse continue;
-        const store_id = try resolveSharedRootStoreAffinity(alloc, replica_root_dir, local_node_id, marker.group_id, stores, placements, tables, range);
+        const store_id = try resolveSharedRootStoreAffinity(alloc, io, replica_root_dir, local_node_id, marker.group_id, stores, placements, tables, range);
         const report_index = findStoreStatusReportIndex(reports, store_id) orelse continue;
         try accumulateStoreStatusBackfillProgress(
             alloc,
@@ -5390,6 +5502,9 @@ fn shouldRefreshLocalStoreStatusForLifecycleRound(service: anytype, backfill_mar
 fn collectLocalGroupStatusReportsWithProvider(
     service: anytype,
     alloc: std.mem.Allocator,
+    backend_runtime: *backend_runtime_mod.BackendRuntime,
+    io: std.Io,
+    local_node_id: u64,
     replica_root_dir: []const u8,
     tables: []const metadata_table_manager.TableRecord,
     ranges: []const metadata_table_manager.RangeRecord,
@@ -5420,6 +5535,9 @@ fn collectLocalGroupStatusReportsWithProvider(
     return try collectLocalGroupStatusReports(
         service,
         alloc,
+        backend_runtime,
+        io,
+        local_node_id,
         replica_root_dir,
         tables,
         ranges,
@@ -5435,6 +5553,9 @@ fn collectLocalGroupStatusReportsWithProvider(
 fn collectLocalGroupStatusReports(
     service: anytype,
     alloc: std.mem.Allocator,
+    backend_runtime: *backend_runtime_mod.BackendRuntime,
+    io: std.Io,
+    local_node_id: u64,
     replica_root_dir: []const u8,
     tables: []const metadata_table_manager.TableRecord,
     ranges: []const metadata_table_manager.RangeRecord,
@@ -5456,28 +5577,51 @@ fn collectLocalGroupStatusReports(
         const db_path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ replica_root_dir, range.group_id });
         defer alloc.free(db_path);
 
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        _ = statFilePath(io_impl.io(), db_path) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
+        const path_present = present: {
+            _ = statFilePath(io, db_path) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => break :present false,
+                else => return err,
+            };
+            break :present true;
         };
 
-        const group_status = try collectLocalGroupStatusReport(
-            service,
-            alloc,
-            db_path,
-            replica_root_dir,
-            range.group_id,
-            stores,
-            merged_group_statuses,
-            split_transitions,
-            merge_transitions,
-            split_observations,
-            merge_observations,
-        );
-        errdefer metadata_table_manager.freeGroupStatus(alloc, group_status);
-        try reports.append(alloc, group_status);
+        const group_status = if (path_present)
+            try collectLocalGroupStatusReport(
+                service,
+                alloc,
+                backend_runtime,
+                io,
+                db_path,
+                replica_root_dir,
+                range.group_id,
+                stores,
+                merged_group_statuses,
+                split_transitions,
+                merge_transitions,
+                split_observations,
+                merge_observations,
+            )
+        else
+            null;
+        if (group_status) |status| {
+            errdefer metadata_table_manager.freeGroupStatus(alloc, status);
+            try reports.append(alloc, status);
+        } else if (latestLocalGroupStatus(stores, local_node_id, range.group_id)) |previous| {
+            var preserved = previous;
+            const readiness = transition_state.readinessForGroupWithObservations(
+                range.group_id,
+                split_transitions,
+                merge_transitions,
+                split_observations,
+                merge_observations,
+            );
+            preserved.transition_pending = readiness.transition_pending;
+            preserved.replay_required = readiness.replay_required;
+            preserved.replay_caught_up = readiness.replay_caught_up;
+            preserved.cutover_ready = readiness.cutover_ready;
+            preserved.reads_ready_after_cutover = readiness.reads_ready_after_cutover;
+            try reports.append(alloc, preserved);
+        }
     }
 
     return try reports.toOwnedSlice(alloc);
@@ -5486,6 +5630,8 @@ fn collectLocalGroupStatusReports(
 fn collectLocalGroupStatusReport(
     service: anytype,
     alloc: std.mem.Allocator,
+    backend_runtime: *backend_runtime_mod.BackendRuntime,
+    io: std.Io,
     db_path: []const u8,
     replica_root_dir: ?[]const u8,
     group_id: u64,
@@ -5495,10 +5641,10 @@ fn collectLocalGroupStatusReport(
     merge_transitions: []const transition_state.MergeTransitionRecord,
     split_observations: []const transition_state.SplitObservationRecord,
     merge_observations: []const transition_state.MergeObservationRecord,
-) !metadata_table_manager.GroupStatusReport {
+) !?metadata_table_manager.GroupStatusReport {
     _ = stores;
     _ = merged_group_statuses;
-    var db = try db_mod.DB.open(alloc, db_path, .{
+    var db = db_mod.DB.open(alloc, db_path, .{
         // This path is only a fallback when no local data-runtime provider is
         // installed. Group status needs primary identity count and filesystem
         // size, never query execution. Catalog-only mode avoids mmap/open of
@@ -5508,7 +5654,11 @@ fn collectLocalGroupStatusReport(
         .ttl_cleanup = .{ .enabled = false },
         .transaction_recovery = .{ .enabled = false },
         .text_merge = .{ .enabled = false },
-    });
+        .backend_runtime = backend_runtime,
+    }) catch |err| switch (err) {
+        error.GenerationTransitionActive, error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
     defer db.close();
 
     const stats = try db.stats(alloc);
@@ -5519,6 +5669,7 @@ fn collectLocalGroupStatusReport(
     const readiness = if (replica_root_dir) |root_dir|
         try transition_state.readinessForLocalGroup(
             alloc,
+            io,
             root_dir,
             group_id,
             split_transitions,
@@ -5533,7 +5684,7 @@ fn collectLocalGroupStatusReport(
     return .{
         .group_id = group_id,
         .doc_count = stats.doc_count,
-        .disk_bytes = try directoryUsageBytes(alloc, db_path),
+        .disk_bytes = try directoryUsageBytes(alloc, io, db_path),
         .empty = stats.doc_count == 0,
         .created_at_millis = created_at_millis,
         .updated_at_millis = now_realtime_ms,
@@ -5551,6 +5702,126 @@ fn collectLocalGroupStatusReport(
         .cutover_ready = readiness.cutover_ready,
         .reads_ready_after_cutover = readiness.reads_ready_after_cutover,
     };
+}
+
+fn latestLocalGroupStatus(
+    stores: []const metadata_table_manager.StoreRecord,
+    local_node_id: u64,
+    group_id: u64,
+) ?metadata_table_manager.GroupStatusReport {
+    var latest: ?metadata_table_manager.GroupStatusReport = null;
+    for (stores) |store| {
+        if (store.node_id != local_node_id) continue;
+        for (store.group_statuses) |status| {
+            if (status.group_id != group_id) continue;
+            if (latest == null or
+                status.raft_term > latest.?.raft_term or
+                (status.raft_term == latest.?.raft_term and
+                    status.raft_applied_index > latest.?.raft_applied_index) or
+                (status.raft_term == latest.?.raft_term and
+                    status.raft_applied_index == latest.?.raft_applied_index and
+                    status.updated_at_millis > latest.?.updated_at_millis))
+            {
+                latest = status;
+            }
+        }
+    }
+    return latest;
+}
+
+test "metadata service status preserves the last observation during a generation transition" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/status-generation-transition",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root);
+    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root});
+    defer alloc.free(db_path);
+    try fs_paths.createDirPathPortable(std.testing.io, db_path);
+
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusive(db_path);
+    defer transition.deinit();
+
+    const tables = [_]metadata_table_manager.TableRecord{
+        .{ .table_id = 7, .name = "docs" },
+    };
+    const ranges = [_]metadata_table_manager.RangeRecord{
+        .{ .group_id = 77, .range_id = 77, .table_id = 7, .start_key = "" },
+    };
+    var previous_statuses = [_]metadata_table_manager.GroupStatusReport{.{
+        .group_id = 77,
+        .doc_count = 42,
+        .disk_bytes = 4096,
+        .disk_bytes_known = true,
+        .empty = false,
+        .updated_at_millis = 1234,
+        .local_leader = true,
+        .local_voter = true,
+        .voter_count = 1,
+    }};
+    var stores = [_]metadata_table_manager.StoreRecord{.{
+        .store_id = 1,
+        .node_id = 1,
+        .group_statuses = &previous_statuses,
+    }};
+    const splits = [_]transition_state.SplitTransitionRecord{.{
+        .transition_id = 7001,
+        .attempt_epoch = 1,
+        .source_group_id = 77,
+        .destination_group_id = 78,
+        .phase = .prepare,
+    }};
+    const split_observations = [_]transition_state.SplitObservationRecord{.{
+        .transition_id = 7001,
+        .observation = .{
+            .status = .{
+                .phase = .cutover_ready,
+                .source_split_phase = .splitting,
+                .bootstrapped = true,
+                .replay_required = true,
+                .replay_caught_up = true,
+                .cutover_ready = true,
+                .destination_ready_for_reads = true,
+                .source_delta_sequence = 5,
+                .dest_delta_sequence = 5,
+            },
+        },
+    }};
+    var fake_service: struct {} = .{};
+
+    const reports = try collectLocalGroupStatusReports(
+        &fake_service,
+        alloc,
+        runtime.ptr(),
+        runtime.ptr().io().?,
+        1,
+        replica_root,
+        &tables,
+        &ranges,
+        &stores,
+        &.{},
+        &splits,
+        &.{},
+        &split_observations,
+        &.{},
+    );
+    defer metadata_table_manager.freeGroupStatuses(alloc, reports);
+
+    try std.testing.expectEqual(@as(usize, 1), reports.len);
+    try std.testing.expectEqual(@as(u64, 42), reports[0].doc_count);
+    try std.testing.expectEqual(@as(u64, 1234), reports[0].updated_at_millis);
+    try std.testing.expect(reports[0].transition_pending);
+    try std.testing.expect(reports[0].replay_required);
+    try std.testing.expect(reports[0].replay_caught_up);
+    try std.testing.expect(reports[0].cutover_ready);
+    try std.testing.expect(reports[0].reads_ready_after_cutover);
 }
 
 const ServiceGroupRaftObservation = struct {
@@ -5707,21 +5978,19 @@ fn serviceGroupMembership(service: anytype, group_id: u64) ServiceGroupMembershi
     return .{};
 }
 
-fn directoryUsageBytes(alloc: std.mem.Allocator, path: []const u8) !u64 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    var dir = openDirPath(io_impl.io(), path, true) catch |err| switch (err) {
+fn directoryUsageBytes(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !u64 {
+    var dir = openDirPath(io, path, true) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
-    defer dir.close(io_impl.io());
+    defer dir.close(io);
 
     var total: u64 = 0;
     var walker = try dir.walk(alloc);
     defer walker.deinit();
-    while (try walker.next(io_impl.io())) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        const stat = try dir.statFile(io_impl.io(), entry.path, .{});
+        const stat = try dir.statFile(io, entry.path, .{});
         total += stat.size;
     }
     return total;
@@ -5999,6 +6268,7 @@ fn freeOwnedStoreStatusReports(alloc: std.mem.Allocator, reports: []const metada
 
 fn resolveSharedRootStoreAffinity(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     local_node_id: u64,
     group_id: u64,
@@ -6008,29 +6278,28 @@ fn resolveSharedRootStoreAffinity(
     range: metadata_table_manager.RangeRecord,
 ) !u64 {
     if (findPlacementIntentStoreId(placements, group_id, local_node_id, stores)) |store_id| {
-        try writeStoreAffinityFile(alloc, replica_root_dir, group_id, store_id);
+        try writeStoreAffinityFile(alloc, io, replica_root_dir, group_id, store_id);
         return store_id;
     }
-    const existing = try readStoreAffinityFile(alloc, replica_root_dir, group_id);
+    const existing = try readStoreAffinityFile(alloc, io, replica_root_dir, group_id);
     if (existing) |store_id| {
         if (findProjectedStore(stores, store_id) != null) return store_id;
     }
 
     const assigned = try assignSharedRootStoreAffinity(alloc, stores, tables, range);
-    try writeStoreAffinityFile(alloc, replica_root_dir, group_id, assigned);
+    try writeStoreAffinityFile(alloc, io, replica_root_dir, group_id, assigned);
     return assigned;
 }
 
 fn readStoreAffinityFile(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     group_id: u64,
 ) !?u64 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
     const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/store-affinity", .{ replica_root_dir, group_id });
     defer alloc.free(path);
-    const contents = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(128)) catch |err| switch (err) {
+    const contents = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(128)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -6042,21 +6311,20 @@ fn readStoreAffinityFile(
 
 fn writeStoreAffinityFile(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     group_id: u64,
     store_id: u64,
 ) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
     const dir_path = try std.fmt.allocPrint(alloc, "{s}/group-{d}", .{ replica_root_dir, group_id });
     defer alloc.free(dir_path);
-    try fs_paths.createDirPathPortable(io_impl.io(), dir_path);
+    try fs_paths.createDirPathPortable(io, dir_path);
     const path = try std.fmt.allocPrint(alloc, "{s}/store-affinity", .{dir_path});
     defer alloc.free(path);
-    var file = try std.Io.Dir.cwd().createFile(io_impl.io(), path, .{ .truncate = true });
-    defer file.close(io_impl.io());
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
     var buf: [64]u8 = undefined;
-    var writer = file.writer(io_impl.io(), &buf);
+    var writer = file.writer(io, &buf);
     try writer.interface.print("{d}\n", .{store_id});
     try writer.end();
 }
@@ -7295,9 +7563,12 @@ test "metadata service proposes split transitions into the metadata group" {
     try svc.upsertTable(.{ .table_id = 20, .name = "docs" });
     try svc.upsertRange(.{
         .group_id = 2001,
+        .range_id = 2001,
         .table_id = 20,
         .start_key = "",
         .end_key = "doc:z",
+        .doc_identity_shard_id = 2001,
+        .doc_identity_range_id = 2001,
         .split_attempt_epoch = 1,
     });
     try svc.upsertSplitTransition(.{
@@ -7308,6 +7579,13 @@ test "metadata service proposes split transitions into the metadata group" {
         .phase = .prepare,
         .split_key = "doc:m",
         .source_range_end = "doc:z",
+        .table_contract = .{
+            .table_id = 20,
+            .table_name = "docs",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 2001, .range_id = 2001 },
+            .target_identity = .{ .shard_id = 2001, .range_id = 2001 },
+        },
     });
 
     try runServiceRounds(&svc, 8);
@@ -7643,15 +7921,21 @@ test "metadata service can apply reconciliation plan proposals" {
     try manager.upsertTable(.{ .table_id = 10, .name = "docs" });
     try manager.upsertRange(.{
         .group_id = 2101,
+        .range_id = 2101,
         .table_id = 10,
         .start_key = "doc:a",
         .end_key = "doc:m",
+        .doc_identity_shard_id = 2101,
+        .doc_identity_range_id = 2101,
     });
     try manager.upsertRange(.{
         .group_id = 2102,
+        .range_id = 2102,
         .table_id = 10,
         .start_key = "doc:m",
         .end_key = "doc:z",
+        .doc_identity_shard_id = 2102,
+        .doc_identity_range_id = 2102,
     });
     try manager.requestSplit(.{
         .transition_id = 9101,
@@ -7666,6 +7950,20 @@ test "metadata service can apply reconciliation plan proposals" {
     defer plan.deinit(std.testing.allocator);
 
     try svc.applyReconciliationPlan(&plan);
+    try runServiceRounds(&svc, 8);
+
+    const projected_tables = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, projected_tables);
+    const projected_ranges = try svc.listProjectedRanges(std.testing.allocator);
+    defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
+
+    var admission_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = projected_tables,
+        .ranges = projected_ranges,
+    });
+    defer admission_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), admission_plan.split_admissions.len);
+    try svc.applyReconciliationPlan(&admission_plan);
     try runServiceRounds(&svc, 8);
 
     const split_records = try svc.listProjectedSplitTransitions(std.testing.allocator);
@@ -9207,6 +9505,7 @@ test "metadata service shared-root reports survive transient rebuild marker remo
     const projected = try collectSharedRootLocalStoreStatusReports(
         .{},
         std.testing.allocator,
+        std.testing.io,
         replica_root,
         1,
         stores[0..],
@@ -9770,6 +10069,7 @@ test "metadata service prefers planned store affinity in shared roots" {
     const projected = try collectSharedRootLocalStoreStatusReports(
         .{},
         std.testing.allocator,
+        std.testing.io,
         replica_root,
         1,
         stores[0..],

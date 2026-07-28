@@ -106,7 +106,7 @@ const transient_embed_retry_max_attempts: u32 = 6;
 const transient_embed_retry_base_sleep_ns: u64 = 250 * std.time.ns_per_ms;
 const transient_embed_retry_max_sleep_ns: u64 = 5 * std.time.ns_per_s;
 const transient_worker_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
-const lease_denied_retry_sleep_ms: i64 = 25;
+const lease_denied_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
 
 const CoverageOutcome = enum { produced, skipped, terminal_failed };
 const coverage_outcome_count = std.meta.fields(CoverageOutcome).len;
@@ -1854,7 +1854,14 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
     };
     runtime.mutex.unlock(io);
     if (!acquired) {
-        io.sleep(Io.Duration.fromMilliseconds(lease_denied_retry_sleep_ms), .awake) catch {};
+        // A live lease held by another owner can remain valid for the full
+        // 30-second TTL. Pace denial retries so failover does not monopolize a
+        // core or hammer the durable lease record while still reacting quickly
+        // after expiry.
+        io.sleep(
+            Io.Duration.fromMilliseconds(@intCast(lease_denied_retry_sleep_ns / std.time.ns_per_ms)),
+            .awake,
+        ) catch {};
         return;
     }
 

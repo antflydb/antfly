@@ -413,14 +413,30 @@ pub const Reconciler = struct {
         }
         for (desired_ranges) |desired| {
             const existing = findRangeRecord(current.ranges, desired.group_id);
-            if (existing == null or !rangeRecordsEqual(existing.?, desired)) {
-                if (active_transition_contracts.rangeMutationFenced(desired.group_id) or
-                    (existing != null and
-                        active_transition_contracts.rangeMutationFenced(existing.?.group_id)))
-                {
+            if (active_transition_contracts.rangeMutationFenced(desired.group_id) or
+                (existing != null and
+                    active_transition_contracts.rangeMutationFenced(existing.?.group_id)))
+            {
+                continue;
+            }
+
+            switch (splitRangePublication(current, desired_splits, desired)) {
+                .publish_epoch => |published_epoch| {
+                    var publishable = desired;
+                    publishable.split_attempt_epoch = published_epoch;
+                    if (existing == null or !rangeRecordsEqual(existing.?, publishable)) {
+                        try range_upserts.ensureUnusedCapacity(self.alloc, 1);
+                        range_upserts.appendAssumeCapacity(
+                            try table_manager.cloneRange(self.alloc, publishable),
+                        );
+                    }
                     continue;
-                }
-                if (rangeEpochPublishedBySplitAdmission(current, desired_splits, desired)) continue;
+                },
+                .blocked => continue,
+                .none => {},
+            }
+
+            if (existing == null or !rangeRecordsEqual(existing.?, desired)) {
                 try range_upserts.ensureUnusedCapacity(self.alloc, 1);
                 range_upserts.appendAssumeCapacity(
                     try table_manager.cloneRange(self.alloc, desired),
@@ -440,18 +456,13 @@ pub const Reconciler = struct {
                     desired.table_contract,
                 )) continue;
                 if (!splitTransitionDocIdentityCompatibleIndexed(current, &evidence, desired)) continue;
-                if (splitAdmissionExpectedEpoch(current, desired)) |expected_source_epoch| {
+                if (splitAdmissionExpectedEpoch(current, desired_ranges, desired)) |expected_source_epoch| {
                     try split_admissions.ensureUnusedCapacity(self.alloc, 1);
                     split_admissions.appendAssumeCapacity(.{
                         .expected_source_epoch = expected_source_epoch,
                         .record = try cloneSplitRecord(self.alloc, desired),
                     });
-                    continue;
                 }
-                try split_upserts.ensureUnusedCapacity(self.alloc, 1);
-                split_upserts.appendAssumeCapacity(
-                    try cloneSplitRecord(self.alloc, desired),
-                );
                 continue;
             }
 
@@ -3460,33 +3471,56 @@ fn findRangeRecord(records: []const table_manager.RangeRecord, group_id: u64) ?t
     return null;
 }
 
-fn splitAdmissionExpectedEpoch(current: CurrentMetadataState, split: transition_state.SplitTransitionRecord) ?u64 {
+fn splitAdmissionExpectedEpoch(
+    current: CurrentMetadataState,
+    desired_ranges: []const table_manager.RangeRecord,
+    split: transition_state.SplitTransitionRecord,
+) ?u64 {
     if (split.phase != .prepare or split.attempt_epoch == 0 or split.split_key == null) return null;
     const source = findRangeRecord(current.ranges, split.source_group_id) orelse return null;
+    const desired_source = findRangeRecord(desired_ranges, split.source_group_id) orelse return null;
     if (source.split_attempt_epoch == std.math.maxInt(u64) or
         split.attempt_epoch != source.split_attempt_epoch + 1 or
         !optionalBytesEqual(source.end_key, split.source_range_end))
     {
         return null;
     }
+    var publishable_source = desired_source;
+    publishable_source.split_attempt_epoch = source.split_attempt_epoch;
+    if (!rangeRecordsEqual(source, publishable_source)) return null;
     return source.split_attempt_epoch;
 }
 
-fn rangeEpochPublishedBySplitAdmission(
+const SplitRangePublication = union(enum) {
+    none,
+    blocked,
+    publish_epoch: u64,
+};
+
+fn splitRangePublication(
     current: CurrentMetadataState,
     desired_splits: []const transition_state.SplitTransitionRecord,
     desired_range: table_manager.RangeRecord,
-) bool {
+) SplitRangePublication {
     for (desired_splits) |split| {
         if (split.source_group_id != desired_range.group_id or
             split.attempt_epoch != desired_range.split_attempt_epoch or
+            split.phase != .prepare or
+            split.attempt_epoch == 0 or
             findSplitRecord(current.split_transitions, split.transition_id) != null)
         {
             continue;
         }
-        if (splitAdmissionExpectedEpoch(current, split) != null) return true;
+        const previous_epoch = split.attempt_epoch - 1;
+        const current_source = findRangeRecord(current.ranges, split.source_group_id);
+        if (current_source == null or current_source.?.split_attempt_epoch == previous_epoch)
+            return .{ .publish_epoch = previous_epoch };
+        // A stale or consumed epoch must never fall through to the ordinary
+        // range upsert path. Only the atomic admission command may advance the
+        // durable source epoch for a new split.
+        return .blocked;
     }
-    return false;
+    return .none;
 }
 
 fn allocSplitProvisioningRanges(
@@ -3690,24 +3724,26 @@ test "metadata reconciler publishes table contracts before admitting transitions
 
     try std.testing.expectEqual(@as(usize, 1), plan.table_upserts.len);
     try std.testing.expectEqual(@as(usize, 2), plan.range_upserts.len);
+    const published_source = findRangeRecord(plan.range_upserts, 101) orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 0), published_source.split_attempt_epoch);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_admissions.len);
     try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
     try std.testing.expectEqual(@as(usize, 0), plan.merge_upserts.len);
     try std.testing.expectEqual(@as(usize, 0), plan.split_steps.len);
     try std.testing.expectEqual(@as(usize, 0), plan.merge_steps.len);
 
-    const tables = try manager.listTables(std.testing.allocator);
-    defer manager.freeTables(std.testing.allocator, tables);
-    const ranges = try manager.listRanges(std.testing.allocator);
-    defer manager.freeRanges(std.testing.allocator, ranges);
     var admission_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
-        .tables = tables,
-        .ranges = ranges,
+        .tables = plan.table_upserts,
+        .ranges = plan.range_upserts,
     });
     defer admission_plan.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 0), admission_plan.table_upserts.len);
     try std.testing.expectEqual(@as(usize, 0), admission_plan.range_upserts.len);
-    try std.testing.expectEqual(@as(usize, 1), admission_plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 1), admission_plan.split_admissions.len);
+    try std.testing.expectEqual(@as(u64, 0), admission_plan.split_admissions[0].expected_source_epoch);
+    try std.testing.expectEqual(@as(usize, 0), admission_plan.split_upserts.len);
     try std.testing.expectEqual(@as(usize, 1), admission_plan.merge_upserts.len);
 }
 
@@ -3734,6 +3770,11 @@ test "metadata reconciler provisions split destination without publishing overla
     defer manager.freeTables(std.testing.allocator, tables);
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
+    const source_range = findRangeRecord(ranges, 101) orelse
+        return error.TestExpectedEqual;
+    var projected_source = source_range;
+    projected_source.split_attempt_epoch = 0;
+    const projected_ranges = [_]table_manager.RangeRecord{projected_source};
     const current_placements = [_]raft_reconciler.PlacementIntent{.{
         .record = .{ .group_id = 101, .replica_id = 1, .local_node_id = 1 },
         .peer_node_ids = &.{1},
@@ -3750,14 +3791,65 @@ test "metadata reconciler provisions split destination without publishing overla
     var reconciler = Reconciler.init(std.testing.allocator);
     var plan = try reconciler.computePlan(&manager, &.{1}, &candidates, .{
         .tables = tables,
-        .ranges = ranges,
+        .ranges = &projected_ranges,
         .placement_intents = &current_placements,
     });
     defer plan.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 0), plan.range_upserts.len);
     try std.testing.expect(findPlacementIntent(plan.placement_upserts, 103, 1) != null);
-    try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.split_admissions.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
+}
+
+test "metadata reconciler never publishes a split epoch without atomic admission" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const desired_table: table_manager.TableRecord = .{
+        .table_id = 10,
+        .name = "docs",
+        .desired_replica_count = 1,
+    };
+    try manager.upsertTable(desired_table);
+    try manager.upsertRange(.{
+        .group_id = 101,
+        .range_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+        .doc_identity_shard_id = 101,
+        .doc_identity_range_id = 101,
+        .split_attempt_epoch = 2,
+    });
+    try manager.requestSplit(.{
+        .transition_id = 7004,
+        .table_id = 10,
+        .source_group_id = 101,
+        .destination_group_id = 102,
+        .split_key = "doc:m",
+    });
+
+    const stale_source: table_manager.RangeRecord = .{
+        .group_id = 101,
+        .range_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+        .doc_identity_shard_id = 101,
+        .doc_identity_range_id = 101,
+        .split_attempt_epoch = 1,
+    };
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = &.{desired_table},
+        .ranges = &.{stale_source},
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.range_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_admissions.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
 }
 
 test "metadata reconciler resumes projected transition after authority handoff" {
@@ -6673,15 +6765,21 @@ test "metadata reconciler plans an automatic merge from adjacent small fresh gro
     try manager.upsertTable(.{ .table_id = 41, .name = "docs", .min_ranges = 1 });
     try manager.upsertRange(.{
         .group_id = 4101,
+        .range_id = 4101,
         .table_id = 41,
         .start_key = "doc:a",
         .end_key = "doc:m",
+        .doc_identity_shard_id = 4101,
+        .doc_identity_range_id = 4101,
     });
     try manager.upsertRange(.{
         .group_id = 4102,
+        .range_id = 4102,
         .table_id = 41,
         .start_key = "doc:m",
         .end_key = "doc:z",
+        .doc_identity_shard_id = 4101,
+        .doc_identity_range_id = 4101,
     });
 
     const tables = try manager.listTables(std.testing.allocator);
@@ -7581,15 +7679,21 @@ test "metadata reconciler does not merge shards that are younger than the merge 
     try manager.upsertTable(.{ .table_id = 410, .name = "docs", .min_ranges = 1 });
     try manager.upsertRange(.{
         .group_id = 41011,
+        .range_id = 41011,
         .table_id = 410,
         .start_key = "doc:a",
         .end_key = "doc:m",
+        .doc_identity_shard_id = 41011,
+        .doc_identity_range_id = 41011,
     });
     try manager.upsertRange(.{
         .group_id = 41012,
+        .range_id = 41012,
         .table_id = 410,
         .start_key = "doc:m",
         .end_key = "doc:z",
+        .doc_identity_shard_id = 41011,
+        .doc_identity_range_id = 41011,
     });
 
     const tables = try manager.listTables(std.testing.allocator);
@@ -7670,15 +7774,21 @@ test "metadata reconciler merges shards once they are older than the merge age t
     try manager.upsertTable(.{ .table_id = 411, .name = "docs", .min_ranges = 1 });
     try manager.upsertRange(.{
         .group_id = 41111,
+        .range_id = 41111,
         .table_id = 411,
         .start_key = "doc:a",
         .end_key = "doc:m",
+        .doc_identity_shard_id = 41111,
+        .doc_identity_range_id = 41111,
     });
     try manager.upsertRange(.{
         .group_id = 41112,
+        .range_id = 41112,
         .table_id = 411,
         .start_key = "doc:m",
         .end_key = "doc:z",
+        .doc_identity_shard_id = 41111,
+        .doc_identity_range_id = 41111,
     });
 
     const tables = try manager.listTables(std.testing.allocator);

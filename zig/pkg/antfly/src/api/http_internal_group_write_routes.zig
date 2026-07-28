@@ -306,6 +306,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             error.ApplyStoreGroupRetired,
             error.ApplyStoreShuttingDown,
             error.BackgroundOwnerClosing,
+            error.BackgroundOwnerClosed,
             error.TransitionOperationBusy,
             => {
                 return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");

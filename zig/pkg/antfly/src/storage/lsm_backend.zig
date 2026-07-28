@@ -3020,7 +3020,7 @@ pub const Backend = struct {
         self.immutable_flush_job_in_flight = true;
         self.background_executor.submit(.commit_durable, self, runImmutableFlushJob, deinitImmutableFlushJob) catch |err| {
             self.immutable_flush_job_in_flight = false;
-            if (err == error.BackgroundOwnerClosing) return;
+            if (err == error.BackgroundOwnerClosing or err == error.BackgroundOwnerClosed) return;
             std.log.warn("lsm immutable flush background scheduling failed root={?s} err={}", .{ self.root_dir, err });
         };
     }
@@ -3053,7 +3053,7 @@ pub const Backend = struct {
         self.maintenance_job_in_flight = true;
         self.background_executor.submit(.maintenance, self, runMaintenanceJob, deinitMaintenanceJob) catch |err| {
             self.maintenance_job_in_flight = false;
-            if (err == error.BackgroundOwnerClosing) return;
+            if (err == error.BackgroundOwnerClosing or err == error.BackgroundOwnerClosed) return;
             std.log.warn("lsm maintenance background scheduling failed root={?s} err={}", .{ self.root_dir, err });
         };
     }
@@ -5463,7 +5463,7 @@ pub const BackendHandle = struct {
             if (resolved_options.background_executor != null) return error.BackgroundExecutorAlreadyConfigured;
             owned_runtime = try background_runtime_mod.BackendRuntimeHandle.init(allocator, runtime_config);
             const runtime = owned_runtime.?.ptr();
-            const executor = BackgroundExecutor.init(runtime, runtime.allocOwnerId());
+            const executor = BackgroundExecutor.init(runtime, try runtime.allocOwnerId());
             resolved_options.background_executor = &executor;
             if (resolved_options.read_runtime == null) {
                 if (runtime.io()) |io| resolved_options.read_runtime = storage_io.ReadRuntime.init(io);
@@ -5503,7 +5503,7 @@ pub const BackendHandle = struct {
             if (resolved_options.background_executor != null) return error.BackgroundExecutorAlreadyConfigured;
             owned_runtime = try background_runtime_mod.BackendRuntimeHandle.init(allocator, runtime_config);
             const runtime = owned_runtime.?.ptr();
-            const executor = BackgroundExecutor.init(runtime, runtime.allocOwnerId());
+            const executor = BackgroundExecutor.init(runtime, try runtime.allocOwnerId());
             resolved_options.background_executor = &executor;
             if (resolved_options.read_runtime == null) {
                 if (runtime.io()) |io| resolved_options.read_runtime = storage_io.ReadRuntime.init(io);
@@ -7236,8 +7236,8 @@ test "lsm backends share one threaded runtime durable lane" {
     var second_storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer second_storage.deinit();
 
-    const first_executor = BackgroundExecutor.init(runtime.ptr(), runtime.ptr().allocOwnerId());
-    const second_executor = BackgroundExecutor.init(runtime.ptr(), runtime.ptr().allocOwnerId());
+    const first_executor = BackgroundExecutor.init(runtime.ptr(), try runtime.ptr().allocOwnerId());
+    const second_executor = BackgroundExecutor.init(runtime.ptr(), try runtime.ptr().allocOwnerId());
     var first = try Backend.open(std.testing.allocator, "/lsm-background-shared-runtime-first", .{
         .storage = first_storage.storage(),
         .background_executor = &first_executor,

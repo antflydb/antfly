@@ -1649,6 +1649,11 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid create table request");
         };
         var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch |err| {
+            if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
+                std.log.err("create table request parsing failed: {} body_len={d}", .{ err, body_data.len });
+                return err;
+            }
+            std.log.debug("create table request rejected: {} body_len={d}", .{ err, body_data.len });
             _ = ctx.status(400);
             if (err == error.InvalidCreateTableSchemaRequest) {
                 return ctx.text(table_contract.createTableRequestErrorMessage(body_data));

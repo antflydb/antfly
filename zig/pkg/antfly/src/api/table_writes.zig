@@ -5412,7 +5412,7 @@ pub const ProvisionedTableWriteSource = struct {
     /// destroy after its optional cache owner has already gone away.
     pub fn quiesce(self: *ProvisionedTableWriteSource) void {
         if (self.quiesced) return;
-        self.drainDroppedTableDeletes();
+        self.closeDroppedTableDeletes();
         const io = self.table_activity_threaded.io();
         self.restore_repair_shutdown.store(true, .release);
         self.restore_repair_work_group.cancel(io);
@@ -5547,9 +5547,9 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) u64 {
+    fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) !u64 {
         if (self.dropped_table_delete_owner_id == 0) {
-            self.dropped_table_delete_owner_id = runtime.allocOwnerId();
+            self.dropped_table_delete_owner_id = try runtime.allocOwnerId();
         }
         return self.dropped_table_delete_owner_id;
     }
@@ -5561,6 +5561,13 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
+    fn closeDroppedTableDeletes(self: *ProvisionedTableWriteSource) void {
+        if (self.dropped_table_delete_owner_id == 0) return;
+        if (self.backend_runtime) |runtime| {
+            runtime.durable_jobs.closeOwner(self.dropped_table_delete_owner_id);
+        }
+    }
+
     fn scheduleDroppedGroupDelete(self: *ProvisionedTableWriteSource, path: []const u8) !bool {
         const runtime = self.backend_runtime orelse return false;
         const work = try std.heap.page_allocator.create(DroppedTableDeleteWork);
@@ -5569,7 +5576,7 @@ pub const ProvisionedTableWriteSource = struct {
         errdefer std.heap.page_allocator.free(owned_path);
         work.* = .{ .path = owned_path };
         try runtime.durable_jobs.submit(.{
-            .owner_id = self.droppedTableDeleteOwnerId(runtime),
+            .owner_id = try self.droppedTableDeleteOwnerId(runtime),
             .class = .cleanup,
             .ptr = work,
             .run = DroppedTableDeleteWork.run,
@@ -28859,7 +28866,6 @@ test "structural reconcile publishes durable index repair debt once per group" {
     const DebtCapture = struct {
         enqueue_calls: usize = 0,
         runnable_enqueue_calls: usize = 0,
-        remove_calls: usize = 0,
 
         fn onDebt(ptr: *anyopaque, table_name: []const u8, group_id: u64, action: ProvisionedTableWriteSource.LocalIndexRepairDebtAction) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -28871,7 +28877,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
                     self.enqueue_calls += 1;
                     self.runnable_enqueue_calls += 1;
                 },
-                .remove => self.remove_calls += 1,
+                .remove => {},
                 .cancel, .clear_cancel => unreachable,
             }
         }
@@ -28958,7 +28964,8 @@ test "structural reconcile publishes durable index repair debt once per group" {
         try source.reconcileTableStructureStep(alloc, &request),
     );
     try std.testing.expectEqual(first_pass_enqueue_calls, capture.enqueue_calls);
-    try std.testing.expect(capture.remove_calls >= 1);
+    // Queue retirement belongs to the aggregate DataServer scheduler after it
+    // verifies that no other named index intent remains in this group.
 }
 
 test "structural reconcile pending set never revisits completed groups" {

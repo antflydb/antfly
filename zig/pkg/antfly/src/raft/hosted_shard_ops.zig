@@ -32,6 +32,13 @@ const AcceptMergeReceiver = @FieldType(metadata_mod.TransitionAction, "accept_me
 const CatchUpMergeReceiver = @FieldType(metadata_mod.TransitionAction, "catch_up_merge_receiver");
 const FinalizeMerge = @FieldType(metadata_mod.TransitionAction, "finalize_merge");
 const RollbackMerge = @FieldType(metadata_mod.TransitionAction, "rollback_merge");
+const test_transition_table_contract: metadata_mod.TransitionTableContract = .{
+    .table_id = 1,
+    .table_name = "docs",
+    .indexes_json = "{}",
+    .source_identity = .{ .shard_id = 1, .range_id = 1 },
+    .target_identity = .{ .shard_id = 1, .range_id = 1 },
+};
 
 pub const GroupTransitionReadinessSource = struct {
     ptr: *anyopaque,
@@ -730,6 +737,7 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
             .source_group_id = 77,
             .destination_group_id = 78,
             .split_key = "doc:m",
+            .table_contract = test_transition_table_contract,
         },
     });
     try std.testing.expect(fake_ops.execute_called);
@@ -814,6 +822,7 @@ test "hosted shard operation adapter rediscovers leader across placed replicas" 
             .source_group_id = 77,
             .destination_group_id = 78,
             .split_key = "doc:m",
+            .table_contract = test_transition_table_contract,
         },
     });
     try std.testing.expectEqual(@as(usize, 2), executor.calls);

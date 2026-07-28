@@ -144,19 +144,10 @@ pub const MetadataState = struct {
         try self.desired.replaceTopology(tables, ranges);
         try self.desired.syncProjectedSplitTransitions(self.committed_splits.items);
         try self.desired.syncProjectedMergeTransitions(self.committed_merges.items);
-        // A finalized transition can be visible one reconciliation before the
-        // projected topology contains its result.  Fold that durable intent
-        // into desired topology before compacting it.
-        for (self.committed_splits.items) |record| switch (record.phase) {
-            .finalized => try self.desired.applyFinalizedSplit(record),
-            .rolled_back => self.desired.applyRolledBackSplit(record.transition_id),
-            else => {},
-        };
-        for (self.committed_merges.items) |record| switch (record.phase) {
-            .finalized => try self.desired.applyFinalizedMerge(record),
-            .rolled_back => self.desired.applyRolledBackMerge(record.transition_id),
-            else => {},
-        };
+        try self.desired.applyProjectedTerminalTransitions(
+            self.committed_splits.items,
+            self.committed_merges.items,
+        );
     }
 
     pub fn syncProjected(self: *MetadataState, service: anytype) !void {
@@ -1174,14 +1165,22 @@ test "metadata state captures committed transitions and observations" {
 
         pub fn listProjectedSplitTransitions(_: *@This(), alloc: std.mem.Allocator) ![]transition_state.SplitTransitionRecord {
             const out = try alloc.alloc(transition_state.SplitTransitionRecord, 1);
-            out[0] = .{
+            errdefer alloc.free(out);
+            out[0] = try metadata_table_manager.cloneSplitTransitionRecord(alloc, .{
                 .transition_id = 1,
                 .attempt_epoch = 1,
                 .source_group_id = 11,
                 .destination_group_id = 12,
                 .phase = .prepare,
-                .split_key = try alloc.dupe(u8, "doc:m"),
-            };
+                .split_key = "doc:m",
+                .table_contract = .{
+                    .table_id = 7,
+                    .table_name = "docs",
+                    .indexes_json = "{}",
+                    .source_identity = .{ .shard_id = 71, .range_id = 71 },
+                    .target_identity = .{ .shard_id = 71, .range_id = 71 },
+                },
+            });
             return out;
         }
 
@@ -1192,12 +1191,20 @@ test "metadata state captures committed transitions and observations" {
 
         pub fn listProjectedMergeTransitions(_: *@This(), alloc: std.mem.Allocator) ![]transition_state.MergeTransitionRecord {
             const out = try alloc.alloc(transition_state.MergeTransitionRecord, 1);
-            out[0] = .{
+            errdefer alloc.free(out);
+            out[0] = try metadata_table_manager.cloneMergeTransitionRecord(alloc, .{
                 .transition_id = 2,
                 .donor_group_id = 12,
                 .receiver_group_id = 11,
                 .phase = .prepare,
-            };
+                .table_contract = .{
+                    .table_id = 7,
+                    .table_name = "docs",
+                    .indexes_json = "{}",
+                    .source_identity = .{ .shard_id = 71, .range_id = 71 },
+                    .target_identity = .{ .shard_id = 71, .range_id = 71 },
+                },
+            });
             return out;
         }
 
@@ -1273,6 +1280,13 @@ test "metadata state seeds active projected transitions after authority handoff"
         .phase = .replay_deltas,
         .split_key = "doc:m",
         .source_range_end = "doc:z",
+        .table_contract = .{
+            .table_id = 7,
+            .table_name = "docs",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 71, .range_id = 71 },
+            .target_identity = .{ .shard_id = 71, .range_id = 71 },
+        },
     }));
 
     try state.seedDesiredFromProjected();
@@ -1304,6 +1318,13 @@ test "metadata state folds finalized split before projected topology catches up"
         .phase = .finalized,
         .split_key = "doc:m",
         .source_range_end = "doc:z",
+        .table_contract = .{
+            .table_id = 7,
+            .table_name = "docs",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 71, .range_id = 71 },
+            .target_identity = .{ .shard_id = 71, .range_id = 71 },
+        },
     }));
 
     try state.seedDesiredFromProjected();

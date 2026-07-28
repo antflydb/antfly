@@ -183,6 +183,24 @@ pub const ReplicationChange = struct {
     }
 };
 
+/// Synchronous durability barrier invoked after the provider inspects the
+/// physical slot, but before it deletes or creates persistent provider state.
+/// The callback lifetime is limited to the enclosing
+/// beginPreparedReplicationSnapshot call.
+pub const ExactCutoverIntent = struct {
+    pub const ProviderIdentity = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+    ptr: *anyopaque,
+    persist_fn: *const fn (
+        ptr: *anyopaque,
+        provider_identity: ProviderIdentity,
+    ) anyerror!void,
+
+    pub fn persist(self: @This(), provider_identity: ProviderIdentity) !void {
+        try self.persist_fn(self.ptr, provider_identity);
+    }
+};
+
 pub const ReplicationPollParams = struct {
     table: []u8,
     slot_name: ?[]u8 = null,
@@ -190,6 +208,11 @@ pub const ReplicationPollParams = struct {
     filter_query_json: ?[]u8 = null,
     checkpoint: ?[]u8 = null,
     limit: ?usize = null,
+    /// A replicated pending intent proves that this attempt-scoped physical
+    /// slot belongs to an interrupted exact cutover and may be reclaimed.
+    /// Never set this based only on a configured/provider-visible name.
+    reclaim_exact_cutover_slot: bool = false,
+    exact_cutover_intent: ?ExactCutoverIntent = null,
 
     pub fn deinit(self: *ReplicationPollParams, alloc: Allocator) void {
         alloc.free(self.table);
@@ -268,7 +291,7 @@ pub const Source = struct {
         statistics: *const fn (ptr: *anyopaque, table: []const u8) anyerror!TableStatistics,
         statistics_with_deadline: ?*const fn (ptr: *anyopaque, table: []const u8, execution_deadline_ns: ?u64) anyerror!TableStatistics = null,
         begin_snapshot_query: ?*const fn (ptr: *anyopaque, alloc: Allocator) anyerror!SnapshotReader = null,
-        begin_prepared_replication_snapshot: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: ReplicationPollParams) anyerror!PreparedReplicationSnapshot = null,
+        begin_prepared_replication_snapshot: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: ReplicationPollParams, execution_deadline_ns: u64) anyerror!PreparedReplicationSnapshot = null,
         prepare_replication: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: ReplicationPollParams) anyerror!ReplicationPrepareResult = null,
         poll_changes: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: ReplicationPollParams) anyerror!ReplicationPollResult = null,
         cleanup_replication: ?*const fn (ptr: *anyopaque, alloc: Allocator, params: ReplicationCleanupParams) anyerror!void = null,
@@ -305,9 +328,14 @@ pub const Source = struct {
         return try begin_fn(self.ptr, alloc);
     }
 
-    pub fn beginPreparedReplicationSnapshot(self: Source, alloc: Allocator, params: ReplicationPollParams) !PreparedReplicationSnapshot {
+    pub fn beginPreparedReplicationSnapshot(
+        self: Source,
+        alloc: Allocator,
+        params: ReplicationPollParams,
+        execution_deadline_ns: u64,
+    ) !PreparedReplicationSnapshot {
         const begin_fn = self.vtable.begin_prepared_replication_snapshot orelse return error.UnsupportedExactCutover;
-        return try begin_fn(self.ptr, alloc, params);
+        return try begin_fn(self.ptr, alloc, params, execution_deadline_ns);
     }
 
     pub fn prepareReplication(self: Source, alloc: Allocator, params: ReplicationPollParams) !ReplicationPrepareResult {

@@ -73,7 +73,7 @@ pub const QueryExecutor = struct {
         discover_columns: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) anyerror![]foreign_source.Column = null,
         refresh_columns: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) anyerror![]foreign_source.Column = null,
         begin_snapshot_query: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8) anyerror!SnapshotQuery = null,
-        begin_prepared_replication_snapshot: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) anyerror!PreparedReplicationSnapshot = null,
+        begin_prepared_replication_snapshot: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams, execution_deadline_ns: u64) anyerror!PreparedReplicationSnapshot = null,
         prepare_replication: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) anyerror!foreign_source.ReplicationPrepareResult = null,
         poll_changes: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) anyerror!foreign_source.ReplicationPollResult = null,
         cleanup_replication: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationCleanupParams) anyerror!void = null,
@@ -118,9 +118,15 @@ pub const QueryExecutor = struct {
         return try begin_fn(self.ptr, alloc, dsn);
     }
 
-    pub fn beginPreparedReplicationSnapshot(self: @This(), alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) !PreparedReplicationSnapshot {
+    pub fn beginPreparedReplicationSnapshot(
+        self: @This(),
+        alloc: Allocator,
+        dsn: []const u8,
+        params: foreign_source.ReplicationPollParams,
+        execution_deadline_ns: u64,
+    ) !PreparedReplicationSnapshot {
         const begin_fn = self.vtable.begin_prepared_replication_snapshot orelse return error.UnsupportedExactCutover;
-        return try begin_fn(self.ptr, alloc, dsn, params);
+        return try begin_fn(self.ptr, alloc, dsn, params, execution_deadline_ns);
     }
 
     pub fn prepareReplication(self: @This(), alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) !foreign_source.ReplicationPrepareResult {
@@ -500,12 +506,22 @@ pub const RuntimeSource = struct {
         return reader.asSnapshotReader();
     }
 
-    fn beginPreparedReplicationSnapshot(ptr: *anyopaque, alloc: Allocator, params: foreign_source.ReplicationPollParams) !foreign_source.PreparedReplicationSnapshot {
+    fn beginPreparedReplicationSnapshot(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        params: foreign_source.ReplicationPollParams,
+        execution_deadline_ns: u64,
+    ) !foreign_source.PreparedReplicationSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var owned_params = try cloneReplicationPollParamsAlloc(alloc, params);
         defer owned_params.deinit(alloc);
 
-        var prepared = try self.executor.beginPreparedReplicationSnapshot(alloc, self.dsn, owned_params);
+        var prepared = try self.executor.beginPreparedReplicationSnapshot(
+            alloc,
+            self.dsn,
+            owned_params,
+            execution_deadline_ns,
+        );
         errdefer prepared.deinit(alloc);
 
         const reader = try alloc.create(RuntimeSnapshotReader);
@@ -1027,6 +1043,8 @@ fn cloneReplicationPollParamsAlloc(
     var out = foreign_source.ReplicationPollParams{
         .table = try alloc.dupe(u8, params.table),
         .limit = params.limit,
+        .reclaim_exact_cutover_slot = params.reclaim_exact_cutover_slot,
+        .exact_cutover_intent = params.exact_cutover_intent,
     };
     errdefer out.deinit(alloc);
     out.slot_name = if (params.slot_name) |slot_name| try alloc.dupe(u8, slot_name) else null;
@@ -1350,6 +1368,7 @@ test "postgres source runtime delegates prepared replication snapshot through ex
 
         begin_calls: usize = 0,
         query_calls: usize = 0,
+        last_deadline_ns: u64 = 0,
         last_slot_name: ?[]u8 = null,
 
         const SnapshotSession = struct {
@@ -1386,9 +1405,11 @@ test "postgres source runtime delegates prepared replication snapshot through ex
             inner_alloc: Allocator,
             _: []const u8,
             params: foreign_source.ReplicationPollParams,
+            execution_deadline_ns: u64,
         ) !QueryExecutor.PreparedReplicationSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.begin_calls += 1;
+            self.last_deadline_ns = execution_deadline_ns;
             if (self.last_slot_name) |value| inner_alloc.free(value);
             self.last_slot_name = if (params.slot_name) |value| try inner_alloc.dupe(u8, value) else null;
             const session = try inner_alloc.create(SnapshotSession);
@@ -1434,7 +1455,12 @@ test "postgres source runtime delegates prepared replication snapshot through ex
     };
     defer poll_params.deinit(alloc);
 
-    var prepared = try src.beginPreparedReplicationSnapshot(alloc, poll_params);
+    const execution_deadline_ns = std.math.maxInt(u64);
+    var prepared = try src.beginPreparedReplicationSnapshot(
+        alloc,
+        poll_params,
+        execution_deadline_ns,
+    );
     defer prepared.deinit(alloc);
 
     var query_params = foreign_source.QueryParams{
@@ -1448,6 +1474,7 @@ test "postgres source runtime delegates prepared replication snapshot through ex
 
     try std.testing.expectEqual(@as(usize, 1), executor.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), executor.query_calls);
+    try std.testing.expectEqual(execution_deadline_ns, executor.last_deadline_ns);
     try std.testing.expectEqualStrings("antfly_slot", executor.last_slot_name.?);
     try std.testing.expectEqualStrings("lsn:cutover", prepared.checkpoint);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);

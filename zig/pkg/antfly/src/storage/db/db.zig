@@ -93,6 +93,7 @@ const chunking_types_mod = @import("../../chunking/types.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
 const enrichment_lease_mod = @import("enrichment/enrichment_lease.zig");
 const enrichment_worker = @import("enrichment/enrichment_worker.zig");
+const enrichment_lease = @import("enrichment/enrichment_lease.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
 const enrichment_types = @import("enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
@@ -3173,7 +3174,14 @@ pub const DB = struct {
             if (backend_runtime.io_impl == null and effective_executor.backend == .io_threaded) {
                 effective_executor.backend = .manual;
             }
-            const backend_owner_id = backend_runtime.allocOwnerId();
+            const backend_owner_id = try backend_runtime.allocOwnerId();
+            var backend_owner_transferred = false;
+            errdefer if (!backend_owner_transferred)
+                backend_runtime.durable_jobs.closeOwner(backend_owner_id);
+            const repair_cleanup_owner_id = try backend_runtime.allocOwnerId();
+            var repair_cleanup_owner_transferred = false;
+            errdefer if (!repair_cleanup_owner_transferred)
+                backend_runtime.durable_jobs.closeOwner(repair_cleanup_owner_id);
             var primary_lsm_background_executor: lsm_backend_mod.BackgroundExecutor = undefined;
             var effective_primary_backend = opts.primary_backend;
             var effective_index_backends = opts.index_backends;
@@ -3273,7 +3281,7 @@ pub const DB = struct {
                 .async_context = async_context,
                 .backend_runtime = backend_runtime,
                 .backend_owner_id = backend_owner_id,
-                .repair_cleanup_owner_id = backend_runtime.allocOwnerId(),
+                .repair_cleanup_owner_id = repair_cleanup_owner_id,
                 .owned_backend_runtime = owned_backend_runtime,
                 .owned_resource_manager = owned_resource_manager,
                 .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
@@ -3301,6 +3309,8 @@ pub const DB = struct {
                 .sparse_compaction_runtime = null,
                 .shadow = null,
             };
+            backend_owner_transferred = true;
+            repair_cleanup_owner_transferred = true;
             var executor_ready = false;
             owned_async_context = null;
             owned_backend_runtime = null;
@@ -4105,7 +4115,7 @@ pub const DB = struct {
         self.async_context.background_closing.store(true, .release);
         self.async_context.enrichment_desired_running.store(false, .release);
         self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
-        self.backend_runtime.durable_jobs.drainOwner(self.repair_cleanup_owner_id);
+        self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
         self.clearLiveDocSetCache();
         self.clearNonVisibleDocSetCache();
         self.bulk_ingest_coalescer.deinit(self.alloc);
@@ -34483,6 +34493,19 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     if (ctx.repair_replay_mutex) |mutex| lockAtomic(mutex);
     defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock();
     var effective = sequence;
+    // Generated enrichment consumes the same durable replay journal as the
+    // managed-index executor, but advances independently. The executor may
+    // reach `sequence` while a provider outage leaves enrichment behind. Clamp
+    // to the persisted checkpoint (written before the in-memory watermark) so
+    // a restart can always replay every ungenerated artifact.
+    if (ctx.index_manager.hasGeneratedEnrichmentTargets()) {
+        const enrichment_applied = try enrichment_state.loadAppliedSequence(
+            ctx.alloc,
+            ctx.store,
+            enrichment_runtime_mod.scope_name,
+        );
+        effective = @min(effective, enrichment_applied);
+    }
     // The resolution/promotion stages consume the replay journal but are not
     // executor workers. Clamp truncation to their applied watermarks whenever a
     // resolver is configured, even before the synchronous driver has raised the
@@ -38887,9 +38910,51 @@ test "db open borrows shared backend runtime" {
     try std.testing.expect(first.backend_owner_id != 0);
     try std.testing.expect(second.backend_owner_id != 0);
     try std.testing.expect(first.backend_owner_id != second.backend_owner_id);
-    // Each DB owns one executor lane identity and one independently drained
-    // retired-generation cleanup identity.
-    try std.testing.expectEqual(@as(u64, 5), runtime.ptr().allocOwnerId());
+    // Each DB owns one backend lane and one repair/cleanup lane. Generation
+    // retirement uses the runtime-wide cleanup owner instead.
+    try std.testing.expectEqual(
+        second.repair_cleanup_owner_id + 1,
+        try runtime.ptr().allocOwnerId(),
+    );
+}
+
+test "db close retires runtime owners for memory primary backend" {
+    const alloc = std.testing.allocator;
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+    });
+    const backend_owner_id = db.backend_owner_id;
+    const repair_cleanup_owner_id = db.repair_cleanup_owner_id;
+    db.close();
+
+    const Fns = struct {
+        fn run(_: *anyopaque) !void {}
+        fn deinit(_: *anyopaque) void {}
+    };
+    var ctx: u8 = 0;
+    try std.testing.expectError(error.BackgroundOwnerClosed, runtime.ptr().durable_jobs.submit(.{
+        .owner_id = backend_owner_id,
+        .class = .maintenance,
+        .ptr = &ctx,
+        .run = Fns.run,
+        .deinit = Fns.deinit,
+    }));
+    try std.testing.expectError(error.BackgroundOwnerClosed, runtime.ptr().durable_jobs.submit(.{
+        .owner_id = repair_cleanup_owner_id,
+        .class = .cleanup,
+        .ptr = &ctx,
+        .run = Fns.run,
+        .deinit = Fns.deinit,
+    }));
 }
 
 test "db inherits the resource manager capacity source" {
@@ -50719,6 +50784,59 @@ test "db leased enrichment worker generates dense embeddings" {
     try expectDenseEmbeddingArtifactValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("generated vector text"), 3);
 }
 
+test "db leased enrichment worker backs off while a stale owner holds the lease" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-b",
+            .dense_embedder = deterministic.interface(),
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var stale_lease = try enrichment_lease.EnrichmentLease.init(
+        alloc,
+        db.core.store,
+        enrichment_lease.default_lease_key,
+    );
+    defer stale_lease.deinit();
+    const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+    try std.testing.expect(try stale_lease.tryAcquire("worker-a", now_ms, 30_000));
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"blocked enrichment\"}" }},
+        .sync_level = .write,
+    });
+
+    var first_failures: u64 = 0;
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        first_failures = db.enrichment_runtime.?.stats().lease_acquire_failures;
+        if (first_failures > 0) break;
+        sleepPollInterval();
+    }
+    try std.testing.expect(first_failures > 0);
+
+    sleepNs(250 * std.time.ns_per_ms);
+    const later_failures = db.enrichment_runtime.?.stats().lease_acquire_failures;
+    // A 100ms denial delay permits at most a handful of retries in this
+    // observation window. The former zero-duration yield produces thousands.
+    try std.testing.expect(later_failures - first_failures <= 5);
+}
+
 test "db leased enrichment worker generates dense embeddings with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
@@ -55251,6 +55369,165 @@ test "db batch truncates replay logs after managed indexes catch up" {
         sleepPollInterval();
     }
     try std.testing.expectEqual(@as(usize, 0), remaining_journal_entries);
+}
+
+test "db async replay truncation retains durable enrichment debt" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    const first_sequence = db.core.nextDerivedSequence();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"beta\"}" }},
+        .sync_level = .write,
+    });
+    const target_sequence = db.core.nextDerivedSequence();
+    try std.testing.expect(target_sequence > first_sequence);
+
+    // Model a provider failure after the first durable enrichment checkpoint
+    // while the managed-index executor has already reached the replay tail.
+    try enrichment_state.saveAppliedSequence(
+        db.core.store,
+        enrichment_runtime_mod.scope_name,
+        first_sequence,
+    );
+    try truncateReplaySequenceAsync(db.async_context, target_sequence);
+
+    const retained = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+    defer {
+        for (retained) |*entry| entry.deinit(alloc);
+        alloc.free(retained);
+    }
+    try std.testing.expectEqual(@as(usize, 1), retained.len);
+    try std.testing.expectEqual(target_sequence, retained[0].sequence);
+}
+
+test "db restart after provider failure resumes enrichment from retained async replay" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var first_applied_sequence: u64 = 0;
+    var failed_target_sequence: u64 = 0;
+    {
+        // Permit one document to establish a durable enrichment watermark, then
+        // keep returning a retryable provider error for the next document while
+        // the independent managed-index executor reaches the replay tail.
+        var gated = GateDenseEmbedder{};
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = gated.interface(),
+            },
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+        first_applied_sequence = db.core.nextEnrichmentSequence();
+        try db.enrichment_runtime.?.waitForApplied(first_applied_sequence);
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"beta\"}" }},
+            .sync_level = .write,
+        });
+        failed_target_sequence = db.core.nextEnrichmentSequence();
+        try std.testing.expect(failed_target_sequence > first_applied_sequence);
+
+        var attempts: usize = 0;
+        while (attempts < default_test_wait_attempts and gated.snapshot().rate_limited_requests == 0) : (attempts += 1) {
+            sleepPollInterval();
+        }
+        try std.testing.expect(gated.snapshot().rate_limited_requests > 0);
+
+        // Stop at the observed provider failure boundary, then let the
+        // independent executor finish and attempt async truncation. This
+        // deterministically models the process exiting during the outage
+        // without spending the test budget on provider retry backoff.
+        db.enrichment_runtime.?.stop();
+        try db.executor.waitForAll(failed_target_sequence);
+
+        const failed_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, failed_stats);
+        try std.testing.expectEqual(first_applied_sequence, failed_stats.enrichment.applied_sequence);
+        try std.testing.expectEqual(failed_target_sequence, failed_stats.enrichment.target_sequence);
+
+        const retained = try replay_stream_mod.iterateFrom(alloc, db.core.store, first_applied_sequence + 1);
+        defer {
+            for (retained) |*entry| entry.deinit(alloc);
+            alloc.free(retained);
+        }
+        try std.testing.expect(retained.len > 0);
+        var retained_failed_target = false;
+        for (retained) |entry| {
+            if (entry.sequence == failed_target_sequence) retained_failed_target = true;
+        }
+        try std.testing.expect(retained_failed_target);
+    }
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try reopened.runUntilIdle();
+
+    const recovered_stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, recovered_stats);
+    try std.testing.expect(recovered_stats.enrichment.applied_sequence >= failed_target_sequence);
+    try std.testing.expectEqual(recovered_stats.enrichment.applied_sequence, recovered_stats.enrichment.target_sequence);
+
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:b", "body_dense_v1");
+    defer alloc.free(artifact_key);
+    const artifacts = try reopened.core.store.scanPrefix(alloc, artifact_key);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.len);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "beta", 3);
+    defer alloc.free(query_vec);
+    var result = try reopened.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = query_vec,
+            .k = 2,
+        },
+        .limit = 2,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
 }
 
 test "db async replay truncation retains journal behind generated enrichment" {

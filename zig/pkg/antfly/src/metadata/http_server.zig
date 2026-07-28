@@ -2502,6 +2502,21 @@ fn reseedReplicationSourceExactCutoverForService(
     const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     var existing = try parseReplicationSourceCleanupAlloc(alloc, table.name, table.replication_sources_json, source_ordinal);
     defer existing.deinit(alloc);
+    // Exact cutover uses an attempt-scoped physical slot. Prefer the durable
+    // status identity over the configured base name so reseed cleans up the
+    // resource that snapshot/streaming actually used.
+    for (snapshot.replication_source_statuses) |status| {
+        if (status.table_id != table.table_id or
+            status.source_ordinal != source_ordinal or
+            !replicationStatusOwnsPhysicalSlot(existing.slot_name, status))
+        {
+            continue;
+        }
+        const physical_slot_name = try alloc.dupe(u8, status.slot_name);
+        alloc.free(existing.slot_name);
+        existing.slot_name = physical_slot_name;
+        break;
+    }
     const updated = try cloneTableWithReseededExactCutoverSource(alloc, table.*, source_ordinal);
     errdefer {
         alloc.free(updated.table.replication_sources_json);
@@ -2604,6 +2619,50 @@ fn reseedReplicationSourcesExactCutoverAlloc(
         .slot_name = slot_name,
         .publication_name = publication_name,
     };
+}
+
+fn replicationStatusOwnsPhysicalSlot(
+    configured_slot_name: []const u8,
+    status: metadata_table_manager.ReplicationSourceStatusRecord,
+) bool {
+    const postgres_identifier_max_len = 63;
+    const suffix_len = "_af_".len + 16;
+    if (status.cutover_intent_id == 0 or
+        status.cutover_authority_id == 0 or
+        std.mem.allEqual(u8, &status.cutover_provider_identity, 0))
+        return false;
+    const prefix_len = @min(
+        configured_slot_name.len,
+        postgres_identifier_max_len - suffix_len,
+    );
+    var expected_buffer: [postgres_identifier_max_len]u8 = undefined;
+    const expected = std.fmt.bufPrint(
+        &expected_buffer,
+        "{s}_af_{x:0>16}",
+        .{ configured_slot_name[0..prefix_len], status.cutover_intent_id },
+    ) catch unreachable;
+    return std.mem.eql(u8, status.slot_name, expected);
+}
+
+test "metadata reseed accepts only the durable attempt-scoped physical slot" {
+    const status = metadata_table_manager.ReplicationSourceStatusRecord{
+        .table_id = 1,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .slot_name = "configured_slot_af_0000000000000042",
+        .cutover_intent_id = 0x42,
+        .cutover_authority_id = 0x43,
+        .cutover_provider_identity = [_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length,
+    };
+    try std.testing.expect(replicationStatusOwnsPhysicalSlot("configured_slot", status));
+
+    var manually_recreated = status;
+    manually_recreated.slot_name = "configured_slot";
+    try std.testing.expect(!replicationStatusOwnsPhysicalSlot("configured_slot", manually_recreated));
+
+    var legacy_unfenced = status;
+    legacy_unfenced.cutover_authority_id = 0;
+    try std.testing.expect(!replicationStatusOwnsPhysicalSlot("configured_slot", legacy_unfenced));
 }
 
 fn cleanupReplicationSourceArtifactsForService(
