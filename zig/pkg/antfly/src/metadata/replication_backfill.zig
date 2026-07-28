@@ -5097,6 +5097,18 @@ test "metadata replication live snapshot and later streaming insert through runn
     try std.testing.expectEqualStrings("cutover_prepared", status_sink.latest().phase);
     try std.testing.expectEqual(@as(u64, 1), status_sink.latest().snapshot_offset);
     try std.testing.expect(status_sink.latest().prepared_checkpoint.len > 0);
+    const snapshot_status = try metadata_table_manager.cloneReplicationSourceStatus(
+        alloc,
+        status_sink.latest(),
+    );
+    defer metadata_table_manager.freeReplicationSourceStatus(alloc, snapshot_status);
+    const drop_physical_slot_sql = try std.fmt.allocPrint(
+        alloc,
+        "select pg_drop_replication_slot('{s}') from pg_replication_slots where slot_name = '{s}' and not active",
+        .{ snapshot_status.slot_name, snapshot_status.slot_name },
+    );
+    defer alloc.free(drop_physical_slot_sql);
+    defer execPsqlCommand(alloc, dsn, drop_physical_slot_sql) catch {};
 
     var user_one = (try db.lookup(alloc, "user-1", .{})).?;
     defer user_one.deinit(alloc);
@@ -5107,14 +5119,38 @@ test "metadata replication live snapshot and later streaming insert through runn
         .registry = &registry,
         .write_source = write_source.source(),
     };
-    const first_stream = try stream_runner.runTableSourceFromCheckpoint(&status_sink, table, 0, 1, "slot_first", null, null);
+    const first_stream = try stream_runner.runTableSourceFromCheckpoint(
+        &status_sink,
+        table,
+        0,
+        1,
+        snapshot_status.cutover_mode,
+        null,
+        snapshot_status,
+    );
     try std.testing.expectEqual(@as(usize, 0), first_stream.changes_applied);
     try std.testing.expectEqualStrings("streaming", status_sink.latest().phase);
 
     try execPsqlCommand(alloc, dsn, insert_sql);
 
-    const resume_checkpoint = if (status_sink.latest().stream_checkpoint.len > 0) status_sink.latest().stream_checkpoint else null;
-    const second_stream = try stream_runner.runTableSourceFromCheckpoint(&status_sink, table, 0, 1, "slot_first", resume_checkpoint, null);
+    const streaming_status = try metadata_table_manager.cloneReplicationSourceStatus(
+        alloc,
+        status_sink.latest(),
+    );
+    defer metadata_table_manager.freeReplicationSourceStatus(alloc, streaming_status);
+    const resume_checkpoint = if (streaming_status.stream_checkpoint.len > 0)
+        streaming_status.stream_checkpoint
+    else
+        null;
+    const second_stream = try stream_runner.runTableSourceFromCheckpoint(
+        &status_sink,
+        table,
+        0,
+        1,
+        streaming_status.cutover_mode,
+        resume_checkpoint,
+        streaming_status,
+    );
     try std.testing.expectEqual(@as(usize, 1), second_stream.changes_applied);
     try std.testing.expectEqualStrings("streaming", status_sink.latest().phase);
 
