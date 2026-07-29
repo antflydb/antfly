@@ -38,6 +38,7 @@ const ttl_mod = @import("../ttl.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
 const graph_mod = @import("../../graph/graph.zig");
+const NodeAdmission = @import("../../graph/node_admission.zig").NodeAdmission;
 const graph_pattern_mod = @import("../../graph/pattern.zig");
 const paths_mod = @import("../../graph/paths.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
@@ -1095,6 +1096,7 @@ pub const DBCore = struct {
         max_depth: u32,
         min_weight: f64,
         max_weight: f64,
+        node_admission: ?NodeAdmission,
     ) !?paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try paths_mod.findShortestPath(alloc, &entry.index, source, target, .{
@@ -1104,6 +1106,7 @@ pub const DBCore = struct {
             .max_depth = max_depth,
             .min_weight = min_weight,
             .max_weight = max_weight,
+            .node_admission = node_admission,
         });
     }
 
@@ -1120,6 +1123,7 @@ pub const DBCore = struct {
         max_depth: u32,
         min_weight: f64,
         max_weight: f64,
+        node_admission: ?NodeAdmission,
     ) ![]paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try paths_mod.findKShortestPaths(alloc, &entry.index, source, target, k, .{
@@ -1129,6 +1133,7 @@ pub const DBCore = struct {
             .max_depth = max_depth,
             .min_weight = min_weight,
             .max_weight = max_weight,
+            .node_admission = node_admission,
         });
     }
 

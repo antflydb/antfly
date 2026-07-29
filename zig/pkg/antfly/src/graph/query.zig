@@ -24,6 +24,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
+const NodeAdmission = @import("node_admission.zig").NodeAdmission;
 const pattern_mod = @import("pattern.zig");
 const traversal_mod = @import("traversal.zig");
 const paths_mod = @import("paths.zig");
@@ -167,6 +168,7 @@ pub const GraphQueryResult = struct {
 
 pub const GraphQueryEngine = struct {
     alloc: Allocator,
+    node_admission: ?NodeAdmission = null,
 
     /// Execute a graph query. For result_ref node selectors, the caller must
     /// resolve refs to keys and pass them as resolved_keys.
@@ -196,7 +198,7 @@ pub const GraphQueryEngine = struct {
         start_keys: []const []const u8,
         target_keys: []const []const u8,
     ) !GraphQueryResult {
-        if (algebraicTraversalConsidered(graph_index, params)) {
+        if (self.node_admission == null and algebraicTraversalConsidered(graph_index, params)) {
             graph_index.noteAlgebraicTraversalAttempt();
             const proof = algebraicTraversalProof(graph_index, params);
             if (proof.safe()) {
@@ -219,7 +221,10 @@ pub const GraphQueryEngine = struct {
             .max_results = params.max_results,
             .deduplicate = params.deduplicate,
             .include_paths = params.include_paths,
+            .node_admission = self.node_admission,
         };
+        const admitted_starts = try self.admittedStartKeysAlloc(start_keys, params.direction);
+        defer if (admitted_starts) |mask| self.alloc.free(mask);
 
         var all_results = std.ArrayListUnmanaged(GraphResultNode).empty;
         var cleanup_results = true;
@@ -235,7 +240,8 @@ pub const GraphQueryEngine = struct {
             seen.deinit(self.alloc);
         }
 
-        for (start_keys) |key| {
+        for (start_keys, 0..) |key, start_index| {
+            if (admitted_starts) |mask| if (!mask[start_index]) continue;
             const trav_results = try traversal_mod.traverse(self.alloc, graph_index, key, rules);
             defer traversal_mod.freeOwnedResults(self.alloc, trav_results);
 
@@ -336,7 +342,7 @@ pub const GraphQueryEngine = struct {
         start_keys: []const []const u8,
     ) !GraphQueryResult {
         const target_keys = resolveTargetKeys(gq);
-        if (algebraicTraversalConsidered(graph_index, gq.params)) {
+        if (self.node_admission == null and algebraicTraversalConsidered(graph_index, gq.params)) {
             graph_index.noteAlgebraicTraversalAttempt();
             if (try self.executeAlgebraicShortestPath(graph_index, gq.params, start_keys, target_keys)) |result| {
                 graph_index.noteAlgebraicTraversalProven(result.nodes.len);
@@ -356,7 +362,10 @@ pub const GraphQueryEngine = struct {
             .max_depth = gq.params.max_depth,
             .min_weight = gq.params.min_weight,
             .max_weight = gq.params.max_weight,
+            .node_admission = self.node_admission,
         };
+        const admitted_starts = try self.admittedStartKeysAlloc(start_keys, gq.params.direction);
+        defer if (admitted_starts) |mask| self.alloc.free(mask);
 
         var all_results = std.ArrayListUnmanaged(GraphResultNode).empty;
         errdefer {
@@ -364,7 +373,8 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         }
 
-        for (start_keys) |sk| {
+        for (start_keys, 0..) |sk, start_index| {
+            if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |tk| {
                 const path = try paths_mod.findShortestPath(self.alloc, graph_index, sk, tk, opts);
                 if (path) |p| {
@@ -436,7 +446,7 @@ pub const GraphQueryEngine = struct {
         start_keys: []const []const u8,
     ) !GraphQueryResult {
         const target_keys = resolveTargetKeys(gq);
-        if (gq.k == 1) {
+        if (self.node_admission == null and gq.k == 1) {
             if (try self.executeAlgebraicShortestPath(graph_index, gq.params, start_keys, target_keys)) |result| return result;
         }
 
@@ -447,7 +457,10 @@ pub const GraphQueryEngine = struct {
             .max_depth = gq.params.max_depth,
             .min_weight = gq.params.min_weight,
             .max_weight = gq.params.max_weight,
+            .node_admission = self.node_admission,
         };
+        const admitted_starts = try self.admittedStartKeysAlloc(start_keys, gq.params.direction);
+        defer if (admitted_starts) |mask| self.alloc.free(mask);
 
         var all_results = std.ArrayListUnmanaged(GraphResultNode).empty;
         errdefer {
@@ -455,7 +468,8 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         }
 
-        for (start_keys) |sk| {
+        for (start_keys, 0..) |sk, start_index| {
+            if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |tk| {
                 const found = try paths_mod.findKShortestPaths(self.alloc, graph_index, sk, tk, gq.k, opts);
                 defer paths_mod.freePaths(self.alloc, found);
@@ -477,17 +491,19 @@ pub const GraphQueryEngine = struct {
         gq: GraphQuery,
         start_keys: []const []const u8,
     ) !GraphQueryResult {
-        if (algebraicPatternPlan(gq)) |plan_for_status| {
-            if (algebraicTraversalConsidered(graph_index, plan_for_status.params)) {
-                graph_index.noteAlgebraicTraversalAttempt();
-                if (try self.executeAlgebraicPattern(graph_index, gq, start_keys)) |result| {
-                    graph_index.noteAlgebraicTraversalProven(result.nodes.len);
-                    return result;
-                }
-                if (algebraicTraversalProof(graph_index, plan_for_status.params).safe()) {
-                    graph_index.noteAlgebraicTraversalFallback();
-                } else {
-                    graph_index.noteAlgebraicTraversalRejected();
+        if (self.node_admission == null) {
+            if (algebraicPatternPlan(gq)) |plan_for_status| {
+                if (algebraicTraversalConsidered(graph_index, plan_for_status.params)) {
+                    graph_index.noteAlgebraicTraversalAttempt();
+                    if (try self.executeAlgebraicPattern(graph_index, gq, start_keys)) |result| {
+                        graph_index.noteAlgebraicTraversalProven(result.nodes.len);
+                        return result;
+                    }
+                    if (algebraicTraversalProof(graph_index, plan_for_status.params).safe()) {
+                        graph_index.noteAlgebraicTraversalFallback();
+                    } else {
+                        graph_index.noteAlgebraicTraversalRejected();
+                    }
                 }
             }
         }
@@ -500,12 +516,36 @@ pub const GraphQueryEngine = struct {
             .{
                 .max_results = gq.params.max_results,
                 .return_aliases = gq.return_aliases,
+                .node_admission = self.node_admission,
             },
         );
         errdefer pattern_mod.freeMatches(self.alloc, matches);
 
         const owned_nodes = try collectUniqueNodesFromMatches(self.alloc, matches);
         return .{ .nodes = owned_nodes, .matches = matches };
+    }
+
+    fn admittedStartKeysAlloc(
+        self: *GraphQueryEngine,
+        start_keys: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+    ) !?[]bool {
+        const admission = self.node_admission orelse return null;
+        // A document-model graph may still contain resolver-produced
+        // cross-table targets identified only by edge metadata. Let the graph
+        // algorithm classify reverse and bidirectional starts in that case.
+        // Bidirectional starts are role-ambiguous even for a statically
+        // external target model, so classify them against actual edges.
+        if (direction == .both or
+            (direction == .in and !admission.external_targets))
+        {
+            return null;
+        }
+        return try admission.filterKeysAlloc(
+            self.alloc,
+            start_keys,
+            admission.external_targets and direction == .in,
+        );
     }
 
     fn executeAlgebraicPattern(

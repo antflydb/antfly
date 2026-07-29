@@ -26,6 +26,8 @@ const graph_mod = @import("graph.zig");
 const Edge = graph_mod.Edge;
 const EdgeDirection = graph_mod.EdgeDirection;
 const GraphIndex = graph_mod.GraphIndex;
+const NodeAdmission = @import("node_admission.zig").NodeAdmission;
+const NodeRef = @import("node_admission.zig").NodeRef;
 
 // ============================================================================
 // Traversal types
@@ -40,6 +42,7 @@ pub const TraversalRules = struct {
     max_results: u32 = 100,
     deduplicate: bool = true,
     include_paths: bool = false,
+    node_admission: ?NodeAdmission = null,
 };
 
 pub const TraversalResult = struct {
@@ -83,6 +86,12 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
     errdefer {
         freeResults(alloc, results.items);
         results.deinit(alloc);
+    }
+
+    if (rules.node_admission) |admission| {
+        if (!try startNodeAdmitted(alloc, graph_index, start_key, rules.direction, admission)) {
+            return try results.toOwnedSlice(alloc);
+        }
     }
 
     var visited = std.StringHashMapUnmanaged(void).empty;
@@ -176,17 +185,47 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
         const edges = try graph_index.getEdges(alloc, current.key, "", rules.direction);
         defer GraphIndex.freeEdges(alloc, edges);
 
-        for (edges) |edge| {
-            if (!shouldTraverseEdge(&rules, &edge)) continue;
+        const admitted_edges = if (rules.node_admission) |admission| blk: {
+            const edge_mask = try alloc.alloc(bool, edges.len);
+            @memset(edge_mask, false);
+            errdefer alloc.free(edge_mask);
+            var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
+            defer candidate_indexes.deinit(alloc);
+            var candidate_nodes = std.ArrayListUnmanaged(NodeRef).empty;
+            defer candidate_nodes.deinit(alloc);
+            try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
+            try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
+            for (edges, 0..) |edge, edge_index| {
+                if (!shouldTraverseEdge(&rules, &edge)) continue;
+                const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
+                if (rules.deduplicate and visited.contains(next_key)) continue;
+                candidate_indexes.appendAssumeCapacity(edge_index);
+                candidate_nodes.appendAssumeCapacity(.{
+                    .key = next_key,
+                    .external = std.mem.eql(u8, next_key, edge.target) and
+                        (admission.external_targets or
+                            metadataTargetTable(edge.metadata) != null),
+                });
+            }
+            const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
+            defer alloc.free(candidate_mask);
+            for (candidate_indexes.items, candidate_mask) |edge_index, allowed| {
+                edge_mask[edge_index] = allowed;
+            }
+            break :blk edge_mask;
+        } else null;
+        defer if (admitted_edges) |mask| alloc.free(mask);
 
-            // Determine next node
+        for (edges, 0..) |edge, edge_index| {
             const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
 
-            // Dedup check
-            if (rules.deduplicate) {
-                if (visited.contains(next_key)) continue;
-                try visited.put(alloc, try alloc.dupe(u8, next_key), {});
+            if (admitted_edges) |mask| {
+                if (!mask[edge_index]) continue;
+            } else {
+                if (!shouldTraverseEdge(&rules, &edge)) continue;
             }
+            if (rules.deduplicate and visited.contains(next_key)) continue;
+            if (rules.deduplicate) try visited.put(alloc, try alloc.dupe(u8, next_key), {});
 
             // Build path for next node
             var next_path: ?std.ArrayListUnmanaged([]const u8) = null;
@@ -228,6 +267,34 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
     const owned = try alloc.dupe(TraversalResult, results.items);
     results.deinit(alloc);
     return owned;
+}
+
+/// Admit a traversal start according to the role it plays in this direction.
+/// Resolver-produced cross-table targets are identified from incoming edge
+/// metadata only after normal local admission rejects the key.
+pub fn startNodeAdmitted(
+    alloc: Allocator,
+    graph_index: *GraphIndex,
+    start_key: []const u8,
+    direction: EdgeDirection,
+    admission: NodeAdmission,
+) !bool {
+    const statically_external = admission.external_targets and direction == .in;
+    const keys = [_][]const u8{start_key};
+    const admitted = try admission.filterKeysAlloc(alloc, &keys, statically_external);
+    defer alloc.free(admitted);
+    if (admitted[0] or statically_external or direction == .out) return admitted[0];
+
+    const incoming = try graph_index.getEdges(alloc, start_key, "", .in);
+    defer GraphIndex.freeEdges(alloc, incoming);
+    for (incoming) |edge| {
+        if (std.mem.eql(u8, edge.target, start_key) and
+            (admission.external_targets or metadataTargetTable(edge.metadata) != null))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn shouldTraverseEdge(rules: *const TraversalRules, edge: *const Edge) bool {

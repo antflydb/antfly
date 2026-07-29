@@ -23,6 +23,7 @@ const platform_time = @import("antfly_platform").time;
 const query_api = @import("query.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
 const json_helpers = @import("json_helpers.zig");
+const wildcard_mod = @import("../search/wildcard.zig");
 
 const AgentDecision = metadata_openapi.AgentDecision;
 const AgentQuestion = metadata_openapi.AgentQuestion;
@@ -212,6 +213,20 @@ pub const QueryRunner = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    pub const KeyPage = struct {
+        /// Owned keys in strictly ascending byte order, all greater than the
+        /// requested cursor.
+        keys: []const []const u8,
+        /// True only when no later matching key exists.
+        exhausted: bool,
+
+        pub fn deinit(self: *KeyPage, alloc: std.mem.Allocator) void {
+            for (self.keys) |key| alloc.free(key);
+            if (self.keys.len > 0) alloc.free(self.keys);
+            self.* = undefined;
+        }
+    };
+
     pub const VTable = struct {
         run_query: *const fn (
             ptr: *anyopaque,
@@ -219,13 +234,15 @@ pub const QueryRunner = struct {
             table_name: []const u8,
             query_json: []const u8,
         ) anyerror!query_api.QueryResponse,
-        scan_keys: ?*const fn (
+        scan_key_page: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
+            after_key: []const u8,
+            limit: u32,
             filter_query_json: ?[]const u8,
             exclusion_query_json: ?[]const u8,
-        ) anyerror![]const []const u8 = null,
+        ) anyerror!KeyPage = null,
     };
 
     pub fn runQuery(
@@ -237,18 +254,22 @@ pub const QueryRunner = struct {
         return try self.vtable.run_query(self.ptr, alloc, table_name, query_json);
     }
 
-    pub fn scanKeys(
+    pub fn scanKeyPage(
         self: QueryRunner,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        after_key: []const u8,
+        limit: u32,
         filter_query_json: ?[]const u8,
         exclusion_query_json: ?[]const u8,
-    ) ![]const []const u8 {
-        const fn_ptr = self.vtable.scan_keys orelse return error.UnsupportedRetrievalAgentRequest;
+    ) !KeyPage {
+        const fn_ptr = self.vtable.scan_key_page orelse return error.UnsupportedRetrievalAgentRequest;
         return try fn_ptr(
             self.ptr,
             alloc,
             table_name,
+            after_key,
+            limit,
             filter_query_json,
             exclusion_query_json,
         );
@@ -5399,7 +5420,11 @@ fn encodeQueryValueForRetrievalQuery(
 
     var query_request = parsed.value;
     applyClassificationRefinement(&query_request, classification_result, retrieval_query_index, refinement_pass);
-    try applyMandatoryPredicates(arena, &query_request, mandatory_predicates);
+    // The raw query predicates are already folded into the table-wide
+    // mandatory set. Install that canonical set instead of conjoining the
+    // source query a second time on every refinement pass.
+    query_request.filter_query = mandatory_predicates.filter_query;
+    query_request.exclusion_query = mandatory_predicates.exclusion_query;
     if (retrieval_query.tree_search) |tree_search| {
         if (query_request.graph_searches != null) return error.UnsupportedRetrievalAgentRequest;
         query_request.graph_searches = try buildTreeGraphSearches(
@@ -5492,11 +5517,15 @@ fn predicateForAccumulatedFilter(
     }
     if (std.mem.eql(u8, operation, "prefix") or std.mem.eql(u8, operation, "contains")) {
         if (filter.value != .string) return error.InvalidRetrievalAgentRequest;
+        if (filter.value.string.len == 0) return error.InvalidRetrievalAgentRequest;
         const root = if (std.mem.eql(u8, operation, "prefix")) "prefix" else "wildcard";
-        const value = if (std.mem.eql(u8, operation, "contains"))
-            std.json.Value{ .string = try std.fmt.allocPrint(alloc, "*{s}*", .{filter.value.string}) }
-        else
-            filter.value;
+        const value = if (std.mem.eql(u8, operation, "contains")) blk: {
+            const escaped = try wildcard_mod.escapeLiteralAlloc(alloc, filter.value.string);
+            defer alloc.free(escaped);
+            break :blk std.json.Value{
+                .string = try std.fmt.allocPrint(alloc, "*{s}*", .{escaped}),
+            };
+        } else filter.value;
         return .{ .filter_query = try explicitFieldPredicate(
             alloc,
             root,
@@ -5873,6 +5902,10 @@ fn discoverTreeRootKeys(
     filter_query: ?std.json.Value,
     exclusion_query: ?std.json.Value,
 ) ![]const []const u8 {
+    const scan_page_size: u32 = 64;
+    const max_root_keys: usize = 4096;
+    const max_scanned_keys: usize = 4096;
+
     const filter_query_json = if (filter_query) |value|
         try std.json.Stringify.valueAlloc(alloc, value, .{})
     else
@@ -5884,72 +5917,118 @@ fn discoverTreeRootKeys(
         null;
     defer if (exclusion_query_json) |value| alloc.free(value);
 
-    const all_keys = try runner.scanKeys(
-        alloc,
-        table_name,
-        filter_query_json,
-        exclusion_query_json,
-    );
-    defer {
-        for (all_keys) |key| alloc.free(key);
-        alloc.free(all_keys);
-    }
     var roots = std.ArrayListUnmanaged([]const u8).empty;
-    defer roots.deinit(alloc);
+    errdefer {
+        for (roots.items) |key| alloc.free(key);
+        roots.deinit(alloc);
+    }
+    var after_key: ?[]u8 = null;
+    defer if (after_key) |key| alloc.free(key);
+    var scanned_keys: usize = 0;
 
-    for (all_keys) |key| {
-        if (!try treeNodeHasIncomingEdges(
+    while (true) {
+        var page = try runner.scanKeyPage(
+            alloc,
+            table_name,
+            after_key orelse "",
+            scan_page_size,
+            filter_query_json,
+            exclusion_query_json,
+        );
+        defer page.deinit(alloc);
+        if (page.keys.len == 0) {
+            if (!page.exhausted) return error.InvalidRetrievalAgentRequest;
+            break;
+        }
+        if (page.keys.len > max_scanned_keys - scanned_keys) {
+            return error.TreeRootDiscoveryBudgetExceeded;
+        }
+        scanned_keys += page.keys.len;
+
+        var previous_key: ?[]const u8 = after_key;
+        for (page.keys) |key| {
+            if (previous_key) |previous| {
+                if (std.mem.order(u8, key, previous) != .gt) {
+                    return error.InvalidRetrievalAgentRequest;
+                }
+            }
+            previous_key = key;
+        }
+        const incoming = try treeNodesHaveIncomingEdges(
             alloc,
             runner,
             table_name,
             index_name,
-            key,
+            page.keys,
             filter_query,
             exclusion_query,
-        )) {
+        );
+        defer alloc.free(incoming);
+        for (page.keys, incoming) |key, has_incoming| {
+            if (has_incoming) continue;
+            if (roots.items.len >= max_root_keys) return error.TreeRootSetTooLarge;
             try roots.append(alloc, try alloc.dupe(u8, key));
         }
-    }
 
-    // During fresh tree-index bring-up, incoming-edge probes can briefly lag the
-    // document scan even after the write path returns. If root detection is
-    // temporarily ambiguous, seed traversal from every visible document instead
-    // of collapsing "$roots" into an empty search.
-    if (roots.items.len == 0 and all_keys.len > 0) {
-        for (all_keys) |key| {
-            try roots.append(alloc, try alloc.dupe(u8, key));
-        }
+        const next_after = try alloc.dupe(u8, page.keys[page.keys.len - 1]);
+        if (after_key) |cursor| alloc.free(cursor);
+        after_key = next_after;
+        if (page.exhausted) break;
     }
 
     return try roots.toOwnedSlice(alloc);
 }
 
-fn treeNodeHasIncomingEdges(
+fn treeNodesHaveIncomingEdges(
     alloc: std.mem.Allocator,
     runner: QueryRunner,
     table_name: []const u8,
     index_name: []const u8,
-    key: []const u8,
+    keys: []const []const u8,
     filter_query: ?std.json.Value,
     exclusion_query: ?std.json.Value,
-) !bool {
+) ![]bool {
+    const result = try alloc.alloc(bool, keys.len);
+    errdefer alloc.free(result);
+    @memset(result, false);
+    if (keys.len == 0) return result;
+
     var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
     defer graph_searches.deinit(alloc);
-    try graph_searches.map.put(alloc, "incoming", .{
-        .type = .neighbors,
-        .index_name = index_name,
-        .start_nodes = .{ .keys = @constCast((&[_][]const u8{key})[0..]) },
-        .params = .{
-            .direction = .in,
-            .max_results = 1,
-        },
-    });
+    const query_names = try alloc.alloc([]u8, keys.len);
+    var query_names_initialized: usize = 0;
+    defer {
+        for (query_names[0..query_names_initialized]) |name| alloc.free(name);
+        alloc.free(query_names);
+    }
+    const selector_keys = try alloc.alloc([][]const u8, keys.len);
+    var selector_keys_initialized: usize = 0;
+    defer {
+        for (selector_keys[0..selector_keys_initialized]) |selector| alloc.free(selector);
+        alloc.free(selector_keys);
+    }
+    for (keys, 0..) |key, i| {
+        query_names[i] = try std.fmt.allocPrint(alloc, "incoming_{d}", .{i});
+        query_names_initialized += 1;
+        selector_keys[i] = try alloc.alloc([]const u8, 1);
+        selector_keys_initialized += 1;
+        selector_keys[i][0] = key;
+        try graph_searches.map.put(alloc, query_names[i], .{
+            .type = .neighbors,
+            .index_name = index_name,
+            .start_nodes = .{ .keys = @constCast(selector_keys[i]) },
+            .params = .{
+                .direction = .in,
+                .max_results = 1,
+            },
+        });
+    }
 
     const body = try std.json.Stringify.valueAlloc(alloc, QueryRequest{
         .graph_searches = graph_searches,
         .filter_query = filter_query,
         .exclusion_query = exclusion_query,
-        .limit = 1,
+        .limit = @intCast(keys.len),
     }, .{});
     defer alloc.free(body);
 
@@ -5960,22 +6039,25 @@ fn treeNodeHasIncomingEdges(
         return error.InvalidRetrievalAgentRequest;
     };
     defer parsed.deinit();
-    return graphResponsesHaveHits(parsed.value);
+    for (query_names, 0..) |query_name, i| {
+        result[i] = try namedGraphResponseHasHits(parsed.value, query_name);
+    }
+    return result;
 }
 
-fn graphResponsesHaveHits(responses: QueryResponses) bool {
-    const query_responses = responses.responses orelse return false;
+fn namedGraphResponseHasHits(responses: QueryResponses, query_name: []const u8) !bool {
+    const query_responses = responses.responses orelse return error.InvalidRetrievalAgentRequest;
+    var found = false;
     for (query_responses) |response| {
         const graph_results = response.graph_results orelse continue;
-        var it = graph_results.map.iterator();
-        while (it.next()) |entry| {
-            const value = entry.value_ptr.*;
-            if (value.total > 0) return true;
-            if (value.nodes) |nodes| if (nodes.len > 0) return true;
-            if (value.paths) |paths| if (paths.len > 0) return true;
-            if (value.matches) |matches| if (matches.len > 0) return true;
-        }
+        const value = graph_results.map.get(query_name) orelse continue;
+        found = true;
+        if (value.total > 0) return true;
+        if (value.nodes) |nodes| if (nodes.len > 0) return true;
+        if (value.paths) |paths| if (paths.len > 0) return true;
+        if (value.matches) |matches| if (matches.len > 0) return true;
     }
+    if (!found) return error.InvalidRetrievalAgentRequest;
     return false;
 }
 
@@ -6477,26 +6559,30 @@ test "retrieval agent supports roots tree search" {
                 .ptr = undefined,
                 .vtable = &.{
                     .run_query = runQuery,
-                    .scan_keys = scanKeys,
+                    .scan_key_page = scanKeyPage,
                 },
             };
         }
 
-        fn scanKeys(
+        fn scanKeyPage(
             _: *anyopaque,
             alloc: std.mem.Allocator,
             _: []const u8,
+            after_key: []const u8,
+            limit: u32,
             filter_query_json: ?[]const u8,
             exclusion_query_json: ?[]const u8,
-        ) ![]const []const u8 {
+        ) !QueryRunner.KeyPage {
+            try std.testing.expectEqualStrings("", after_key);
+            try std.testing.expectEqual(@as(u32, 64), limit);
             try std.testing.expect(filter_query_json != null);
             try std.testing.expect(exclusion_query_json != null);
             try std.testing.expect(std.mem.indexOf(u8, filter_query_json.?, "\"tenant\":\"visible\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, exclusion_query_json.?, "\"classification\":\"hidden\"") != null);
             const keys = try alloc.alloc([]const u8, 2);
-            keys[0] = try alloc.dupe(u8, "doc:root");
-            keys[1] = try alloc.dupe(u8, "doc:child");
-            return keys;
+            keys[0] = try alloc.dupe(u8, "doc:child");
+            keys[1] = try alloc.dupe(u8, "doc:root");
+            return .{ .keys = keys, .exhausted = true };
         }
 
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, query_json: []const u8) !query_api.QueryResponse {
@@ -6505,20 +6591,11 @@ test "retrieval agent supports roots tree search" {
             try std.testing.expect(parsed_query.value.filter_query != null);
             try std.testing.expect(parsed_query.value.exclusion_query != null);
             if (parsed_query.value.graph_searches) |graph_searches| {
-                if (graph_searches.map.get("incoming") != null) {
-                    const start_nodes = graph_searches.map.get("incoming").?.start_nodes.?;
-                    if (start_nodes.keys) |keys| {
-                        if (keys.len == 1 and std.mem.eql(u8, keys[0], "doc:root")) {
-                            return .{
-                                .json = try alloc.dupe(u8,
-                                    \\{"responses":[{"status":200,"took":1,"graph_results":{"incoming":{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":1}}}]}
-                                ),
-                            };
-                        }
-                    }
+                if (graph_searches.map.get("incoming_0") != null) {
+                    try std.testing.expect(graph_searches.map.get("incoming_1") != null);
                     return .{
                         .json = try alloc.dupe(u8,
-                            \\{"responses":[{"status":200,"took":1,"graph_results":{"incoming":{"type":"neighbors","nodes":[{"key":"doc:root","depth":1,"document":{"title":"root"}}],"paths":[],"total":1,"took":1}}}]}
+                            \\{"responses":[{"status":200,"took":1,"graph_results":{"incoming_0":{"type":"neighbors","nodes":[{"key":"doc:root","depth":1,"document":{"title":"root"}}],"paths":[],"total":1,"took":1},"incoming_1":{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":1}}}]}
                         ),
                     };
                 }
@@ -6609,6 +6686,66 @@ test "retrieval agent applies table predicates and accumulated filters to siblin
 
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tenant\":\"visible\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"status\":\"active\"") != null);
+}
+
+test "retrieval agent installs canonical mandatory predicates once" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const raw_json =
+        \\{"table":"docs","filter_query":{"term":{"tenant":"visible"}},"exclusion_query":{"term":{"classification":"hidden"}},"limit":5}
+    ;
+    var raw = try std.json.parseFromSlice(std.json.Value, alloc, raw_json, .{});
+    defer raw.deinit();
+    var declared = try parseJsonBody(RetrievalQueryRequest, alloc, raw_json);
+    defer declared.deinit();
+    const queries = [_]RetrievalQueryRequest{declared.value};
+    const mandatory = try buildMandatoryPredicates(arena, &queries, &.{});
+
+    const encoded = try encodeQueryValueForRetrievalQuery(
+        alloc,
+        ValidationOnlyRunner.iface(),
+        raw.value,
+        declared.value,
+        mandatory[0],
+        &.{},
+        null,
+        0,
+        .initial,
+    );
+    defer alloc.free(encoded);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, encoded, "\"tenant\""));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, encoded, "\"classification\""));
+}
+
+test "retrieval contains filter treats wildcard operators as literals" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const alloc = arena_impl.allocator();
+    var value = try std.json.parseFromSlice(std.json.Value, alloc, "\"a*?\\\\b\"", .{});
+    defer value.deinit();
+
+    const predicate = try predicateForAccumulatedFilter(alloc, .{
+        .field = "title",
+        .operator = "contains",
+        .value = value.value,
+    });
+    const wildcard = predicate.filter_query.?.object.get("wildcard") orelse return error.TestUnexpectedResult;
+    const pattern = wildcard.object.get("pattern") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*a\\*\\?\\\\b*", pattern.string);
+    try std.testing.expect(wildcard_mod.match(pattern.string, "prefix a*?\\b suffix"));
+    try std.testing.expect(!wildcard_mod.match(pattern.string, "prefix axxb suffix"));
+
+    var empty = try std.json.parseFromSlice(std.json.Value, alloc, "\"\"", .{});
+    defer empty.deinit();
+    try std.testing.expectError(error.InvalidRetrievalAgentRequest, predicateForAccumulatedFilter(alloc, .{
+        .field = "title",
+        .operator = "contains",
+        .value = empty.value,
+    }));
 }
 
 test "retrieval session id remains a correlation identifier with mandatory predicates" {

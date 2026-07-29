@@ -31,6 +31,9 @@ const graph_mod = @import("graph.zig");
 const Edge = graph_mod.Edge;
 const EdgeDirection = graph_mod.EdgeDirection;
 const GraphIndex = graph_mod.GraphIndex;
+const NodeAdmission = @import("node_admission.zig").NodeAdmission;
+const NodeRef = @import("node_admission.zig").NodeRef;
+const traversal_mod = @import("traversal.zig");
 
 // ============================================================================
 // Types
@@ -45,6 +48,7 @@ pub const PathFindOptions = struct {
     max_depth: u32 = 50,
     min_weight: f64 = 0.0,
     max_weight: f64 = 0.0, // 0 = no limit
+    node_admission: ?NodeAdmission = null,
 };
 
 pub const PathEdge = struct {
@@ -131,6 +135,12 @@ pub fn findShortestPathWithExclusions(
     excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
     excluded_edges: ?*const std.StringHashMapUnmanaged(void),
 ) !?Path {
+    if (opts.node_admission) |admission| {
+        if (!try traversal_mod.startNodeAdmitted(alloc, graph_index, source, opts.direction, admission)) {
+            return null;
+        }
+    }
+
     // Same source and target — trivial path
     if (std.mem.eql(u8, source, target)) {
         const node = try alloc.dupe(u8, source);
@@ -213,21 +223,56 @@ fn bfsShortestPath(
         const edges = try graph_index.getEdges(alloc, current.key, "", opts.direction);
         defer GraphIndex.freeEdges(alloc, edges);
 
-        for (edges) |edge| {
-            if (!shouldTraverseEdge(opts, &edge)) continue;
+        const admitted_edges = if (opts.node_admission) |admission| blk: {
+            const edge_mask = try alloc.alloc(bool, edges.len);
+            @memset(edge_mask, false);
+            errdefer alloc.free(edge_mask);
+            var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
+            defer candidate_indexes.deinit(alloc);
+            var candidate_nodes = std.ArrayListUnmanaged(NodeRef).empty;
+            defer candidate_nodes.deinit(alloc);
+            try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
+            try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
+            for (edges, 0..) |edge, edge_index| {
+                if (!shouldTraverseEdge(opts, &edge)) continue;
+                const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
+                if (excluded_nodes) |en| if (en.contains(next_key)) continue;
+                if (excluded_edges) |ee| {
+                    var edge_key_buf: [2048]u8 = undefined;
+                    const ek = makeEdgeExclusionKey(&edge_key_buf, edge.source, edge.target, edge.edge_type);
+                    if (ee.contains(ek)) continue;
+                }
+                if (visited.contains(next_key)) continue;
+                candidate_indexes.appendAssumeCapacity(edge_index);
+                candidate_nodes.appendAssumeCapacity(.{
+                    .key = next_key,
+                    .external = std.mem.eql(u8, next_key, edge.target) and
+                        (admission.external_targets or
+                            traversal_mod.metadataTargetTable(edge.metadata) != null),
+                });
+            }
+            const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
+            defer alloc.free(candidate_mask);
+            for (candidate_indexes.items, candidate_mask) |edge_index, allowed| {
+                edge_mask[edge_index] = allowed;
+            }
+            break :blk edge_mask;
+        } else null;
+        defer if (admitted_edges) |mask| alloc.free(mask);
 
+        for (edges, 0..) |edge, edge_index| {
             const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
-
-            // Check exclusions
-            if (excluded_nodes) |en| {
-                if (en.contains(next_key)) continue;
+            if (admitted_edges) |mask| {
+                if (!mask[edge_index]) continue;
+            } else {
+                if (!shouldTraverseEdge(opts, &edge)) continue;
+                if (excluded_nodes) |en| if (en.contains(next_key)) continue;
+                if (excluded_edges) |ee| {
+                    var edge_key_buf: [2048]u8 = undefined;
+                    const ek = makeEdgeExclusionKey(&edge_key_buf, edge.source, edge.target, edge.edge_type);
+                    if (ee.contains(ek)) continue;
+                }
             }
-            if (excluded_edges) |ee| {
-                var edge_key_buf: [2048]u8 = undefined;
-                const ek = makeEdgeExclusionKey(&edge_key_buf, edge.source, edge.target, edge.edge_type);
-                if (ee.contains(ek)) continue;
-            }
-
             if (visited.contains(next_key)) continue;
             try visited.put(alloc, try alloc.dupe(u8, next_key), {});
 
@@ -327,18 +372,54 @@ fn dijkstraPath(
         const edges = try graph_index.getEdges(alloc, current.key, "", opts.direction);
         defer GraphIndex.freeEdges(alloc, edges);
 
-        for (edges) |edge| {
-            if (!shouldTraverseEdge(opts, &edge)) continue;
-
-            const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
-
-            if (excluded_nodes) |en| {
-                if (en.contains(next_key)) continue;
+        const admitted_edges = if (opts.node_admission) |admission| blk: {
+            const edge_mask = try alloc.alloc(bool, edges.len);
+            @memset(edge_mask, false);
+            errdefer alloc.free(edge_mask);
+            var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
+            defer candidate_indexes.deinit(alloc);
+            var candidate_nodes = std.ArrayListUnmanaged(NodeRef).empty;
+            defer candidate_nodes.deinit(alloc);
+            try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
+            try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
+            for (edges, 0..) |edge, edge_index| {
+                if (!shouldTraverseEdge(opts, &edge)) continue;
+                const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
+                if (excluded_nodes) |en| if (en.contains(next_key)) continue;
+                if (excluded_edges) |ee| {
+                    var edge_key_buf: [2048]u8 = undefined;
+                    const ek = makeEdgeExclusionKey(&edge_key_buf, edge.source, edge.target, edge.edge_type);
+                    if (ee.contains(ek)) continue;
+                }
+                candidate_indexes.appendAssumeCapacity(edge_index);
+                candidate_nodes.appendAssumeCapacity(.{
+                    .key = next_key,
+                    .external = std.mem.eql(u8, next_key, edge.target) and
+                        (admission.external_targets or
+                            traversal_mod.metadataTargetTable(edge.metadata) != null),
+                });
             }
-            if (excluded_edges) |ee| {
-                var edge_key_buf: [2048]u8 = undefined;
-                const ek = makeEdgeExclusionKey(&edge_key_buf, edge.source, edge.target, edge.edge_type);
-                if (ee.contains(ek)) continue;
+            const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
+            defer alloc.free(candidate_mask);
+            for (candidate_indexes.items, candidate_mask) |edge_index, allowed| {
+                edge_mask[edge_index] = allowed;
+            }
+            break :blk edge_mask;
+        } else null;
+        defer if (admitted_edges) |mask| alloc.free(mask);
+
+        for (edges, 0..) |edge, edge_index| {
+            const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
+            if (admitted_edges) |mask| {
+                if (!mask[edge_index]) continue;
+            } else {
+                if (!shouldTraverseEdge(opts, &edge)) continue;
+                if (excluded_nodes) |en| if (en.contains(next_key)) continue;
+                if (excluded_edges) |ee| {
+                    var edge_key_buf: [2048]u8 = undefined;
+                    const ek = makeEdgeExclusionKey(&edge_key_buf, edge.source, edge.target, edge.edge_type);
+                    if (ee.contains(ek)) continue;
+                }
             }
 
             const new_dist = switch (opts.weight_mode) {

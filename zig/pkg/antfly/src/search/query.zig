@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const wildcard_mod = @import("wildcard.zig");
 const roaring = @import("../encoding/roaring.zig");
 const inverted = @import("../section/inverted.zig");
 const segment_mod = @import("../segment.zig");
@@ -1494,31 +1495,7 @@ pub const WildcardFilter = struct {
 /// Match a glob pattern against a string.
 /// `*` matches zero or more characters, `?` matches exactly one character.
 fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
-    var pi: usize = 0;
-    var ti: usize = 0;
-    var star_pi: ?usize = null;
-    var star_ti: usize = 0;
-
-    while (ti < text.len) {
-        if (pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == text[ti])) {
-            pi += 1;
-            ti += 1;
-        } else if (pi < pattern.len and pattern[pi] == '*') {
-            star_pi = pi;
-            star_ti = ti;
-            pi += 1;
-        } else if (star_pi) |sp| {
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-
-    // Consume trailing *'s
-    while (pi < pattern.len and pattern[pi] == '*') pi += 1;
-    return pi == pattern.len;
+    return wildcard_mod.match(pattern, text);
 }
 
 /// Document ID filter: matches documents by their stored document ID.

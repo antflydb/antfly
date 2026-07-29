@@ -119,6 +119,8 @@ const scraping = if (builtin.os.tag == .freestanding or build_options.bench_mini
 else
     @import("antfly_scraping");
 const graph_mod = @import("../../graph/graph.zig");
+const NodeAdmission = @import("../../graph/node_admission.zig").NodeAdmission;
+const GraphNodeRef = @import("../../graph/node_admission.zig").NodeRef;
 const traversal_mod = @import("../../graph/traversal.zig");
 const paths_mod = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
@@ -13434,6 +13436,7 @@ pub const DB = struct {
             max_depth,
             min_weight,
             max_weight,
+            null,
         );
     }
 
@@ -13472,6 +13475,7 @@ pub const DB = struct {
             max_depth,
             min_weight,
             max_weight,
+            null,
         );
     }
 
@@ -13574,6 +13578,27 @@ pub const DB = struct {
         max_results: u32,
         return_aliases: []const []const u8,
     ) ![]graph_pattern_mod.PatternMatch {
+        return try self.matchPatternWithNodeAdmission(
+            alloc,
+            index_name,
+            start_keys,
+            pattern,
+            max_results,
+            return_aliases,
+            null,
+        );
+    }
+
+    fn matchPatternWithNodeAdmission(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        start_keys: []const []const u8,
+        pattern: []const graph_pattern_mod.PatternStep,
+        max_results: u32,
+        return_aliases: []const []const u8,
+        node_admission: ?NodeAdmission,
+    ) ![]graph_pattern_mod.PatternMatch {
         if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
         var filter_ctx = PatternNodeFilterContext.init(self, alloc);
         defer filter_ctx.deinit();
@@ -13584,6 +13609,7 @@ pub const DB = struct {
                 .ctx = &filter_ctx,
                 .func = patternNodeFilterEvaluator,
             },
+            .node_admission = node_admission,
         });
     }
 
@@ -13610,6 +13636,9 @@ pub const DB = struct {
         hit_ids: []const []const u8,
         generation: ?u64,
     ) ![]types.SearchHit {
+        const ordinals = try self.lookupLiveDocOrdinalsNoLock(alloc, hit_ids, generation);
+        defer alloc.free(ordinals);
+
         const hits = try alloc.alloc(types.SearchHit, hit_ids.len);
         var initialized: usize = 0;
         errdefer {
@@ -13619,7 +13648,7 @@ pub const DB = struct {
         for (hit_ids, 0..) |hit_id, j| {
             hits[j] = .{
                 .id = try alloc.dupe(u8, hit_id),
-                .doc_ordinal = try self.lookupLiveDocOrdinalNoLock(alloc, hit_id, generation),
+                .doc_ordinal = ordinals[j],
                 .score = null,
                 .stored_data = null,
                 .chunk_hits = &.{},
@@ -21430,9 +21459,21 @@ pub const DB = struct {
 
     fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
         _ = req.index_name;
+        const predicate_aware = db_query_graph.searchRequestHasGraphPredicates(req);
+        var admission = GraphNodeAdmissionCache.init(self, alloc, req, graph_query.index_name);
+        defer admission.deinit();
+        var execution = GraphPredicateExecutionContext{
+            .db = self,
+            .admission = &admission,
+        };
         var raw = try db_query_graph.executeSearchGraph(alloc, req, graph_query, base_hits, .{
             .ctx = self,
-            .execute_graph_query = executeSearchGraphQueryCallback,
+            .graph_ctx = if (predicate_aware) &execution else null,
+            .predicate_aware = predicate_aware,
+            .execute_graph_query = if (predicate_aware)
+                executeSearchGraphQueryWithAdmissionCallback
+            else
+                executeSearchGraphQueryCallback,
             .load_projected_document = loadProjectedSearchDocumentCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
             .filter_keys = filterGraphKeysCallback,
@@ -21480,13 +21521,38 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
     ) !types.GraphSearchResult {
+        const predicate_aware = db_query_graph.searchRequestHasGraphPredicates(req);
+        var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name);
+        defer admission.deinit();
+        var execution = GraphPredicateExecutionContext{
+            .db = self,
+            .admission = &admission,
+        };
         var result = switch (named.query.query_type) {
-            .pattern => try self.executeSinglePatternQueryWithSets(alloc, req, named, named_sets),
+            .pattern => try self.executeSinglePatternQueryWithSetsWithContext(
+                alloc,
+                req,
+                named,
+                named_sets,
+                &execution,
+                predicate_aware,
+            ),
             else => try db_query_graph.executeSingleNonPatternQueryWithSets(alloc, req, named, named_sets, .{
                 .ctx = self,
-                .find_shortest_path = executeShortestPathCallback,
-                .find_k_shortest_paths = executeKShortestPathsCallback,
-                .execute_graph_query = executeGraphQueryCallback,
+                .graph_ctx = if (predicate_aware) &execution else null,
+                .predicate_aware = predicate_aware,
+                .find_shortest_path = if (predicate_aware)
+                    executeShortestPathWithAdmissionCallback
+                else
+                    executeShortestPathCallback,
+                .find_k_shortest_paths = if (predicate_aware)
+                    executeKShortestPathsWithAdmissionCallback
+                else
+                    executeKShortestPathsCallback,
+                .execute_graph_query = if (predicate_aware)
+                    executeGraphQueryWithAdmissionCallback
+                else
+                    executeGraphQueryCallback,
                 .load_projected_document = loadProjectedSearchDocumentCallback,
                 .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
                 .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
@@ -21504,9 +21570,25 @@ pub const DB = struct {
         req: types.SearchRequest,
         hits: []types.SearchHit,
     ) !void {
+        var missing_ids = std.ArrayListUnmanaged([]const u8).empty;
+        defer missing_ids.deinit(alloc);
+        for (hits) |hit| {
+            if (hit.doc_ordinal == null) try missing_ids.append(alloc, hit.id);
+        }
+        if (missing_ids.items.len == 0) return;
+
+        const ordinals = try self.lookupLiveDocOrdinalsNoLock(
+            alloc,
+            missing_ids.items,
+            req.identity_read_generation,
+        );
+        defer alloc.free(ordinals);
+
+        var ordinal_index: usize = 0;
         for (hits) |*hit| {
             if (hit.doc_ordinal != null) continue;
-            hit.doc_ordinal = try self.lookupLiveDocOrdinalNoLock(alloc, hit.id, req.identity_read_generation);
+            hit.doc_ordinal = ordinals[ordinal_index];
+            ordinal_index += 1;
         }
     }
 
@@ -21574,9 +21656,40 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
     ) !types.GraphSearchResult {
+        const predicate_aware = db_query_graph.searchRequestHasGraphPredicates(req);
+        var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name);
+        defer admission.deinit();
+        var execution = GraphPredicateExecutionContext{
+            .db = self,
+            .admission = &admission,
+        };
+        return try self.executeSinglePatternQueryWithSetsWithContext(
+            alloc,
+            req,
+            named,
+            named_sets,
+            &execution,
+            predicate_aware,
+        );
+    }
+
+    fn executeSinglePatternQueryWithSetsWithContext(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        named: *const types.NamedGraphQuery,
+        named_sets: []const NamedResultSet,
+        execution: *GraphPredicateExecutionContext,
+        predicate_aware: bool,
+    ) !types.GraphSearchResult {
         return try db_query_graph.executeSinglePatternQueryWithSets(alloc, req, named, named_sets, .{
             .ctx = self,
-            .match_pattern = executePatternMatchCallback,
+            .graph_ctx = if (predicate_aware) execution else null,
+            .predicate_aware = predicate_aware,
+            .match_pattern = if (predicate_aware)
+                executePatternMatchWithAdmissionCallback
+            else
+                executePatternMatchCallback,
             .load_projected_document = loadPatternProjectedDocumentCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
@@ -21591,23 +21704,46 @@ pub const DB = struct {
         keys: []const []const u8,
     ) anyerror![]bool {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        var hits = try alloc.alloc(types.SearchHit, keys.len);
+        return try self.filterGraphKeysAlloc(alloc, req, keys);
+    }
+
+    fn filterGraphKeysAlloc(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) ![]bool {
+        const ordinals = try self.lookupLiveDocOrdinalsNoLock(
+            alloc,
+            keys,
+            req.identity_read_generation,
+        );
+        defer alloc.free(ordinals);
+
+        var live_count: usize = 0;
+        for (ordinals) |ordinal| {
+            if (ordinal != null) live_count += 1;
+        }
+
+        const mask = try alloc.alloc(bool, keys.len);
+        errdefer alloc.free(mask);
+        @memset(mask, false);
+        if (live_count == 0) return mask;
+
+        var hits = try alloc.alloc(types.SearchHit, live_count);
         var initialized: usize = 0;
-        errdefer {
+        var hits_owned = true;
+        errdefer if (hits_owned) {
             for (hits[0..initialized]) |*hit| hit.deinit(alloc);
             if (hits.len > 0) alloc.free(hits);
-        }
-        for (keys, 0..) |key, i| {
+        };
+        for (keys, ordinals) |key, maybe_ordinal| {
+            const ordinal = maybe_ordinal orelse continue;
             const id = try alloc.dupe(u8, key);
             errdefer alloc.free(id);
-            const doc_ordinal = try self.lookupLiveDocOrdinalNoLock(
-                alloc,
-                key,
-                req.identity_read_generation,
-            );
-            hits[i] = .{
+            hits[initialized] = .{
                 .id = id,
-                .doc_ordinal = doc_ordinal,
+                .doc_ordinal = ordinal,
                 .score = 1.0,
                 .stored_data = null,
             };
@@ -21626,12 +21762,12 @@ pub const DB = struct {
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
         });
+        hits_owned = false;
         defer filtered.deinit();
 
-        const mask = try alloc.alloc(bool, keys.len);
-        errdefer alloc.free(mask);
         var filtered_index: usize = 0;
-        for (keys, 0..) |key, i| {
+        for (keys, ordinals, 0..) |key, maybe_ordinal, i| {
+            if (maybe_ordinal == null) continue;
             const allowed = filtered_index < filtered.hits.len and
                 std.mem.eql(u8, key, filtered.hits[filtered_index].id);
             mask[i] = allowed;
@@ -21640,6 +21776,102 @@ pub const DB = struct {
         if (filtered_index != filtered.hits.len) return error.InvalidQueryResult;
         return mask;
     }
+
+    const GraphPredicateExecutionContext = struct {
+        db: *DB,
+        admission: *GraphNodeAdmissionCache,
+    };
+
+    const GraphNodeAdmissionCache = struct {
+        db: *DB,
+        req: types.SearchRequest,
+        alloc: Allocator,
+        external_targets: bool,
+        decisions: std.StringHashMapUnmanaged(bool) = .empty,
+
+        fn init(
+            db: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            index_name: []const u8,
+        ) GraphNodeAdmissionCache {
+            const artifact_source = db.core.index_manager.graphArtifactSource(index_name);
+            return .{
+                .db = db,
+                .req = req,
+                .alloc = alloc,
+                .external_targets = artifact_source != null and
+                    artifact_source.?.mapping.node_model == .external,
+            };
+        }
+
+        fn deinit(self: *GraphNodeAdmissionCache) void {
+            var it = self.decisions.keyIterator();
+            while (it.next()) |key| self.alloc.free(key.*);
+            self.decisions.deinit(self.alloc);
+            self.* = undefined;
+        }
+
+        fn iface(self: *GraphNodeAdmissionCache) NodeAdmission {
+            return .{
+                .ctx = self,
+                .external_targets = self.external_targets,
+                .filter_many = filterMany,
+            };
+        }
+
+        fn filterMany(
+            ctx: ?*anyopaque,
+            result_alloc: Allocator,
+            nodes: []const GraphNodeRef,
+        ) anyerror![]bool {
+            const self: *GraphNodeAdmissionCache = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const result = try result_alloc.alloc(bool, nodes.len);
+            errdefer result_alloc.free(result);
+
+            var missing_by_key = std.StringHashMapUnmanaged(void).empty;
+            defer missing_by_key.deinit(result_alloc);
+            var missing_keys = std.ArrayListUnmanaged([]const u8).empty;
+            defer missing_keys.deinit(result_alloc);
+
+            for (nodes) |node| {
+                if (node.external) continue;
+                const key = node.key;
+                if (self.decisions.contains(key)) continue;
+                const entry = try missing_by_key.getOrPut(result_alloc, key);
+                if (entry.found_existing) continue;
+                entry.value_ptr.* = {};
+                try missing_keys.append(result_alloc, key);
+            }
+
+            if (missing_keys.items.len > 0) {
+                const missing_mask = try self.db.filterGraphKeysAlloc(
+                    result_alloc,
+                    self.req,
+                    missing_keys.items,
+                );
+                defer result_alloc.free(missing_mask);
+                if (missing_mask.len != missing_keys.items.len) {
+                    return error.InvalidGraphNodeAdmissionResult;
+                }
+                for (missing_keys.items, missing_mask) |key, allowed| {
+                    const owned_key = try self.alloc.dupe(u8, key);
+                    self.decisions.putNoClobber(self.alloc, owned_key, allowed) catch |err| {
+                        self.alloc.free(owned_key);
+                        return err;
+                    };
+                }
+            }
+
+            for (nodes, 0..) |node, i| {
+                result[i] = if (node.external)
+                    true
+                else
+                    self.decisions.get(node.key) orelse return error.InvalidGraphNodeAdmissionResult;
+            }
+            return result;
+        }
+    };
 
     fn executePatternMatchCallback(
         ctx: ?*anyopaque,
@@ -21655,6 +21887,24 @@ pub const DB = struct {
             named.query.pattern,
             named.query.params.max_results,
             named.query.return_aliases,
+        );
+    }
+
+    fn executePatternMatchWithAdmissionCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        start_key_refs: []const []const u8,
+    ) anyerror![]graph_pattern_mod.PatternMatch {
+        const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try execution.db.matchPatternWithNodeAdmission(
+            alloc,
+            named.query.index_name,
+            start_key_refs,
+            named.query.pattern,
+            named.query.params.max_results,
+            named.query.return_aliases,
+            execution.admission.iface(),
         );
     }
 
@@ -21696,6 +21946,29 @@ pub const DB = struct {
         );
     }
 
+    fn executeShortestPathWithAdmissionCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        source: []const u8,
+        target: []const u8,
+    ) anyerror!?types.GraphPath {
+        const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try execution.db.core.graphFindShortestPath(
+            alloc,
+            named.query.index_name,
+            source,
+            target,
+            named.query.params.edge_types,
+            named.query.params.direction,
+            named.query.params.weight_mode,
+            named.query.params.max_depth,
+            named.query.params.min_weight,
+            named.query.params.max_weight,
+            execution.admission.iface(),
+        );
+    }
+
     fn executeKShortestPathsCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -21719,6 +21992,30 @@ pub const DB = struct {
         );
     }
 
+    fn executeKShortestPathsWithAdmissionCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        source: []const u8,
+        target: []const u8,
+    ) anyerror![]types.GraphPath {
+        const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try execution.db.core.graphFindKShortestPaths(
+            alloc,
+            named.query.index_name,
+            source,
+            target,
+            named.query.k,
+            named.query.params.edge_types,
+            named.query.params.direction,
+            named.query.params.weight_mode,
+            named.query.params.max_depth,
+            named.query.params.min_weight,
+            named.query.params.max_weight,
+            execution.admission.iface(),
+        );
+    }
+
     fn executeGraphQueryCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -21728,6 +22025,24 @@ pub const DB = struct {
     ) anyerror!graph_query_mod.GraphQueryResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try executeGraphQueryWithTargets(self, alloc, named.query, start_key_refs, target_keys);
+    }
+
+    fn executeGraphQueryWithAdmissionCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        start_key_refs: []const []const u8,
+        target_keys: [][]u8,
+    ) anyerror!graph_query_mod.GraphQueryResult {
+        const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try executeGraphQueryWithAdmission(
+            execution.db,
+            alloc,
+            named.query,
+            start_key_refs,
+            target_keys,
+            execution.admission.iface(),
+        );
     }
 
     fn loadProjectedSearchDocumentCallback(
@@ -21804,6 +22119,24 @@ pub const DB = struct {
         return try executeGraphQueryWithTargets(self, alloc, graph_query, start_key_refs, target_keys);
     }
 
+    fn executeSearchGraphQueryWithAdmissionCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        graph_query: graph_query_mod.GraphQuery,
+        start_key_refs: []const []const u8,
+        target_keys: [][]u8,
+    ) anyerror!graph_query_mod.GraphQueryResult {
+        const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try executeGraphQueryWithAdmission(
+            execution.db,
+            alloc,
+            graph_query,
+            start_key_refs,
+            target_keys,
+            execution.admission.iface(),
+        );
+    }
+
     fn searchGraphWithSets(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, named_sets: []const NamedResultSet) !types.SearchResult {
         _ = req.index_name;
 
@@ -21822,9 +22155,21 @@ pub const DB = struct {
                 .graph_results = graph_results,
             };
         }
+        const predicate_aware = db_query_graph.searchRequestHasGraphPredicates(req);
+        var admission = GraphNodeAdmissionCache.init(self, alloc, req, graph_query.index_name);
+        defer admission.deinit();
+        var execution = GraphPredicateExecutionContext{
+            .db = self,
+            .admission = &admission,
+        };
         const raw = try db_query_graph.executeSearchGraphWithSets(alloc, req, graph_query, named_sets, .{
             .ctx = self,
-            .execute_graph_query = executeSearchGraphQueryCallback,
+            .graph_ctx = if (predicate_aware) &execution else null,
+            .predicate_aware = predicate_aware,
+            .execute_graph_query = if (predicate_aware)
+                executeSearchGraphQueryWithAdmissionCallback
+            else
+                executeSearchGraphQueryCallback,
             .load_projected_document = loadProjectedSearchDocumentCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
             .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
@@ -21873,6 +22218,37 @@ pub const DB = struct {
         };
 
         var graph_engine = graph_query_mod.GraphQueryEngine{ .alloc = alloc };
+        return try graph_engine.execute(&entry.index, resolved_query, start_key_refs);
+    }
+
+    fn executeGraphQueryWithAdmission(
+        self: *DB,
+        alloc: Allocator,
+        graph_query: graph_query_mod.GraphQuery,
+        start_key_refs: []const []const u8,
+        target_keys: [][]u8,
+        admission: NodeAdmission,
+    ) !graph_query_mod.GraphQueryResult {
+        const entry = self.core.graphIndex(graph_query.index_name) orelse {
+            try self.failIfIndexQuarantined(graph_query.index_name);
+            return error.IndexNotFound;
+        };
+
+        var resolved_query = graph_query;
+        if (graph_query.target_nodes != null) {
+            resolved_query.target_nodes = .{ .keys = try castOwnedKeysToConst(alloc, target_keys) };
+        }
+        defer if (graph_query.target_nodes != null) {
+            switch (resolved_query.target_nodes.?) {
+                .keys => |owned| alloc.free(owned),
+                .result_ref => unreachable,
+            }
+        };
+
+        var graph_engine = graph_query_mod.GraphQueryEngine{
+            .alloc = alloc,
+            .node_admission = admission,
+        };
         return try graph_engine.execute(&entry.index, resolved_query, start_key_refs);
     }
 
@@ -44824,7 +45200,7 @@ test "db graph hydration fails closed for a not-yet-promoted entity node" {
         .writes = &.{.{
             .key = "doc:a",
             .value =
-            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            \\{"tenant":"visible","relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
             ,
         }},
         .sync_level = .enrichments,
@@ -44859,6 +45235,52 @@ test "db graph hydration fails closed for a not-yet-promoted entity node" {
         try std.testing.expectEqualStrings("person/ada_lovelace", nodes[0].key);
         try std.testing.expect(nodes[0].table != null);
         try std.testing.expectEqualStrings("entities", nodes[0].table.?);
+    }
+
+    // Resolver targets are cross-table even when the graph's default node model
+    // is document. Reverse traversal admits that external start by edge role,
+    // while still enforcing the source-table predicate on the reached document.
+    {
+        var result = try db.search(alloc, .{
+            .graph_queries = &.{.{
+                .name = "reverse_mentions",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "prov_graph",
+                    .start_nodes = .{ .keys = &.{"person/ada_lovelace"} },
+                    .params = .{
+                        .edge_types = &.{"mentions"},
+                        .direction = .in,
+                        .max_depth = 1,
+                    },
+                },
+            }},
+            .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
+        try std.testing.expectEqualStrings("doc:a", result.graph_results[0].nodes[0].key);
+    }
+    {
+        var result = try db.search(alloc, .{
+            .graph_queries = &.{.{
+                .name = "bidirectional_mentions",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "prov_graph",
+                    .start_nodes = .{ .keys = &.{"person/ada_lovelace"} },
+                    .params = .{
+                        .edge_types = &.{"mentions"},
+                        .direction = .both,
+                        .max_depth = 1,
+                    },
+                },
+            }},
+            .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
+        try std.testing.expectEqualStrings("doc:a", result.graph_results[0].nodes[0].key);
     }
 
     // Once the entity document exists (promoter wrote it; here co-located for the
@@ -45377,7 +45799,7 @@ test "db graph artifact external node targets return ids without document hydrat
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"entity_id\":\"entity:person:ada_lovelace\"}}]}}" },
+            .{ .key = "doc:a", .value = "{\"tenant\":\"visible\",\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"entity_id\":\"entity:person:ada_lovelace\"}}]}}" },
         },
         .sync_level = .enrichments,
     });
@@ -45405,6 +45827,48 @@ test "db graph artifact external node targets return ids without document hydrat
     try std.testing.expectEqualStrings("entity:person:ada_lovelace", result.graph_results[0].hits[0].id);
     try std.testing.expect(result.graph_results[0].hits[0].stored_data == null);
     try std.testing.expect(result.graph_results[0].hits[0].doc_ordinal == null);
+
+    var reverse = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "mentioned_by",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "relations_graph",
+                    .start_nodes = .{ .keys = &.{"entity:person:ada_lovelace"} },
+                    .params = .{ .direction = .in, .edge_types = &.{"mentions"} },
+                    .include_documents = true,
+                },
+            },
+        },
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer reverse.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), reverse.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("doc:a", reverse.graph_results[0].hits[0].id);
+    try std.testing.expect(reverse.graph_results[0].hits[0].stored_data != null);
+
+    var bidirectional = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "connected",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "relations_graph",
+                    .start_nodes = .{ .keys = &.{"entity:person:ada_lovelace"} },
+                    .params = .{ .direction = .both, .edge_types = &.{"mentions"} },
+                },
+            },
+        },
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer bidirectional.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), bidirectional.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("doc:a", bidirectional.graph_results[0].nodes[0].key);
 }
 
 test "db async asset producer graph source materializes through replay" {
@@ -66873,6 +67337,61 @@ test "db search supports graph-only named queries" {
     try std.testing.expect(stats.doc_set_planning.ordinal_list_docs >= 1);
 }
 
+test "db unfiltered graph search retains algebraic execution" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "gr_alg",
+        .kind = .graph,
+        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
+    });
+    try db.batch(.{
+        .graph_writes = &.{
+            .{ .index_name = "gr_alg", .source = "n:a", .target = "n:b", .edge_type = "links" },
+            .{ .index_name = "gr_alg", .source = "n:a", .target = "n:c", .edge_type = "links" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var result = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "neighbors",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "gr_alg",
+                    .start_nodes = .{ .keys = &.{"n:a"} },
+                    .params = .{
+                        .direction = .out,
+                        .edge_types = &.{"links"},
+                        .max_results = 0,
+                    },
+                },
+            },
+        },
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), result.graph_results[0].total_hits);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    for (stats.indexes) |item| {
+        if (!std.mem.eql(u8, item.name, "gr_alg")) continue;
+        try std.testing.expectEqual(@as(u64, 1), item.algebraic_graph_traversal_attempt_count);
+        try std.testing.expectEqual(@as(u64, 1), item.algebraic_graph_traversal_proven_count);
+        return;
+    }
+    return error.TestExpectedEqual;
+}
+
 test "db graph search filters result nodes and hidden traversal intermediates" {
     const alloc = std.testing.allocator;
 
@@ -66910,10 +67429,10 @@ test "db graph search filters result nodes and hidden traversal intermediates" {
         &db,
         alloc,
         .{ .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}" },
-        &.{ "n:a", "n:b", "n:c", "n:d" },
+        &.{ "n:a", "n:b", "n:c", "n:d", "n:missing" },
     );
     defer alloc.free(graph_key_mask);
-    try std.testing.expectEqualSlices(bool, &.{ true, false, true, true }, graph_key_mask);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true, true, false }, graph_key_mask);
 
     var result = try db.search(alloc, .{
         .graph_queries = &.{
@@ -66970,6 +67489,147 @@ test "db graph search filters result nodes and hidden traversal intermediates" {
     try std.testing.expectEqual(@as(usize, 1), direct.hits.len);
     try std.testing.expectEqualStrings("n:d", direct.hits[0].id);
     try std.testing.expect(direct.hits[0].stored_data != null);
+
+    var bounded = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "bounded_links",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "gr_v1",
+                    .start_nodes = .{ .keys = &.{"n:a"} },
+                    .params = .{
+                        .direction = .out,
+                        .edge_types = &.{"links"},
+                        .max_depth = 1,
+                        .max_results = 1,
+                    },
+                },
+            },
+        },
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer bounded.deinit();
+    try std.testing.expectEqual(@as(u32, 1), bounded.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("n:d", bounded.graph_results[0].nodes[0].key);
+
+    var pattern = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "bounded_pattern",
+                .query = .{
+                    .query_type = .pattern,
+                    .index_name = "gr_v1",
+                    .start_nodes = .{ .keys = &.{"n:a"} },
+                    .params = .{ .max_results = 1 },
+                    .pattern = &.{
+                        .{ .alias = "source" },
+                        .{
+                            .alias = "target",
+                            .edge = .{
+                                .direction = .out,
+                                .types = &.{"links"},
+                            },
+                        },
+                    },
+                    .return_aliases = &.{ "source", "target" },
+                },
+            },
+        },
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer pattern.deinit();
+    try std.testing.expectEqual(@as(u32, 1), pattern.graph_results[0].total_hits);
+    try std.testing.expectEqual(@as(usize, 1), pattern.graph_results[0].matches.len);
+    var matched_visible_target = false;
+    for (pattern.graph_results[0].matches[0].bindings) |binding| {
+        if (std.mem.eql(u8, binding.alias, "target")) {
+            try std.testing.expectEqualStrings("n:d", binding.node.key);
+            matched_visible_target = true;
+        }
+    }
+    try std.testing.expect(matched_visible_target);
+
+    var hidden_start = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "hidden_start",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "gr_v1",
+                    .start_nodes = .{ .keys = &.{"n:b"} },
+                    .params = .{
+                        .direction = .out,
+                        .edge_types = &.{"links"},
+                    },
+                },
+            },
+        },
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer hidden_start.deinit();
+    try std.testing.expectEqual(@as(u32, 0), hidden_start.graph_results[0].total_hits);
+}
+
+test "db graph shortest path searches through admitted alternatives" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "n:a", .value = "{\"tenant\":\"visible\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:b\"},{\"target\":\"n:d\"}]}}}" },
+            .{ .key = "n:b", .value = "{\"tenant\":\"hidden\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:c\"}]}}}" },
+            .{ .key = "n:c", .value = "{\"tenant\":\"visible\"}" },
+            .{ .key = "n:d", .value = "{\"tenant\":\"visible\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:e\"}]}}}" },
+            .{ .key = "n:e", .value = "{\"tenant\":\"visible\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:c\"}]}}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var result = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "visible_path",
+                .query = .{
+                    .query_type = .shortest_path,
+                    .index_name = "gr_v1",
+                    .start_nodes = .{ .keys = &.{"n:a"} },
+                    .target_nodes = .{ .keys = &.{"n:c"} },
+                    .params = .{
+                        .direction = .out,
+                        .edge_types = &.{"links"},
+                        .max_depth = 4,
+                    },
+                },
+            },
+        },
+        .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+        .limit = 10,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results[0].paths.len);
+    try std.testing.expectEqual(@as(u32, 3), result.graph_results[0].paths[0].length);
+    try std.testing.expectEqual(@as(usize, 4), result.graph_results[0].paths[0].nodes.len);
+    try std.testing.expectEqualStrings("n:a", result.graph_results[0].paths[0].nodes[0]);
+    try std.testing.expectEqualStrings("n:d", result.graph_results[0].paths[0].nodes[1]);
+    try std.testing.expectEqualStrings("n:e", result.graph_results[0].paths[0].nodes[2]);
+    try std.testing.expectEqualStrings("n:c", result.graph_results[0].paths[0].nodes[3]);
 }
 
 test "db named graph input sets carry resolved doc sets" {

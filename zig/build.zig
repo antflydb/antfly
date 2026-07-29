@@ -3266,6 +3266,17 @@ pub fn build(b: *std.Build) void {
         "retrieval agent treats aggregations as first-class tool capability",
         "retrieval agent requires filter and aggregate tools for filtered aggregations",
         "retrieval agent ignores empty map-valued tool fields for policy and strategy",
+        "retrieval agent supports roots tree search",
+        "retrieval agent installs canonical mandatory predicates once",
+        "retrieval contains filter treats wildcard operators as literals",
+        "wildcard matching distinguishes operators from escaped literals",
+        "wildcard literal escaping round trips metacharacters",
+        "algebraic wildcard helpers preserve escaped literals",
+        "db unfiltered graph search retains algebraic execution",
+        "db graph search filters result nodes and hidden traversal intermediates",
+        "db graph shortest path searches through admitted alternatives",
+        "db graph artifact external node targets return ids without document hydration",
+        "db graph hydration fails closed for a not-yet-promoted entity node",
     };
     const lib_unit_filters = selectTestFilters(b, &lib_unit_default_filters);
     const lib_unit_tests = b.addTest(.{

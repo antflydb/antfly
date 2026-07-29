@@ -40,6 +40,7 @@ const derived_types = @import("../derived/derived_types.zig");
 const regex_mod = @import("../../../search/regex.zig");
 const levenshtein_mod = @import("../../../search/levenshtein.zig");
 const geo_mod = @import("../../../search/geo.zig");
+const wildcard_mod = @import("../../../search/wildcard.zig");
 
 const namespace_prefix = "\x00\x00__algebraic__:";
 pub const path_fact_exists_constraint_value = "pathfact-exists:v1";
@@ -17302,40 +17303,29 @@ fn rangeFieldAcceptsKind(field_type: []const u8, kind: RangeKind) bool {
 
 fn wildcardLiteralPrefix(pattern: []const u8) []const u8 {
     for (pattern, 0..) |ch, i| {
-        if (ch == '*' or ch == '?') return pattern[0..i];
+        // An escaped byte cannot be represented in a borrowed literal-prefix
+        // slice without its quoting backslash. Stop before it; the shorter
+        // prefix remains safe and the matcher performs the exact check.
+        if (ch == '\\' or ch == '*' or ch == '?') return pattern[0..i];
     }
     return pattern;
 }
 
 fn wildcardPatternHasMeta(pattern: []const u8) bool {
-    return std.mem.indexOfAny(u8, pattern, "*?") != null;
+    // Escape syntax also requires wildcard evaluation: an exact dictionary
+    // lookup of the encoded pattern would look for the quoting backslashes.
+    return std.mem.indexOfAny(u8, pattern, "\\*?") != null;
 }
 
 fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
-    var pi: usize = 0;
-    var ti: usize = 0;
-    var star_pi: ?usize = null;
-    var star_ti: usize = 0;
+    return wildcard_mod.match(pattern, text);
+}
 
-    while (ti < text.len) {
-        if (pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == text[ti])) {
-            pi += 1;
-            ti += 1;
-        } else if (pi < pattern.len and pattern[pi] == '*') {
-            star_pi = pi;
-            star_ti = ti;
-            pi += 1;
-        } else if (star_pi) |sp| {
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-
-    while (pi < pattern.len and pattern[pi] == '*') pi += 1;
-    return pi == pattern.len;
+test "algebraic wildcard helpers preserve escaped literals" {
+    try std.testing.expect(wildcardMatch("foo\\*bar", "foo*bar"));
+    try std.testing.expect(!wildcardMatch("foo\\*bar", "fooxbar"));
+    try std.testing.expectEqualStrings("foo", wildcardLiteralPrefix("foo\\*bar"));
+    try std.testing.expect(wildcardPatternHasMeta("foo\\*bar"));
 }
 
 fn regexpLiteralPrefix(pattern: []const u8) []const u8 {

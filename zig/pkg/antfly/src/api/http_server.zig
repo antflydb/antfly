@@ -5165,7 +5165,7 @@ pub const ApiHttpServer = struct {
                     .ptr = runner,
                     .vtable = &.{
                         .run_query = runQuery,
-                        .scan_keys = scanKeys,
+                        .scan_key_page = scanKeyPage,
                     },
                 };
             }
@@ -5215,18 +5215,22 @@ pub const ApiHttpServer = struct {
                 }) orelse error.TableNotFound;
             }
 
-            fn scanKeys(
+            fn scanKeyPage(
                 ptr_inner: *anyopaque,
                 inner_alloc: std.mem.Allocator,
                 table_name: []const u8,
+                after_key: []const u8,
+                limit: u32,
                 filter_query_json: ?[]const u8,
                 exclusion_query_json: ?[]const u8,
-            ) ![]const []const u8 {
+            ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                return try runner.server.scanRetrievalKeys(
+                return try runner.server.scanRetrievalKeyPage(
                     inner_alloc,
                     runner.source,
                     table_name,
+                    after_key,
+                    limit,
                     filter_query_json,
                     exclusion_query_json,
                     runner.authenticated_identity,
@@ -5315,6 +5319,14 @@ pub const ApiHttpServer = struct {
         };
         try queue.status(alloc, task_id, context_id, "working", "retrieval started");
         const retrieval_resp = retrieval_agent.executeWithEventSink(alloc, query_runner.iface(), generation_runner.iface(), body, sink.iface()) catch |err| switch (err) {
+            error.TreeRootSetTooLarge => {
+                try queue.status(alloc, task_id, context_id, "failed", "tree root set exceeds the bounded retrieval limit");
+                return;
+            },
+            error.TreeRootDiscoveryBudgetExceeded => {
+                try queue.status(alloc, task_id, context_id, "failed", "tree root discovery exceeded its scan budget; provide explicit roots");
+                return;
+            },
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
                 try queue.status(alloc, task_id, context_id, "failed", "invalid retrieval agent request");
                 return;
@@ -5363,7 +5375,7 @@ pub const ApiHttpServer = struct {
                     .ptr = runner,
                     .vtable = &.{
                         .run_query = runQuery,
-                        .scan_keys = scanKeys,
+                        .scan_key_page = scanKeyPage,
                     },
                 };
             }
@@ -5398,18 +5410,22 @@ pub const ApiHttpServer = struct {
                 }) orelse error.TableNotFound;
             }
 
-            fn scanKeys(
+            fn scanKeyPage(
                 ptr_inner: *anyopaque,
                 alloc: std.mem.Allocator,
                 table_name: []const u8,
+                after_key: []const u8,
+                limit: u32,
                 filter_query_json: ?[]const u8,
                 exclusion_query_json: ?[]const u8,
-            ) ![]const []const u8 {
+            ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                return try runner.server.scanRetrievalKeys(
+                return try runner.server.scanRetrievalKeyPage(
                     alloc,
                     runner.source,
                     table_name,
+                    after_key,
+                    limit,
                     filter_query_json,
                     exclusion_query_json,
                     null,
@@ -5454,6 +5470,8 @@ pub const ApiHttpServer = struct {
             .source = source,
         };
         const retrieval_resp = retrieval_agent.execute(self.alloc, query_runner.iface(), generation_runner.iface(), req.body) catch |err| switch (err) {
+            error.TreeRootSetTooLarge => return try textResponse(self.alloc, 422, "tree root set exceeds the bounded retrieval limit"),
+            error.TreeRootDiscoveryBudgetExceeded => return try textResponse(self.alloc, 422, "tree root discovery exceeded its scan budget; provide explicit roots"),
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => return try textResponse(self.alloc, 400, "invalid retrieval agent request"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
@@ -6485,16 +6503,19 @@ pub const ApiHttpServer = struct {
         return .{ .json = owned, .owned = owned };
     }
 
-    pub fn scanRetrievalKeys(
+    pub fn scanRetrievalKeyPage(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
         source: table_reads.TableReadSource,
         table_name: []const u8,
+        after_key: []const u8,
+        limit: u32,
         filter_query_json: ?[]const u8,
         exclusion_query_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
-    ) ![]const []const u8 {
+    ) !retrieval_agent.QueryRunner.KeyPage {
         _ = self;
+        if (limit == 0) return error.InvalidRetrievalAgentRequest;
         const row_filter_json = try resolveEffectiveRowFilterJson(
             alloc,
             authenticated_identity,
@@ -6513,10 +6534,10 @@ pub const ApiHttpServer = struct {
         var scan = (try source.scan(
             alloc,
             table_name,
-            "",
+            after_key,
             "",
             .{
-                .limit = 0,
+                .limit = limit,
                 .filter_query_json = predicate.json,
             },
             .read_index,
@@ -6536,7 +6557,12 @@ pub const ApiHttpServer = struct {
             errdefer alloc.free(key);
             try keys.append(alloc, key);
         }
-        return try keys.toOwnedSlice(alloc);
+        if (keys.items.len > @as(usize, limit)) return error.InvalidRetrievalAgentRequest;
+        const exhausted = keys.items.len < @as(usize, limit);
+        return .{
+            .keys = try keys.toOwnedSlice(alloc),
+            .exhausted = exhausted,
+        };
     }
 
     pub fn tableExists(self: *ApiHttpServer, table_name: []const u8) !bool {

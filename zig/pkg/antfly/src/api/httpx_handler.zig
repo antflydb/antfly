@@ -1457,7 +1457,7 @@ pub const AntflyApiHandler = struct {
                     .ptr = runner,
                     .vtable = &.{
                         .run_query = runQuery,
-                        .scan_keys = runScanKeys,
+                        .scan_key_page = runScanKeyPage,
                     },
                 };
             }
@@ -1504,18 +1504,22 @@ pub const AntflyApiHandler = struct {
                 }) orelse error.TableNotFound;
             }
 
-            fn runScanKeys(
+            fn runScanKeyPage(
                 ptr: *anyopaque,
                 a: std.mem.Allocator,
                 table_name: []const u8,
+                after_key: []const u8,
+                limit: u32,
                 filter_query_json: ?[]const u8,
                 exclusion_query_json: ?[]const u8,
-            ) ![]const []const u8 {
+            ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                return try runner.server.scanRetrievalKeys(
+                return try runner.server.scanRetrievalKeyPage(
                     a,
                     runner.source,
                     table_name,
+                    after_key,
+                    limit,
                     filter_query_json,
                     exclusion_query_json,
                     runner.authenticated_identity,
@@ -1560,6 +1564,14 @@ pub const AntflyApiHandler = struct {
             .authenticated_identity = authenticated_identity,
         };
         const retrieval_resp = retrieval_agent.execute(alloc, query_runner.iface(), generation_runner.iface(), body_data) catch |err| switch (err) {
+            error.TreeRootSetTooLarge => {
+                _ = ctx.status(422);
+                return ctx.text("tree root set exceeds the bounded retrieval limit");
+            },
+            error.TreeRootDiscoveryBudgetExceeded => {
+                _ = ctx.status(422);
+                return ctx.text("tree root discovery exceeded its scan budget; provide explicit roots");
+            },
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
                 _ = ctx.status(400);
                 return ctx.text("invalid retrieval agent request");

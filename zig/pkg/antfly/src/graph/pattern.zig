@@ -15,7 +15,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const graph_mod = @import("graph.zig");
+const NodeAdmission = @import("node_admission.zig").NodeAdmission;
+const NodeRef = @import("node_admission.zig").NodeRef;
 const paths_mod = @import("paths.zig");
+const traversal_mod = @import("traversal.zig");
 
 pub const NodeFilter = struct {
     filter_prefix: []const u8 = "",
@@ -75,6 +78,7 @@ pub const MatchOptions = struct {
     max_results: u32 = 100,
     return_aliases: []const []const u8 = &.{},
     evaluator: ?FilterEvaluator = null,
+    node_admission: ?NodeAdmission = null,
 };
 
 const MatchState = struct {
@@ -152,7 +156,33 @@ pub fn matchPatternWithEdgeReader(
 
     var first_alias_buf: [32]u8 = undefined;
     const first_alias = effectiveAlias(pattern[0].alias, 0, &first_alias_buf);
-    for (start_keys) |start_key| {
+    const start_direction = if (pattern.len > 1)
+        pattern[1].edge.direction
+    else
+        graph_mod.EdgeDirection.out;
+    const admitted_starts = if (opts.node_admission) |admission| blk: {
+        if (start_direction == .both or
+            (start_direction == .in and !admission.external_targets))
+        {
+            break :blk null;
+        }
+        const starts_external = admission.external_targets and start_direction == .in;
+        break :blk try admission.filterKeysAlloc(alloc, start_keys, starts_external);
+    } else null;
+    defer if (admitted_starts) |mask| alloc.free(mask);
+    for (start_keys, 0..) |start_key, start_index| {
+        if (admitted_starts) |mask| if (!mask[start_index]) continue;
+        if (admitted_starts == null) {
+            if (opts.node_admission) |admission| {
+                if (!try startNodeAdmitted(
+                    alloc,
+                    edge_reader,
+                    start_key,
+                    start_direction,
+                    admission,
+                )) continue;
+            }
+        }
         if (!(try passesNodeFilter(start_key, pattern[0].node_filter, opts.evaluator))) continue;
 
         var bindings = try alloc.alloc(PatternBinding, 1);
@@ -188,7 +218,16 @@ pub fn matchPatternWithEdgeReader(
         for (current.items) |*match| {
             const current_binding = findBinding(match.bindings, prev_alias) orelse continue;
             const cycle_binding = findBinding(match.bindings, step_alias);
-            const reachable = try findReachableNodes(alloc, edge_reader, current_binding.key, step.edge, step.node_filter, opts.max_results, opts.evaluator);
+            const reachable = try findReachableNodes(
+                alloc,
+                edge_reader,
+                current_binding.key,
+                step.edge,
+                step.node_filter,
+                opts.max_results,
+                opts.evaluator,
+                opts.node_admission,
+            );
             defer {
                 for (reachable) |*node| node.deinit(alloc);
                 if (reachable.len > 0) alloc.free(reachable);
@@ -269,6 +308,7 @@ fn findReachableNodes(
     node_filter: NodeFilter,
     max_results: u32,
     evaluator: ?FilterEvaluator,
+    node_admission: ?NodeAdmission,
 ) ![]ReachableNode {
     const min_hops = if (edge.min_hops == 0) @as(u32, 1) else edge.min_hops;
     const max_hops = if (edge.max_hops == 0) @as(u32, 1) else edge.max_hops;
@@ -312,11 +352,45 @@ fn findReachableNodes(
             const edges = try edge_reader.getEdges(alloc, frontier.key, edge.direction);
             defer edge_reader.freeEdges(alloc, edges);
 
-            for (edges) |graph_edge| {
-                if (!edgeMatches(graph_edge, edge)) continue;
-                const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
-                if (std.mem.eql(u8, target_key, frontier.key)) continue;
+            const admitted_edges = if (node_admission) |admission| blk: {
+                const edge_mask = try alloc.alloc(bool, edges.len);
+                @memset(edge_mask, false);
+                errdefer alloc.free(edge_mask);
+                var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
+                defer candidate_indexes.deinit(alloc);
+                var candidate_nodes = std.ArrayListUnmanaged(NodeRef).empty;
+                defer candidate_nodes.deinit(alloc);
+                try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
+                try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
+                for (edges, 0..) |graph_edge, edge_index| {
+                    if (!edgeMatches(graph_edge, edge)) continue;
+                    const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
+                    if (std.mem.eql(u8, target_key, frontier.key)) continue;
+                    candidate_indexes.appendAssumeCapacity(edge_index);
+                    candidate_nodes.appendAssumeCapacity(.{
+                        .key = target_key,
+                        .external = std.mem.eql(u8, target_key, graph_edge.target) and
+                            (admission.external_targets or
+                                traversal_mod.metadataTargetTable(graph_edge.metadata) != null),
+                    });
+                }
+                const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
+                defer alloc.free(candidate_mask);
+                for (candidate_indexes.items, candidate_mask) |edge_index, allowed| {
+                    edge_mask[edge_index] = allowed;
+                }
+                break :blk edge_mask;
+            } else null;
+            defer if (admitted_edges) |mask| alloc.free(mask);
 
+            for (edges, 0..) |graph_edge, edge_index| {
+                const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
+                if (admitted_edges) |mask| {
+                    if (!mask[edge_index]) continue;
+                } else {
+                    if (!edgeMatches(graph_edge, edge)) continue;
+                    if (std.mem.eql(u8, target_key, frontier.key)) continue;
+                }
                 const new_hops = frontier.hops + 1;
                 const new_path = try appendPathEdge(alloc, frontier.path, graph_edge, frontier.key, target_key);
                 errdefer freePathEdges(alloc, new_path);
@@ -353,6 +427,31 @@ fn findReachableNodes(
     }
 
     return try results.toOwnedSlice(alloc);
+}
+
+fn startNodeAdmitted(
+    alloc: Allocator,
+    edge_reader: anytype,
+    start_key: []const u8,
+    direction: graph_mod.EdgeDirection,
+    admission: NodeAdmission,
+) !bool {
+    const keys = [_][]const u8{start_key};
+    const admitted = try admission.filterLocalKeysAlloc(alloc, &keys);
+    defer alloc.free(admitted);
+    if (admitted[0] or direction == .out) return admitted[0];
+
+    const incoming = try edge_reader.getEdges(alloc, start_key, .in);
+    defer edge_reader.freeEdges(alloc, incoming);
+    for (incoming) |graph_edge| {
+        if (std.mem.eql(u8, graph_edge.target, start_key) and
+            (admission.external_targets or
+                traversal_mod.metadataTargetTable(graph_edge.metadata) != null))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn edgeMatches(edge: graph_mod.Edge, step: PatternEdgeStep) bool {
