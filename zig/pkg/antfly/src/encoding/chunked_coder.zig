@@ -456,62 +456,72 @@ pub const ChunkedIntDecoder = struct {
         const num_docs = try readUvarint(chunk_bytes, &offset);
         const num_locs = try readUvarint(chunk_bytes, &offset);
         const num_array_pos = try readUvarint(chunk_bytes, &offset);
+        const num_docs_usize = std.math.cast(usize, num_docs) orelse return error.InvalidChunk;
+        const num_locs_usize = std.math.cast(usize, num_locs) orelse return error.InvalidChunk;
+        const num_array_pos_usize = std.math.cast(usize, num_array_pos) orelse return error.InvalidChunk;
 
         // Read columns
-        const col_counts = try self.readColumn(chunk_bytes, &offset, @intCast(num_docs));
+        const col_counts = try self.readColumn(chunk_bytes, &offset, num_docs_usize);
         defer self.alloc.free(col_counts);
-        const col_field_ids = try self.readColumn(chunk_bytes, &offset, @intCast(num_locs));
+        const col_field_ids = try self.readColumn(chunk_bytes, &offset, num_locs_usize);
         defer self.alloc.free(col_field_ids);
-        const col_positions = try self.readColumn(chunk_bytes, &offset, @intCast(num_locs));
+        const col_positions = try self.readColumn(chunk_bytes, &offset, num_locs_usize);
         defer self.alloc.free(col_positions);
-        const start_deltas = try self.readColumn(chunk_bytes, &offset, @intCast(num_locs));
+        const start_deltas = try self.readColumn(chunk_bytes, &offset, num_locs_usize);
         defer self.alloc.free(start_deltas);
-        const end_deltas = try self.readColumn(chunk_bytes, &offset, @intCast(num_locs));
+        const end_deltas = try self.readColumn(chunk_bytes, &offset, num_locs_usize);
         defer self.alloc.free(end_deltas);
-        const col_num_aps = try self.readColumn(chunk_bytes, &offset, @intCast(num_locs));
+        const col_num_aps = try self.readColumn(chunk_bytes, &offset, num_locs_usize);
         defer self.alloc.free(col_num_aps);
 
         var col_array_pos: []u32 = &.{};
         defer if (col_array_pos.len > 0) self.alloc.free(col_array_pos);
         if (num_array_pos > 0) {
-            col_array_pos = try self.readColumn(chunk_bytes, &offset, @intCast(num_array_pos));
+            col_array_pos = try self.readColumn(chunk_bytes, &offset, num_array_pos_usize);
         }
+        if (offset != chunk_bytes.len) return error.InvalidChunk;
 
         // Delta decode starts and ends
         svb.deltaDecode(start_deltas);
         svb.deltaDecode(end_deltas);
 
         // Reconstruct interleaved format
-        const total_values = @as(usize, @intCast(num_docs)) + @as(usize, @intCast(num_locs)) * 5 + @as(usize, @intCast(num_array_pos));
+        const location_values = std.math.mul(usize, num_locs_usize, 5) catch return error.InvalidChunk;
+        const base_values = std.math.add(usize, num_docs_usize, location_values) catch return error.InvalidChunk;
+        const total_values = std.math.add(usize, base_values, num_array_pos_usize) catch return error.InvalidChunk;
         self.values.clearRetainingCapacity();
         try self.values.ensureTotalCapacity(self.alloc, total_values);
 
         var loc_idx: usize = 0;
         var ap_idx: usize = 0;
-        for (0..@as(usize, @intCast(num_docs))) |doc_idx| {
+        for (0..num_docs_usize) |doc_idx| {
             const count = col_counts[doc_idx];
             self.values.appendAssumeCapacity(count);
 
             var rem: i64 = @intCast(count);
-            while (rem > 0 and loc_idx < @as(usize, @intCast(num_locs))) {
+            while (rem > 0) {
+                if (loc_idx >= num_locs_usize) return error.InvalidChunk;
+                const num_ap: usize = col_num_aps[loc_idx];
+                const location_len = 5 + num_ap;
+                if (location_len > rem) return error.InvalidChunk;
+                if (num_ap > num_array_pos_usize - ap_idx) return error.InvalidChunk;
+
                 self.values.appendAssumeCapacity(col_field_ids[loc_idx]);
                 self.values.appendAssumeCapacity(col_positions[loc_idx]);
                 self.values.appendAssumeCapacity(start_deltas[loc_idx]);
                 self.values.appendAssumeCapacity(end_deltas[loc_idx]);
                 self.values.appendAssumeCapacity(col_num_aps[loc_idx]);
 
-                const num_ap = col_num_aps[loc_idx];
                 for (0..num_ap) |_| {
-                    if (ap_idx < @as(usize, @intCast(num_array_pos))) {
-                        self.values.appendAssumeCapacity(col_array_pos[ap_idx]);
-                        ap_idx += 1;
-                    }
+                    self.values.appendAssumeCapacity(col_array_pos[ap_idx]);
+                    ap_idx += 1;
                 }
 
-                rem -= @as(i64, 5 + @as(i64, @intCast(num_ap)));
+                rem -= @intCast(location_len);
                 loc_idx += 1;
             }
         }
+        if (loc_idx != num_locs_usize or ap_idx != num_array_pos_usize) return error.InvalidChunk;
 
         self.pos = 0;
     }
@@ -708,6 +718,32 @@ test "ChunkedIntEncoder/Decoder with array positions" {
     try std.testing.expectEqual(@as(?u32, 2), dec.readValue()); // numAP
     try std.testing.expectEqual(@as(?u32, 0), dec.readValue()); // arrayPos[0]
     try std.testing.expectEqual(@as(?u32, 1), dec.readValue()); // arrayPos[1]
+}
+
+test "ChunkedIntDecoder rejects inconsistent columnar cardinalities" {
+    const alloc = std.testing.allocator;
+
+    var enc = try ChunkedIntEncoder.init(alloc, 1024, 1);
+    defer enc.deinit();
+    try enc.add(0, &[_]u32{ 7, 2, 5, 50, 60, 2, 0, 1 });
+    try enc.close();
+
+    const bytes = try enc.toBytes();
+    defer alloc.free(bytes);
+
+    var header_pos: usize = 0;
+    _ = try readUvarint(bytes, &header_pos); // numChunks
+    _ = try readUvarint(bytes, &header_pos); // chunk offset
+    try std.testing.expectEqual(@as(u8, @intFromEnum(ChunkFormat.columnar)), bytes[header_pos]);
+    header_pos += 1;
+    _ = try readUvarint(bytes, &header_pos); // numDocs
+    _ = try readUvarint(bytes, &header_pos); // numLocs
+    try std.testing.expectEqual(@as(u8, 2), bytes[header_pos]); // numArrayPos
+    bytes[header_pos] = 1;
+
+    var dec = try ChunkedIntDecoder.init(alloc, bytes, 0);
+    defer dec.deinit();
+    try std.testing.expectError(error.InvalidChunk, dec.loadChunk(0));
 }
 
 test "ChunkedIntEncoder/Decoder multi-chunk" {
