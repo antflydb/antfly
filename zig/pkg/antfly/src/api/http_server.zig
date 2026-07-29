@@ -2260,7 +2260,7 @@ pub const ApiHttpServer = struct {
 
     fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64) anyerror!query_api.QueryResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, execution_deadline_ns, .{ .domain = .internal, .value = "" });
+        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, execution_deadline_ns, .{ .domain = .internal, .value = "" });
     }
 
     fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64) anyerror![]u8 {
@@ -5166,6 +5166,7 @@ pub const ApiHttpServer = struct {
                     .vtable = &.{
                         .run_query = runQuery,
                         .scan_key_page = scanKeyPage,
+                        .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
             }
@@ -5203,6 +5204,9 @@ pub const ApiHttpServer = struct {
                     injectRowFilterIntoSearchRequest(inner_alloc, &query_req.req, value) catch
                         return error.InvalidRetrievalAgentRequest;
                 }
+                if (runner.authenticated_identity) |*identity| {
+                    ApiHttpServer.attachGraphTableReadAuthorizer(&query_req.req, identity);
+                }
                 return (runner.source.query(
                     inner_alloc,
                     table_name,
@@ -5234,6 +5238,23 @@ pub const ApiHttpServer = struct {
                     filter_query_json,
                     exclusion_query_json,
                     runner.authenticated_identity,
+                );
+            }
+
+            fn probeIncomingEdges(
+                ptr_inner: *anyopaque,
+                inner_alloc: std.mem.Allocator,
+                table_name: []const u8,
+                index_name: []const u8,
+                keys: []const []const u8,
+            ) ![]bool {
+                const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                return try runner.server.probeRetrievalIncomingEdges(
+                    inner_alloc,
+                    runner.source,
+                    table_name,
+                    index_name,
+                    keys,
                 );
             }
         };
@@ -5323,10 +5344,6 @@ pub const ApiHttpServer = struct {
                 try queue.status(alloc, task_id, context_id, "failed", "tree root set exceeds the bounded retrieval limit");
                 return;
             },
-            error.TreeRootDiscoveryBudgetExceeded => {
-                try queue.status(alloc, task_id, context_id, "failed", "tree root discovery exceeded its scan budget; provide explicit roots");
-                return;
-            },
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
                 try queue.status(alloc, task_id, context_id, "failed", "invalid retrieval agent request");
                 return;
@@ -5376,6 +5393,7 @@ pub const ApiHttpServer = struct {
                     .vtable = &.{
                         .run_query = runQuery,
                         .scan_key_page = scanKeyPage,
+                        .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
             }
@@ -5431,6 +5449,23 @@ pub const ApiHttpServer = struct {
                     null,
                 );
             }
+
+            fn probeIncomingEdges(
+                ptr_inner: *anyopaque,
+                inner_alloc: std.mem.Allocator,
+                table_name: []const u8,
+                index_name: []const u8,
+                keys: []const []const u8,
+            ) ![]bool {
+                const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                return try runner.server.probeRetrievalIncomingEdges(
+                    inner_alloc,
+                    runner.source,
+                    table_name,
+                    index_name,
+                    keys,
+                );
+            }
         };
 
         const RetrievalGenerationRunner = struct {
@@ -5471,7 +5506,6 @@ pub const ApiHttpServer = struct {
         };
         const retrieval_resp = retrieval_agent.execute(self.alloc, query_runner.iface(), generation_runner.iface(), req.body) catch |err| switch (err) {
             error.TreeRootSetTooLarge => return try textResponse(self.alloc, 422, "tree root set exceeds the bounded retrieval limit"),
-            error.TreeRootDiscoveryBudgetExceeded => return try textResponse(self.alloc, 422, "tree root discovery exceeded its scan budget; provide explicit roots"),
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => return try textResponse(self.alloc, 400, "invalid retrieval agent request"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
@@ -6563,6 +6597,88 @@ pub const ApiHttpServer = struct {
             .keys = try keys.toOwnedSlice(alloc),
             .exhausted = exhausted,
         };
+    }
+
+    pub fn probeRetrievalIncomingEdges(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        index_name: []const u8,
+        keys: []const []const u8,
+    ) ![]bool {
+        const SourceWorker = struct {
+            server: *ApiHttpServer,
+            source: table_reads.TableReadSource,
+
+            fn iface(worker: *@This()) distributed_graph.Worker {
+                return .{
+                    .ptr = worker,
+                    .vtable = &.{
+                        .execute_graph_expand = executeGraphExpand,
+                        .execute_graph_hydrate = executeGraphHydrate,
+                        .fanout_io = fanoutIo,
+                    },
+                };
+            }
+
+            fn executeGraphExpand(
+                _: *anyopaque,
+                _: std.mem.Allocator,
+                _: u64,
+                _: []const u8,
+                _: distributed_graph.GraphExpandRequest,
+                _: raft_mod.ReadConsistency,
+            ) !distributed_graph.GraphExpandResponse {
+                return error.UnsupportedQueryRequest;
+            }
+
+            fn executeGraphHydrate(
+                ptr: *anyopaque,
+                inner_alloc: std.mem.Allocator,
+                group_id: u64,
+                inner_table_name: []const u8,
+                req: distributed_graph.GraphHydrateRequest,
+                consistency: raft_mod.ReadConsistency,
+            ) !distributed_graph.GraphHydrateResponse {
+                const worker: *@This() = @ptrCast(@alignCast(ptr));
+                return (try worker.source.graphHydrateGroupLocal(
+                    inner_alloc,
+                    group_id,
+                    inner_table_name,
+                    req,
+                    consistency,
+                )) orelse error.TableNotFound;
+            }
+
+            fn fanoutIo(ptr: *anyopaque) ?std.Io {
+                const worker: *@This() = @ptrCast(@alignCast(ptr));
+                return worker.server.sharedApiIo();
+            }
+        };
+
+        const catalog = self.catalogSource();
+        const topology_epoch = try table_catalog.topologyEpoch(
+            alloc,
+            catalog,
+            table_name,
+        );
+        if (topology_epoch == 0) return error.TableNotFound;
+        var worker = SourceWorker{
+            .server = self,
+            .source = source,
+        };
+        return try distributed_graph.probeIncomingEdgesForKeys(
+            alloc,
+            catalog,
+            worker.iface(),
+            table_name,
+            topology_epoch,
+            null,
+            index_name,
+            keys,
+            .read_index,
+        );
     }
 
     pub fn tableExists(self: *ApiHttpServer, table_name: []const u8) !bool {
@@ -8391,6 +8507,7 @@ pub const ApiHttpServer = struct {
                 table_name,
                 body,
                 row_filter_json,
+                authenticated_identity,
                 request_deadline_ns,
                 queryEmbeddingSecurityScope(authenticated_identity),
             ) catch |err| switch (err) {
@@ -8481,6 +8598,7 @@ pub const ApiHttpServer = struct {
             table_name,
             body,
             row_filter_json,
+            authenticated_identity,
             request_deadline_ns,
             queryEmbeddingSecurityScope(authenticated_identity),
         ) catch |err| switch (err) {
@@ -8887,6 +9005,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
         row_filter_json: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
         query_embedding_security_scope: QueryEmbeddingSecurityScope,
     ) !query_api.QueryResponse {
@@ -8930,6 +9049,9 @@ pub const ApiHttpServer = struct {
         if (row_filter_json) |value| {
             injectRowFilterIntoSearchRequest(alloc, &query_req.req, value) catch return error.InvalidQueryRequest;
         }
+        if (authenticated_identity) |*identity| {
+            attachGraphTableReadAuthorizer(&query_req.req, identity);
+        }
         return (queryWithTransientReadRetry(
             alloc,
             source,
@@ -8944,6 +9066,33 @@ pub const ApiHttpServer = struct {
             error.InvalidArgument => return error.InvalidQueryRequest,
             else => return err,
         }) orelse error.TableNotFound;
+    }
+
+    pub fn attachGraphTableReadAuthorizer(
+        req: *db_mod.types.SearchRequest,
+        identity: *const AuthenticatedIdentity,
+    ) void {
+        req.graph_table_read_authorizer = .{
+            .ctx = identity,
+            .authorize_table = authorizeGraphTargetTableRead,
+        };
+    }
+
+    fn authorizeGraphTargetTableRead(
+        ctx: ?*const anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) anyerror!db_mod.types.GraphTableReadAuthorization {
+        const identity: *const AuthenticatedIdentity = @ptrCast(@alignCast(ctx orelse {
+            return .{ .allowed = false };
+        }));
+        if (!permissionsAllow(identity.permissions, .table, table_name, .read)) {
+            return .{ .allowed = false };
+        }
+        return .{
+            .allowed = true,
+            .filter_query_json = try resolveEffectiveRowFilterJson(alloc, identity.*, table_name),
+        };
     }
 
     fn queryWithTransientReadRetry(
@@ -9172,16 +9321,9 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
     ) public_table_http.TableApi.ExecuteListIndexesError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        // A projected catalog miss is authoritative enough to reject a typo;
-        // do not enter the five-second linearizable/status retry path for a
-        // table that is already known not to exist.
-        var cached = self.source.cachedAdminSnapshot() catch null;
-        if (cached) |*snapshot| {
-            defer self.source.freeAdminSnapshot(snapshot);
-            if (tables_api.findTableByName(snapshot, table_name) == null) return error.NotFound;
-        }
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
+        if (tables_api.findTableByName(&snapshot, table_name) == null) return error.NotFound;
         var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot) catch return error.InternalFailure;
         defer if (local_statuses) |*status| status.deinit(self.alloc);
         return (indexes_api.encodeIndexList(
@@ -16953,6 +17095,7 @@ test "api http plain public query preserves outer absolute request deadline" {
         reads.source(),
         "docs",
         body,
+        null,
         null,
         outer_deadline_ns,
         .{ .domain = .internal, .value = "test" },

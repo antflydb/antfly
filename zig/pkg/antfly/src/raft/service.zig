@@ -1468,27 +1468,49 @@ test "managed host service seeds queued transitions from projected metadata stor
         try svc.host.host.campaignGroup(1300);
         _ = try svc.host.host.runRound(1, 1);
 
-        const cmd = try metadata.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 901,
-                .attempt_epoch = 1,
-                .source_group_id = 1300,
-                .destination_group_id = 1301,
-                .phase = .prepare,
-                .split_key = "doc:m",
-                .table_contract = .{
-                    .table_id = 13,
-                    .table_name = "docs",
-                    .indexes_json = "{}",
-                    .source_identity = .{ .shard_id = 1300, .range_id = 1300 },
-                    .target_identity = .{ .shard_id = 1300, .range_id = 1300 },
-                },
+        const transition_record: metadata.SplitTransitionRecord = .{
+            .transition_id = 901,
+            .attempt_epoch = 1,
+            .source_group_id = 1300,
+            .destination_group_id = 1301,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
+            .table_contract = .{
+                .table_id = 13,
+                .table_name = "docs",
+                .indexes_json = "{}",
+                .source_identity = .{ .shard_id = 1300, .range_id = 1300 },
+                .target_identity = .{ .shard_id = 1300, .range_id = 1300 },
             },
-        });
-        defer std.testing.allocator.free(cmd);
-
-        try svc.host.host.propose(1300, cmd);
-        _ = try svc.host.host.runRound(1, 1);
+        };
+        const seed_commands = [_]metadata.TransitionCommand{
+            .{ .upsert_table = .{
+                .table_id = 13,
+                .name = "docs",
+                .indexes_json = "{}",
+            } },
+            .{ .upsert_range = .{
+                .group_id = 1300,
+                .range_id = 1300,
+                .table_id = 13,
+                .start_key = "doc:a",
+                .end_key = "doc:z",
+                .doc_identity_shard_id = 1300,
+                .doc_identity_range_id = 1300,
+                .split_attempt_epoch = 0,
+            } },
+            .{ .admit_split_transition = .{
+                .expected_source_epoch = 0,
+                .record = transition_record,
+            } },
+        };
+        for (seed_commands) |command| {
+            const encoded = try metadata.encodeTransitionCommand(std.testing.allocator, command);
+            defer std.testing.allocator.free(encoded);
+            try svc.host.host.propose(1300, encoded);
+            _ = try svc.host.host.runRound(1, 1);
+        }
 
         const metadata_store = svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         const projected = try metadata_store.listSplitTransitions(std.testing.allocator, 1300);

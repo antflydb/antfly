@@ -16,6 +16,9 @@ const std = @import("std");
 
 pub const NodeRef = struct {
     key: []const u8,
+    /// Target document table when the edge crosses a table boundary. The
+    /// slice is borrowed for the duration of `filter_many`.
+    table: ?[]const u8 = null,
     /// External nodes are authorized and hydrated by their target-table read
     /// path; they must not be looked up in the source table's identity store.
     external: bool = false,
@@ -66,6 +69,7 @@ pub const NodeAdmission = struct {
         defer alloc.free(nodes);
         for (keys, 0..) |key, i| nodes[i] = .{
             .key = key,
+            .table = null,
             .external = external,
         };
         return try self.filterAlloc(alloc, nodes);

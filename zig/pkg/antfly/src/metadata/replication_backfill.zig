@@ -3565,24 +3565,7 @@ test "metadata replication backfill applies postgres snapshot rows through bound
                 Parent.saw_order_by_id = std.mem.indexOf(u8, owned.sql_text, "ORDER BY \"id\" ASC") != null;
 
                 const limit = parseSqlSuffixUsize(owned.sql_text, " LIMIT ") orelse 0;
-                const offset = if (owned.args.len > 0 and
-                    owned.args[owned.args.len - 1] == .string and
-                    std.mem.eql(
-                        u8,
-                        owned.args[owned.args.len - 1].string,
-                        "doc:1",
-                    ))
-                    1
-                else if (owned.args.len > 0 and
-                    owned.args[owned.args.len - 1] == .string and
-                    std.mem.eql(
-                        u8,
-                        owned.args[owned.args.len - 1].string,
-                        "doc:2",
-                    ))
-                    2
-                else
-                    parseSqlSuffixUsize(owned.sql_text, " OFFSET ") orelse 0;
+                const offset = testSnapshotDocOffset(owned);
 
                 const all_rows = [_][]const u8{
                     "{\"id\":\"doc:1\",\"name\":\"alpha\"}",
@@ -3700,6 +3683,15 @@ test "metadata replication backfill applies postgres snapshot rows through bound
         fn upsertReplicationSourceStatus(self: *@This(), record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
             try self.records.append(self.alloc, try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record));
         }
+
+        fn replicationSourceAuthorityCurrent(
+            self: *@This(),
+            _: []const u8,
+            expected: metadata_table_manager.ReplicationSourceStatusRecord,
+        ) !void {
+            if (!testSinkHasCurrentAuthority(self.records.items, expected))
+                return error.ReplicationCutoverAuthorityLost;
+        }
     };
 
     var status_sink: StatusSink = .{ .alloc = alloc };
@@ -3800,7 +3792,7 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
                 Parent.snapshot_query_calls += 1;
 
                 const limit = parseSqlSuffixUsize(owned.sql_text, " LIMIT ") orelse 0;
-                const offset = parseSqlSuffixUsize(owned.sql_text, " OFFSET ") orelse 0;
+                const offset = testSnapshotDocOffset(owned);
                 const all_rows = [_][]const u8{
                     "{\"id\":\"doc:1\",\"name\":\"alpha\"}",
                     "{\"id\":\"doc:2\",\"name\":\"beta\"}",
@@ -4347,7 +4339,7 @@ test "metadata replication backfill coordinator resumes and then skips completed
             defer owned.deinit(inner_alloc);
 
             const limit = parseSqlSuffixUsize(owned.sql_text, " LIMIT ") orelse 0;
-            const offset = parseSqlSuffixUsize(owned.sql_text, " OFFSET ") orelse 0;
+            const offset = testSnapshotDocOffset(owned);
 
             const all_rows = [_][]const u8{
                 "{\"id\":\"doc:1\",\"name\":\"alpha\"}",
@@ -4511,7 +4503,7 @@ test "metadata replication backfill coordinator resumes and then skips completed
         .source_kind = "postgres",
         .external_table = "users",
         .phase = "snapshot",
-        .checkpoint = "snapshot_offset:1",
+        .checkpoint = "snapshot_keyset:[\"doc:1\"]",
         .snapshot_offset = 1,
         .cutover_mode = "exported_snapshot",
         .prepared_checkpoint = "lsn:resume",
@@ -4536,7 +4528,7 @@ test "metadata replication backfill coordinator resumes and then skips completed
     try std.testing.expectEqual(@as(usize, 1), first.sources_resumed);
     try std.testing.expectEqual(@as(usize, 1), first.sources_completed);
     try std.testing.expectEqualStrings("cutover_prepared", service.statuses.items[0].phase);
-    try std.testing.expectEqualStrings("snapshot_offset:2", service.statuses.items[0].checkpoint);
+    try std.testing.expectEqualStrings("snapshot_keyset:[\"doc:2\"]", service.statuses.items[0].checkpoint);
     try std.testing.expectEqualStrings("lsn:resume", service.statuses.items[0].prepared_checkpoint);
     try std.testing.expectEqualStrings("exported_snapshot", service.statuses.items[0].cutover_mode);
 
@@ -4617,6 +4609,15 @@ test "metadata replication backfill marks existing-slot fallback as slot_resumed
 
         fn upsertReplicationSourceStatus(self: *@This(), record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
             try self.records.append(self.alloc, try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record));
+        }
+
+        fn replicationSourceAuthorityCurrent(
+            self: *@This(),
+            _: []const u8,
+            expected: metadata_table_manager.ReplicationSourceStatusRecord,
+        ) !void {
+            if (!testSinkHasCurrentAuthority(self.records.items, expected))
+                return error.ReplicationCutoverAuthorityLost;
         }
     };
 
@@ -5069,6 +5070,15 @@ test "metadata replication stream applies insert update and delete through bound
         fn upsertReplicationSourceStatus(self: *@This(), record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
             try self.records.append(self.alloc, try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record));
         }
+
+        fn replicationSourceAuthorityCurrent(
+            self: *@This(),
+            _: []const u8,
+            expected: metadata_table_manager.ReplicationSourceStatusRecord,
+        ) !void {
+            if (!testSinkHasCurrentAuthority(self.records.items, expected))
+                return error.ReplicationCutoverAuthorityLost;
+        }
     };
 
     var status_sink: StatusSink = .{ .alloc = alloc };
@@ -5097,6 +5107,7 @@ test "metadata replication stream applies insert update and delete through bound
         .cutover_config_fingerprint = ownership_fingerprint,
         .cutover_provider_identity = [_]u8{0x7a} ** cutover_config_fingerprint_len,
     };
+    try status_sink.upsertReplicationSourceStatus(existing_status);
     const summary = try runner.runTableSourceFromCheckpoint(&status_sink, .{
         .table_id = 11,
         .name = "docs",
@@ -6252,6 +6263,19 @@ fn parseSqlSuffixUsize(sql_text: []const u8, marker: []const u8) ?usize {
     while (value_end < sql_text.len and std.ascii.isDigit(sql_text[value_end])) : (value_end += 1) {}
     if (value_end == value_start) return null;
     return std.fmt.parseInt(usize, sql_text[value_start..value_end], 10) catch null;
+}
+
+fn testSnapshotDocOffset(prepared: foreign_mod.PreparedQuery) usize {
+    if (prepared.args.len > 0) {
+        switch (prepared.args[prepared.args.len - 1]) {
+            .string => |cursor| {
+                if (std.mem.eql(u8, cursor, "doc:1")) return 1;
+                if (std.mem.eql(u8, cursor, "doc:2")) return 2;
+            },
+            else => {},
+        }
+    }
+    return parseSqlSuffixUsize(prepared.sql_text, " OFFSET ") orelse 0;
 }
 
 test "metadata replication live snapshot and later streaming insert through runner" {

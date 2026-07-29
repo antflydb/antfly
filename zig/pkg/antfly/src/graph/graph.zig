@@ -976,6 +976,32 @@ pub const GraphIndex = struct {
         return owned;
     }
 
+    /// Probe incoming-edge existence for a key batch using one reverse-store
+    /// snapshot and one cursor. Results are aligned with `keys`.
+    pub fn hasIncomingEdgesManyAlloc(
+        self: *GraphIndex,
+        alloc: Allocator,
+        keys: []const []const u8,
+    ) ![]bool {
+        const result = try alloc.alloc(bool, keys.len);
+        errdefer alloc.free(result);
+        @memset(result, false);
+        if (keys.len == 0) return result;
+
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+
+        for (keys, 0..) |key, i| {
+            const prefix = try reverseEdgePrefixAlloc(alloc, key, self.index_name, "");
+            defer alloc.free(prefix);
+            const first = (try cursor.seekAtOrAfter(prefix)) orelse continue;
+            result[i] = std.mem.startsWith(u8, first.key, prefix);
+        }
+        return result;
+    }
+
     fn scanOutgoingEdges(self: *GraphIndex, alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), key: []const u8, edge_type: []const u8) !void {
         const prefix = try edgePrefixAlloc(alloc, key, self.index_name, edge_type);
         defer alloc.free(prefix);
@@ -1402,6 +1428,11 @@ test "graph addEdge and getEdges in (reverse index)" {
     for (edges) |e| {
         try std.testing.expectEqualStrings("b", e.target);
     }
+
+    const keys = [_][]const u8{ "a", "b", "missing", "c" };
+    const incoming = try graph.hasIncomingEdgesManyAlloc(alloc, &keys);
+    defer alloc.free(incoming);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, false }, incoming);
 }
 
 test "graph edge keys support arbitrary document ids and edge types" {

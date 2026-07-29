@@ -199,12 +199,17 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
                 if (!shouldTraverseEdge(&rules, &edge)) continue;
                 const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
                 if (rules.deduplicate and visited.contains(next_key)) continue;
+                const target_table = if (std.mem.eql(u8, next_key, edge.target))
+                    metadataTargetTable(edge.metadata)
+                else
+                    null;
                 candidate_indexes.appendAssumeCapacity(edge_index);
                 candidate_nodes.appendAssumeCapacity(.{
                     .key = next_key,
+                    .table = target_table,
                     .external = std.mem.eql(u8, next_key, edge.target) and
                         (admission.external_targets or
-                            metadataTargetTable(edge.metadata) != null),
+                            target_table != null),
                 });
             }
             const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);

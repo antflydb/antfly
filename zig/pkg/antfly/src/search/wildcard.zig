@@ -25,6 +25,17 @@ const ParsedToken = struct {
     next: usize,
 };
 
+pub const SearchPlan = struct {
+    literal_prefix: []const u8,
+    exact: bool,
+    owned_prefix: []u8 = &.{},
+
+    pub fn deinit(self: *SearchPlan, alloc: std.mem.Allocator) void {
+        if (self.owned_prefix.len > 0) alloc.free(self.owned_prefix);
+        self.* = undefined;
+    }
+};
+
 fn tokenAt(pattern: []const u8, index: usize) ?ParsedToken {
     if (index >= pattern.len) return null;
     if (pattern[index] == '\\') {
@@ -46,6 +57,57 @@ fn tokenAt(pattern: []const u8, index: usize) ?ParsedToken {
             else => |byte| .{ .literal = byte },
         },
         .next = index + 1,
+    };
+}
+
+/// Parse the portion of a wildcard pattern that can constrain a dictionary
+/// scan. Plain patterns borrow their prefix; quoted prefixes are decoded once.
+/// `exact` means the decoded prefix is the complete literal lookup key.
+pub fn searchPlanAlloc(alloc: std.mem.Allocator, pattern: []const u8) !SearchPlan {
+    var raw_prefix_end = pattern.len;
+    var exact = true;
+    var requires_decode = false;
+    var index: usize = 0;
+    while (index < pattern.len) {
+        if (pattern[index] == '\\') {
+            requires_decode = true;
+            index += if (index + 1 < pattern.len) 2 else 1;
+            continue;
+        }
+        if (pattern[index] == '*' or pattern[index] == '?') {
+            raw_prefix_end = index;
+            exact = false;
+            break;
+        }
+        index += 1;
+    }
+
+    const raw_prefix = pattern[0..raw_prefix_end];
+    if (!requires_decode) {
+        return .{
+            .literal_prefix = raw_prefix,
+            .exact = exact,
+        };
+    }
+
+    const storage = try alloc.alloc(u8, raw_prefix.len);
+    errdefer alloc.free(storage);
+    var output_index: usize = 0;
+    index = 0;
+    while (tokenAt(raw_prefix, index)) |parsed| {
+        const literal = switch (parsed.token) {
+            .literal => |byte| byte,
+            // raw_prefix ends before the first unquoted operator.
+            .any, .star => unreachable,
+        };
+        storage[output_index] = literal;
+        output_index += 1;
+        index = parsed.next;
+    }
+    return .{
+        .literal_prefix = storage[0..output_index],
+        .exact = exact,
+        .owned_prefix = storage,
     };
 }
 
@@ -131,4 +193,29 @@ test "wildcard literal escaping round trips metacharacters" {
     try std.testing.expectEqualStrings("a\\*\\?\\\\b", escaped);
     try std.testing.expect(match(escaped, "a*?\\b"));
     try std.testing.expect(!match(escaped, "axxb"));
+}
+
+test "wildcard search plans preserve escaped exact literals and prefixes" {
+    const alloc = std.testing.allocator;
+
+    var plain = try searchPlanAlloc(alloc, "plain");
+    defer plain.deinit(alloc);
+    try std.testing.expect(plain.exact);
+    try std.testing.expectEqualStrings("plain", plain.literal_prefix);
+    try std.testing.expectEqual(@as(usize, 0), plain.owned_prefix.len);
+
+    var escaped_exact = try searchPlanAlloc(alloc, "foo\\*bar\\?");
+    defer escaped_exact.deinit(alloc);
+    try std.testing.expect(escaped_exact.exact);
+    try std.testing.expectEqualStrings("foo*bar?", escaped_exact.literal_prefix);
+
+    var escaped_prefix = try searchPlanAlloc(alloc, "foo\\*bar*tail");
+    defer escaped_prefix.deinit(alloc);
+    try std.testing.expect(!escaped_prefix.exact);
+    try std.testing.expectEqualStrings("foo*bar", escaped_prefix.literal_prefix);
+
+    var trailing_escape = try searchPlanAlloc(alloc, "foo\\");
+    defer trailing_escape.deinit(alloc);
+    try std.testing.expect(trailing_escape.exact);
+    try std.testing.expectEqualStrings("foo\\", trailing_escape.literal_prefix);
 }

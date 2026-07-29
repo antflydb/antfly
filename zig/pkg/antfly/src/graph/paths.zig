@@ -243,12 +243,17 @@ fn bfsShortestPath(
                     if (ee.contains(ek)) continue;
                 }
                 if (visited.contains(next_key)) continue;
+                const target_table = if (std.mem.eql(u8, next_key, edge.target))
+                    traversal_mod.metadataTargetTable(edge.metadata)
+                else
+                    null;
                 candidate_indexes.appendAssumeCapacity(edge_index);
                 candidate_nodes.appendAssumeCapacity(.{
                     .key = next_key,
+                    .table = target_table,
                     .external = std.mem.eql(u8, next_key, edge.target) and
                         (admission.external_targets or
-                            traversal_mod.metadataTargetTable(edge.metadata) != null),
+                            target_table != null),
                 });
             }
             const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
@@ -391,12 +396,17 @@ fn dijkstraPath(
                     const ek = makeEdgeExclusionKey(&edge_key_buf, edge.source, edge.target, edge.edge_type);
                     if (ee.contains(ek)) continue;
                 }
+                const target_table = if (std.mem.eql(u8, next_key, edge.target))
+                    traversal_mod.metadataTargetTable(edge.metadata)
+                else
+                    null;
                 candidate_indexes.appendAssumeCapacity(edge_index);
                 candidate_nodes.appendAssumeCapacity(.{
                     .key = next_key,
+                    .table = target_table,
                     .external = std.mem.eql(u8, next_key, edge.target) and
                         (admission.external_targets or
-                            traversal_mod.metadataTargetTable(edge.metadata) != null),
+                            target_table != null),
                 });
             }
             const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);

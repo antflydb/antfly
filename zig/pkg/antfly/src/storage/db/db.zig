@@ -21426,13 +21426,63 @@ pub const DB = struct {
         return ordinal;
     }
 
-    pub fn lookupLiveDocOrdinalForInternalRead(
+    /// Owner-local graph admission and hydration after the caller has crossed
+    /// the Raft read gate. Candidate filtering and document loading are
+    /// batched, avoiding one probe transaction per graph node.
+    pub fn graphHydrateKeysForInternalRead(
         self: *DB,
         alloc: Allocator,
-        doc_id: []const u8,
-        generation: ?u64,
-    ) !?doc_set.DocOrdinal {
-        return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) ![]types.SearchHit {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+        var admission = try self.filterGraphKeysWithOrdinalsAlloc(
+            alloc,
+            snapshot_req,
+            keys,
+        );
+        defer admission.deinit(alloc);
+
+        var hits = std.ArrayListUnmanaged(types.SearchHit).empty;
+        errdefer {
+            for (hits.items) |*hit| hit.deinit(alloc);
+            hits.deinit(alloc);
+        }
+        try hits.ensureTotalCapacity(alloc, keys.len);
+        for (keys, admission.allowed, admission.ordinals, 0..) |key, admitted, maybe_ordinal, i| {
+            if (!admitted) continue;
+            const ordinal = maybe_ordinal orelse return error.InvalidGraphNodeAdmissionResult;
+            var stored_data: ?[]u8 = null;
+            if (admission.stored_data) |items| {
+                stored_data = items[i] orelse return error.InvalidGraphNodeAdmissionResult;
+                items[i] = null;
+            }
+            const id = try alloc.dupe(u8, key);
+            errdefer alloc.free(id);
+            hits.appendAssumeCapacity(.{
+                .id = id,
+                .doc_ordinal = ordinal,
+                .stored_data = stored_data,
+            });
+        }
+        return try hits.toOwnedSlice(alloc);
+    }
+
+    /// Owner-local graph root probe after the caller has crossed the Raft read
+    /// gate. The graph index performs the whole batch in one reverse snapshot.
+    pub fn graphHasIncomingEdgesForInternalRead(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        keys: []const []const u8,
+    ) ![]bool {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        const graph_entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try graph_entry.index.hasIncomingEdgesManyAlloc(alloc, keys);
     }
 
     fn scanStoreRangeCallback(
@@ -21459,7 +21509,7 @@ pub const DB = struct {
 
     fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
         _ = req.index_name;
-        const predicate_aware = db_query_graph.searchRequestHasGraphPredicates(req);
+        const predicate_aware = graphRequestRequiresAdmission(req);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, graph_query.index_name);
         defer admission.deinit();
         var execution = GraphPredicateExecutionContext{
@@ -21521,7 +21571,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
     ) !types.GraphSearchResult {
-        const predicate_aware = db_query_graph.searchRequestHasGraphPredicates(req);
+        const predicate_aware = graphRequestRequiresAdmission(req);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name);
         defer admission.deinit();
         var execution = GraphPredicateExecutionContext{
@@ -21656,7 +21706,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
     ) !types.GraphSearchResult {
-        const predicate_aware = db_query_graph.searchRequestHasGraphPredicates(req);
+        const predicate_aware = graphRequestRequiresAdmission(req);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name);
         defer admission.deinit();
         var execution = GraphPredicateExecutionContext{
@@ -21713,12 +21763,38 @@ pub const DB = struct {
         req: types.SearchRequest,
         keys: []const []const u8,
     ) ![]bool {
+        var filter_req = req;
+        filter_req.include_stored = false;
+        const admission = try self.filterGraphKeysWithOrdinalsAlloc(alloc, filter_req, keys);
+        alloc.free(admission.ordinals);
+        return admission.allowed;
+    }
+
+    const GraphKeyAdmission = struct {
+        allowed: []bool,
+        ordinals: []?doc_set.DocOrdinal,
+        stored_data: ?[]?[]u8 = null,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.allowed);
+            alloc.free(self.ordinals);
+            if (self.stored_data) |items| freeOptionalOwnedBytes(alloc, items);
+            self.* = undefined;
+        }
+    };
+
+    fn filterGraphKeysWithOrdinalsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) !GraphKeyAdmission {
         const ordinals = try self.lookupLiveDocOrdinalsNoLock(
             alloc,
             keys,
             req.identity_read_generation,
         );
-        defer alloc.free(ordinals);
+        errdefer alloc.free(ordinals);
 
         var live_count: usize = 0;
         for (ordinals) |ordinal| {
@@ -21728,7 +21804,16 @@ pub const DB = struct {
         const mask = try alloc.alloc(bool, keys.len);
         errdefer alloc.free(mask);
         @memset(mask, false);
-        if (live_count == 0) return mask;
+        if (live_count == 0) return .{
+            .allowed = mask,
+            .ordinals = ordinals,
+        };
+
+        const loaded = if (req.include_stored)
+            try loadStoredSearchDocumentsMany(self, alloc, keys)
+        else
+            null;
+        defer if (loaded) |items| freeOptionalOwnedBytes(alloc, items);
 
         var hits = try alloc.alloc(types.SearchHit, live_count);
         var initialized: usize = 0;
@@ -21737,15 +21822,20 @@ pub const DB = struct {
             for (hits[0..initialized]) |*hit| hit.deinit(alloc);
             if (hits.len > 0) alloc.free(hits);
         };
-        for (keys, ordinals) |key, maybe_ordinal| {
+        for (keys, ordinals, 0..) |key, maybe_ordinal, i| {
             const ordinal = maybe_ordinal orelse continue;
             const id = try alloc.dupe(u8, key);
             errdefer alloc.free(id);
+            const stored_data = if (loaded) |items| blk: {
+                const value = items[i] orelse return error.InvalidGraphNodeAdmissionResult;
+                items[i] = null;
+                break :blk value;
+            } else null;
             hits[initialized] = .{
                 .id = id,
                 .doc_ordinal = ordinal,
                 .score = 1.0,
-                .stored_data = null,
+                .stored_data = stored_data,
             };
             initialized += 1;
         }
@@ -21765,22 +21855,44 @@ pub const DB = struct {
         hits_owned = false;
         defer filtered.deinit();
 
+        const stored_data = if (req.include_stored) blk: {
+            const values = try alloc.alloc(?[]u8, keys.len);
+            @memset(values, null);
+            break :blk values;
+        } else null;
+        errdefer if (stored_data) |items| freeOptionalOwnedBytes(alloc, items);
+
         var filtered_index: usize = 0;
         for (keys, ordinals, 0..) |key, maybe_ordinal, i| {
             if (maybe_ordinal == null) continue;
             const allowed = filtered_index < filtered.hits.len and
                 std.mem.eql(u8, key, filtered.hits[filtered_index].id);
             mask[i] = allowed;
-            if (allowed) filtered_index += 1;
+            if (!allowed) continue;
+            if (stored_data) |items| {
+                items[i] = filtered.hits[filtered_index].stored_data orelse
+                    return error.InvalidGraphNodeAdmissionResult;
+                filtered.hits[filtered_index].stored_data = null;
+            }
+            filtered_index += 1;
         }
         if (filtered_index != filtered.hits.len) return error.InvalidQueryResult;
-        return mask;
+        return .{
+            .allowed = mask,
+            .ordinals = ordinals,
+            .stored_data = stored_data,
+        };
     }
 
     const GraphPredicateExecutionContext = struct {
         db: *DB,
         admission: *GraphNodeAdmissionCache,
     };
+
+    fn graphRequestRequiresAdmission(req: types.SearchRequest) bool {
+        return db_query_graph.searchRequestHasGraphPredicates(req) or
+            req.graph_table_read_authorizer != null;
+    }
 
     const GraphNodeAdmissionCache = struct {
         db: *DB,
@@ -21835,7 +21947,13 @@ pub const DB = struct {
             defer missing_keys.deinit(result_alloc);
 
             for (nodes) |node| {
-                if (node.external) continue;
+                // A DB-local graph engine has no target-table catalog or
+                // owner-routed reader. Authenticated cross-table reads must
+                // execute through the distributed coordinator.
+                if (node.table != null and self.req.graph_table_read_authorizer != null) {
+                    return error.UnsupportedQueryRequest;
+                }
+                if (node.external or node.table != null) continue;
                 const key = node.key;
                 if (self.decisions.contains(key)) continue;
                 const entry = try missing_by_key.getOrPut(result_alloc, key);
@@ -21864,7 +21982,7 @@ pub const DB = struct {
             }
 
             for (nodes, 0..) |node, i| {
-                result[i] = if (node.external)
+                result[i] = if (node.external or node.table != null)
                     true
                 else
                     self.decisions.get(node.key) orelse return error.InvalidGraphNodeAdmissionResult;
@@ -22155,7 +22273,7 @@ pub const DB = struct {
                 .graph_results = graph_results,
             };
         }
-        const predicate_aware = db_query_graph.searchRequestHasGraphPredicates(req);
+        const predicate_aware = graphRequestRequiresAdmission(req);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, graph_query.index_name);
         defer admission.deinit();
         var execution = GraphPredicateExecutionContext{
@@ -45215,6 +45333,26 @@ test "db graph hydration fails closed for a not-yet-promoted entity node" {
         .include_documents = true,
     };
 
+    const Authorizer = struct {
+        fn authorize(
+            _: ?*const anyopaque,
+            _: Allocator,
+            _: []const u8,
+        ) !types.GraphTableReadAuthorization {
+            return .{ .allowed = false };
+        }
+    };
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        db.search(alloc, .{
+            .graph_queries = &.{.{ .name = "m", .query = mention_query }},
+            .graph_table_read_authorizer = .{
+                .ctx = null,
+                .authorize_table = Authorizer.authorize,
+            },
+        }),
+    );
+
     // The mention edge points at person/ada_lovelace, but that entity document
     // has not been promoted into this store: the node is returned as a graph
     // result with its key, hydrated to nothing (fail closed), never fabricated.
@@ -67433,6 +67571,58 @@ test "db graph search filters result nodes and hidden traversal intermediates" {
     );
     defer alloc.free(graph_key_mask);
     try std.testing.expectEqualSlices(bool, &.{ true, false, true, true, false }, graph_key_mask);
+
+    const hydrated = try db.graphHydrateKeysForInternalRead(
+        alloc,
+        .{
+            .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+            .include_stored = false,
+        },
+        &.{ "n:a", "n:b", "n:c", "n:d", "n:missing" },
+    );
+    defer {
+        for (hydrated) |*hit| hit.deinit(alloc);
+        alloc.free(hydrated);
+    }
+    try std.testing.expectEqual(@as(usize, 3), hydrated.len);
+    try std.testing.expectEqualStrings("n:a", hydrated[0].id);
+    try std.testing.expectEqualStrings("n:c", hydrated[1].id);
+    try std.testing.expectEqualStrings("n:d", hydrated[2].id);
+    for (hydrated) |hit| {
+        try std.testing.expect(hit.doc_ordinal != null);
+        try std.testing.expect(hit.stored_data == null);
+    }
+
+    const hydrated_with_stored = try db.graphHydrateKeysForInternalRead(
+        alloc,
+        .{
+            .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+            .include_stored = true,
+        },
+        &.{ "n:a", "n:b", "n:c", "n:d", "n:missing" },
+    );
+    defer {
+        for (hydrated_with_stored) |*hit| hit.deinit(alloc);
+        alloc.free(hydrated_with_stored);
+    }
+    try std.testing.expectEqual(@as(usize, 3), hydrated_with_stored.len);
+    for (hydrated_with_stored) |hit| {
+        try std.testing.expect(hit.doc_ordinal != null);
+        try std.testing.expect(hit.stored_data != null);
+        try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "\"tenant\":\"visible\"") != null);
+    }
+
+    const incoming = try db.graphHasIncomingEdgesForInternalRead(
+        alloc,
+        "gr_v1",
+        &.{ "n:a", "n:b", "n:c", "n:d", "n:missing" },
+    );
+    defer alloc.free(incoming);
+    try std.testing.expectEqualSlices(
+        bool,
+        &.{ false, true, true, true, false },
+        incoming,
+    );
 
     var result = try db.search(alloc, .{
         .graph_queries = &.{

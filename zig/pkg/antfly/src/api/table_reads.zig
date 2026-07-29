@@ -2842,23 +2842,15 @@ pub const BoundTableReadSource = struct {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         if (req.topology_epoch != 0) return error.TopologyChanged;
-
-        var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
-        errdefer {
-            for (hits.items) |*hit| hit.deinit(alloc);
-            hits.deinit(alloc);
-        }
-
-        for (req.keys) |key| {
-            var result = (try self.reads.lookupWithConsistency(alloc, self.db, key, .{}, consistency)) orelse continue;
-            defer result.deinit(alloc);
-            try hits.append(alloc, .{
-                .id = try alloc.dupe(u8, key),
-                .doc_ordinal = try self.db.lookupLiveDocOrdinalForInternalRead(alloc, key, req.identity_read_generation),
-                .stored_data = try alloc.dupe(u8, result.json),
-            });
-        }
-        return .{ .hits = try hits.toOwnedSlice(alloc) };
+        try validateGraphHydrateResolvedDocFilterForDb(req, self.db);
+        return try graphHydrateOnOpenDb(
+            alloc,
+            self.reads,
+            self.db,
+            req,
+            consistency,
+            false,
+        );
     }
 
     fn graphEdgesGroupLocal(
@@ -3167,7 +3159,7 @@ pub const ProvisionedTableReadSource = struct {
             return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
         }
 
-        if (group_ids.len > 1 and distributed_graph.supportsCrossRange(req)) {
+        if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
             var base_req = req;
             base_req.graph_queries = &.{};
             base_req.expand_strategy = null;
@@ -4022,7 +4014,7 @@ pub const HostedProvisionedTableReadSource = struct {
             }
         }
 
-        if (group_ids.len > 1 and distributed_graph.supportsCrossRange(req)) {
+        if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
             var base_req = req;
             base_req.graph_queries = &.{};
             base_req.expand_strategy = null;
@@ -5528,6 +5520,14 @@ fn graphHydrateRequestHasResolvedDocFilter(req: distributed_graph.GraphHydrateRe
     return req.resolved_doc_filter != null;
 }
 
+fn requiresDistributedGraphCoordinator(
+    group_count: usize,
+    req: db_mod.types.SearchRequest,
+) bool {
+    return distributed_graph.supportsCrossRange(req) and
+        (group_count > 1 or req.graph_table_read_authorizer != null);
+}
+
 fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
     if (!graphHydrateRequestHasResolvedDocFilter(req)) return;
     const ctx = req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest;
@@ -5536,24 +5536,52 @@ fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrat
     if (generation != ctx.identity_read_generation) return error.IdentityReadGenerationChanged;
 }
 
-fn graphHydrateResolvedDocFilterAllows(req: distributed_graph.GraphHydrateRequest, key: []const u8, ordinal: ?doc_set.DocOrdinal) bool {
-    const ptr = req.resolved_doc_filter orelse return true;
-    const filter: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(ptr));
-    return graphHydrateResolvedDocSetIncludes(&filter.include, key, ordinal) and
-        !graphHydrateResolvedDocSetIncludes(&filter.exclude, key, ordinal);
+fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_mod.types.SearchRequest {
+    return .{
+        .query = .{ .match_all = {} },
+        .filter_query_json = req.filter_query_json,
+        .exclusion_query_json = req.exclusion_query_json,
+        .include_stored = req.include_stored,
+        .resolved_doc_filter = req.resolved_doc_filter,
+        .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
+        .identity_read_generation = req.identity_read_generation,
+    };
 }
 
-fn graphHydrateResolvedDocSetIncludes(set: *const doc_set.ResolvedDocSet, key: []const u8, ordinal: ?doc_set.DocOrdinal) bool {
-    return switch (set.*) {
-        .all => true,
-        .none => false,
-        .doc_keys => |keys| blk: {
-            for (keys) |candidate| {
-                if (std.mem.eql(u8, candidate, key)) break :blk true;
-            }
-            break :blk false;
+fn graphHydrateOnOpenDb(
+    alloc: std.mem.Allocator,
+    reads: raft_mod.FeatureDBReads,
+    db: *db_mod.DB,
+    req: distributed_graph.GraphHydrateRequest,
+    consistency: raft_mod.ReadConsistency,
+    fallback_to_stale_on_not_leader: bool,
+) !distributed_graph.GraphHydrateResponse {
+    const search_req = graphHydrateSearchRequest(req);
+    reads.reads.prepareSearchWithConsistency(reads.group_id, search_req, consistency) catch |err| switch (err) {
+        error.NotLeader => {
+            if (!fallback_to_stale_on_not_leader or consistency == .stale) return err;
+            try reads.reads.prepareSearchWithConsistency(reads.group_id, search_req, .stale);
         },
-        .ordinals, .ordinal_bitmap => if (ordinal) |value| set.containsOrdinal(value) else false,
+        else => return err,
+    };
+    const hits = if (req.include_hits)
+        try db.graphHydrateKeysForInternalRead(alloc, search_req, req.keys)
+    else
+        @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+    errdefer {
+        for (hits) |*hit| hit.deinit(alloc);
+        if (hits.len > 0) alloc.free(hits);
+    }
+    return .{
+        .hits = hits,
+        .has_incoming = if (req.incoming_index_name.len > 0)
+            try db.graphHasIncomingEdgesForInternalRead(
+                alloc,
+                req.incoming_index_name,
+                req.keys,
+            )
+        else
+            @constCast((&[_]bool{})[0..]),
     };
 }
 
@@ -5741,28 +5769,8 @@ fn executeProvisionedGraphHydrate(
     defer db.close();
     try validateGraphHydrateResolvedDocFilterForDb(req, &db);
 
-    var reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
-    var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
-    errdefer {
-        for (hits.items) |*hit| hit.deinit(alloc);
-        hits.deinit(alloc);
-    }
-
-    for (req.keys) |key| {
-        var result = (reads.lookupWithConsistency(alloc, &db, key, .{}, consistency) catch |err| switch (err) {
-            error.NotLeader => if (consistency == .stale) return err else try reads.lookupWithConsistency(alloc, &db, key, .{}, .stale),
-            else => return err,
-        }) orelse continue;
-        defer result.deinit(alloc);
-        const ordinal = try db.lookupLiveDocOrdinalForInternalRead(alloc, key, req.identity_read_generation);
-        if (!graphHydrateResolvedDocFilterAllows(req, key, ordinal)) continue;
-        try hits.append(alloc, .{
-            .id = try alloc.dupe(u8, key),
-            .doc_ordinal = ordinal,
-            .stored_data = try alloc.dupe(u8, result.json),
-        });
-    }
-    return .{ .hits = try hits.toOwnedSlice(alloc) };
+    const reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
+    return try graphHydrateOnOpenDb(alloc, reads, &db, req, consistency, true);
 }
 
 fn executeHostedGraphExpand(
@@ -5802,25 +5810,8 @@ fn executeHostedGraphHydrate(
             try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
             try validateGraphHydrateResolvedDocFilterForDb(req, &db);
 
-            var reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
-            var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
-            errdefer {
-                for (hits.items) |*hit| hit.deinit(alloc);
-                hits.deinit(alloc);
-            }
-
-            for (req.keys) |key| {
-                var result = (try reads.lookupWithConsistency(alloc, &db, key, .{}, consistency)) orelse continue;
-                defer result.deinit(alloc);
-                const ordinal = try db.lookupLiveDocOrdinalForInternalRead(alloc, key, req.identity_read_generation);
-                if (!graphHydrateResolvedDocFilterAllows(req, key, ordinal)) continue;
-                try hits.append(alloc, .{
-                    .id = try alloc.dupe(u8, key),
-                    .doc_ordinal = ordinal,
-                    .stored_data = try alloc.dupe(u8, result.json),
-                });
-            }
-            break :blk .{ .hits = try hits.toOwnedSlice(alloc) };
+            const reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
+            break :blk try graphHydrateOnOpenDb(alloc, reads, &db, req, consistency, false);
         },
         .remote => |remote| blk: {
             if (req.resolved_doc_filter != null) {
@@ -20927,6 +20918,39 @@ test "hosted table read source preflights mixed local and remote groups" {
         .dense = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 5 },
     }, .read_index, 0));
     try std.testing.expectEqual(@as(usize, 1), executor_state.call_count);
+}
+
+test "authenticated single-group graph queries require distributed coordination" {
+    const Authorizer = struct {
+        fn authorize(
+            _: ?*const anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+        ) !db_mod.types.GraphTableReadAuthorization {
+            return .{ .allowed = false };
+        }
+    };
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "links",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .params = .{},
+        },
+    }};
+    var req = db_mod.types.SearchRequest{
+        .graph_queries = &graph_queries,
+        .graph_table_read_authorizer = .{
+            .ctx = null,
+            .authorize_table = Authorizer.authorize,
+        },
+    };
+
+    try std.testing.expect(requiresDistributedGraphCoordinator(1, req));
+    req.graph_table_read_authorizer = null;
+    try std.testing.expect(!requiresDistributedGraphCoordinator(1, req));
+    try std.testing.expect(requiresDistributedGraphCoordinator(2, req));
 }
 
 test "hosted cross-range graph query expands explicit local start keys" {

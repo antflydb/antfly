@@ -30,7 +30,7 @@ const FinalizeMerge = std.meta.fieldInfo(metadata.TransitionAction, .finalize_me
 const RollbackMerge = std.meta.fieldInfo(metadata.TransitionAction, .rollback_merge).type;
 
 pub const SplitCoordinatorRuntime = struct {
-    coordinator: data.SplitSyncCoordinator,
+    coordinator: ?data.SplitSyncCoordinator,
 
     pub fn init(alloc: std.mem.Allocator, cfg: data.SplitSyncConfig) !SplitCoordinatorRuntime {
         return .{
@@ -39,8 +39,10 @@ pub const SplitCoordinatorRuntime = struct {
     }
 
     pub fn deinit(self: *SplitCoordinatorRuntime) void {
-        self.coordinator.deinit();
-        self.* = undefined;
+        if (self.coordinator) |*coordinator| {
+            coordinator.deinit();
+            self.coordinator = null;
+        }
     }
 
     pub fn runtime(self: *SplitCoordinatorRuntime) SplitRuntime {
@@ -60,8 +62,9 @@ pub const SplitCoordinatorRuntime = struct {
 
     fn observeStatus(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !data.SplitTransitionStatus {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        const status = try self.coordinator.status();
+        const coordinator = try self.coordinatorRef();
+        try coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        const status = try coordinator.status();
         return .{
             .phase = status.phase,
             .source_split_phase = status.source_split_phase,
@@ -77,43 +80,54 @@ pub const SplitCoordinatorRuntime = struct {
 
     fn prepareSource(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try self.coordinator.prepareSourceSplit(split_key, source_range_end);
+        const coordinator = try self.coordinatorRef();
+        try coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        return try coordinator.prepareSourceSplit(split_key, source_range_end);
     }
 
     fn startSource(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try self.coordinator.startSourceSplit();
+        const coordinator = try self.coordinatorRef();
+        try coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        return try coordinator.startSourceSplit();
     }
 
     fn bootstrapDestination(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try self.coordinator.ensureBootstrapped();
+        const coordinator = try self.coordinatorRef();
+        try coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        return try coordinator.ensureBootstrapped();
     }
 
     fn catchUpDestination(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !usize {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try self.coordinator.catchUp();
+        const coordinator = try self.coordinatorRef();
+        try coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        return try coordinator.catchUp();
     }
 
     fn finalizeSource(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try self.coordinator.finalizeSource();
+        const coordinator = try self.coordinatorRef();
+        try coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        return try coordinator.finalizeSource();
     }
 
     fn rollbackSource(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !bool {
         const self: *SplitCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
-        return try self.coordinator.rollbackSource();
+        const coordinator = try self.coordinatorRef();
+        try coordinator.validateTransitionCoordinates(transition_id, attempt_epoch, source_group_id, destination_group_id);
+        return try coordinator.rollbackSource();
+    }
+
+    fn coordinatorRef(self: *SplitCoordinatorRuntime) !*data.SplitSyncCoordinator {
+        if (self.coordinator) |*coordinator| return coordinator;
+        return error.TransitionRuntimeClosed;
     }
 };
 
 pub const MergeCoordinatorRuntime = struct {
-    coordinator: data.MergeCoordinator,
+    coordinator: ?data.MergeCoordinator,
 
     pub fn init(alloc: std.mem.Allocator, cfg: data.MergeConfig) !MergeCoordinatorRuntime {
         return .{
@@ -122,8 +136,10 @@ pub const MergeCoordinatorRuntime = struct {
     }
 
     pub fn deinit(self: *MergeCoordinatorRuntime) void {
-        self.coordinator.deinit();
-        self.* = undefined;
+        if (self.coordinator) |*coordinator| {
+            coordinator.deinit();
+            self.coordinator = null;
+        }
     }
 
     pub fn runtime(self: *MergeCoordinatorRuntime) MergeRuntime {
@@ -142,33 +158,39 @@ pub const MergeCoordinatorRuntime = struct {
 
     fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.MergeTransitionStatus {
         const self: *MergeCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        return try self.coordinator.status();
+        return try (try self.coordinatorRef()).status();
     }
 
     fn recordDocIdentityReassignment(ptr: *anyopaque, _: u64, _: u64) !void {
         const self: *MergeCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.recordDocIdentityReassignmentOptIn();
+        try (try self.coordinatorRef()).recordDocIdentityReassignmentOptIn();
     }
 
     fn acceptReceiver(ptr: *anyopaque, _: u64, _: u64) !void {
         const self: *MergeCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        try self.coordinator.acceptDonorRange();
+        try (try self.coordinatorRef()).acceptDonorRange();
     }
 
     fn catchUpReceiver(ptr: *anyopaque, _: u64, _: u64) !usize {
         const self: *MergeCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        _ = try self.coordinator.ensureReceiverBootstrapped();
-        return try self.coordinator.catchUp();
+        const coordinator = try self.coordinatorRef();
+        _ = try coordinator.ensureReceiverBootstrapped();
+        return try coordinator.catchUp();
     }
 
     fn finalizeMerge(ptr: *anyopaque, _: u64, _: u64) !bool {
         const self: *MergeCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        return try self.coordinator.finalizeMerge();
+        return try (try self.coordinatorRef()).finalizeMerge();
     }
 
     fn rollbackMerge(ptr: *anyopaque, _: u64, _: u64) !bool {
         const self: *MergeCoordinatorRuntime = @ptrCast(@alignCast(ptr));
-        return try self.coordinator.rollbackMerge();
+        return try (try self.coordinatorRef()).rollbackMerge();
+    }
+
+    fn coordinatorRef(self: *MergeCoordinatorRuntime) !*data.MergeCoordinator {
+        if (self.coordinator) |*coordinator| return coordinator;
+        return error.TransitionRuntimeClosed;
     }
 };
 

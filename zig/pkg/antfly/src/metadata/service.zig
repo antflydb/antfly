@@ -8303,22 +8303,25 @@ test "metadata service proposes split transitions into the metadata group" {
         .end_key = "doc:z",
         .doc_identity_shard_id = 2001,
         .doc_identity_range_id = 2001,
-        .split_attempt_epoch = 1,
+        .split_attempt_epoch = 0,
     });
-    try svc.upsertSplitTransition(.{
-        .transition_id = 4001,
-        .attempt_epoch = 1,
-        .source_group_id = 2001,
-        .destination_group_id = 2002,
-        .phase = .prepare,
-        .split_key = "doc:m",
-        .source_range_end = "doc:z",
-        .table_contract = .{
-            .table_id = 20,
-            .table_name = "docs",
-            .indexes_json = "{}",
-            .source_identity = .{ .shard_id = 2001, .range_id = 2001 },
-            .target_identity = .{ .shard_id = 2001, .range_id = 2001 },
+    try svc.admitSplitTransition(.{
+        .expected_source_epoch = 0,
+        .record = .{
+            .transition_id = 4001,
+            .attempt_epoch = 1,
+            .source_group_id = 2001,
+            .destination_group_id = 2002,
+            .phase = .prepare,
+            .split_key = "doc:m",
+            .source_range_end = "doc:z",
+            .table_contract = .{
+                .table_id = 20,
+                .table_name = "docs",
+                .indexes_json = "{}",
+                .source_identity = .{ .shard_id = 2001, .range_id = 2001 },
+                .target_identity = .{ .shard_id = 2001, .range_id = 2001 },
+            },
         },
     });
 

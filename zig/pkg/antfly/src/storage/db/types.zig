@@ -1260,10 +1260,43 @@ pub const SearchRequest = struct {
     resolved_text_doc_filter: ?*const anyopaque = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
+    /// Request-local authorization hook used only by the distributed graph
+    /// coordinator when an edge names a document in another table. The hook is
+    /// never serialized to a shard worker; it resolves the target table to a
+    /// trusted internal row predicate before owner-routed admission.
+    graph_table_read_authorizer: ?GraphTableReadAuthorizer = null,
     identity_read_generation: ?u64 = null,
     execution_deadline_ns: ?u64 = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+};
+
+pub const GraphTableReadAuthorization = struct {
+    allowed: bool,
+    /// Owned by this value when non-null.
+    filter_query_json: ?[]u8 = null,
+
+    pub fn deinit(self: *GraphTableReadAuthorization, alloc: std.mem.Allocator) void {
+        if (self.filter_query_json) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const GraphTableReadAuthorizer = struct {
+    ctx: ?*const anyopaque,
+    authorize_table: *const fn (
+        ctx: ?*const anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) anyerror!GraphTableReadAuthorization,
+
+    pub fn authorize(
+        self: GraphTableReadAuthorizer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !GraphTableReadAuthorization {
+        return try self.authorize_table(self.ctx, alloc, table_name);
+    }
 };
 
 pub const SortField = struct {

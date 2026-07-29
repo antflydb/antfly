@@ -366,12 +366,17 @@ fn findReachableNodes(
                     if (!edgeMatches(graph_edge, edge)) continue;
                     const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
                     if (std.mem.eql(u8, target_key, frontier.key)) continue;
+                    const target_table = if (std.mem.eql(u8, target_key, graph_edge.target))
+                        traversal_mod.metadataTargetTable(graph_edge.metadata)
+                    else
+                        null;
                     candidate_indexes.appendAssumeCapacity(edge_index);
                     candidate_nodes.appendAssumeCapacity(.{
                         .key = target_key,
+                        .table = target_table,
                         .external = std.mem.eql(u8, target_key, graph_edge.target) and
                             (admission.external_targets or
-                                traversal_mod.metadataTargetTable(graph_edge.metadata) != null),
+                                target_table != null),
                     });
                 }
                 const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);

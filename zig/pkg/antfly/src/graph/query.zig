@@ -25,6 +25,7 @@ const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
 const NodeAdmission = @import("node_admission.zig").NodeAdmission;
+const NodeRef = @import("node_admission.zig").NodeRef;
 const pattern_mod = @import("pattern.zig");
 const traversal_mod = @import("traversal.zig");
 const paths_mod = @import("paths.zig");
@@ -198,7 +199,7 @@ pub const GraphQueryEngine = struct {
         start_keys: []const []const u8,
         target_keys: []const []const u8,
     ) !GraphQueryResult {
-        if (self.node_admission == null and algebraicTraversalConsidered(graph_index, params)) {
+        if (algebraicTraversalConsidered(graph_index, params)) {
             graph_index.noteAlgebraicTraversalAttempt();
             const proof = algebraicTraversalProof(graph_index, params);
             if (proof.safe()) {
@@ -303,9 +304,21 @@ pub const GraphQueryEngine = struct {
             seen.deinit(self.alloc);
         }
 
-        for (start_keys) |start_key| {
+        const admitted_starts = try self.admittedStartKeysAlloc(start_keys, params.direction);
+        defer if (admitted_starts) |mask| self.alloc.free(mask);
+        if (self.node_admission != null and admitted_starts == null) return null;
+
+        for (start_keys, 0..) |start_key, start_index| {
+            if (admitted_starts) |mask| if (!mask[start_index]) continue;
             var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, params);
             defer algebraic_edges.deinit(self.alloc);
+            if (self.node_admission) |admission| {
+                try filterAlgebraicReachabilityEdgesWithAdmission(
+                    self.alloc,
+                    &algebraic_edges,
+                    admission,
+                );
+            }
 
             const reached = try algebraic_path_mod.boundedReachabilityWithOptionsAlloc(self.alloc, start_key, algebraic_edges.items, params.max_depth, .{ .target_nodes = target_keys });
             defer algebraic_path_mod.deinitPathResults(self.alloc, reached);
@@ -342,7 +355,7 @@ pub const GraphQueryEngine = struct {
         start_keys: []const []const u8,
     ) !GraphQueryResult {
         const target_keys = resolveTargetKeys(gq);
-        if (self.node_admission == null and algebraicTraversalConsidered(graph_index, gq.params)) {
+        if (algebraicTraversalConsidered(graph_index, gq.params)) {
             graph_index.noteAlgebraicTraversalAttempt();
             if (try self.executeAlgebraicShortestPath(graph_index, gq.params, start_keys, target_keys)) |result| {
                 graph_index.noteAlgebraicTraversalProven(result.nodes.len);
@@ -408,7 +421,12 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         }
 
-        for (start_keys) |start_key| {
+        const admitted_starts = try self.admittedStartKeysAlloc(start_keys, params.direction);
+        defer if (admitted_starts) |mask| self.alloc.free(mask);
+        if (self.node_admission != null and admitted_starts == null) return null;
+
+        for (start_keys, 0..) |start_key, start_index| {
+            if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |target_key| {
                 if (std.mem.eql(u8, start_key, target_key)) {
                     try all_results.append(self.alloc, try trivialPathResultNode(self.alloc, start_key));
@@ -417,6 +435,13 @@ pub const GraphQueryEngine = struct {
 
                 var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, params);
                 defer algebraic_edges.deinit(self.alloc);
+                if (self.node_admission) |admission| {
+                    try filterAlgebraicReachabilityEdgesWithAdmission(
+                        self.alloc,
+                        &algebraic_edges,
+                        admission,
+                    );
+                }
 
                 const reached = try algebraic_path_mod.boundedReachabilityWithOptionsAlloc(
                     self.alloc,
@@ -446,7 +471,7 @@ pub const GraphQueryEngine = struct {
         start_keys: []const []const u8,
     ) !GraphQueryResult {
         const target_keys = resolveTargetKeys(gq);
-        if (self.node_admission == null and gq.k == 1) {
+        if (gq.k == 1) {
             if (try self.executeAlgebraicShortestPath(graph_index, gq.params, start_keys, target_keys)) |result| return result;
         }
 
@@ -1212,6 +1237,45 @@ fn collectAlgebraicReachabilityEdges(
     return .{ .items = owned, .target_tables = tables_out };
 }
 
+fn filterAlgebraicReachabilityEdgesWithAdmission(
+    alloc: Allocator,
+    edges: *AlgebraicReachabilityEdges,
+    admission: NodeAdmission,
+) !void {
+    if (edges.items.len == 0) return;
+    const refs = try alloc.alloc(NodeRef, edges.items.len);
+    defer alloc.free(refs);
+    for (edges.items, 0..) |edge, i| {
+        const table = edges.target_tables.get(edge.to);
+        refs[i] = .{
+            .key = edge.to,
+            .table = table,
+            .external = table != null,
+        };
+    }
+    const allowed = try admission.filterAlloc(alloc, refs);
+    defer alloc.free(allowed);
+
+    var allowed_count: usize = 0;
+    for (allowed) |value| allowed_count += @intFromBool(value);
+    if (allowed_count == edges.items.len) return;
+
+    const filtered = try alloc.alloc(algebraic_path_mod.Edge, allowed_count);
+    var write_index: usize = 0;
+    for (edges.items, allowed) |edge, include| {
+        if (include) {
+            filtered[write_index] = edge;
+            write_index += 1;
+        } else {
+            alloc.free(edge.from);
+            alloc.free(edge.to);
+            alloc.free(edge.provenance);
+        }
+    }
+    alloc.free(edges.items);
+    edges.items = filtered;
+}
+
 fn algebraicTraversalTensorProgramAccepted(
     alloc: Allocator,
     graph_index: *const graph_mod.GraphIndex,
@@ -1706,6 +1770,57 @@ test "traverse algebraic semiring path supports deterministic result limits" {
     try std.testing.expectEqualStrings("C", result.nodes[1].key);
     try std.testing.expect(result.nodes[0].provenance != null);
     try std.testing.expect(result.nodes[1].provenance != null);
+}
+
+test "algebraic traversal intersects query-scoped node admission" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-alg-admission-s", "gq-alg-admission-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    ctx.graph.algebraic_semiring_traversal = true;
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("B", "C", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "D", "e", 1.0, 0, 0, "");
+
+    const Admission = struct {
+        fn filter(
+            _: ?*anyopaque,
+            result_alloc: Allocator,
+            nodes: []const NodeRef,
+        ) ![]bool {
+            const out = try result_alloc.alloc(bool, nodes.len);
+            for (nodes, 0..) |node, i| {
+                out[i] = !std.mem.eql(u8, node.key, "B");
+            }
+            return out;
+        }
+    };
+    var engine = GraphQueryEngine{
+        .alloc = alloc,
+        .node_admission = .{
+            .ctx = null,
+            .filter_many = Admission.filter,
+        },
+    };
+    const start_keys: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .max_depth = 2 },
+    }, start_keys);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+    try std.testing.expectEqualStrings("D", result.nodes[0].key);
+    const stats = ctx.graph.algebraicTraversalRuntimeStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.proven_count);
+    try std.testing.expectEqual(@as(u64, 0), stats.fallback_count);
 }
 
 test "algebraic traversal reconstructs path-returning shapes when provenance is unique" {

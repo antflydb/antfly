@@ -1458,6 +1458,7 @@ pub const AntflyApiHandler = struct {
                     .vtable = &.{
                         .run_query = runQuery,
                         .scan_key_page = runScanKeyPage,
+                        .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
             }
@@ -1492,6 +1493,9 @@ pub const AntflyApiHandler = struct {
                     http_server_mod.injectRowFilterIntoSearchRequest(a, &query_req.req, value) catch
                         return error.InvalidRetrievalAgentRequest;
                 }
+                if (runner.authenticated_identity) |*identity| {
+                    ApiHttpServer.attachGraphTableReadAuthorizer(&query_req.req, identity);
+                }
                 return (runner.source.query(
                     a,
                     table_name,
@@ -1523,6 +1527,23 @@ pub const AntflyApiHandler = struct {
                     filter_query_json,
                     exclusion_query_json,
                     runner.authenticated_identity,
+                );
+            }
+
+            fn probeIncomingEdges(
+                ptr: *anyopaque,
+                a: std.mem.Allocator,
+                table_name: []const u8,
+                index_name: []const u8,
+                keys: []const []const u8,
+            ) ![]bool {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                return try runner.server.probeRetrievalIncomingEdges(
+                    a,
+                    runner.source,
+                    table_name,
+                    index_name,
+                    keys,
                 );
             }
         };
@@ -1567,10 +1588,6 @@ pub const AntflyApiHandler = struct {
             error.TreeRootSetTooLarge => {
                 _ = ctx.status(422);
                 return ctx.text("tree root set exceeds the bounded retrieval limit");
-            },
-            error.TreeRootDiscoveryBudgetExceeded => {
-                _ = ctx.status(422);
-                return ctx.text("tree root discovery exceeded its scan budget; provide explicit roots");
             },
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
                 _ = ctx.status(400);

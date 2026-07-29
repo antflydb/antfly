@@ -502,7 +502,7 @@ fn parseTransformOps(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
     const ops = try alloc.alloc(db_mod.types.TransformOp, values.len);
     var initialized: usize = 0;
     errdefer {
-        freeTransformOps(alloc, ops[0..initialized]);
+        freeTransformOpElements(alloc, ops[0..initialized]);
         alloc.free(ops);
     }
 
@@ -580,11 +580,15 @@ fn freeTransforms(alloc: std.mem.Allocator, transforms: []db_mod.types.DocumentT
 }
 
 fn freeTransformOps(alloc: std.mem.Allocator, ops: []const db_mod.types.TransformOp) void {
+    freeTransformOpElements(alloc, ops);
+    if (ops.len > 0) alloc.free(@constCast(ops));
+}
+
+fn freeTransformOpElements(alloc: std.mem.Allocator, ops: []const db_mod.types.TransformOp) void {
     for (ops) |op| {
         alloc.free(@constCast(op.path));
         if (op.value_json) |value_json| alloc.free(@constCast(value_json));
     }
-    if (ops.len > 0) alloc.free(@constCast(ops));
 }
 
 test "batch parser accepts inserts and deletes" {
@@ -796,6 +800,18 @@ test "batch parser rejects every recognized but unsupported transform operator" 
             .{op},
         );
         defer std.testing.allocator.free(body);
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            parseBatchRequest(std.testing.allocator, body),
+        );
+    }
+}
+
+test "batch parser safely rejects unsupported transform after initialized operations" {
+    const body =
+        \\{"transforms":[{"key":"doc:missing","operations":[{"op":"$set","path":"ready","value":true},{"op":"$push","path":"items","value":1}]}]}
+    ;
+    for (0..32) |_| {
         try std.testing.expectError(
             error.InvalidBatchRequest,
             parseBatchRequest(std.testing.allocator, body),
