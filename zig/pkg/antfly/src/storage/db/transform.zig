@@ -21,6 +21,7 @@ pub fn resolveDocumentTransform(
     existing_json: ?[]const u8,
     transform: types.DocumentTransform,
 ) !?[]u8 {
+    try validateDocumentTransform(transform);
     if (existing_json == null and !transform.upsert) return null;
     const is_insert = existing_json == null;
 
@@ -32,18 +33,24 @@ pub fn resolveDocumentTransform(
     } else std.json.Value{ .object = std.json.ObjectMap.empty };
     defer freeJsonValue(alloc, &root);
 
-    // Validate the whole transform before changing the cloned document.  In
-    // particular, never acknowledge an operator that this implementation does
-    // not support and never partially apply a mixed transform.
-    for (transform.operations) |op| {
-        switch (op.op) {
-            .set, .set_on_insert, .unset, .inc, .add_to_set, .max => {},
-            else => return error.UnsupportedTransformOperation,
-        }
-    }
     for (transform.operations) |op| try applyTransformOp(alloc, &root, op, is_insert);
 
     return try std.json.Stringify.valueAlloc(alloc, root, .{});
+}
+
+/// Validates the complete transform at admission and storage boundaries.
+///
+/// Keep this independent of document state so an unsupported request cannot
+/// become an acknowledged no-op merely because its target is absent.
+pub fn validateDocumentTransform(transform: types.DocumentTransform) !void {
+    for (transform.operations) |op| try validateTransformOpType(op.op);
+}
+
+pub fn validateTransformOpType(op: types.TransformOpType) !void {
+    switch (op) {
+        .set, .set_on_insert, .unset, .inc, .add_to_set, .max => {},
+        else => return error.UnsupportedTransformOperation,
+    }
 }
 
 pub fn transformOpText(op: types.TransformOpType) []const u8 {
@@ -457,4 +464,17 @@ test "unsupported transforms fail atomically instead of reporting success" {
             }),
         );
     }
+}
+
+test "unsupported transform on a missing document is rejected before no-op resolution" {
+    const operations = [_]types.TransformOp{
+        .{ .op = .push, .path = "tags", .value_json = "\"new\"" },
+    };
+    try std.testing.expectError(
+        error.UnsupportedTransformOperation,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &operations,
+        }),
+    );
 }

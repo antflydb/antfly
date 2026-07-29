@@ -34518,18 +34518,6 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     if (ctx.promotion_runtime) |runtime| {
         effective = clampReplayTruncationForReplayStage(effective, ctx.index_manager, runtime.stats());
     }
-    // Generated enrichment is also an asynchronous replay consumer. The
-    // executor workers may finish the source write before enrichment has
-    // published its derived entries, so retain the journal through the
-    // enrichment watermark just as the synchronous truncation path does.
-    if (ctx.index_manager.hasGeneratedEnrichmentTargets()) {
-        const enrichment_applied = try enrichment_state.loadAppliedSequence(
-            ctx.alloc,
-            ctx.store,
-            enrichment_runtime_mod.scope_name,
-        );
-        effective = @min(effective, enrichment_applied);
-    }
     effective = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, effective);
     try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
 }

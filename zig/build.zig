@@ -3596,6 +3596,8 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &.{
             "storage.db.db.test.",
+            "unsupported transforms fail atomically instead of reporting success",
+            "unsupported transform on a missing document is rejected before no-op resolution",
             "io threaded applied callback observes published watermark outside runtime lock",
         }),
         .test_runner = .{
@@ -4299,7 +4301,9 @@ pub fn build(b: *std.Build) void {
         "metadata openapi module generates extractor surface for routed endpoints",
         "usermgr openapi module generates extractor surface for routed endpoints",
         "client openapi module resolves shared refs through owner modules",
-        "batch parser accepts Go transform op spelling",
+        "batch parser accepts supported Go transform op spelling",
+        "batch parser rejects every recognized but unsupported transform operator",
+        "public table batch handler rejects unsupported missing-document transform before execution",
         "public table contract exposes migration metadata",
         "api http client round-trips public table management routes",
         "api http server serves status",
