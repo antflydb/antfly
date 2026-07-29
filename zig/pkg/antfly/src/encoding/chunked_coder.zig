@@ -820,6 +820,17 @@ test "ChunkedIntDecoder rejects truncated chunk metadata" {
     defer empty_dec.deinit();
     try empty_dec.loadChunk(0);
     try std.testing.expectEqual(@as(usize, 0), empty_dec.remaining());
+
+    const maximal_value_count = [_]u8{
+        0x01, 0x0c, 0x01,
+        0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff,
+        0x01, 0x00,
+    };
+    var maximal_dec = try ChunkedIntDecoder.init(alloc, &maximal_value_count, 0);
+    defer maximal_dec.deinit();
+    try std.testing.expectError(error.InvalidChunk, maximal_dec.loadChunk(0));
 }
 
 test "ChunkedIntDecoder accepts omitted unused partial-group padding" {

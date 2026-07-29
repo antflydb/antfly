@@ -260,7 +260,7 @@ fn encodeGroupScalar(values: []const u32, dst: []u8) struct { ctrl: u8, n: usize
 // ============================================================================
 
 pub fn encodedControlLen(value_count: usize) usize {
-    return (value_count + 3) / 4;
+    return value_count / 4 + @intFromBool(value_count % 4 != 0);
 }
 
 pub fn encodedDataCapacity(value_count: usize) usize {
@@ -451,6 +451,10 @@ test "encodedLength" {
     try std.testing.expectEqual(@as(u3, 3), encodedLength(0xFFFFFF));
     try std.testing.expectEqual(@as(u3, 4), encodedLength(0x1000000));
     try std.testing.expectEqual(@as(u3, 4), encodedLength(0xFFFFFFFF));
+}
+
+test "encodedControlLen does not overflow at maximum input" {
+    try std.testing.expectEqual(std.math.maxInt(usize) / 4 + 1, encodedControlLen(std.math.maxInt(usize)));
 }
 
 test "encode and decode roundtrip - small values" {
