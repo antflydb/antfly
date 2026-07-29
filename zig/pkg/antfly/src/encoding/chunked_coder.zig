@@ -36,17 +36,20 @@ pub const ChunkFormat = enum(u8) {
 // Uvarint helpers (protobuf-style, matching Go's binary.Uvarint)
 // ============================================================================
 
-fn readUvarint(data: []const u8, pos: *usize) u64 {
+fn readUvarint(data: []const u8, pos: *usize) !u64 {
+    if (pos.* > data.len) return error.TruncatedInput;
+
     var result: u64 = 0;
-    var shift: u6 = 0;
+    var shift: u7 = 0;
     while (pos.* < data.len) {
         const b = data[pos.*];
         pos.* += 1;
-        result |= @as(u64, b & 0x7F) << shift;
-        if (b & 0x80 == 0) break;
-        shift +|= 7;
+        if (shift == 63 and b > 1) return error.InvalidVarint;
+        result |= @as(u64, b & 0x7F) << @intCast(shift);
+        if (b & 0x80 == 0) return result;
+        shift += 7;
     }
-    return result;
+    return error.TruncatedInput;
 }
 
 fn uvarintSize(value: u64) usize {
@@ -368,13 +371,17 @@ pub const ChunkedIntDecoder = struct {
             .alloc = alloc,
         };
 
+        if (offset > data.len) return error.TruncatedInput;
         var read_pos = @as(usize, @intCast(offset));
-        const num_chunks = readUvarint(data, &read_pos);
+        const num_chunks = try readUvarint(data, &read_pos);
 
         if (num_chunks > 0) {
+            // Every declared chunk requires at least one offset byte.
+            if (num_chunks > @as(u64, @intCast(data.len - read_pos))) return error.TruncatedInput;
             self.chunk_offsets = try alloc.alloc(u64, @intCast(num_chunks));
+            errdefer alloc.free(self.chunk_offsets);
             for (0..@as(usize, @intCast(num_chunks))) |i| {
-                self.chunk_offsets[i] = readUvarint(data, &read_pos);
+                self.chunk_offsets[i] = try readUvarint(data, &read_pos);
             }
         }
 
@@ -404,7 +411,7 @@ pub const ChunkedIntDecoder = struct {
             return;
         }
 
-        self.format = @enumFromInt(chunk_bytes[0]);
+        self.format = std.enums.fromInt(ChunkFormat, chunk_bytes[0]) orelse return error.InvalidChunk;
 
         switch (self.format) {
             .columnar => try self.loadChunkColumnar(chunk_bytes),
@@ -416,8 +423,8 @@ pub const ChunkedIntDecoder = struct {
     fn loadChunkStreamVByte(self: *ChunkedIntDecoder, chunk_bytes: []const u8) !void {
         var offset: usize = 1;
 
-        const num_values = readUvarint(chunk_bytes, &offset);
-        const control_len = readUvarint(chunk_bytes, &offset);
+        const num_values = try readUvarint(chunk_bytes, &offset);
+        const control_len = try readUvarint(chunk_bytes, &offset);
         if (control_len != svb.encodedControlLen(@intCast(num_values))) return error.InvalidChunk;
         if (control_len > chunk_bytes.len -| offset) return error.TruncatedInput;
 
@@ -444,9 +451,9 @@ pub const ChunkedIntDecoder = struct {
     fn loadChunkColumnar(self: *ChunkedIntDecoder, chunk_bytes: []const u8) !void {
         var offset: usize = 1;
 
-        const num_docs = readUvarint(chunk_bytes, &offset);
-        const num_locs = readUvarint(chunk_bytes, &offset);
-        const num_array_pos = readUvarint(chunk_bytes, &offset);
+        const num_docs = try readUvarint(chunk_bytes, &offset);
+        const num_locs = try readUvarint(chunk_bytes, &offset);
+        const num_array_pos = try readUvarint(chunk_bytes, &offset);
 
         // Read columns
         const col_counts = try self.readColumn(chunk_bytes, &offset, @intCast(num_docs));
@@ -508,7 +515,7 @@ pub const ChunkedIntDecoder = struct {
     }
 
     fn readColumn(self: *ChunkedIntDecoder, chunk_bytes: []const u8, offset: *usize, num_values: usize) ![]u32 {
-        const ctrl_len = readUvarint(chunk_bytes, offset);
+        const ctrl_len = try readUvarint(chunk_bytes, offset);
         if (ctrl_len == 0) {
             if (num_values != 0) return error.InvalidChunk;
             return try self.alloc.alloc(u32, 0);
@@ -537,7 +544,7 @@ pub const ChunkedIntDecoder = struct {
         self.values.clearRetainingCapacity();
         var offset: usize = 0;
         while (offset < chunk_bytes.len) {
-            const val = readUvarint(chunk_bytes, &offset);
+            const val = try readUvarint(chunk_bytes, &offset);
             try self.values.append(self.alloc, @intCast(val));
         }
         self.pos = 0;
@@ -580,12 +587,12 @@ pub const ChunkedIntDecoder = struct {
 /// Useful when document IDs move by an exact multiple of chunk_size.
 pub fn prependEmptyChunks(alloc: Allocator, data: []const u8, chunk_delta: usize, total_chunks: usize) ![]u8 {
     var pos: usize = 0;
-    const old_num_chunks = readUvarint(data, &pos);
+    const old_num_chunks = try readUvarint(data, &pos);
     if (total_chunks < chunk_delta + old_num_chunks) return error.InvalidChunk;
 
     var old_total_len: u64 = 0;
     for (0..@as(usize, @intCast(old_num_chunks))) |_| {
-        old_total_len = readUvarint(data, &pos);
+        old_total_len = try readUvarint(data, &pos);
     }
 
     const chunk_data = data[pos..];
@@ -597,7 +604,7 @@ pub fn prependEmptyChunks(alloc: Allocator, data: []const u8, chunk_delta: usize
         const offset: u64 = if (chunk_idx < chunk_delta)
             0
         else if (exact_shifted_idx < old_num_chunks) blk: {
-            const val = readUvarint(data, &size_pos);
+            const val = try readUvarint(data, &size_pos);
             exact_shifted_idx += 1;
             break :blk val;
         } else old_total_len;
@@ -616,7 +623,7 @@ pub fn prependEmptyChunks(alloc: Allocator, data: []const u8, chunk_delta: usize
         const offset: u64 = if (chunk_idx < chunk_delta)
             0
         else if (shifted_idx < old_num_chunks) blk: {
-            next_offset = readUvarint(data, &src_pos);
+            next_offset = try readUvarint(data, &src_pos);
             shifted_idx += 1;
             break :blk next_offset;
         } else old_total_len;
@@ -781,6 +788,36 @@ test "ChunkedIntDecoder rejects a truncated StreamVByte value" {
     var dec = try ChunkedIntDecoder.init(alloc, bytes[0 .. bytes.len - 1], 0);
     defer dec.deinit();
     try std.testing.expectError(error.TruncatedInput, dec.loadChunk(0));
+}
+
+test "ChunkedIntDecoder rejects truncated chunk metadata" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.TruncatedInput, ChunkedIntDecoder.init(alloc, &.{}, 0));
+    try std.testing.expectError(error.TruncatedInput, ChunkedIntDecoder.init(alloc, &.{0x01}, 0));
+
+    const truncated_chunks = [_][]const u8{
+        &.{ 0x01, 0x01, 0x01 },
+        &.{ 0x01, 0x01, 0x02 },
+        &.{ 0x01, 0x01, 0x03 },
+        &.{ 0x01, 0x02, 0x01, 0x80 },
+    };
+    for (truncated_chunks) |bytes| {
+        var dec = try ChunkedIntDecoder.init(alloc, bytes, 0);
+        defer dec.deinit();
+        try std.testing.expectError(error.TruncatedInput, dec.loadChunk(0));
+    }
+
+    const invalid_format = [_]u8{ 0x01, 0x01, 0xff };
+    var invalid_dec = try ChunkedIntDecoder.init(alloc, &invalid_format, 0);
+    defer invalid_dec.deinit();
+    try std.testing.expectError(error.InvalidChunk, invalid_dec.loadChunk(0));
+
+    const empty_chunk = [_]u8{ 0x01, 0x00 };
+    var empty_dec = try ChunkedIntDecoder.init(alloc, &empty_chunk, 0);
+    defer empty_dec.deinit();
+    try empty_dec.loadChunk(0);
+    try std.testing.expectEqual(@as(usize, 0), empty_dec.remaining());
 }
 
 test "prependEmptyChunks shifts chunk table without reencoding payload" {
