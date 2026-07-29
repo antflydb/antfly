@@ -2784,7 +2784,7 @@ fn makeAnalyzeRunBudget(
 
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
-    run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+    run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
         backend_kind,
         kv_dtype,
         cfg,

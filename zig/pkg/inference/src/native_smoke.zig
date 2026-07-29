@@ -181,7 +181,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     budget_limits = applyBudgetOverrides(budget_limits, opts);
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     const admission_prefill_chunk = if (opts.prefill_chunk_size > 0) opts.prefill_chunk_size else 256;
-    run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+    run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
         backend_kind,
         kv_dtype,
         gpt_config,
@@ -610,9 +610,10 @@ fn estimateModelArtifactBytes(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
 ) !usize {
-    if (manifest.gguf_path) |path| return @intCast(try c_file.fileSize(allocator, path));
-    if (manifest.safetensors_path) |path| return @intCast(try c_file.fileSize(allocator, path));
-    return 0;
+    return std.math.cast(
+        usize,
+        try session_factory.estimateNativeWeightBytes(allocator, manifest.*),
+    ) orelse error.ResourceLimitExceeded;
 }
 
 fn estimatePreflightWeightBytes(
@@ -671,7 +672,7 @@ fn printGgufSummary(
     manifest: *const manifest_mod.ModelManifest,
     report: ?session_factory.GgufInspectionReport,
 ) !void {
-    if (manifest.gguf_path == null) return;
+    if (!manifest.usesGgufWeights()) return;
     const gguf_report = report orelse {
         print("gguf path={s} inspection=unavailable\n", .{manifest.gguf_path.?});
         return;

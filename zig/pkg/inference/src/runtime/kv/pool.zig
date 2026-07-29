@@ -88,6 +88,49 @@ pub const KvDType = enum {
         return self.bytesForKeyRow(num_kv_heads, head_dim) + self.bytesForValueRow(num_kv_heads, head_dim);
     }
 
+    /// Overflow-safe variant for resource planning and untrusted model metadata.
+    pub fn bytesForTokenPairChecked(self: KvDType, num_kv_heads: u32, head_dim: u32) !usize {
+        const heads: usize = num_kv_heads;
+        const dim: usize = head_dim;
+        const token_values = try std.math.mul(usize, heads, dim);
+        const key_bytes: usize = switch (self) {
+            .f32 => try std.math.mul(usize, token_values, 4),
+            .f16, .bf16 => try std.math.mul(usize, token_values, 2),
+            .fp8 => token_values,
+            .int8 => try std.math.mul(usize, heads, try std.math.add(usize, dim, @sizeOf(f32))),
+            .int4 => try std.math.mul(
+                usize,
+                try ceilDivChecked(token_values, int4_group_size),
+                int4_bytes_per_group,
+            ),
+            .polar4 => if (turboquant.isSupportedHeadDim(head_dim))
+                try ceilDivChecked(token_values, 2)
+            else
+                0,
+            .turbo3 => if (turboquant.isSupportedHeadDim(head_dim)) blk: {
+                const packed_bytes = try ceilDivChecked(try std.math.mul(usize, token_values, 3), 8);
+                const residual_bits = try std.math.mul(usize, heads, turboquant.turbo3_residual_bits_per_head);
+                break :blk try std.math.add(usize, packed_bytes, try ceilDivChecked(residual_bits, 8));
+            } else 0,
+        };
+        const value_bytes: usize = switch (self) {
+            .f32 => try std.math.mul(usize, token_values, 4),
+            .f16, .bf16 => try std.math.mul(usize, token_values, 2),
+            .fp8 => token_values,
+            .int8, .polar4, .turbo3 => try std.math.mul(
+                usize,
+                heads,
+                try std.math.add(usize, dim, @sizeOf(f32)),
+            ),
+            .int4 => try std.math.mul(
+                usize,
+                try ceilDivChecked(token_values, int4_group_size),
+                int4_bytes_per_group,
+            ),
+        };
+        return std.math.add(usize, key_bytes, value_bytes);
+    }
+
     pub fn bytesForFlatKeyRow(self: KvDType, values_per_token: usize, num_kv_heads: u32, head_dim: u32) usize {
         const default_width = @as(usize, num_kv_heads) * @as(usize, head_dim);
         if (values_per_token == default_width) return self.bytesForKeyRow(num_kv_heads, head_dim);
@@ -149,6 +192,11 @@ fn flatTurbo3KeyBytes(values_per_token: usize, num_kv_heads: u32) usize {
 fn int4BytesForRow(token_values: usize) usize {
     const num_groups = (token_values + int4_group_size - 1) / int4_group_size;
     return num_groups * int4_bytes_per_group;
+}
+
+fn ceilDivChecked(numerator: usize, denominator: usize) !usize {
+    if (numerator == 0) return 0;
+    return try std.math.add(usize, numerator, denominator - 1) / denominator;
 }
 
 pub const KvPoolConfig = struct {
@@ -1291,4 +1339,19 @@ test "bytesForTokenRow matches expected sizes" {
     try std.testing.expectEqual(@as(usize, 512 + 1024 + 8 * 4), KvDType.polar4.bytesForTokenRow(8, 128));
     // turbo3 is asymmetric: 3-bit packed keys plus residual sketch and int8-style values.
     try std.testing.expectEqual(@as(usize, 384 + 32 + 1024 + 8 * 4), KvDType.turbo3.bytesForTokenRow(8, 128));
+}
+
+test "checked token-pair sizes match runtime layouts and reject overflow" {
+    inline for (std.enums.values(KvDType)) |dtype| {
+        try std.testing.expectEqual(
+            dtype.bytesForTokenPair(8, 128),
+            try dtype.bytesForTokenPairChecked(8, 128),
+        );
+    }
+    if (@sizeOf(usize) == 8) {
+        try std.testing.expectError(
+            error.Overflow,
+            KvDType.f32.bytesForTokenPairChecked(std.math.maxInt(u32), std.math.maxInt(u32)),
+        );
+    }
 }

@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const generating_api_openapi = @import("antfly_generating_api_openapi");
 const eval_openapi = @import("antfly_eval_openapi");
 const generating_openapi = @import("antfly_generating_openapi");
@@ -227,13 +226,6 @@ pub const QueryRunner = struct {
             filter_query_json: ?[]const u8,
             exclusion_query_json: ?[]const u8,
         ) anyerror![]const []const u8 = null,
-        bind_predicate_session: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            session_id: ?[]const u8,
-            predicate_json: []const u8,
-            continuation: bool,
-        ) anyerror!?[]u8 = null,
     };
 
     pub fn runQuery(
@@ -259,34 +251,6 @@ pub const QueryRunner = struct {
             table_name,
             filter_query_json,
             exclusion_query_json,
-        );
-    }
-
-    pub fn bindPredicateSession(
-        self: QueryRunner,
-        alloc: std.mem.Allocator,
-        session_id: ?[]const u8,
-        predicate_json: []const u8,
-        continuation: bool,
-    ) !?[]u8 {
-        if (predicate_json.len == 0) {
-            if (continuation and session_id != null and
-                std.mem.startsWith(u8, session_id.?, predicate_session_prefix))
-            {
-                return error.InvalidRetrievalAgentRequest;
-            }
-            return if (session_id) |value| try alloc.dupe(u8, value) else null;
-        }
-        if (self.vtable.bind_predicate_session) |bind| {
-            return try bind(self.ptr, alloc, session_id, predicate_json, continuation);
-        }
-        if (!builtin.is_test) return error.UnsupportedRetrievalAgentRequest;
-        return try bindPredicateSessionToken(
-            alloc,
-            "antfly-embedded-predicate-session-v1",
-            session_id,
-            predicate_json,
-            continuation and session_id != null and std.mem.startsWith(u8, session_id.?, predicate_session_prefix),
         );
     }
 };
@@ -575,21 +539,6 @@ fn executeInternal(
         retrieval_queries,
         request.accumulated_filters orelse &.{},
     );
-    const predicate_session_json = if (mandatoryPredicatesActive(mandatory_predicates))
-        try mandatoryPredicateSessionJsonAlloc(arena, retrieval_queries, mandatory_predicates)
-    else
-        "";
-    const replaying_bound_session = if (request.session_id) |session_id|
-        std.mem.startsWith(u8, session_id, predicate_session_prefix)
-    else
-        false;
-    const effective_session_id = try runner.bindPredicateSession(
-        arena,
-        request.session_id,
-        predicate_session_json,
-        replaying_bound_session or
-            (request.decisions != null and request.decisions.?.len > 0),
-    );
 
     var hit_list = std.ArrayListUnmanaged(QueryHit).empty;
     var seen_ids = std.StringHashMapUnmanaged(void).empty;
@@ -681,7 +630,7 @@ fn executeInternal(
                 .hits = &.{},
                 .steps = steps,
                 .strategy_used = null,
-                .session_id = effective_session_id,
+                .session_id = request.session_id,
                 .iteration = 0,
                 .clarification_count = clarification_state.count,
                 .remaining_internal_iterations = max_internal_iterations,
@@ -708,7 +657,7 @@ fn executeInternal(
                 .hits = &.{},
                 .steps = steps,
                 .strategy_used = null,
-                .session_id = effective_session_id,
+                .session_id = request.session_id,
                 .iteration = 0,
                 .clarification_count = clarification_state.count,
                 .remaining_internal_iterations = max_internal_iterations,
@@ -1215,7 +1164,7 @@ fn executeInternal(
                             .hits = try hit_list.toOwnedSlice(arena),
                             .steps = steps,
                             .strategy_used = detectAggregateStrategy(strategies.items),
-                            .session_id = effective_session_id,
+                            .session_id = request.session_id,
                             .iteration = iteration_count,
                             .clarification_count = clarification_state.count,
                             .remaining_internal_iterations = @max(@as(i64, 0), max_internal_iterations - iteration_count),
@@ -1286,7 +1235,7 @@ fn executeInternal(
             .hits = &.{},
             .steps = steps,
             .strategy_used = null,
-            .session_id = effective_session_id,
+            .session_id = request.session_id,
             .iteration = iteration_count,
             .clarification_count = clarification_state.count,
             .remaining_internal_iterations = @max(@as(i64, 0), max_internal_iterations - iteration_count),
@@ -1358,7 +1307,7 @@ fn executeInternal(
         .hits = try hit_list.toOwnedSlice(arena),
         .steps = steps,
         .strategy_used = detectAggregateStrategy(strategies.items),
-        .session_id = effective_session_id,
+        .session_id = request.session_id,
         .iteration = if (agentic_mode) iteration_count else 0,
         .clarification_count = clarification_state.count,
         .remaining_internal_iterations = if (agentic_mode) @max(@as(i64, 0), max_internal_iterations - iteration_count) else 0,
@@ -5472,124 +5421,6 @@ const MandatoryPredicates = struct {
     exclusion_query: ?std.json.Value = null,
 };
 
-const MandatoryPredicateSessionBinding = struct {
-    table: []const u8,
-    filter_query: ?std.json.Value = null,
-    exclusion_query: ?std.json.Value = null,
-};
-
-fn mandatoryPredicatesActive(predicates: []const MandatoryPredicates) bool {
-    for (predicates) |predicate| {
-        if (predicate.filter_query != null or predicate.exclusion_query != null) return true;
-    }
-    return false;
-}
-
-fn mandatoryPredicateSessionJsonAlloc(
-    alloc: std.mem.Allocator,
-    queries: []const RetrievalQueryRequest,
-    predicates: []const MandatoryPredicates,
-) ![]u8 {
-    if (queries.len != predicates.len) return error.InvalidRetrievalAgentRequest;
-
-    var seen = std.StringHashMapUnmanaged(void).empty;
-    defer seen.deinit(alloc);
-    var bindings = std.ArrayListUnmanaged(MandatoryPredicateSessionBinding).empty;
-    defer bindings.deinit(alloc);
-
-    for (queries, predicates) |query, predicate| {
-        const table = query.table orelse return error.InvalidRetrievalAgentRequest;
-        const entry = try seen.getOrPut(alloc, table);
-        if (entry.found_existing) continue;
-        try bindings.append(alloc, .{
-            .table = table,
-            .filter_query = predicate.filter_query,
-            .exclusion_query = predicate.exclusion_query,
-        });
-    }
-    std.mem.sort(MandatoryPredicateSessionBinding, bindings.items, {}, struct {
-        fn lessThan(
-            _: void,
-            lhs: MandatoryPredicateSessionBinding,
-            rhs: MandatoryPredicateSessionBinding,
-        ) bool {
-            return std.mem.order(u8, lhs.table, rhs.table) == .lt;
-        }
-    }.lessThan);
-    return try std.json.Stringify.valueAlloc(alloc, bindings.items, .{});
-}
-
-const predicate_session_prefix = "afp1.";
-const predicate_session_digest_hex_len = std.crypto.hash.sha2.Sha256.digest_length * 2;
-const predicate_session_mac_hex_len = std.crypto.auth.hmac.sha2.HmacSha256.mac_length * 2;
-
-pub fn bindPredicateSessionToken(
-    alloc: std.mem.Allocator,
-    secret: []const u8,
-    session_id: ?[]const u8,
-    predicate_json: []const u8,
-    continuation: bool,
-) !?[]u8 {
-    if (predicate_json.len == 0) {
-        if (continuation and session_id != null and
-            std.mem.startsWith(u8, session_id.?, predicate_session_prefix))
-        {
-            return error.InvalidRetrievalAgentRequest;
-        }
-        return if (session_id) |value| try alloc.dupe(u8, value) else null;
-    }
-    if (secret.len < 32) return error.InvalidRetrievalAgentRequest;
-
-    var predicate_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(predicate_json, &predicate_digest, .{});
-    const digest_hex = std.fmt.bytesToHex(predicate_digest, .lower);
-
-    if (continuation) {
-        const token = session_id orelse return error.InvalidRetrievalAgentRequest;
-        if (!std.mem.startsWith(u8, token, predicate_session_prefix)) {
-            return error.InvalidRetrievalAgentRequest;
-        }
-        const payload_and_mac = token[predicate_session_prefix.len..];
-        const separator = std.mem.lastIndexOfScalar(u8, payload_and_mac, '.') orelse
-            return error.InvalidRetrievalAgentRequest;
-        const payload = payload_and_mac[0..separator];
-        const supplied_mac_hex = payload_and_mac[separator + 1 ..];
-        if (supplied_mac_hex.len != predicate_session_mac_hex_len) {
-            return error.InvalidRetrievalAgentRequest;
-        }
-
-        var expected_mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
-        std.crypto.auth.hmac.sha2.HmacSha256.create(&expected_mac, payload, secret);
-        const expected_mac_hex = std.fmt.bytesToHex(expected_mac, .lower);
-        if (!std.crypto.timing_safe.eql([predicate_session_mac_hex_len]u8, expected_mac_hex, supplied_mac_hex[0..predicate_session_mac_hex_len].*)) {
-            return error.InvalidRetrievalAgentRequest;
-        }
-
-        const digest_separator = std.mem.lastIndexOfScalar(u8, payload, '.') orelse
-            return error.InvalidRetrievalAgentRequest;
-        const supplied_digest = payload[digest_separator + 1 ..];
-        if (supplied_digest.len != predicate_session_digest_hex_len or
-            !std.mem.eql(u8, supplied_digest, &digest_hex))
-        {
-            return error.InvalidRetrievalAgentRequest;
-        }
-        return try alloc.dupe(u8, token);
-    }
-
-    const base_session = session_id orelse "";
-    const encoded_size = std.base64.url_safe_no_pad.Encoder.calcSize(base_session.len);
-    const encoded_session = try alloc.alloc(u8, encoded_size);
-    defer alloc.free(encoded_session);
-    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded_session, base_session);
-
-    const payload = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ encoded_session, digest_hex });
-    defer alloc.free(payload);
-    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, payload, secret);
-    const mac_hex = std.fmt.bytesToHex(mac, .lower);
-    return try std.fmt.allocPrint(alloc, "{s}{s}.{s}", .{ predicate_session_prefix, payload, mac_hex });
-}
-
 fn buildMandatoryPredicates(
     alloc: std.mem.Allocator,
     queries: []const RetrievalQueryRequest,
@@ -6778,140 +6609,19 @@ test "retrieval agent applies table predicates and accumulated filters to siblin
 
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tenant\":\"visible\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"status\":\"active\"") != null);
-
-    const session_json = try mandatoryPredicateSessionJsonAlloc(arena, &queries, mandatory);
-    try std.testing.expect(std.mem.indexOf(u8, session_json, "\"table\":\"docs\"") != null);
 }
 
-test "retrieval predicate session binding is canonical and table scoped" {
+test "retrieval session id remains a correlation identifier with mandatory predicates" {
     const alloc = std.testing.allocator;
-    var arena_impl = std.heap.ArenaAllocator.init(alloc);
-    defer arena_impl.deinit();
-    const arena = arena_impl.allocator();
-
-    var docs = try parseJsonBody(RetrievalQueryRequest, alloc,
-        \\{"table":"docs","filter_query":{"term":{"tenant":"visible"}}}
-    );
-    defer docs.deinit();
-    var audit = try parseJsonBody(RetrievalQueryRequest, alloc,
-        \\{"table":"audit","full_text_search":{"query":"raft"}}
-    );
-    defer audit.deinit();
-    var moved = try parseJsonBody(RetrievalQueryRequest, alloc,
-        \\{"table":"audit","filter_query":{"term":{"tenant":"visible"}}}
-    );
-    defer moved.deinit();
-
-    const ordered_queries = [_]RetrievalQueryRequest{ docs.value, audit.value };
-    const ordered_predicates = try buildMandatoryPredicates(arena, &ordered_queries, &.{});
-    const ordered_json = try mandatoryPredicateSessionJsonAlloc(arena, &ordered_queries, ordered_predicates);
-
-    const reordered_queries = [_]RetrievalQueryRequest{ audit.value, docs.value };
-    const reordered_predicates = try buildMandatoryPredicates(arena, &reordered_queries, &.{});
-    const reordered_json = try mandatoryPredicateSessionJsonAlloc(arena, &reordered_queries, reordered_predicates);
-    try std.testing.expectEqualStrings(ordered_json, reordered_json);
-
-    const moved_queries = [_]RetrievalQueryRequest{ moved.value, audit.value };
-    const moved_predicates = try buildMandatoryPredicates(arena, &moved_queries, &.{});
-    const moved_json = try mandatoryPredicateSessionJsonAlloc(arena, &moved_queries, moved_predicates);
-    try std.testing.expect(!std.mem.eql(u8, ordered_json, moved_json));
-}
-
-test "retrieval predicate session token rejects broadening and tampering" {
-    const alloc = std.testing.allocator;
-    const secret = "0123456789abcdef0123456789abcdef";
-    const predicate_json = "[{\"table\":\"docs\",\"filter\":{\"term\":{\"tenant\":\"visible\"}}}]";
-
-    const token = (try bindPredicateSessionToken(
-        alloc,
-        secret,
-        "conversation-1",
-        predicate_json,
-        false,
-    )).?;
-    defer alloc.free(token);
-    try std.testing.expect(std.mem.startsWith(u8, token, predicate_session_prefix));
-
-    const continued = (try bindPredicateSessionToken(
-        alloc,
-        secret,
-        token,
-        predicate_json,
-        true,
-    )).?;
-    defer alloc.free(continued);
-    try std.testing.expectEqualStrings(token, continued);
-
-    try std.testing.expectError(
-        error.InvalidRetrievalAgentRequest,
-        bindPredicateSessionToken(
-            alloc,
-            secret,
-            token,
-            "[{\"table\":\"docs\"}]",
-            true,
-        ),
-    );
-    try std.testing.expectError(
-        error.InvalidRetrievalAgentRequest,
-        bindPredicateSessionToken(
-            alloc,
-            secret,
-            token,
-            "",
-            true,
-        ),
-    );
-
-    const tampered = try alloc.dupe(u8, token);
-    defer alloc.free(tampered);
-    tampered[tampered.len - 1] = if (tampered[tampered.len - 1] == '0') '1' else '0';
-    try std.testing.expectError(
-        error.InvalidRetrievalAgentRequest,
-        bindPredicateSessionToken(
-            alloc,
-            secret,
-            tampered,
-            predicate_json,
-            true,
-        ),
-    );
-}
-
-test "retrieval continuation revalidates bound predicates without decisions" {
-    const alloc = std.testing.allocator;
-    const initial_body =
+    const body =
         \\{"query":"find active docs","stream":false,"session_id":"conversation-1","queries":[{"table":"docs","filter_query":{"term":{"tenant":"visible"}},"limit":5}]}
     ;
-    const initial_encoded = try executeJson(alloc, ValidationOnlyRunner.iface(), null, initial_body);
-    defer alloc.free(initial_encoded);
-    var initial = try std.json.parseFromSlice(RetrievalAgentResult, alloc, initial_encoded, .{});
-    defer initial.deinit();
-    const token = initial.value.session_id orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.startsWith(u8, token, predicate_session_prefix));
+    const encoded = try executeJson(alloc, ValidationOnlyRunner.iface(), null, body);
+    defer alloc.free(encoded);
 
-    const replay_body = try std.fmt.allocPrint(
-        alloc,
-        "{{\"query\":\"find active docs\",\"stream\":false,\"session_id\":\"{s}\",\"queries\":[{{\"table\":\"docs\",\"filter_query\":{{\"term\":{{\"tenant\":\"visible\"}}}},\"limit\":5}}]}}",
-        .{token},
-    );
-    defer alloc.free(replay_body);
-    const replay_encoded = try executeJson(alloc, ValidationOnlyRunner.iface(), null, replay_body);
-    defer alloc.free(replay_encoded);
-    var replay = try std.json.parseFromSlice(RetrievalAgentResult, alloc, replay_encoded, .{});
-    defer replay.deinit();
-    try std.testing.expectEqualStrings(token, replay.value.session_id.?);
-
-    const broadened_body = try std.fmt.allocPrint(
-        alloc,
-        "{{\"query\":\"find active docs\",\"stream\":false,\"session_id\":\"{s}\",\"queries\":[{{\"table\":\"docs\",\"limit\":5}}]}}",
-        .{token},
-    );
-    defer alloc.free(broadened_body);
-    try std.testing.expectError(
-        error.InvalidRetrievalAgentRequest,
-        executeJson(alloc, ValidationOnlyRunner.iface(), null, broadened_body),
-    );
+    var parsed = try std.json.parseFromSlice(RetrievalAgentResult, alloc, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("conversation-1", parsed.value.session_id.?);
 }
 
 test "describe hit for generation includes tree lineage" {

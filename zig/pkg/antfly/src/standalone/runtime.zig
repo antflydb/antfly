@@ -1350,6 +1350,11 @@ pub fn runFromIterator(
     if (loaded_config) |*cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
         if (cfg.inference.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
+        if (cfg.inference.keep_alive) |value|
+            antfly_node_cfg.keep_alive_ms = try parseInferenceKeepAliveMs(value);
+        if (cfg.inference.max_loaded_models) |value|
+            antfly_node_cfg.max_loaded_models =
+                std.math.cast(usize, value) orelse return error.InvalidInferenceModelCacheConfig;
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
     // Until DataServer exists, error cleanup is owned here. Once its
@@ -1541,6 +1546,9 @@ pub fn runFromIterator(
         antfly_node.deinit();
     }
 
+    antfly_node.configureAdmissionResourceBudget(inferenceAdmissionResourceBudget(
+        &data_server.provisioned_storage.resource_manager,
+    ));
     antfly_node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(&data_server.provisioned_storage.resource_manager);
     try antfly_node.configureTokenizerCaches(.{
         // Keep the small lock-free front table hot while providing enough
@@ -1763,6 +1771,106 @@ fn promptCacheResourceUsageObserver(manager: *antfly.resource_manager.ResourceMa
         .context = manager,
         .update = observePromptCacheResourceUsage,
     };
+}
+
+fn inferenceAdmissionResourceBudget(
+    manager: *antfly.resource_manager.ResourceManager,
+) inference.runtime.tier.memory.AdmissionResourceBudget {
+    return .{
+        .context = manager,
+        .try_reserve = reserveInferenceAdmissionResources,
+        .release = releaseInferenceAdmissionResources,
+    };
+}
+
+fn inferenceAdmissionSliceAmounts(
+    amounts: inference.runtime.tier.memory.AdmissionAmounts,
+) ![3]antfly.resource_manager.SliceAmount {
+    const model_residency = try std.math.add(
+        usize,
+        amounts.host_weight_bytes,
+        amounts.backend_weight_bytes,
+    );
+    const kv_working_set = try std.math.add(
+        usize,
+        amounts.host_kv_bytes,
+        amounts.backend_kv_bytes,
+    );
+    const scratch_working_set = try std.math.add(
+        usize,
+        amounts.host_scratch_bytes,
+        amounts.backend_scratch_bytes,
+    );
+    return .{
+        .{ .slice = .inference_model_residency, .bytes = @intCast(model_residency) },
+        .{ .slice = .inference_kv_working_set, .bytes = @intCast(kv_working_set) },
+        .{ .slice = .inference_scratch_working_set, .bytes = @intCast(scratch_working_set) },
+    };
+}
+
+fn reserveInferenceAdmissionResources(
+    context: *anyopaque,
+    amounts: inference.runtime.tier.memory.AdmissionAmounts,
+) inference.runtime.tier.memory.AdmissionResourceError!void {
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    const slices = inferenceAdmissionSliceAmounts(amounts) catch
+        return error.ResourceLimitExceeded;
+    manager.reserveBatchClassified(&slices) catch |err| switch (err) {
+        error.ResourceRequestTooLarge => return error.ResourceLimitExceeded,
+        error.ResourceTemporarilyUnavailable => return error.ResourceTemporarilyUnavailable,
+        // Duplicate slices are impossible in the fixed bridge plan.
+        error.DuplicateResourceSlice => unreachable,
+    };
+}
+
+fn releaseInferenceAdmissionResources(
+    context: *anyopaque,
+    amounts: inference.runtime.tier.memory.AdmissionAmounts,
+) void {
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    const slices = inferenceAdmissionSliceAmounts(amounts) catch unreachable;
+    manager.releaseBatch(&slices);
+}
+
+test "inference admission bridge charges combined native residency to resource manager" {
+    var budgets = antfly.resource_manager.Options.defaultBudgets();
+    budgets[@intFromEnum(antfly.resource_manager.Slice.inference_model_residency)] =
+        .{ .hard_limit_bytes = 100 };
+    var manager = antfly.resource_manager.ResourceManager.init(.{ .budgets = budgets });
+    const budget = inferenceAdmissionResourceBudget(&manager);
+
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        budget.try_reserve(budget.context, .{
+            .host_weight_bytes = 80,
+            .backend_weight_bytes = 30,
+        }),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+
+    const admitted = inference.runtime.tier.memory.AdmissionAmounts{
+        .host_weight_bytes = 60,
+        .backend_weight_bytes = 30,
+    };
+    try budget.try_reserve(budget.context, admitted);
+    try std.testing.expectEqual(
+        @as(u64, 90),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        budget.try_reserve(budget.context, .{
+            .host_weight_bytes = 11,
+        }),
+    );
+    budget.release(budget.context, admitted);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
 }
 
 fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) void {
@@ -3658,6 +3766,52 @@ fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.C
     if (cli.inference_models_dir) |value| return value;
     if (cfg) |loaded| return loaded.inference.models_dir;
     return null;
+}
+
+fn parseInferenceKeepAliveMs(raw: []const u8) !u64 {
+    if (std.mem.eql(u8, raw, "0")) return 0;
+    if (raw.len == 0) return error.InvalidInferenceModelCacheConfig;
+    var i: usize = 0;
+    var total_ns: u64 = 0;
+    while (i < raw.len) {
+        const start = i;
+        while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) {}
+        if (i == start) return error.InvalidInferenceModelCacheConfig;
+        const value = std.fmt.parseUnsigned(u64, raw[start..i], 10) catch
+            return error.InvalidInferenceModelCacheConfig;
+        const unit_ns: u64 = if (std.mem.startsWith(u8, raw[i..], "ms")) blk: {
+            i += 2;
+            break :blk std.time.ns_per_ms;
+        } else if (i < raw.len and raw[i] == 's') blk: {
+            i += 1;
+            break :blk std.time.ns_per_s;
+        } else if (i < raw.len and raw[i] == 'm') blk: {
+            i += 1;
+            break :blk std.time.ns_per_min;
+        } else if (i < raw.len and raw[i] == 'h') blk: {
+            i += 1;
+            break :blk std.time.ns_per_hour;
+        } else return error.InvalidInferenceModelCacheConfig;
+        const part_ns = std.math.mul(u64, value, unit_ns) catch
+            return error.InvalidInferenceModelCacheConfig;
+        total_ns = std.math.add(u64, total_ns, part_ns) catch
+            return error.InvalidInferenceModelCacheConfig;
+    }
+    if (total_ns == 0) return 0;
+    return @max(@as(u64, 1), total_ns / std.time.ns_per_ms);
+}
+
+test "standalone inference keep alive parses compound durations and zero" {
+    try std.testing.expectEqual(@as(u64, 0), try parseInferenceKeepAliveMs("0"));
+    try std.testing.expectEqual(@as(u64, 0), try parseInferenceKeepAliveMs("0s"));
+    try std.testing.expectEqual(
+        @as(u64, 90_000),
+        try parseInferenceKeepAliveMs("1m30s"),
+    );
+    try std.testing.expectError(
+        error.InvalidInferenceModelCacheConfig,
+        parseInferenceKeepAliveMs("forever"),
+    );
 }
 
 fn resolveInferenceMlDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {

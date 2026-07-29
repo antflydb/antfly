@@ -299,7 +299,6 @@ const metadata_bootstrap_retry_jitter_ms: u64 = 250;
 const public_api_max_connection_threads: u32 = 64;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
-const retrieval_continuation_secret_key = "antfly.retrieval.continuation.secret";
 
 fn dataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     var cfg: raft_engine.runtime.RuntimeConfig = .{};
@@ -1810,6 +1809,9 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.lite_docstore_snapshot_cache,
         resource_manager_mod.Slice.inference_prompt_cache,
         resource_manager_mod.Slice.inference_tokenizer_cache,
+        resource_manager_mod.Slice.inference_model_residency,
+        resource_manager_mod.Slice.inference_kv_working_set,
+        resource_manager_mod.Slice.inference_scratch_working_set,
         resource_manager_mod.Slice.dense_repair_working_set,
         resource_manager_mod.Slice.shard_transition_working_set,
     }) |slice| {
@@ -13976,11 +13978,6 @@ pub fn runFromIterator(
         if (secret_store_initialized) &secret_store else null,
     );
     defer if (trusted_principal_secret) |value| alloc.free(value);
-    const retrieval_continuation_secret = try resolveRetrievalContinuationSecret(
-        alloc,
-        if (secret_store_initialized) &secret_store else null,
-    );
-    defer if (retrieval_continuation_secret) |value| alloc.free(value);
     const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
@@ -14047,7 +14044,6 @@ pub fn runFromIterator(
             .auth_enabled = effective_auth_enabled,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
-            .retrieval_continuation_secret = retrieval_continuation_secret,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
@@ -14466,13 +14462,6 @@ fn resolveTrustedPrincipalIssuer(
     secret_store: ?*antfly.common.secrets.FileStore,
 ) !?[]u8 {
     return try resolveTrustedPrincipalConfigValue(alloc, secret_store, trusted_principal_issuer_key);
-}
-
-fn resolveRetrievalContinuationSecret(
-    alloc: std.mem.Allocator,
-    secret_store: ?*antfly.common.secrets.FileStore,
-) !?[]u8 {
-    return try resolveTrustedPrincipalConfigValue(alloc, secret_store, retrieval_continuation_secret_key);
 }
 
 fn resolveTrustedPrincipalConfigValue(
@@ -15069,24 +15058,6 @@ test "data runtime resolves trusted principal issuer from secret store" {
     const resolved = try resolveTrustedPrincipalIssuer(alloc, &store);
     defer if (resolved) |value| alloc.free(value);
     try std.testing.expectEqualStrings("cloudaf", resolved.?);
-}
-
-test "data runtime resolves retrieval continuation secret from secret store" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retrieval-continuation-secret.json", .{tmp.sub_path});
-    defer alloc.free(store_path);
-
-    var store = try antfly.common.secrets.FileStore.init(alloc, store_path);
-    defer store.deinit();
-    var entry = try store.put(alloc, retrieval_continuation_secret_key, "shared-retrieval-secret");
-    defer entry.deinit(alloc);
-
-    const resolved = try resolveRetrievalContinuationSecret(alloc, &store);
-    defer if (resolved) |value| alloc.free(value);
-    try std.testing.expectEqualStrings("shared-retrieval-secret", resolved.?);
 }
 
 test "data runtime local group status uses injected leadership source" {

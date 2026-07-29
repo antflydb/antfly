@@ -30,7 +30,6 @@ const metadata_raft_election_max_ticks = 60;
 const metadata_bootstrap_campaign_retry_min_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
-const retrieval_continuation_secret_key = "antfly.retrieval.continuation.secret";
 
 fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     return .{
@@ -821,11 +820,6 @@ pub fn runFromIterator(
         if (secret_store_initialized) &secret_store else null,
     );
     defer if (trusted_principal_secret) |value| alloc.free(value);
-    const retrieval_continuation_secret = try resolveRetrievalContinuationSecret(
-        alloc,
-        if (secret_store_initialized) &secret_store else null,
-    );
-    defer if (retrieval_continuation_secret) |value| alloc.free(value);
     const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
@@ -896,7 +890,6 @@ pub fn runFromIterator(
             .auth_enabled = effective_auth_enabled,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
-            .retrieval_continuation_secret = retrieval_continuation_secret,
             .user_manager = if (user_manager) |*manager| manager else null,
             .secret_store = if (secret_store_initialized) &secret_store else null,
             .remote_content = remote_content,
@@ -1437,13 +1430,6 @@ fn resolveTrustedPrincipalIssuer(
     return try resolveMetadataRuntimeSecretValue(alloc, secret_store, trusted_principal_issuer_key);
 }
 
-fn resolveRetrievalContinuationSecret(
-    alloc: std.mem.Allocator,
-    secret_store: ?*antfly.common.secrets.FileStore,
-) !?[]u8 {
-    return try resolveMetadataRuntimeSecretValue(alloc, secret_store, retrieval_continuation_secret_key);
-}
-
 fn resolveMetadataRuntimeSecretValue(
     alloc: std.mem.Allocator,
     secret_store: ?*antfly.common.secrets.FileStore,
@@ -1542,19 +1528,13 @@ test "metadata runtime preserves trusted principal auth material bytes" {
     defer stored_secret.deinit(alloc);
     var stored_issuer = try secret_store.put(alloc, trusted_principal_issuer_key, "\ttrusted-upstream ");
     defer stored_issuer.deinit(alloc);
-    var stored_retrieval_secret = try secret_store.put(alloc, retrieval_continuation_secret_key, " retrieval-session-secret ");
-    defer stored_retrieval_secret.deinit(alloc);
-
     const secret = try resolveTrustedPrincipalSecret(alloc, &secret_store);
     defer if (secret) |value| alloc.free(value);
     const issuer = try resolveTrustedPrincipalIssuer(alloc, &secret_store);
     defer if (issuer) |value| alloc.free(value);
-    const retrieval_secret = try resolveRetrievalContinuationSecret(alloc, &secret_store);
-    defer if (retrieval_secret) |value| alloc.free(value);
 
     try std.testing.expectEqualStrings(" shared-secret \n", secret.?);
     try std.testing.expectEqualStrings("\ttrusted-upstream ", issuer.?);
-    try std.testing.expectEqualStrings(" retrieval-session-secret ", retrieval_secret.?);
 }
 
 fn expectMetricPresent(output: []const u8, name: []const u8) !void {

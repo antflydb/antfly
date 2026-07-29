@@ -246,23 +246,6 @@ pub const Reconciler = struct {
         var planner = placement_planner.PlacementPlanner.init(self.alloc);
         const desired_tables = try manager.listTables(self.alloc);
         defer manager.freeTables(self.alloc, desired_tables);
-        const candidate_domains = try self.alloc.alloc(placement_planner.CandidateDomain, placement_candidate_info.len);
-        defer self.alloc.free(candidate_domains);
-        for (placement_candidate_info, 0..) |candidate, i| {
-            candidate_domains[i] = .{
-                .node_id = candidate.node_id,
-                .store_id = candidate.store_id,
-                .role = candidate.role,
-                .failure_domain = candidate.failure_domain,
-                .priority = candidate.priority,
-                .status_tag = candidate.status_tag,
-                .available_bytes = candidate.available_bytes,
-                .lease_pressure = candidate.lease_pressure,
-                .read_load = candidate.read_load,
-                .write_load = candidate.write_load,
-                .retain_current = if (current.reallocate_requested) false else candidate.retain_current,
-            };
-        }
         var evidence = try StoreEvidenceIndex.init(self.alloc, current);
         defer evidence.deinit();
         try self.syncAutomaticShardIntents(
@@ -280,6 +263,36 @@ pub const Reconciler = struct {
         defer manager.freeMergeTransitions(self.alloc, desired_merges);
         const split_provisioning_ranges = try allocSplitProvisioningRanges(self.alloc, desired_ranges, desired_splits);
         defer self.alloc.free(split_provisioning_ranges);
+
+        // A forced rebalance and a range transition both change Raft
+        // membership. Planning them together can expand the source voter set
+        // while the transition driver is trying to prepare that same leader.
+        // Serialize forced placement movement behind split/merge work. Health-
+        // driven exclusion still flows through candidate.retain_current and
+        // therefore remains able to repair failed or draining stores.
+        const force_placement_reallocation = current.reallocate_requested and
+            desired_splits.len == 0 and
+            desired_merges.len == 0 and
+            current.split_transitions.len == 0 and
+            current.merge_transitions.len == 0;
+        const candidate_domains = try self.alloc.alloc(placement_planner.CandidateDomain, placement_candidate_info.len);
+        defer self.alloc.free(candidate_domains);
+        for (placement_candidate_info, 0..) |candidate, i| {
+            candidate_domains[i] = .{
+                .node_id = candidate.node_id,
+                .store_id = candidate.store_id,
+                .role = candidate.role,
+                .failure_domain = candidate.failure_domain,
+                .priority = candidate.priority,
+                .status_tag = candidate.status_tag,
+                .available_bytes = candidate.available_bytes,
+                .lease_pressure = candidate.lease_pressure,
+                .read_load = candidate.read_load,
+                .write_load = candidate.write_load,
+                .retain_current = if (force_placement_reallocation) false else candidate.retain_current,
+                .force_reallocate = force_placement_reallocation,
+            };
+        }
         const protected_placement_groups = try allocUnconvergedPlacementGroups(
             self.alloc,
             current,
@@ -3621,19 +3634,7 @@ fn findMergeObservation(records: []const MergeRuntimeObservation, transition_id:
 }
 
 fn defaultSplitObservation() transition_state.SplitObservation {
-    return .{
-        .status = .{
-            .phase = .prepare,
-            .source_split_phase = .prepare,
-            .bootstrapped = false,
-            .replay_required = false,
-            .replay_caught_up = false,
-            .cutover_ready = false,
-            .destination_ready_for_reads = false,
-            .source_delta_sequence = 0,
-            .dest_delta_sequence = 0,
-        },
-    };
+    return transition_state.unpreparedSplitObservation();
 }
 
 fn defaultMergeObservation(record: transition_state.MergeTransitionRecord) transition_state.MergeObservation {
@@ -3909,7 +3910,7 @@ test "metadata reconciler resumes projected transition after authority handoff" 
     try std.testing.expectEqual(@as(usize, 0), plan.split_removals.len);
     try std.testing.expectEqual(@as(usize, 1), plan.split_steps.len);
     try std.testing.expectEqual(transition_controller.SplitExecutionStateTag.awaiting_source_start, plan.split_steps[0].execution.tag);
-    try std.testing.expect(plan.split_steps[0].execution.actionable());
+    try std.testing.expect(plan.split_steps[0].execution.action == .prepare_split_source);
 }
 
 test "metadata reconciler never removes an unterminated durable transition" {
@@ -4668,6 +4669,104 @@ test "metadata reconciler forced reallocation can place replicas on newly added 
         findPlacementIntent(forced_plan.placement_upserts, 2101, 4) != null or
             findPlacementIntent(forced_plan.placement_upserts, 2102, 4) != null,
     );
+}
+
+test "metadata reconciler serializes forced placement movement behind split provisioning" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 210, .name = "docs", .desired_replica_count = 3 });
+    try manager.upsertRange(.{ .group_id = 2101, .table_id = 210, .start_key = "", .end_key = null });
+    try manager.requestSplit(.{
+        .transition_id = 21001,
+        .table_id = 210,
+        .source_group_id = 2101,
+        .destination_group_id = 2102,
+        .split_key = "doc:m",
+    });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 2101, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 1, .peer_node_ids = &.{ 1, 2, 3 } },
+        .{ .record = .{ .group_id = 2101, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 2, .peer_node_ids = &.{ 1, 2, 3 } },
+        .{ .record = .{ .group_id = 2101, .replica_id = 3, .local_node_id = 3, .bootstrap_mode = .persisted }, .store_id = 3, .peer_node_ids = &.{ 1, 2, 3 } },
+    };
+    const ranges = [_]table_manager.RangeRecord{.{
+        .group_id = 2101,
+        .range_id = 2101,
+        .table_id = 210,
+        .start_key = "",
+        .end_key = null,
+    }};
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{
+        .{ .node_id = 1, .store_id = 1, .role = "data", .failure_domain = "rack-a", .retain_current = true },
+        .{ .node_id = 2, .store_id = 2, .role = "data", .failure_domain = "rack-b", .retain_current = true },
+        .{ .node_id = 3, .store_id = 3, .role = "data", .failure_domain = "rack-c", .retain_current = true },
+        .{ .node_id = 4, .store_id = 4, .role = "data", .failure_domain = "rack-d", .retain_current = true },
+    };
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{ 1, 2, 3, 4 }, &candidates, .{
+        .placement_intents = &current,
+        .ranges = &ranges,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expect(plan.forced_reallocation);
+    try std.testing.expect(plan.clear_reallocation_request);
+    try std.testing.expectEqual(@as(usize, 0), plan.placement_removals.len);
+    try std.testing.expect(findPlacementIntent(plan.placement_upserts, 2101, 4) == null);
+    var destination_placements: usize = 0;
+    for (plan.placement_upserts) |intent| {
+        if (intent.record.group_id == 2102) destination_placements += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), destination_placements);
+}
+
+test "metadata reconciler keeps in-flight group placement sticky across repeated reallocation" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 211, .name = "docs", .desired_replica_count = 1 });
+    try manager.upsertRange(.{ .group_id = 2111, .table_id = 211, .start_key = "", .end_key = null });
+
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{
+        .{ .node_id = 101, .store_id = 101, .role = "data", .failure_domain = "rack-a", .retain_current = true },
+        .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = true },
+        .{ .node_id = 103, .store_id = 103, .role = "data", .failure_domain = "rack-c", .retain_current = true },
+    };
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var initial_plan = try reconciler.computePlan(&manager, &.{ 101, 102, 103 }, &candidates, .{
+        .reallocate_requested = true,
+    });
+    defer initial_plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), initial_plan.placement_upserts.len);
+    const initial = initial_plan.placement_upserts[0];
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.serving, initial.serving_state);
+
+    var unready = initial;
+    unready.serving_state = .bootstrapping;
+    unready.relocation_doc_count_watermark = 1;
+    const current = [_]raft_reconciler.PlacementIntent{unready};
+    const merged_statuses = [_]MergedGroupStatus{.{
+        .group_id = 2111,
+        .doc_count = 1,
+        .disk_bytes = 1024,
+        .empty = false,
+    }};
+    var repeated_plan = try reconciler.computePlan(&manager, &.{ 101, 102, 103 }, &candidates, .{
+        .placement_intents = &current,
+        .merged_group_statuses = &merged_statuses,
+        .reallocate_requested = true,
+    });
+    defer repeated_plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), repeated_plan.placement_upserts.len);
+    try std.testing.expectEqual(initial.record.local_node_id, repeated_plan.placement_upserts[0].record.local_node_id);
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.bootstrapping, repeated_plan.placement_upserts[0].serving_state);
+    try std.testing.expectEqual(@as(usize, 0), repeated_plan.placement_removals.len);
 }
 
 test "metadata reconciler keeps relocation source serving while target bootstraps" {
@@ -6257,6 +6356,69 @@ test "metadata reconciler automatic split planning cleans up every allocation fa
         Runner.run,
         .{},
     );
+}
+
+test "metadata reconciler waits for placement convergence before automatic split" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 401, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 4011,
+        .table_id = 401,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+
+    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+        .group_id = 4011,
+        .doc_count = 200,
+        .disk_bytes = 200,
+        .empty = false,
+        .updated_at_millis = now_ms,
+        .local_leader = true,
+    }})[0..]);
+    const stores = [_]table_manager.StoreRecord{.{
+        .store_id = 1,
+        .node_id = 1,
+        .role = "data",
+        .health_class = "healthy",
+        .failure_domain = "rack-a",
+        .live = true,
+        .group_statuses = statuses,
+    }};
+    const intents = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{
+            .group_id = 4011,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .bootstrap_mode = .persisted,
+        },
+        .peer_node_ids = &.{1},
+        .serving_state = .bootstrapping,
+    }};
+
+    var lookup = TestMedianKeyLookup{ .median_key = "doc:m" };
+    var reconciler = Reconciler.initWithConfig(std.testing.allocator, .{
+        .max_shard_size_bytes = 100,
+        .max_shards_per_table = 8,
+        .median_key_lookup = lookup.iface(),
+    });
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .placement_intents = &intents,
+        .tables = tables,
+        .ranges = ranges,
+        .stores = &stores,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
 }
 
 test "metadata reconciler plans an automatic split from disk size when doc count is stale" {

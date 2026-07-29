@@ -5618,15 +5618,7 @@ components:
             traversal, aggregations, and root scans.
         session_id:
           type: string
-          description: |
-            Correlation identifier for a bounded agent interaction. When a
-            mandatory predicate is active, the server returns this as an opaque,
-            HMAC-bound continuation token. Clients must replay the returned value
-            unchanged. Continuations that omit or broaden the effective predicate,
-            or alter the token, fail closed. Multi-node deployments must provide
-            the same `antfly.retrieval.continuation.secret` secret-store value
-            (or `ANTFLY_RETRIEVAL_CONTINUATION_SECRET` environment variable) on
-            every API node.
+          description: Correlation identifier for a bounded agent interaction. This is echoed back to the client and does not imply server-side session persistence.
         decisions:
           type: array
           items:
@@ -5742,10 +5734,7 @@ components:
           description: Primary strategy that was used (optional in agentic mode)
         session_id:
           type: string
-          description: |
-            Correlation identifier for client-carried continuation. When mandatory
-            predicates were applied, this is an opaque HMAC-bound token and must
-            be replayed unchanged in the next request.
+          description: Correlation identifier for client-carried continuation.
         iteration:
           type: integer
           description: Current internal iteration count for this bounded session.

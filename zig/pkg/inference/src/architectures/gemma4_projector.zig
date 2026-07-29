@@ -27,7 +27,9 @@ const projector_format_mod = @import("projector_format.zig");
 const ComputeBackend = ops.ComputeBackend;
 const CT = ops.CT;
 
-const default_spatial_merge_size: usize = 3;
+const default_spatial_merge_size: usize = @intCast(
+    projector_format_mod.gemma4_spatial_merge_size,
+);
 const default_max_image_tokens: usize = 280;
 const default_max_direct_audio_tokens: usize = 16_384;
 
@@ -70,6 +72,7 @@ const Config = struct {
     image_std: [3]f32,
     spatial_merge_size: usize = default_spatial_merge_size,
     max_image_tokens: usize = default_max_image_tokens,
+    position_embeddings_per_axis: usize = 0,
 
     fn maxPatchCount(self: Config) usize {
         return self.max_image_tokens * self.spatial_merge_size * self.spatial_merge_size;
@@ -809,8 +812,42 @@ fn parseConfig(file: *const gguf_format.File) !Config {
     if (!projector_format_mod.isGemma4ImageProjectorType(projector_type)) return error.UnsupportedGgufProjector;
     const block_count: usize = @intCast(view.getU64("clip.vision.block_count") orelse return error.InvalidGgufProjector);
     const direct_unified = std.mem.eql(u8, projector_type, "gemma4uv") and block_count == 0;
-    const projection_scale_factor: usize = @intCast(view.getU64("clip.vision.projector_scale_factor") orelse default_spatial_merge_size);
-    const metadata_patch_size: usize = @intCast(view.getU64("clip.vision.patch_size") orelse return error.InvalidGgufProjector);
+    const projection_scale_factor = std.math.cast(
+        usize,
+        view.getU64("clip.vision.projector_scale_factor") orelse default_spatial_merge_size,
+    ) orelse return error.InvalidGgufProjector;
+    const metadata_patch_size = std.math.cast(
+        usize,
+        view.getU64("clip.vision.patch_size") orelse return error.InvalidGgufProjector,
+    ) orelse return error.InvalidGgufProjector;
+    if (metadata_patch_size == 0 or (direct_unified and projection_scale_factor == 0)) {
+        return error.InvalidGgufProjector;
+    }
+    const patch_size = if (direct_unified)
+        std.math.mul(usize, metadata_patch_size, projection_scale_factor) catch
+            return error.InvalidGgufProjector
+    else
+        metadata_patch_size;
+    const patch_area = std.math.mul(usize, patch_size, patch_size) catch
+        return error.InvalidGgufProjector;
+    const patch_input = std.math.mul(usize, patch_area, 3) catch
+        return error.InvalidGgufProjector;
+    if (patch_input > std.math.maxInt(i32)) return error.InvalidGgufProjector;
+    const vision_hidden = std.math.cast(
+        usize,
+        view.getU64("clip.vision.embedding_length") orelse return error.InvalidGgufProjector,
+    ) orelse return error.InvalidGgufProjector;
+    const spatial_merge_size: usize = if (direct_unified) 1 else default_spatial_merge_size;
+    const position_embeddings_per_axis = std.math.cast(
+        usize,
+        projector_format_mod.gemma4PositionEmbeddingCapacity(
+            file,
+            @intCast(vision_hidden),
+        ) catch return error.InvalidGgufProjector,
+    ) orelse return error.InvalidGgufProjector;
+    if (position_embeddings_per_axis < spatial_merge_size) {
+        return error.InvalidGgufProjector;
+    }
 
     var image_mean = [3]f32{ 0.0, 0.0, 0.0 };
     var image_std = [3]f32{ 1.0, 1.0, 1.0 };
@@ -823,17 +860,18 @@ fn parseConfig(file: *const gguf_format.File) !Config {
 
     return .{
         .text_hidden = @intCast(view.getU64("clip.vision.projection_dim") orelse return error.InvalidGgufProjector),
-        .vision_hidden = @intCast(view.getU64("clip.vision.embedding_length") orelse return error.InvalidGgufProjector),
+        .vision_hidden = vision_hidden,
         .intermediate_size = @intCast(view.getU64("clip.vision.feed_forward_length") orelse return error.InvalidGgufProjector),
         .block_count = block_count,
         .head_count = @intCast(view.getU64("clip.vision.attention.head_count") orelse return error.InvalidGgufProjector),
         .direct_unified = direct_unified,
         .image_size = @intCast(view.getU64("clip.vision.image_size") orelse return error.InvalidGgufProjector),
-        .patch_size = if (direct_unified) metadata_patch_size * projection_scale_factor else metadata_patch_size,
+        .patch_size = patch_size,
         .layer_norm_eps = view.getF32("clip.vision.attention.layer_norm_epsilon") orelse 1e-6,
         .image_mean = image_mean,
         .image_std = image_std,
-        .spatial_merge_size = if (direct_unified) 1 else default_spatial_merge_size,
+        .spatial_merge_size = spatial_merge_size,
+        .position_embeddings_per_axis = position_embeddings_per_axis,
     };
 }
 
@@ -1389,7 +1427,19 @@ test "gemma4 unified projector metadata parses image and audio configs" {
         .{ .key = "clip.audio.num_mel_bins", .value = .{ .u32 = 128 } },
         .{ .key = "clip.audio.attention.layer_norm_epsilon", .value = .{ .f32 = 0.000001 } },
     };
-    var layout = try @import("../gguf/writer.zig").buildLayout(allocator, &metadata, &.{});
+    const position_dims = [_]u64{ 2, 64, 3840 };
+    const tensors = [_]@import("../gguf/writer.zig").TensorSpec{
+        .{
+            .name = "v.position_embd.weight",
+            .dimensions = &position_dims,
+            .tensor_type = .{ .known = .F32 },
+        },
+    };
+    var layout = try @import("../gguf/writer.zig").buildLayout(
+        allocator,
+        &metadata,
+        &tensors,
+    );
     defer layout.deinit(allocator);
     var parsed = try gguf_format.parse(allocator, layout.header_bytes);
     defer parsed.deinit(allocator);
@@ -1399,6 +1449,7 @@ test "gemma4 unified projector metadata parses image and audio configs" {
     try std.testing.expectEqual(@as(usize, 3840), image_cfg.vision_hidden);
     try std.testing.expectEqual(@as(usize, 224), image_cfg.image_size);
     try std.testing.expectEqual(@as(usize, 48), image_cfg.patch_size);
+    try std.testing.expectEqual(@as(usize, 64), image_cfg.position_embeddings_per_axis);
     try std.testing.expect(image_cfg.direct_unified);
 
     const audio_cfg = try parseAudioConfig(&parsed);
@@ -1406,6 +1457,37 @@ test "gemma4 unified projector metadata parses image and audio configs" {
     try std.testing.expectEqual(@as(usize, 640), audio_cfg.audio_hidden);
     try std.testing.expectEqual(@as(usize, 640), audio_cfg.raw_samples_per_token);
     try std.testing.expect(audio_cfg.direct_unified);
+}
+
+test "gemma4 unified projector rejects invalid effective patch geometry" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        patch_size: u32,
+        scale_factor: u32,
+    }{
+        .{ .patch_size = 16, .scale_factor = 0 },
+        .{ .patch_size = std.math.maxInt(u32), .scale_factor = std.math.maxInt(u32) },
+    };
+    for (cases) |case| {
+        const metadata = [_]gguf_format.MetadataEntry{
+            .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+            .{ .key = "clip.vision.projector_type", .value = .{ .string = "gemma4uv" } },
+            .{ .key = "clip.vision.projection_dim", .value = .{ .u32 = 4 } },
+            .{ .key = "clip.vision.embedding_length", .value = .{ .u32 = 4 } },
+            .{ .key = "clip.vision.feed_forward_length", .value = .{ .u32 = 0 } },
+            .{ .key = "clip.vision.block_count", .value = .{ .u32 = 0 } },
+            .{ .key = "clip.vision.attention.head_count", .value = .{ .u32 = 0 } },
+            .{ .key = "clip.vision.image_size", .value = .{ .u32 = 224 } },
+            .{ .key = "clip.vision.patch_size", .value = .{ .u32 = case.patch_size } },
+            .{ .key = "clip.vision.projector_scale_factor", .value = .{ .u32 = case.scale_factor } },
+        };
+        var layout = try @import("../gguf/writer.zig").buildLayout(allocator, &metadata, &.{});
+        defer layout.deinit(allocator);
+        var parsed = try gguf_format.parse(allocator, layout.header_bytes);
+        defer parsed.deinit(allocator);
+
+        try std.testing.expectError(error.InvalidGgufProjector, parseConfig(&parsed));
+    }
 }
 
 fn metadataF32Triple(view: gguf_metadata.View, key: []const u8) ?[3]f32 {
@@ -1443,7 +1525,18 @@ fn targetGeometry(cfg: Config, width_u32: u32, height_u32: u32) Geometry {
 
     var target_w = floorToMultiple(@intFromFloat(@floor(ideal_w)), block);
     var target_h = floorToMultiple(@intFromFloat(@floor(ideal_h)), block);
-    const max_side = (max_patches / (cfg.spatial_merge_size * cfg.spatial_merge_size)) * block;
+    const budget_max_grid =
+        (max_patches / (cfg.spatial_merge_size * cfg.spatial_merge_size)) *
+        cfg.spatial_merge_size;
+    const position_max_grid = if (cfg.position_embeddings_per_axis == 0)
+        budget_max_grid
+    else
+        floorToMultiple(
+            @min(cfg.position_embeddings_per_axis, budget_max_grid),
+            cfg.spatial_merge_size,
+        );
+    std.debug.assert(position_max_grid >= cfg.spatial_merge_size);
+    const max_side = position_max_grid * cfg.patch_size;
     if (target_w == 0 and target_h == 0) {
         target_w = block;
         target_h = block;
@@ -1456,6 +1549,32 @@ fn targetGeometry(cfg: Config, width_u32: u32, height_u32: u32) Geometry {
     }
     target_w = @max(target_w, block);
     target_h = @max(target_h, block);
+    if (target_w > max_side or target_h > max_side) {
+        const position_scale = @min(
+            @as(f64, @floatFromInt(max_side)) / @as(f64, @floatFromInt(target_w)),
+            @as(f64, @floatFromInt(max_side)) / @as(f64, @floatFromInt(target_h)),
+        );
+        target_w = @min(
+            @max(
+                floorToMultiple(
+                    @intFromFloat(@floor(@as(f64, @floatFromInt(target_w)) * position_scale)),
+                    block,
+                ),
+                block,
+            ),
+            max_side,
+        );
+        target_h = @min(
+            @max(
+                floorToMultiple(
+                    @intFromFloat(@floor(@as(f64, @floatFromInt(target_h)) * position_scale)),
+                    block,
+                ),
+                block,
+            ),
+            max_side,
+        );
+    }
     while ((target_w / cfg.patch_size) * (target_h / cfg.patch_size) > max_patches) {
         if (target_w >= target_h and target_w > block) {
             target_w -= block;
@@ -1475,6 +1594,30 @@ fn targetGeometry(cfg: Config, width_u32: u32, height_u32: u32) Geometry {
         .pooled_x = grid_x / cfg.spatial_merge_size,
         .pooled_y = grid_y / cfg.spatial_merge_size,
     };
+}
+
+test "gemma4 target geometry respects learned position capacity" {
+    const cfg = Config{
+        .text_hidden = 4,
+        .vision_hidden = 4,
+        .intermediate_size = 0,
+        .block_count = 0,
+        .head_count = 0,
+        .direct_unified = true,
+        .image_size = 224,
+        .patch_size = 2,
+        .layer_norm_eps = 1e-6,
+        .image_mean = .{ 0.0, 0.0, 0.0 },
+        .image_std = .{ 1.0, 1.0, 1.0 },
+        .spatial_merge_size = 1,
+        .position_embeddings_per_axis = 8,
+    };
+    const geometry = targetGeometry(cfg, 4096, 64);
+    try std.testing.expect(geometry.grid_x <= cfg.position_embeddings_per_axis);
+    try std.testing.expect(geometry.grid_y <= cfg.position_embeddings_per_axis);
+    try std.testing.expect(geometry.grid_x * geometry.grid_y <= cfg.maxPatchCount());
+    try std.testing.expect(geometry.grid_x > 0);
+    try std.testing.expect(geometry.grid_y > 0);
 }
 
 fn floorToMultiple(value: usize, multiple: usize) usize {

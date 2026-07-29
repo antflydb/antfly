@@ -112,6 +112,26 @@ pub const TranscriptionPipeline = struct {
     /// Transcribe PCM audio samples at the given sample rate.
     pub fn transcribePcm(self: *TranscriptionPipeline, samples: []const f32, sample_rate: u32) !TranscribeResult {
         const allocator = self.allocator;
+        const mel_elements = std.math.mul(
+            usize,
+            audio.WHISPER_N_MELS,
+            audio.WHISPER_N_FRAMES,
+        ) catch return error.ResourceLimitExceeded;
+        const mel_bytes = std.math.mul(usize, mel_elements, @sizeOf(f32)) catch
+            return error.ResourceLimitExceeded;
+        const pcm_bytes = std.math.mul(usize, samples.len, @sizeOf(f32)) catch
+            return error.ResourceLimitExceeded;
+        var encoder_permit = try self.encoder.admit(.{
+            .batch = 1,
+            .sequence = audio.WHISPER_N_FRAMES,
+            .input_bytes = mel_bytes,
+            .host_preprocess_bytes = std.math.add(
+                usize,
+                pcm_bytes,
+                mel_bytes,
+            ) catch return error.ResourceLimitExceeded,
+        });
+        defer encoder_permit.deinit();
 
         const mel = try audio.whisperMelFromPcm(allocator, samples, sample_rate);
         defer allocator.free(mel);
@@ -123,7 +143,7 @@ pub const TranscriptionPipeline = struct {
         var mel_tensor = try backends.Tensor.initFloat32(allocator, "input_features", &mel_shape, mel);
         defer mel_tensor.deinit();
 
-        const encoder_outputs = try self.encoder.run(&.{mel_tensor}, allocator);
+        const encoder_outputs = try encoder_permit.run(&.{mel_tensor}, allocator);
         defer {
             for (encoder_outputs) |*t| {
                 var mt = t.*;

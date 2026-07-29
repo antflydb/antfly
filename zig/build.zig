@@ -5506,6 +5506,8 @@ pub fn build(b: *std.Build) void {
 
     const resource_budget_runtime_filters = [_][]const u8{
         "default tokenizer cache budget is aligned with its resource slice",
+        "batch reservation is atomic across inference resource slices",
+        "classified batch reservation distinguishes size from contention",
         "resource manager observes over-budget external usage",
         "resource manager evaluates projected admission with configured action",
         "resource manager bounds soft write throttling without waiting for compaction publication",
@@ -5857,6 +5859,7 @@ pub fn build(b: *std.Build) void {
             "standalone public listener lease is exclusive and immediately reusable",
             "parse cli accepts inference budget overrides",
             "inference config falls back to common config",
+            "inference admission bridge charges combined native residency to resource manager",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",

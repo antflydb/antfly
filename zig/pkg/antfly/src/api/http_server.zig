@@ -584,11 +584,6 @@ pub const ApiHttpServerConfig = struct {
     ard_public_catalog_enabled: bool = false,
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
-    /// Shared secret for binding request-scoped retrieval predicates to
-    /// client-carried continuation tokens. Runtime entry points resolve
-    /// `antfly.retrieval.continuation.secret` on every API node. Falls back to
-    /// trusted_principal_secret when present.
-    retrieval_continuation_secret: ?[]const u8 = null,
     deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     storage_maintenance: ?*@import("../storage/maintenance.zig").Coordinator = null,
@@ -1665,7 +1660,6 @@ pub const ApiHttpServer = struct {
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
     query_embedding_cache: query_embedding_cache.QueryEmbeddingCache,
-    retrieval_continuation_secret: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 
     pub const RequestStats = struct {
         request_count: u64 = 0,
@@ -1777,7 +1771,6 @@ pub const ApiHttpServer = struct {
         owner_ids: RuntimeOwnerIds,
     ) ApiHttpServer {
         const effective_query_embedding_cache = effectiveQueryEmbeddingCacheConfig(cfg);
-        const retrieval_continuation_secret = deriveRetrievalContinuationSecret(cfg);
         return .{
             .alloc = request_alloc,
             .owner_alloc = owner_alloc,
@@ -1823,22 +1816,9 @@ pub const ApiHttpServer = struct {
             .local_resource_manager = resource_manager_mod.ResourceManager.init(.{}),
             .shared_resource_manager = cfg.resource_manager,
             .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, queryEmbeddingCacheIo(cfg), effective_query_embedding_cache),
-            .retrieval_continuation_secret = retrieval_continuation_secret,
             .mcp_sessions = mcp.InMemorySessionStore.init(owner_alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(owner_alloc),
         };
-    }
-
-    fn deriveRetrievalContinuationSecret(cfg: ApiHttpServerConfig) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
-        var secret: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        if (cfg.retrieval_continuation_secret orelse cfg.trusted_principal_secret) |configured| {
-            std.crypto.hash.sha2.Sha256.hash(configured, &secret, .{});
-        } else {
-            queryEmbeddingCacheIo(cfg).randomSecure(&secret) catch {
-                @panic("secure entropy unavailable for retrieval continuation tokens");
-            };
-        }
-        return secret;
     }
 
     fn effectiveQueryEmbeddingCacheConfig(cfg: ApiHttpServerConfig) query_embedding_cache.Config {
@@ -5186,7 +5166,6 @@ pub const ApiHttpServer = struct {
                     .vtable = &.{
                         .run_query = runQuery,
                         .scan_keys = scanKeys,
-                        .bind_predicate_session = bindPredicateSession,
                     },
                 };
             }
@@ -5251,23 +5230,6 @@ pub const ApiHttpServer = struct {
                     filter_query_json,
                     exclusion_query_json,
                     runner.authenticated_identity,
-                );
-            }
-
-            fn bindPredicateSession(
-                ptr_inner: *anyopaque,
-                inner_alloc: std.mem.Allocator,
-                session_id: ?[]const u8,
-                predicate_json: []const u8,
-                continuation: bool,
-            ) !?[]u8 {
-                const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                return try retrieval_agent.bindPredicateSessionToken(
-                    inner_alloc,
-                    &runner.server.retrieval_continuation_secret,
-                    session_id,
-                    predicate_json,
-                    continuation,
                 );
             }
         };
@@ -5402,7 +5364,6 @@ pub const ApiHttpServer = struct {
                     .vtable = &.{
                         .run_query = runQuery,
                         .scan_keys = scanKeys,
-                        .bind_predicate_session = bindPredicateSession,
                     },
                 };
             }
@@ -5452,23 +5413,6 @@ pub const ApiHttpServer = struct {
                     filter_query_json,
                     exclusion_query_json,
                     null,
-                );
-            }
-
-            fn bindPredicateSession(
-                ptr_inner: *anyopaque,
-                alloc: std.mem.Allocator,
-                session_id: ?[]const u8,
-                predicate_json: []const u8,
-                continuation: bool,
-            ) !?[]u8 {
-                const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                return try retrieval_agent.bindPredicateSessionToken(
-                    alloc,
-                    &runner.server.retrieval_continuation_secret,
-                    session_id,
-                    predicate_json,
-                    continuation,
                 );
             }
         };

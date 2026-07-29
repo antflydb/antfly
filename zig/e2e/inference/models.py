@@ -74,6 +74,8 @@ class ModelSpec:
         return f"hf:{self.repo}:{self.variant}"
 
 
+# Models added while verifying the capability surface the website implies. Each is here
+# because a claim needed evidence, not because CI needs breadth for its own sake.
 EMBEDDER_MODELS = [
     ModelSpec(
         name="bge-small-en-v1.5",
@@ -96,15 +98,55 @@ EMBEDDER_MODELS = [
         dim=512,
         large=True,
     ),
+    ModelSpec(
+        name="bge-base-en-v1.5",
+        repo="BAAI/bge-base-en-v1.5",
+        task="embedders",
+        dim=768,
+    ),
+    ModelSpec(
+        name="bge-large-en-v1.5",
+        repo="BAAI/bge-large-en-v1.5",
+        task="embedders",
+        dim=1024,
+        large=True,
+    ),
+    ModelSpec(
+        name="mxbai-embed-large-v1",
+        repo="mixedbread-ai/mxbai-embed-large-v1",
+        task="embedders",
+        dim=1024,
+    ),
+    ModelSpec(
+        name="all-MiniLM-L6-v2",
+        repo="sentence-transformers/all-MiniLM-L6-v2",
+        task="embedders",
+        dim=384,
+    ),
 ]
 
 RERANKER_MODELS = [
+    ModelSpec(
+        name="ms-marco-MiniLM-L6-v2",
+        repo="cross-encoder/ms-marco-MiniLM-L6-v2",
+        task="rerankers",
+    ),
     ModelSpec(
         name="mxbai-rerank-base-v1",
         repo="mixedbread-ai/mxbai-rerank-base-v1",
         task="rerankers",
     ),
 ]
+
+# Chunking had no model in the curated set at all, despite chunkers being a declared task.
+CHUNKER_MODELS = [
+    ModelSpec(
+        name="chonky_mmbert_small_multilingual_1",
+        repo="mirth/chonky_mmbert_small_multilingual_1",
+        task="chunkers",
+    ),
+]
+
 
 CLASSIFIER_MODELS = [
     ModelSpec(
@@ -128,6 +170,8 @@ RECOGNIZER_MODELS = [
         task="recognizers",
         variant="native",
     ),
+    # CC-BY-NC-SA: non-commercial only, and ~3GB. Kept for relation-extraction coverage,
+    # but it must not appear in any default bundle. GLiNER2 is the recommended extractor.
     ModelSpec(
         name="rebel-large",
         repo="Babelscape/rebel-large",
@@ -163,12 +207,39 @@ TRANSCRIBER_MODELS = [
     ),
 ]
 
-DEFAULT_GENERATOR_MODEL = "openai-community/gpt2"
+# Generator models used to keep the decoder support tiers honest.
+#
+# Each family in models/gpt.zig has a SupportLevel; these are the artifacts those levels
+# were measured against. Without them the tiers are assertions rather than results.
+GENERATOR_MODELS = [
+    ModelSpec(
+        name="gemma-4-e2b-it-gguf",
+        repo="ggml-org/gemma-4-e2b-it-gguf",
+        task="generators",
+        large=True,
+    ),
+    ModelSpec(
+        name="Qwen3-1.7B-GGUF",
+        repo="unsloth/Qwen3-1.7B-GGUF",
+        task="generators",
+    ),
+    ModelSpec(
+        name="Llama-3.2-1B-Instruct-GGUF",
+        repo="unsloth/Llama-3.2-1B-Instruct-GGUF",
+        task="generators",
+        large=True,
+    ),
+]
+
+
+DEFAULT_GENERATOR_MODEL = "unsloth/Qwen3-1.7B-GGUF"
 DEFAULT_TOOL_GENERATOR_MODEL = "ggml-org/gemma-4-e2b-it-gguf"
 DEFAULT_MULTIMODAL_GENERATOR_MODEL = "ggml-org/gemma-4-e2b-it-gguf"
 
 CURATED_MODELS = [
     *EMBEDDER_MODELS,
+    *GENERATOR_MODELS,
+    *CHUNKER_MODELS,
     *RERANKER_MODELS,
     *CLASSIFIER_MODELS,
     *RECOGNIZER_MODELS,

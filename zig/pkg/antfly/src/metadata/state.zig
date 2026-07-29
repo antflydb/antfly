@@ -1075,19 +1075,7 @@ fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTran
 }
 
 fn defaultSplitObservation() transition_state.SplitObservation {
-    return .{
-        .status = .{
-            .phase = .prepare,
-            .source_split_phase = .prepare,
-            .bootstrapped = false,
-            .replay_required = false,
-            .replay_caught_up = false,
-            .cutover_ready = false,
-            .destination_ready_for_reads = false,
-            .source_delta_sequence = 0,
-            .dest_delta_sequence = 0,
-        },
-    };
+    return transition_state.unpreparedSplitObservation();
 }
 
 fn defaultMergeObservation(record: transition_state.MergeTransitionRecord) transition_state.MergeObservation {

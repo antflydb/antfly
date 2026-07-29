@@ -41,10 +41,13 @@ pub fn parse(value: []const u8) ?Choice {
 
 pub fn validate(choice: Choice) !void {
     switch (choice) {
+        .onnx => if (!build_options.enable_onnx) return error.BackendUnavailable,
+        .native => if (!build_options.enable_native) return error.BackendUnavailable,
+        .metal => if (!build_options.enable_metal) return error.BackendUnavailable,
         .cuda => if (!build_options.enable_cuda) return error.BackendUnavailable,
         .xla => if (!build_options.enable_pjrt) return error.BackendUnavailable,
         .webgpu => if (!(build_options.enable_wasm and build_options.enable_webgpu)) return error.BackendUnavailable,
-        .auto, .onnx, .native, .metal => {},
+        .auto => {},
     }
 }
 
@@ -56,17 +59,10 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
             &.{ backends.BackendType.metal, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
-        .onnx => if (build_options.enable_native)
-            &.{ backends.BackendType.onnx, backends.BackendType.native }
-        else if (build_options.enable_wasm)
-            &.{ backends.BackendType.onnx, backends.BackendType.wasm }
-        else if (build_options.enable_metal)
-            &.{ backends.BackendType.onnx, backends.BackendType.metal }
-        else
-            &.{backends.BackendType.onnx},
+        .onnx => &.{backends.BackendType.onnx},
         .native => &.{backends.BackendType.native},
-        .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
-        .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
+        .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{},
+        .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{},
         .webgpu => if (build_options.enable_wasm and build_options.enable_webgpu)
             &.{backends.BackendType.wasm}
         else
@@ -133,4 +129,34 @@ test "compiledPartitionBackend maps explicit compiled backends" {
         try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackendForMode(.webgpu, true));
     }
     try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackendForMode(.webgpu, false));
+}
+
+test "explicit session preferences never silently fall back" {
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    configureSessionPreference(&manager, .native);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.native}, manager.preferred_backends);
+
+    configureSessionPreference(&manager, .onnx);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.onnx}, manager.preferred_backends);
+
+    configureSessionPreference(&manager, .metal);
+    if (build_options.enable_metal) {
+        try std.testing.expectEqualSlices(backends.BackendType, &.{.metal}, manager.preferred_backends);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), manager.preferred_backends.len);
+    }
+}
+
+test "automatic native session selection retains safe fallback" {
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    configureSessionPreference(&manager, .auto);
+    if (build_options.enable_metal and !build_options.enable_wasm) {
+        try std.testing.expectEqualSlices(
+            backends.BackendType,
+            &.{ .metal, .native },
+            manager.preferred_backends,
+        );
+    } else {
+        try std.testing.expect(manager.preferred_backends.len > 0);
+    }
 }
