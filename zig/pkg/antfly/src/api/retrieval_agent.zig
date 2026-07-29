@@ -223,6 +223,8 @@ pub const QueryRunner = struct {
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
+            filter_query_json: ?[]const u8,
+            exclusion_query_json: ?[]const u8,
         ) anyerror![]const []const u8 = null,
     };
 
@@ -239,9 +241,17 @@ pub const QueryRunner = struct {
         self: QueryRunner,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        filter_query_json: ?[]const u8,
+        exclusion_query_json: ?[]const u8,
     ) ![]const []const u8 {
         const fn_ptr = self.vtable.scan_keys orelse return error.UnsupportedRetrievalAgentRequest;
-        return try fn_ptr(self.ptr, alloc, table_name);
+        return try fn_ptr(
+            self.ptr,
+            alloc,
+            table_name,
+            filter_query_json,
+            exclusion_query_json,
+        );
     }
 };
 
@@ -5363,6 +5373,7 @@ fn encodeQueryValueForRetrievalQuery(
 
     var query_request = parsed.value;
     applyClassificationRefinement(&query_request, classification_result, retrieval_query_index, refinement_pass);
+    try applyMandatoryPredicates(arena, &query_request, retrieval_query);
     if (retrieval_query.tree_search) |tree_search| {
         if (query_request.graph_searches != null) return error.UnsupportedRetrievalAgentRequest;
         query_request.graph_searches = try buildTreeGraphSearches(
@@ -5377,6 +5388,43 @@ fn encodeQueryValueForRetrievalQuery(
     }
 
     return try std.json.Stringify.valueAlloc(alloc, query_request, .{});
+}
+
+fn applyMandatoryPredicates(
+    alloc: std.mem.Allocator,
+    query_request: *QueryRequest,
+    declared_query: RetrievalQueryRequest,
+) !void {
+    query_request.filter_query = try combineMandatoryPredicate(
+        alloc,
+        query_request.filter_query,
+        declared_query.filter_query,
+        "conjuncts",
+    );
+    query_request.exclusion_query = try combineMandatoryPredicate(
+        alloc,
+        query_request.exclusion_query,
+        declared_query.exclusion_query,
+        "disjuncts",
+    );
+}
+
+fn combineMandatoryPredicate(
+    alloc: std.mem.Allocator,
+    existing: ?std.json.Value,
+    mandatory: ?std.json.Value,
+    compound_key: []const u8,
+) !?std.json.Value {
+    const required = mandatory orelse return existing;
+    const current = existing orelse return required;
+
+    var clauses = std.json.Array.init(alloc);
+    try clauses.append(current);
+    try clauses.append(required);
+
+    var compound = std.json.ObjectMap.empty;
+    try compound.put(alloc, compound_key, .{ .array = clauses });
+    return .{ .object = compound };
 }
 
 fn applyClassificationRefinement(
@@ -5574,7 +5622,14 @@ fn buildTreeStartNodes(
         const trimmed = std.mem.trim(u8, start_nodes, " \t\r\n");
         if (trimmed.len == 0) return error.InvalidRetrievalAgentRequest;
         if (std.mem.eql(u8, trimmed, "$roots")) {
-            return .{ .keys = try discoverTreeRootKeys(alloc, runner, table_name, tree_search.index) };
+            return .{ .keys = try discoverTreeRootKeys(
+                alloc,
+                runner,
+                table_name,
+                tree_search.index,
+                query_request.filter_query,
+                query_request.exclusion_query,
+            ) };
         }
         if (trimmed[0] == '$') {
             if (hasInlineTreeSeedSearch(query_request)) {
@@ -5635,8 +5690,26 @@ fn discoverTreeRootKeys(
     runner: QueryRunner,
     table_name: []const u8,
     index_name: []const u8,
+    filter_query: ?std.json.Value,
+    exclusion_query: ?std.json.Value,
 ) ![]const []const u8 {
-    const all_keys = try runner.scanKeys(alloc, table_name);
+    const filter_query_json = if (filter_query) |value|
+        try std.json.Stringify.valueAlloc(alloc, value, .{})
+    else
+        null;
+    defer if (filter_query_json) |value| alloc.free(value);
+    const exclusion_query_json = if (exclusion_query) |value|
+        try std.json.Stringify.valueAlloc(alloc, value, .{})
+    else
+        null;
+    defer if (exclusion_query_json) |value| alloc.free(value);
+
+    const all_keys = try runner.scanKeys(
+        alloc,
+        table_name,
+        filter_query_json,
+        exclusion_query_json,
+    );
     defer {
         for (all_keys) |key| alloc.free(key);
         alloc.free(all_keys);
@@ -5645,7 +5718,15 @@ fn discoverTreeRootKeys(
     defer roots.deinit(alloc);
 
     for (all_keys) |key| {
-        if (!try treeNodeHasIncomingEdges(alloc, runner, table_name, index_name, key)) {
+        if (!try treeNodeHasIncomingEdges(
+            alloc,
+            runner,
+            table_name,
+            index_name,
+            key,
+            filter_query,
+            exclusion_query,
+        )) {
             try roots.append(alloc, try alloc.dupe(u8, key));
         }
     }
@@ -5669,6 +5750,8 @@ fn treeNodeHasIncomingEdges(
     table_name: []const u8,
     index_name: []const u8,
     key: []const u8,
+    filter_query: ?std.json.Value,
+    exclusion_query: ?std.json.Value,
 ) !bool {
     var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
     defer graph_searches.deinit(alloc);
@@ -5684,6 +5767,8 @@ fn treeNodeHasIncomingEdges(
 
     const body = try std.json.Stringify.valueAlloc(alloc, QueryRequest{
         .graph_searches = graph_searches,
+        .filter_query = filter_query,
+        .exclusion_query = exclusion_query,
         .limit = 1,
     }, .{});
     defer alloc.free(body);
@@ -6217,7 +6302,17 @@ test "retrieval agent supports roots tree search" {
             };
         }
 
-        fn scanKeys(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8) ![]const []const u8 {
+        fn scanKeys(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            filter_query_json: ?[]const u8,
+            exclusion_query_json: ?[]const u8,
+        ) ![]const []const u8 {
+            try std.testing.expect(filter_query_json != null);
+            try std.testing.expect(exclusion_query_json != null);
+            try std.testing.expect(std.mem.indexOf(u8, filter_query_json.?, "\"tenant\":\"visible\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, exclusion_query_json.?, "\"classification\":\"hidden\"") != null);
             const keys = try alloc.alloc([]const u8, 2);
             keys[0] = try alloc.dupe(u8, "doc:root");
             keys[1] = try alloc.dupe(u8, "doc:child");
@@ -6227,6 +6322,8 @@ test "retrieval agent supports roots tree search" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, query_json: []const u8) !query_api.QueryResponse {
             var parsed_query = try parseJsonBody(QueryRequest, alloc, query_json);
             defer parsed_query.deinit();
+            try std.testing.expect(parsed_query.value.filter_query != null);
+            try std.testing.expect(parsed_query.value.exclusion_query != null);
             if (parsed_query.value.graph_searches) |graph_searches| {
                 if (graph_searches.map.get("incoming") != null) {
                     const start_nodes = graph_searches.map.get("incoming").?.start_nodes.?;
@@ -6257,7 +6354,7 @@ test "retrieval agent supports roots tree search" {
     };
 
     const body =
-        \\{"query":"find alpha","stream":false,"queries":[{"table":"docs","tree_search":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2},"limit":5}]}
+        \\{"query":"find alpha","stream":false,"queries":[{"table":"docs","filter_query":{"term":{"tenant":"visible"}},"exclusion_query":{"term":{"classification":"hidden"}},"tree_search":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2},"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, FakeRunner.iface(), null, body);
     defer std.testing.allocator.free(encoded);
@@ -6267,6 +6364,31 @@ test "retrieval agent supports roots tree search" {
     try std.testing.expectEqual(RetrievalStrategy.tree, parsed.value.strategy_used.?);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.hits.len);
     try std.testing.expectEqualStrings("doc:child", parsed.value.hits[0]._id);
+}
+
+test "retrieval agent conjoins mandatory predicates with generated predicates" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    var generated = try parseJsonBody(QueryRequest, alloc,
+        \\{"filter_query":{"term":{"status":"active"}},"exclusion_query":{"term":{"status":"archived"}}}
+    );
+    defer generated.deinit();
+    var declared = try parseJsonBody(RetrievalQueryRequest, alloc,
+        \\{"table":"docs","filter_query":{"term":{"tenant":"visible"}},"exclusion_query":{"term":{"classification":"hidden"}}}
+    );
+    defer declared.deinit();
+
+    try applyMandatoryPredicates(arena_impl.allocator(), &generated.value, declared.value);
+    const encoded = try std.json.Stringify.valueAlloc(alloc, generated.value, .{});
+    defer alloc.free(encoded);
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"conjuncts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"status\":\"active\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tenant\":\"visible\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"disjuncts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"status\":\"archived\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"classification\":\"hidden\"") != null);
 }
 
 test "describe hit for generation includes tree lineage" {

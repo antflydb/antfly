@@ -1136,7 +1136,61 @@ fn replicationCutoverIntentApplied(
         std.mem.eql(u8, record.cutover_mode, expected.cutover_mode) and
         std.mem.eql(u8, record.slot_name, expected.slot_name) and
         std.mem.eql(u8, record.publication_name, expected.publication_name) and
-        std.mem.eql(u8, record.phase, expected.phase);
+        std.mem.eql(u8, record.phase, expected.phase) and
+        record.retired_cutover_authority_id ==
+            expected.retired_cutover_authority_id and
+        std.mem.eql(
+            u8,
+            record.retired_slot_name,
+            expected.retired_slot_name,
+        ) and
+        std.mem.eql(
+            u8,
+            record.retired_publication_name,
+            expected.retired_publication_name,
+        );
+}
+
+fn replicationCutoverAuthorityMatches(
+    record: metadata_table_manager.ReplicationSourceStatusRecord,
+    expected: metadata_table_manager.ReplicationSourceStatusRecord,
+) bool {
+    return record.table_id == expected.table_id and
+        record.source_ordinal == expected.source_ordinal and
+        record.cutover_intent_id == expected.cutover_intent_id and
+        record.cutover_authority_id == expected.cutover_authority_id and
+        std.mem.eql(
+            u8,
+            &record.cutover_config_fingerprint,
+            &expected.cutover_config_fingerprint,
+        ) and
+        std.mem.eql(
+            u8,
+            &record.cutover_provider_identity,
+            &expected.cutover_provider_identity,
+        ) and
+        std.mem.eql(u8, record.source_kind, expected.source_kind) and
+        std.mem.eql(u8, record.external_table, expected.external_table) and
+        std.mem.eql(u8, record.slot_name, expected.slot_name) and
+        std.mem.eql(u8, record.publication_name, expected.publication_name);
+}
+
+fn replicationCutoverRetirementMatches(
+    record: metadata_table_manager.ReplicationSourceStatusRecord,
+    expected: metadata_table_manager.ReplicationSourceStatusRecord,
+) bool {
+    return record.retired_cutover_authority_id ==
+        expected.retired_cutover_authority_id and
+        std.mem.eql(
+            u8,
+            record.retired_slot_name,
+            expected.retired_slot_name,
+        ) and
+        std.mem.eql(
+            u8,
+            record.retired_publication_name,
+            expected.retired_publication_name,
+        );
 }
 
 fn isExpectedCdcRoundError(err: anyerror) bool {
@@ -1157,9 +1211,15 @@ fn isExpectedCdcRoundError(err: anyerror) bool {
         error.ForeignQueryFailed,
         error.ForeignProviderIdentityMismatch,
         error.ExactCutoverProviderIdentityMismatch,
+        error.ReplicationCutoverAuthorityLost,
+        error.ReplicationSourceConfigChanged,
+        error.InvalidReplicationCutoverIntent,
         error.ForeignReplicationSlotMissing,
         error.ForeignTableNotFound,
         error.ExactCutoverCleanupPending,
+        error.CdcWorkLeaseLost,
+        error.CdcWorkShuttingDown,
+        error.CdcWorkLeaseRenewalTimeout,
         error.MetadataMutationApplyTimeout,
         error.Timeout,
         error.FileNotFound,
@@ -1210,6 +1270,12 @@ test "metadata durable cutover acknowledgement is attempt scoped" {
     var overwritten_phase = expected;
     overwritten_phase.phase = "failed";
     try std.testing.expect(!replicationCutoverIntentApplied(overwritten_phase, expected));
+
+    var stale_retirement = expected;
+    stale_retirement.retired_cutover_authority_id = 1000;
+    stale_retirement.retired_slot_name = "antfly_docs_old";
+    stale_retirement.retired_publication_name = "antfly_docs_pub_old";
+    try std.testing.expect(!replicationCutoverIntentApplied(stale_retirement, expected));
 }
 
 test "metadata CDC round error policy isolates expected recovery failures" {
@@ -1354,6 +1420,11 @@ pub const MetadataService = struct {
     local_schema_progress_group_ids_fingerprint: ?u64,
     last_local_schema_progress_refresh_at_ms: u64,
     cdc_runtime_mutex: std.Io.Mutex = .init,
+    reconcile_lease_mutex: std.Io.Mutex = .init,
+    cdc_job_in_flight: std.atomic.Value(bool) = .init(false),
+    cdc_shutdown: std.atomic.Value(bool) = .init(false),
+    cdc_permit_check_after_ns: std.atomic.Value(u64) = .init(0),
+    cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
     lifecycle_signal: LifecycleSignal,
     lifecycle_reconcile_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1437,6 +1508,7 @@ pub const MetadataService = struct {
     }
 
     pub fn deinit(self: *MetadataService) void {
+        shutdownCdcRuntimeJobs(self);
         // Projection listeners retain `self`; stop and drain their Raft apply
         // producer before releasing any callback-owned service state.
         self.raft.deinit();
@@ -1751,8 +1823,104 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
+    pub fn replaceTableDefinition(
+        self: *MetadataService,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !void {
+        if (expected.table_id == 0 or
+            replacement.table_id != expected.table_id or
+            !std.mem.eql(u8, replacement.name, expected.name))
+            return error.InvalidTableDefinitionReplacement;
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const baseline_fence = try store.getTableTransitionFence(
+            self.metadata_group_id,
+            expected.table_id,
+        );
+        if (baseline_fence.active()) return error.TableTransitionActive;
+        try self.proposeTransitionCommand(.{ .compare_and_replace_table = .{
+            .expected = expected,
+            .replacement = replacement,
+        } });
+
+        const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const current = (try store.getTable(
+                self.alloc,
+                self.metadata_group_id,
+                expected.table_id,
+            )) orelse return error.TableNotFound;
+            defer metadata_table_manager.freeTable(self.alloc, current);
+            if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected))
+                return error.TableGenerationChanged;
+
+            const fence = try store.getTableTransitionFence(
+                self.metadata_group_id,
+                expected.table_id,
+            );
+            if (fence.active() or fence.generation != baseline_fence.generation)
+                return error.TableTransitionActive;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                try self.raft.runRaftRoundOnly();
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
+    }
+
     pub fn removeTable(self: *MetadataService, table_id: u64) !void {
-        try self.proposeTransitionCommand(.{ .remove_table = .{ .table_id = table_id } });
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const baseline_fence = try store.getTableTransitionFence(
+            self.metadata_group_id,
+            table_id,
+        );
+        if (baseline_fence.active()) return error.TableTransitionActive;
+        if (try store.getTable(self.alloc, self.metadata_group_id, table_id)) |current| {
+            metadata_table_manager.freeTable(self.alloc, current);
+        } else {
+            return;
+        }
+        try self.proposeTransitionCommand(.{ .remove_table = .{
+            .table_id = table_id,
+            .expected_transition_generation = baseline_fence.generation,
+        } });
+
+        const deadline_ns = platform_time.monotonicNs() +|
+            linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            if (try store.getTable(
+                self.alloc,
+                self.metadata_group_id,
+                table_id,
+            )) |current| {
+                metadata_table_manager.freeTable(self.alloc, current);
+            } else {
+                return;
+            }
+            const fence = try store.getTableTransitionFence(
+                self.metadata_group_id,
+                table_id,
+            );
+            if (fence.active() or
+                fence.generation != baseline_fence.generation)
+                return error.TableTransitionActive;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                try self.raft.runRaftRoundOnly();
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn upsertSchemaProgress(self: *MetadataService, record: metadata_table_manager.SchemaProgressRecord) !void {
@@ -1782,14 +1950,23 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
     }
 
-    /// Persists exact-cutover ownership and fresh authority and does not return
-    /// until this provider attempt is visible in the applied Raft projection.
-    pub fn upsertReplicationSourceStatusDurable(self: *MetadataService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+    /// Atomically claims exact-cutover authority against both the current
+    /// source catalog and prior authority, then waits for the applied proof.
+    pub fn claimReplicationSourceCutoverDurable(
+        self: *MetadataService,
+        expected_replication_sources_json: []const u8,
+        expected_authority_id: u64,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
         if (record.cutover_intent_id == 0 or
             record.cutover_authority_id == 0 or
             std.mem.allEqual(u8, &record.cutover_provider_identity, 0))
             return error.InvalidReplicationCutoverIntent;
-        try self.upsertReplicationSourceStatus(record);
+        try self.proposeTransitionCommand(.{ .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = expected_replication_sources_json,
+            .expected_authority_id = expected_authority_id,
+            .record = record,
+        } });
 
         const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
         while (platform_time.monotonicNs() < deadline_ns) {
@@ -1802,7 +1979,20 @@ pub const MetadataService = struct {
             )) |applied_record| {
                 defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, applied_record);
                 if (replicationCutoverIntentApplied(applied_record, record)) return;
+                if (applied_record.cutover_authority_id != expected_authority_id)
+                    return error.ReplicationCutoverAuthorityLost;
             }
+            const current_table = (try store.getTable(
+                self.alloc,
+                self.metadata_group_id,
+                record.table_id,
+            )) orelse return error.TableNotFound;
+            defer metadata_table_manager.freeTable(self.alloc, current_table);
+            if (!std.mem.eql(
+                u8,
+                current_table.replication_sources_json,
+                expected_replication_sources_json,
+            )) return error.ReplicationSourceConfigChanged;
 
             self.lockRuntime();
             {
@@ -1816,11 +2006,80 @@ pub const MetadataService = struct {
         return error.MetadataMutationApplyTimeout;
     }
 
-    pub fn removeReplicationSourceStatus(self: *MetadataService, table_id: u64, source_ordinal: u32) !void {
-        try self.proposeTransitionCommand(.{ .remove_replication_source_status = .{
-            .table_id = table_id,
-            .source_ordinal = source_ordinal,
-        } });
+    pub fn replicationSourceAuthorityCurrent(
+        self: *MetadataService,
+        expected_replication_sources_json: []const u8,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const table = (try store.getTable(
+            self.alloc,
+            self.metadata_group_id,
+            expected.table_id,
+        )) orelse return error.ReplicationSourceConfigChanged;
+        defer metadata_table_manager.freeTable(self.alloc, table);
+        if (!std.mem.eql(
+            u8,
+            table.replication_sources_json,
+            expected_replication_sources_json,
+        )) return error.ReplicationSourceConfigChanged;
+        const current = (try store.getReplicationSourceStatus(
+            self.alloc,
+            self.metadata_group_id,
+            expected.table_id,
+            expected.source_ordinal,
+        )) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, current);
+        if (!replicationCutoverAuthorityMatches(current, expected))
+            return error.ReplicationCutoverAuthorityLost;
+    }
+
+    pub fn completeReplicationSourceCutoverRetirementDurable(
+        self: *MetadataService,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        if (expected.cutover_authority_id == 0 or
+            expected.retired_cutover_authority_id == 0 or
+            expected.retired_slot_name.len == 0 or
+            expected.retired_publication_name.len == 0)
+            return error.InvalidReplicationCutoverIntent;
+        try self.proposeTransitionCommand(.{
+            .complete_replication_source_retirement = expected,
+        });
+        const deadline_ns = platform_time.monotonicNs() +|
+            linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const store = self.projectedStore() orelse
+                return error.MissingMetadataStore;
+            const current = (try store.getReplicationSourceStatus(
+                self.alloc,
+                self.metadata_group_id,
+                expected.table_id,
+                expected.source_ordinal,
+            )) orelse return error.ReplicationCutoverAuthorityLost;
+            defer metadata_table_manager.freeReplicationSourceStatus(
+                self.alloc,
+                current,
+            );
+            if (!replicationCutoverAuthorityMatches(current, expected))
+                return error.ReplicationCutoverAuthorityLost;
+            if (current.retired_cutover_authority_id == 0 and
+                current.retired_slot_name.len == 0 and
+                current.retired_publication_name.len == 0)
+                return;
+            if (!replicationCutoverRetirementMatches(current, expected))
+                return error.ReplicationCutoverAuthorityLost;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                try self.raft.runRaftRoundOnly();
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn upsertRange(self: *MetadataService, record: metadata_table_manager.RangeRecord) !void {
@@ -2202,6 +2461,8 @@ pub const MetadataService = struct {
     }
 
     pub fn reconcileLeaseStats(self: *MetadataService) metadata_reconcile_lease.Stats {
+        self.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.reconcile_lease_mutex.unlock(std.Options.debug_io);
         return self.reconcile_lease.stats();
     }
 
@@ -2712,6 +2973,12 @@ pub const MetadataService = struct {
     }
 
     fn ensureReconcileLease(self: *MetadataService) !bool {
+        self.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.reconcile_lease_mutex.unlock(std.Options.debug_io);
+        return try self.ensureReconcileLeaseLocked();
+    }
+
+    fn ensureReconcileLeaseLocked(self: *MetadataService) !bool {
         const now_ms = self.reconcile_lease.nowMs();
         const is_local_leader = self.isLocalMetadataLeader();
         const projected = self.getCachedProjectedReconcileLease(now_ms, is_local_leader) catch |err| switch (err) {
@@ -2759,27 +3026,29 @@ pub const MetadataService = struct {
     }
 
     fn runReplicationBackfillRound(self: *MetadataService) !void {
-        const replica_root_dir = self.replica_root_dir orelse return;
-        if (!self.isLocalMetadataLeader()) return;
-        self.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.cdc_runtime_mutex.unlock(std.Options.debug_io);
-        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-        if (now_ms < self.cdc_next_round_at_ms) return;
-        self.cdc_next_round_at_ms = now_ms + cdc_replication_round_interval_ms;
+        try scheduleReplicationBackfillJob(self);
+    }
 
+    fn runReplicationBackfillWorker(self: *MetadataService) !void {
+        const replica_root_dir = self.replica_root_dir orelse return;
+        try ensureCdcWorkPermit(self);
+
+        const runtime = try self.ensureBackendRuntime();
         var write_source = api_table_writes.ProvisionedTableWriteSource.init(
             replica_root_dir,
             api_table_catalog.CatalogSource.fromMetadataService(self),
         );
-        write_source.backend_runtime = try self.ensureBackendRuntime();
+        write_source.backend_runtime = runtime;
         _ = write_source.withSecretStore(self.secret_store);
         var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
             .alloc = self.alloc,
             .runner = .{
                 .alloc = self.alloc,
+                .io = runtime.io() orelse std.Options.debug_io,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source.source(),
                 .secret_store = self.secret_store,
+                .work_permit = cdcWorkPermit(self),
             },
         };
         const summary = coordinator.runRound(self) catch |err| {
@@ -2789,13 +3058,14 @@ pub const MetadataService = struct {
         };
         if (summary.sources_considered > 0) {
             std.log.info(
-                "metadata cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d}",
+                "metadata cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d} yielded={d}",
                 .{
                     summary.tables_considered,
                     summary.sources_considered,
                     summary.sources_started,
                     summary.sources_resumed,
                     summary.sources_completed,
+                    summary.sources_yielded,
                 },
             );
         }
@@ -2806,6 +3076,7 @@ pub const MetadataService = struct {
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source.source(),
                 .secret_store = self.secret_store,
+                .work_permit = cdcWorkPermit(self),
             },
         };
         const stream_summary = streaming.runRound(self) catch |err| {
@@ -2857,6 +3128,11 @@ pub const MetadataHttpService = struct {
     local_schema_progress_group_ids_fingerprint: ?u64,
     last_local_schema_progress_refresh_at_ms: u64,
     cdc_runtime_mutex: std.Io.Mutex = .init,
+    reconcile_lease_mutex: std.Io.Mutex = .init,
+    cdc_job_in_flight: std.atomic.Value(bool) = .init(false),
+    cdc_shutdown: std.atomic.Value(bool) = .init(false),
+    cdc_permit_check_after_ns: std.atomic.Value(u64) = .init(0),
+    cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
     runtime_mutex: std.Io.Mutex = .init,
     placement_reconcile_mutex: std.Io.Mutex = .init,
@@ -2963,6 +3239,7 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn deinit(self: *MetadataHttpService) void {
+        shutdownCdcRuntimeJobs(self);
         // Projection listeners retain `self`; stop and drain their Raft apply
         // producer before releasing any callback-owned service state.
         self.raft.deinit();
@@ -3232,8 +3509,113 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
+    pub fn replaceTableDefinition(
+        self: *MetadataHttpService,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !void {
+        if (expected.table_id == 0 or
+            replacement.table_id != expected.table_id or
+            !std.mem.eql(u8, replacement.name, expected.name))
+            return error.InvalidTableDefinitionReplacement;
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const baseline_fence = try store.getTableTransitionFence(
+            self.metadata_group_id,
+            expected.table_id,
+        );
+        if (baseline_fence.active()) return error.TableTransitionActive;
+        try self.proposeTransitionCommand(.{ .compare_and_replace_table = .{
+            .expected = expected,
+            .replacement = replacement,
+        } });
+
+        const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const current = (try store.getTable(
+                self.alloc,
+                self.metadata_group_id,
+                expected.table_id,
+            )) orelse return error.TableNotFound;
+            defer metadata_table_manager.freeTable(self.alloc, current);
+            if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
+            if (!metadata_table_manager.tableDefinitionsEqual(current, expected))
+                return error.TableGenerationChanged;
+
+            const fence = try store.getTableTransitionFence(
+                self.metadata_group_id,
+                expected.table_id,
+            );
+            if (fence.active() or fence.generation != baseline_fence.generation)
+                return error.TableTransitionActive;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id))
+                    return error.NotLeader;
+                if (self.raft.pending_updates.items.len > 0) {
+                    _ = try self.raft.syncPendingRaftOnly();
+                } else {
+                    try self.raft.runRaftRoundOnly();
+                }
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
+    }
+
     pub fn removeTable(self: *MetadataHttpService, table_id: u64) !void {
-        try self.proposeTransitionCommand(.{ .remove_table = .{ .table_id = table_id } });
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const baseline_fence = try store.getTableTransitionFence(
+            self.metadata_group_id,
+            table_id,
+        );
+        if (baseline_fence.active()) return error.TableTransitionActive;
+        if (try store.getTable(self.alloc, self.metadata_group_id, table_id)) |current| {
+            metadata_table_manager.freeTable(self.alloc, current);
+        } else {
+            return;
+        }
+        try self.proposeTransitionCommand(.{ .remove_table = .{
+            .table_id = table_id,
+            .expected_transition_generation = baseline_fence.generation,
+        } });
+
+        const deadline_ns = platform_time.monotonicNs() +|
+            linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            if (try store.getTable(
+                self.alloc,
+                self.metadata_group_id,
+                table_id,
+            )) |current| {
+                metadata_table_manager.freeTable(self.alloc, current);
+            } else {
+                return;
+            }
+            const fence = try store.getTableTransitionFence(
+                self.metadata_group_id,
+                table_id,
+            );
+            if (fence.active() or
+                fence.generation != baseline_fence.generation)
+                return error.TableTransitionActive;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.http_host.host.isLocalLeader(
+                    self.metadata_group_id,
+                )) return error.NotLeader;
+                if (self.raft.pending_updates.items.len > 0) {
+                    _ = try self.raft.syncPendingRaftOnly();
+                } else {
+                    try self.raft.runRaftRoundOnly();
+                }
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn upsertSchemaProgress(self: *MetadataHttpService, record: metadata_table_manager.SchemaProgressRecord) !void {
@@ -3263,14 +3645,23 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
     }
 
-    /// Persists exact-cutover ownership and fresh authority and does not return
-    /// until this provider attempt is visible in the applied Raft projection.
-    pub fn upsertReplicationSourceStatusDurable(self: *MetadataHttpService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+    /// Atomically claims exact-cutover authority against both the current
+    /// source catalog and prior authority, then waits for the applied proof.
+    pub fn claimReplicationSourceCutoverDurable(
+        self: *MetadataHttpService,
+        expected_replication_sources_json: []const u8,
+        expected_authority_id: u64,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
         if (record.cutover_intent_id == 0 or
             record.cutover_authority_id == 0 or
             std.mem.allEqual(u8, &record.cutover_provider_identity, 0))
             return error.InvalidReplicationCutoverIntent;
-        try self.upsertReplicationSourceStatus(record);
+        try self.proposeTransitionCommand(.{ .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = expected_replication_sources_json,
+            .expected_authority_id = expected_authority_id,
+            .record = record,
+        } });
 
         const deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
         while (platform_time.monotonicNs() < deadline_ns) {
@@ -3283,7 +3674,20 @@ pub const MetadataHttpService = struct {
             )) |applied_record| {
                 defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, applied_record);
                 if (replicationCutoverIntentApplied(applied_record, record)) return;
+                if (applied_record.cutover_authority_id != expected_authority_id)
+                    return error.ReplicationCutoverAuthorityLost;
             }
+            const current_table = (try store.getTable(
+                self.alloc,
+                self.metadata_group_id,
+                record.table_id,
+            )) orelse return error.TableNotFound;
+            defer metadata_table_manager.freeTable(self.alloc, current_table);
+            if (!std.mem.eql(
+                u8,
+                current_table.replication_sources_json,
+                expected_replication_sources_json,
+            )) return error.ReplicationSourceConfigChanged;
 
             self.lockRuntime();
             {
@@ -3301,11 +3705,85 @@ pub const MetadataHttpService = struct {
         return error.MetadataMutationApplyTimeout;
     }
 
-    pub fn removeReplicationSourceStatus(self: *MetadataHttpService, table_id: u64, source_ordinal: u32) !void {
-        try self.proposeTransitionCommand(.{ .remove_replication_source_status = .{
-            .table_id = table_id,
-            .source_ordinal = source_ordinal,
-        } });
+    pub fn replicationSourceAuthorityCurrent(
+        self: *MetadataHttpService,
+        expected_replication_sources_json: []const u8,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const table = (try store.getTable(
+            self.alloc,
+            self.metadata_group_id,
+            expected.table_id,
+        )) orelse return error.ReplicationSourceConfigChanged;
+        defer metadata_table_manager.freeTable(self.alloc, table);
+        if (!std.mem.eql(
+            u8,
+            table.replication_sources_json,
+            expected_replication_sources_json,
+        )) return error.ReplicationSourceConfigChanged;
+        const current = (try store.getReplicationSourceStatus(
+            self.alloc,
+            self.metadata_group_id,
+            expected.table_id,
+            expected.source_ordinal,
+        )) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, current);
+        if (!replicationCutoverAuthorityMatches(current, expected))
+            return error.ReplicationCutoverAuthorityLost;
+    }
+
+    pub fn completeReplicationSourceCutoverRetirementDurable(
+        self: *MetadataHttpService,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        if (expected.cutover_authority_id == 0 or
+            expected.retired_cutover_authority_id == 0 or
+            expected.retired_slot_name.len == 0 or
+            expected.retired_publication_name.len == 0)
+            return error.InvalidReplicationCutoverIntent;
+        try self.proposeTransitionCommand(.{
+            .complete_replication_source_retirement = expected,
+        });
+        const deadline_ns = platform_time.monotonicNs() +|
+            linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            const store = self.projectedStore() orelse
+                return error.MissingMetadataStore;
+            const current = (try store.getReplicationSourceStatus(
+                self.alloc,
+                self.metadata_group_id,
+                expected.table_id,
+                expected.source_ordinal,
+            )) orelse return error.ReplicationCutoverAuthorityLost;
+            defer metadata_table_manager.freeReplicationSourceStatus(
+                self.alloc,
+                current,
+            );
+            if (!replicationCutoverAuthorityMatches(current, expected))
+                return error.ReplicationCutoverAuthorityLost;
+            if (current.retired_cutover_authority_id == 0 and
+                current.retired_slot_name.len == 0 and
+                current.retired_publication_name.len == 0)
+                return;
+            if (!replicationCutoverRetirementMatches(current, expected))
+                return error.ReplicationCutoverAuthorityLost;
+
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (!self.raft.host.http_host.host.isLocalLeader(
+                    self.metadata_group_id,
+                )) return error.NotLeader;
+                if (self.raft.pending_updates.items.len > 0) {
+                    _ = try self.raft.syncPendingRaftOnly();
+                } else {
+                    try self.raft.runRaftRoundOnly();
+                }
+            }
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        return error.MetadataMutationApplyTimeout;
     }
 
     pub fn upsertRange(self: *MetadataHttpService, record: metadata_table_manager.RangeRecord) !void {
@@ -4210,6 +4688,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn reconcileLeaseStats(self: *MetadataHttpService) metadata_reconcile_lease.Stats {
+        self.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.reconcile_lease_mutex.unlock(std.Options.debug_io);
         return self.reconcile_lease.stats();
     }
 
@@ -4879,6 +5359,12 @@ pub const MetadataHttpService = struct {
     }
 
     fn ensureReconcileLease(self: *MetadataHttpService) !bool {
+        self.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.reconcile_lease_mutex.unlock(std.Options.debug_io);
+        return try self.ensureReconcileLeaseLocked();
+    }
+
+    fn ensureReconcileLeaseLocked(self: *MetadataHttpService) !bool {
         const now_ms = self.reconcile_lease.nowMs();
         const is_local_leader = self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id);
         const projected = self.getCachedProjectedReconcileLease(now_ms, is_local_leader) catch |err| switch (err) {
@@ -4926,14 +5412,14 @@ pub const MetadataHttpService = struct {
     }
 
     fn runReplicationBackfillRound(self: *MetadataHttpService) !void {
-        const replica_root_dir = self.replica_root_dir orelse return;
-        if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id)) return;
-        self.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.cdc_runtime_mutex.unlock(std.Options.debug_io);
-        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-        if (now_ms < self.cdc_next_round_at_ms) return;
-        self.cdc_next_round_at_ms = now_ms + cdc_replication_round_interval_ms;
+        try scheduleReplicationBackfillJob(self);
+    }
 
+    fn runReplicationBackfillWorker(self: *MetadataHttpService) !void {
+        const replica_root_dir = self.replica_root_dir orelse return;
+        try ensureCdcWorkPermit(self);
+
+        const runtime = try self.ensureBackendRuntime();
         const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
         var cdc_group_router = api_table_router.CatalogBackedGroupRouter.init(
             catalog,
@@ -4947,16 +5433,18 @@ pub const MetadataHttpService = struct {
             cdc_group_router.router(),
             self.raft.host.http_host.request_executor,
         );
-        _ = hosted_write_source.withBackendRuntime(try self.ensureBackendRuntime());
+        _ = hosted_write_source.withBackendRuntime(runtime);
         _ = hosted_write_source.withSecretStore(self.secret_store);
         const write_source = self.cdc_write_source_override orelse hosted_write_source.source();
         var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
             .alloc = self.alloc,
             .runner = .{
                 .alloc = self.alloc,
+                .io = runtime.io() orelse std.Options.debug_io,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source,
                 .secret_store = self.secret_store,
+                .work_permit = cdcWorkPermit(self),
             },
         };
         const summary = coordinator.runRound(self) catch |err| {
@@ -4969,13 +5457,14 @@ pub const MetadataHttpService = struct {
         };
         if (summary.sources_considered > 0) {
             std.log.info(
-                "metadata http cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d}",
+                "metadata http cdc snapshot round tables={d} sources={d} started={d} resumed={d} completed={d} yielded={d}",
                 .{
                     summary.tables_considered,
                     summary.sources_considered,
                     summary.sources_started,
                     summary.sources_resumed,
                     summary.sources_completed,
+                    summary.sources_yielded,
                 },
             );
         }
@@ -4986,6 +5475,7 @@ pub const MetadataHttpService = struct {
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source,
                 .secret_store = self.secret_store,
+                .work_permit = cdcWorkPermit(self),
             },
         };
         const stream_summary = streaming.runRound(self) catch |err| {
@@ -5009,6 +5499,250 @@ pub const MetadataHttpService = struct {
         }
     }
 };
+
+fn cdcLocalMetadataLeader(service: anytype) bool {
+    const Service = @TypeOf(service.*);
+    if (Service == MetadataService) return service.isLocalMetadataLeader();
+    service.lockRuntime();
+    defer service.unlockRuntime();
+    return service.raft.host.http_host.host.isLocalLeader(service.metadata_group_id);
+}
+
+fn shutdownCdcRuntimeJobs(service: anytype) void {
+    service.cdc_shutdown.store(true, .release);
+    service.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+    const runtime = service.backend_runtime;
+    const owner_id = service.cdc_job_owner_id;
+    service.cdc_runtime_mutex.unlock(std.Options.debug_io);
+    if (runtime) |value| {
+        if (owner_id != 0) value.durable_jobs.closeOwner(owner_id);
+    }
+}
+
+fn advanceCdcLeaseRaft(service: anytype) !void {
+    const Service = @TypeOf(service.*);
+    service.lockRuntime();
+    defer service.unlockRuntime();
+    if (Service == MetadataService) {
+        if (!service.raft.host.host.isLocalLeader(service.metadata_group_id))
+            return error.CdcWorkLeaseLost;
+        try service.raft.runRaftRoundOnly();
+    } else {
+        if (!service.raft.host.http_host.host.isLocalLeader(service.metadata_group_id))
+            return error.CdcWorkLeaseLost;
+        if (service.raft.pending_updates.items.len > 0) {
+            _ = try service.raft.syncPendingRaftOnly();
+        } else {
+            try service.raft.runRaftRoundOnly();
+        }
+    }
+}
+
+fn ensureCdcWorkPermit(service: anytype) !void {
+    if (service.cdc_shutdown.load(.acquire)) return error.CdcWorkShuttingDown;
+    const now_ns = platform_time.monotonicNs();
+    if (now_ns < service.cdc_permit_check_after_ns.load(.acquire)) return;
+
+    service.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+    defer service.reconcile_lease_mutex.unlock(std.Options.debug_io);
+
+    const locked_now_ns = platform_time.monotonicNs();
+    if (locked_now_ns < service.cdc_permit_check_after_ns.load(.acquire)) return;
+    if (!cdcLocalMetadataLeader(service)) return error.CdcWorkLeaseLost;
+    const permit_cache_ns = @min(
+        @as(u64, 250 * std.time.ns_per_ms),
+        @max(
+            @as(u64, std.time.ns_per_ms),
+            (service.reconcile_lease.config.lease_ttl_ms *|
+                std.time.ns_per_ms) / 10,
+        ),
+    );
+    if (!service.reconcile_lease.config.enabled) {
+        service.cdc_permit_check_after_ns.store(
+            locked_now_ns +| permit_cache_ns,
+            .release,
+        );
+        return;
+    }
+
+    const renew_timeout_ns = @min(
+        linearizable_metadata_read_timeout_ns,
+        service.reconcile_lease.config.lease_ttl_ms *| std.time.ns_per_ms,
+    );
+    const deadline_ns = platform_time.monotonicNs() +| renew_timeout_ns;
+    var proposed_expires_at_ms: u64 = 0;
+    while (platform_time.monotonicNs() < deadline_ns) {
+        if (service.cdc_shutdown.load(.acquire)) return error.CdcWorkShuttingDown;
+        if (!cdcLocalMetadataLeader(service)) return error.CdcWorkLeaseLost;
+
+        const now_ms = service.reconcile_lease.nowMs();
+        const projected = try service.getProjectedReconcileLease();
+        _ = service.reconcile_lease.observe(true, projected, now_ms);
+        const minimum_remaining_ms = @max(
+            @as(u64, 1),
+            service.reconcile_lease.config.lease_ttl_ms / 2,
+        );
+        if (projected) |current| {
+            if (current.owner_node_id == service.reconcile_lease.local_node_id and
+                current.expires_at_ms > now_ms +| minimum_remaining_ms)
+            {
+                service.cdc_permit_check_after_ns.store(
+                    platform_time.monotonicNs() +| permit_cache_ns,
+                    .release,
+                );
+                return;
+            }
+            if (current.owner_node_id != service.reconcile_lease.local_node_id and
+                current.expires_at_ms > now_ms)
+                return error.CdcWorkLeaseLost;
+        }
+
+        const desired = service.reconcile_lease.desiredRecord(now_ms);
+        if (desired.expires_at_ms > proposed_expires_at_ms) {
+            service.upsertReconcileLease(desired) catch |err| {
+                service.reconcile_lease.noteAcquireFailure();
+                return err;
+            };
+            proposed_expires_at_ms = desired.expires_at_ms;
+        }
+        try advanceCdcLeaseRaft(service);
+        platform_clock.Clock.real().sleepMs(1);
+    }
+    return error.CdcWorkLeaseRenewalTimeout;
+}
+
+fn cdcWorkDeadlineNs(service: anytype) !u64 {
+    try ensureCdcWorkPermit(service);
+    if (!service.reconcile_lease.config.enabled)
+        return platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+
+    service.reconcile_lease_mutex.lockUncancelable(std.Options.debug_io);
+    defer service.reconcile_lease_mutex.unlock(std.Options.debug_io);
+    const now_ms = service.reconcile_lease.nowMs();
+    if (service.reconcile_lease.owner_node_id !=
+        service.reconcile_lease.local_node_id or
+        service.reconcile_lease.expires_at_ms <= now_ms)
+        return error.CdcWorkLeaseLost;
+    const remaining_ms = service.reconcile_lease.expires_at_ms - now_ms;
+    const quantum_ns = try cdcProviderQuantumNs(
+        service.reconcile_lease.config.lease_ttl_ms,
+        remaining_ms,
+    );
+    return platform_time.monotonicNs() +| quantum_ns;
+}
+
+fn cdcProviderQuantumNs(ttl_ms: u64, remaining_ms: u64) !u64 {
+    if (ttl_ms == 0 or remaining_ms <= 1) return error.CdcWorkLeaseLost;
+    const safety_ms = @max(
+        @as(u64, 1),
+        @min(ttl_ms / 10, remaining_ms / 2),
+    );
+    if (remaining_ms <= safety_ms) return error.CdcWorkLeaseLost;
+    const lease_budget_ns =
+        (remaining_ms - safety_ms) *| std.time.ns_per_ms;
+    const configured_quantum_ns = @max(
+        @as(u64, std.time.ns_per_ms),
+        (ttl_ms *| std.time.ns_per_ms) / 3,
+    );
+    return @min(
+        @as(u64, 5 * std.time.ns_per_s),
+        @min(configured_quantum_ns, lease_budget_ns),
+    );
+}
+
+test "metadata cdc provider quantum is bounded by observed lease remainder" {
+    try std.testing.expectError(
+        error.CdcWorkLeaseLost,
+        cdcProviderQuantumNs(100, 1),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 100 * std.time.ns_per_ms / 3),
+        try cdcProviderQuantumNs(100, 60),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 50 * std.time.ns_per_ms),
+        try cdcProviderQuantumNs(5_000, 100),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 5_000 * std.time.ns_per_ms / 3),
+        try cdcProviderQuantumNs(5_000, 3_000),
+    );
+}
+
+fn cdcWorkPermit(service: anytype) metadata_replication_backfill.WorkPermit {
+    const Service = @TypeOf(service.*);
+    const Callbacks = struct {
+        fn checkpoint(ptr: *anyopaque) !void {
+            const typed: *Service = @ptrCast(@alignCast(ptr));
+            try ensureCdcWorkPermit(typed);
+        }
+
+        fn deadline(ptr: *anyopaque) !u64 {
+            const typed: *Service = @ptrCast(@alignCast(ptr));
+            return try cdcWorkDeadlineNs(typed);
+        }
+    };
+    return .{
+        .ptr = service,
+        .checkpoint_fn = Callbacks.checkpoint,
+        .deadline_fn = Callbacks.deadline,
+    };
+}
+
+fn scheduleReplicationBackfillJob(service: anytype) !void {
+    const Service = @TypeOf(service.*);
+    if (service.replica_root_dir == null or !cdcLocalMetadataLeader(service)) return;
+
+    service.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+    defer service.cdc_runtime_mutex.unlock(std.Options.debug_io);
+    if (service.cdc_shutdown.load(.acquire)) return;
+    if (service.cdc_job_in_flight.load(.acquire)) return;
+
+    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    if (now_ms < service.cdc_next_round_at_ms) return;
+
+    const runtime = try service.ensureBackendRuntime();
+    if (service.cdc_job_owner_id == 0)
+        service.cdc_job_owner_id = try runtime.allocOwnerId();
+
+    const JobContext = struct {
+        alloc: std.mem.Allocator,
+        service: *Service,
+
+        fn run(ptr: *anyopaque) !void {
+            const ctx: *@This() = @ptrCast(@alignCast(ptr));
+            ctx.service.runReplicationBackfillWorker() catch |err| {
+                if (isExpectedCdcRoundError(err)) {
+                    std.log.warn("metadata CDC maintenance job deferred: {s}", .{@errorName(err)});
+                } else {
+                    std.log.err("metadata CDC maintenance job failed: {s}", .{@errorName(err)});
+                }
+            };
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const ctx: *@This() = @ptrCast(@alignCast(ptr));
+            ctx.service.cdc_job_in_flight.store(false, .release);
+            const alloc = ctx.alloc;
+            alloc.destroy(ctx);
+        }
+    };
+
+    const ctx = try service.alloc.create(JobContext);
+    ctx.* = .{ .alloc = service.alloc, .service = service };
+    service.cdc_job_in_flight.store(true, .release);
+    runtime.durable_jobs.submit(.{
+        .owner_id = service.cdc_job_owner_id,
+        .class = .maintenance,
+        .ptr = ctx,
+        .run = JobContext.run,
+        .deinit = JobContext.deinit,
+    }) catch |err| {
+        JobContext.deinit(ctx);
+        return err;
+    };
+    service.cdc_next_round_at_ms = now_ms + cdc_replication_round_interval_ms;
+}
 
 fn syncLocalSchemaProgress(
     service: anytype,

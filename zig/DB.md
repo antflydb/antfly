@@ -673,6 +673,24 @@ concurrency without allocating an I/O runtime per request or serializing all
 control-plane traffic. Nodes fail closed if either group or whole-table fencing
 is unavailable.
 
+User-visible table-definition mutation has a separate replicated admission
+fence. Each table owns an O(1) `TableTransitionFence` containing a monotonic
+generation and active split/merge count. Admitting or terminating a range
+transition updates that fence in the same metadata-Raft transaction as the
+transition record. Schema, index, enrichment, and other in-place table
+definition changes use compare-and-replace against both the expected table
+definition and the fence. Table deletion carries the observed inactive fence
+generation in its Raft command and waits for the committed absence; a transition
+admitted or completed in between makes the command a durable no-op and returns
+HTTP 409 instead of reporting a false success. A mutation racing an active or
+newly admitted transition cannot silently alter the contract retained by
+transition work. Admission is reciprocal: a new split
+or merge verifies the current table contract and participating range identities
+in the same Raft transaction that creates the transition. An older proposal
+therefore cannot become active after a newer schema or index definition commits.
+Progress upserts can only advance an already admitted transition. The fence is
+keyed by table, so unrelated tables neither scan nor invalidate one another.
+
 Each bounded reconciliation quantum receives one whole-table admission fence.
 It captures the table runtime-cache epoch before opening storage, retains owned
 observations for completed groups, performs one post-mutation linearizable
@@ -1410,6 +1428,58 @@ Current status:
   owner-scoped DB runtime tests cover the lifecycle contract
 - raft replica placement reconciliation remains foreground control-loop work,
   while distributed transaction recovery is already runtime-owned
+
+### CDC Runtime And Cutover Ownership
+
+Metadata-Raft owns CDC intent, lease, authority, and progress. It does not own
+long-running provider execution. A metadata control round admits at most one
+owner-scoped `BackendRuntime` maintenance job and returns; the job performs
+snapshot and streaming work using the runtime's shared `std.Io` capability.
+Service shutdown closes that runtime owner and drains the job before metadata
+state is destroyed.
+
+Every CDC job carries a `WorkPermit` tied to the replicated reconciliation
+lease. Permit checks are cached for at most 250 ms to keep per-row checks cheap,
+but provider calls receive a deadline shorter than the proven remaining lease.
+The runner checks again before and after provider I/O, document application,
+and durable status publication. It renews the lease continuously and stops
+without publishing further work after leadership, lease ownership, or service
+lifetime changes. Snapshot queries remain batch-bounded; exact exported
+snapshots may keep one background job alive across batches because yielding
+would destroy snapshot consistency, but they do not block the metadata control
+loop. Reopenable snapshots persist a validated keyset cursor derived from the
+document-key template, including lexicographic tuples for composite keys. Each
+quantum resumes strictly after that cursor instead of using an increasingly
+expensive and mutation-sensitive SQL offset. Sources without a derivable stable
+key retain one consistent background snapshot rather than claiming a resumable
+checkpoint they cannot honor. A provider page must advance the persisted keyset
+tuple before any writes are applied, preventing a provider that ignores or
+misapplies the cursor from replaying one page indefinitely.
+
+PostgreSQL exact cutover uses two independent fences:
+
+- a replicated authority claim compare-and-swaps the current source catalog
+  and prior authority
+- a stable provider advisory lock serializes physical resource lifecycle
+  operations for the configured source
+
+Physical slot and publication names include both cutover intent and authority,
+so a replacement owner never mutates the predecessor's current resources by
+name. The new authority durably records the superseded slot and publication,
+removes the inactive slot before its publication, verifies absence, and only
+then submits a dedicated retirement-completion Raft command. Ordinary status
+publication must preserve the exact retirement tuple and cannot acknowledge
+cleanup. The completion command compare-and-swaps both current authority and
+retired resource identity, then clears only those fields while preserving newer
+progress. Every provider mutation revalidates the current replicated authority.
+A further authority handoff is rejected while retirement is pending, which
+bounds durable cleanup state to one predecessor per source and makes retries
+idempotent. Manual exact-cutover reseed first compare-and-replaces the source
+catalog; it never deletes provider resources or clears source status on the
+request thread. That publication revokes the prior runtime permit, and the next
+runtime authority claim records and retires the predecessor's physical
+resources durably. A crash between catalog publication and cleanup therefore
+leaves recoverable intent rather than leaked, unowned provider state.
 
 ## Storage Backend Boundary
 

@@ -5230,22 +5230,14 @@ pub const DataServer = struct {
                                 table_name,
                                 body,
                                 dataRaftBatchHttpTimeoutMs(deadline_ns),
-                            ) catch |err| switch (err) {
-                                error.LeaderUnavailable,
-                                error.UnexpectedHttpStatus,
-                                error.HttpConnectionClosing,
-                                error.ConnectionResetByPeer,
-                                error.ConnectionRefused,
-                                error.BrokenPipe,
-                                error.EndOfStream,
-                                error.ConnectionTimedOut,
-                                error.Timeout,
-                                => {
-                                    if (platform_time.monotonicNs() >= deadline_ns) return err;
+                            ) catch |err| {
+                                if (isRetryableDataRaftForwardError(err)) {
+                                    if (platform_time.monotonicNs() >= deadline_ns)
+                                        return error.LeaderUnavailable;
                                     sleepDataRaftBatchLeaderRetry();
                                     continue;
-                                },
-                                else => return err,
+                                }
+                                return err;
                             };
                             response.deinit(alloc);
                             return;
@@ -5375,21 +5367,13 @@ pub const DataServer = struct {
             table_name,
             body,
             dataRaftBatchHttpTimeoutMs(deadline_ns),
-        ) catch |err| switch (err) {
-            error.LeaderUnavailable,
-            error.UnexpectedHttpStatus,
-            error.HttpConnectionClosing,
-            error.ConnectionResetByPeer,
-            error.ConnectionRefused,
-            error.BrokenPipe,
-            error.EndOfStream,
-            error.ConnectionTimedOut,
-            error.Timeout,
-            => {
-                if (platform_time.monotonicNs() >= deadline_ns) return err;
+        ) catch |err| {
+            if (isRetryableDataRaftForwardError(err)) {
+                if (platform_time.monotonicNs() >= deadline_ns)
+                    return error.LeaderUnavailable;
                 return false;
-            },
-            else => return err,
+            }
+            return err;
         };
         response.deinit(alloc);
         return true;
@@ -5401,6 +5385,22 @@ pub const DataServer = struct {
         const remaining_ns = deadline_ns - now_ns;
         const rounded_ms = (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms;
         return @intCast(@min(rounded_ms, std.math.maxInt(u32)));
+    }
+
+    fn isRetryableDataRaftForwardError(err: anyerror) bool {
+        return switch (err) {
+            error.LeaderUnavailable,
+            error.UnexpectedHttpStatus,
+            error.HttpConnectionClosing,
+            error.ConnectionResetByPeer,
+            error.ConnectionRefused,
+            error.BrokenPipe,
+            error.EndOfStream,
+            error.ConnectionTimedOut,
+            error.Timeout,
+            => true,
+            else => false,
+        };
     }
 
     fn waitForLocalRaftBatchApply(
@@ -23727,4 +23727,11 @@ test "remote metadata source shares backend runtime io across a bounded executor
         try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(expected)));
     }
     try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(&source.http_executors[0])));
+}
+
+test "data raft forwarding classifies deadline and transport failures as retryable" {
+    try std.testing.expect(DataServer.isRetryableDataRaftForwardError(error.Timeout));
+    try std.testing.expect(DataServer.isRetryableDataRaftForwardError(error.ConnectionResetByPeer));
+    try std.testing.expect(DataServer.isRetryableDataRaftForwardError(error.LeaderUnavailable));
+    try std.testing.expect(!DataServer.isRetryableDataRaftForwardError(error.OutOfMemory));
 }

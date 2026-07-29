@@ -352,7 +352,24 @@ pub fn collectLocalSchemaProgressWithOptions(
 
         const version = try schemaVersion(alloc, table.schema_json);
         const read_version = try schemaVersion(alloc, table.read_schema_json);
-        const ready = try localRangeHasSchemaVersionIndex(alloc, replica_root_dir, table.name, group_id, version, read_version, options);
+        const ready = localRangeHasSchemaVersionIndex(
+            alloc,
+            replica_root_dir,
+            table.name,
+            group_id,
+            version,
+            read_version,
+            options,
+        ) catch |err| switch (err) {
+            // Schema progress is observational. A generation publication can
+            // acquire the DB between the durable-marker check and DB.open;
+            // report that shard as not ready and observe it next round.
+            error.GenerationTransitionActive,
+            error.FileNotFound,
+            error.NotDir,
+            => false,
+            else => return err,
+        };
 
         const gop = try progress_by_table.getOrPut(alloc, table.table_id);
         if (!gop.found_existing) {
@@ -3222,6 +3239,60 @@ test "table provisioner reports local schema progress once all local shards have
     try std.testing.expectEqual(@as(u64, 9), progress[0].table_id);
     try std.testing.expectEqual(@as(u64, 7), progress[0].node_id);
     try std.testing.expectEqual(@as(u32, 1), progress[0].schema_version);
+}
+
+test "table provisioner treats an active generation transition as schema progress not ready" {
+    const GenerationTransitionAdapter = struct {
+        fn fetchMedianKey(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+
+        fn schemaIndexReady(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: u64,
+            _: u32,
+            _: u32,
+        ) !bool {
+            return error.GenerationTransitionActive;
+        }
+
+        fn adapter() shard_db_adapter_mod.ShardDbAdapter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .fetch_median_key = fetchMedianKey,
+                    .schema_index_ready = schemaIndexReady,
+                },
+            };
+        }
+    };
+
+    const progress = try collectLocalSchemaProgressWithOptions(
+        std.testing.allocator,
+        "/tmp/unused-antfly-schema-progress-transition",
+        100,
+        7,
+        &.{ 100, 2003 },
+        &.{.{
+            .table_id = 9,
+            .name = "docs",
+            .schema_json = "{\"version\":1}",
+            .read_schema_json = "{\"version\":0}",
+            .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+        }},
+        &.{.{
+            .group_id = 2003,
+            .table_id = 9,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+        .{ .shard_db_adapter = GenerationTransitionAdapter.adapter() },
+    );
+    defer std.testing.allocator.free(progress);
+
+    try std.testing.expectEqual(@as(usize, 0), progress.len);
 }
 
 test "table provisioner schema progress probes do not take a writer lease" {

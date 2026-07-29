@@ -1443,6 +1443,7 @@ pub const AntflyApiHandler = struct {
             server: *ApiHttpServer,
             source: table_reads.TableReadSource,
             query_embedding_security_scope: ApiHttpServer.QueryEmbeddingSecurityScope,
+            authenticated_identity: ?AuthenticatedIdentity,
 
             fn iface(runner: *@This()) retrieval_agent.QueryRunner {
                 return .{
@@ -1474,6 +1475,16 @@ pub const AntflyApiHandler = struct {
                     error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,
                     else => return err,
                 };
+                const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(
+                    a,
+                    runner.authenticated_identity,
+                    table_name,
+                );
+                defer if (row_filter_json) |value| a.free(value);
+                if (row_filter_json) |value| {
+                    http_server_mod.injectRowFilterIntoSearchRequest(a, &query_req.req, value) catch
+                        return error.InvalidRetrievalAgentRequest;
+                }
                 return (runner.source.query(
                     a,
                     table_name,
@@ -1490,31 +1501,18 @@ pub const AntflyApiHandler = struct {
                 ptr: *anyopaque,
                 a: std.mem.Allocator,
                 table_name: []const u8,
+                filter_query_json: ?[]const u8,
+                exclusion_query_json: ?[]const u8,
             ) ![]const []const u8 {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var scan = (try runner.source.scan(
+                return try runner.server.scanRetrievalKeys(
                     a,
+                    runner.source,
                     table_name,
-                    "",
-                    "",
-                    .{ .limit = 0 },
-                    .read_index,
-                )) orelse return error.TableNotFound;
-                defer scan.deinit(a);
-
-                var keys = std.ArrayListUnmanaged([]const u8).empty;
-                errdefer {
-                    for (keys.items) |key| a.free(key);
-                    keys.deinit(a);
-                }
-
-                var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
-                while (lines.next()) |line| {
-                    if (line.len == 0) continue;
-                    const key = http_server_mod.scanLineKey(a, line) catch return error.InvalidRetrievalAgentRequest;
-                    try keys.append(a, key);
-                }
-                return try keys.toOwnedSlice(a);
+                    filter_query_json,
+                    exclusion_query_json,
+                    runner.authenticated_identity,
+                );
             }
         };
 
@@ -1552,6 +1550,7 @@ pub const AntflyApiHandler = struct {
             .server = self.api_server,
             .source = source,
             .query_embedding_security_scope = ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity),
+            .authenticated_identity = authenticated_identity,
         };
         const retrieval_resp = retrieval_agent.execute(alloc, query_runner.iface(), generation_runner.iface(), body_data) catch |err| switch (err) {
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {

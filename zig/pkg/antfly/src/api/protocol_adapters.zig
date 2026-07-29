@@ -1247,10 +1247,21 @@ fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn handleA2aRequest(server_ptr: anytype, req: http_common.HttpRequest, query_embedding_security_scope: anytype) !http_common.HttpResponse {
+pub fn handleA2aRequest(
+    server_ptr: anytype,
+    req: http_common.HttpRequest,
+    query_embedding_security_scope: anytype,
+    authenticated_identity: anytype,
+) !http_common.HttpResponse {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization, query_embedding_security_scope);
+    var dispatcher = try buildA2aDispatcher(
+        server_ptr,
+        arena_impl.allocator(),
+        req.authorization,
+        query_embedding_security_scope,
+        authenticated_identity,
+    );
     if (isJsonRpcMethod(arena_impl.allocator(), req.body, "message/stream")) {
         var sink = A2aSseSink{};
         defer sink.out.deinit(server_ptr.alloc);
@@ -1267,7 +1278,13 @@ pub fn isA2aStreamingRequest(alloc: std.mem.Allocator, req: http_common.HttpRequ
     return req.method == .POST and isJsonRpcMethod(alloc, req.body, "message/stream");
 }
 
-pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpRequest, writer: http_common.StreamWriter, query_embedding_security_scope: anytype) !bool {
+pub fn handleA2aStreamingRequest(
+    server_ptr: anytype,
+    req: http_common.HttpRequest,
+    writer: http_common.StreamWriter,
+    query_embedding_security_scope: anytype,
+    authenticated_identity: anytype,
+) !bool {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
     if (!isJsonRpcMethod(arena_impl.allocator(), req.body, "message/stream")) return false;
@@ -1277,7 +1294,13 @@ pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpReque
         .content_type = "text/event-stream",
     });
 
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization, query_embedding_security_scope);
+    var dispatcher = try buildA2aDispatcher(
+        server_ptr,
+        arena_impl.allocator(),
+        req.authorization,
+        query_embedding_security_scope,
+        authenticated_identity,
+    );
     var sink = A2aLiveSseSink{ .writer = writer };
     try dispatcher.handleJsonRpcStream(server_ptr.alloc, req.body, sink.iface());
     try writer.writeAll("event: done\ndata: {}\n\n");
@@ -1312,10 +1335,20 @@ const A2aLiveSseSink = struct {
     }
 };
 
-pub fn handleA2aCard(server_ptr: anytype, query_embedding_security_scope: anytype) !http_common.HttpResponse {
+pub fn handleA2aCard(
+    server_ptr: anytype,
+    query_embedding_security_scope: anytype,
+    authenticated_identity: anytype,
+) !http_common.HttpResponse {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), null, query_embedding_security_scope);
+    var dispatcher = try buildA2aDispatcher(
+        server_ptr,
+        arena_impl.allocator(),
+        null,
+        query_embedding_security_scope,
+        authenticated_identity,
+    );
     const card = try dispatcher.agentCard(arena_impl.allocator());
     const body = try stringifyJsonValue(server_ptr.alloc, card);
     defer server_ptr.alloc.free(body);
@@ -1327,6 +1360,7 @@ fn buildA2aDispatcher(
     dispatcher_alloc: std.mem.Allocator,
     authorization: ?[]const u8,
     query_embedding_security_scope: anytype,
+    authenticated_identity: anytype,
 ) !a2a.Dispatcher {
     const Server = @TypeOf(server_ptr);
     const HandlerKind = enum { query_builder, retrieval };
@@ -1334,6 +1368,7 @@ fn buildA2aDispatcher(
         server: Server,
         authorization: ?[]const u8,
         query_embedding_security_scope: @TypeOf(query_embedding_security_scope),
+        authenticated_identity: @TypeOf(authenticated_identity),
         kind: HandlerKind,
 
         fn iface(ctx: *@This()) a2a.AgentHandler {
@@ -1429,6 +1464,7 @@ fn buildA2aDispatcher(
                 request_ctx.context_id,
                 queue,
                 ctx.query_embedding_security_scope,
+                ctx.authenticated_identity,
             );
         }
     };
@@ -1444,12 +1480,14 @@ fn buildA2aDispatcher(
         .server = server_ptr,
         .authorization = authorization,
         .query_embedding_security_scope = query_embedding_security_scope,
+        .authenticated_identity = authenticated_identity,
         .kind = .query_builder,
     };
     contexts[1] = .{
         .server = server_ptr,
         .authorization = authorization,
         .query_embedding_security_scope = query_embedding_security_scope,
+        .authenticated_identity = authenticated_identity,
         .kind = .retrieval,
     };
     try dispatcher.addHandler(dispatcher_alloc, contexts[0].iface());

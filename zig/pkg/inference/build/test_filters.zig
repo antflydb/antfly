@@ -14,6 +14,10 @@
 
 const std = @import("std");
 
+fn validateSkipTestFilter(value: []const u8) error{EmptySkipTestFilter}!void {
+    if (value.len == 0) return error.EmptySkipTestFilter;
+}
+
 pub fn select(
     alloc: std.mem.Allocator,
     args: []const []const u8,
@@ -38,10 +42,13 @@ pub fn select(
             filters.appendAssumeCapacity(filter);
         } else if (std.mem.eql(u8, arg, "--skip-test-filter")) {
             i += 1;
-            if (i >= args.len or args[i].len == 0)
+            if (i >= args.len) @panic("missing value after --skip-test-filter");
+            validateSkipTestFilter(args[i]) catch
                 @panic("missing value after --skip-test-filter");
-        } else if (std.mem.startsWith(u8, arg, "--skip-test-filter=") or
-            std.mem.startsWith(u8, arg, "--seed=") or
+        } else if (std.mem.startsWith(u8, arg, "--skip-test-filter=")) {
+            validateSkipTestFilter(arg["--skip-test-filter=".len..]) catch
+                @panic("missing value after --skip-test-filter=");
+        } else if (std.mem.startsWith(u8, arg, "--seed=") or
             std.mem.startsWith(u8, arg, "--cache-dir=") or
             std.mem.eql(u8, arg, "--listen=-"))
         {
@@ -77,11 +84,15 @@ pub fn addRuntimeControls(
                 @panic("missing value after --test-filter=");
         } else if (std.mem.eql(u8, arg, "--skip-test-filter")) {
             i += 1;
-            if (i >= args.len or args[i].len == 0)
+            if (i >= args.len) @panic("missing value after --skip-test-filter");
+            validateSkipTestFilter(args[i]) catch
                 @panic("missing value after --skip-test-filter");
             run.addArgs(&.{ "--skip-test-filter", args[i] });
-        } else if (std.mem.startsWith(u8, arg, "--skip-test-filter=") or
-            std.mem.startsWith(u8, arg, "--seed=") or
+        } else if (std.mem.startsWith(u8, arg, "--skip-test-filter=")) {
+            validateSkipTestFilter(arg["--skip-test-filter=".len..]) catch
+                @panic("missing value after --skip-test-filter=");
+            run.addArg(arg);
+        } else if (std.mem.startsWith(u8, arg, "--seed=") or
             std.mem.startsWith(u8, arg, "--cache-dir=") or
             std.mem.eql(u8, arg, "--listen=-"))
         {
@@ -111,4 +122,9 @@ test "select accepts repeated filters and ignores runtime controls" {
     try std.testing.expectEqual(@as(usize, 2), filters.len);
     try std.testing.expectEqualStrings("metrics render", filters[0]);
     try std.testing.expectEqualStrings("singleflight basic", filters[1]);
+}
+
+test "empty skip filters are rejected before compiling a zero-test selection" {
+    try std.testing.expectError(error.EmptySkipTestFilter, validateSkipTestFilter(""));
+    try validateSkipTestFilter("known flaky test");
 }

@@ -2788,7 +2788,17 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn removeTable(self: MetadataHttpNodeSimulation, table_id: u64) !void {
-        try self.proposeTransitionCommand(.{ .remove_table = .{ .table_id = table_id } });
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        const fence = try store.getTableTransitionFence(
+            self.cluster.metadata_group_id,
+            table_id,
+        );
+        if (fence.active()) return error.TableTransitionActive;
+        try self.proposeTransitionCommand(.{ .remove_table = .{
+            .table_id = table_id,
+            .expected_transition_generation = fence.generation,
+        } });
     }
 
     pub fn upsertRange(self: MetadataHttpNodeSimulation, record: metadata_table_manager.RangeRecord) !void {
@@ -2860,7 +2870,19 @@ pub const MetadataHttpNodeSimulation = struct {
                 .local_node_id = record.local_node_id,
             } });
         }
-        for (plan.table_removals) |table_id| try commands.append(self.cluster.alloc, .{ .remove_table = .{ .table_id = table_id } });
+        for (plan.table_removals) |table_id| {
+            const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+                return error.MissingMetadataStore;
+            const fence = try store.getTableTransitionFence(
+                self.cluster.metadata_group_id,
+                table_id,
+            );
+            if (fence.active()) return error.TableTransitionActive;
+            try commands.append(self.cluster.alloc, .{ .remove_table = .{
+                .table_id = table_id,
+                .expected_transition_generation = fence.generation,
+            } });
+        }
         for (plan.range_removals) |group_id| try commands.append(self.cluster.alloc, .{ .remove_range = .{ .group_id = group_id } });
         for (plan.split_removals) |transition_id| try commands.append(self.cluster.alloc, .{ .remove_split_transition = .{ .transition_id = transition_id } });
         for (plan.merge_removals) |transition_id| try commands.append(self.cluster.alloc, .{ .remove_merge_transition = .{ .transition_id = transition_id } });

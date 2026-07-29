@@ -141,6 +141,7 @@ pub const TableApi = struct {
     pub const ExecuteCreateIndexError = error{
         NotLeader,
         NotFound,
+        Conflict,
         MethodNotAllowed,
         InvalidIndexRequest,
         ProbeUnavailable,
@@ -151,6 +152,7 @@ pub const TableApi = struct {
     pub const ExecuteDeleteIndexError = error{
         NotLeader,
         NotFound,
+        Conflict,
         MethodNotAllowed,
         InternalFailure,
     };
@@ -158,6 +160,7 @@ pub const TableApi = struct {
     pub const ExecutePutArtifactEnrichmentError = error{
         NotLeader,
         NotFound,
+        Conflict,
         MethodNotAllowed,
         InvalidEnrichmentRequest,
         InternalFailure,
@@ -166,6 +169,7 @@ pub const TableApi = struct {
     pub const ExecuteDeleteArtifactEnrichmentError = error{
         NotLeader,
         NotFound,
+        Conflict,
         MethodNotAllowed,
         InvalidEnrichmentRequest,
         InternalFailure,
@@ -963,6 +967,7 @@ pub fn handleTableCreateIndex(
     api.executeTableCreateIndex(alloc, table_name, index_name, body) catch |err| switch (err) {
         error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported index configuration") },
         error.ProbeUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "index validation probe unavailable") },
@@ -981,6 +986,7 @@ pub fn handleTableDeleteIndex(
     api.executeTableDeleteIndex(alloc, table_name, index_name) catch |err| switch (err) {
         error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index delete failed") },
     };
@@ -997,6 +1003,7 @@ pub fn handlePutArtifactEnrichment(
     api.executePutArtifactEnrichment(alloc, table_name, artifact_name, body) catch |err| switch (err) {
         error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment update failed") },
@@ -1013,6 +1020,7 @@ pub fn handleDeleteArtifactEnrichment(
     api.executeDeleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
         error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment delete failed") },

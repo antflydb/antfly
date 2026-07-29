@@ -1161,7 +1161,7 @@ fn replaceTableDefinitionOnService(
     if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
     if (extensionOwnsTableShape(&snapshot, replacement.name)) return error.ExtensionOwnedObject;
 
-    try svc.upsertTable(replacement);
+    try svc.replaceTableDefinition(expected, replacement);
     try svc.runRound();
 }
 
@@ -1185,7 +1185,7 @@ fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []c
 
     const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
     defer metadata_table_manager.freeTable(alloc, updated);
-    try svc.upsertTable(updated);
+    try svc.replaceTableDefinition(table.*, updated);
     try svc.runRound();
 }
 
@@ -1200,7 +1200,7 @@ fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
     var updated_record = table.*;
     updated_record.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, expanded_index_json);
     defer alloc.free(updated_record.indexes_json);
-    try svc.upsertTable(updated_record);
+    try svc.replaceTableDefinition(table.*, updated_record);
     try svc.runRound();
 }
 
@@ -1214,7 +1214,7 @@ fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     defer alloc.free(indexes_json);
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
-    try svc.upsertTable(updated_record);
+    try svc.replaceTableDefinition(table.*, updated_record);
     try svc.runRound();
 }
 
@@ -1228,7 +1228,7 @@ fn putArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_
     updated_record.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, artifact_name, enrichment_json);
     defer alloc.free(updated_record.indexes_json);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
-    try svc.upsertTable(updated_record);
+    try svc.replaceTableDefinition(table.*, updated_record);
     try svc.runRound();
 }
 
@@ -1243,7 +1243,7 @@ fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, tab
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
-    try svc.upsertTable(updated_record);
+    try svc.replaceTableDefinition(table.*, updated_record);
     try svc.runRound();
 }
 
@@ -3628,10 +3628,19 @@ pub const ApiHttpServer = struct {
             return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
         }
         if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.a2a)) {
-            return try protocol_adapters.handleA2aRequest(self, req, queryEmbeddingSecurityScope(authenticated_identity));
+            return try protocol_adapters.handleA2aRequest(
+                self,
+                req,
+                queryEmbeddingSecurityScope(authenticated_identity),
+                authenticated_identity,
+            );
         }
         if (req.method == .GET and (std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card_legacy) or std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card))) {
-            return try protocol_adapters.handleA2aCard(self, queryEmbeddingSecurityScope(null));
+            return try protocol_adapters.handleA2aCard(
+                self,
+                queryEmbeddingSecurityScope(null),
+                @as(?AuthenticatedIdentity, null),
+            );
         }
         return null;
     }
@@ -5138,6 +5147,7 @@ pub const ApiHttpServer = struct {
         context_id: []const u8,
         queue: *a2a.EventQueue,
         query_embedding_security_scope: QueryEmbeddingSecurityScope,
+        authenticated_identity: ?AuthenticatedIdentity,
     ) !void {
         const source = self.table_reads orelse {
             try queue.status(alloc, task_id, context_id, "failed", "not found");
@@ -5148,6 +5158,7 @@ pub const ApiHttpServer = struct {
             server: *ApiHttpServer,
             source: table_reads.TableReadSource,
             query_embedding_security_scope: QueryEmbeddingSecurityScope,
+            authenticated_identity: ?AuthenticatedIdentity,
 
             fn iface(runner: *@This()) retrieval_agent.QueryRunner {
                 return .{
@@ -5182,6 +5193,16 @@ pub const ApiHttpServer = struct {
                     error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,
                     else => return err,
                 };
+                const row_filter_json = try resolveEffectiveRowFilterJson(
+                    inner_alloc,
+                    runner.authenticated_identity,
+                    table_name,
+                );
+                defer if (row_filter_json) |value| inner_alloc.free(value);
+                if (row_filter_json) |value| {
+                    injectRowFilterIntoSearchRequest(inner_alloc, &query_req.req, value) catch
+                        return error.InvalidRetrievalAgentRequest;
+                }
                 return (runner.source.query(
                     inner_alloc,
                     table_name,
@@ -5198,31 +5219,18 @@ pub const ApiHttpServer = struct {
                 ptr_inner: *anyopaque,
                 inner_alloc: std.mem.Allocator,
                 table_name: []const u8,
+                filter_query_json: ?[]const u8,
+                exclusion_query_json: ?[]const u8,
             ) ![]const []const u8 {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                var scan = (try runner.source.scan(
+                return try runner.server.scanRetrievalKeys(
                     inner_alloc,
+                    runner.source,
                     table_name,
-                    "",
-                    "",
-                    .{ .limit = 0 },
-                    .read_index,
-                )) orelse return error.TableNotFound;
-                defer scan.deinit(inner_alloc);
-
-                var keys = std.ArrayListUnmanaged([]const u8).empty;
-                errdefer {
-                    for (keys.items) |key| inner_alloc.free(key);
-                    keys.deinit(inner_alloc);
-                }
-
-                var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
-                while (lines.next()) |line| {
-                    if (line.len == 0) continue;
-                    const key = scanLineKey(inner_alloc, line) catch return error.InvalidRetrievalAgentRequest;
-                    try keys.append(inner_alloc, key);
-                }
-                return try keys.toOwnedSlice(inner_alloc);
+                    filter_query_json,
+                    exclusion_query_json,
+                    runner.authenticated_identity,
+                );
             }
         };
 
@@ -5262,6 +5270,7 @@ pub const ApiHttpServer = struct {
             .server = self,
             .source = source,
             .query_embedding_security_scope = query_embedding_security_scope,
+            .authenticated_identity = authenticated_identity,
         };
 
         const RetrievalA2aSink = struct {
@@ -5393,31 +5402,18 @@ pub const ApiHttpServer = struct {
                 ptr_inner: *anyopaque,
                 alloc: std.mem.Allocator,
                 table_name: []const u8,
+                filter_query_json: ?[]const u8,
+                exclusion_query_json: ?[]const u8,
             ) ![]const []const u8 {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                var scan = (try runner.source.scan(
+                return try runner.server.scanRetrievalKeys(
                     alloc,
+                    runner.source,
                     table_name,
-                    "",
-                    "",
-                    .{ .limit = 0 },
-                    .read_index,
-                )) orelse return error.TableNotFound;
-                defer scan.deinit(alloc);
-
-                var keys = std.ArrayListUnmanaged([]const u8).empty;
-                errdefer {
-                    for (keys.items) |key| alloc.free(key);
-                    keys.deinit(alloc);
-                }
-
-                var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
-                while (lines.next()) |line| {
-                    if (line.len == 0) continue;
-                    const key = scanLineKey(alloc, line) catch return error.InvalidRetrievalAgentRequest;
-                    try keys.append(alloc, key);
-                }
-                return try keys.toOwnedSlice(alloc);
+                    filter_query_json,
+                    exclusion_query_json,
+                    null,
+                );
             }
         };
 
@@ -5806,6 +5802,8 @@ pub const ApiHttpServer = struct {
                     self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
                         error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                         error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.TableGenerationChanged => return try textResponse(self.alloc, 409, "table mutation conflict; retry request"),
+                        error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
                         error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => {
                             const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
@@ -5827,6 +5825,8 @@ pub const ApiHttpServer = struct {
                 self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
                     error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.TableGenerationChanged => return try textResponse(self.alloc, 409, "table mutation conflict; retry request"),
+                    error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
                     error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.UnsupportedOperation => {
                         const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
@@ -5985,6 +5985,7 @@ pub const ApiHttpServer = struct {
                 }
                 self.source.dropTable(self.alloc, table_name) catch |err| switch (err) {
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
                     error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.NotLeader => return err,
@@ -6417,6 +6418,67 @@ pub const ApiHttpServer = struct {
         }
 
         return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn scanRetrievalKeys(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        filter_query_json: ?[]const u8,
+        exclusion_query_json: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) ![]const []const u8 {
+        const row_filter_json = try resolveEffectiveRowFilterJson(
+            alloc,
+            authenticated_identity,
+            table_name,
+        );
+        defer if (row_filter_json) |value| alloc.free(value);
+
+        var scan = (try source.scan(
+            alloc,
+            table_name,
+            "",
+            "",
+            .{ .limit = 0 },
+            .read_index,
+        )) orelse return error.TableNotFound;
+        defer scan.deinit(alloc);
+
+        var keys = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (keys.items) |key| alloc.free(key);
+            keys.deinit(alloc);
+        }
+
+        var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            const key = scanLineKey(alloc, line) catch return error.InvalidRetrievalAgentRequest;
+            errdefer alloc.free(key);
+
+            if (row_filter_json) |predicate| {
+                if (!(try self.docMatchesRowFilter(source, table_name, key, predicate))) {
+                    alloc.free(key);
+                    continue;
+                }
+            }
+            if (filter_query_json) |predicate| {
+                if (!(try self.docMatchesRowFilter(source, table_name, key, predicate))) {
+                    alloc.free(key);
+                    continue;
+                }
+            }
+            if (exclusion_query_json) |predicate| {
+                if (try self.docMatchesRowFilter(source, table_name, key, predicate)) {
+                    alloc.free(key);
+                    continue;
+                }
+            }
+            try keys.append(alloc, key);
+        }
+        return try keys.toOwnedSlice(alloc);
     }
 
     pub fn tableExists(self: *ApiHttpServer, table_name: []const u8) !bool {
@@ -8055,6 +8117,7 @@ pub const ApiHttpServer = struct {
             req,
             writer,
             queryEmbeddingSecurityScope(authenticated_identity),
+            authenticated_identity,
         );
     }
 
@@ -9141,6 +9204,7 @@ pub const ApiHttpServer = struct {
         self.source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
+            error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
@@ -9188,6 +9252,7 @@ pub const ApiHttpServer = struct {
         self.source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
+            error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             else => {
@@ -9246,6 +9311,7 @@ pub const ApiHttpServer = struct {
         self.source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
+            error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
@@ -9293,6 +9359,7 @@ pub const ApiHttpServer = struct {
         self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
+            error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
@@ -15786,7 +15853,7 @@ test "join auth rejects joined table without read permission" {
     try std.testing.expectError(error.InvalidQueryRequest, applyAuthenticatedIdentityToJoinRequest(alloc, identity, &join));
 }
 
-fn injectRowFilterIntoSearchRequest(
+pub fn injectRowFilterIntoSearchRequest(
     alloc: std.mem.Allocator,
     req: *db_mod.types.SearchRequest,
     row_filter_json: []const u8,
@@ -15802,6 +15869,24 @@ fn injectRowFilterIntoSearchRequest(
     );
     alloc.free(req.filter_query_json);
     req.filter_query_json = conjunction;
+}
+
+test "retrieval agent authenticated row filter conjoins generated filter" {
+    const alloc = std.testing.allocator;
+    var req = db_mod.types.SearchRequest{
+        .filter_query_json = try alloc.dupe(u8, "{\"term\":{\"status\":\"active\"}}"),
+    };
+    defer alloc.free(req.filter_query_json);
+
+    try injectRowFilterIntoSearchRequest(
+        alloc,
+        &req,
+        "{\"term\":{\"tenant\":\"visible\"}}",
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, req.filter_query_json, "\"conjuncts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.filter_query_json, "\"status\":\"active\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.filter_query_json, "\"tenant\":\"visible\"") != null);
 }
 
 fn injectRowFilterIntoOpenApiQueryRequest(
@@ -17867,7 +17952,11 @@ test "direct index deletion rejects extension-owned indexes" {
         }
 
         fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
-        fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+        fn replaceTableDefinition(
+            _: *@This(),
+            _: metadata_table_manager.TableRecord,
+            _: metadata_table_manager.TableRecord,
+        ) !void {
             return error.UnexpectedUpsert;
         }
         fn runRound(_: *@This()) !void {
@@ -17923,7 +18012,11 @@ test "direct index creation rejects extension-owned index names" {
         }
 
         fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
-        fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+        fn replaceTableDefinition(
+            _: *@This(),
+            _: metadata_table_manager.TableRecord,
+            _: metadata_table_manager.TableRecord,
+        ) !void {
             return error.UnexpectedUpsert;
         }
         fn runRound(_: *@This()) !void {
@@ -17981,7 +18074,11 @@ test "direct schema update rejects extension-owned data shapes" {
         }
 
         fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
-        fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+        fn replaceTableDefinition(
+            _: *@This(),
+            _: metadata_table_manager.TableRecord,
+            _: metadata_table_manager.TableRecord,
+        ) !void {
             return error.UnexpectedUpsert;
         }
         fn runRound(_: *@This()) !void {
