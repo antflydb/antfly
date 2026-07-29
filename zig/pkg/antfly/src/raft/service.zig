@@ -145,6 +145,19 @@ fn establishManagedHostTransitionAuthorityForTest(svc: *ManagedHostService, grou
     return error.SimulationProgressTimeout;
 }
 
+fn proposeManagedHostTransitionCommandsForTest(
+    svc: *ManagedHostService,
+    metadata_group_id: u64,
+    commands: []const metadata.TransitionCommand,
+) !void {
+    for (commands) |command| {
+        const encoded = try metadata.encodeTransitionCommand(std.testing.allocator, command);
+        defer std.testing.allocator.free(encoded);
+        try svc.host.host.propose(metadata_group_id, encoded);
+        _ = try svc.host.host.runRound(1, 1);
+    }
+}
+
 pub const ManagedHostService = struct {
     alloc: std.mem.Allocator,
     cfg: ManagedServiceConfig,
@@ -1505,12 +1518,7 @@ test "managed host service seeds queued transitions from projected metadata stor
                 .record = transition_record,
             } },
         };
-        for (seed_commands) |command| {
-            const encoded = try metadata.encodeTransitionCommand(std.testing.allocator, command);
-            defer std.testing.allocator.free(encoded);
-            try svc.host.host.propose(1300, encoded);
-            _ = try svc.host.host.runRound(1, 1);
-        }
+        try proposeManagedHostTransitionCommandsForTest(&svc, 1300, &seed_commands);
 
         const metadata_store = svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         const projected = try metadata_store.listSplitTransitions(std.testing.allocator, 1300);
@@ -1637,19 +1645,44 @@ test "managed host service resumes real split transition after restart" {
         try svc.host.host.campaignGroup(1300);
         _ = try svc.host.host.runRound(1, 1);
 
-        const cmd = try metadata.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_split_transition = .{
-                .transition_id = 1001,
-                .attempt_epoch = 1,
-                .source_group_id = 1701,
-                .destination_group_id = 1702,
-                .phase = .prepare,
-                .table_contract = test_transition_table_contract,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        try svc.host.host.propose(1300, cmd);
-        _ = try svc.host.host.runRound(1, 1);
+        const seed_commands = [_]metadata.TransitionCommand{
+            .{ .upsert_table = .{
+                .table_id = test_transition_table_contract.table_id,
+                .name = test_transition_table_contract.table_name,
+                .schema_json = test_transition_table_contract.schema_json,
+                .indexes_json = test_transition_table_contract.indexes_json,
+            } },
+            .{ .upsert_range = .{
+                .group_id = 1701,
+                .range_id = test_transition_table_contract.source_identity.range_id,
+                .table_id = test_transition_table_contract.table_id,
+                .start_key = "doc:a",
+                .end_key = "doc:z",
+                .doc_identity_shard_id = test_transition_table_contract.source_identity.shard_id,
+                .doc_identity_range_id = test_transition_table_contract.source_identity.range_id,
+                .split_attempt_epoch = 0,
+            } },
+            .{ .admit_split_transition = .{
+                .expected_source_epoch = 0,
+                .record = .{
+                    .transition_id = 1001,
+                    .attempt_epoch = 1,
+                    .source_group_id = 1701,
+                    .destination_group_id = 1702,
+                    .phase = .prepare,
+                    .split_key = "doc:m",
+                    .source_range_end = "doc:z",
+                    .table_contract = test_transition_table_contract,
+                },
+            } },
+        };
+        try proposeManagedHostTransitionCommandsForTest(&svc, 1300, &seed_commands);
+
+        const metadata_store = svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        const projected = try metadata_store.listSplitTransitions(std.testing.allocator, 1300);
+        defer metadata_store.freeSplitTransitions(std.testing.allocator, projected);
+        try std.testing.expectEqual(@as(usize, 1), projected.len);
+        try std.testing.expectEqual(@as(u64, 1001), projected[0].transition_id);
     }
 
     {
@@ -1796,18 +1829,46 @@ test "managed host service resumes real merge transition after restart" {
         try svc.host.host.campaignGroup(1300);
         _ = try svc.host.host.runRound(1, 1);
 
-        const cmd = try metadata.encodeTransitionCommand(std.testing.allocator, .{
-            .upsert_merge_transition = .{
+        const seed_commands = [_]metadata.TransitionCommand{
+            .{ .upsert_table = .{
+                .table_id = test_transition_table_contract.table_id,
+                .name = test_transition_table_contract.table_name,
+                .schema_json = test_transition_table_contract.schema_json,
+                .indexes_json = test_transition_table_contract.indexes_json,
+            } },
+            .{ .upsert_range = .{
+                .group_id = 1802,
+                .range_id = test_transition_table_contract.target_identity.range_id,
+                .table_id = test_transition_table_contract.table_id,
+                .start_key = "doc:a",
+                .end_key = "doc:m",
+                .doc_identity_shard_id = test_transition_table_contract.target_identity.shard_id,
+                .doc_identity_range_id = test_transition_table_contract.target_identity.range_id,
+            } },
+            .{ .upsert_range = .{
+                .group_id = 1801,
+                .range_id = test_transition_table_contract.source_identity.range_id,
+                .table_id = test_transition_table_contract.table_id,
+                .start_key = "doc:m",
+                .end_key = "doc:z",
+                .doc_identity_shard_id = test_transition_table_contract.source_identity.shard_id,
+                .doc_identity_range_id = test_transition_table_contract.source_identity.range_id,
+            } },
+            .{ .upsert_merge_transition = .{
                 .transition_id = 1002,
                 .donor_group_id = 1801,
                 .receiver_group_id = 1802,
                 .phase = .prepare,
                 .table_contract = test_transition_table_contract,
-            },
-        });
-        defer std.testing.allocator.free(cmd);
-        try svc.host.host.propose(1300, cmd);
-        _ = try svc.host.host.runRound(1, 1);
+            } },
+        };
+        try proposeManagedHostTransitionCommandsForTest(&svc, 1300, &seed_commands);
+
+        const metadata_store = svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        const projected = try metadata_store.listMergeTransitions(std.testing.allocator, 1300);
+        defer metadata_store.freeMergeTransitions(std.testing.allocator, projected);
+        try std.testing.expectEqual(@as(usize, 1), projected.len);
+        try std.testing.expectEqual(@as(u64, 1002), projected[0].transition_id);
     }
 
     {
