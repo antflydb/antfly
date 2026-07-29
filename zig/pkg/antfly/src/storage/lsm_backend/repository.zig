@@ -527,7 +527,13 @@ pub fn loadRunStateAllocWithStorage(storage: storage_io.Storage, allocator: Allo
             window.physicalLen(),
         );
         defer allocator.free(payload);
-        const bytes = try lsm_table_file.decodeBlockPayloadAlloc(allocator, window.compression, payload, window.len);
+        const bytes = try lsm_table_file.decodeBlockPayloadAlloc(
+            allocator,
+            window.compression,
+            payload,
+            window.len,
+            window.checksum,
+        );
         defer allocator.free(bytes);
 
         const end = block.first_entry_index + block.entry_count;

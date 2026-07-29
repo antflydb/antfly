@@ -3956,6 +3956,13 @@ components:
         - $inc
         - $addToSet
         - $max
+      x-enum-varnames:
+        - SET
+        - SET_ON_INSERT
+        - UNSET
+        - INC
+        - ADD_TO_SET
+        - MAX
       description: MongoDB-style update operator
     TransformOp:
       type: object

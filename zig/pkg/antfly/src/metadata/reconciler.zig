@@ -19,6 +19,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const table_manager = @import("table_manager.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
+const reallocation_request = @import("reallocation_request.zig");
 const transition_controller = @import("transition_controller.zig");
 const transition_state = @import("transition_state.zig");
 
@@ -55,7 +56,7 @@ pub const CurrentMetadataState = struct {
     stores: []const table_manager.StoreRecord = &.{},
     merged_group_statuses: []const MergedGroupStatus = &.{},
     restore_progresses: []const table_manager.RestoreProgressRecord = &.{},
-    reallocate_requested: bool = false,
+    reallocation_request: ?reallocation_request.ReallocationRequestRecord = null,
     schema_progresses: []const table_manager.SchemaProgressRecord = &.{},
     split_transitions: []const transition_state.SplitTransitionRecord = &.{},
     merge_transitions: []const transition_state.MergeTransitionRecord = &.{},
@@ -141,7 +142,7 @@ pub const ReconciliationPlan = struct {
     repair_placement_groups: usize = 0,
     rebalance_placement_groups: usize = 0,
     forced_reallocation: bool = false,
-    clear_reallocation_request: bool = false,
+    clear_reallocation_request: ?u128 = null,
 
     pub fn empty() ReconciliationPlan {
         return .{
@@ -161,7 +162,7 @@ pub const ReconciliationPlan = struct {
             .repair_placement_groups = 0,
             .rebalance_placement_groups = 0,
             .forced_reallocation = false,
-            .clear_reallocation_request = false,
+            .clear_reallocation_request = null,
         };
     }
 
@@ -270,7 +271,7 @@ pub const Reconciler = struct {
         // Serialize forced placement movement behind split/merge work. Health-
         // driven exclusion still flows through candidate.retain_current and
         // therefore remains able to repair failed or draining stores.
-        const force_placement_reallocation = current.reallocate_requested and
+        const force_placement_reallocation = current.reallocation_request != null and
             desired_splits.len == 0 and
             desired_merges.len == 0 and
             current.split_transitions.len == 0 and
@@ -713,8 +714,18 @@ pub const Reconciler = struct {
         plan.merge_steps = try merge_steps.toOwnedSlice(self.alloc);
         plan.repair_placement_groups = repair_placement_groups;
         plan.rebalance_placement_groups = rebalance_placement_groups;
-        plan.forced_reallocation = current.reallocate_requested;
-        plan.clear_reallocation_request = current.reallocate_requested;
+        plan.forced_reallocation = current.reallocation_request != null;
+        // Reallocation is a level-triggered replicated intent. Do not consume
+        // it unless this round was allowed to run forced placement planning
+        // with fully converged membership. Splits, merges, and unconverged
+        // groups defer the intent so a single unlucky reconcile round cannot
+        // permanently lose the operator's request.
+        if (force_placement_reallocation and
+            protected_placement_groups.len == 0 and
+            placement_candidate_info.len != 0)
+        {
+            plan.clear_reallocation_request = current.reallocation_request.?.request_id;
+        }
         return plan;
     }
 
@@ -760,7 +771,7 @@ pub const Reconciler = struct {
         now_monotonic_ms: u64,
         now_realtime_ms: u64,
     ) !AutomaticTransitions {
-        if ((self.config.disable_shard_alloc and !current.reallocate_requested) or self.config.max_shard_size_bytes == 0) {
+        if ((self.config.disable_shard_alloc and current.reallocation_request == null) or self.config.max_shard_size_bytes == 0) {
             return .{ .splits = &.{}, .merges = &.{} };
         }
 
@@ -4651,20 +4662,21 @@ test "metadata reconciler forced reallocation can place replicas on newly added 
 
     var unconverged_forced_plan = try reconciler.computePlan(&manager, &.{ 1, 2, 3, 4 }, &candidates, .{
         .placement_intents = &current,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer unconverged_forced_plan.deinit(std.testing.allocator);
     try std.testing.expect(findPlacementIntent(unconverged_forced_plan.placement_upserts, 2101, 4) == null);
     try std.testing.expect(findPlacementIntent(unconverged_forced_plan.placement_upserts, 2102, 4) == null);
+    try std.testing.expect(unconverged_forced_plan.clear_reallocation_request == null);
 
     var forced_plan = try reconciler.computePlan(&manager, &.{ 1, 2, 3, 4 }, &candidates, .{
         .placement_intents = &current,
         .stores = &stable_stores,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer forced_plan.deinit(std.testing.allocator);
     try std.testing.expect(forced_plan.forced_reallocation);
-    try std.testing.expect(forced_plan.clear_reallocation_request);
+    try std.testing.expectEqual(@as(?u128, 1), forced_plan.clear_reallocation_request);
     try std.testing.expect(
         findPlacementIntent(forced_plan.placement_upserts, 2101, 4) != null or
             findPlacementIntent(forced_plan.placement_upserts, 2102, 4) != null,
@@ -4708,12 +4720,12 @@ test "metadata reconciler serializes forced placement movement behind split prov
     var plan = try reconciler.computePlan(&manager, &.{ 1, 2, 3, 4 }, &candidates, .{
         .placement_intents = &current,
         .ranges = &ranges,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer plan.deinit(std.testing.allocator);
 
     try std.testing.expect(plan.forced_reallocation);
-    try std.testing.expect(plan.clear_reallocation_request);
+    try std.testing.expect(plan.clear_reallocation_request == null);
     try std.testing.expectEqual(@as(usize, 0), plan.placement_removals.len);
     try std.testing.expect(findPlacementIntent(plan.placement_upserts, 2101, 4) == null);
     var destination_placements: usize = 0;
@@ -4738,7 +4750,7 @@ test "metadata reconciler keeps in-flight group placement sticky across repeated
 
     var reconciler = Reconciler.init(std.testing.allocator);
     var initial_plan = try reconciler.computePlan(&manager, &.{ 101, 102, 103 }, &candidates, .{
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer initial_plan.deinit(std.testing.allocator);
 
@@ -4759,7 +4771,7 @@ test "metadata reconciler keeps in-flight group placement sticky across repeated
     var repeated_plan = try reconciler.computePlan(&manager, &.{ 101, 102, 103 }, &candidates, .{
         .placement_intents = &current,
         .merged_group_statuses = &merged_statuses,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer repeated_plan.deinit(std.testing.allocator);
 
@@ -4767,6 +4779,7 @@ test "metadata reconciler keeps in-flight group placement sticky across repeated
     try std.testing.expectEqual(initial.record.local_node_id, repeated_plan.placement_upserts[0].record.local_node_id);
     try std.testing.expectEqual(raft_reconciler.PlacementServingState.bootstrapping, repeated_plan.placement_upserts[0].serving_state);
     try std.testing.expectEqual(@as(usize, 0), repeated_plan.placement_removals.len);
+    try std.testing.expect(repeated_plan.clear_reallocation_request == null);
 }
 
 test "metadata reconciler keeps relocation source serving while target bootstraps" {
@@ -4814,7 +4827,7 @@ test "metadata reconciler keeps relocation source serving while target bootstrap
     var plan = try reconciler.computePlan(&manager, &.{2}, &candidates, .{
         .placement_intents = &current,
         .stores = &stores,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer plan.deinit(std.testing.allocator);
 
@@ -4866,7 +4879,7 @@ test "metadata reconciler converges overlapping relocation intents on one desire
     var plan = try reconciler.computePlan(&manager, &.{ 3, 4, 5 }, &candidates, .{
         .placement_intents = &current,
         .stores = &stores,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer plan.deinit(std.testing.allocator);
 
@@ -4885,7 +4898,7 @@ test "metadata reconciler converges overlapping relocation intents on one desire
     };
     var contract_plan = try reconciler.computePlan(&manager, &.{ 3, 4, 5 }, &candidates, .{
         .placement_intents = &contracted_current,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer contract_plan.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), contract_plan.placement_upserts.len);
@@ -4993,7 +5006,7 @@ test "metadata reconciler removes relocation source only after final voter retir
         .placement_intents = &current,
         .stores = &stores,
         .merged_group_statuses = &merged_statuses,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer plan.deinit(std.testing.allocator);
 
@@ -5097,7 +5110,7 @@ test "metadata reconciler does not gate empty relocation on storage overhead byt
     var plan = try reconciler.computePlan(&manager, &.{2}, &candidates, .{
         .placement_intents = &current,
         .stores = &stores,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer plan.deinit(std.testing.allocator);
 
@@ -5736,7 +5749,7 @@ test "metadata reconciler retains a compact shrink source until a survivor leads
         .placement_intents = &current,
         .stores = &stores,
         .merged_group_statuses = &merged_statuses,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer plan.deinit(std.testing.allocator);
 
@@ -5844,7 +5857,7 @@ test "metadata reconciler compact shrink enters retirement after stable expanded
     var plan = try reconciler.computePlan(&manager, &.{ 102, 103 }, &candidates, .{
         .placement_intents = &current,
         .stores = &stores,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer plan.deinit(std.testing.allocator);
 
@@ -5975,7 +5988,7 @@ test "metadata reconciler requires preserved peers to report stable membership b
     var plan = try reconciler.computePlan(&manager, &.{ 2, 3 }, &candidates, .{
         .placement_intents = &current,
         .stores = &stores,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer plan.deinit(std.testing.allocator);
 
@@ -6108,7 +6121,7 @@ test "metadata reconciler waits for every final voter despite unrelated relocati
     var plan = try reconciler.computePlan(&manager, &.{ 102, 103, 104 }, &candidates, .{
         .placement_intents = &current,
         .stores = &stores,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer plan.deinit(std.testing.allocator);
 
@@ -8381,23 +8394,26 @@ test "metadata reconciler respects disable shard alloc unless reallocation is re
         .ranges = ranges,
         .placement_intents = &placements,
         .stores = &stores,
-        .reallocate_requested = false,
+        .reallocation_request = null,
     });
     defer blocked_plan.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), blocked_plan.split_upserts.len);
-    try std.testing.expect(!blocked_plan.clear_reallocation_request);
+    try std.testing.expect(blocked_plan.clear_reallocation_request == null);
 
     var forced_plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
         .tables = tables,
         .ranges = ranges,
         .placement_intents = &placements,
         .stores = &stores,
-        .reallocate_requested = true,
+        .reallocation_request = .{ .request_id = 1, .requested_at_ms = 1 },
     });
     defer forced_plan.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), forced_plan.split_admissions.len);
     try std.testing.expect(forced_plan.forced_reallocation);
-    try std.testing.expect(forced_plan.clear_reallocation_request);
+    // The request admitted the split, but no placement candidates were
+    // available in this round. Keep it durable until a later round can run
+    // the complete forced-placement plan.
+    try std.testing.expect(forced_plan.clear_reallocation_request == null);
 }
 
 test "metadata reconciler places completed split groups into cooldown" {

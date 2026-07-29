@@ -20,11 +20,13 @@ const snapshot_payload_store = @import("snapshot_payload_store.zig");
 const file_snapshot_artifact = @import("file_snapshot_artifact.zig");
 
 const magic: u32 = 0x41524654; // ARFT
-const legacy_inline_snapshot_version: u32 = 2;
-const legacy_external_snapshot_version: u32 = 3;
-// Version 4 stores the Raft log compaction boundary separately from the
-// transferable state snapshot metadata.
-const version: u32 = 4;
+// Version 5 requires a checksum and stores the Raft log compaction boundary
+// separately from the transferable state snapshot metadata.
+const version: u32 = 5;
+const state_checksum_len = @sizeOf(u32);
+const max_state_bytes: usize = 16 << 20;
+const max_state_body_bytes = max_state_bytes - state_checksum_len;
+const max_conf_state_nodes: usize = 1024;
 var state_publish_nonce = std.atomic.Value(u64).init(1);
 
 const SnapshotIdentity = struct { index: u64, term: u64 };
@@ -119,6 +121,7 @@ pub const PersistentReplicaState = struct {
     }
 
     pub fn setConfState(self: *PersistentReplicaState, conf_state: raft_engine.core.ConfState) !void {
+        try validateConfState(conf_state);
         try self.store.setConfState(conf_state);
         try self.persist();
     }
@@ -150,6 +153,8 @@ pub const PersistentReplicaState = struct {
     fn persistReady(ptr: *anyopaque, group_id: u64, ready: raft_engine.core.Ready) !void {
         _ = group_id;
         const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
+        if (ready.snapshot) |snapshot| try validateConfState(snapshot.metadata.conf_state);
+        if (ready.conf_state) |conf_state| try validateConfState(conf_state);
         var previous_snapshot: ?SnapshotIdentity = null;
         if (ready.snapshot) |snapshot| {
             previous_snapshot = snapshotIdentity(self.store.snapshot_state.metadata);
@@ -167,6 +172,7 @@ pub const PersistentReplicaState = struct {
     fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot, compact_index: u64) !void {
         _ = group_id;
         const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
+        try validateConfState(snapshot.metadata.conf_state);
         const previous = snapshotIdentity(self.store.snapshot_state.metadata);
         try self.publishSnapshotPayload(snapshot);
         try self.store.compactToSnapshot(metadataOnlySnapshot(snapshot), compact_index);
@@ -183,6 +189,7 @@ pub const PersistentReplicaState = struct {
     ) !void {
         _ = group_id;
         const self: *PersistentReplicaState = @ptrCast(@alignCast(ptr));
+        try validateConfState(metadata.conf_state);
         const previous = snapshotIdentity(self.store.snapshot_state.metadata);
         try snapshot_payload_store.writeArtifactAtomically(
             self.alloc,
@@ -287,75 +294,64 @@ pub const PersistentReplicaState = struct {
     fn load(self: *PersistentReplicaState) !void {
         const path = try self.statePath();
         defer self.alloc.free(path);
-        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io(), path, self.alloc, .limited(16 << 20)) catch |err| switch (err) {
+        const raw = std.Io.Dir.cwd().readFileAlloc(self.io(), path, self.alloc, .limited(max_state_bytes)) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
-        defer self.alloc.free(bytes);
-        if (bytes.len == 0) return;
+        defer self.alloc.free(raw);
+        if (raw.len < @sizeOf(u32) * 3) return error.InvalidReplicaState;
+
+        const body = raw[0 .. raw.len - state_checksum_len];
+        const expected_checksum = std.mem.readInt(
+            u32,
+            raw[raw.len - state_checksum_len ..][0..state_checksum_len],
+            .little,
+        );
+        if (std.hash.Crc32.hash(body) != expected_checksum) return error.InvalidReplicaState;
 
         var cursor: usize = 0;
-        if (try readInt(u32, bytes, &cursor) != magic) return error.InvalidReplicaState;
-        const file_version = try readInt(u32, bytes, &cursor);
-        if (file_version < 1 or file_version > version) return error.UnsupportedReplicaStateVersion;
-        const requires_migration = file_version != version;
+        if (try readInt(u32, body, &cursor) != magic) return error.InvalidReplicaState;
+        if (try readInt(u32, body, &cursor) != version) return error.UnsupportedReplicaStateVersion;
 
         self.store.setHardState(.{
-            .current_term = try readInt(u64, bytes, &cursor),
-            .voted_for = if (try readBool(bytes, &cursor)) try readInt(u64, bytes, &cursor) else null,
-            .commit_index = try readInt(u64, bytes, &cursor),
+            .current_term = try readInt(u64, body, &cursor),
+            .voted_for = if (try readBool(body, &cursor)) try readInt(u64, body, &cursor) else null,
+            .commit_index = try readInt(u64, body, &cursor),
         });
-        self.applied_index = if (file_version >= legacy_inline_snapshot_version)
-            try readInt(u64, bytes, &cursor)
-        else
-            self.store.hard_state.commit_index;
+        self.applied_index = try readInt(u64, body, &cursor);
 
-        var conf_state = try decodeConfState(self.alloc, bytes, &cursor);
+        var conf_state = try decodeConfState(self.alloc, body, &cursor);
         defer conf_state.deinit(self.alloc);
         try self.store.setConfState(conf_state);
 
-        const has_snapshot = try readBool(bytes, &cursor);
+        const has_snapshot = try readBool(body, &cursor);
         if (has_snapshot) {
-            const snapshot = try decodeSnapshot(self.alloc, bytes, &cursor);
+            const snapshot = try decodeSnapshot(self.alloc, body, &cursor);
             defer {
                 var owned = snapshot;
                 owned.deinit(self.alloc);
             }
-            // Versions 1 and 2 embedded the transferable snapshot payload in
-            // state.bin. Publish the sidecar before replacing state.bin so a
-            // crash can only leave the old, self-contained format or the new,
-            // fully durable format.
-            if (file_version <= legacy_inline_snapshot_version and snapshot.metadata.index != 0) {
-                try self.publishSnapshotPayload(snapshot);
-            }
+            if (snapshot.data.len != 0) return error.InvalidReplicaState;
             try self.store.applySnapshot(metadataOnlySnapshot(snapshot));
         }
 
-        if (file_version > legacy_external_snapshot_version) {
-            const compacted_index = try readInt(u64, bytes, &cursor);
-            const compacted_term = try readInt(u64, bytes, &cursor);
-            try self.store.restoreCompactionBoundary(compacted_index, compacted_term);
-        }
+        const compacted_index = try readInt(u64, body, &cursor);
+        const compacted_term = try readInt(u64, body, &cursor);
+        try self.store.restoreCompactionBoundary(compacted_index, compacted_term);
 
-        const entry_count = try readInt(u32, bytes, &cursor);
+        const entry_count = try readInt(u32, body, &cursor);
+        const minimum_entry_bytes = @sizeOf(u64) * 2 + @sizeOf(u8) + @sizeOf(u32);
+        if (entry_count > (body.len - cursor) / minimum_entry_bytes)
+            return error.InvalidReplicaState;
         if (entry_count > 0) {
             const entries = try self.alloc.alloc(raft_engine.core.Entry, entry_count);
             defer {
                 raft_engine.core.types.freeEntries(self.alloc, entries);
             }
-            for (entries) |*entry| entry.* = try decodeEntry(self.alloc, bytes, &cursor);
+            for (entries) |*entry| entry.* = try decodeEntry(self.alloc, body, &cursor);
             try self.store.append(entries);
         }
-        if (cursor != bytes.len) return error.InvalidReplicaState;
-
-        // Versions through 3 used snapshot.index as the compaction boundary.
-        // applySnapshot above restores that invariant before appending the
-        // retained suffix. Rewrite once into v4 so subsequent opens use the
-        // explicit boundary and metadata-only snapshot representation.
-        if (requires_migration) {
-            try self.validateDurableSnapshotPayload();
-            try self.persist();
-        }
+        if (cursor != body.len) return error.InvalidReplicaState;
     }
 
     fn persist(self: *PersistentReplicaState) !void {
@@ -380,8 +376,14 @@ pub const PersistentReplicaState = struct {
         try appendInt(u64, self.alloc, buffer, self.store.compactedTerm());
 
         const entries = self.store.entries_state.items;
+        if (entries.len > std.math.maxInt(u32)) return error.ReplicaStateTooLarge;
         try appendInt(u32, self.alloc, buffer, @intCast(entries.len));
         for (entries) |entry| try encodeEntry(self.alloc, buffer, entry);
+        if (buffer.items.len > max_state_body_bytes)
+            return error.ReplicaStateTooLarge;
+        var checksum: [state_checksum_len]u8 = undefined;
+        std.mem.writeInt(u32, &checksum, std.hash.Crc32.hash(buffer.items), .little);
+        try buffer.appendSlice(self.alloc, &checksum);
 
         const path = try self.statePath();
         defer self.alloc.free(path);
@@ -414,22 +416,33 @@ pub const PersistentReplicaState = struct {
     }
 
     fn appendInt(comptime T: type, alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: T) !void {
+        try ensureStateBodyCapacity(out, @sizeOf(T));
         var bytes: [@sizeOf(T)]u8 = undefined;
         std.mem.writeInt(T, &bytes, value, .little);
         try out.appendSlice(alloc, &bytes);
     }
 
     fn appendBool(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: bool) !void {
+        try ensureStateBodyCapacity(out, 1);
         try out.append(alloc, @intFromBool(value));
     }
 
     fn appendBytes(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
-        try appendInt(u32, alloc, out, @intCast(bytes.len));
+        if (bytes.len > std.math.maxInt(u32)) return error.ReplicaStateTooLarge;
+        try ensureStateBodyCapacity(out, @sizeOf(u32) + bytes.len);
+        var len_bytes: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &len_bytes, @intCast(bytes.len), .little);
+        try out.appendSlice(alloc, &len_bytes);
         try out.appendSlice(alloc, bytes);
     }
 
+    fn ensureStateBodyCapacity(out: *const std.ArrayListUnmanaged(u8), additional: usize) !void {
+        if (additional > max_state_body_bytes -| out.items.len) return error.ReplicaStateTooLarge;
+    }
+
     fn readInt(comptime T: type, bytes: []const u8, cursor: *usize) !T {
-        if (cursor.* + @sizeOf(T) > bytes.len) return error.InvalidReplicaState;
+        if (cursor.* > bytes.len or @sizeOf(T) > bytes.len - cursor.*)
+            return error.InvalidReplicaState;
         var buf: [@sizeOf(T)]u8 = undefined;
         @memcpy(&buf, bytes[cursor.* .. cursor.* + @sizeOf(T)]);
         cursor.* += @sizeOf(T);
@@ -438,25 +451,35 @@ pub const PersistentReplicaState = struct {
 
     fn readBool(bytes: []const u8, cursor: *usize) !bool {
         if (cursor.* >= bytes.len) return error.InvalidReplicaState;
-        const value = bytes[cursor.*] != 0;
+        const raw = bytes[cursor.*];
         cursor.* += 1;
-        return value;
+        return switch (raw) {
+            0 => false,
+            1 => true,
+            else => error.InvalidReplicaState,
+        };
     }
 
     fn readBytes(alloc: std.mem.Allocator, bytes: []const u8, cursor: *usize) ![]u8 {
         const len = try readInt(u32, bytes, cursor);
-        if (cursor.* + len > bytes.len) return error.InvalidReplicaState;
+        if (cursor.* > bytes.len or len > bytes.len - cursor.*)
+            return error.InvalidReplicaState;
         defer cursor.* += len;
         return try alloc.dupe(u8, bytes[cursor.* .. cursor.* + len]);
     }
 
     fn encodeNodeList(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), nodes: []const u64) !void {
+        if (nodes.len > max_conf_state_nodes) return error.ReplicaStateTooLarge;
+        try ensureStateBodyCapacity(out, @sizeOf(u32) + nodes.len * @sizeOf(u64));
         try appendInt(u32, alloc, out, @intCast(nodes.len));
         for (nodes) |node_id| try appendInt(u64, alloc, out, node_id);
     }
 
     fn decodeNodeList(alloc: std.mem.Allocator, bytes: []const u8, cursor: *usize) ![]u64 {
         const len = try readInt(u32, bytes, cursor);
+        if (len > max_conf_state_nodes) return error.InvalidReplicaState;
+        if (cursor.* > bytes.len or len > (bytes.len - cursor.*) / @sizeOf(u64))
+            return error.InvalidReplicaState;
         const out = try alloc.alloc(u64, len);
         errdefer alloc.free(out);
         for (out) |*node_id| node_id.* = try readInt(u64, bytes, cursor);
@@ -464,6 +487,7 @@ pub const PersistentReplicaState = struct {
     }
 
     fn encodeConfState(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), conf_state: raft_engine.core.ConfState) !void {
+        try validateConfState(conf_state);
         try encodeNodeList(alloc, out, conf_state.voters);
         try encodeNodeList(alloc, out, conf_state.voters_outgoing);
         try encodeNodeList(alloc, out, conf_state.learners);
@@ -502,6 +526,7 @@ pub const PersistentReplicaState = struct {
     fn encodeEntry(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entry: raft_engine.core.Entry) !void {
         try appendInt(u64, alloc, out, entry.term);
         try appendInt(u64, alloc, out, entry.index);
+        try ensureStateBodyCapacity(out, 1);
         try out.append(alloc, @intFromEnum(entry.entry_type));
         try appendBytes(alloc, out, entry.data);
     }
@@ -524,97 +549,98 @@ pub const PersistentReplicaState = struct {
             .data = try readBytes(alloc, bytes, cursor),
         };
     }
+
+    fn validateConfState(conf_state: raft_engine.core.ConfState) !void {
+        if (conf_state.voters.len > max_conf_state_nodes or
+            conf_state.voters_outgoing.len > max_conf_state_nodes or
+            conf_state.learners.len > max_conf_state_nodes or
+            conf_state.learners_next.len > max_conf_state_nodes)
+        {
+            return error.ReplicaStateTooLarge;
+        }
+    }
 };
 
-fn encodeLegacyPersistentStateForTest(
-    alloc: std.mem.Allocator,
-    file_version: u32,
-    snapshot_data: []const u8,
-) ![]u8 {
-    std.debug.assert(file_version >= 1 and file_version <= legacy_external_snapshot_version);
-    var buffer = std.ArrayListUnmanaged(u8).empty;
-    errdefer buffer.deinit(alloc);
-
-    try PersistentReplicaState.appendInt(u32, alloc, &buffer, magic);
-    try PersistentReplicaState.appendInt(u32, alloc, &buffer, file_version);
-    try PersistentReplicaState.appendInt(u64, alloc, &buffer, 6);
-    try PersistentReplicaState.appendBool(alloc, &buffer, true);
-    try PersistentReplicaState.appendInt(u64, alloc, &buffer, 2);
-    try PersistentReplicaState.appendInt(u64, alloc, &buffer, 8);
-    if (file_version >= legacy_inline_snapshot_version)
-        try PersistentReplicaState.appendInt(u64, alloc, &buffer, 7);
-    try PersistentReplicaState.encodeConfState(alloc, &buffer, .{ .voters = @constCast((&[_]u64{ 1, 2 })[0..]) });
-    try PersistentReplicaState.appendBool(alloc, &buffer, true);
-    try PersistentReplicaState.encodeSnapshot(alloc, &buffer, .{
-        .metadata = .{
-            .index = 5,
-            .term = 4,
-            .conf_state = .{ .voters = @constCast((&[_]u64{ 1, 2 })[0..]) },
-        },
-        .data = @constCast(snapshot_data),
-    });
-    try PersistentReplicaState.appendInt(u32, alloc, &buffer, 3);
-    for ([_]u64{ 6, 7, 8 }) |entry_index| {
-        try PersistentReplicaState.encodeEntry(alloc, &buffer, .{
-            .term = 6,
-            .index = entry_index,
-            .data = @constCast("legacy-entry"),
-        });
-    }
-    return try buffer.toOwnedSlice(alloc);
-}
-
-test "persistent replica state migrates legacy checkpoints atomically" {
+test "persistent replica state rejects corrupt unchecked and structurally invalid files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/checksummed-state", .{tmp.sub_path});
+    defer alloc.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(alloc, root, 70, 3);
+    defer layout.deinit(alloc);
+    const state_path = try std.fmt.allocPrint(alloc, "{s}/state.bin", .{layout.log_dir});
+    defer alloc.free(state_path);
 
-    for ([_]u32{ 1, 2, 3 }) |file_version| {
-        const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/legacy-v{d}", .{ tmp.sub_path, file_version });
-        defer std.testing.allocator.free(root);
-        var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 70 + file_version, 3);
-        defer layout.deinit(std.testing.allocator);
-        try fs_paths.createDirPathPortable(std.testing.io, layout.log_dir);
-        try fs_paths.createDirPathPortable(std.testing.io, layout.snapshot_dir);
+    {
+        var state = try PersistentReplicaState.init(alloc, layout);
+        defer state.deinit();
+        const oversized_voters = try alloc.alloc(u64, max_conf_state_nodes + 1);
+        defer alloc.free(oversized_voters);
+        for (oversized_voters, 0..) |*node_id, i| node_id.* = @intCast(i + 1);
+        try std.testing.expectError(
+            error.ReplicaStateTooLarge,
+            state.setConfState(.{ .voters = oversized_voters }),
+        );
+        var unchanged = try state.storage().initialState(alloc);
+        defer unchanged.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), unchanged.conf_state.voters.len);
 
-        const inline_payload = if (file_version <= legacy_inline_snapshot_version) "legacy-snapshot" else "";
-        const encoded = try encodeLegacyPersistentStateForTest(std.testing.allocator, file_version, inline_payload);
-        defer std.testing.allocator.free(encoded);
-        if (file_version == legacy_external_snapshot_version) {
-            try snapshot_payload_store.writeAtomically(
-                std.testing.allocator,
-                std.testing.io,
-                layout.snapshot_dir,
-                5,
-                4,
-                "legacy-snapshot",
-            );
-        }
-        const state_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/state.bin", .{layout.log_dir});
-        defer std.testing.allocator.free(state_path);
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = encoded });
-
-        {
-            var state = try PersistentReplicaState.init(std.testing.allocator, layout);
-            defer state.deinit();
-            try std.testing.expectEqual(if (file_version == 1) @as(u64, 8) else 7, state.appliedIndex());
-            try std.testing.expectEqual(@as(u64, 6), try state.storage().firstIndex());
-            try std.testing.expectEqual(@as(u64, 8), try state.storage().lastIndex());
-            var snapshot = try state.storage().snapshot(std.testing.allocator);
-            defer snapshot.deinit(std.testing.allocator);
-            try std.testing.expectEqualStrings("legacy-snapshot", snapshot.data);
-
-            const migrated = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, std.testing.allocator, .limited(1 << 20));
-            defer std.testing.allocator.free(migrated);
-            try std.testing.expectEqual(version, std.mem.readInt(u32, migrated[4..8], .little));
-        }
-
-        var reopened = try PersistentReplicaState.init(std.testing.allocator, layout);
-        defer reopened.deinit();
-        try std.testing.expectEqual(@as(u64, 6), try reopened.storage().firstIndex());
-        var snapshot = try reopened.storage().snapshot(std.testing.allocator);
-        defer snapshot.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings("legacy-snapshot", snapshot.data);
+        try state.setConfState(.{ .voters = @constCast((&[_]u64{1})[0..]) });
     }
+
+    const valid = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        state_path,
+        alloc,
+        .limited(max_state_bytes),
+    );
+    defer alloc.free(valid);
+    try std.testing.expectEqual(version, std.mem.readInt(u32, valid[4..8], .little));
+
+    const corrupt = try alloc.dupe(u8, valid);
+    defer alloc.free(corrupt);
+    corrupt[8] ^= 0x40;
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = corrupt });
+    try std.testing.expectError(
+        error.InvalidReplicaState,
+        PersistentReplicaState.init(alloc, layout),
+    );
+
+    const unchecked = try alloc.dupe(u8, valid);
+    defer alloc.free(unchecked);
+    std.mem.writeInt(u32, unchecked[4..8], version - 1, .little);
+    std.mem.writeInt(
+        u32,
+        unchecked[unchecked.len - state_checksum_len ..][0..state_checksum_len],
+        std.hash.Crc32.hash(unchecked[0 .. unchecked.len - state_checksum_len]),
+        .little,
+    );
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = unchecked });
+    try std.testing.expectError(
+        error.UnsupportedReplicaStateVersion,
+        PersistentReplicaState.init(alloc, layout),
+    );
+
+    var invalid = std.ArrayListUnmanaged(u8).empty;
+    defer invalid.deinit(alloc);
+    try PersistentReplicaState.appendInt(u32, alloc, &invalid, magic);
+    try PersistentReplicaState.appendInt(u32, alloc, &invalid, version);
+    try PersistentReplicaState.appendInt(u64, alloc, &invalid, 0);
+    try PersistentReplicaState.appendBool(alloc, &invalid, false);
+    try PersistentReplicaState.appendInt(u64, alloc, &invalid, 0);
+    try PersistentReplicaState.appendInt(u64, alloc, &invalid, 0);
+    try PersistentReplicaState.encodeConfState(alloc, &invalid, .{});
+    try PersistentReplicaState.appendBool(alloc, &invalid, false);
+    try PersistentReplicaState.appendInt(u64, alloc, &invalid, 0);
+    try PersistentReplicaState.appendInt(u64, alloc, &invalid, 0);
+    try PersistentReplicaState.appendInt(u32, alloc, &invalid, std.math.maxInt(u32));
+    try PersistentReplicaState.appendInt(u32, alloc, &invalid, std.hash.Crc32.hash(invalid.items));
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = invalid.items });
+    try std.testing.expectError(
+        error.InvalidReplicaState,
+        PersistentReplicaState.init(alloc, layout),
+    );
 }
 
 test "persistent replica state persists ready updates across reopen" {

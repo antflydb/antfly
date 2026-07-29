@@ -379,7 +379,6 @@ fn parseSupportedGraphQueryParams(
 ) !graph_query_mod.QueryParams {
     if (params == null) return .{};
     const graph_params = params.?;
-    if (graph_params.node_filter != null) return error.UnsupportedQueryRequest;
     if (graph_params.algorithm != null or graph_params.algorithm_params != null) return error.UnsupportedQueryRequest;
     if (graph_params.min_weight != null or graph_params.max_weight != null) return error.UnsupportedQueryRequest;
     if (graph_params.deduplicate_nodes) |deduplicate| {
@@ -390,24 +389,33 @@ fn parseSupportedGraphQueryParams(
         else => return error.UnsupportedQueryRequest,
     };
 
+    const max_depth = if (graph_params.max_depth) |raw| blk: {
+        const value = std.math.cast(u32, raw) orelse return error.InvalidQueryRequest;
+        if (value < 1 or value > 64) return error.InvalidQueryRequest;
+        break :blk value;
+    } else 3;
+    const max_results = if (graph_params.max_results) |raw| blk: {
+        const value = std.math.cast(u32, raw) orelse return error.InvalidQueryRequest;
+        if (value < 1 or value > 10_000) return error.InvalidQueryRequest;
+        break :blk value;
+    } else 100;
+    const node_filter = try parsePatternNodeFilter(alloc, graph_params.node_filter);
+    errdefer freePatternNodeFilter(alloc, node_filter);
+    const edge_types = if (graph_params.edge_types) |values| try cloneFields(alloc, values) else &.{};
+
     return .{
-        .edge_types = if (graph_params.edge_types) |edge_types| try cloneFields(alloc, edge_types) else &.{},
+        .edge_types = edge_types,
         .direction = if (graph_params.direction) |direction| switch (direction) {
             .out => .out,
             .in => .in,
             .both => .both,
         } else .out,
-        .max_depth = if (graph_params.max_depth) |max_depth|
-            std.math.cast(u32, max_depth) orelse return error.InvalidQueryRequest
-        else
-            3,
-        .max_results = if (graph_params.max_results) |max_results|
-            std.math.cast(u32, max_results) orelse return error.InvalidQueryRequest
-        else
-            100,
+        .max_depth = max_depth,
+        .max_results = max_results,
         .deduplicate = true,
         .include_paths = graph_params.include_paths orelse false,
         .weight_mode = .min_hops,
+        .node_filter = node_filter,
     };
 }
 
@@ -537,6 +545,7 @@ fn freeNodeSelector(alloc: std.mem.Allocator, selector: graph_query_mod.NodeSele
 fn freeGraphQueryParams(alloc: std.mem.Allocator, params: graph_query_mod.QueryParams) void {
     for (params.edge_types) |edge_type| alloc.free(edge_type);
     if (params.edge_types.len > 0) alloc.free(params.edge_types);
+    freePatternNodeFilter(alloc, params.node_filter);
 }
 
 test "parse supported graph queries alloc clones edge types and keys" {
@@ -548,7 +557,11 @@ test "parse supported graph queries alloc clones edge types and keys" {
         \\      "type": "neighbors",
         \\      "index_name": "graph_idx",
         \\      "start_nodes": {"keys": ["doc-a"]},
-        \\      "params": {"edge_types": ["cites", "related"], "max_results": 7}
+        \\      "params": {
+        \\        "edge_types": ["cites", "related"],
+        \\        "max_results": 7,
+        \\        "node_filter": {"filter_query": {"term": "visible", "field": "tenant"}}
+        \\      }
         \\    }
         \\  }
         \\}
@@ -565,6 +578,23 @@ test "parse supported graph queries alloc clones edge types and keys" {
     try std.testing.expectEqualStrings("cites", items[0].query.params.edge_types[0]);
     try std.testing.expectEqualStrings("related", items[0].query.params.edge_types[1]);
     try std.testing.expectEqual(@as(u32, 7), items[0].query.params.max_results);
+    try std.testing.expect(items[0].query.params.node_filter.filter_query_json != null);
+    try std.testing.expectEqualStrings(
+        "{\"term\":{\"path\":\"tenant\",\"term\":\"visible\"}}",
+        items[0].query.params.node_filter.filter_query_json.?,
+    );
+}
+
+test "parse supported graph queries reject unbounded traversal limits" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"max_results":10001}}}}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseSupportedGraphQueriesAlloc(alloc, parsed.value),
+    );
 }
 
 test "parse supported graph queries rejects unsupported result refs" {
@@ -741,5 +771,8 @@ test "parse supported graph queries accepts pattern node filter queries" {
     try std.testing.expectEqual(@as(usize, 1), items.len);
     try std.testing.expectEqual(graph_query_mod.QueryType.pattern, items[0].query.query_type);
     try std.testing.expect(items[0].query.pattern[1].node_filter.filter_query_json != null);
-    try std.testing.expect(std.mem.indexOf(u8, items[0].query.pattern[1].node_filter.filter_query_json.?, "\"term\":{\"title\":\"beta\"}") != null);
+    try std.testing.expectEqualStrings(
+        "{\"term\":{\"path\":\"title\",\"term\":\"beta\"}}",
+        items[0].query.pattern[1].node_filter.filter_query_json.?,
+    );
 }

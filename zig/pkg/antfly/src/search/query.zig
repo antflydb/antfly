@@ -50,6 +50,7 @@ pub const FilterError = error{
     InvalidChunk,
     CorruptInput,
     InvalidSegment,
+    CrcMismatch,
 };
 
 const geo_filter_earth_radius_meters: f64 = 6371008.8;
@@ -154,7 +155,7 @@ pub const TermFilter = struct {
         }
 
         // Synonym expansion: check if field has a synonym section
-        if (seg.reader.getSection(self.field, .synonym)) |syn_data| {
+        if (try seg.reader.getSection(self.field, .synonym)) |syn_data| {
             var syn_reader = synonyms_mod.SynonymReader.init(alloc, syn_data) catch return result;
             defer syn_reader.deinit();
 
@@ -619,17 +620,16 @@ pub const TermRangeFilter = struct {
         const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
-        // Compute FST bounds: iterator uses [start, end) half-open interval
+        // Compute FST bounds: iterator uses [start, end) half-open interval.
+        // `max ++ "\x00"` is the first byte string after `max` itself and
+        // before every longer string with `max` as a prefix.
         const start = self.min;
-        // For inclusive_max, we need to include max itself. FST iterator uses [start, end),
-        // so append \xff to make end exclusive past max.
-        var end_buf: [1024]u8 = undefined;
+        var owned_end: ?[]u8 = null;
+        defer if (owned_end) |end| alloc.free(end);
         const end: ?[]const u8 = if (self.max) |m| blk: {
             if (self.inclusive_max) {
-                if (m.len + 1 > end_buf.len) break :blk null; // too long, unbounded
-                @memcpy(end_buf[0..m.len], m);
-                end_buf[m.len] = 0xff;
-                break :blk end_buf[0 .. m.len + 1];
+                owned_end = try inclusiveTermUpperBoundAlloc(alloc, m);
+                break :blk owned_end.?;
             } else {
                 break :blk m;
             }
@@ -661,6 +661,14 @@ pub const TermRangeFilter = struct {
         return result;
     }
 };
+
+fn inclusiveTermUpperBoundAlloc(alloc: Allocator, max: []const u8) FilterError![]u8 {
+    if (max.len == std.math.maxInt(usize)) return error.OutOfMemory;
+    const end = try alloc.alloc(u8, max.len + 1);
+    @memcpy(end[0..max.len], max);
+    end[max.len] = 0;
+    return end;
+}
 
 /// CIDR-based IP range filter. Matches docs with IP address terms in the given subnet.
 /// IPs must be indexed as dotted-quad strings (e.g. "192.168.1.1").
@@ -771,7 +779,7 @@ pub const GeoShapeFilter = struct {
         // the segment or decode its typed doc values.
         if (self.relation == .contains) return roaring.RoaringBitmap.init(alloc);
 
-        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
             return roaring.RoaringBitmap.init(alloc);
         var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
         if (reader.value_type != .geo_point) return roaring.RoaringBitmap.init(alloc);
@@ -804,7 +812,7 @@ pub const RangeFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: RangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
         const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
@@ -847,7 +855,7 @@ pub const GeoDistanceFilter = struct {
     radius_meters: f64,
 
     pub fn execute(self: GeoDistanceFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
         const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
@@ -912,7 +920,7 @@ pub const GeoBBoxFilter = struct {
     max_lon: f64,
 
     pub fn execute(self: GeoBBoxFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
         const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
@@ -1426,7 +1434,7 @@ pub const DateRangeFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: DateRangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
         const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
@@ -1508,7 +1516,7 @@ pub const DocIdFilter = struct {
 
         // Scan stored docs and match IDs
         for (0..seg.reader.doc_count) |doc_num| {
-            const stored = seg.reader.storedDoc(@intCast(doc_num)) orelse continue;
+            const stored = (try seg.reader.storedDoc(@intCast(doc_num))) orelse continue;
             for (self.doc_ids) |wanted| {
                 if (std.mem.eql(u8, stored.id, wanted)) {
                     try result.add(@intCast(doc_num));
@@ -1545,7 +1553,7 @@ pub const BoolFieldFilter = struct {
     value: bool,
 
     pub fn execute(self: BoolFieldFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = seg.reader.getSection(self.field, .typed_doc_values) orelse
+        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
             return roaring.RoaringBitmap.init(alloc);
 
         const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
@@ -2922,6 +2930,7 @@ test "term range filter inclusive max [b, d]" {
     try inv_builder.addDocument(0, &.{.{ .term = "banana", .freq = 1, .norm = 10 }});
     try inv_builder.addDocument(1, &.{.{ .term = "cherry", .freq = 1, .norm = 10 }});
     try inv_builder.addDocument(2, &.{.{ .term = "date", .freq = 1, .norm = 10 }});
+    try inv_builder.addDocument(3, &.{.{ .term = "date\x00suffix", .freq = 1, .norm = 10 }});
     const inv_data = try inv_builder.build();
     defer alloc.free(inv_data);
 
@@ -2929,7 +2938,7 @@ test "term range filter inclusive max [b, d]" {
     defer seg_writer.deinit();
     const field_idx = try seg_writer.addField("fruit");
     try seg_writer.addSection(field_idx, .inverted_text, inv_data);
-    for (0..3) |_| try seg_writer.addStoredDoc("d", "{}");
+    for (0..4) |_| try seg_writer.addStoredDoc("d", "{}");
     const seg_bytes = try seg_writer.build();
     defer alloc.free(seg_bytes);
 
@@ -2954,6 +2963,20 @@ test "term range filter inclusive max [b, d]" {
     try testing.expect(bm.contains(0)); // banana
     try testing.expect(bm.contains(1)); // cherry
     try testing.expect(bm.contains(2)); // date (inclusive)
+    try testing.expect(!bm.contains(3)); // lexicographically greater prefixed term
+}
+
+test "term range inclusive upper bound is exact and unbounded in length" {
+    const alloc = testing.allocator;
+    const max = try alloc.alloc(u8, 4096);
+    defer alloc.free(max);
+    @memset(max, 'x');
+
+    const end = try inclusiveTermUpperBoundAlloc(alloc, max);
+    defer alloc.free(end);
+    try testing.expectEqual(max.len + 1, end.len);
+    try testing.expectEqualSlices(u8, max, end[0..max.len]);
+    try testing.expectEqual(@as(u8, 0), end[max.len]);
 }
 
 test "term range filter unbounded lower" {

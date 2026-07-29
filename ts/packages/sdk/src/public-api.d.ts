@@ -10937,6 +10937,8 @@ export interface components {
         GraphResultNode: {
             /** @description Document key */
             key: string;
+            /** @description Owning table for a cross-table node; omitted for nodes in the queried table */
+            table?: string;
             /** @description Distance from start node */
             depth?: number;
             /**

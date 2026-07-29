@@ -604,19 +604,25 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         });
     }
 
-    const is_initialize = req.method == .POST and isJsonRpcMethod(server_ptr.alloc, req.body, "initialize");
-    if (!is_initialize) {
-        if (try validateMcpSession(server_ptr, req)) |err_resp| return err_resp;
-    }
-
     var transport = switch (req.method) {
-        .GET => try protocol_server.handleStreamableHttpGetWithSession(
+        .GET => protocol_server.handleStreamableHttpGetWithSession(
             server_ptr.alloc,
             endpoint_path,
             req.header(mcp.session_id_header),
             req.header(mcp.last_event_id_header),
-        ),
-        .POST => try protocol_server.handleStreamableHttpPost(server_ptr.alloc, req.body),
+        ) catch |err| switch (err) {
+            error.InvalidLastEventId => return try textResponse(server_ptr.alloc, 400, "invalid Last-Event-ID"),
+            error.McpEventIdExhausted => return try textResponse(server_ptr.alloc, 409, "MCP event sequence exhausted"),
+            else => return err,
+        },
+        .POST => protocol_server.handleStreamableHttpPostWithSession(
+            server_ptr.alloc,
+            req.body,
+            req.header(mcp.session_id_header),
+        ) catch |err| switch (err) {
+            error.McpSessionCapacityExceeded => return try textResponse(server_ptr.alloc, 429, "MCP session capacity exceeded"),
+            else => return err,
+        },
         .DELETE => try protocol_server.handleStreamableHttpDelete(server_ptr.alloc, req.header(mcp.session_id_header)),
         else => return try textResponse(server_ptr.alloc, 405, "method not allowed"),
     };
@@ -697,12 +703,6 @@ fn identityHasPermission(
         if (permission.type == .admin or permission.type == permission_type) return true;
     }
     return false;
-}
-
-fn validateMcpSession(server_ptr: anytype, req: http_common.HttpRequest) !?http_common.HttpResponse {
-    const session_id = req.header(mcp.session_id_header) orelse return try textResponse(server_ptr.alloc, 400, "missing MCP session");
-    if (!server_ptr.mcp_sessions.iface().exists(session_id)) return try textResponse(server_ptr.alloc, 404, "unknown MCP session");
-    return null;
 }
 
 fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const extension_domain.ExtensionMember, snapshot: anytype) !ExtensionMcpTool {
@@ -1470,6 +1470,7 @@ fn buildA2aDispatcher(
     };
 
     var dispatcher = a2a.Dispatcher{
+        .io = server_ptr.inferenceIo(),
         .name = "Antfly",
         .version = "1.0.0",
         .base_url = routes.Routes.a2a,

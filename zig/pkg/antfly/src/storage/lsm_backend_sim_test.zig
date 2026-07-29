@@ -714,9 +714,9 @@ test "lsm backend simulation full-text segment compaction drops stale and delete
     defer merged_reader.deinit();
 
     try std.testing.expectEqual(@as(u32, 3), merged_reader.doc_count);
-    try std.testing.expectEqualStrings("doc:b", (merged_reader.storedDoc(0) orelse return error.TestExpectedEqual).id);
-    try std.testing.expectEqualStrings("doc:a", (merged_reader.storedDoc(1) orelse return error.TestExpectedEqual).id);
-    try std.testing.expectEqualStrings("doc:c", (merged_reader.storedDoc(2) orelse return error.TestExpectedEqual).id);
+    try std.testing.expectEqualStrings("doc:b", ((try merged_reader.storedDoc(0)) orelse return error.TestExpectedEqual).id);
+    try std.testing.expectEqualStrings("doc:a", ((try merged_reader.storedDoc(1)) orelse return error.TestExpectedEqual).id);
+    try std.testing.expectEqualStrings("doc:c", ((try merged_reader.storedDoc(2)) orelse return error.TestExpectedEqual).id);
 
     try expectTermDocIds(&merged_reader, "stale", &.{});
     try expectTermDocIds(&merged_reader, "tombstone", &.{});

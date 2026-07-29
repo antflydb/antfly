@@ -750,6 +750,7 @@ const ContainerAtomicWriteSink = struct {
         .append_slice = appendSlice,
         .write_at = writeAt,
         .crc32_prefix = crc32Prefix,
+        .crc32_range = crc32Range,
         .finish = finish,
         .abort = abort,
     };
@@ -794,6 +795,12 @@ const ContainerAtomicWriteSink = struct {
         const self: *ContainerAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
         return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
+    }
+
+    fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        const self: *ContainerAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
+        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 
     fn finish(ptr: *anyopaque) !void {

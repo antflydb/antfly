@@ -4390,6 +4390,7 @@ const AsyncPointBlockRead = struct {
     physical_len: u32,
     logical_len: u32,
     compression: lsm_table_file.BlockCompression,
+    checksum: u32,
     status: Status,
     physical_handle: ?cache_mod.Handle = null,
     future: ?storage_io.RangeReadFuture = null,
@@ -4455,6 +4456,7 @@ fn prepareAsyncPointBlockRead(
             .physical_len = 0,
             .logical_len = 0,
             .compression = .none,
+            .checksum = 0,
             .status = .known_miss,
         };
     }
@@ -4475,6 +4477,7 @@ fn prepareAsyncPointBlockRead(
             .physical_len = physical_len,
             .logical_len = window.len,
             .compression = window.compression,
+            .checksum = window.checksum,
             .status = .ready_handle,
             .physical_handle = handle,
         };
@@ -4494,6 +4497,7 @@ fn prepareAsyncPointBlockRead(
         .physical_len = physical_len,
         .logical_len = window.len,
         .compression = window.compression,
+        .checksum = window.checksum,
         .status = .future,
         .future = future,
     };
@@ -4515,6 +4519,7 @@ fn payloadForAsyncPointRead(
     const elapsed_ns = backend.readStatsElapsedNs(start_ns);
     backend.recordPointRunAsyncWait(elapsed_ns);
     backend.recordTableBlockLoad(bytes.len, elapsed_ns);
+    try lsm_table_file.validateBlockPayload(bytes, read.checksum);
     read.physical_handle = try cache.putRunTablePhysicalBlock(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes);
     return read.physical_handle.?.runTablePhysicalBlock();
 }
@@ -4543,6 +4548,7 @@ fn consumeAsyncPointRead(
                 value_allocator,
                 read.compression,
                 payload,
+                read.checksum,
                 block.first_entry_index,
                 namespace.name,
                 key,
@@ -4567,7 +4573,13 @@ fn consumeAsyncPointRead(
             return .{ .hit = positioned.entry.value };
         },
         .none, .snappy => {
-            const decoded = try lsm_table_file.decodeBlockPayloadAlloc(value_allocator, read.compression, payload, read.logical_len);
+            const decoded = try lsm_table_file.decodeBlockPayloadAlloc(
+                value_allocator,
+                read.compression,
+                payload,
+                read.logical_len,
+                read.checksum,
+            );
             errdefer value_allocator.free(decoded);
             const positioned = try lsm_table_file.findExactEntryInBlock(
                 index,
@@ -4878,10 +4890,11 @@ fn loadRunTableDecodedBlockWithStats(
     physical_len: usize,
     compression: lsm_table_file.BlockCompression,
     logical_len: usize,
+    checksum: u32,
 ) ![]u8 {
     const payload = try loadRunTableBlockWithStats(backend, allocator, path, absolute_offset, physical_len);
     defer allocator.free(payload);
-    return try lsm_table_file.decodeBlockPayloadAlloc(allocator, compression, payload, logical_len);
+    return try lsm_table_file.decodeBlockPayloadAlloc(allocator, compression, payload, logical_len, checksum);
 }
 
 fn getFromRunWithBlockCache(
@@ -5015,7 +5028,15 @@ fn loadRunTableBlockHandle(
     window: lsm_table_file.EntryDataWindow,
 ) !cache_mod.Handle {
     const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-    return try loadRunTableBlockHandleAtOffset(backend, run, absolute_offset, window.physicalLen(), window.compression, window.len);
+    return try loadRunTableBlockHandleAtOffset(
+        backend,
+        run,
+        absolute_offset,
+        window.physicalLen(),
+        window.compression,
+        window.len,
+        window.checksum,
+    );
 }
 
 fn loadRunTableBlockHandleAtOffset(
@@ -5025,6 +5046,7 @@ fn loadRunTableBlockHandleAtOffset(
     physical_len: u32,
     compression: lsm_table_file.BlockCompression,
     logical_len: u32,
+    checksum: u32,
 ) !cache_mod.Handle {
     const cache = backend.options.cache orelse return error.RunStateUnavailable;
     const path = run.path orelse return error.RunStateUnavailable;
@@ -5041,7 +5063,16 @@ fn loadRunTableBlockHandleAtOffset(
             return retained;
         }
         backend.recordSharedBlockCacheMiss();
-        const block = try loadRunTableDecodedBlockWithStats(backend, cache.valueAllocator(), path, absolute_offset, physical_len, compression, logical_len);
+        const block = try loadRunTableDecodedBlockWithStats(
+            backend,
+            cache.valueAllocator(),
+            path,
+            absolute_offset,
+            physical_len,
+            compression,
+            logical_len,
+            checksum,
+        );
         return try cache.putRunTableBlock(path, run.id, generation, absolute_offset, physical_len, block);
     }
 }
@@ -5051,6 +5082,7 @@ fn loadRunTablePhysicalBlockHandleAtOffset(
     run: *Run,
     absolute_offset: u64,
     physical_len: u32,
+    checksum: u32,
 ) !cache_mod.Handle {
     const cache = backend.options.cache orelse return error.RunStateUnavailable;
     const path = run.path orelse return error.RunStateUnavailable;
@@ -5068,6 +5100,7 @@ fn loadRunTablePhysicalBlockHandleAtOffset(
         }
         backend.recordSharedBlockCacheMiss();
         const block = try loadRunTableBlockWithStats(backend, cache.valueAllocator(), path, absolute_offset, physical_len);
+        try lsm_table_file.validateBlockPayload(block, checksum);
         return try cache.putRunTablePhysicalBlock(path, run.id, generation, absolute_offset, physical_len, block);
     }
 }
@@ -5089,12 +5122,19 @@ fn findExactEntryInCachedCompressedPrefixBlock(
         .none, .snappy => return null,
     }
     const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-    var handle = try loadRunTablePhysicalBlockHandleAtOffset(backend, run, absolute_offset, window.physicalLen());
+    var handle = try loadRunTablePhysicalBlockHandleAtOffset(
+        backend,
+        run,
+        absolute_offset,
+        window.physicalLen(),
+        window.checksum,
+    );
     defer handle.release();
     const positioned = try lsm_table_file.findExactEntryInCompressedBlockPayloadAlloc(
         value_allocator,
         window.compression,
         handle.runTablePhysicalBlock(),
+        window.checksum,
         block.first_entry_index,
         namespace.name,
         key,
@@ -5353,7 +5393,15 @@ fn loadOwnedBlockForWindowAlloc(
     const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
     const physical_len = window.physicalLen();
     if (backend.options.cache != null) {
-        var block_handle = try loadRunTableBlockHandleAtOffset(backend, run, absolute_offset, physical_len, window.compression, window.len);
+        var block_handle = try loadRunTableBlockHandleAtOffset(
+            backend,
+            run,
+            absolute_offset,
+            physical_len,
+            window.compression,
+            window.len,
+            window.checksum,
+        );
         defer block_handle.release();
         return try allocator.dupe(u8, block_handle.runTableBlock());
     }
@@ -5372,7 +5420,16 @@ fn loadOwnedBlockForWindowAlloc(
         backend.recordLocalBlockCacheMiss();
     }
 
-    const bytes = try loadRunTableDecodedBlockWithStats(backend, allocator, path, absolute_offset, physical_len, window.compression, window.len);
+    const bytes = try loadRunTableDecodedBlockWithStats(
+        backend,
+        allocator,
+        path,
+        absolute_offset,
+        physical_len,
+        window.compression,
+        window.len,
+        window.checksum,
+    );
     errdefer allocator.free(bytes);
     {
         const locked = lockBackend(@TypeOf(backend.*), backend);
@@ -5398,7 +5455,15 @@ fn loadOwnedBlockForWindowAllocMaybeLocked(
     const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
     const physical_len = window.physicalLen();
     if (backend.options.cache != null) {
-        var block_handle = try loadRunTableBlockHandleAtOffset(backend, run, absolute_offset, physical_len, window.compression, window.len);
+        var block_handle = try loadRunTableBlockHandleAtOffset(
+            backend,
+            run,
+            absolute_offset,
+            physical_len,
+            window.compression,
+            window.len,
+            window.checksum,
+        );
         defer block_handle.release();
         return try allocator.dupe(u8, block_handle.runTableBlock());
     }
@@ -5413,7 +5478,16 @@ fn loadOwnedBlockForWindowAllocMaybeLocked(
         backend.recordLocalBlockCacheMiss();
     }
 
-    const bytes = try loadRunTableDecodedBlockWithStats(backend, allocator, path, absolute_offset, physical_len, window.compression, window.len);
+    const bytes = try loadRunTableDecodedBlockWithStats(
+        backend,
+        allocator,
+        path,
+        absolute_offset,
+        physical_len,
+        window.compression,
+        window.len,
+        window.checksum,
+    );
     errdefer allocator.free(bytes);
     if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend)) {
         _ = try backend.putCachedRunBlock(path, run.id, absolute_offset, physical_len, try backend.allocator.dupe(u8, bytes));
@@ -5468,6 +5542,7 @@ fn findExactEntryInCompressedPrefixBlock(
         backend.allocator,
         window.compression,
         payload,
+        window.checksum,
         block.first_entry_index,
         namespace.name,
         key,
@@ -6488,6 +6563,7 @@ test "lsm async point read cleanup preserves independently retained index pin" {
         .physical_len = 0,
         .logical_len = 0,
         .compression = .none,
+        .checksum = 0,
         .status = .known_miss,
     };
 

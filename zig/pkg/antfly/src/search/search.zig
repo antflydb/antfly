@@ -3308,7 +3308,7 @@ fn collectStatsBatched(
 ) !void {
     // Build a set of matching doc IDs per segment
     for (snap.segments, 0..) |*seg, seg_idx| {
-        const section_data = seg.reader.getSection(field, .typed_doc_values) orelse continue;
+        const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse continue;
         var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
 
         // Collect local doc IDs that belong to this segment
@@ -3388,7 +3388,7 @@ fn readF64ForDoc(
 ) !?f64 {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = seg.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     return switch (reader.value_type) {
         .f64_val => try reader.getF64(resolved.local_id),
@@ -3409,7 +3409,7 @@ fn readBytesForDoc(
 ) !?[]u8 {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = seg.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     if (reader.value_type != .bytes_val) return null;
 
@@ -3437,7 +3437,7 @@ fn readU64ForDoc(
 ) !?u64 {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = seg.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     if (reader.value_type != .u64_val) return null;
     return try reader.getU64(resolved.local_id);
@@ -3452,7 +3452,7 @@ fn readGeoPointForDoc(
 ) !?geo_mod.GeoPoint {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = seg.reader.getSection(field, .typed_doc_values) orelse return null;
+    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
     var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
     if (reader.value_type != .geo_point) return null;
     const gp = try reader.getGeoPoint(resolved.local_id) orelse return null;
@@ -4463,7 +4463,7 @@ test "resolveDocId across segments" {
     try std.testing.expect(snap.resolveDocId(3) == null);
 
     // storedDoc by global ID
-    const stored = snap.storedDoc(2).?;
+    const stored = (try snap.storedDoc(2)).?;
     try std.testing.expectEqualStrings("c", stored.id);
 }
 

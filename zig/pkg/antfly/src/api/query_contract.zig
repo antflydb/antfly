@@ -4609,6 +4609,7 @@ fn toOpenApiPatternMatches(
         for (match.bindings) |binding| {
             try bindings.map.put(alloc, binding.alias, .{
                 .key = binding.node.key,
+                .table = binding.node.table,
                 .depth = @intCast(binding.node.depth),
                 .distance = binding.node.distance,
                 .document = findGraphDocument(alloc, graph_result.hits, binding.node.key),
@@ -4635,6 +4636,7 @@ fn toOpenApiGraphNodes(
     for (graph_result.nodes, 0..) |node, i| {
         nodes[i] = .{
             .key = node.key,
+            .table = node.table,
             .depth = @intCast(node.depth),
             .distance = node.distance,
             .document = findGraphDocument(alloc, graph_result.hits, node.key),
@@ -7694,6 +7696,15 @@ fn parseGraphQuery(
         if (pattern.len > 0 or return_aliases.len > 0) return error.UnsupportedQueryRequest;
     }
 
+    const k: u32 = if (query.params) |graph_params|
+        if (graph_params.k) |raw| blk: {
+            const value = std.math.cast(u32, raw) orelse return error.InvalidQueryRequest;
+            if (value < 1 or value > 100) return error.InvalidQueryRequest;
+            break :blk value;
+        } else 1
+    else
+        1;
+
     return .{
         .query_type = switch (query.type) {
             .traverse => .traverse,
@@ -7706,13 +7717,7 @@ fn parseGraphQuery(
         .start_nodes = start_nodes,
         .params = params,
         .target_nodes = target_nodes,
-        .k = if (query.params) |graph_params|
-            if (graph_params.k) |k|
-                std.math.cast(u32, k) orelse return error.InvalidQueryRequest
-            else
-                1
-        else
-            1,
+        .k = k,
         .pattern = pattern,
         .return_aliases = return_aliases,
         .include_documents = query.include_documents orelse false,
@@ -7837,24 +7842,31 @@ fn parseGraphQueryParams(
 ) !graph_query_mod.QueryParams {
     if (params == null) return .{};
     const graph_params = params.?;
-    if (graph_params.node_filter != null) return error.UnsupportedQueryRequest;
     if (graph_params.algorithm != null or graph_params.algorithm_params != null) return error.UnsupportedQueryRequest;
 
+    const max_depth = if (graph_params.max_depth) |raw| blk: {
+        const value = std.math.cast(u32, raw) orelse return error.InvalidQueryRequest;
+        if (value < 1 or value > 64) return error.InvalidQueryRequest;
+        break :blk value;
+    } else 3;
+    const max_results = if (graph_params.max_results) |raw| blk: {
+        const value = std.math.cast(u32, raw) orelse return error.InvalidQueryRequest;
+        if (value < 1 or value > 10_000) return error.InvalidQueryRequest;
+        break :blk value;
+    } else 100;
+    const node_filter = try parsePatternNodeFilter(alloc, graph_params.node_filter);
+    errdefer freePatternNodeFilter(alloc, node_filter);
+    const edge_types = if (graph_params.edge_types) |values| try cloneFields(alloc, values) else &.{};
+
     return .{
-        .edge_types = if (graph_params.edge_types) |edge_types| try cloneFields(alloc, edge_types) else &.{},
+        .edge_types = edge_types,
         .direction = if (graph_params.direction) |direction| switch (direction) {
             .out => .out,
             .in => .in,
             .both => .both,
         } else .out,
-        .max_depth = if (graph_params.max_depth) |max_depth|
-            std.math.cast(u32, max_depth) orelse return error.InvalidQueryRequest
-        else
-            3,
-        .max_results = if (graph_params.max_results) |max_results|
-            std.math.cast(u32, max_results) orelse return error.InvalidQueryRequest
-        else
-            100,
+        .max_depth = max_depth,
+        .max_results = max_results,
         .min_weight = graph_params.min_weight orelse 0.0,
         .max_weight = graph_params.max_weight orelse 0.0,
         .deduplicate = graph_params.deduplicate_nodes orelse true,
@@ -7864,6 +7876,7 @@ fn parseGraphQueryParams(
             .min_weight => .min_weight,
             .max_weight => .max_weight,
         } else .min_hops,
+        .node_filter = node_filter,
     };
 }
 
@@ -9510,6 +9523,7 @@ fn freeGraphNodeSelector(alloc: std.mem.Allocator, selector: graph_query_mod.Nod
 fn freeGraphQueryParams(alloc: std.mem.Allocator, params: graph_query_mod.QueryParams) void {
     for (params.edge_types) |edge_type| alloc.free(edge_type);
     if (params.edge_types.len > 0) alloc.free(params.edge_types);
+    freePatternNodeFilter(alloc, params.node_filter);
 }
 
 fn freeTextQueryList(alloc: std.mem.Allocator, items: []const db_mod.types.TextQuery) void {

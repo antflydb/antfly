@@ -1420,49 +1420,120 @@ fn countRunEntries(runs: []const Run) usize {
     return total;
 }
 
-fn buildPlanForSourceRange(runs: []const Run, source_level: u32, source_start: usize, source_len: usize) ?CompactionPlan {
-    if (source_len == 0) return null;
-    var smallest_namespace_name = runs[source_start].smallest_namespace_name;
-    var smallest_key = runs[source_start].smallest_key;
-    var largest_namespace_name = runs[source_start].largest_namespace_name;
-    var largest_key = runs[source_start].largest_key;
+const CompactionBounds = struct {
+    smallest_namespace_name: ?[]const u8,
+    smallest_key: []const u8,
+    largest_namespace_name: ?[]const u8,
+    largest_key: []const u8,
 
-    for (runs[source_start + 1 .. source_start + source_len]) |run| {
-        if (compareRunBound(run.smallest_namespace_name, run.smallest_key, smallest_namespace_name, smallest_key) == .lt) {
-            smallest_namespace_name = run.smallest_namespace_name;
-            smallest_key = run.smallest_key;
+    fn include(self: *CompactionBounds, run: Run) void {
+        if (compareRunBound(
+            run.smallest_namespace_name,
+            run.smallest_key,
+            self.smallest_namespace_name,
+            self.smallest_key,
+        ) == .lt) {
+            self.smallest_namespace_name = run.smallest_namespace_name;
+            self.smallest_key = run.smallest_key;
         }
-        if (compareRunBound(run.largest_namespace_name, run.largest_key, largest_namespace_name, largest_key) == .gt) {
-            largest_namespace_name = run.largest_namespace_name;
-            largest_key = run.largest_key;
+        if (compareRunBound(
+            run.largest_namespace_name,
+            run.largest_key,
+            self.largest_namespace_name,
+            self.largest_key,
+        ) == .gt) {
+            self.largest_namespace_name = run.largest_namespace_name;
+            self.largest_key = run.largest_key;
         }
     }
 
-    const output_level = source_level + 1;
-    var target_start: ?usize = null;
-    var target_end: usize = 0;
-    for (runs, 0..) |run, i| {
-        if (run.level < output_level) continue;
-        if (run.level > output_level) break;
-        if (!rangesOverlap(
+    fn overlaps(self: CompactionBounds, run: Run) bool {
+        return rangesOverlap(
             run.smallest_namespace_name,
             run.smallest_key,
             run.largest_namespace_name,
             run.largest_key,
-            smallest_namespace_name,
-            smallest_key,
-            largest_namespace_name,
-            largest_key,
-        )) continue;
-        if (target_start == null) target_start = i;
-        target_end = i + 1;
+            self.smallest_namespace_name,
+            self.smallest_key,
+            self.largest_namespace_name,
+            self.largest_key,
+        );
+    }
+};
+
+fn buildPlanForSourceRange(runs: []const Run, source_level: u32, source_start: usize, initial_source_len: usize) ?CompactionPlan {
+    if (initial_source_len == 0 or source_start >= runs.len or initial_source_len > runs.len - source_start) return null;
+    if (runs[source_start].level != source_level) return null;
+
+    var source_end = source_start + initial_source_len;
+    for (runs[source_start..source_end]) |run| {
+        if (run.level != source_level) return null;
+    }
+
+    var bounds = CompactionBounds{
+        .smallest_namespace_name = runs[source_start].smallest_namespace_name,
+        .smallest_key = runs[source_start].smallest_key,
+        .largest_namespace_name = runs[source_start].largest_namespace_name,
+        .largest_key = runs[source_start].largest_key,
+    };
+    for (runs[source_start + 1 .. source_end]) |run| bounds.include(run);
+
+    const output_level = source_level + 1;
+    var target_start: ?usize = null;
+    var target_end: usize = 0;
+
+    // L0 has newest-first precedence. A middle-slice compaction must include
+    // every older L0 run that overlaps the eventual L1 output; otherwise that
+    // older run remains ahead of the compacted result and can reveal stale
+    // state. Target runs can expand that output range, so close both sets to a
+    // fixed point. The ranges are represented as contiguous windows because
+    // that is the plan/install contract; intervening runs are included too.
+    while (true) {
+        var changed = false;
+
+        var closure_target_start = target_start;
+        var closure_target_end = target_end;
+        for (runs, 0..) |run, i| {
+            if (run.level < output_level) continue;
+            if (run.level > output_level) break;
+            if (!bounds.overlaps(run)) continue;
+            if (closure_target_start == null or i < closure_target_start.?) closure_target_start = i;
+            closure_target_end = @max(closure_target_end, i + 1);
+        }
+        if (closure_target_start) |start| {
+            const old_start = target_start orelse start;
+            if (target_start == null or start < old_start or closure_target_end > target_end) {
+                for (runs[start..closure_target_end]) |run| {
+                    if (run.level != output_level) return null;
+                    bounds.include(run);
+                }
+                target_start = start;
+                target_end = closure_target_end;
+                changed = true;
+            }
+        }
+
+        if (source_level == 0) {
+            const l0_count = countLeadingL0Runs(runs);
+            var closure_source_end = source_end;
+            for (runs[source_end..l0_count], source_end..) |run, i| {
+                if (bounds.overlaps(run)) closure_source_end = i + 1;
+            }
+            if (closure_source_end > source_end) {
+                for (runs[source_end..closure_source_end]) |run| bounds.include(run);
+                source_end = closure_source_end;
+                changed = true;
+            }
+        }
+
+        if (!changed) break;
     }
 
     return .{
         .source_level = source_level,
         .source_start = source_start,
-        .source_len = source_len,
-        .target_start = target_start orelse source_start + source_len,
+        .source_len = source_end - source_start,
+        .target_start = target_start orelse source_end,
         .target_len = if (target_start == null) 0 else target_end - target_start.?,
         .output_level = output_level,
     };
@@ -1664,6 +1735,37 @@ test "lsm compaction drains a hard L0 backlog in one byte-bounded window" {
     const bounded = selectL0Compaction(runs.items, 4, 20 * 1024 * 1024, false) orelse return error.TestUnexpectedResult;
     try std.testing.expect(bounded.source_len <= 6);
     try std.testing.expect(bounded.source_len > 0);
+}
+
+test "lsm L0 compaction closes over older inputs and expanded target ranges" {
+    const runs = [_]Run{
+        // A newer, disjoint run may remain in L0.
+        testRun(6, 0, "doc:z", "doc:zz", 10),
+        // The initial hotspot is these two runs.
+        testRun(5, 0, "doc:a", "doc:b", 10),
+        testRun(4, 0, "doc:b", "doc:c", 10),
+        // This older run does not overlap the hotspot directly. The first L1
+        // target expands the output range to it, so it must join the source.
+        testRun(3, 0, "doc:e", "doc:g", 10),
+        testRun(1, 1, "doc:a", "doc:f", 10),
+        // The older L0 inclusion then expands into this target too.
+        testRun(2, 1, "doc:g", "doc:k", 10),
+    };
+
+    const plan = buildPlanForSourceRange(&runs, 0, 1, 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), plan.source_start);
+    try std.testing.expectEqual(@as(usize, 3), plan.source_len);
+    try std.testing.expectEqual(@as(usize, 4), plan.target_start);
+    try std.testing.expectEqual(@as(usize, 2), plan.target_len);
+
+    // Correctness closures are indivisible: a byte budget can defer the job,
+    // but it cannot compact the hotspot while leaving the stale older input.
+    try std.testing.expect(selectL0OverlapCompaction(&runs, 2, 49) == null);
+    const unbounded = selectL0OverlapCompaction(&runs, 2, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(plan.source_start, unbounded.source_start);
+    try std.testing.expectEqual(plan.source_len, unbounded.source_len);
+    try std.testing.expectEqual(plan.target_start, unbounded.target_start);
+    try std.testing.expectEqual(plan.target_len, unbounded.target_len);
 }
 
 test "lsm compaction plan selection chooses highest scored debt" {
@@ -2038,7 +2140,13 @@ const PersistedRunCursor = struct {
             window.physicalLen(),
         );
         defer self.allocator.free(payload);
-        self.loaded_bytes = try lsm_table_file.decodeBlockPayloadAlloc(self.allocator, window.compression, payload, window.len);
+        self.loaded_bytes = try lsm_table_file.decodeBlockPayloadAlloc(
+            self.allocator,
+            window.compression,
+            payload,
+            window.len,
+            window.checksum,
+        );
         self.loaded_window = window;
     }
 };

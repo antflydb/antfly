@@ -1771,6 +1771,7 @@ pub const ApiHttpServer = struct {
         owner_ids: RuntimeOwnerIds,
     ) ApiHttpServer {
         const effective_query_embedding_cache = effectiveQueryEmbeddingCacheConfig(cfg);
+        const api_io = queryEmbeddingCacheIo(cfg);
         return .{
             .alloc = request_alloc,
             .owner_alloc = owner_alloc,
@@ -1815,9 +1816,13 @@ pub const ApiHttpServer = struct {
             .connections_cache = connections_api.Cache.init(owner_alloc),
             .local_resource_manager = resource_manager_mod.ResourceManager.init(.{}),
             .shared_resource_manager = cfg.resource_manager,
-            .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, queryEmbeddingCacheIo(cfg), effective_query_embedding_cache),
-            .mcp_sessions = mcp.InMemorySessionStore.init(owner_alloc),
-            .a2a_tasks = a2a.InMemoryTaskStore.init(owner_alloc),
+            .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, api_io, effective_query_embedding_cache),
+            .mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
+                .now_ns_fn = protocolStoreNowNs,
+            }),
+            .a2a_tasks = a2a.InMemoryTaskStore.initWithOptions(owner_alloc, api_io, .{
+                .now_ns_fn = protocolStoreNowNs,
+            }),
         };
     }
 
@@ -1837,6 +1842,10 @@ pub const ApiHttpServer = struct {
             if (runtime.apiIoImpl()) |io_impl| return io_impl.io();
         }
         return std.Io.Threaded.global_single_threaded.io();
+    }
+
+    fn protocolStoreNowNs() u64 {
+        return platform_time.monotonicNs();
     }
 
     pub fn inferenceIo(self: *const ApiHttpServer) std.Io {

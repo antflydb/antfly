@@ -22,6 +22,7 @@ const metadata_api = @import("api.zig");
 const raft_engine = @import("raft_engine");
 const metadata_control_loop = @import("control_loop.zig");
 const metadata_reconcile_lease = @import("reconcile_lease.zig");
+const metadata_reallocation_request = @import("reallocation_request.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_replication_backfill = @import("replication_backfill.zig");
 const metadata_state = @import("state.zig");
@@ -2123,13 +2124,18 @@ pub const MetadataService = struct {
     }
 
     pub fn requestReallocation(self: *MetadataService, requested_at_ms: u64) !void {
+        const runtime = try self.ensureBackendRuntime();
+        const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse std.Options.debug_io);
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
+            .request_id = request_id,
             .requested_at_ms = requested_at_ms,
         } });
     }
 
-    pub fn clearReallocationRequest(self: *MetadataService) !void {
-        try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{} });
+    pub fn clearReallocationRequest(self: *MetadataService, expected_request_id: u128) !void {
+        try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{
+            .expected_request_id = expected_request_id,
+        } });
     }
 
     pub fn upsertExtensionPackage(self: *MetadataService, record: extension_domain.PackageManifest) !void {
@@ -2276,7 +2282,7 @@ pub const MetadataService = struct {
         for (plan.range_removals) |group_id| try self.removeRange(group_id);
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
         for (plan.merge_removals) |transition_id| try self.removeMergeTransition(transition_id);
-        if (plan.clear_reallocation_request) try self.clearReallocationRequest();
+        if (plan.clear_reallocation_request) |expected| try self.clearReallocationRequest(expected);
     }
 
     pub fn observeSplitTransition(self: *MetadataService, transition_id: u64) !?transition_state.SplitObservation {
@@ -3827,13 +3833,18 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn requestReallocation(self: *MetadataHttpService, requested_at_ms: u64) !void {
+        const runtime = try self.ensureBackendRuntime();
+        const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse std.Options.debug_io);
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
+            .request_id = request_id,
             .requested_at_ms = requested_at_ms,
         } });
     }
 
-    pub fn clearReallocationRequest(self: *MetadataHttpService) !void {
-        try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{} });
+    pub fn clearReallocationRequest(self: *MetadataHttpService, expected_request_id: u128) !void {
+        try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{
+            .expected_request_id = expected_request_id,
+        } });
     }
 
     pub fn upsertExtensionPackage(self: *MetadataHttpService, record: extension_domain.PackageManifest) !void {
@@ -4120,7 +4131,7 @@ pub const MetadataHttpService = struct {
         for (plan.range_removals) |group_id| try self.removeRange(group_id);
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
         for (plan.merge_removals) |transition_id| try self.removeMergeTransition(transition_id);
-        if (plan.clear_reallocation_request) try self.clearReallocationRequest();
+        if (plan.clear_reallocation_request) |expected| try self.clearReallocationRequest(expected);
     }
 
     pub fn observeSplitTransition(self: *MetadataHttpService, transition_id: u64) !?transition_state.SplitObservation {
@@ -9644,11 +9655,23 @@ test "metadata service persists and clears reallocation requests" {
     try svc.runRound();
     const requested = try svc.getProjectedReallocationRequest();
     try std.testing.expect(requested != null);
+    try std.testing.expect(requested.?.request_id != 0);
     try std.testing.expectEqual(@as(u64, 77_000), requested.?.requested_at_ms);
 
-    var plan = metadata_reconciler.ReconciliationPlan.empty();
-    plan.clear_reallocation_request = true;
-    try svc.applyReconciliationPlan(&plan);
+    var stale_plan = metadata_reconciler.ReconciliationPlan.empty();
+    stale_plan.clear_reallocation_request = requested.?.request_id;
+    try svc.requestReallocation(88_000);
+    try svc.runRound();
+    try svc.applyReconciliationPlan(&stale_plan);
+    try svc.runRound();
+    const replacement = try svc.getProjectedReallocationRequest();
+    try std.testing.expect(replacement != null);
+    try std.testing.expect(replacement.?.request_id != requested.?.request_id);
+    try std.testing.expectEqual(@as(u64, 88_000), replacement.?.requested_at_ms);
+
+    var current_plan = metadata_reconciler.ReconciliationPlan.empty();
+    current_plan.clear_reallocation_request = replacement.?.request_id;
+    try svc.applyReconciliationPlan(&current_plan);
     try svc.runRound();
     try std.testing.expect((try svc.getProjectedReallocationRequest()) == null);
 }

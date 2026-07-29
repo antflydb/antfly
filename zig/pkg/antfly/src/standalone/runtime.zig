@@ -401,25 +401,28 @@ const LocalStandaloneMetadata = struct {
         catalog_store: ?*antfly.storage_backend_erased.Store,
         storage_engine: antfly.common.config.StorageEngine,
     ) !LocalStandaloneMetadata {
-        const owned_api_url = try alloc.dupe(u8, api_url);
-        errdefer alloc.free(owned_api_url);
-        const owned_replica_root_dir = try alloc.dupe(u8, replica_root_dir);
-        errdefer alloc.free(owned_replica_root_dir);
-        const owned_catalog_path = try alloc.dupe(u8, catalog_path);
-        errdefer alloc.free(owned_catalog_path);
+        var owned_api_url: ?[]u8 = try alloc.dupe(u8, api_url);
+        errdefer if (owned_api_url) |value| alloc.free(value);
+        var owned_replica_root_dir: ?[]u8 = try alloc.dupe(u8, replica_root_dir);
+        errdefer if (owned_replica_root_dir) |value| alloc.free(value);
+        var owned_catalog_path: ?[]u8 = try alloc.dupe(u8, catalog_path);
+        errdefer if (owned_catalog_path) |value| alloc.free(value);
         var self = LocalStandaloneMetadata{
             .alloc = alloc,
             .manager = antfly.metadata.TableManager.init(alloc),
             .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
             .local_node_id = local_node_id,
             .store_id = store_id,
-            .api_url = owned_api_url,
-            .replica_root_dir = owned_replica_root_dir,
-            .catalog_path = owned_catalog_path,
+            .api_url = owned_api_url.?,
+            .replica_root_dir = owned_replica_root_dir.?,
+            .catalog_path = owned_catalog_path.?,
             .catalog_store = catalog_store,
             .backend_runtime = backend_runtime,
             .storage_engine = storage_engine,
         };
+        owned_api_url = null;
+        owned_replica_root_dir = null;
+        owned_catalog_path = null;
         errdefer self.deinit();
         try self.loadPersistedCatalog();
         return self;
@@ -2833,12 +2836,15 @@ fn writeFileAtomically(alloc: std.mem.Allocator, path: []const u8, contents: []c
         var writer = file.writer(io, &buf);
         try writer.interface.writeAll(contents);
         try writer.end();
+        try file.sync(io);
     }
 
     std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io) catch |err| {
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
         return err;
     };
+    const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
+    try fs_paths.syncDirPortable(io, parent);
 }
 
 fn registerInternalGroupRoutes(server: anytype) !void {
@@ -5441,6 +5447,34 @@ test "standalone metadata rolls back an undurable catalog mutation" {
     }
     try std.testing.expectEqual(@as(u64, 1), metadata.epoch);
     try std.testing.expect(metadata.findTableByNameLocked("docs") == null);
+}
+
+test "standalone metadata rejects corrupt catalog without double-freeing owned paths" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/corrupt-catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+    try writeFileAtomically(alloc, catalog_path, "{not-json");
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    const result = LocalStandaloneMetadata.init(
+        alloc,
+        1,
+        1,
+        "http://127.0.0.1:8080",
+        ".",
+        catalog_path,
+        backend_runtime.ptr(),
+        null,
+        .local,
+    );
+    if (result) |value| {
+        var metadata = value;
+        defer metadata.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }
 
 test "standalone metadata finalizes schema migration from resident runtime evidence" {

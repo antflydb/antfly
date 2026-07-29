@@ -799,6 +799,7 @@ pub const DBCore = struct {
         }
         return apply_state.loadAppliedSequenceWithCheckpoint(
             alloc,
+            self.index_manager.checkpointIo(),
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
@@ -814,6 +815,7 @@ pub const DBCore = struct {
         }
         return apply_state.loadProjectionCheckpointWithSidecar(
             alloc,
+            self.index_manager.checkpointIo(),
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
@@ -855,6 +857,7 @@ pub const DBCore = struct {
         }
         try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
             self.alloc,
+            self.index_manager.checkpointIo(),
             self.store,
             self.applied_sequence_checkpoint_path,
             .{
@@ -881,6 +884,7 @@ pub const DBCore = struct {
         }
         try apply_state.saveProjectionCheckpointWithSidecar(
             self.alloc,
+            self.index_manager.checkpointIo(),
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,

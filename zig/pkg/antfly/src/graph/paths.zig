@@ -103,6 +103,73 @@ const OwnedEdgeInfo = struct {
     metadata: []const u8 = "",
 };
 
+const EdgeIdentity = struct {
+    source: []const u8,
+    target: []const u8,
+    edge_type: []const u8,
+};
+
+const EdgeIdentityContext = struct {
+    pub fn hash(_: @This(), key: EdgeIdentity) u64 {
+        var hasher = std.hash.Wyhash.init(0x4146_4752_4150_4845);
+        hashIdentityPart(&hasher, key.source);
+        hashIdentityPart(&hasher, key.target);
+        hashIdentityPart(&hasher, key.edge_type);
+        return hasher.final();
+    }
+
+    pub fn eql(_: @This(), a: EdgeIdentity, b: EdgeIdentity) bool {
+        return std.mem.eql(u8, a.source, b.source) and
+            std.mem.eql(u8, a.target, b.target) and
+            std.mem.eql(u8, a.edge_type, b.edge_type);
+    }
+
+    fn hashIdentityPart(hasher: *std.hash.Wyhash, value: []const u8) void {
+        const len: u64 = @intCast(value.len);
+        hasher.update(std.mem.asBytes(&len));
+        hasher.update(value);
+    }
+};
+
+const ExcludedEdgeSet = std.HashMapUnmanaged(EdgeIdentity, void, EdgeIdentityContext, 80);
+
+fn putExcludedEdge(
+    set: *ExcludedEdgeSet,
+    alloc: Allocator,
+    source: []const u8,
+    target: []const u8,
+    edge_type: []const u8,
+) !void {
+    const borrowed: EdgeIdentity = .{
+        .source = source,
+        .target = target,
+        .edge_type = edge_type,
+    };
+    if (set.contains(borrowed)) return;
+
+    const owned_source = try alloc.dupe(u8, source);
+    errdefer alloc.free(owned_source);
+    const owned_target = try alloc.dupe(u8, target);
+    errdefer alloc.free(owned_target);
+    const owned_edge_type = try alloc.dupe(u8, edge_type);
+    errdefer alloc.free(owned_edge_type);
+    try set.putNoClobber(alloc, .{
+        .source = owned_source,
+        .target = owned_target,
+        .edge_type = owned_edge_type,
+    }, {});
+}
+
+fn deinitExcludedEdges(set: *ExcludedEdgeSet, alloc: Allocator) void {
+    var it = set.keyIterator();
+    while (it.next()) |key| {
+        alloc.free(key.source);
+        alloc.free(key.target);
+        alloc.free(key.edge_type);
+    }
+    set.deinit(alloc);
+}
+
 fn pathNodeLessThan(_: void, a: *PathNode, b: *PathNode) std.math.Order {
     if (a.distance < b.distance) return .lt;
     if (a.distance > b.distance) return .gt;
@@ -133,7 +200,7 @@ pub fn findShortestPathWithExclusions(
     target: []const u8,
     opts: PathFindOptions,
     excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
-    excluded_edges: ?*const std.StringHashMapUnmanaged(void),
+    excluded_edges: ?*const ExcludedEdgeSet,
 ) !?Path {
     if (opts.node_admission) |admission| {
         if (!try traversal_mod.startNodeAdmitted(alloc, graph_index, source, opts.direction, admission)) {
@@ -172,7 +239,7 @@ fn bfsShortestPath(
     target: []const u8,
     opts: PathFindOptions,
     excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
-    excluded_edges: ?*const std.StringHashMapUnmanaged(void),
+    excluded_edges: ?*const ExcludedEdgeSet,
 ) !?Path {
     // Arena for PathNodes — freed at end
     var node_pool = std.ArrayListUnmanaged(*PathNode).empty;
@@ -238,9 +305,11 @@ fn bfsShortestPath(
                 const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
                 if (excluded_nodes) |en| if (en.contains(next_key)) continue;
                 if (excluded_edges) |ee| {
-                    var edge_key_buf: [2048]u8 = undefined;
-                    const ek = makeEdgeExclusionKey(&edge_key_buf, edge.source, edge.target, edge.edge_type);
-                    if (ee.contains(ek)) continue;
+                    if (ee.contains(.{
+                        .source = edge.source,
+                        .target = edge.target,
+                        .edge_type = edge.edge_type,
+                    })) continue;
                 }
                 if (visited.contains(next_key)) continue;
                 const target_table = if (std.mem.eql(u8, next_key, edge.target))
@@ -273,9 +342,11 @@ fn bfsShortestPath(
                 if (!shouldTraverseEdge(opts, &edge)) continue;
                 if (excluded_nodes) |en| if (en.contains(next_key)) continue;
                 if (excluded_edges) |ee| {
-                    var edge_key_buf: [2048]u8 = undefined;
-                    const ek = makeEdgeExclusionKey(&edge_key_buf, edge.source, edge.target, edge.edge_type);
-                    if (ee.contains(ek)) continue;
+                    if (ee.contains(.{
+                        .source = edge.source,
+                        .target = edge.target,
+                        .edge_type = edge.edge_type,
+                    })) continue;
                 }
             }
             if (visited.contains(next_key)) continue;
@@ -320,7 +391,7 @@ fn dijkstraPath(
     target: []const u8,
     opts: PathFindOptions,
     excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
-    excluded_edges: ?*const std.StringHashMapUnmanaged(void),
+    excluded_edges: ?*const ExcludedEdgeSet,
 ) !?Path {
     var node_pool = std.ArrayListUnmanaged(*PathNode).empty;
     defer {
@@ -392,9 +463,11 @@ fn dijkstraPath(
                 const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
                 if (excluded_nodes) |en| if (en.contains(next_key)) continue;
                 if (excluded_edges) |ee| {
-                    var edge_key_buf: [2048]u8 = undefined;
-                    const ek = makeEdgeExclusionKey(&edge_key_buf, edge.source, edge.target, edge.edge_type);
-                    if (ee.contains(ek)) continue;
+                    if (ee.contains(.{
+                        .source = edge.source,
+                        .target = edge.target,
+                        .edge_type = edge.edge_type,
+                    })) continue;
                 }
                 const target_table = if (std.mem.eql(u8, next_key, edge.target))
                     traversal_mod.metadataTargetTable(edge.metadata)
@@ -426,9 +499,11 @@ fn dijkstraPath(
                 if (!shouldTraverseEdge(opts, &edge)) continue;
                 if (excluded_nodes) |en| if (en.contains(next_key)) continue;
                 if (excluded_edges) |ee| {
-                    var edge_key_buf: [2048]u8 = undefined;
-                    const ek = makeEdgeExclusionKey(&edge_key_buf, edge.source, edge.target, edge.edge_type);
-                    if (ee.contains(ek)) continue;
+                    if (ee.contains(.{
+                        .source = edge.source,
+                        .target = edge.target,
+                        .edge_type = edge.edge_type,
+                    })) continue;
                 }
             }
 
@@ -533,12 +608,8 @@ pub fn findKShortestPaths(
             const spur_node = prev_path.nodes[spur_idx];
 
             // Build exclusion sets
-            var excluded_edges = std.StringHashMapUnmanaged(void).empty;
-            defer {
-                var eit = excluded_edges.keyIterator();
-                while (eit.next()) |ek| alloc.free(ek.*);
-                excluded_edges.deinit(alloc);
-            }
+            var excluded_edges = ExcludedEdgeSet.empty;
+            defer deinitExcludedEdges(&excluded_edges, alloc);
 
             var excluded_nodes = std.StringHashMapUnmanaged(void).empty;
             defer {
@@ -553,16 +624,13 @@ pub fn findKShortestPaths(
                 if (result_path.nodes.len <= spur_idx + 1) continue;
                 if (!rootPathMatches(prev_path, &result_path, spur_idx)) continue;
 
-                var edge_key_buf: [2048]u8 = undefined;
-                const ek = makeEdgeExclusionKey(
-                    &edge_key_buf,
+                try putExcludedEdge(
+                    &excluded_edges,
+                    alloc,
                     result_path.nodes[spur_idx],
                     result_path.nodes[spur_idx + 1],
                     if (result_path.edges.len > spur_idx) result_path.edges[spur_idx].edge_type else "",
                 );
-                if (!excluded_edges.contains(ek)) {
-                    try excluded_edges.put(alloc, try alloc.dupe(u8, ek), {});
-                }
             }
 
             // Exclude root path nodes (except spur node)
@@ -678,26 +746,22 @@ fn reconstructPath(alloc: Allocator, end_node: *PathNode) !Path {
     };
 }
 
-fn makeEdgeExclusionKey(buf: []u8, src: []const u8, tgt: []const u8, edge_type: []const u8) []const u8 {
-    const slice = std.fmt.bufPrint(buf, "{s}->{s}:{s}", .{ src, tgt, edge_type }) catch return "";
-    return slice;
-}
-
 fn pathToKey(alloc: Allocator, path: *const Path) ![]u8 {
     var total_len: usize = 0;
-    for (path.nodes) |n| total_len += n.len + 2; // "->".len
-    if (total_len >= 2) total_len -= 2; // no trailing ->
+    for (path.nodes) |node| {
+        total_len = std.math.add(usize, total_len, @sizeOf(u64)) catch
+            return error.PathIdentityTooLarge;
+        total_len = std.math.add(usize, total_len, node.len) catch
+            return error.PathIdentityTooLarge;
+    }
 
-    var buf = try alloc.alloc(u8, total_len);
+    const buf = try alloc.alloc(u8, total_len);
     var pos: usize = 0;
-    for (path.nodes, 0..) |n, i| {
-        @memcpy(buf[pos..][0..n.len], n);
-        pos += n.len;
-        if (i < path.nodes.len - 1) {
-            buf[pos] = '-';
-            buf[pos + 1] = '>';
-            pos += 2;
-        }
+    for (path.nodes) |node| {
+        std.mem.writeInt(u64, buf[pos..][0..8], @intCast(node.len), .little);
+        pos += 8;
+        @memcpy(buf[pos..][0..node.len], node);
+        pos += node.len;
     }
     return buf;
 }
@@ -995,4 +1059,47 @@ test "k shortest paths" {
     try std.testing.expectEqual(@as(u32, 2), found_paths[0].length);
     try std.testing.expect(found_paths[0].total_weight <= found_paths[1].total_weight);
     try std.testing.expect(found_paths[1].total_weight <= found_paths[2].total_weight);
+}
+
+test "k shortest paths preserve delimiter and long node identities" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const store_path = tmpPath(&sb, "k-path-identity-s");
+    defer cleanupTmp(store_path);
+    var rb: [256]u8 = undefined;
+    const reverse_path = tmpPath(&rb, "k-path-identity-r");
+    defer cleanupTmp(reverse_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, reverse_path, "test", .{});
+    defer graph.close();
+
+    const long_mid = try alloc.alloc(u8, 4 * 1024);
+    defer alloc.free(long_mid);
+    @memset(long_mid, 'L');
+
+    // The first two paths collide under a delimiter-concatenated identity:
+    // A -> B->C -> D and A -> B -> C -> D.
+    try graph.addEdge("A", "B->C", "e:->", 1.0, 0, 0, "");
+    try graph.addEdge("B->C", "D", "e:->", 1.0, 0, 0, "");
+    try graph.addEdge("A", "B", "e:->", 1.0, 0, 0, "");
+    try graph.addEdge("B", "C", "e:->", 1.0, 0, 0, "");
+    try graph.addEdge("C", "D", "e:->", 1.0, 0, 0, "");
+    try graph.addEdge("A", long_mid, "e:->", 2.0, 0, 0, "");
+    try graph.addEdge(long_mid, "D", "e:->", 2.0, 0, 0, "");
+
+    const found = try findKShortestPaths(alloc, &graph, "A", "D", 3, .{
+        .weight_mode = .min_weight,
+    });
+    defer freePaths(alloc, found);
+
+    try std.testing.expectEqual(@as(usize, 3), found.len);
+    var saw_long = false;
+    for (found) |path| {
+        for (path.nodes) |node| {
+            if (std.mem.eql(u8, node, long_mid)) saw_long = true;
+        }
+    }
+    try std.testing.expect(saw_long);
 }

@@ -152,7 +152,9 @@ pub const TransitionCommand = union(enum) {
         keys: []const []const u8,
     },
     upsert_reallocation_request: metadata.ReallocationRequestRecord,
-    remove_reallocation_request: struct {},
+    remove_reallocation_request: struct {
+        expected_request_id: u128,
+    },
     upsert_extension_package: extension_domain.PackageManifest,
     remove_extension_package: struct {
         name: []const u8,
@@ -2632,9 +2634,17 @@ pub const RaftApplyStore = struct {
                 try txn.put(key, value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
             },
-            .remove_reallocation_request => {
+            .remove_reallocation_request => |expected| remove: {
                 var key_buf: [160]u8 = undefined;
                 const key = try reallocationRequestKeyForGroup(&key_buf, group_id);
+                const encoded = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => break :remove,
+                    else => return err,
+                };
+                var pos: usize = 0;
+                const current = try readReallocationRequestRecord(encoded, &pos);
+                if (pos != encoded.len) return error.InvalidMetadataRecord;
+                if (current.request_id != expected.expected_request_id) break :remove;
                 txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
@@ -3960,8 +3970,9 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_reallocation_request));
             try appendReallocationRequestRecord(alloc, &out, record);
         },
-        .remove_reallocation_request => {
+        .remove_reallocation_request => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_reallocation_request));
+            try appendInt(alloc, &out, u128, record.expected_request_id);
         },
         .upsert_extension_package => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_extension_package));
@@ -4179,7 +4190,9 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
             .upsert_reallocation_request = try readReallocationRequestRecord(encoded, &pos),
         },
         .remove_reallocation_request => .{
-            .remove_reallocation_request = .{},
+            .remove_reallocation_request = .{
+                .expected_request_id = try readInt(encoded, &pos, u128),
+            },
         },
         .upsert_extension_package => .{
             .upsert_extension_package = try readJsonRecord(extension_domain.PackageManifest, alloc, encoded, &pos),
@@ -5551,6 +5564,8 @@ fn appendReallocationRequestRecord(
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.ReallocationRequestRecord,
 ) !void {
+    if (!metadata.isValidReallocationRequest(record)) return error.InvalidMetadataRecord;
+    try appendInt(alloc, out, u128, record.request_id);
     try appendInt(alloc, out, u64, record.requested_at_ms);
 }
 
@@ -6367,9 +6382,12 @@ fn readReallocationRequestRecord(
     encoded: []const u8,
     pos: *usize,
 ) !metadata.ReallocationRequestRecord {
-    return .{
+    const record: metadata.ReallocationRequestRecord = .{
+        .request_id = try readInt(encoded, pos, u128),
         .requested_at_ms = try readInt(encoded, pos, u64),
     };
+    if (!metadata.isValidReallocationRequest(record)) return error.InvalidMetadataRecord;
+    return record;
 }
 
 fn appendMetadataPrefixRowsTxn(
@@ -8751,6 +8769,7 @@ test "metadata schema progress transition command round-trips" {
 test "metadata reallocation request transition command round-trips" {
     const encoded = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_reallocation_request = .{
+            .request_id = 17,
             .requested_at_ms = 42_000,
         },
     });
@@ -8761,7 +8780,25 @@ test "metadata reallocation request transition command round-trips" {
 
     switch (decoded) {
         .upsert_reallocation_request => |record| {
+            try std.testing.expectEqual(@as(u128, 17), record.request_id);
             try std.testing.expectEqual(@as(u64, 42_000), record.requested_at_ms);
+        },
+        else => return error.InvalidMetadataTransitionEncoding,
+    }
+
+    const remove_encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_reallocation_request = .{
+            .expected_request_id = 17,
+        },
+    });
+    defer std.testing.allocator.free(remove_encoded);
+
+    var remove_decoded = (try decodeTransitionCommand(std.testing.allocator, remove_encoded)) orelse
+        return error.InvalidMetadataTransitionEncoding;
+    defer remove_decoded.deinit(std.testing.allocator);
+    switch (remove_decoded) {
+        .remove_reallocation_request => |record| {
+            try std.testing.expectEqual(@as(u128, 17), record.expected_request_id);
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }

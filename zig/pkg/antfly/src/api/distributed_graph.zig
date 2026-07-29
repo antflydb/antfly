@@ -723,6 +723,7 @@ const GraphAdmissionTableState = struct {
     resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null,
     allowed: bool,
     requires_admission: bool,
+    requires_hydration: bool,
     decisions: std.StringHashMapUnmanaged(bool) = .empty,
 
     fn deinit(self: *GraphAdmissionTableState, alloc: std.mem.Allocator) void {
@@ -751,6 +752,7 @@ const GraphNodeAdmissionContext = struct {
     source_resolved_doc_filter: ?*const anyopaque,
     source_resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext,
     table_authorizer: ?db_mod.types.GraphTableReadAuthorizer,
+    node_filter: graph_pattern_mod.NodeFilter,
     consistency: raft_mod.ReadConsistency,
     tables: std.StringArrayHashMapUnmanaged(GraphAdmissionTableState) = .empty,
 
@@ -761,6 +763,7 @@ const GraphNodeAdmissionContext = struct {
         source_table: []const u8,
         source_topology_epoch: u64,
         req: db_mod.types.SearchRequest,
+        node_filter: graph_pattern_mod.NodeFilter,
         consistency: raft_mod.ReadConsistency,
     ) GraphNodeAdmissionContext {
         return .{
@@ -775,6 +778,7 @@ const GraphNodeAdmissionContext = struct {
             .source_resolved_doc_filter = req.resolved_doc_filter,
             .source_resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
             .table_authorizer = req.graph_table_read_authorizer,
+            .node_filter = node_filter,
             .consistency = consistency,
         };
     }
@@ -815,6 +819,7 @@ const GraphNodeAdmissionContext = struct {
         var resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null;
         var allowed = false;
         var requires_admission = false;
+        var requires_hydration = false;
 
         if (std.mem.eql(u8, table_name, self.source_table)) {
             topology_epoch = self.source_topology_epoch;
@@ -822,7 +827,7 @@ const GraphNodeAdmissionContext = struct {
             resolved_doc_filter = self.source_resolved_doc_filter;
             resolved_doc_filter_wire_context = self.source_resolved_doc_filter_wire_context;
             allowed = true;
-            requires_admission = self.source_filter_query_json.len > 0 or
+            requires_hydration = self.source_filter_query_json.len > 0 or
                 self.source_exclusion_query_json.len > 0 or
                 self.source_resolved_doc_filter != null;
             if (self.source_filter_query_json.len > 0) {
@@ -846,13 +851,31 @@ const GraphNodeAdmissionContext = struct {
             else
                 0;
             allowed = exists;
-            requires_admission = self.table_authorizer != null;
+            requires_hydration = self.table_authorizer != null;
             if (authorization.filter_query_json) |filter| {
                 filter_query_json = filter;
                 filter_query_json_live = true;
                 authorization.filter_query_json = null;
             }
         }
+
+        if (self.node_filter.filter_query_json) |node_filter_json| {
+            if (filter_query_json.len == 0) {
+                filter_query_json = try self.alloc.dupe(u8, node_filter_json);
+                filter_query_json_live = true;
+            } else {
+                const combined = try std.fmt.allocPrint(
+                    self.alloc,
+                    "{{\"conjuncts\":[{s},{s}]}}",
+                    .{ filter_query_json, node_filter_json },
+                );
+                self.alloc.free(filter_query_json);
+                filter_query_json = combined;
+            }
+            requires_hydration = true;
+        }
+        requires_admission = requires_hydration or
+            self.node_filter.filter_prefix.len > 0;
 
         var state = GraphAdmissionTableState{
             .table_name = owned_name,
@@ -864,6 +887,7 @@ const GraphNodeAdmissionContext = struct {
             .resolved_doc_filter_wire_context = resolved_doc_filter_wire_context,
             .allowed = allowed,
             .requires_admission = requires_admission,
+            .requires_hydration = requires_hydration,
         };
         owned_name_live = false;
         filter_query_json_live = false;
@@ -909,6 +933,16 @@ const GraphNodeAdmissionContext = struct {
         for (nodes) |node| {
             const state = self.tables.getPtr(node.table orelse self.source_table).?;
             if (!state.allowed or !state.requires_admission or state.decisions.contains(node.key)) continue;
+            if (self.node_filter.filter_prefix.len > 0 and
+                !std.mem.startsWith(u8, node.key, self.node_filter.filter_prefix))
+            {
+                try self.cacheDecision(state, node.key, false);
+                continue;
+            }
+            if (!state.requires_hydration) {
+                try self.cacheDecision(state, node.key, true);
+                continue;
+            }
             const entry = try pending.getOrPut(result_alloc, state);
             if (!entry.found_existing) entry.value_ptr.* = .{};
             const seen = try entry.value_ptr.seen.getOrPut(result_alloc, node.key);
@@ -943,15 +977,7 @@ const GraphNodeAdmissionContext = struct {
             defer allowed.deinit(result_alloc);
             for (hits) |hit| try allowed.put(result_alloc, hit.id, {});
             for (entry.value_ptr.keys.items) |key| {
-                const owned_key = try self.alloc.dupe(u8, key);
-                state.decisions.putNoClobber(
-                    self.alloc,
-                    owned_key,
-                    allowed.contains(key),
-                ) catch |err| {
-                    self.alloc.free(owned_key);
-                    return err;
-                };
+                try self.cacheDecision(state, key, allowed.contains(key));
             }
         }
 
@@ -962,6 +988,20 @@ const GraphNodeAdmissionContext = struct {
                     (state.decisions.get(node.key) orelse return error.InvalidGraphNodeAdmissionResult));
         }
         return result;
+    }
+
+    fn cacheDecision(
+        self: *GraphNodeAdmissionContext,
+        state: *GraphAdmissionTableState,
+        key: []const u8,
+        allowed: bool,
+    ) !void {
+        if (state.decisions.contains(key)) return;
+        const owned_key = try self.alloc.dupe(u8, key);
+        state.decisions.putNoClobber(self.alloc, owned_key, allowed) catch |err| {
+            self.alloc.free(owned_key);
+            return err;
+        };
     }
 };
 
@@ -1012,6 +1052,7 @@ fn executeSingleCrossRange(
         table_name,
         topology_epoch,
         req,
+        graph_query.query.params.node_filter,
         consistency,
     );
     defer admission.deinit();
@@ -3002,13 +3043,7 @@ fn dupPathEdgesFromGraphPath(
 }
 
 fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-    for (path.nodes, 0..) |node, i| {
-        if (i > 0) try out.appendSlice(alloc, "->");
-        try out.appendSlice(alloc, node);
-    }
-    return try out.toOwnedSlice(alloc);
+    return try compositeIdentityAlloc(alloc, path.nodes);
 }
 
 fn rootPathMatches(a: db_mod.types.GraphPath, b: db_mod.types.GraphPath, spur_idx: usize) bool {
@@ -3132,7 +3167,45 @@ fn allocEdgeExclusionKey(
     tgt: []const u8,
     edge_type: []const u8,
 ) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}->{s}:{s}", .{ src, tgt, edge_type });
+    return try compositeIdentityAlloc(alloc, &.{ src, tgt, edge_type });
+}
+
+fn compositeIdentityAlloc(
+    alloc: std.mem.Allocator,
+    parts: []const []const u8,
+) ![]u8 {
+    var encoded_len: usize = 0;
+    for (parts) |part| {
+        encoded_len = std.math.add(usize, encoded_len, @sizeOf(u64)) catch
+            return error.GraphIdentityTooLarge;
+        encoded_len = std.math.add(usize, encoded_len, part.len) catch
+            return error.GraphIdentityTooLarge;
+    }
+
+    const encoded = try alloc.alloc(u8, encoded_len);
+    var cursor: usize = 0;
+    for (parts) |part| {
+        std.mem.writeInt(u64, encoded[cursor..][0..8], @intCast(part.len), .little);
+        cursor += 8;
+        @memcpy(encoded[cursor..][0..part.len], part);
+        cursor += part.len;
+    }
+    return encoded;
+}
+
+test "distributed graph identities are length framed" {
+    const alloc = std.testing.allocator;
+    const path_a = try compositeIdentityAlloc(alloc, &.{ "A", "B->C", "D" });
+    defer alloc.free(path_a);
+    const path_b = try compositeIdentityAlloc(alloc, &.{ "A", "B", "C", "D" });
+    defer alloc.free(path_b);
+    try std.testing.expect(!std.mem.eql(u8, path_a, path_b));
+
+    const edge_a = try compositeIdentityAlloc(alloc, &.{ "A->B", "C", "kind" });
+    defer alloc.free(edge_a);
+    const edge_b = try compositeIdentityAlloc(alloc, &.{ "A", "B->C", "kind" });
+    defer alloc.free(edge_b);
+    try std.testing.expect(!std.mem.eql(u8, edge_a, edge_b));
 }
 
 fn edgeCost(_: FrontierState, node: graph_query_mod.GraphResultNode, mode: graph_paths_mod.PathWeightMode) f64 {
@@ -4778,6 +4851,7 @@ pub fn testCrossTableHydrateAppliesTargetAuthorizationAndClearsOrdinals(alloc: s
             .resolved_doc_filter_wire_context = context,
             .graph_table_read_authorizer = authorizer.iface(),
         },
+        .{},
         .read_index,
     );
     defer admission.deinit();
@@ -4803,6 +4877,7 @@ pub fn testCrossTableHydrateAppliesTargetAuthorizationAndClearsOrdinals(alloc: s
         "docs",
         0,
         .{ .graph_table_read_authorizer = denying_authorizer.iface() },
+        .{},
         .read_index,
     );
     defer denied_admission.deinit();

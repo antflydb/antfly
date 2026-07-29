@@ -3027,7 +3027,8 @@ fn buildGraphQueryBuilderRepairMessages(
         \\- Use only listed graph indexes.
         \\- Use start_nodes/target_nodes keys or one of $full_text_results, $fused_results, $embeddings_results, or $graph_results.<search_name>.
         \\- $graph_results.<search_name> refs must point to another graph_searches entry and must not form a cycle.
-        \\- Do not include node_filter, algorithm, algorithm_params, include_edges, or unknown fields.
+        \\- node_filter is supported in params and pattern steps, but not inside start_nodes or target_nodes.
+        \\- Do not include algorithm, algorithm_params, include_edges, or unknown fields.
         \\- shortest_path and k_shortest_paths require target_nodes.
         \\- pattern queries require unique aliases, an edge on every step after the first, and return_aliases that exist in the pattern.
     ;
@@ -3765,16 +3766,17 @@ fn validateGeneratedGraphQueryParams(
     query_type: indexes_openapi.GraphQueryType,
     params: indexes_openapi.GraphQueryParams,
 ) QueryBuilderValidationError!void {
-    if (params.node_filter != null or params.algorithm != null or params.algorithm_params != null) return error.InvalidQueryBuilderGeneration;
+    if (params.algorithm != null or params.algorithm_params != null) return error.InvalidQueryBuilderGeneration;
+    if (params.node_filter) |filter| try validateGeneratedGraphNodeFilter(filter);
     if (params.edge_types) |edge_types| try validateGeneratedGraphEdgeTypes(edge_types);
     if (params.max_depth) |max_depth| {
-        if (max_depth <= 0) return error.InvalidQueryBuilderGeneration;
+        if (max_depth < 1 or max_depth > 64) return error.InvalidQueryBuilderGeneration;
     }
     if (params.max_results) |max_results| {
-        if (max_results <= 0) return error.InvalidQueryBuilderGeneration;
+        if (max_results < 1 or max_results > 10_000) return error.InvalidQueryBuilderGeneration;
     }
     if (params.k) |k| {
-        if (query_type != .k_shortest_paths or k <= 0) return error.InvalidQueryBuilderGeneration;
+        if (query_type != .k_shortest_paths or k < 1 or k > 100) return error.InvalidQueryBuilderGeneration;
     }
     if (query_type == .pattern) {
         if (params.edge_types != null or params.direction != null or params.include_paths != null or params.weight_mode != null or params.k != null) {
@@ -3796,7 +3798,7 @@ fn validateGeneratedGraphPattern(
                 if (std.mem.eql(u8, previous_alias, alias)) return error.InvalidQueryBuilderGeneration;
             }
         }
-        if (step.node_filter != null) return error.InvalidQueryBuilderGeneration;
+        if (step.node_filter) |filter| try validateGeneratedGraphNodeFilter(filter);
         if (i == 0) {
             if (step.edge != null) return error.InvalidQueryBuilderGeneration;
         } else {
@@ -3810,6 +3812,14 @@ fn validateGeneratedGraphPattern(
             if (!generatedGraphPatternHasAlias(pattern, alias)) return error.InvalidQueryBuilderGeneration;
         }
     }
+}
+
+fn validateGeneratedGraphNodeFilter(
+    filter: indexes_openapi.NodeFilter,
+) QueryBuilderValidationError!void {
+    const has_prefix = if (filter.filter_prefix) |prefix| prefix.len > 0 else false;
+    const has_query = filter.filter_query != null;
+    if (!has_prefix and !has_query) return error.InvalidQueryBuilderGeneration;
 }
 
 fn validateGeneratedGraphPatternEdge(edge: indexes_openapi.PatternEdgeStep) QueryBuilderValidationError!void {
@@ -6891,7 +6901,7 @@ test "query builder metadata validator rejects generated full text fields outsid
     try std.testing.expect(std.mem.indexOf(u8, feedback.?, "status") != null);
 }
 
-test "query builder metadata validator preflights graph searches against executor parser" {
+test "query builder metadata validator accepts executable graph node filters" {
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
         \\{
         \\  "graph_searches": {
@@ -6914,9 +6924,7 @@ test "query builder metadata validator preflights graph searches against executo
     const feedback = try metadataValidateQueryRequestAgainstContext(std.testing.allocator, &context, parsed.value, null);
     defer if (feedback) |value| std.testing.allocator.free(value);
 
-    try std.testing.expect(feedback != null);
-    try std.testing.expect(std.mem.indexOf(u8, feedback.?, "executor preflight") != null);
-    try std.testing.expect(std.mem.indexOf(u8, feedback.?, "UnsupportedQueryRequest") != null);
+    try std.testing.expect(feedback == null);
 }
 
 test "query builder metadata validator rejects graph result refs without seed results" {

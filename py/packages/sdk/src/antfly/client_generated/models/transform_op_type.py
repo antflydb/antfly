@@ -2,12 +2,12 @@ from enum import Enum
 
 
 class TransformOpType(str, Enum):
-    VALUE_0 = "$set"
-    VALUE_1 = "$setOnInsert"
-    VALUE_2 = "$unset"
-    VALUE_3 = "$inc"
-    VALUE_4 = "$addToSet"
-    VALUE_5 = "$max"
+    SET = "$set"
+    SET_ON_INSERT = "$setOnInsert"
+    UNSET = "$unset"
+    INC = "$inc"
+    ADD_TO_SET = "$addToSet"
+    MAX = "$max"
 
     def __str__(self) -> str:
         return str(self.value)

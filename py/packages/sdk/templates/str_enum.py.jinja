@@ -1,0 +1,17 @@
+from enum import Enum
+
+{% set transform_op_names = {
+    "$set": "SET",
+    "$setOnInsert": "SET_ON_INSERT",
+    "$unset": "UNSET",
+    "$inc": "INC",
+    "$addToSet": "ADD_TO_SET",
+    "$max": "MAX",
+} %}
+class {{ enum.class_info.name }}(str, Enum):
+    {% for key, value in enum.values|dictsort(true) %}
+    {{ transform_op_names.get(value, key) if enum.class_info.name == "TransformOpType" else key }} = "{{ value }}"
+    {% endfor %}
+
+    def __str__(self) -> str:
+        return str(self.value)

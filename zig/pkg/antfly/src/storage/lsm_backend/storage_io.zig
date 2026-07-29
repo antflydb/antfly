@@ -60,6 +60,7 @@ pub const AtomicWriteSink = struct {
         append_slice: *const fn (*anyopaque, []const u8) anyerror!void,
         write_at: *const fn (*anyopaque, usize, []const u8) anyerror!void,
         crc32_prefix: *const fn (*anyopaque, usize) anyerror!u32,
+        crc32_range: *const fn (*anyopaque, usize, usize) anyerror!u32,
         finish: *const fn (*anyopaque) anyerror!void,
         abort: *const fn (*anyopaque) void,
     };
@@ -83,6 +84,10 @@ pub const AtomicWriteSink = struct {
 
     pub fn crc32Prefix(self: *AtomicWriteSink, len_prefix: usize) !u32 {
         return try self.vtable.crc32_prefix(self.ptr, len_prefix);
+    }
+
+    pub fn crc32Range(self: *AtomicWriteSink, offset: usize, range_len: usize) !u32 {
+        return try self.vtable.crc32_range(self.ptr, offset, range_len);
     }
 
     /// Atomically publish the written bytes at the requested destination.
@@ -584,6 +589,12 @@ const BufferedAtomicWriteSink = struct {
         return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
     }
 
+    fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
+        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+    }
+
     fn finish(ptr: *anyopaque) !void {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
@@ -615,6 +626,7 @@ const buffered_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
     .append_slice = BufferedAtomicWriteSink.appendSlice,
     .write_at = BufferedAtomicWriteSink.writeAt,
     .crc32_prefix = BufferedAtomicWriteSink.crc32Prefix,
+    .crc32_range = BufferedAtomicWriteSink.crc32Range,
     .finish = BufferedAtomicWriteSink.finish,
     .abort = BufferedAtomicWriteSink.abort,
 };
@@ -2079,6 +2091,12 @@ const NativeBufferedAtomicWriteSink = struct {
         return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
     }
 
+    fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
+        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+    }
+
     fn finish(ptr: *anyopaque) !void {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
@@ -2114,6 +2132,7 @@ const native_buffered_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
     .append_slice = NativeBufferedAtomicWriteSink.appendSlice,
     .write_at = NativeBufferedAtomicWriteSink.writeAt,
     .crc32_prefix = NativeBufferedAtomicWriteSink.crc32Prefix,
+    .crc32_range = NativeBufferedAtomicWriteSink.crc32Range,
     .finish = NativeBufferedAtomicWriteSink.finish,
     .abort = NativeBufferedAtomicWriteSink.abort,
 };
@@ -2187,15 +2206,19 @@ const NativeAtomicWriteSink = struct {
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
+        return crc32Range(ptr, 0, len_prefix);
+    }
+
+    fn crc32Range(ptr: *anyopaque, range_offset: usize, range_len: usize) !u32 {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (len_prefix > self.bytes_written) return error.InvalidAtomicWriteOffset;
+        if (range_offset > self.bytes_written or range_len > self.bytes_written - range_offset) return error.InvalidAtomicWriteOffset;
 
         var crc = std.hash.Crc32.init();
         var offset: usize = 0;
         var buf: [64 * 1024]u8 = undefined;
-        while (offset < len_prefix) {
-            const n = @min(buf.len, len_prefix - offset);
-            try readAllAtOffset(self.fd, buf[0..n], @intCast(offset));
+        while (offset < range_len) {
+            const n = @min(buf.len, range_len - offset);
+            try readAllAtOffset(self.fd, buf[0..n], @intCast(range_offset + offset));
             crc.update(buf[0..n]);
             offset += n;
         }
@@ -2241,6 +2264,7 @@ const native_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
     .append_slice = NativeAtomicWriteSink.appendSlice,
     .write_at = NativeAtomicWriteSink.writeAt,
     .crc32_prefix = NativeAtomicWriteSink.crc32Prefix,
+    .crc32_range = NativeAtomicWriteSink.crc32Range,
     .finish = NativeAtomicWriteSink.finish,
     .abort = NativeAtomicWriteSink.abort,
 };

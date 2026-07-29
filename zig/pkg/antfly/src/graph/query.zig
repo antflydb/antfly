@@ -66,7 +66,12 @@ pub const QueryParams = struct {
     include_paths: bool = false,
     weight_mode: paths_mod.PathWeightMode = .min_hops,
     algebraic_semiring: bool = false,
+    node_filter: pattern_mod.NodeFilter = .{},
 };
+
+pub fn nodeFilterActive(filter: pattern_mod.NodeFilter) bool {
+    return filter.filter_prefix.len > 0 or filter.filter_query_json != null;
+}
 
 pub const AlgebraicTraversalRejectReason = algebraic_path_mod.ExecutionRejectReason;
 pub const AlgebraicTraversalProof = algebraic_path_mod.ExecutionProof;

@@ -280,7 +280,7 @@ pub const MetadataState = struct {
                 .stores = self.committed_stores.items,
                 .merged_group_statuses = merged_group_statuses,
                 .restore_progresses = restore_progresses,
-                .reallocate_requested = projected_reallocation_request != null,
+                .reallocation_request = projected_reallocation_request,
                 .schema_progresses = schema_progresses,
                 .split_transitions = self.committed_splits.items,
                 .merge_transitions = self.committed_merges.items,

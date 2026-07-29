@@ -5894,7 +5894,8 @@ pub const DB = struct {
                 try store_writes.append(self.alloc, haAppliedReplicationLsnWrite(lsn, &ha_applied_lsn_value_buf));
             }
         }
-        var split_range_buf: [1024]u8 = undefined;
+        var split_range_value: ?[]u8 = null;
+        defer if (split_range_value) |value| self.alloc.free(value);
         var split_sequence_buf: [8]u8 = undefined;
         var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
         var persisted_range: ?types.ByteRange = null;
@@ -5915,9 +5916,10 @@ pub const DB = struct {
                 persisted_range = .{ .start = checkpoint.range_start, .end = checkpoint.range_end };
                 persisted_range_start_owned = try self.alloc.dupe(u8, checkpoint.range_start);
                 persisted_range_end_owned = try self.alloc.dupe(u8, checkpoint.range_end);
+                split_range_value = try range_state_mod.encodeRangeAlloc(self.alloc, persisted_range.?);
                 try store_writes.append(self.alloc, .{
                     .key = range_state_mod.range_key,
-                    .value = try range_state_mod.encodeRange(persisted_range.?, &split_range_buf),
+                    .value = split_range_value.?,
                 });
             }
             try store_writes.append(self.alloc, .{
@@ -11269,6 +11271,7 @@ pub const DB = struct {
             shadow_base,
             self.index_backends,
         );
+        shadow_manager.setIo(self.backend_runtime.io());
         shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
         shadow_manager.registerReplacementIndex(self.core.store, cfg) catch |err| {
             shadow_manager.deinit();
@@ -11310,6 +11313,7 @@ pub const DB = struct {
         else if (resume_candidate)
             try apply_state.loadAppliedSequenceWithCheckpoint(
                 alloc,
+                shadow_manager.checkpointIo(),
                 self.core.store,
                 shadow_checkpoint_path,
                 cfg.name,
@@ -11844,6 +11848,7 @@ pub const DB = struct {
 
         var applied = try apply_state.loadAppliedSequenceWithCheckpoint(
             alloc,
+            shadow_manager.checkpointIo(),
             self.core.store,
             shadow_checkpoint_path,
             index_ref.name,
@@ -11978,6 +11983,7 @@ pub const DB = struct {
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(shadow_manager, &updates);
         try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
             alloc,
+            shadow_manager.checkpointIo(),
             self.core.store,
             shadow_checkpoint_path,
             update,
@@ -12145,8 +12151,9 @@ pub const DB = struct {
         const end = try self.alloc.dupe(u8, byte_range.end);
         errdefer self.alloc.free(end);
         const owned_range: types.ByteRange = .{ .start = start, .end = end };
-        var range_buf: [1024]u8 = undefined;
-        const range_write = try range_state_mod.rangeMetadataWrite(owned_range, &range_buf);
+        const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, owned_range);
+        defer self.alloc.free(range_value);
+        const range_write: docstore_mod.KVPair = .{ .key = range_state_mod.range_key, .value = range_value };
         try rebaseRangeCoverageMetadata(
             self.alloc,
             self.core.store,
@@ -12301,8 +12308,9 @@ pub const DB = struct {
             try deletes.append(alloc, logical_key);
         }
 
-        var range_buf: [1024]u8 = undefined;
-        const range_write = try range_state_mod.rangeMetadataWrite(byte_range, &range_buf);
+        const range_value = try range_state_mod.encodeRangeAlloc(alloc, byte_range);
+        defer alloc.free(range_value);
+        const range_write: docstore_mod.KVPair = .{ .key = range_state_mod.range_key, .value = range_value };
         try self.batchInternal(.{
             .writes = writes,
             .deletes = deletes.items,
@@ -12349,8 +12357,9 @@ pub const DB = struct {
         byte_range: types.ByteRange,
     ) !void {
         try staged_generation.validatePath(self.core.path);
-        var range_buf: [1024]u8 = undefined;
-        const range_write = try range_state_mod.rangeMetadataWrite(byte_range, &range_buf);
+        const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, byte_range);
+        defer self.alloc.free(range_value);
+        const range_write: docstore_mod.KVPair = .{ .key = range_state_mod.range_key, .value = range_value };
         try self.batchInternal(.{ .sync_level = .write }, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
@@ -12449,14 +12458,14 @@ pub const DB = struct {
             try deletes.append(alloc, logical_key);
         }
 
-        var range_buf: [1024]u8 = undefined;
+        const range_value = try range_state_mod.encodeRangeAlloc(alloc, byte_range);
+        defer alloc.free(range_value);
         var sequence_buf: [8]u8 = undefined;
         var marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
         const metadata_writes = try range_state_mod.splitBootstrapMetadataWrites(
-            byte_range,
+            range_value,
             base_delta_sequence,
             marker,
-            &range_buf,
             &sequence_buf,
             &marker_buf,
         );
@@ -12523,14 +12532,14 @@ pub const DB = struct {
             return false;
         }
 
-        var range_buf: [1024]u8 = undefined;
+        const range_value = try range_state_mod.encodeRangeAlloc(alloc, byte_range);
+        defer alloc.free(range_value);
         var sequence_buf: [8]u8 = undefined;
         var marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
         const metadata_writes = try range_state_mod.splitBootstrapMetadataWrites(
-            byte_range,
+            range_value,
             base_delta_sequence,
             marker,
-            &range_buf,
             &sequence_buf,
             &marker_buf,
         );
@@ -21509,8 +21518,8 @@ pub const DB = struct {
 
     fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
         _ = req.index_name;
-        const predicate_aware = graphRequestRequiresAdmission(req);
-        var admission = GraphNodeAdmissionCache.init(self, alloc, req, graph_query.index_name);
+        const predicate_aware = graphRequestRequiresAdmission(req, graph_query.params.node_filter);
+        var admission = GraphNodeAdmissionCache.init(self, alloc, req, graph_query.index_name, graph_query.params.node_filter);
         defer admission.deinit();
         var execution = GraphPredicateExecutionContext{
             .db = self,
@@ -21571,8 +21580,8 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
     ) !types.GraphSearchResult {
-        const predicate_aware = graphRequestRequiresAdmission(req);
-        var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name);
+        const predicate_aware = graphRequestRequiresAdmission(req, named.query.params.node_filter);
+        var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name, named.query.params.node_filter);
         defer admission.deinit();
         var execution = GraphPredicateExecutionContext{
             .db = self,
@@ -21706,8 +21715,8 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
     ) !types.GraphSearchResult {
-        const predicate_aware = graphRequestRequiresAdmission(req);
-        var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name);
+        const predicate_aware = graphRequestRequiresAdmission(req, named.query.params.node_filter);
+        var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name, named.query.params.node_filter);
         defer admission.deinit();
         var execution = GraphPredicateExecutionContext{
             .db = self,
@@ -21889,9 +21898,13 @@ pub const DB = struct {
         admission: *GraphNodeAdmissionCache,
     };
 
-    fn graphRequestRequiresAdmission(req: types.SearchRequest) bool {
+    fn graphRequestRequiresAdmission(
+        req: types.SearchRequest,
+        node_filter: graph_pattern_mod.NodeFilter,
+    ) bool {
         return db_query_graph.searchRequestHasGraphPredicates(req) or
-            req.graph_table_read_authorizer != null;
+            req.graph_table_read_authorizer != null or
+            graph_query_mod.nodeFilterActive(node_filter);
     }
 
     const GraphNodeAdmissionCache = struct {
@@ -21899,6 +21912,8 @@ pub const DB = struct {
         req: types.SearchRequest,
         alloc: Allocator,
         external_targets: bool,
+        node_filter: graph_pattern_mod.NodeFilter,
+        prepared_filters: db_query_graph.PreparedPatternFilterCache,
         decisions: std.StringHashMapUnmanaged(bool) = .empty,
 
         fn init(
@@ -21906,6 +21921,7 @@ pub const DB = struct {
             alloc: Allocator,
             req: types.SearchRequest,
             index_name: []const u8,
+            node_filter: graph_pattern_mod.NodeFilter,
         ) GraphNodeAdmissionCache {
             const artifact_source = db.core.index_manager.graphArtifactSource(index_name);
             return .{
@@ -21914,6 +21930,8 @@ pub const DB = struct {
                 .alloc = alloc,
                 .external_targets = artifact_source != null and
                     artifact_source.?.mapping.node_model == .external,
+                .node_filter = node_filter,
+                .prepared_filters = db_query_graph.PreparedPatternFilterCache.init(alloc),
             };
         }
 
@@ -21921,6 +21939,7 @@ pub const DB = struct {
             var it = self.decisions.keyIterator();
             while (it.next()) |key| self.alloc.free(key.*);
             self.decisions.deinit(self.alloc);
+            self.prepared_filters.deinit();
             self.* = undefined;
         }
 
@@ -21972,6 +21991,42 @@ pub const DB = struct {
                 if (missing_mask.len != missing_keys.items.len) {
                     return error.InvalidGraphNodeAdmissionResult;
                 }
+
+                for (missing_keys.items, missing_mask) |key, *allowed| {
+                    if (allowed.* and self.node_filter.filter_prefix.len > 0 and
+                        !std.mem.startsWith(u8, key, self.node_filter.filter_prefix))
+                    {
+                        allowed.* = false;
+                    }
+                }
+
+                if (self.node_filter.filter_query_json) |filter_query_json| {
+                    var query_keys = std.ArrayListUnmanaged([]const u8).empty;
+                    defer query_keys.deinit(result_alloc);
+                    var query_positions = std.ArrayListUnmanaged(usize).empty;
+                    defer query_positions.deinit(result_alloc);
+                    for (missing_keys.items, missing_mask, 0..) |key, allowed, i| {
+                        if (!allowed) continue;
+                        try query_keys.append(result_alloc, key);
+                        try query_positions.append(result_alloc, i);
+                    }
+                    if (query_keys.items.len > 0) {
+                        const loaded = try loadStoredSearchDocumentsMany(
+                            self.db,
+                            result_alloc,
+                            query_keys.items,
+                        );
+                        defer freeOptionalOwnedBytes(result_alloc, loaded);
+                        const prepared = try self.prepared_filters.getOrPrepare(filter_query_json);
+                        for (query_keys.items, query_positions.items, loaded) |key, position, maybe_stored| {
+                            missing_mask[position] = if (maybe_stored) |stored|
+                                try prepared.matchesStored(result_alloc, key, stored)
+                            else
+                                false;
+                        }
+                    }
+                }
+
                 for (missing_keys.items, missing_mask) |key, allowed| {
                     const owned_key = try self.alloc.dupe(u8, key);
                     self.decisions.putNoClobber(self.alloc, owned_key, allowed) catch |err| {
@@ -21983,7 +22038,7 @@ pub const DB = struct {
 
             for (nodes, 0..) |node, i| {
                 result[i] = if (node.external or node.table != null)
-                    true
+                    !graph_query_mod.nodeFilterActive(self.node_filter)
                 else
                     self.decisions.get(node.key) orelse return error.InvalidGraphNodeAdmissionResult;
             }
@@ -22273,8 +22328,8 @@ pub const DB = struct {
                 .graph_results = graph_results,
             };
         }
-        const predicate_aware = graphRequestRequiresAdmission(req);
-        var admission = GraphNodeAdmissionCache.init(self, alloc, req, graph_query.index_name);
+        const predicate_aware = graphRequestRequiresAdmission(req, graph_query.params.node_filter);
+        var admission = GraphNodeAdmissionCache.init(self, alloc, req, graph_query.index_name, graph_query.params.node_filter);
         defer admission.deinit();
         var execution = GraphPredicateExecutionContext{
             .db = self,
@@ -30847,6 +30902,7 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
     for (managed_indexes) |index_ref| {
         const applied = try apply_state.loadAppliedSequenceWithCheckpoint(
             ctx.alloc,
+            ctx.index_manager.checkpointIo(),
             ctx.store,
             ctx.applied_sequence_checkpoint_path,
             index_ref.name,
@@ -31061,6 +31117,7 @@ fn saveAppliedSequencesBatchContext(
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
         try apply_state.saveAppliedSequencesWithCheckpoint(
             ctx.alloc,
+            ctx.index_manager.checkpointIo(),
             ctx.store,
             ctx.applied_sequence_checkpoint_path,
             enriched_updates,
@@ -31073,6 +31130,7 @@ fn saveAppliedSequencesBatchContext(
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(
         ctx.alloc,
+        ctx.index_manager.checkpointIo(),
         ctx.store,
         ctx.applied_sequence_checkpoint_path,
         enriched_updates,
@@ -35093,6 +35151,7 @@ fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
     for (managed_indexes) |index_ref| {
         const applied = try apply_state.loadAppliedSequenceWithCheckpoint(
             ctx.alloc,
+            ctx.index_manager.checkpointIo(),
             ctx.store,
             ctx.applied_sequence_checkpoint_path,
             index_ref.name,
@@ -35608,7 +35667,13 @@ fn registerSplitDestinationIndexesDirect(
         };
     }
     try saveDenseProjectionMetadataForAppliedSequenceUpdates(dest_indexes, updates);
-    try apply_state.saveAppliedSequencesWithCheckpoint(alloc, dest_store, applied_sequence_checkpoint_path, updates);
+    try apply_state.saveAppliedSequencesWithCheckpoint(
+        alloc,
+        dest_indexes.checkpointIo(),
+        dest_store,
+        applied_sequence_checkpoint_path,
+        updates,
+    );
 }
 
 fn streamRangeIntoSplitDestinationDirect(
@@ -36690,6 +36755,7 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     const persisted_applied = try apply_state.loadAppliedSequenceWithCheckpoint(
         ctx.alloc,
+        ctx.index_manager.checkpointIo(),
         ctx.store,
         ctx.applied_sequence_checkpoint_path,
         index_ref.name,
@@ -37460,6 +37526,7 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
     try ctx.index_manager.saveDenseProjectionCheckpointMetadata(index_name, clean_checkpoint);
     try apply_state.saveProjectionCheckpointWithSidecar(
         ctx.alloc,
+        ctx.index_manager.checkpointIo(),
         ctx.store,
         ctx.applied_sequence_checkpoint_path,
         index_name,
@@ -37568,7 +37635,13 @@ fn flushFinishedDenseAppliedSequenceLocked(
     defer ctx.alloc.free(enriched_updates);
     try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try apply_state.saveAppliedSequencesWithCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, enriched_updates);
+    try apply_state.saveAppliedSequencesWithCheckpoint(
+        ctx.alloc,
+        ctx.index_manager.checkpointIo(),
+        ctx.store,
+        ctx.applied_sequence_checkpoint_path,
+        enriched_updates,
+    );
     lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence) or lifecycle_completed.*;
     try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
     const save_ns = elapsedSince(save_start_ns);
@@ -37617,6 +37690,7 @@ fn flushPendingAppliedSequencesLocked(
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
     try apply_state.saveAppliedSequencesWithCheckpoint(
         ctx.alloc,
+        ctx.index_manager.checkpointIo(),
         ctx.store,
         ctx.applied_sequence_checkpoint_path,
         enriched_updates,
@@ -65062,7 +65136,7 @@ test "db dense artifact rebuild trusts clean projection checkpoint without artif
         });
         const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
         const mirrored_ahead_sequence: u64 = 1000;
-        try apply_state.saveProjectionCheckpointWithSidecar(alloc, db.core.store, checkpoint_path, "dense_idx", .{
+        try apply_state.saveProjectionCheckpointWithSidecar(alloc, db.core.index_manager.checkpointIo(), db.core.store, checkpoint_path, "dense_idx", .{
             .applied_sequence = mirrored_ahead_sequence,
             .status = .clean,
             .generation = 99,
@@ -65148,7 +65222,7 @@ test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" 
         try writeRawProjectionCheckpointSidecarForTest(checkpoint_path, "not-a-derived-apply-checkpoint");
         try std.testing.expectError(
             error.InvalidDerivedApplyState,
-            apply_state.loadProjectionCheckpointWithSidecar(alloc, db.core.store, checkpoint_path, "dense_idx"),
+            apply_state.loadProjectionCheckpointWithSidecar(alloc, db.core.index_manager.checkpointIo(), db.core.store, checkpoint_path, "dense_idx"),
         );
     }
 
@@ -67679,6 +67753,31 @@ test "db graph search filters result nodes and hidden traversal intermediates" {
     try std.testing.expectEqual(@as(usize, 1), direct.hits.len);
     try std.testing.expectEqualStrings("n:d", direct.hits[0].id);
     try std.testing.expect(direct.hits[0].stored_data != null);
+
+    var query_scoped = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "query_scoped_visible",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "gr_v1",
+                    .start_nodes = .{ .keys = &.{"n:a"} },
+                    .params = .{
+                        .direction = .out,
+                        .edge_types = &.{"links"},
+                        .max_depth = 2,
+                        .node_filter = .{
+                            .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}",
+                        },
+                    },
+                },
+            },
+        },
+        .limit = 10,
+    });
+    defer query_scoped.deinit();
+    try std.testing.expectEqual(@as(u32, 1), query_scoped.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("n:d", query_scoped.graph_results[0].nodes[0].key);
 
     var bounded = try db.search(alloc, .{
         .graph_queries = &.{

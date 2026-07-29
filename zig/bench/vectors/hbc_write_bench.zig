@@ -987,7 +987,13 @@ fn analyzeRunTable(
         const payload = try storage.readFileRangeAlloc(allocator, path, physical_offset, window.physicalLen());
         defer allocator.free(payload);
 
-        const decoded = try lsm_table_file.decodeBlockPayloadAlloc(allocator, window.compression, payload, window.len);
+        const decoded = try lsm_table_file.decodeBlockPayloadAlloc(
+            allocator,
+            window.compression,
+            payload,
+            window.len,
+            window.checksum,
+        );
         defer allocator.free(decoded);
 
         const end = block.first_entry_index + block.entry_count;

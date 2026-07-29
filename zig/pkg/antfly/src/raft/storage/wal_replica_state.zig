@@ -33,7 +33,10 @@ const delta_magic: u32 = 0x4152444c; // ARDL
 const legacy_inline_delta_version: u32 = 2;
 const delta_version: u32 = 3;
 const applied_watermark_magic: u32 = 0x4152574d; // ARWM
-const applied_watermark_version: u32 = 1;
+const applied_watermark_version: u32 = 2;
+const applied_watermark_payload_len = 20;
+const max_conf_state_nodes: usize = 1024;
+const min_encoded_entry_len = 8 + 8 + 1 + 4;
 
 var applied_watermark_tmp_nonce: std.atomic.Value(u64) = .init(0);
 
@@ -638,10 +641,11 @@ pub const WalReplicaState = struct {
     fn persistAppliedWatermark(self: *WalReplicaState) !void {
         self.stats.applied_index_persist_calls += 1;
         const started_ns = nowNs();
-        var payload: [16]u8 = undefined;
+        var payload: [applied_watermark_payload_len]u8 = undefined;
         std.mem.writeInt(u32, payload[0..4], applied_watermark_magic, .little);
         std.mem.writeInt(u32, payload[4..8], applied_watermark_version, .little);
         std.mem.writeInt(u64, payload[8..16], self.applied_index, .little);
+        std.mem.writeInt(u32, payload[16..20], std.hash.Crc32.hash(payload[0..16]), .little);
         try writeFileAtomically(self.io_impl.io(), self.applied_watermark_path, &payload);
         self.durable_applied_index = self.applied_index;
         self.stats.applied_watermark_persist_ns += elapsedSince(started_ns);
@@ -662,15 +666,19 @@ pub const WalReplicaState = struct {
             else => return err,
         };
         defer file.close(self.io_impl.io());
+        if (try file.length(self.io_impl.io()) != applied_watermark_payload_len)
+            return error.InvalidReplicaState;
 
         var reader = file.reader(self.io_impl.io(), &.{});
-        var payload: [16]u8 = undefined;
+        var payload: [applied_watermark_payload_len]u8 = undefined;
         try reader.interface.readSliceAll(&payload);
 
         const file_magic = std.mem.readInt(u32, payload[0..4], .little);
         if (file_magic != applied_watermark_magic) return error.InvalidReplicaState;
         const file_version = std.mem.readInt(u32, payload[4..8], .little);
         if (file_version != applied_watermark_version) return error.UnsupportedReplicaStateVersion;
+        if (std.mem.readInt(u32, payload[16..20], .little) != std.hash.Crc32.hash(payload[0..16]))
+            return error.InvalidReplicaState;
         const watermark = std.mem.readInt(u64, payload[8..16], .little);
         if (watermark > self.applied_index) self.applied_index = watermark;
     }
@@ -740,8 +748,10 @@ pub const WalReplicaState = struct {
             try self.store.restoreCompactionBoundary(compacted_index, compacted_term);
         }
 
-        const entry_count = try readInt(u32, bytes, &cursor);
+        const entry_count: usize = try readInt(u32, bytes, &cursor);
         if (entry_count > 0) {
+            if (entry_count > (bytes.len - cursor) / min_encoded_entry_len)
+                return error.InvalidReplicaState;
             const entries = try self.alloc.alloc(raft_engine.core.Entry, entry_count);
             defer raft_engine.core.types.freeEntries(self.alloc, entries);
             for (entries) |*entry| entry.* = try decodeEntry(self.alloc, bytes, &cursor);
@@ -833,8 +843,10 @@ pub const WalReplicaState = struct {
                     if (snapshot.metadata.index > self.applied_index) self.applied_index = snapshot.metadata.index;
                 }
 
-                const entry_count = try readInt(u32, bytes, &cursor);
+                const entry_count: usize = try readInt(u32, bytes, &cursor);
                 if (entry_count > 0) {
+                    if (entry_count > (bytes.len - cursor) / min_encoded_entry_len)
+                        return error.InvalidReplicaState;
                     const entries = try self.alloc.alloc(raft_engine.core.Entry, entry_count);
                     defer raft_engine.core.types.freeEntries(self.alloc, entries);
                     for (entries) |*entry| entry.* = try decodeEntry(self.alloc, bytes, &cursor);
@@ -882,14 +894,18 @@ pub const WalReplicaState = struct {
 
     fn readBool(bytes: []const u8, cursor: *usize) !bool {
         if (cursor.* >= bytes.len) return error.InvalidReplicaState;
-        const value = bytes[cursor.*] != 0;
+        const raw = bytes[cursor.*];
         cursor.* += 1;
-        return value;
+        return switch (raw) {
+            0 => false,
+            1 => true,
+            else => error.InvalidReplicaState,
+        };
     }
 
     fn readBytes(alloc: std.mem.Allocator, bytes: []const u8, cursor: *usize) ![]u8 {
-        const len = try readInt(u32, bytes, cursor);
-        if (cursor.* + len > bytes.len) return error.InvalidReplicaState;
+        const len: usize = try readInt(u32, bytes, cursor);
+        if (len > bytes.len - cursor.*) return error.InvalidReplicaState;
         defer cursor.* += len;
         return try alloc.dupe(u8, bytes[cursor.* .. cursor.* + len]);
     }
@@ -900,7 +916,9 @@ pub const WalReplicaState = struct {
     }
 
     fn decodeNodeList(alloc: std.mem.Allocator, bytes: []const u8, cursor: *usize) ![]u64 {
-        const len = try readInt(u32, bytes, cursor);
+        const len: usize = try readInt(u32, bytes, cursor);
+        if (len > max_conf_state_nodes or len > (bytes.len - cursor.*) / @sizeOf(u64))
+            return error.InvalidReplicaState;
         const out = try alloc.alloc(u64, len);
         errdefer alloc.free(out);
         for (out) |*node_id| node_id.* = try readInt(u64, bytes, cursor);
@@ -1400,7 +1418,57 @@ test "wal replica state tracks persist reasons separately" {
     try std.testing.expect(stats.wal_append_ns > 0);
     try std.testing.expect(stats.encoded_bytes > 0);
     try std.testing.expect(stats.applied_watermark_persist_ns > 0);
-    try std.testing.expectEqual(@as(u64, 16), stats.applied_watermark_bytes);
+    try std.testing.expectEqual(@as(u64, applied_watermark_payload_len), stats.applied_watermark_bytes);
+}
+
+test "wal replica state rejects corrupt or oversized applied watermark sidecars" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-watermark-integrity", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 208, 14);
+    defer layout.deinit(std.testing.allocator);
+
+    {
+        var state = try WalReplicaState.init(std.testing.allocator, layout, .{
+            .applied_watermark_persist_interval = 1,
+        });
+        defer state.deinit();
+        const data = try std.testing.allocator.dupe(u8, "one");
+        defer std.testing.allocator.free(data);
+        try state.groupStorage().persistReady(208, .{
+            .hard_state = .{ .current_term = 2, .voted_for = 1, .commit_index = 1 },
+            .entries = &.{.{ .term = 2, .index = 1, .data = data }},
+        });
+        try state.setAppliedIndex(1);
+    }
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/applied-watermark.bin", .{layout.log_dir});
+    defer std.testing.allocator.free(path);
+    const payload = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        std.testing.allocator,
+        .limited(applied_watermark_payload_len + 1),
+    );
+    defer std.testing.allocator.free(payload);
+    payload[8] ^= 0x40;
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = payload });
+    try std.testing.expectError(
+        error.InvalidReplicaState,
+        WalReplicaState.init(std.testing.allocator, layout, .{}),
+    );
+
+    payload[8] ^= 0x40;
+    const oversized = try std.testing.allocator.alloc(u8, payload.len + 1);
+    defer std.testing.allocator.free(oversized);
+    @memcpy(oversized[0..payload.len], payload);
+    oversized[payload.len] = 0;
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = oversized });
+    try std.testing.expectError(
+        error.InvalidReplicaState,
+        WalReplicaState.init(std.testing.allocator, layout, .{}),
+    );
 }
 
 test "wal replica state checkpoints and compacts delta records when replay debt crosses threshold" {

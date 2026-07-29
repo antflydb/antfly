@@ -43,7 +43,18 @@ pub fn resolveDocumentTransform(
 /// Keep this independent of document state so an unsupported request cannot
 /// become an acknowledged no-op merely because its target is absent.
 pub fn validateDocumentTransform(transform: types.DocumentTransform) !void {
-    for (transform.operations) |op| try validateTransformOpType(op.op);
+    for (transform.operations) |op| {
+        try validateTransformOpType(op.op);
+        const path = try normalizeJsonPath(op.path);
+        if (path.len == 0) return error.InvalidArgument;
+        switch (op.op) {
+            .unset => if (op.value_json != null) return error.InvalidArgument,
+            .set, .set_on_insert, .inc, .add_to_set, .max => {
+                if (op.value_json == null) return error.InvalidArgument;
+            },
+            else => unreachable,
+        }
+    }
 }
 
 pub fn validateTransformOpType(op: types.TransformOpType) !void {
@@ -128,7 +139,7 @@ fn setOp(
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
         defer parsed.deinit();
         break :blk try cloneJsonValue(alloc, parsed.value);
-    } else .null;
+    } else return error.InvalidArgument;
     errdefer freeJsonValue(alloc, &value);
     try setNestedValue(alloc, obj, normalized.slice(), value);
 }
@@ -475,6 +486,41 @@ test "unsupported transform on a missing document is rejected before no-op resol
         resolveDocumentTransform(std.testing.allocator, null, .{
             .key = "doc:missing",
             .operations = &operations,
+        }),
+    );
+}
+
+test "invalid transform shape is rejected before missing-document no-op resolution" {
+    const missing_value = [_]types.TransformOp{
+        .{ .op = .set, .path = "status" },
+    };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &missing_value,
+        }),
+    );
+
+    const unset_value = [_]types.TransformOp{
+        .{ .op = .unset, .path = "status", .value_json = "true" },
+    };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &unset_value,
+        }),
+    );
+
+    const invalid_path = [_]types.TransformOp{
+        .{ .op = .set, .path = "$", .value_json = "true" },
+    };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &invalid_path,
         }),
     );
 }

@@ -2834,13 +2834,18 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn requestReallocation(self: MetadataHttpNodeSimulation, requested_at_ms: u64) !void {
+        const request_id = self.cluster.next_reallocation_request_id;
+        self.cluster.next_reallocation_request_id +|= 1;
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
+            .request_id = request_id,
             .requested_at_ms = requested_at_ms,
         } });
     }
 
-    pub fn clearReallocationRequest(self: MetadataHttpNodeSimulation) !void {
-        try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{} });
+    pub fn clearReallocationRequest(self: MetadataHttpNodeSimulation, expected_request_id: u128) !void {
+        try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{
+            .expected_request_id = expected_request_id,
+        } });
     }
 
     pub fn applyReconciliationPlan(self: MetadataHttpNodeSimulation, plan: *const metadata_reconciler.ReconciliationPlan) !void {
@@ -2886,7 +2891,9 @@ pub const MetadataHttpNodeSimulation = struct {
         for (plan.range_removals) |group_id| try commands.append(self.cluster.alloc, .{ .remove_range = .{ .group_id = group_id } });
         for (plan.split_removals) |transition_id| try commands.append(self.cluster.alloc, .{ .remove_split_transition = .{ .transition_id = transition_id } });
         for (plan.merge_removals) |transition_id| try commands.append(self.cluster.alloc, .{ .remove_merge_transition = .{ .transition_id = transition_id } });
-        if (plan.clear_reallocation_request) try commands.append(self.cluster.alloc, .{ .remove_reallocation_request = .{} });
+        if (plan.clear_reallocation_request) |expected| try commands.append(self.cluster.alloc, .{
+            .remove_reallocation_request = .{ .expected_request_id = expected },
+        });
 
         try self.proposeTransitionCommands(commands.items);
     }
@@ -3085,6 +3092,7 @@ pub const MetadataHttpClusterSimulation = struct {
     manual_clock: *platform_clock.ManualClock,
     reconcile_lease_update_in_flight: bool = false,
     metadata_proposal_in_flight: usize = 0,
+    next_reallocation_request_id: u128 = 1,
 
     pub const ProgressPredicate = *const fn (*MetadataHttpClusterSimulation, *anyopaque) anyerror!bool;
     const min_pending_reconcile_lease_retry_ms: u64 = 250;

@@ -513,16 +513,20 @@ fn parseTransformOps(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
         const path_value = item.object.get("path") orelse return error.InvalidBatchRequest;
         if (path_value != .string) return error.InvalidBatchRequest;
         const op = try transformOpTypeFromString(op_value.string);
-        db_mod.transform.validateTransformOpType(op) catch return error.InvalidBatchRequest;
         const value_json = if (item.object.get("value")) |raw| try std.json.Stringify.valueAlloc(alloc, raw, .{}) else null;
         errdefer if (value_json) |json| alloc.free(json);
         const path = try alloc.dupe(u8, path_value.string);
         errdefer alloc.free(path);
-        ops[initialized] = .{
+        const parsed_op: db_mod.types.TransformOp = .{
             .op = op,
             .path = path,
             .value_json = value_json,
         };
+        db_mod.transform.validateDocumentTransform(.{
+            .key = "",
+            .operations = @constCast((&[_]db_mod.types.TransformOp{parsed_op})[0..]),
+        }) catch return error.InvalidBatchRequest;
+        ops[initialized] = parsed_op;
         initialized += 1;
     }
     return ops;
@@ -531,20 +535,10 @@ fn parseTransformOps(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
 fn transformOpTypeFromString(op: []const u8) !db_mod.types.TransformOpType {
     if (std.mem.eql(u8, op, "$set")) return .set;
     if (std.mem.eql(u8, op, "$setOnInsert")) return .set_on_insert;
-    if (std.mem.eql(u8, op, "$set_on_insert")) return .set_on_insert;
     if (std.mem.eql(u8, op, "$unset")) return .unset;
     if (std.mem.eql(u8, op, "$inc")) return .inc;
-    if (std.mem.eql(u8, op, "$push")) return .push;
-    if (std.mem.eql(u8, op, "$pull")) return .pull;
     if (std.mem.eql(u8, op, "$addToSet")) return .add_to_set;
-    if (std.mem.eql(u8, op, "$add_to_set")) return .add_to_set;
-    if (std.mem.eql(u8, op, "$pop")) return .pop;
-    if (std.mem.eql(u8, op, "$mul")) return .mul;
-    if (std.mem.eql(u8, op, "$min")) return .min;
     if (std.mem.eql(u8, op, "$max")) return .max;
-    if (std.mem.eql(u8, op, "$currentDate")) return .current_date;
-    if (std.mem.eql(u8, op, "$current_date")) return .current_date;
-    if (std.mem.eql(u8, op, "$rename")) return .rename;
     return error.InvalidBatchRequest;
 }
 
