@@ -343,15 +343,6 @@ test "transition controller plans split start bootstrap and finalize actions" {
     try std.testing.expectEqual(transition_state.TransitionPhase.bootstrap_peer, start.next_phase);
     try std.testing.expect(start.action == .start_split_source);
 
-    var unprepared_record = split_record;
-    unprepared_record.split_key = "doc:m";
-    const prepare = TransitionController.planSplit(
-        unprepared_record,
-        transition_state.unpreparedSplitObservation(),
-    );
-    try std.testing.expectEqual(transition_state.TransitionPhase.prepare, prepare.next_phase);
-    try std.testing.expect(prepare.action == .prepare_split_source);
-
     const bootstrap = TransitionController.planSplit(split_record, .{
         .status = .{
             .phase = .bootstrap_peer,

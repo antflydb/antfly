@@ -187,6 +187,7 @@ pub const PlacementPlanner = struct {
             );
             defer self.alloc.free(preserved);
             const forced_move = if (force_reallocate and
+                !protect_current_members and
                 !groupPlacementTransitionInFlight(current_intents, range.group_id) and
                 preserved.len >= replica_count)
                 selectBeneficialForcedMove(
@@ -1455,11 +1456,11 @@ test "placement planner preserves protected unconverged members during forced re
         .{ .record = .{ .group_id = 15101, .replica_id = 3, .local_node_id = 105 }, .peer_node_ids = &.{ 101, 102, 105 } },
     };
     const candidates = [_]CandidateDomain{
-        .{ .node_id = 101, .role = "data", .failure_domain = "rack-a", .retain_current = false },
-        .{ .node_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = false },
-        .{ .node_id = 103, .role = "data", .failure_domain = "rack-c", .retain_current = false },
-        .{ .node_id = 104, .role = "data", .failure_domain = "rack-d", .retain_current = false },
-        .{ .node_id = 105, .role = "data", .failure_domain = "rack-e", .retain_current = false },
+        .{ .node_id = 101, .role = "data", .failure_domain = "rack-a", .retain_current = false, .force_reallocate = true },
+        .{ .node_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = false, .force_reallocate = true },
+        .{ .node_id = 103, .role = "data", .failure_domain = "rack-c", .retain_current = false, .force_reallocate = true },
+        .{ .node_id = 104, .role = "data", .failure_domain = "rack-d", .retain_current = false, .force_reallocate = true },
+        .{ .node_id = 105, .role = "data", .failure_domain = "rack-e", .retain_current = false, .force_reallocate = true },
     };
 
     var planner = PlacementPlanner.init(std.testing.allocator);

@@ -246,7 +246,15 @@ pub const Reconciler = struct {
         var planner = placement_planner.PlacementPlanner.init(self.alloc);
         const desired_tables = try manager.listTables(self.alloc);
         defer manager.freeTables(self.alloc, desired_tables);
-        try self.syncAutomaticShardIntents(manager, current, now_monotonic_ms, now_realtime_ms);
+        var evidence = try StoreEvidenceIndex.init(self.alloc, current);
+        defer evidence.deinit();
+        try self.syncAutomaticShardIntents(
+            manager,
+            current,
+            &evidence,
+            now_monotonic_ms,
+            now_realtime_ms,
+        );
         const desired_ranges = try manager.listRanges(self.alloc);
         defer manager.freeRanges(self.alloc, desired_ranges);
         const desired_splits = try manager.listDesiredSplitTransitions(self.alloc);
@@ -285,23 +293,6 @@ pub const Reconciler = struct {
                 .force_reallocate = force_placement_reallocation,
             };
         }
-        var evidence = try StoreEvidenceIndex.init(self.alloc, current);
-        defer evidence.deinit();
-        try self.syncAutomaticShardIntents(
-            manager,
-            current,
-            &evidence,
-            now_monotonic_ms,
-            now_realtime_ms,
-        );
-        const desired_ranges = try manager.listRanges(self.alloc);
-        defer manager.freeRanges(self.alloc, desired_ranges);
-        const desired_splits = try manager.listDesiredSplitTransitions(self.alloc);
-        defer manager.freeSplitTransitions(self.alloc, desired_splits);
-        const desired_merges = try manager.listDesiredMergeTransitions(self.alloc);
-        defer manager.freeMergeTransitions(self.alloc, desired_merges);
-        const split_provisioning_ranges = try allocSplitProvisioningRanges(self.alloc, desired_ranges, desired_splits);
-        defer self.alloc.free(split_provisioning_ranges);
         const protected_placement_groups = try allocUnconvergedPlacementGroups(
             self.alloc,
             current,
