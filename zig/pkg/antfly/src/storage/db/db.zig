@@ -36212,10 +36212,11 @@ fn denseCoverageMatchesTarget(active_count: u64, expected_count: u64) bool {
 }
 
 fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !?u64 {
-    // Inline external vectors have no generated-enrichment incarnation.
-    // Their durable artifact counter remains authoritative.
+    // Inline external vectors have no generated-enrichment incarnation, while
+    // one source document can produce multiple chunk-backed vectors. Their
+    // durable artifact counter remains authoritative.
     if (ctx.index_manager.denseIndex(index_name)) |entry| {
-        if (entry.external) {
+        if (entry.external or entry.chunk_name != null) {
             return try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
         }
     }
