@@ -28,6 +28,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+pub const DecodeError = error{TruncatedInput};
+
 // ============================================================================
 // Lookup tables (computed at comptime)
 // ============================================================================
@@ -324,16 +326,38 @@ pub fn encode(alloc: Allocator, values: []const u32) !struct { control: []u8, da
 /// Decode StreamVByte format back to uint32 values.
 /// `n` is the number of values to decode.
 /// Returns owned slice. Caller must free with `alloc`.
-pub fn decode(alloc: Allocator, control: []const u8, data: []const u8, n: usize) ![]u32 {
+pub fn decode(alloc: Allocator, control: []const u8, data: []const u8, n: usize) (Allocator.Error || DecodeError)![]u32 {
     if (n == 0) return &.{};
 
     const result = try alloc.alloc(u32, n);
     errdefer alloc.free(result);
 
     const decoded = decodeInto(control, data, result);
-    _ = decoded;
+    if (decoded.decoded != n) return error.TruncatedInput;
 
     return result;
+}
+
+/// A deliberately scalar test oracle. Keep this separate from the vector
+/// implementation so differential tests do not share its shuffle path.
+fn decodeScalarReference(control: []const u8, data: []const u8, dst: []u32) DecodeError!struct { decoded: usize, data_consumed: usize } {
+    var data_pos: usize = 0;
+    var dst_pos: usize = 0;
+
+    for (control) |ctrl| {
+        for (0..4) |i| {
+            if (dst_pos == dst.len) return .{ .decoded = dst_pos, .data_consumed = data_pos };
+            const length: usize = @as(usize, ((ctrl >> @intCast(i * 2)) & 0x3)) + 1;
+            if (data_pos + length > data.len) return error.TruncatedInput;
+
+            var value: u32 = 0;
+            for (0..length) |b| value |= @as(u32, data[data_pos + b]) << @intCast(8 * b);
+            dst[dst_pos] = value;
+            dst_pos += 1;
+            data_pos += length;
+        }
+    }
+    return .{ .decoded = dst_pos, .data_consumed = data_pos };
 }
 
 /// Decode into a pre-allocated destination buffer.
@@ -543,6 +567,83 @@ test "decodeInto" {
     const result = decodeInto(encoded.control, encoded.data, &dst);
     try std.testing.expectEqual(@as(usize, 6), result.decoded);
     try std.testing.expectEqualSlices(u32, &values, &dst);
+}
+
+test "historical short tail fixture decodes without zero-filled output" {
+    const control = [_]u8{0xe4};
+    const data = [_]u8{ 0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03 };
+    const expected = [_]u32{ 0, 256, 131072, 50331648 };
+    var destination = [_]u32{0xDEADBEEF} ** 4;
+
+    const result = decodeInto(&control, &data, &destination);
+    try std.testing.expectEqual(@as(usize, 4), result.decoded);
+    try std.testing.expectEqual(@as(usize, 10), result.data_consumed);
+    try std.testing.expectEqualSlices(u32, &expected, &destination);
+    for (destination) |value| try std.testing.expect(value != 0xDEADBEEF);
+    try std.testing.expect(destination[1] != 0 and destination[2] != 0 and destination[3] != 0);
+}
+
+test "decodeInto matches independent scalar reference across controls and short tails" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_c0de);
+    const random = prng.random();
+    const counts = [_]usize{ 1, 2, 3, 4, 5, 15, 16, 17, 31, 32, 33 };
+
+    for (0..256) |control_value| {
+        const control = [_]u8{@intCast(control_value)};
+        var data: [16]u8 = undefined;
+        for (&data) |*byte| byte.* = random.int(u8);
+
+        var production_storage = [_]u32{0xDEADBEEF} ** 6;
+        var reference_storage = [_]u32{0xDEADBEEF} ** 6;
+        const production = decodeInto(&control, data[0..data_len_table[control[0]]], production_storage[1..5]);
+        const reference = try decodeScalarReference(&control, data[0..data_len_table[control[0]]], reference_storage[1..5]);
+        try std.testing.expectEqual(reference.decoded, production.decoded);
+        try std.testing.expectEqual(reference.data_consumed, production.data_consumed);
+        try std.testing.expectEqualSlices(u32, reference_storage[1..5], production_storage[1..5]);
+    }
+
+    for (counts) |count| {
+        const values = try std.testing.allocator.alloc(u32, count);
+        defer std.testing.allocator.free(values);
+        for (values, 0..) |*value, i| {
+            value.* = switch (i % 4) {
+                0 => random.intRangeAtMost(u32, 0, 0xff),
+                1 => random.intRangeAtMost(u32, 0x100, 0xffff),
+                2 => random.intRangeAtMost(u32, 0x1_0000, 0xff_ffff),
+                else => random.intRangeAtMost(u32, 0x1_000000, 0xffff_ffff),
+            };
+        }
+        const encoded = try encode(std.testing.allocator, values);
+        defer std.testing.allocator.free(encoded.control);
+        defer std.testing.allocator.free(encoded.data);
+
+        var input_storage: [133]u8 = undefined;
+        @memcpy(input_storage[1..][0..encoded.data.len], encoded.data);
+        const input = input_storage[1..][0..encoded.data.len];
+        const output_storage = try std.testing.allocator.alloc(u32, count + 2);
+        defer std.testing.allocator.free(output_storage);
+        const reference = try std.testing.allocator.alloc(u32, count);
+        defer std.testing.allocator.free(reference);
+        @memset(output_storage, 0xDEADBEEF);
+        @memset(reference, 0xDEADBEEF);
+
+        const production = decodeInto(encoded.control, input, output_storage[1..][0..count]);
+        const scalar = try decodeScalarReference(encoded.control, input, reference);
+        try std.testing.expectEqual(scalar.decoded, production.decoded);
+        try std.testing.expectEqual(scalar.data_consumed, production.data_consumed);
+        try std.testing.expectEqualSlices(u32, values, output_storage[1..][0..count]);
+        try std.testing.expectEqualSlices(u32, reference, output_storage[1..][0..count]);
+    }
+}
+
+test "decode rejects truncation inside a value but permits omitted unused partial padding" {
+    const control = [_]u8{0x01}; // first value is two bytes; the remaining slots are unused padding
+    const data = [_]u8{ 0x34, 0x12, 0x00, 0x00, 0x00 };
+
+    const decoded = try decode(std.testing.allocator, &control, data[0..2], 1);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u32, &[_]u32{0x1234}, decoded);
+    try std.testing.expectError(error.TruncatedInput, decode(std.testing.allocator, &control, data[0..1], 1));
 }
 
 test "SIMD group decoder handles every control byte" {

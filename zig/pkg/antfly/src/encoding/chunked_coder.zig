@@ -393,8 +393,9 @@ pub const ChunkedIntDecoder = struct {
         if (chunk >= self.chunk_offsets.len) return error.InvalidChunk;
 
         // Calculate chunk byte range
-        const start_off = self.data_start_offset + if (chunk > 0) self.chunk_offsets[chunk - 1] else 0;
-        const end_off = self.data_start_offset + self.chunk_offsets[chunk];
+        const start_off = std.math.add(u64, self.data_start_offset, if (chunk > 0) self.chunk_offsets[chunk - 1] else 0) catch return error.InvalidChunk;
+        const end_off = std.math.add(u64, self.data_start_offset, self.chunk_offsets[chunk]) catch return error.InvalidChunk;
+        if (start_off > end_off or end_off > self.data.len) return error.TruncatedInput;
         const chunk_bytes = self.data[@intCast(start_off)..@intCast(end_off)];
 
         if (chunk_bytes.len == 0) {
@@ -417,16 +418,20 @@ pub const ChunkedIntDecoder = struct {
 
         const num_values = readUvarint(chunk_bytes, &offset);
         const control_len = readUvarint(chunk_bytes, &offset);
+        if (control_len != svb.encodedControlLen(@intCast(num_values))) return error.InvalidChunk;
+        if (control_len > chunk_bytes.len -| offset) return error.TruncatedInput;
 
         const control = chunk_bytes[offset..][0..@intCast(control_len)];
         const data_bytes = chunk_bytes[offset + @as(usize, @intCast(control_len)) ..];
+        if (svb.dataLength(control) != data_bytes.len) return error.TruncatedInput;
 
         // Ensure capacity
         self.values.clearRetainingCapacity();
         try self.values.ensureTotalCapacity(self.alloc, @intCast(num_values));
         self.values.items.len = @intCast(num_values);
 
-        _ = svb.decodeInto(control, data_bytes, self.values.items);
+        const decoded = svb.decodeInto(control, data_bytes, self.values.items);
+        if (decoded.decoded != self.values.items.len) return error.TruncatedInput;
 
         // Delta decode if needed
         if (self.format == .stream_vbyte_delta) {
@@ -505,19 +510,25 @@ pub const ChunkedIntDecoder = struct {
     fn readColumn(self: *ChunkedIntDecoder, chunk_bytes: []const u8, offset: *usize, num_values: usize) ![]u32 {
         const ctrl_len = readUvarint(chunk_bytes, offset);
         if (ctrl_len == 0) {
+            if (num_values != 0) return error.InvalidChunk;
             return try self.alloc.alloc(u32, 0);
         }
+        if (ctrl_len != svb.encodedControlLen(num_values)) return error.InvalidChunk;
+        if (ctrl_len > chunk_bytes.len -| offset.*) return error.TruncatedInput;
 
         const control = chunk_bytes[offset.*..][0..@intCast(ctrl_len)];
         offset.* += @intCast(ctrl_len);
 
         // Calculate data length from control bytes
         const data_len = svb.dataLength(control);
+        if (data_len > chunk_bytes.len -| offset.*) return error.TruncatedInput;
         const data_bytes = chunk_bytes[offset.*..][0..data_len];
         offset.* += data_len;
 
         const result = try self.alloc.alloc(u32, num_values);
-        _ = svb.decodeInto(control, data_bytes, result);
+        errdefer self.alloc.free(result);
+        const decoded = svb.decodeInto(control, data_bytes, result);
+        if (decoded.decoded != num_values) return error.TruncatedInput;
         return result;
     }
 
@@ -756,6 +767,20 @@ test "ChunkedIntDecoder readValues batch" {
     try std.testing.expectEqual(@as(u32, 100), batch.?[2]); // start
     try std.testing.expectEqual(@as(u32, 110), batch.?[3]); // end
     try std.testing.expectEqual(@as(u32, 0), batch.?[4]); // numAP
+}
+
+test "ChunkedIntDecoder rejects a truncated StreamVByte value" {
+    const alloc = std.testing.allocator;
+    var enc = try ChunkedIntEncoder.initWithMode(alloc, 1024, 1, .stream_vbyte);
+    defer enc.deinit();
+    try enc.add(0, &[_]u32{ 0x1234, 0x5678, 0x9abc, 0xdef0 });
+    try enc.close();
+
+    const bytes = try enc.toBytes();
+    defer alloc.free(bytes);
+    var dec = try ChunkedIntDecoder.init(alloc, bytes[0 .. bytes.len - 1], 0);
+    defer dec.deinit();
+    try std.testing.expectError(error.TruncatedInput, dec.loadChunk(0));
 }
 
 test "prependEmptyChunks shifts chunk table without reencoding payload" {
