@@ -36,8 +36,8 @@ type AntflyHandler interface {
 	ListIndexes(ctx context.Context, tableName string) ([]IndexInfo, error)
 	Query(ctx context.Context, req QueryRequest) (*QueryResult, error)
 	Batch(ctx context.Context, tableName string, inserts map[string]any, deletes []string) (*BatchResult, error)
-	Backup(ctx context.Context, tableName, backupID, location string) error
-	Restore(ctx context.Context, tableName, backupID, location string) error
+	Backup(ctx context.Context, tableName, backupID, connection, location string) error
+	Restore(ctx context.Context, tableName, backupID, connection, location string) error
 }
 
 // TableInfo describes a table for MCP display and structured output.
@@ -126,16 +126,18 @@ type QueryArgs struct {
 
 // BackupArgs defines the backup tool parameters.
 type BackupArgs struct {
-	TableName string `json:"tableName" mcp:"name of the table to backup"`
-	BackupID  string `json:"backupId"  mcp:"unique identifier for the backup"`
-	Location  string `json:"location"  mcp:"backup location (e.g., file:///path/to/backup)"`
+	TableName  string `json:"tableName"  mcp:"name of the table to backup"`
+	BackupID   string `json:"backupId"   mcp:"unique identifier for the backup"`
+	Connection string `json:"connection" mcp:"external_io connection authorized for backup.write"`
+	Location   string `json:"location"   mcp:"backup location (e.g., file:///path/to/backup)"`
 }
 
 // RestoreArgs defines the restore tool parameters.
 type RestoreArgs struct {
-	TableName string `json:"tableName" mcp:"name of the table to restore into"`
-	BackupID  string `json:"backupId"  mcp:"backup identifier to restore from"`
-	Location  string `json:"location"  mcp:"backup location"`
+	TableName  string `json:"tableName"  mcp:"name of the table to restore into"`
+	BackupID   string `json:"backupId"   mcp:"backup identifier to restore from"`
+	Connection string `json:"connection" mcp:"external_io connection authorized for restore.read"`
+	Location   string `json:"location"   mcp:"backup location"`
 }
 
 // BatchArgs defines the batch tool parameters.
@@ -533,7 +535,7 @@ func (s *AntflyMCPServer) Backup(
 ) (*mcp.CallToolResult, map[string]any, error) {
 	var res mcp.CallToolResult
 
-	err := s.handler.Backup(ctx, args.TableName, args.BackupID, args.Location)
+	err := s.handler.Backup(ctx, args.TableName, args.BackupID, args.Connection, args.Location)
 	if err != nil {
 		res.Content = []mcp.Content{
 			&mcp.TextContent{Text: "Failed to create backup: " + err.Error()},
@@ -561,7 +563,7 @@ func (s *AntflyMCPServer) Restore(
 ) (*mcp.CallToolResult, map[string]any, error) {
 	var res mcp.CallToolResult
 
-	err := s.handler.Restore(ctx, args.TableName, args.BackupID, args.Location)
+	err := s.handler.Restore(ctx, args.TableName, args.BackupID, args.Connection, args.Location)
 	if err != nil {
 		res.Content = []mcp.Content{
 			&mcp.TextContent{Text: "Failed to restore from backup: " + err.Error()},

@@ -23,9 +23,14 @@ const query_contract = @import("query_contract.zig");
 pub const QueryResponse = query_contract.QueryResponse;
 pub const QueryResponseMeta = query_contract.QueryResponseMeta;
 pub const OwnedQueryRequest = query_contract.OwnedQueryRequest;
+pub const PublicFilterQueryErrorKind = query_contract.PublicFilterQueryErrorKind;
 
 pub const parseQueryRequest = query_contract.parseQueryRequest;
 pub const parsePublicQueryRequest = query_contract.parsePublicQueryRequest;
+pub const parsePublicQueryRequestWithDeadline = query_contract.parsePublicQueryRequestWithDeadline;
+pub const isPublicQueryValidationError = query_contract.isPublicQueryValidationError;
+pub const publicFilterQueryErrorStatus = query_contract.publicFilterQueryErrorStatus;
+pub const encodePublicFilterQueryErrorBodyAlloc = query_contract.encodePublicFilterQueryErrorBodyAlloc;
 pub const parseAggregationRequestsJson = query_contract.parseAggregationRequestsJson;
 pub const freeAggregationRequests = query_contract.freeAggregationRequests;
 pub const encodeQueryResponses = query_contract.encodeQueryResponses;

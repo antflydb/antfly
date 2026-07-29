@@ -2853,9 +2853,17 @@ paths:
         - All shard data (compressed with zstd)
 
 
-        The backup creates a cluster-level manifest that tracks all included tables
+        A non-empty backup publishes a cluster-level manifest only after every
 
-        and their individual backup locations.
+        requested table backup is durable. The manifest is the final commit
+
+        point and records complete expected/completed table counts. A `partial`
+
+        or `failed` attempt returns per-table diagnostics but does not publish a
+
+        restorable aggregate manifest. A cluster with no selected tables returns
+
+        `400` without writing a backup artifact.
 
 
         Backup IDs are immutable. Reusing an ID that already has a published
@@ -2896,6 +2904,8 @@ paths:
             is fully successful, while `partial` or `failed` reports per-table
 
             failures even though the request itself was processed successfully.
+
+            Only `completed` publishes a restorable cluster manifest.
           content:
             application/json:
               schema:
@@ -10133,20 +10143,24 @@ components:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
           description: >
-            Antfly query to filter documents. Only documents matching this query
+            Structured subset of the Antfly query AST used to filter a primary-key
 
-            are included in results. Uses the sear library for efficient per-document
+            scan. Only documents matching this query are included in results.
 
-            matching without requiring a full index.
+            Because scans do not open a text index, text-index-only variants such
+
+            as phrase and multi-match queries are rejected with a validation error
+
+            instead of being evaluated with slower stored-document semantics.
 
 
             Examples:
 
-            - Status filtering: `{"query": "status:published"}`
+            - Status filtering: `{"term":{"path":"/status","value":"published"}}`
 
-            - Date ranges: `{"query": "created_at:>2023-01-01"}`
+            - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}`
 
-            - Field matching: `{"query": "category:technology"}`
+            - Field existence: `{"exists":{"path":"/category"}}`
         limit:
           type: integer
           minimum: 1
@@ -10886,6 +10900,7 @@ components:
           example: portable
         table_names:
           type: array
+          minItems: 1
           maxItems: 256
           uniqueItems: true
           items:
@@ -12321,16 +12336,16 @@ components:
 
             - `bool.must` is scoring query input.
 
-            - `bool.filter` is a non-scoring structured filter.
+            - `bool.filter` is non-scoring query input.
 
-            - `bool.must_not` is a structured exclusion filter.
+            - `bool.must_not` is non-scoring exclusion query input.
 
 
-            The same AST accepts direct structured filters using `field` or JSON-pointer
+            Filter branches accept the same query variants as `filter_query` and
 
-            `path`, scalar `term` values, multi-value `terms`, and `exists`.
+            `exclusion_query`. Structured clauses use the native document-value
 
-            Query-string objects remain supported as a full-text escape hatch.
+            path; text clauses are resolved through the text index before scoring.
           example:
             bool:
               must:
@@ -16556,14 +16571,6 @@ components:
           $ref: '#/components/schemas/Boost'
       required:
         - term
-    Fuzziness:
-      description: The fuzziness of the query. Can be an integer or "auto".
-      anyOf:
-        - type: integer
-          format: int32
-        - type: string
-          enum:
-            - auto
     MatchQuery:
       type: object
       properties:
@@ -16575,16 +16582,6 @@ components:
           type: string
         boost:
           $ref: '#/components/schemas/Boost'
-        prefix_length:
-          type: integer
-          format: int32
-        fuzziness:
-          $ref: '#/components/schemas/Fuzziness'
-        operator:
-          type: string
-          enum:
-            - or
-            - and
       required:
         - match
     MultiMatchBody:
@@ -16614,6 +16611,16 @@ components:
           $ref: '#/components/schemas/MultiMatchBody'
       required:
         - multi_match
+    Fuzziness:
+      description: The fuzziness of the query. Can be an integer or "auto".
+      anyOf:
+        - type: integer
+          format: int32
+          minimum: 0
+          maximum: 2
+        - type: string
+          enum:
+            - auto
     MatchPhraseQuery:
       type: object
       properties:
@@ -16669,6 +16676,8 @@ components:
         prefix_length:
           type: integer
           format: int32
+          minimum: 0
+          maximum: 255
         fuzziness:
           $ref: '#/components/schemas/Fuzziness'
         field:
@@ -17163,10 +17172,10 @@ components:
           type: integer
           format: uint64
           description: Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: ^[0-9a-f]{16}$
           description: Projection configuration identity associated with the durable checkpoint.
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -17336,6 +17345,153 @@ components:
         degraded:
           type: boolean
           description: Whether coverage is complete under best_effort but includes terminal failures.
+    EnrichmentRuntimeStatus:
+      type: object
+      additionalProperties: false
+      description: Runtime state for the durable embeddings enrichment worker.
+      required:
+        - enabled
+        - target_sequence
+        - applied_sequence
+        - pending_sequence_count
+        - projection_checkpoint_status
+        - projection_checkpoint_applied_sequence
+        - projection_checkpoint_generation
+        - projection_checkpoint_config_fingerprint
+        - projection_checkpoint_identity_consistent
+        - checkpoint_replay_tail_sequence_count
+        - processed_requests
+        - error_count
+        - retryable_error_count
+        - fatal_error_count
+        - retrying
+        - worker_failed
+        - worker_started
+        - stalled
+        - skip_by_hash_count
+        - skipped_source_count
+        - codec_decode_failures
+        - embed_batches_started
+        - embed_batches_completed
+        - embed_items_started
+        - embed_items_completed
+        - active_embed_batch_items
+        - active_embed_batch_bytes
+        - active_embed_batch_max_bytes
+        - active_embed_batch_started_ms
+        - last_embed_batch_items
+        - last_embed_batch_bytes
+        - last_embed_batch_max_bytes
+        - last_embed_batch_completed_ms
+        - last_embed_batch_ns
+        - total_embed_ns
+      properties:
+        enabled:
+          type: boolean
+        target_sequence:
+          type: integer
+          format: uint64
+        applied_sequence:
+          type: integer
+          format: uint64
+        pending_sequence_count:
+          type: integer
+          format: uint64
+        projection_checkpoint_status:
+          type: string
+        projection_checkpoint_applied_sequence:
+          type: integer
+          format: uint64
+        projection_checkpoint_generation:
+          type: integer
+          format: uint64
+        projection_checkpoint_config_fingerprint:
+          type: string
+          pattern: ^[0-9a-f]{16}$
+        projection_checkpoint_identity_consistent:
+          type: boolean
+          description: Whether every shard contributing to this status reports the same checkpoint generation
+            and configuration identity.
+        checkpoint_replay_tail_sequence_count:
+          type: integer
+          format: uint64
+        processed_requests:
+          type: integer
+          format: uint64
+        error_count:
+          type: integer
+          format: uint64
+        retryable_error_count:
+          type: integer
+          format: uint64
+        fatal_error_count:
+          type: integer
+          format: uint64
+        retrying:
+          type: boolean
+        worker_failed:
+          type: boolean
+        worker_started:
+          type: boolean
+          description: Whether the background enrichment worker is currently running.
+        stalled:
+          type: boolean
+          description: Whether work is pending with no running worker, retry, or terminal failure explaining
+            the backlog.
+        skip_by_hash_count:
+          type: integer
+          format: uint64
+        skipped_source_count:
+          type: integer
+          format: uint64
+        codec_decode_failures:
+          type: integer
+          format: uint64
+        embed_batches_started:
+          type: integer
+          format: uint64
+        embed_batches_completed:
+          type: integer
+          format: uint64
+        embed_items_started:
+          type: integer
+          format: uint64
+        embed_items_completed:
+          type: integer
+          format: uint64
+        active_embed_batch_items:
+          type: integer
+          format: uint64
+        active_embed_batch_bytes:
+          type: integer
+          format: uint64
+        active_embed_batch_max_bytes:
+          type: integer
+          format: uint64
+        active_embed_batch_started_ms:
+          type: integer
+          format: uint64
+        last_embed_batch_items:
+          type: integer
+          format: uint64
+        last_embed_batch_bytes:
+          type: integer
+          format: uint64
+        last_embed_batch_max_bytes:
+          type: integer
+          format: uint64
+        last_embed_batch_completed_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock completion time in Unix milliseconds for the most recently completed
+            embedding batch.
+        last_embed_batch_ns:
+          type: integer
+          format: uint64
+          description: Elapsed duration in nanoseconds for the most recently completed embedding batch.
+        total_embed_ns:
+          type: integer
+          format: uint64
     EmbeddingsIndexStats:
       type: object
       description: Statistics for an embeddings index (dense or sparse)
@@ -17482,14 +17638,7 @@ components:
           type: integer
           format: uint64
         enrichment_runtime:
-          x-go-type-skip-optional-pointer: true
-          type: object
-          additionalProperties: true
-          properties:
-            pending_sequence_count:
-              type: integer
-              format: uint64
-          description: Embedding enrichment worker runtime diagnostics.
+          $ref: '#/components/schemas/EnrichmentRuntimeStatus'
         hbc_cache:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -17516,10 +17665,10 @@ components:
           type: integer
           format: uint64
           description: Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: ^[0-9a-f]{16}$
           description: Projection configuration identity associated with the durable checkpoint.
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -17721,10 +17870,10 @@ components:
           type: integer
           format: uint64
           description: Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: ^[0-9a-f]{16}$
           description: Projection configuration identity associated with the durable checkpoint.
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -18013,10 +18162,10 @@ components:
           type: integer
           format: uint64
           description: Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: ^[0-9a-f]{16}$
           description: Projection configuration identity associated with the durable checkpoint.
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -21602,11 +21751,11 @@ components:
 
             Models are automatically unloaded after this duration of inactivity.
 
-            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
 
-            Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
+            Defaults to "5m". Set to "0" to disable idle-time eviction; models can
 
-            where all models are loaded at startup and never unloaded.
+            still be evicted under resource pressure or to enforce max_loaded_models.
           default: 5m
           example: 5m
         max_loaded_models:
@@ -21616,8 +21765,10 @@ components:
 
             generators, chunkers, etc.). When the limit is reached, the least-recently-used
 
-            idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-          default: 0
+            idle model from any registry is evicted to make room. Set to 0 for unlimited.
+
+            Defaults to 10.
+          default: 10
           example: 3
         pool_size:
           type: integer
@@ -21736,11 +21887,9 @@ components:
           description: >
             Per-model loading strategy overrides. Maps model names to their loading strategy.
 
-            Models not in this map use the default strategy based on keep_alive:
+            Models not in this map load on demand. keep_alive controls their idle
 
-            - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-
-            - If keep_alive="0": eager loading (load at startup, never unload)
+            eviction; setting it to "0" disables idle eviction but does not preload or pin them.
 
 
             When a model has strategy "eager" in this map:

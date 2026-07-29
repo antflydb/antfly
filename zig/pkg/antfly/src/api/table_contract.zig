@@ -20,8 +20,56 @@ fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
 
+pub const CreateTableRequestErrorDisposition = enum {
+    bad_request,
+    internal_failure,
+};
+
+/// Keep the HTTP boundary fail-closed: only errors that are known to describe
+/// malformed client input become 400 responses. Allocation, entropy, I/O, and
+/// any future operational failures must retain their error identity so the
+/// server can surface a 500 and preserve operational observability.
+pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDisposition {
+    return switch (err) {
+        error.InvalidCreateTableRequest,
+        error.InvalidCreateTableSchemaRequest,
+        error.InvalidSchemaUpdateRequest,
+        error.SyntaxError,
+        error.UnexpectedEndOfInput,
+        error.UnexpectedToken,
+        error.InvalidNumber,
+        error.Overflow,
+        error.InvalidEnumTag,
+        error.DuplicateField,
+        error.UnknownField,
+        error.MissingField,
+        error.LengthMismatch,
+        error.InvalidCharacter,
+        error.ValueTooLong,
+        => .bad_request,
+        else => .internal_failure,
+    };
+}
+
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tables_api.CreateTableRequest {
     if (body.len == 0) return .{};
+
+    // Validate and normalize indexes from the raw request before invoking the
+    // generated parser. The generated OpenAPI parser rejects unknown enum
+    // values, and this function historically fell back to the more permissive
+    // internal parser on any generated-parser error. That allowed an unknown
+    // index type to reach catalog publication before local admission rejected
+    // it. Performing public index validation first keeps the compatibility
+    // fallback without making it an admission bypass.
+    var raw_parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer raw_parsed.deinit();
+    const raw_root = switch (raw_parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+    if (raw_root.get("indexes")) |indexes_value| {
+        if (indexes_value != .null) try validateCreateTableIndexesValue(indexes_value);
+    }
 
     // Use typed OpenAPI parsing for scalar fields (num_shards, description, schema,
     // replication_sources). For indexes, parse from the raw body to preserve
@@ -42,13 +90,6 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         req.description = try alloc.dupe(u8, description);
     }
 
-    // Extract indexes from raw body to preserve all fields.
-    var raw_parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
-    defer raw_parsed.deinit();
-    const raw_root = switch (raw_parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidCreateTableRequest,
-    };
     if (raw_root.get("indexes")) |indexes_value| {
         if (indexes_value != .null)
             req.indexes_json = try normalizeCreateTableIndexesFromValue(alloc, indexes_value)
@@ -297,6 +338,28 @@ fn validatePublicIndexObject(object: anytype) !void {
     const index_type = extractPublicIndexType(object) orelse "full_text";
     if (std.mem.eql(u8, index_type, "full_text")) {
         try validatePublicFullTextIndexObject(object);
+        return;
+    }
+    if (std.mem.eql(u8, index_type, "embeddings") or
+        std.mem.eql(u8, index_type, "graph") or
+        std.mem.eql(u8, index_type, "algebraic"))
+    {
+        return;
+    }
+    return error.InvalidCreateIndexRequest;
+}
+
+fn validateCreateTableIndexesValue(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
+        try validateCreateTableIndexName(entry.key_ptr.*);
+        validatePublicIndexObject(entry.value_ptr.object) catch return error.InvalidCreateTableRequest;
     }
 }
 
@@ -719,6 +782,45 @@ test "table contract rejects reserved full text index names on create table" {
             std.testing.allocator,
             "{\"indexes\":{\"full_text_index_v1\":{\"type\":\"embeddings\",\"dimension\":3}}}",
         ),
+    );
+}
+
+test "table contract rejects unsupported index kinds before catalog admission" {
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"unsupported_idx\":{\"type\":\"unsupported\"}}}",
+        ),
+    );
+}
+
+test "table contract keeps operational create request failures on the internal error path" {
+    try std.testing.expectEqual(
+        CreateTableRequestErrorDisposition.bad_request,
+        classifyCreateTableRequestError(error.InvalidCreateTableRequest),
+    );
+    try std.testing.expectEqual(
+        CreateTableRequestErrorDisposition.bad_request,
+        classifyCreateTableRequestError(error.SyntaxError),
+    );
+    try std.testing.expectEqual(
+        CreateTableRequestErrorDisposition.internal_failure,
+        classifyCreateTableRequestError(error.OutOfMemory),
+    );
+    try std.testing.expectEqual(
+        CreateTableRequestErrorDisposition.internal_failure,
+        classifyCreateTableRequestError(error.EntropyUnavailable),
+    );
+    try std.testing.expectEqual(
+        CreateTableRequestErrorDisposition.internal_failure,
+        classifyCreateTableRequestError(error.Canceled),
+    );
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        parseCreateTableRequest(failing.allocator(), "{}"),
     );
 }
 

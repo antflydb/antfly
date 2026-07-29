@@ -175,8 +175,8 @@ test "metadata admin helpers filter snapshot state" {
         .{ .record = .{ .group_id = 20, .replica_id = 3, .local_node_id = 3, .bootstrap_mode = .persisted }, .peer_node_ids = group20_peers[0..] },
     };
     var split_transitions = [_]transition_state.SplitTransitionRecord{
-        .{ .transition_id = 9001, .source_group_id = 10, .destination_group_id = 12, .phase = .bootstrap_peer },
-        .{ .transition_id = 9002, .source_group_id = 11, .destination_group_id = 13, .phase = .finalized },
+        .{ .transition_id = 9001, .attempt_epoch = 1, .source_group_id = 10, .destination_group_id = 12, .phase = .bootstrap_peer },
+        .{ .transition_id = 9002, .attempt_epoch = 1, .source_group_id = 11, .destination_group_id = 13, .phase = .finalized },
     };
     var merge_transitions = [_]transition_state.MergeTransitionRecord{
         .{ .transition_id = 9010, .donor_group_id = 20, .receiver_group_id = 10, .phase = .prepare },

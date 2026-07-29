@@ -12,6 +12,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.cluster_data_status import ClusterDataStatus
+    from ..models.runtime_config_status import RuntimeConfigStatus
     from ..models.secret_store_status import SecretStoreStatus
     from ..models.storage_runtime_status import StorageRuntimeStatus
 
@@ -30,6 +31,8 @@ class ClusterTopology:
         deployment_mode (ClusterTopologyDeploymentMode | Unset): Runtime deployment topology
         secret_store (SecretStoreStatus | Unset): Non-secret status for the local secrets file store, when one is
             available.
+        runtime_config (RuntimeConfigStatus | Unset): Non-secret status for the applied config.json snapshot. Hot
+            publication accepts validated remote_content-only changes; startup-only changes remain stale until restart.
         storage (StorageRuntimeStatus | Unset):
     """
 
@@ -39,6 +42,7 @@ class ClusterTopology:
     auth_enabled: bool | Unset = UNSET
     deployment_mode: ClusterTopologyDeploymentMode | Unset = UNSET
     secret_store: SecretStoreStatus | Unset = UNSET
+    runtime_config: RuntimeConfigStatus | Unset = UNSET
     storage: StorageRuntimeStatus | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -58,6 +62,10 @@ class ClusterTopology:
         secret_store: dict[str, Any] | Unset = UNSET
         if not isinstance(self.secret_store, Unset):
             secret_store = self.secret_store.to_dict()
+
+        runtime_config: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.runtime_config, Unset):
+            runtime_config = self.runtime_config.to_dict()
 
         storage: dict[str, Any] | Unset = UNSET
         if not isinstance(self.storage, Unset):
@@ -79,6 +87,8 @@ class ClusterTopology:
             field_dict["deployment_mode"] = deployment_mode
         if secret_store is not UNSET:
             field_dict["secret_store"] = secret_store
+        if runtime_config is not UNSET:
+            field_dict["runtime_config"] = runtime_config
         if storage is not UNSET:
             field_dict["storage"] = storage
 
@@ -87,6 +97,7 @@ class ClusterTopology:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.cluster_data_status import ClusterDataStatus
+        from ..models.runtime_config_status import RuntimeConfigStatus
         from ..models.secret_store_status import SecretStoreStatus
         from ..models.storage_runtime_status import StorageRuntimeStatus
 
@@ -113,6 +124,13 @@ class ClusterTopology:
         else:
             secret_store = SecretStoreStatus.from_dict(_secret_store)
 
+        _runtime_config = d.pop("runtime_config", UNSET)
+        runtime_config: RuntimeConfigStatus | Unset
+        if isinstance(_runtime_config, Unset):
+            runtime_config = UNSET
+        else:
+            runtime_config = RuntimeConfigStatus.from_dict(_runtime_config)
+
         _storage = d.pop("storage", UNSET)
         storage: StorageRuntimeStatus | Unset
         if isinstance(_storage, Unset):
@@ -127,6 +145,7 @@ class ClusterTopology:
             auth_enabled=auth_enabled,
             deployment_mode=deployment_mode,
             secret_store=secret_store,
+            runtime_config=runtime_config,
             storage=storage,
         )
 

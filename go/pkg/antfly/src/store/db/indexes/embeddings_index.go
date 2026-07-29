@@ -473,7 +473,7 @@ func (s *EmbeddingIndex) Stats() IndexStats {
 		is.BackfillActive = es.Backfilling
 		is.BackfillProgress = es.BackfillProgress
 		pending := uint64(es.WALBacklog) //nolint:gosec // G115: WALBacklog is non-negative
-		is.EnrichmentRuntime.PendingSequenceCount = &pending
+		is.EnrichmentRuntime.PendingSequenceCount = pending
 	}
 
 	return is.AsIndexStats()

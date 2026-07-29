@@ -1172,6 +1172,22 @@ pub const SparseIndex = struct {
             self.* = .none;
         }
 
+        fn abandonAfterCrash(self: *StoreOwner, alloc: Allocator) void {
+            switch (self.*) {
+                .none => {},
+                .lmdb => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
+                .mem => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
+                .lsm => |*handle| handle.abandonAfterCrash(),
+            }
+            self.* = .none;
+        }
+
         fn sync(self: *StoreOwner, force: bool) !void {
             switch (self.*) {
                 .none, .mem => {},
@@ -1384,6 +1400,12 @@ pub const SparseIndex = struct {
     pub fn close(self: *SparseIndex) void {
         self.store.deinit();
         self.owner.close(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn abandonAfterCrash(self: *SparseIndex) void {
+        self.store.deinit();
+        self.owner.abandonAfterCrash(self.alloc);
         self.* = undefined;
     }
 

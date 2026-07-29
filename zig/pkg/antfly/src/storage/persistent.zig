@@ -268,7 +268,14 @@ const SegmentFileStore = struct {
         errdefer allocator.free(owned_root);
 
         if (storage) |provided| {
-            if (create_if_missing) try provided.createDirPath(owned_root);
+            if (create_if_missing) {
+                try provided.createDirPath(owned_root);
+                // Segment publication fsyncs each immutable file and its
+                // containing directory. Publish the directory entry itself
+                // first so those acknowledged files remain reachable after a
+                // crash that follows initial index creation.
+                try provided.syncParentAbsolute(owned_root);
+            }
             return .{
                 .allocator = allocator,
                 .root_dir = owned_root,
@@ -280,7 +287,10 @@ const SegmentFileStore = struct {
         errdefer allocator.destroy(owner);
         owner.* = try storage_io.NativeStorage.init(allocator, io_runtime);
         errdefer owner.deinit();
-        if (create_if_missing) try owner.storage().createDirPath(owned_root);
+        if (create_if_missing) {
+            try owner.storage().createDirPath(owned_root);
+            try owner.storage().syncParentAbsolute(owned_root);
+        }
 
         return .{
             .allocator = allocator,
@@ -313,7 +323,10 @@ const SegmentFileStore = struct {
         try writer.appendSlice(bytes);
         active = false;
         writer.finish() catch |err| {
-            if (builtin.os.tag != .freestanding) std.log.err("text segment atomic finish failed: {s}", .{@errorName(err)});
+            // The atomic writer preserves the previously published segment on
+            // failure and the caller receives the error for retry/rollback.
+            // This is an operational write failure, not an invariant breach.
+            if (builtin.os.tag != .freestanding) std.log.warn("text segment atomic finish failed: {s}", .{@errorName(err)});
             return err;
         };
 
@@ -609,6 +622,21 @@ const MainStoreOwner = union(enum) {
                 alloc.destroy(backend);
             },
             .lsm => |*handle| handle.close(),
+        }
+        self.* = undefined;
+    }
+
+    fn abandonAfterCrash(self: *MainStoreOwner, alloc: Allocator) void {
+        switch (self.*) {
+            .lmdb => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
+            .mem => |backend| {
+                backend.close();
+                alloc.destroy(backend);
+            },
+            .lsm => |*handle| handle.abandonAfterCrash(),
         }
         self.* = undefined;
     }
@@ -1119,6 +1147,20 @@ pub const PersistentIndex = struct {
         self.wal.close();
         self.main_store.deinit();
         self.main_store_owner.close(self.alloc);
+        if (self.retired_segment_file_deleter) |deleter| deleter.deinit();
+        if (self.segment_files) |*store| store.close();
+        self.unlockStorage();
+        self.* = undefined;
+    }
+
+    /// Tears down a pre-crash owner without allowing it to flush, compact, or
+    /// reclaim files after storage has been rolled back to a durable snapshot.
+    pub fn abandonAfterCrash(self: *PersistentIndex) void {
+        self.lockStorage();
+        self.writer.deinit();
+        self.wal.abandonAfterCrash();
+        self.main_store.deinit();
+        self.main_store_owner.abandonAfterCrash(self.alloc);
         if (self.retired_segment_file_deleter) |deleter| deleter.deinit();
         if (self.segment_files) |*store| store.close();
         self.unlockStorage();

@@ -197,7 +197,8 @@ pub const StdHttpListener = struct {
         if (self.thread) |thread| {
             if (bound_addr) |addr| {
                 const wake_io = std.Io.Threaded.global_single_threaded.io();
-                if (addr.connect(wake_io, .{ .mode = .stream })) |stream| {
+                const wake_addr = listenerWakeAddress(addr);
+                if (wake_addr.connect(wake_io, .{ .mode = .stream })) |stream| {
                     var wake_stream = stream;
                     wake_stream.close(wake_io);
                 } else |_| {}
@@ -216,6 +217,19 @@ pub const StdHttpListener = struct {
         }
     }
 
+    fn listenerWakeAddress(bound: std.Io.net.IpAddress) std.Io.net.IpAddress {
+        return switch (bound) {
+            .ip4 => |addr| if (std.mem.allEqual(u8, &addr.bytes, 0))
+                .{ .ip4 = std.Io.net.Ip4Address.loopback(addr.port) }
+            else
+                bound,
+            .ip6 => |addr| if (std.mem.allEqual(u8, &addr.bytes, 0))
+                .{ .ip6 = std.Io.net.Ip6Address.loopback(addr.port) }
+            else
+                bound,
+        };
+    }
+
     pub fn boundAddress(self: *const StdHttpListener) ?std.Io.net.IpAddress {
         const server = self.server orelse return null;
         return server.socket.address;
@@ -228,8 +242,6 @@ pub const StdHttpListener = struct {
 
     fn serve(self: *StdHttpListener) void {
         const io = self.io_impl.io();
-        var connection_group = std.Io.Group.init;
-        defer connection_group.await(io) catch {};
         defer if (self.stopping.load(.acquire)) self.shutdownActiveStreams(io);
         var slot_held = false;
         defer if (slot_held) self.releaseConnectionThreadSlot();
@@ -267,14 +279,25 @@ pub const StdHttpListener = struct {
                 return;
             }
             if (self.cfg.serve_in_connection_threads) {
-                connection_group.concurrent(io, serveStreamFiber, .{ self, stream }) catch |err| {
-                    slot_held = false;
-                    self.releaseConnectionThreadSlot();
-                    std.log.warn("std http listener connection fiber handoff failed err={s}", .{@errorName(err)});
+                const connection_thread = std.Thread.spawn(
+                    .{ .stack_size = self.cfg.connection_thread_stack_size },
+                    serveStreamThread,
+                    .{ self, stream },
+                ) catch |err| {
+                    // Resource exhaustion must degrade to bounded inline
+                    // service, not drop an already accepted request. The
+                    // listener thread remains joinable by stop(), and retains
+                    // this connection's admission slot while serving it.
+                    std.log.warn("std http listener connection thread handoff failed err={s}", .{@errorName(err)});
                     self.serveStream(stream);
+                    self.releaseConnectionThreadSlot();
+                    slot_held = false;
                     continue;
                 };
-                // The fiber owns the slot now and releases it on completion.
+                connection_thread.detach();
+                // The detached thread owns the slot now. stop() shuts down
+                // registered streams and drains this counter before the
+                // listener or shared I/O runtime can be destroyed.
                 slot_held = false;
                 continue;
             }
@@ -295,7 +318,7 @@ pub const StdHttpListener = struct {
         }
     }
 
-    fn serveStreamFiber(self: *StdHttpListener, stream: std.Io.net.Stream) void {
+    fn serveStreamThread(self: *StdHttpListener, stream: std.Io.net.Stream) void {
         defer self.releaseConnectionThreadSlot();
         self.serveStream(stream);
     }
@@ -736,6 +759,41 @@ pub const StdHttpListener = struct {
         };
     }
 };
+
+test "std http listener wake address maps wildcard binds to loopback" {
+    const expected4 = std.Io.net.Ip4Address.loopback(4200);
+    const wake4 = StdHttpListener.listenerWakeAddress(try std.Io.net.IpAddress.parse("0.0.0.0", 4200));
+    switch (wake4) {
+        .ip4 => |addr| {
+            try std.testing.expectEqualSlices(u8, &expected4.bytes, &addr.bytes);
+            try std.testing.expectEqual(@as(u16, 4200), addr.port);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const expected6 = std.Io.net.Ip6Address.loopback(4201);
+    const wake6 = StdHttpListener.listenerWakeAddress(try std.Io.net.IpAddress.parse("::", 4201));
+    switch (wake6) {
+        .ip6 => |addr| {
+            try std.testing.expectEqualSlices(u8, &expected6.bytes, &addr.bytes);
+            try std.testing.expectEqual(@as(u16, 4201), addr.port);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const bound = try std.Io.net.IpAddress.parse("127.0.0.2", 4202);
+    const unchanged = StdHttpListener.listenerWakeAddress(bound);
+    switch (unchanged) {
+        .ip4 => |addr| switch (bound) {
+            .ip4 => |expected| {
+                try std.testing.expectEqualSlices(u8, &expected.bytes, &addr.bytes);
+                try std.testing.expectEqual(expected.port, addr.port);
+            },
+            else => unreachable,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
 
 test "std http listener and executor round-trip raft batch route" {
     const raft_engine = @import("raft_engine");
@@ -1821,11 +1879,13 @@ test "std http listener stop returns while saturated with a headerless connectio
 test "std http executor runs timed requests concurrently" {
     const std_http_executor = @import("std_http_executor.zig");
     const request_timeout_ms = 20_000;
-    const completion_wait_iterations = 10_000;
+    const admission_timeout_ms = 10_000;
 
     const App = struct {
-        entered_slow: std.atomic.Value(bool) = .init(false),
-        release_slow: std.atomic.Value(bool) = .init(false),
+        io: std.Io,
+        entered_slow: std.Io.Event = .unset,
+        entered_fast: std.Io.Event = .unset,
+        release_slow: std.Io.Event = .unset,
 
         fn executor(self: *@This()) common.RequestExecutor {
             return .{
@@ -1839,8 +1899,8 @@ test "std http executor runs timed requests concurrently" {
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (std.mem.eql(u8, req.uri, "/slow")) {
-                self.entered_slow.store(true, .release);
-                while (!self.release_slow.load(.acquire)) sleepMs(1);
+                self.entered_slow.set(self.io);
+                self.release_slow.waitUncancelable(self.io);
                 return .{
                     .status = 200,
                     .content_type = try alloc.dupe(u8, "text/plain; charset=utf-8"),
@@ -1848,6 +1908,7 @@ test "std http executor runs timed requests concurrently" {
                 };
             }
             if (std.mem.eql(u8, req.uri, "/fast")) {
+                self.entered_fast.set(self.io);
                 return .{
                     .status = 200,
                     .content_type = try alloc.dupe(u8, "text/plain; charset=utf-8"),
@@ -1867,7 +1928,6 @@ test "std http executor runs timed requests concurrently" {
         executor: common.RequestExecutor,
         status: std.atomic.Value(u16) = .init(0),
         failed: std.atomic.Value(bool) = .init(false),
-        done: std.atomic.Value(bool) = .init(false),
 
         fn run(self: *@This()) void {
             var response = self.executor.execute(std.heap.page_allocator, .{
@@ -1876,17 +1936,37 @@ test "std http executor runs timed requests concurrently" {
                 .timeout_ms = request_timeout_ms,
             }) catch {
                 self.failed.store(true, .release);
-                self.done.store(true, .release);
                 return;
             };
             defer response.deinit(std.heap.page_allocator);
 
             self.status.store(response.status, .release);
-            self.done.store(true, .release);
         }
     };
 
-    var app = App{};
+    const Wait = struct {
+        fn event(evt: *std.Io.Event, io: std.Io) bool {
+            const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+                .raw = std.Io.Duration.fromMilliseconds(admission_timeout_ms),
+                .clock = .awake,
+            });
+            while (!evt.isSet()) {
+                evt.waitTimeout(io, .{ .deadline = deadline }) catch |err| switch (err) {
+                    error.Timeout => {
+                        if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return false;
+                        continue;
+                    },
+                    error.Canceled => return false,
+                };
+            }
+            return true;
+        }
+    };
+
+    var event_io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer event_io_impl.deinit();
+    const event_io = event_io_impl.io();
+    var app = App{ .io = event_io };
     var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
     defer executor.deinit();
     const request_executor = executor.executor();
@@ -1906,46 +1986,28 @@ test "std http executor runs timed requests concurrently" {
     defer std.testing.allocator.free(fast_uri);
 
     var slow_req = RequestThread{ .uri = slow_uri, .executor = request_executor };
-    const slow_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});
-    defer slow_thread.join();
-    defer app.release_slow.store(true, .release);
-
-    var saw_slow = false;
-    for (0..completion_wait_iterations) |_| {
-        if (app.entered_slow.load(.acquire)) {
-            saw_slow = true;
-            break;
-        }
-        sleepMs(1);
+    var slow_thread: ?std.Thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});
+    var fast_thread: ?std.Thread = null;
+    defer {
+        app.release_slow.set(event_io);
+        if (fast_thread) |thread| thread.join();
+        if (slow_thread) |thread| thread.join();
     }
-    try std.testing.expect(saw_slow);
+    try std.testing.expect(Wait.event(&app.entered_slow, event_io));
 
     var fast_req = RequestThread{ .uri = fast_uri, .executor = request_executor };
-    const fast_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&fast_req});
-    defer fast_thread.join();
+    fast_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&fast_req});
+    const fast_admitted = Wait.event(&app.entered_fast, event_io);
 
-    var fast_completed = false;
-    for (0..completion_wait_iterations) |_| {
-        if (fast_req.done.load(.acquire)) {
-            fast_completed = true;
-            break;
-        }
-        sleepMs(1);
-    }
-    try std.testing.expect(fast_completed);
+    app.release_slow.set(event_io);
+    fast_thread.?.join();
+    fast_thread = null;
+    slow_thread.?.join();
+    slow_thread = null;
+
+    try std.testing.expect(fast_admitted);
     try std.testing.expect(!fast_req.failed.load(.acquire));
     try std.testing.expectEqual(@as(u16, 200), fast_req.status.load(.acquire));
-
-    app.release_slow.store(true, .release);
-    var slow_completed = false;
-    for (0..completion_wait_iterations) |_| {
-        if (slow_req.done.load(.acquire)) {
-            slow_completed = true;
-            break;
-        }
-        sleepMs(1);
-    }
-    try std.testing.expect(slow_completed);
     try std.testing.expect(!slow_req.failed.load(.acquire));
     try std.testing.expectEqual(@as(u16, 200), slow_req.status.load(.acquire));
 }

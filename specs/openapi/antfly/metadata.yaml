@@ -4063,14 +4063,16 @@ components:
             - $ref: "query.yaml#/components/schemas/Query"
             - x-go-type: json.RawMessage
           description: |
-            Antfly query to filter documents. Only documents matching this query
-            are included in results. Uses the sear library for efficient per-document
-            matching without requiring a full index.
+            Structured subset of the Antfly query AST used to filter a primary-key
+            scan. Only documents matching this query are included in results.
+            Because scans do not open a text index, text-index-only variants such
+            as phrase and multi-match queries are rejected with a validation error
+            instead of being evaluated with slower stored-document semantics.
 
             Examples:
-            - Status filtering: `{"query": "status:published"}`
-            - Date ranges: `{"query": "created_at:>2023-01-01"}`
-            - Field matching: `{"query": "category:technology"}`
+            - Status filtering: `{"term":{"path":"/status","value":"published"}}`
+            - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}`
+            - Field existence: `{"exists":{"path":"/category"}}`
         limit:
           type: integer
           minimum: 1
@@ -4718,6 +4720,7 @@ components:
           example: "portable"
         table_names:
           type: array
+          minItems: 1
           maxItems: 256
           uniqueItems: true
           items:
@@ -5982,12 +5985,12 @@ components:
 
             Boolean clauses are normalized before planning:
             - `bool.must` is scoring query input.
-            - `bool.filter` is a non-scoring structured filter.
-            - `bool.must_not` is a structured exclusion filter.
+            - `bool.filter` is non-scoring query input.
+            - `bool.must_not` is non-scoring exclusion query input.
 
-            The same AST accepts direct structured filters using `field` or JSON-pointer
-            `path`, scalar `term` values, multi-value `terms`, and `exists`.
-            Query-string objects remain supported as a full-text escape hatch.
+            Filter branches accept the same query variants as `filter_query` and
+            `exclusion_query`. Structured clauses use the native document-value
+            path; text clauses are resolved through the text index before scoring.
           example:
             bool:
               must:
@@ -8298,8 +8301,12 @@ paths:
         - Table metadata (schema, indexes, shard configuration)
         - All shard data (compressed with zstd)
 
-        The backup creates a cluster-level manifest that tracks all included tables
-        and their individual backup locations.
+        A non-empty backup publishes a cluster-level manifest only after every
+        requested table backup is durable. The manifest is the final commit
+        point and records complete expected/completed table counts. A `partial`
+        or `failed` attempt returns per-table diagnostics but does not publish a
+        restorable aggregate manifest. A cluster with no selected tables returns
+        `400` without writing a backup artifact.
 
         Backup IDs are immutable. Reusing an ID that already has a published
         cluster manifest returns `409` and leaves the existing backup unchanged.
@@ -8327,6 +8334,7 @@ paths:
             Backup attempt completed. Inspect the response `status`: `completed`
             is fully successful, while `partial` or `failed` reports per-table
             failures even though the request itself was processed successfully.
+            Only `completed` publishes a restorable cluster manifest.
           content:
             application/json:
               schema:

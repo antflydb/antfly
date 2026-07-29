@@ -17,7 +17,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_state = @import("state.zig");
 const metadata_table_manager = @import("table_manager.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_clock = @import("antfly_platform").clock;
 const transition_state = @import("transition_state.zig");
 
 pub const ReconcileSummary = struct {
@@ -26,6 +26,7 @@ pub const ReconcileSummary = struct {
     rebalance_placement_groups: usize = 0,
     table_upserts: usize = 0,
     range_upserts: usize = 0,
+    split_admissions: usize = 0,
     split_upserts: usize = 0,
     merge_upserts: usize = 0,
     placement_removals: usize = 0,
@@ -100,6 +101,7 @@ pub const MetadataControlLoop = struct {
             .rebalance_placement_groups = plan.rebalance_placement_groups,
             .table_upserts = plan.table_upserts.len,
             .range_upserts = plan.range_upserts.len,
+            .split_admissions = plan.split_admissions.len,
             .split_upserts = plan.split_upserts.len,
             .merge_upserts = plan.merge_upserts.len,
             .placement_removals = plan.placement_removals.len,
@@ -149,6 +151,7 @@ test "metadata control loop proposes desired transitions through the service sea
         tables: []const metadata_table_manager.TableRecord,
         ranges: []const metadata_table_manager.RangeRecord,
         placement_upserts: usize = 0,
+        split_admissions: usize = 0,
         split_upserts: usize = 0,
         merge_upserts: usize = 0,
 
@@ -175,21 +178,20 @@ test "metadata control loop proposes desired transitions through the service sea
 
         pub fn listProjectedRanges(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
             const out = try alloc.alloc(metadata_table_manager.RangeRecord, self.ranges.len);
-            errdefer alloc.free(out);
-            for (self.ranges, 0..) |record, i| out[i] = .{
-                .group_id = record.group_id,
-                .table_id = record.table_id,
-                .start_key = try alloc.dupe(u8, record.start_key),
-                .end_key = if (record.end_key) |end| try alloc.dupe(u8, end) else null,
-            };
+            var cloned: usize = 0;
+            errdefer {
+                for (out[0..cloned]) |record| metadata_table_manager.freeRange(alloc, record);
+                alloc.free(out);
+            }
+            for (self.ranges, 0..) |record, i| {
+                out[i] = try metadata_table_manager.cloneRange(alloc, record);
+                cloned += 1;
+            }
             return out;
         }
 
         pub fn freeProjectedRanges(_: *@This(), alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
-            for (records) |record| {
-                alloc.free(record.start_key);
-                if (record.end_key) |end| alloc.free(end);
-            }
+            for (records) |record| metadata_table_manager.freeRange(alloc, record);
             alloc.free(records);
         }
 
@@ -227,6 +229,7 @@ test "metadata control loop proposes desired transitions through the service sea
 
         pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
             self.placement_upserts += plan.placement_upserts.len;
+            self.split_admissions += plan.split_admissions.len;
             self.split_upserts += plan.split_upserts.len;
             self.merge_upserts += plan.merge_upserts.len;
         }
@@ -252,6 +255,12 @@ test "metadata control loop proposes desired transitions through the service sea
         .destination_group_id = 103,
         .split_key = "doc:h",
     });
+    const desired_ranges = try loop.stateRef().tableManager().listRanges(std.testing.allocator);
+    defer loop.stateRef().tableManager().freeRanges(std.testing.allocator, desired_ranges);
+    const desired_source = for (desired_ranges) |record| {
+        if (record.group_id == 101) break record;
+    } else return error.MissingSourceRange;
+    try std.testing.expectEqual(@as(u64, 1), desired_source.split_attempt_epoch);
 
     var fake = FakeService{
         .tables = &tables,
@@ -261,8 +270,9 @@ test "metadata control loop proposes desired transitions through the service sea
     try std.testing.expectEqual(@as(usize, 0), summary.table_upserts);
     try std.testing.expectEqual(@as(usize, 0), summary.range_upserts);
     try std.testing.expectEqual(@as(usize, 0), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
-    try std.testing.expectEqual(@as(usize, 1), fake.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), summary.split_admissions);
+    try std.testing.expectEqual(@as(usize, 1), fake.split_admissions);
+    try std.testing.expectEqual(@as(usize, 0), summary.split_upserts);
 }
 
 test "metadata control loop plans placement intents from desired topology and candidates" {
@@ -294,21 +304,20 @@ test "metadata control loop plans placement intents from desired topology and ca
 
         pub fn listProjectedRanges(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
             const out = try alloc.alloc(metadata_table_manager.RangeRecord, self.ranges.len);
-            errdefer alloc.free(out);
-            for (self.ranges, 0..) |record, i| out[i] = .{
-                .group_id = record.group_id,
-                .table_id = record.table_id,
-                .start_key = try alloc.dupe(u8, record.start_key),
-                .end_key = if (record.end_key) |end| try alloc.dupe(u8, end) else null,
-            };
+            var cloned: usize = 0;
+            errdefer {
+                for (out[0..cloned]) |record| metadata_table_manager.freeRange(alloc, record);
+                alloc.free(out);
+            }
+            for (self.ranges, 0..) |record, i| {
+                out[i] = try metadata_table_manager.cloneRange(alloc, record);
+                cloned += 1;
+            }
             return out;
         }
 
         pub fn freeProjectedRanges(_: *@This(), alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
-            for (records) |record| {
-                alloc.free(record.start_key);
-                if (record.end_key) |end| alloc.free(end);
-            }
+            for (records) |record| metadata_table_manager.freeRange(alloc, record);
             alloc.free(records);
         }
 
@@ -374,6 +383,7 @@ test "metadata control loop installs service median key lookup for automatic spl
         tables: []const metadata_table_manager.TableRecord,
         ranges: []const metadata_table_manager.RangeRecord,
         stores: []const metadata_table_manager.StoreRecord,
+        placements: []const raft_reconciler.PlacementIntent,
         planned_split_key: ?[]u8 = null,
 
         pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -435,11 +445,24 @@ test "metadata control loop installs service median key lookup for automatic spl
             alloc.free(records);
         }
 
-        pub fn listProjectedPlacementIntents(_: *@This(), alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
-            return try alloc.alloc(raft_reconciler.PlacementIntent, 0);
+        pub fn listProjectedPlacementIntents(self: *@This(), alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
+            const out = try alloc.alloc(raft_reconciler.PlacementIntent, self.placements.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |intent| {
+                    raft_reconciler.freeIntentOwned(alloc, intent);
+                }
+                alloc.free(out);
+            }
+            for (self.placements, 0..) |record, i| {
+                out[i] = try raft_reconciler.cloneIntentOwned(alloc, record);
+                initialized += 1;
+            }
+            return out;
         }
 
         pub fn freeProjectedPlacementIntents(_: *@This(), alloc: std.mem.Allocator, intents: []raft_reconciler.PlacementIntent) void {
+            for (intents) |intent| raft_reconciler.freeIntentOwned(alloc, intent);
             alloc.free(intents);
         }
 
@@ -485,14 +508,18 @@ test "metadata control loop installs service median key lookup for automatic spl
                 std.testing.allocator.free(value);
                 self.planned_split_key = null;
             }
-            if (plan.split_upserts.len != 0) {
-                self.planned_split_key = try std.testing.allocator.dupe(u8, plan.split_upserts[0].split_key.?);
+            if (plan.split_admissions.len != 0) {
+                self.planned_split_key = try std.testing.allocator.dupe(u8, plan.split_admissions[0].record.split_key.?);
             }
         }
     };
 
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(10 * std.time.ns_per_s);
+    const now_realtime_ms = manual_clock.clock().nowRealtimeMs();
     var loop = MetadataControlLoop.initWithConfig(std.testing.allocator, .{
         .max_shard_size_bytes = 100,
+        .clock = manual_clock.clock(),
     });
     defer loop.deinit();
 
@@ -502,6 +529,12 @@ test "metadata control loop installs service median key lookup for automatic spl
     const ranges = [_]metadata_table_manager.RangeRecord{
         .{ .group_id = 4901, .table_id = 49, .start_key = "doc:a", .end_key = "doc:z" },
     };
+    const voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(&.{1}, null);
+    const placements = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{ .group_id = 4901, .replica_id = 1, .local_node_id = 1 },
+        .store_id = 1,
+        .peer_node_ids = &.{1},
+    }};
     const stores = [_]metadata_table_manager.StoreRecord{
         .{
             .store_id = 1,
@@ -516,8 +549,12 @@ test "metadata control loop installs service median key lookup for automatic spl
                     .doc_count = 200,
                     .disk_bytes = 200,
                     .empty = false,
-                    .updated_at_millis = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)),
+                    .updated_at_millis = now_realtime_ms,
                     .local_leader = true,
+                    .local_voter = true,
+                    .voter_count = 1,
+                    .voter_set_known = true,
+                    .voter_set_fingerprint = voter_set_fingerprint,
                 },
             })[0..]),
         },
@@ -528,11 +565,12 @@ test "metadata control loop installs service median key lookup for automatic spl
         .tables = &tables,
         .ranges = &ranges,
         .stores = &stores,
+        .placements = &placements,
     };
     defer fake.deinit(std.testing.allocator);
 
     const summary = try loop.reconcileOnce(&fake);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), summary.split_admissions);
     try std.testing.expect(fake.planned_split_key != null);
     try std.testing.expectEqualStrings("doc:m", fake.planned_split_key.?);
 }
@@ -543,6 +581,7 @@ test "metadata control loop rewrites desired topology after finalized split" {
         ranges: []const metadata_table_manager.RangeRecord,
         split_records: []const transition_state.SplitTransitionRecord,
         range_upserts: usize = 0,
+        split_upserts: usize = 0,
         split_removals: usize = 0,
 
         pub fn listProjectedTables(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
@@ -568,21 +607,20 @@ test "metadata control loop rewrites desired topology after finalized split" {
 
         pub fn listProjectedRanges(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
             const out = try alloc.alloc(metadata_table_manager.RangeRecord, self.ranges.len);
-            errdefer alloc.free(out);
-            for (self.ranges, 0..) |record, i| out[i] = .{
-                .group_id = record.group_id,
-                .table_id = record.table_id,
-                .start_key = try alloc.dupe(u8, record.start_key),
-                .end_key = if (record.end_key) |end| try alloc.dupe(u8, end) else null,
-            };
+            var cloned: usize = 0;
+            errdefer {
+                for (out[0..cloned]) |record| metadata_table_manager.freeRange(alloc, record);
+                alloc.free(out);
+            }
+            for (self.ranges, 0..) |record, i| {
+                out[i] = try metadata_table_manager.cloneRange(alloc, record);
+                cloned += 1;
+            }
             return out;
         }
 
         pub fn freeProjectedRanges(_: *@This(), alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
-            for (records) |record| {
-                alloc.free(record.start_key);
-                if (record.end_key) |end| alloc.free(end);
-            }
+            for (records) |record| metadata_table_manager.freeRange(alloc, record);
             alloc.free(records);
         }
 
@@ -596,17 +634,14 @@ test "metadata control loop rewrites desired topology after finalized split" {
 
         pub fn listProjectedSplitTransitions(self: *@This(), alloc: std.mem.Allocator) ![]transition_state.SplitTransitionRecord {
             const out = try alloc.alloc(transition_state.SplitTransitionRecord, self.split_records.len);
-            errdefer alloc.free(out);
+            var cloned: usize = 0;
+            errdefer {
+                for (out[0..cloned]) |record| metadata_table_manager.freeSplitTransitionRecord(alloc, record);
+                alloc.free(out);
+            }
             for (self.split_records, 0..) |record, i| {
-                out[i] = .{
-                    .transition_id = record.transition_id,
-                    .source_group_id = record.source_group_id,
-                    .destination_group_id = record.destination_group_id,
-                    .phase = record.phase,
-                    .split_key = if (record.split_key) |value| try alloc.dupe(u8, value) else null,
-                    .source_range_end = if (record.source_range_end) |value| try alloc.dupe(u8, value) else null,
-                    .rollback_reason = null,
-                };
+                out[i] = try metadata_table_manager.cloneSplitTransitionRecord(alloc, record);
+                cloned += 1;
             }
             return out;
         }
@@ -646,6 +681,7 @@ test "metadata control loop rewrites desired topology after finalized split" {
 
         pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
             self.range_upserts += plan.range_upserts.len;
+            self.split_upserts += plan.split_upserts.len;
             self.split_removals += plan.split_removals.len;
         }
     };
@@ -656,10 +692,15 @@ test "metadata control loop rewrites desired topology after finalized split" {
     const tables = [_]metadata_table_manager.TableRecord{
         .{ .table_id = 10, .name = "docs" },
     };
-    const ranges = [_]metadata_table_manager.RangeRecord{
-        .{ .group_id = 101, .table_id = 10, .start_key = "doc:a", .end_key = "doc:z" },
+    const desired_ranges = [_]metadata_table_manager.RangeRecord{
+        .{
+            .group_id = 101,
+            .table_id = 10,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        },
     };
-    try loop.stateRef().tableManager().replaceTopology(&tables, &ranges);
+    try loop.stateRef().tableManager().replaceTopology(&tables, &desired_ranges);
     try loop.stateRef().tableManager().requestSplit(.{
         .transition_id = 8001,
         .table_id = 10,
@@ -668,25 +709,58 @@ test "metadata control loop rewrites desired topology after finalized split" {
         .split_key = "doc:m",
     });
 
-    const split_records = [_]transition_state.SplitTransitionRecord{
+    const projected_ranges = [_]metadata_table_manager.RangeRecord{
+        .{
+            .group_id = 101,
+            .table_id = 10,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+            .split_attempt_epoch = 1,
+        },
+    };
+    var split_records = [_]transition_state.SplitTransitionRecord{
         .{
             .transition_id = 8001,
+            .attempt_epoch = 1,
             .source_group_id = 101,
             .destination_group_id = 102,
             .phase = .finalizing,
             .split_key = "doc:m",
             .source_range_end = "doc:z",
+            .table_contract = .{
+                .table_id = 10,
+                .table_name = "docs",
+                .indexes_json = "{}",
+                .source_identity = .{ .shard_id = 101, .range_id = 101 },
+                .target_identity = .{ .shard_id = 101, .range_id = 101 },
+            },
         },
     };
     var fake = FakeService{
         .tables = &tables,
-        .ranges = &ranges,
+        .ranges = &projected_ranges,
         .split_records = &split_records,
     };
 
-    const summary = try loop.reconcileOnce(&fake);
-    try std.testing.expectEqual(@as(usize, 2), summary.range_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.split_removals);
+    const terminal_summary = try loop.reconcileOnce(&fake);
+    try std.testing.expectEqual(@as(usize, 0), terminal_summary.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), terminal_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 0), terminal_summary.split_removals);
+    try std.testing.expectEqual(@as(usize, 0), fake.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), fake.split_upserts);
+    try std.testing.expectEqual(@as(usize, 0), fake.split_removals);
+
+    // The immutable contract fences range mutation until the terminal
+    // transition record is durably projected. The next round can publish the
+    // replacement ranges and retire the transition.
+    split_records[0].phase = .finalized;
+    try loop.stateRef().syncProjected(&fake);
+    try loop.stateRef().seedDesiredFromProjected();
+    const topology_summary = try loop.reconcilePrepared(&fake);
+    try std.testing.expectEqual(@as(usize, 2), topology_summary.range_upserts);
+    try std.testing.expectEqual(@as(usize, 0), topology_summary.split_upserts);
+    try std.testing.expectEqual(@as(usize, 1), topology_summary.split_removals);
     try std.testing.expectEqual(@as(usize, 2), fake.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), fake.split_upserts);
     try std.testing.expectEqual(@as(usize, 1), fake.split_removals);
 }

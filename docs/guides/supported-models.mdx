@@ -1,0 +1,207 @@
+---
+title: Local model compatibility
+description: How Antfly checks local model compatibility, resource fit, and tested artifacts
+prerequisites:
+  - Antfly installed and running
+difficulty: beginner
+estimatedTime: "5 min"
+tags: [inference, models, embedding, reranking, generation, gguf]
+---
+
+<Questions>
+- How does Antfly decide whether a local artifact can load?
+- Why was my model rejected?
+- What does the `compatibility` field in `/ai/v1/models` mean?
+- Which thoroughly tested models should I start with?
+</Questions>
+
+Antfly is a database first and an inference engine second. It enables the model runtime
+paths needed to turn unstructured data into searchable, ranked, structured knowledge,
+without claiming compatibility with every artifact published under a model-family name.
+
+Every discovered model reports `compatibility` in `/ai/v1/models`. Compatibility is a
+property of the actual artifact and this Antfly build, not a certification label attached
+to a repository name. Antfly checks the bundle contract, architecture runtime, required
+sidecars, GGUF tensor names and encodings, available backends, and resource admission before
+loading weights.
+
+## Compatibility states
+
+| State | Meaning | Behaviour |
+|---|---|---|
+| **`compatible`** | Static checks found a viable runtime path for this artifact and build. | May load, subject to resource admission. |
+| **`unknown`** | Antfly cannot prove compatibility or incompatibility without trying an unrecognized contract. | Rejected by default; opt in with `--allow-unknown-models`. |
+| **`incompatible`** | A required artifact/backend is missing, a tensor contract cannot be materialized, or the path is known unsafe or unusable. | Always rejected before load; the unknown-model opt-in cannot override it. |
+
+Resource fit is separate from compatibility. Model weights are admitted against stable host
+and accelerator limits before load; KV-cache and scratch estimates join the same shared
+reservation ledger for each request. A request that can never fit returns
+`MODEL_RESOURCE_LIMIT`; temporary contention returns `MODEL_RESOURCE_BUSY`. A one-shot live
+memory-pressure check protects the process without making the published compatibility state
+flap with momentary system load.
+
+Automatic backend selection may fall back to another compatible backend (for example, from
+Metal to native when a quant is not implemented on Metal). An explicitly requested backend
+is strict and never silently falls back.
+
+## Start here
+
+| Role | Use this | Verified alternates |
+|---|---|---|
+| Fast text embedding | `BAAI/bge-small-en-v1.5` | `sentence-transformers/all-MiniLM-L6-v2` |
+| Higher-quality embedding | `BAAI/bge-large-en-v1.5` | `BAAI/bge-base-en-v1.5`, `mixedbread-ai/mxbai-embed-large-v1` |
+| Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | — |
+| Reranking | `mixedbread-ai/mxbai-rerank-base-v1` | `cross-encoder/ms-marco-MiniLM-L6-v2` |
+| Multimodal (text + image + audio) | `antflydb/clipclap` | — |
+| Chunking | `fixed_bert` (built in) | `mirth/chonky_mmbert_small_multilingual_1` |
+| Recognition & extraction | `antflydb/gliner2-base-v1` | — |
+| Document reading / OCR | `antflydb/Florence-2-base` | — |
+| Transcription | `openai/whisper-tiny` | — |
+| Local generation | `ggml-org/gemma-4-E4B-it-GGUF` | Gemma 3, Llama 3.x, Qwen3 dense GGUFs |
+
+Pull models by their full `owner/name` reference:
+
+```bash
+antfly inference pull hf:BAAI/bge-small-en-v1.5 --tasks embed
+antfly inference pull hf:antflydb/clipclap:gguf:Q4_K --tasks embed
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF --tasks generate
+```
+
+## Thoroughly tested artifacts (documentation certification)
+
+These particular artifacts were checked for a meaningful result rather than merely a
+successful response. This is the certification matrix for operators, maintained in the
+documentation rather than baked into runtime policy. A certified artifact must still pass
+the same compatibility and resource-fit checks as every other artifact.
+
+| Capability | Model | Verified by |
+|---|---|---|
+| Dense embedding | `BAAI/bge-small-en-v1.5` | dim 384, unit norm; query↔relevant 0.81 vs irrelevant 0.27 |
+| Dense embedding | `BAAI/bge-base-en-v1.5` | dim 768, unit norm |
+| Dense embedding | `BAAI/bge-large-en-v1.5` | dim 1024; relevant 0.86 vs irrelevant 0.35 |
+| Dense embedding | `mixedbread-ai/mxbai-embed-large-v1` | dim 1024; relevant 0.885 vs irrelevant 0.312 |
+| Dense embedding | `sentence-transformers/all-MiniLM-L6-v2` | dim 384; relevant 0.824 vs irrelevant −0.007 |
+| Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | 90 non-zero terms |
+| Reranking | `mixedbread-ai/mxbai-rerank-base-v1` | relevant 0.9997 vs irrelevant 0.0003 |
+| Reranking | `cross-encoder/ms-marco-MiniLM-L6-v2` | relevant 0.1610 vs irrelevant 0.0001 |
+| Multimodal | `antflydb/clipclap` | text, image and audio all embed; image↔"red" 0.277 vs image↔"blue" 0.189 |
+| Chunking | `fixed_bert`, `fixed_bpe`, `mirth/chonky_mmbert_small_multilingual_1` | all split a three-topic document at its topic boundaries |
+| Extraction | `antflydb/gliner2-base-v1` | "Marie Curie worked at the University of Paris in France" → correct name, organization and country |
+| Reading / OCR | `antflydb/Florence-2-base` | reads rendered text back exactly |
+| Transcription | `openai/whisper-tiny` | transcribes recorded speech |
+| Generation | Gemma 3, Gemma 4, Llama 3.x, Qwen3 dense GGUF | see below |
+
+### Generation
+
+| Family | Verified with |
+|---|---|
+| Gemma 3 | `unsloth/gemma-3-4b-it-GGUF` |
+| Gemma 4 | `ggml-org/gemma-4-E4B-it-GGUF` |
+| Llama 3.x | `unsloth/Llama-3.2-1B-Instruct-GGUF` |
+| Qwen3 (dense) | `unsloth/Qwen3-1.7B-GGUF` |
+
+Text generation works with the decoder artifacts listed above. Multimodal generation is
+also available when the bundle contains a compatible Antfly Gemma 3 projector or supported
+Gemma 4 CLIP projector: Gemma 3 accepts images, while Gemma 4 projector metadata can enable
+images, audio, or both. The projector is opened only when a request contains media, so the
+same bundle continues to serve text-only requests without projector execution.
+
+## Known incompatible artifacts and families
+
+Rejected with HTTP 400 before any load. Some of these do not merely fail — they would
+otherwise crash the server, so blocking them protects every other caller.
+
+| Model or family | Why |
+|---|---|
+| Standalone CLIP (`Xenova/clip-vit-base-patch32`) | Image embedding allocates without bound — about 800 MB/s to 31 GB for one 64×64 image — until the process is killed. Use `antflydb/clipclap`. |
+| Standalone CLAP (`Xenova/clap-htsat-unfused`) | `ShapeMismatch` converting the audio encoder. Use `antflydb/clipclap`. |
+| TrOCR-style readers (`Xenova/trocr-base-printed`) | ONNX encoder/decoder readers exhaust memory the same way as CLIP. Use `antflydb/Florence-2-base`. |
+| Seq2seq rewriters (`/rewrite`) | Importing an ONNX encoder/decoder graph panics on a rank assertion. No rewriter model currently works. |
+| `Babelscape/rebel-large` | Uses the same unsafe BART encoder-decoder graph-import path. Its relation parser has unit coverage, but the real model is not release-safe. It is also CC-BY-NC-SA. |
+| `microsoft/layoutlmv3-base` | Ships the legacy `vocab.json` + `merges.txt` pair with no `tokenizer.json`; the manifest accepts it but the loader rejects it. |
+| `monkt/paddleocr-onnx` | No backend accepts the model. |
+| `nomic-ai/nomic-embed-text-v1.5-GGUF` | `NoTokenizerFound`. |
+| Qwen2 | Loads with a correct chat template and clean termination, then answers the wrong question and emits token soup over the chat endpoint. |
+| Mistral / Mixtral | Loads with zero missing tensors, then argmaxes to token 0 on every step on both backends. The prompt tokenizes correctly, so the fault is in the forward pass. |
+| Phi | The mapping works for the separate-projection layout, but Phi-3 GGUFs fuse `attn_qkv` and `ffn_up` and report 257 missing tensors. |
+| BitNet | Loads and generates, then degenerates into repetition. |
+| Gemma 4 12B unified exports | The unified layout has unresolved required weights. Gemma 4 E4B uses a different dense layout and remains compatible. |
+| Gemma 4 26B-A4B MoE exports | The GGUF declares experts, but the 0.2.0 Gemma 4 MoE runtime is not enabled. |
+| DeepSeek V4 (`deepseek4`) | Loads and resolves all 1328 tensors, then panics on a shape mismatch in the grouped output projection. llama.cpp runs the same file, so this is ours to fix. |
+| `qwen35`, `qwen3next`, `qwen35moe` | Hybrid linear attention; the GGUF `ssm_*` tensors have no mapping. |
+| `falcon`, `opt`, `bloom` | Recognised by name only — no tensor mapping and no runtime. |
+| `gpt2`, `gpt_neo`, `gpt_neox`, `gptj`, `t5` | No verified generation path. T5 has an encoder-decoder implementation but no generation path. |
+
+A known-incompatible generation request returns HTTP 400:
+
+```json
+{
+  "error": "INCOMPATIBLE_MODEL",
+  "message": "the current decoder path is known to be missing, unsafe, or to produce unusable output"
+}
+```
+
+An artifact whose compatibility cannot be determined instead returns
+`UNKNOWN_MODEL_COMPATIBILITY`. To try it deliberately:
+
+```bash
+antfly inference run --allow-unknown-models
+```
+
+The flag does not bypass `INCOMPATIBLE_MODEL` or resource limits.
+
+## Licensing
+
+`Babelscape/rebel-large` is **CC-BY-NC-SA — non-commercial only**, and about 3 GB. Its
+relation-output parser has unit coverage, but the actual BART inference path is incompatible
+with 0.2.0. It is not part of any default bundle and must not be deployed commercially.
+`antflydb/gliner2-base-v1` is the recommended extraction model.
+
+## Known caveats
+
+**Llama 3.x chat templates.** Llama 3.x ships a Jinja chat template Antfly's template engine
+cannot yet parse. The model loads and generates correctly, but chat requests fall back to
+raw prompting, which produces continuation-style output instead of a reply. Affected models
+report `"chat_template": false` in `/ai/v1/models`.
+
+**Small Gemma 3 models over the chat endpoint.** `gemma-3-1b` answers correctly and stops
+cleanly through `antfly inference generate`, but can fail to stop through
+`/ai/v1/chat/completions`. Prefer `gemma-3-4b` or larger for chat.
+
+**Gemma 4 artifacts and quants differ.** The recommended
+`ggml-org/gemma-4-E4B-it-GGUF` Q4_K_M artifact runs on native and Metal. Google QAT Q4_0
+and tested third-party Q4_1/Q4_K_M variants also produce a clean final channel after the
+GGUF-over-sidecar structural fix. A tested `UD-Q4_K_XL` contains `IQ4_XS`; Metal rejects
+that quant before generation and automatic selection falls back to native. Keep one quant
+per directory and prefer the recommended artifact.
+
+**Mixed-variant model directories.** Pulling a second variant into a directory that already
+holds another leaves both in place, and different parts of a model can then resolve to
+different variants. ClipClap in particular fails this way. Keep one variant per directory;
+if in doubt, delete and re-pull.
+
+**Chunk overlap.** `/chunk` returns `InvalidChunkOverlap` when `target_tokens` is smaller
+than `overlap_tokens`. Set both together when using small chunks.
+
+## Not covered here
+
+Hosted generation providers (OpenAI, Gemini/Vertex, Bedrock, Cohere, OpenRouter) and Ollama
+are configured separately and are not part of this local-model matrix.
+
+## Checking a model before running it
+
+`smoke --inspect-only` reports what Antfly makes of a bundle without loading weights:
+
+```bash
+antfly inference smoke ~/.antfly/inference/models/unsloth/Qwen3-1.7B-GGUF "hi" --inspect-only
+```
+
+```
+gguf path=.../Qwen3-1.7B-UD-Q4_K_XL.gguf architecture=qwen3 tensors=310 metadata=32
+  gpt family=qwen3 layers=28 heads=16 kv_heads=8 hidden=2048 head_dim=128 ...
+  unsupported_tensor_types=none
+  missing_required_tensors=none
+```
+
+`missing_required_tensors` with a non-zero count means the architecture was recognised but
+its tensor names could not be mapped — the signature of an unsupported or fused layout.

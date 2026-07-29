@@ -1004,7 +1004,7 @@ fn spawnWikiStandalone(
             bind_port_arg,
             "--health-port",
             health_port_arg,
-            "--tick-ms",
+            "--control-tick-ms",
             "5",
             "--models-dir",
             cfg.models_dir,

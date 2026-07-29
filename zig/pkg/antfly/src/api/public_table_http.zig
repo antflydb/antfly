@@ -73,6 +73,10 @@ pub const TableApi = struct {
 
     pub const ExecuteQueryError = error{
         InvalidQueryRequest,
+        InvalidFilterQueryRequest,
+        InvalidExclusionQueryRequest,
+        UnsupportedFilterQueryRequest,
+        UnsupportedExclusionQueryRequest,
         NotFound,
         DocIdentityUnavailable,
         ReadRequiresPrimary,
@@ -99,6 +103,7 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteBackupError = error{
+        NotLeader,
         NotFound,
         BackupAlreadyExists,
         MethodNotAllowed,
@@ -118,6 +123,7 @@ pub const TableApi = struct {
         UnsupportedBackupFormat,
         RestoreDurabilityPending,
         RestoreDurabilityConfirmed,
+        BackupIntegrityFailure,
         InvalidBackupRequest,
         InternalFailure,
     };
@@ -245,6 +251,7 @@ pub const TableApi = struct {
             table_name: []const u8,
             backup_id: []const u8,
             location_uri: []const u8,
+            connection: []const u8,
             location: *backups_api.BackupLocation,
         ) ExecuteRestoreError!void,
         execute_table_list_indexes: *const fn (
@@ -365,9 +372,10 @@ pub const TableApi = struct {
         table_name: []const u8,
         backup_id: []const u8,
         location_uri: []const u8,
+        connection: []const u8,
         location: *backups_api.BackupLocation,
     ) ExecuteRestoreError!void {
-        return try self.vtable.execute_table_restore(self.ptr, alloc, table_name, backup_id, location_uri, location);
+        return try self.vtable.execute_table_restore(self.ptr, alloc, table_name, backup_id, location_uri, connection, location);
     }
 
     pub fn executeTableListIndexes(
@@ -611,6 +619,30 @@ pub fn handleTableQueryRequest(
                 std.log.err("public table query invalid table={s} err={}", .{ table_name, err });
                 return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
             },
+            error.InvalidFilterQueryRequest => return publicFilterQueryErrorResponse(
+                alloc,
+                body,
+                "filter_query",
+                .invalid,
+            ),
+            error.InvalidExclusionQueryRequest => return publicFilterQueryErrorResponse(
+                alloc,
+                body,
+                "exclusion_query",
+                .invalid,
+            ),
+            error.UnsupportedFilterQueryRequest => return publicFilterQueryErrorResponse(
+                alloc,
+                body,
+                "filter_query",
+                .unsupported,
+            ),
+            error.UnsupportedExclusionQueryRequest => return publicFilterQueryErrorResponse(
+                alloc,
+                body,
+                "exclusion_query",
+                .unsupported,
+            ),
             error.NotFound => {
                 std.log.err("public table query missing table={s} err={}", .{ table_name, err });
                 return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
@@ -673,6 +705,24 @@ pub fn handleTableQueryRequest(
     return .{
         .status = 200,
         .body = response_body,
+    };
+}
+
+fn publicFilterQueryErrorResponse(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    field: []const u8,
+    kind: query_contract.PublicFilterQueryErrorKind,
+) !OwnedResponse {
+    return .{
+        .status = query_contract.publicFilterQueryErrorStatus(kind),
+        .body = try query_contract.encodePublicFilterQueryErrorBodyAlloc(
+            alloc,
+            body,
+            field,
+            kind,
+        ),
+        .json = true,
     };
 }
 
@@ -757,6 +807,7 @@ pub fn handleTableBackup(
     defer location.deinit(alloc);
 
     api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, parsed_req.value.location, parsed_req.value.connection, &location) catch |err| switch (err) {
+        error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, "backup id already exists") },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
@@ -807,7 +858,14 @@ pub fn handleTableRestore(
     };
     defer location.deinit(alloc);
 
-    api.executeTableRestore(alloc, table_name, parsed_req.value.backup_id, parsed_req.value.location, &location) catch |err| switch (err) {
+    api.executeTableRestore(
+        alloc,
+        table_name,
+        parsed_req.value.backup_id,
+        parsed_req.value.location,
+        parsed_req.value.connection,
+        &location,
+    ) catch |err| switch (err) {
         error.NotLeader => return err,
         error.TableAlreadyExists => return .{ .status = 400, .body = try alloc.dupe(u8, "restore target already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
@@ -817,6 +875,7 @@ pub fn handleTableRestore(
         error.UnsupportedBackupFormat => return .{ .status = 400, .body = try alloc.dupe(u8, "restore does not support this backup layout") },
         error.RestoreDurabilityPending => return .{ .status = 202, .body = try backups_api.encodeRestoreDurabilityPending(alloc) },
         error.RestoreDurabilityConfirmed => return .{ .status = 200, .body = try backups_api.encodeRestoreDurabilityConfirmed(alloc) },
+        error.BackupIntegrityFailure => return .{ .status = 422, .body = try alloc.dupe(u8, backups_api.integrity_failure_message) },
         error.InvalidBackupRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
     };
@@ -1421,6 +1480,7 @@ fn unsupportedRestore(
     _: []const u8,
     _: []const u8,
     _: []const u8,
+    _: []const u8,
     _: *backups_api.BackupLocation,
 ) TableApi.ExecuteRestoreError!void {
     return error.InternalFailure;
@@ -1765,6 +1825,86 @@ test "public table query handler maps doc identity unavailable errors" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+}
+
+test "public table query handler preserves structured filter diagnostics" {
+    const Backend = struct {
+        err: TableApi.ExecuteQueryError,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
+        }
+    };
+    const Case = struct {
+        err: TableApi.ExecuteQueryError,
+        field: []const u8,
+        status: u16,
+    };
+    const cases = [_]Case{
+        .{ .err = error.InvalidFilterQueryRequest, .field = "filter_query", .status = 400 },
+        .{ .err = error.InvalidExclusionQueryRequest, .field = "exclusion_query", .status = 400 },
+        .{ .err = error.UnsupportedFilterQueryRequest, .field = "filter_query", .status = 422 },
+        .{ .err = error.UnsupportedExclusionQueryRequest, .field = "exclusion_query", .status = 422 },
+    };
+    const body =
+        \\{"filter_query":{"disjuncts":[{"query_string":"status:active"}]},"exclusion_query":{"disjuncts":[{"query_string":"status:deleted"}]}}
+    ;
+    const Parsed = struct {
+        status: u16,
+        field: []const u8,
+        offending_node: []const u8,
+        retryable: bool,
+    };
+
+    for (cases) |tc| {
+        var backend = Backend{ .err = tc.err };
+        var resp = try handleTableQueryRequest(
+            std.testing.allocator,
+            "docs",
+            body,
+            null,
+            backend.iface(),
+        );
+        defer resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(tc.status, resp.status);
+        try std.testing.expect(resp.json);
+
+        var parsed = try std.json.parseFromSlice(
+            Parsed,
+            std.testing.allocator,
+            resp.body,
+            .{ .ignore_unknown_fields = true },
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqual(tc.status, parsed.value.status);
+        try std.testing.expectEqualStrings(tc.field, parsed.value.field);
+        try std.testing.expectEqualStrings("query_string", parsed.value.offending_node);
+        try std.testing.expect(!parsed.value.retryable);
+    }
 }
 
 test "public table query handler preserves retryable failure status" {
@@ -2674,6 +2814,7 @@ test "public table restore handler maps target already exists" {
             _: []const u8,
             _: []const u8,
             _: []const u8,
+            _: []const u8,
             _: *backups_api.BackupLocation,
         ) TableApi.ExecuteRestoreError!void {
             return error.TableAlreadyExists;
@@ -2722,6 +2863,7 @@ test "public table restore handler maps unsupported multi-range error" {
             _: []const u8,
             _: []const u8,
             _: []const u8,
+            _: []const u8,
             _: *backups_api.BackupLocation,
         ) TableApi.ExecuteRestoreError!void {
             return error.UnsupportedMultiRangeTable;
@@ -2743,6 +2885,55 @@ test "public table restore handler maps unsupported multi-range error" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("restore does not support multi-range tables", resp.body);
+}
+
+test "public table restore handler reports artifact integrity failures" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = executeTableRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableRestore(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: *backups_api.BackupLocation,
+        ) TableApi.ExecuteRestoreError!void {
+            return error.BackupIntegrityFailure;
+        }
+    };
+
+    var node_config = try testBackupNodeConfig(std.testing.allocator);
+    defer node_config.deinit();
+    var resp = try handleTableRestore(
+        std.testing.allocator,
+        "docs",
+        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"connection\":\"test-backups\"}",
+        Backend.iface(),
+        null,
+        &node_config,
+        null,
+    );
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings(backups_api.integrity_failure_message, resp.body);
 }
 
 test "public table restore handler reports committed durability pending" {
@@ -2767,6 +2958,7 @@ test "public table restore handler reports committed durability pending" {
         fn executeTableRestore(
             _: *anyopaque,
             _: std.mem.Allocator,
+            _: []const u8,
             _: []const u8,
             _: []const u8,
             _: []const u8,
@@ -2815,6 +3007,7 @@ test "public table restore handler reports confirmed durability" {
         fn executeTableRestore(
             _: *anyopaque,
             _: std.mem.Allocator,
+            _: []const u8,
             _: []const u8,
             _: []const u8,
             _: []const u8,

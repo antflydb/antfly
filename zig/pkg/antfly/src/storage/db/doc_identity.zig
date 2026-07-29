@@ -786,6 +786,15 @@ pub fn fastStatsFromStore(store: *docstore_mod.DocStore) !Stats {
     return stats;
 }
 
+/// Returns the maintained live/tombstone cardinality without scanning identity
+/// rows. A null result identifies a store whose identity summary has not been
+/// initialized and lets callers choose an explicit bounded fallback.
+pub fn visibilitySummaryFromStore(store: *docstore_mod.DocStore) !?VisibilitySummary {
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    return try readVisibilitySummaryTxn(&txn);
+}
+
 pub fn allVisibleFromSummaryFast(store: *docstore_mod.DocStore, generation: ?u64) !?bool {
     var txn = try store.beginProbeTxn();
     defer txn.abort();

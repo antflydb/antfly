@@ -23,6 +23,7 @@ const tokenizer_mod = @import("inference_tokenizer");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Tensor = backends.Tensor;
 const runtime = @import("../runtime/root.zig");
+const session_mod = @import("../backends/session.zig");
 
 pub const ScoringMode = enum {
     cross_encoder,
@@ -93,6 +94,8 @@ pub const RerankingPipeline = struct {
         const alloc = self.allocator;
         const max_len = self.config.max_length;
         const batch = documents.len;
+        var run_permit = try self.admitTextRun(batch, max_len);
+        defer run_permit.deinit();
 
         const all_ids = try alloc.alloc(i32, batch * max_len);
         defer alloc.free(all_ids);
@@ -114,7 +117,15 @@ pub const RerankingPipeline = struct {
             );
         }
 
-        var run = try self.runTextEncoder(all_ids, all_mask, all_type_ids, batch, max_len, true);
+        var run = try self.runTextEncoder(
+            all_ids,
+            all_mask,
+            all_type_ids,
+            batch,
+            max_len,
+            true,
+            &run_permit,
+        );
         defer run.deinit();
 
         return try self.extractScores(try run.output(), batch);
@@ -126,6 +137,8 @@ pub const RerankingPipeline = struct {
         const special = self.tok.specialTokens();
         const chunk_size = @max(@as(usize, 1), self.config.batch_size);
 
+        var query_permit = try self.admitTextRun(1, max_len);
+        defer query_permit.deinit();
         var query_encoded = try self.encodeSingleText(query);
         defer query_encoded.deinit();
 
@@ -133,7 +146,15 @@ pub const RerankingPipeline = struct {
         defer alloc.free(query_type_ids);
         @memset(query_type_ids, 0);
 
-        var query_run = try self.runTextEncoder(query_encoded.ids, query_encoded.attention_mask, query_type_ids, 1, max_len, false);
+        var query_run = try self.runTextEncoder(
+            query_encoded.ids,
+            query_encoded.attention_mask,
+            query_type_ids,
+            1,
+            max_len,
+            false,
+            &query_permit,
+        );
         defer query_run.deinit();
 
         const query_output = try query_run.output();
@@ -145,6 +166,8 @@ pub const RerankingPipeline = struct {
         var offset: usize = 0;
         while (offset < documents.len) {
             const chunk_len = @min(chunk_size, documents.len - offset);
+            var doc_permit = try self.admitTextRun(chunk_len, max_len);
+            defer doc_permit.deinit();
             const doc_ids = try alloc.alloc(i32, chunk_len * max_len);
             defer alloc.free(doc_ids);
             const doc_mask = try alloc.alloc(i32, chunk_len * max_len);
@@ -160,7 +183,15 @@ pub const RerankingPipeline = struct {
                 @memcpy(doc_mask[local_idx * max_len .. (local_idx + 1) * max_len], encoded.attention_mask);
             }
 
-            var doc_run = try self.runTextEncoder(doc_ids, doc_mask, doc_type_ids, chunk_len, max_len, false);
+            var doc_run = try self.runTextEncoder(
+                doc_ids,
+                doc_mask,
+                doc_type_ids,
+                chunk_len,
+                max_len,
+                false,
+                &doc_permit,
+            );
             defer doc_run.deinit();
             const doc_output = try doc_run.output();
             if (doc_output.shape.len != 3) return error.UnexpectedOutputShape;
@@ -279,6 +310,7 @@ pub const RerankingPipeline = struct {
         batch: usize,
         max_len: usize,
         include_cross_segments: bool,
+        permit: *session_mod.RunPermit,
     ) !TextRun {
         const alloc = self.allocator;
         const ids_i64 = try alloc.alloc(i64, batch * max_len);
@@ -321,8 +353,25 @@ pub const RerankingPipeline = struct {
 
         return .{
             .allocator = alloc,
-            .outputs = try self.session.run(inputs, alloc),
+            .outputs = try permit.run(inputs, alloc),
         };
+    }
+
+    fn admitTextRun(
+        self: *RerankingPipeline,
+        batch: usize,
+        sequence: usize,
+    ) !session_mod.RunPermit {
+        const tokens = std.math.mul(usize, batch, sequence) catch
+            return error.ResourceLimitExceeded;
+        return self.session.admit(.{
+            .batch = batch,
+            .sequence = sequence,
+            .input_bytes = std.math.mul(usize, tokens, 24) catch
+                return error.ResourceLimitExceeded,
+            .host_preprocess_bytes = std.math.mul(usize, tokens, 32) catch
+                return error.ResourceLimitExceeded,
+        });
     }
 
     fn encodeSingleText(self: *RerankingPipeline, text: []const u8) !@import("inference_tokenizer").EncodeResult {

@@ -17,8 +17,14 @@ const filter = @import("filter.zig");
 const foreign_source = @import("source.zig");
 const postgres_libpq = @import("postgres_libpq.zig");
 const sql = @import("sql.zig");
+const platform_time = @import("antfly_platform").time;
 
 const Allocator = std.mem.Allocator;
+
+fn ensureExecutionDeadline(deadline_ns: ?u64) !void {
+    const deadline = deadline_ns orelse return;
+    if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+}
 
 pub const QueryExecutor = struct {
     ptr: *anyopaque,
@@ -30,7 +36,7 @@ pub const QueryExecutor = struct {
 
         pub const VTable = struct {
             deinit: *const fn (ptr: *anyopaque, alloc: Allocator) void,
-            query: *const fn (ptr: *anyopaque, alloc: Allocator, prepared: sql.PreparedQuery) anyerror!foreign_source.QueryResult,
+            query: *const fn (ptr: *anyopaque, alloc: Allocator, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64) anyerror!foreign_source.QueryResult,
         };
 
         pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -38,8 +44,13 @@ pub const QueryExecutor = struct {
             self.* = undefined;
         }
 
-        pub fn queryPrepared(self: @This(), alloc: Allocator, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
-            return try self.vtable.query(self.ptr, alloc, prepared);
+        pub fn queryPrepared(
+            self: @This(),
+            alloc: Allocator,
+            prepared: sql.PreparedQuery,
+            execution_deadline_ns: ?u64,
+        ) !foreign_source.QueryResult {
+            return try self.vtable.query(self.ptr, alloc, prepared, execution_deadline_ns);
         }
     };
 
@@ -56,11 +67,13 @@ pub const QueryExecutor = struct {
 
     pub const VTable = struct {
         deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
-        query: *const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery) anyerror!foreign_source.QueryResult,
+        query: *const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64) anyerror!foreign_source.QueryResult,
         statistics: *const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8) anyerror!foreign_source.TableStatistics,
-        discover_columns: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8) anyerror![]foreign_source.Column = null,
+        statistics_with_deadline: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) anyerror!foreign_source.TableStatistics = null,
+        discover_columns: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) anyerror![]foreign_source.Column = null,
+        refresh_columns: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) anyerror![]foreign_source.Column = null,
         begin_snapshot_query: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8) anyerror!SnapshotQuery = null,
-        begin_prepared_replication_snapshot: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) anyerror!PreparedReplicationSnapshot = null,
+        begin_prepared_replication_snapshot: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams, execution_deadline_ns: u64) anyerror!PreparedReplicationSnapshot = null,
         prepare_replication: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) anyerror!foreign_source.ReplicationPrepareResult = null,
         poll_changes: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) anyerror!foreign_source.ReplicationPollResult = null,
         cleanup_replication: ?*const fn (ptr: *anyopaque, alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationCleanupParams) anyerror!void = null,
@@ -70,17 +83,34 @@ pub const QueryExecutor = struct {
         if (self.vtable.deinit) |deinit_fn| deinit_fn(self.ptr, alloc);
     }
 
-    pub fn query(self: @This(), alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
-        return try self.vtable.query(self.ptr, alloc, dsn, prepared);
+    pub fn query(self: @This(), alloc: Allocator, dsn: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64) !foreign_source.QueryResult {
+        return try self.vtable.query(self.ptr, alloc, dsn, prepared, execution_deadline_ns);
     }
 
     pub fn statistics(self: @This(), alloc: Allocator, dsn: []const u8, table: []const u8) !foreign_source.TableStatistics {
         return try self.vtable.statistics(self.ptr, alloc, dsn, table);
     }
 
-    pub fn discoverColumns(self: @This(), alloc: Allocator, dsn: []const u8, table: []const u8) ![]foreign_source.Column {
+    pub fn statisticsWithDeadline(self: @This(), alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) !foreign_source.TableStatistics {
+        if (self.vtable.statistics_with_deadline) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, dsn, table, execution_deadline_ns);
+        }
+        if (execution_deadline_ns != null) return error.UnsupportedDeadline;
+        try ensureExecutionDeadline(execution_deadline_ns);
+        const result = try self.statistics(alloc, dsn, table);
+        try ensureExecutionDeadline(execution_deadline_ns);
+        return result;
+    }
+
+    pub fn discoverColumns(self: @This(), alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) ![]foreign_source.Column {
         const discover_fn = self.vtable.discover_columns orelse return error.UnsupportedColumnDiscovery;
-        return try discover_fn(self.ptr, alloc, dsn, table);
+        return try discover_fn(self.ptr, alloc, dsn, table, execution_deadline_ns);
+    }
+
+    pub fn refreshColumns(self: @This(), alloc: Allocator, dsn: []const u8, table: []const u8, execution_deadline_ns: ?u64) ![]foreign_source.Column {
+        if (self.vtable.refresh_columns) |refresh_fn|
+            return try refresh_fn(self.ptr, alloc, dsn, table, execution_deadline_ns);
+        return try self.discoverColumns(alloc, dsn, table, execution_deadline_ns);
     }
 
     pub fn beginSnapshotQuery(self: @This(), alloc: Allocator, dsn: []const u8) !SnapshotQuery {
@@ -88,9 +118,15 @@ pub const QueryExecutor = struct {
         return try begin_fn(self.ptr, alloc, dsn);
     }
 
-    pub fn beginPreparedReplicationSnapshot(self: @This(), alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) !PreparedReplicationSnapshot {
+    pub fn beginPreparedReplicationSnapshot(
+        self: @This(),
+        alloc: Allocator,
+        dsn: []const u8,
+        params: foreign_source.ReplicationPollParams,
+        execution_deadline_ns: u64,
+    ) !PreparedReplicationSnapshot {
         const begin_fn = self.vtable.begin_prepared_replication_snapshot orelse return error.UnsupportedExactCutover;
-        return try begin_fn(self.ptr, alloc, dsn, params);
+        return try begin_fn(self.ptr, alloc, dsn, params, execution_deadline_ns);
     }
 
     pub fn prepareReplication(self: @This(), alloc: Allocator, dsn: []const u8, params: foreign_source.ReplicationPollParams) !foreign_source.ReplicationPrepareResult {
@@ -133,6 +169,19 @@ fn cloneObjectFieldValueAlloc(
     return try cloneJsonValueAlloc(alloc, value);
 }
 
+fn putOwnedJsonObjectValue(
+    alloc: Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: std.json.Value,
+) !void {
+    var owned_value = value;
+    errdefer foreign_source.deinitJsonValue(alloc, &owned_value);
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    try object.put(alloc, owned_key, owned_value);
+}
+
 fn cloneJsonValueAlloc(alloc: Allocator, value: std.json.Value) !std.json.Value {
     return switch (value) {
         .null => .null,
@@ -162,11 +211,13 @@ fn cloneJsonValueAlloc(alloc: Allocator, value: std.json.Value) !std.json.Value 
             }
             var it = obj.iterator();
             while (it.next()) |entry| {
-                try out.put(
-                    alloc,
-                    try alloc.dupe(u8, entry.key_ptr.*),
-                    try cloneJsonValueAlloc(alloc, entry.value_ptr.*),
-                );
+                {
+                    const key = try alloc.dupe(u8, entry.key_ptr.*);
+                    errdefer alloc.free(key);
+                    var item = try cloneJsonValueAlloc(alloc, entry.value_ptr.*);
+                    errdefer foreign_source.deinitJsonValue(alloc, &item);
+                    try out.put(alloc, key, item);
+                }
             }
             break :blk .{ .object = out };
         },
@@ -191,6 +242,7 @@ pub const RuntimeSource = struct {
                 .query = RuntimeSource.query,
                 .aggregate = aggregate,
                 .statistics = statistics,
+                .statistics_with_deadline = statisticsWithDeadline,
                 .begin_snapshot_query = beginSnapshotQuery,
                 .begin_prepared_replication_snapshot = beginPreparedReplicationSnapshot,
                 .prepare_replication = prepareReplication,
@@ -209,62 +261,134 @@ pub const RuntimeSource = struct {
 
     fn query(ptr: *anyopaque, alloc: Allocator, params: foreign_source.QueryParams) !foreign_source.QueryResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        try ensureExecutionDeadline(params.execution_deadline_ns);
         var owned_params = try cloneQueryParamsAlloc(alloc, params);
         defer owned_params.deinit(alloc);
 
-        if (owned_params.columns.len == 0 and
-            (owned_params.fields.len > 0 or owned_params.order_by.len > 0 or owned_params.filter_query_json != null))
-        {
-            owned_params.columns = try self.executor.discoverColumns(alloc, self.dsn, owned_params.table);
+        const auto_discovered_columns = owned_params.columns.len == 0 and
+            (owned_params.fields.len > 0 or owned_params.order_by.len > 0 or owned_params.filter_query_json != null);
+        if (auto_discovered_columns) {
+            owned_params.columns = try self.executor.discoverColumns(alloc, self.dsn, owned_params.table, owned_params.execution_deadline_ns);
         }
+        var refreshed_columns = false;
+        while (true) {
+            validateRequestedFields(owned_params.fields, owned_params.columns) catch |err| {
+                if (!shouldRefreshDiscoveredColumns(err, auto_discovered_columns, refreshed_columns)) return err;
+                try refreshQueryParamsColumns(self.executor, alloc, self.dsn, &owned_params);
+                refreshed_columns = true;
+                continue;
+            };
+            validateRequestedOrderBy(owned_params.order_by, owned_params.columns) catch |err| {
+                if (!shouldRefreshDiscoveredColumns(err, auto_discovered_columns, refreshed_columns)) return err;
+                try refreshQueryParamsColumns(self.executor, alloc, self.dsn, &owned_params);
+                refreshed_columns = true;
+                continue;
+            };
 
-        try validateRequestedFields(owned_params.fields, owned_params.columns);
-        try validateRequestedOrderBy(owned_params.order_by, owned_params.columns);
+            var translated_filter: ?filter.Translation = null;
+            defer if (translated_filter) |*value| value.deinit(alloc);
+            if (owned_params.filter_query_json) |filter_query_json| {
+                translated_filter = filter.translateAlloc(alloc, sql.postgresDialect(), filter_query_json, owned_params.columns) catch |err| {
+                    if (!shouldRefreshDiscoveredColumns(err, auto_discovered_columns, refreshed_columns)) return err;
+                    try refreshQueryParamsColumns(self.executor, alloc, self.dsn, &owned_params);
+                    refreshed_columns = true;
+                    continue;
+                };
+            }
 
-        var translated_filter: ?filter.Translation = null;
-        defer if (translated_filter) |*value| value.deinit(alloc);
-        if (owned_params.filter_query_json) |filter_query_json| {
-            translated_filter = try filter.translateAlloc(alloc, sql.postgresDialect(), filter_query_json, owned_params.columns);
+            const sql_text = try sql.buildSelectStatementAlloc(alloc, sql.postgresDialect(), .{
+                .table = owned_params.table,
+                .fields = owned_params.fields,
+                .where_sql = if (translated_filter) |value| if (value.where_sql.len > 0) value.where_sql else null else null,
+                .order_by = owned_params.order_by,
+                .limit = owned_params.limit,
+                .offset = owned_params.offset,
+            });
+            ensureExecutionDeadline(owned_params.execution_deadline_ns) catch |err| {
+                alloc.free(sql_text);
+                return err;
+            };
+            const args: []sql.ParameterValue = if (translated_filter) |value|
+                cloneArgsAlloc(alloc, value.args) catch |err| {
+                    alloc.free(sql_text);
+                    return err;
+                }
+            else
+                &.{};
+            var result = self.executor.query(alloc, self.dsn, .{
+                .sql_text = sql_text,
+                .args = args,
+            }, owned_params.execution_deadline_ns) catch |err| {
+                if (!shouldRefreshDiscoveredColumns(err, auto_discovered_columns, refreshed_columns)) return err;
+                try refreshQueryParamsColumns(self.executor, alloc, self.dsn, &owned_params);
+                refreshed_columns = true;
+                continue;
+            };
+            errdefer result.deinit(alloc);
+            try ensureExecutionDeadline(owned_params.execution_deadline_ns);
+            return result;
         }
-
-        const sql_text = try sql.buildSelectStatementAlloc(alloc, sql.postgresDialect(), .{
-            .table = owned_params.table,
-            .fields = owned_params.fields,
-            .where_sql = if (translated_filter) |value| if (value.where_sql.len > 0) value.where_sql else null else null,
-            .order_by = owned_params.order_by,
-            .limit = owned_params.limit,
-            .offset = owned_params.offset,
-        });
-        return try self.executor.query(alloc, self.dsn, .{
-            .sql_text = sql_text,
-            .args = if (translated_filter) |value| try cloneArgsAlloc(alloc, value.args) else &.{},
-        });
     }
 
     fn aggregate(ptr: *anyopaque, alloc: Allocator, params: foreign_source.AggregateParams) !foreign_source.AggregateResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        try ensureExecutionDeadline(params.execution_deadline_ns);
         var owned_params = try cloneAggregateParamsAlloc(alloc, params);
         defer owned_params.deinit(alloc);
 
-        if (owned_params.columns.len == 0 and
-            (owned_params.filter_query_json != null or aggregateParamsNeedColumnDiscovery(owned_params.aggregations)))
-        {
-            owned_params.columns = try self.executor.discoverColumns(alloc, self.dsn, owned_params.table);
+        const auto_discovered_columns = owned_params.columns.len == 0 and
+            (owned_params.filter_query_json != null or aggregateParamsNeedColumnDiscovery(owned_params.aggregations));
+        if (auto_discovered_columns) {
+            owned_params.columns = try self.executor.discoverColumns(alloc, self.dsn, owned_params.table, owned_params.execution_deadline_ns);
         }
-        try validateAggregations(owned_params.aggregations, owned_params.columns);
+        var refreshed_columns = false;
+        while (true) {
+            validateAggregations(owned_params.aggregations, owned_params.columns) catch |err| {
+                if (!shouldRefreshDiscoveredColumns(err, auto_discovered_columns, refreshed_columns)) return err;
+                try refreshAggregateParamsColumns(self.executor, alloc, self.dsn, &owned_params);
+                refreshed_columns = true;
+                continue;
+            };
 
-        var translated_filter: ?filter.Translation = null;
-        defer if (translated_filter) |*value| value.deinit(alloc);
-        if (owned_params.filter_query_json) |filter_query_json| {
-            translated_filter = try filter.translateAlloc(alloc, sql.postgresDialect(), filter_query_json, owned_params.columns);
+            var translated_filter: ?filter.Translation = null;
+            defer if (translated_filter) |*value| value.deinit(alloc);
+            if (owned_params.filter_query_json) |filter_query_json| {
+                translated_filter = filter.translateAlloc(alloc, sql.postgresDialect(), filter_query_json, owned_params.columns) catch |err| {
+                    if (!shouldRefreshDiscoveredColumns(err, auto_discovered_columns, refreshed_columns)) return err;
+                    try refreshAggregateParamsColumns(self.executor, alloc, self.dsn, &owned_params);
+                    refreshed_columns = true;
+                    continue;
+                };
+            }
+
+            try ensureExecutionDeadline(owned_params.execution_deadline_ns);
+            var result = self.aggregateParamsAlloc(
+                alloc,
+                owned_params,
+                if (translated_filter) |value| if (value.where_sql.len > 0) value.where_sql else null else null,
+                if (translated_filter) |value| value.args else &.{},
+            ) catch |err| {
+                if (!shouldRefreshDiscoveredColumns(err, auto_discovered_columns, refreshed_columns)) return err;
+                try refreshAggregateParamsColumns(self.executor, alloc, self.dsn, &owned_params);
+                refreshed_columns = true;
+                continue;
+            };
+            errdefer result.deinit(alloc);
+            try ensureExecutionDeadline(owned_params.execution_deadline_ns);
+            return result;
         }
-
-        return try self.aggregateParamsAlloc(alloc, owned_params, if (translated_filter) |value| if (value.where_sql.len > 0) value.where_sql else null else null, if (translated_filter) |value| value.args else &.{});
     }
 
     fn statistics(ptr: *anyopaque, table: []const u8) !foreign_source.TableStatistics {
+        return try statisticsWithDeadline(ptr, table, null);
+    }
+
+    fn statisticsWithDeadline(ptr: *anyopaque, table: []const u8, execution_deadline_ns: ?u64) !foreign_source.TableStatistics {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.executor.statistics(self.alloc, self.dsn, table);
+        try ensureExecutionDeadline(execution_deadline_ns);
+        const result = try self.executor.statisticsWithDeadline(self.alloc, self.dsn, table, execution_deadline_ns);
+        try ensureExecutionDeadline(execution_deadline_ns);
+        return result;
     }
 
     const RuntimeSnapshotReader = struct {
@@ -298,36 +422,68 @@ pub const RuntimeSource = struct {
 
         fn query(ptr: *anyopaque, alloc: Allocator, params: foreign_source.QueryParams) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try ensureExecutionDeadline(params.execution_deadline_ns);
             var owned_params = try cloneQueryParamsAlloc(alloc, params);
             defer owned_params.deinit(alloc);
 
-            if (owned_params.columns.len == 0 and
-                (owned_params.fields.len > 0 or owned_params.order_by.len > 0 or owned_params.filter_query_json != null))
-            {
-                owned_params.columns = try self.executor.discoverColumns(alloc, self.dsn, owned_params.table);
+            const auto_discovered_columns = owned_params.columns.len == 0 and
+                (owned_params.fields.len > 0 or owned_params.order_by.len > 0 or owned_params.filter_query_json != null);
+            if (auto_discovered_columns) {
+                owned_params.columns = try self.executor.discoverColumns(alloc, self.dsn, owned_params.table, owned_params.execution_deadline_ns);
             }
+            var refreshed_columns = false;
+            while (true) {
+                validateRequestedFields(owned_params.fields, owned_params.columns) catch |err| {
+                    if (!shouldRefreshDiscoveredColumns(err, auto_discovered_columns, refreshed_columns)) return err;
+                    try refreshQueryParamsColumns(self.executor, alloc, self.dsn, &owned_params);
+                    refreshed_columns = true;
+                    continue;
+                };
+                validateRequestedOrderBy(owned_params.order_by, owned_params.columns) catch |err| {
+                    if (!shouldRefreshDiscoveredColumns(err, auto_discovered_columns, refreshed_columns)) return err;
+                    try refreshQueryParamsColumns(self.executor, alloc, self.dsn, &owned_params);
+                    refreshed_columns = true;
+                    continue;
+                };
 
-            try validateRequestedFields(owned_params.fields, owned_params.columns);
-            try validateRequestedOrderBy(owned_params.order_by, owned_params.columns);
+                var translated_filter: ?filter.Translation = null;
+                defer if (translated_filter) |*value| value.deinit(alloc);
+                if (owned_params.filter_query_json) |filter_query_json| {
+                    translated_filter = filter.translateAlloc(alloc, sql.postgresDialect(), filter_query_json, owned_params.columns) catch |err| {
+                        if (!shouldRefreshDiscoveredColumns(err, auto_discovered_columns, refreshed_columns)) return err;
+                        try refreshQueryParamsColumns(self.executor, alloc, self.dsn, &owned_params);
+                        refreshed_columns = true;
+                        continue;
+                    };
+                }
 
-            var translated_filter: ?filter.Translation = null;
-            defer if (translated_filter) |*value| value.deinit(alloc);
-            if (owned_params.filter_query_json) |filter_query_json| {
-                translated_filter = try filter.translateAlloc(alloc, sql.postgresDialect(), filter_query_json, owned_params.columns);
+                const sql_text = try sql.buildSelectStatementAlloc(alloc, sql.postgresDialect(), .{
+                    .table = owned_params.table,
+                    .fields = owned_params.fields,
+                    .where_sql = if (translated_filter) |value| if (value.where_sql.len > 0) value.where_sql else null else null,
+                    .order_by = owned_params.order_by,
+                    .limit = owned_params.limit,
+                    .offset = owned_params.offset,
+                });
+                ensureExecutionDeadline(owned_params.execution_deadline_ns) catch |err| {
+                    alloc.free(sql_text);
+                    return err;
+                };
+                const args: []sql.ParameterValue = if (translated_filter) |value|
+                    cloneArgsAlloc(alloc, value.args) catch |err| {
+                        alloc.free(sql_text);
+                        return err;
+                    }
+                else
+                    &.{};
+                var result = try self.snapshot_query.queryPrepared(alloc, .{
+                    .sql_text = sql_text,
+                    .args = args,
+                }, owned_params.execution_deadline_ns);
+                errdefer result.deinit(alloc);
+                try ensureExecutionDeadline(owned_params.execution_deadline_ns);
+                return result;
             }
-
-            const sql_text = try sql.buildSelectStatementAlloc(alloc, sql.postgresDialect(), .{
-                .table = owned_params.table,
-                .fields = owned_params.fields,
-                .where_sql = if (translated_filter) |value| if (value.where_sql.len > 0) value.where_sql else null else null,
-                .order_by = owned_params.order_by,
-                .limit = owned_params.limit,
-                .offset = owned_params.offset,
-            });
-            return try self.snapshot_query.queryPrepared(alloc, .{
-                .sql_text = sql_text,
-                .args = if (translated_filter) |value| try cloneArgsAlloc(alloc, value.args) else &.{},
-            });
         }
     };
 
@@ -350,12 +506,22 @@ pub const RuntimeSource = struct {
         return reader.asSnapshotReader();
     }
 
-    fn beginPreparedReplicationSnapshot(ptr: *anyopaque, alloc: Allocator, params: foreign_source.ReplicationPollParams) !foreign_source.PreparedReplicationSnapshot {
+    fn beginPreparedReplicationSnapshot(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        params: foreign_source.ReplicationPollParams,
+        execution_deadline_ns: u64,
+    ) !foreign_source.PreparedReplicationSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var owned_params = try cloneReplicationPollParamsAlloc(alloc, params);
         defer owned_params.deinit(alloc);
 
-        var prepared = try self.executor.beginPreparedReplicationSnapshot(alloc, self.dsn, owned_params);
+        var prepared = try self.executor.beginPreparedReplicationSnapshot(
+            alloc,
+            self.dsn,
+            owned_params,
+            execution_deadline_ns,
+        );
         errdefer prepared.deinit(alloc);
 
         const reader = try alloc.create(RuntimeSnapshotReader);
@@ -389,9 +555,14 @@ pub const RuntimeSource = struct {
 
     fn cleanupReplication(ptr: *anyopaque, alloc: Allocator, params: foreign_source.ReplicationCleanupParams) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        const slot_name = try alloc.dupe(u8, params.slot_name);
+        const publication_name = alloc.dupe(u8, params.publication_name) catch |err| {
+            alloc.free(slot_name);
+            return err;
+        };
         var owned_params = foreign_source.ReplicationCleanupParams{
-            .slot_name = try alloc.dupe(u8, params.slot_name),
-            .publication_name = try alloc.dupe(u8, params.publication_name),
+            .slot_name = slot_name,
+            .publication_name = publication_name,
         };
         defer owned_params.deinit(alloc);
         return try self.executor.cleanupReplication(alloc, self.dsn, owned_params);
@@ -415,25 +586,35 @@ pub const RuntimeSource = struct {
         }
 
         if (simple_aggs.len > 0) {
+            try ensureExecutionDeadline(params.execution_deadline_ns);
             const prepared = try buildSimpleAggregatePreparedQueryAlloc(alloc, params.table, simple_aggs, where_sql, where_args);
-            var result = try self.executor.query(alloc, self.dsn, prepared);
+            var result = try self.executor.query(alloc, self.dsn, prepared, params.execution_deadline_ns);
             defer result.deinit(alloc);
             const row = if (result.rows.len > 0) result.rows[0] else std.json.Value{ .object = std.json.ObjectMap.empty };
             defer if (result.rows.len == 0) foreign_source.deinitJsonValue(alloc, @constCast(&row));
             for (simple_aggs) |simple_agg| {
+                const name = try alloc.dupe(u8, simple_agg.name);
+                errdefer alloc.free(name);
+                var value = try cloneObjectFieldValueAlloc(alloc, row, simple_agg.name);
+                errdefer foreign_source.deinitJsonValue(alloc, &value);
                 out[initialized] = .{
-                    .name = try alloc.dupe(u8, simple_agg.name),
-                    .value = try cloneObjectFieldValueAlloc(alloc, row, simple_agg.name),
+                    .name = name,
+                    .value = value,
                 };
                 initialized += 1;
             }
         }
 
         for (params.aggregations) |aggregation| {
+            try ensureExecutionDeadline(params.execution_deadline_ns);
             if (isSimpleAggregation(aggregation.definition.type_name)) continue;
+            const name = try alloc.dupe(u8, aggregation.name);
+            errdefer alloc.free(name);
+            var value = try self.executeComplexAggregationAlloc(alloc, params.table, aggregation.definition, where_sql, where_args, params.execution_deadline_ns);
+            errdefer foreign_source.deinitJsonValue(alloc, &value);
             out[initialized] = .{
-                .name = try alloc.dupe(u8, aggregation.name),
-                .value = try self.executeComplexAggregationAlloc(alloc, params.table, aggregation.definition, where_sql, where_args),
+                .name = name,
+                .value = value,
             };
             initialized += 1;
         }
@@ -448,12 +629,13 @@ pub const RuntimeSource = struct {
         definition: foreign_source.AggregationDef,
         where_sql: ?[]const u8,
         where_args: []const sql.ParameterValue,
+        execution_deadline_ns: ?u64,
     ) !std.json.Value {
         if (std.mem.eql(u8, definition.type_name, "stats")) {
-            return try self.runStatsAggregateAlloc(alloc, table, definition, where_sql, where_args);
+            return try self.runStatsAggregateAlloc(alloc, table, definition, where_sql, where_args, execution_deadline_ns);
         }
         if (std.mem.eql(u8, definition.type_name, "terms")) {
-            return try self.runTermsAggregateAlloc(alloc, table, definition, where_sql, where_args);
+            return try self.runTermsAggregateAlloc(alloc, table, definition, where_sql, where_args, execution_deadline_ns);
         }
         return error.UnsupportedAggregate;
     }
@@ -465,11 +647,12 @@ pub const RuntimeSource = struct {
         definition: foreign_source.AggregationDef,
         where_sql: ?[]const u8,
         where_args: []const sql.ParameterValue,
+        execution_deadline_ns: ?u64,
     ) !std.json.Value {
         const field = definition.field orelse return error.InvalidQueryRequest;
         const quoted_field = try sql.postgresDialect().quote_identifier(alloc, field);
         defer alloc.free(quoted_field);
-        const quoted_table = try sql.postgresDialect().quote_identifier(alloc, table);
+        const quoted_table = try sql.postgresDialect().quote_relation(alloc, table);
         defer alloc.free(quoted_table);
         const where_clause = if (where_sql) |value|
             try std.fmt.allocPrint(alloc, " WHERE {s}", .{value})
@@ -494,11 +677,11 @@ pub const RuntimeSource = struct {
             .sql_text = try alloc.dupe(u8, sql_text),
             .args = try cloneArgsAlloc(alloc, where_args),
         };
-        var result = try self.executor.query(alloc, self.dsn, prepared);
+        var result = try self.executor.query(alloc, self.dsn, prepared, execution_deadline_ns);
         defer result.deinit(alloc);
         if (result.rows.len == 0) {
             var empty = std.json.ObjectMap.empty;
-            try empty.put(alloc, try alloc.dupe(u8, "count"), .{ .integer = 0 });
+            try putOwnedJsonObjectValue(alloc, &empty, "count", .{ .integer = 0 });
             return .{ .object = empty };
         }
         return try cloneJsonValueAlloc(alloc, result.rows[0]);
@@ -511,11 +694,12 @@ pub const RuntimeSource = struct {
         definition: foreign_source.AggregationDef,
         where_sql: ?[]const u8,
         where_args: []const sql.ParameterValue,
+        execution_deadline_ns: ?u64,
     ) !std.json.Value {
         const field = definition.field orelse return error.InvalidQueryRequest;
         const quoted_field = try sql.postgresDialect().quote_identifier(alloc, field);
         defer alloc.free(quoted_field);
-        const quoted_table = try sql.postgresDialect().quote_identifier(alloc, table);
+        const quoted_table = try sql.postgresDialect().quote_relation(alloc, table);
         defer alloc.free(quoted_table);
         const size = @min(definition.size orelse 10, 1000);
         const where_clause = if (where_sql) |value|
@@ -533,7 +717,7 @@ pub const RuntimeSource = struct {
             .sql_text = try alloc.dupe(u8, sql_text),
             .args = try cloneArgsAlloc(alloc, where_args),
         };
-        var result = try self.executor.query(alloc, self.dsn, prepared);
+        var result = try self.executor.query(alloc, self.dsn, prepared, execution_deadline_ns);
         defer result.deinit(alloc);
 
         var buckets = std.json.Array.init(alloc);
@@ -542,6 +726,7 @@ pub const RuntimeSource = struct {
             buckets.deinit();
         }
         for (result.rows) |row| {
+            try ensureExecutionDeadline(execution_deadline_ns);
             var bucket = std.json.ObjectMap.empty;
             errdefer {
                 var it = bucket.iterator();
@@ -551,8 +736,8 @@ pub const RuntimeSource = struct {
                 }
                 bucket.deinit(alloc);
             }
-            try bucket.put(alloc, try alloc.dupe(u8, "key"), try cloneObjectFieldValueAlloc(alloc, row, "key"));
-            try bucket.put(alloc, try alloc.dupe(u8, "doc_count"), try cloneObjectFieldValueAlloc(alloc, row, "doc_count"));
+            try putOwnedJsonObjectValue(alloc, &bucket, "key", try cloneObjectFieldValueAlloc(alloc, row, "key"));
+            try putOwnedJsonObjectValue(alloc, &bucket, "doc_count", try cloneObjectFieldValueAlloc(alloc, row, "doc_count"));
             try buckets.append(.{ .object = bucket });
         }
         return .{ .array = buckets };
@@ -562,16 +747,22 @@ pub const RuntimeSource = struct {
 fn cloneColumnsAlloc(alloc: Allocator, columns: []const foreign_source.Column) ![]foreign_source.Column {
     if (columns.len == 0) return &.{};
     const out = try alloc.alloc(foreign_source.Column, columns.len);
+    var initialized: usize = 0;
     errdefer {
-        for (out[0..]) |*column| column.deinit(alloc);
+        for (out[0..initialized]) |*column| column.deinit(alloc);
         alloc.free(out);
     }
     for (columns, 0..) |column, i| {
+        const name = try alloc.dupe(u8, column.name);
+        errdefer alloc.free(name);
+        const data_type = try alloc.dupe(u8, column.data_type);
+        errdefer alloc.free(data_type);
         out[i] = .{
-            .name = try alloc.dupe(u8, column.name),
-            .data_type = try alloc.dupe(u8, column.data_type),
+            .name = name,
+            .data_type = data_type,
             .nullable = column.nullable,
         };
+        initialized += 1;
     }
     return out;
 }
@@ -579,19 +770,24 @@ fn cloneColumnsAlloc(alloc: Allocator, columns: []const foreign_source.Column) !
 fn cloneFieldsAlloc(alloc: Allocator, fields: []const []u8) ![][]u8 {
     if (fields.len == 0) return &.{};
     const out = try alloc.alloc([]u8, fields.len);
+    var initialized: usize = 0;
     errdefer {
-        for (out[0..]) |field| alloc.free(field);
+        for (out[0..initialized]) |field| alloc.free(field);
         alloc.free(out);
     }
-    for (fields, 0..) |field, i| out[i] = try alloc.dupe(u8, field);
+    for (fields, 0..) |field, i| {
+        out[i] = try alloc.dupe(u8, field);
+        initialized += 1;
+    }
     return out;
 }
 
 fn cloneOrderByAlloc(alloc: Allocator, order_by: []const foreign_source.SortField) ![]foreign_source.SortField {
     if (order_by.len == 0) return &.{};
     const out = try alloc.alloc(foreign_source.SortField, order_by.len);
+    var initialized: usize = 0;
     errdefer {
-        for (out[0..]) |*field| field.deinit(alloc);
+        for (out[0..initialized]) |*field| field.deinit(alloc);
         alloc.free(out);
     }
     for (order_by, 0..) |field, i| {
@@ -599,6 +795,7 @@ fn cloneOrderByAlloc(alloc: Allocator, order_by: []const foreign_source.SortFiel
             .field = try alloc.dupe(u8, field.field),
             .desc = field.desc,
         };
+        initialized += 1;
     }
     return out;
 }
@@ -606,42 +803,56 @@ fn cloneOrderByAlloc(alloc: Allocator, order_by: []const foreign_source.SortFiel
 fn cloneAggregationsAlloc(alloc: Allocator, aggregations: []const foreign_source.NamedAggregation) ![]foreign_source.NamedAggregation {
     if (aggregations.len == 0) return &.{};
     const out = try alloc.alloc(foreign_source.NamedAggregation, aggregations.len);
+    var initialized: usize = 0;
     errdefer {
-        for (out[0..]) |*aggregation| aggregation.deinit(alloc);
+        for (out[0..initialized]) |*aggregation| aggregation.deinit(alloc);
         alloc.free(out);
     }
     for (aggregations, 0..) |aggregation, i| {
+        const name = try alloc.dupe(u8, aggregation.name);
+        errdefer alloc.free(name);
+        const type_name = try alloc.dupe(u8, aggregation.definition.type_name);
+        errdefer alloc.free(type_name);
+        const field = if (aggregation.definition.field) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (field) |value| alloc.free(value);
         out[i] = .{
-            .name = try alloc.dupe(u8, aggregation.name),
+            .name = name,
             .definition = .{
-                .type_name = try alloc.dupe(u8, aggregation.definition.type_name),
-                .field = if (aggregation.definition.field) |field| try alloc.dupe(u8, field) else null,
+                .type_name = type_name,
+                .field = field,
                 .size = aggregation.definition.size,
             },
         };
+        initialized += 1;
     }
     return out;
 }
 
 fn cloneQueryParamsAlloc(alloc: Allocator, params: foreign_source.QueryParams) !foreign_source.QueryParams {
-    return .{
+    var out = foreign_source.QueryParams{
         .table = try alloc.dupe(u8, params.table),
-        .fields = try cloneFieldsAlloc(alloc, params.fields),
-        .filter_query_json = if (params.filter_query_json) |query| try alloc.dupe(u8, query) else null,
-        .columns = try cloneColumnsAlloc(alloc, params.columns),
         .limit = params.limit,
         .offset = params.offset,
-        .order_by = try cloneOrderByAlloc(alloc, params.order_by),
+        .execution_deadline_ns = params.execution_deadline_ns,
     };
+    errdefer out.deinit(alloc);
+    out.fields = try cloneFieldsAlloc(alloc, params.fields);
+    out.filter_query_json = if (params.filter_query_json) |query| try alloc.dupe(u8, query) else null;
+    out.columns = try cloneColumnsAlloc(alloc, params.columns);
+    out.order_by = try cloneOrderByAlloc(alloc, params.order_by);
+    return out;
 }
 
 fn cloneAggregateParamsAlloc(alloc: Allocator, params: foreign_source.AggregateParams) !foreign_source.AggregateParams {
-    return .{
+    var out = foreign_source.AggregateParams{
         .table = try alloc.dupe(u8, params.table),
-        .filter_query_json = if (params.filter_query_json) |query| try alloc.dupe(u8, query) else null,
-        .columns = try cloneColumnsAlloc(alloc, params.columns),
-        .aggregations = try cloneAggregationsAlloc(alloc, params.aggregations),
+        .execution_deadline_ns = params.execution_deadline_ns,
     };
+    errdefer out.deinit(alloc);
+    out.filter_query_json = if (params.filter_query_json) |query| try alloc.dupe(u8, query) else null;
+    out.columns = try cloneColumnsAlloc(alloc, params.columns);
+    out.aggregations = try cloneAggregationsAlloc(alloc, params.aggregations);
+    return out;
 }
 
 const SimpleAggregation = struct {
@@ -693,7 +904,7 @@ fn buildSimpleAggregatePreparedQueryAlloc(
     where_sql: ?[]const u8,
     where_args: []const sql.ParameterValue,
 ) !sql.PreparedQuery {
-    const quoted_table = try sql.postgresDialect().quote_identifier(alloc, table);
+    const quoted_table = try sql.postgresDialect().quote_relation(alloc, table);
     defer alloc.free(quoted_table);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -743,6 +954,52 @@ fn validateRequestedFields(fields: []const []const u8, columns: []const foreign_
     }
 }
 
+fn shouldRefreshDiscoveredColumns(err: anyerror, auto_discovered: bool, already_refreshed: bool) bool {
+    return auto_discovered and
+        !already_refreshed and
+        (err == error.UnknownColumn or err == error.ForeignTableNotFound);
+}
+
+fn replaceOwnedColumns(
+    alloc: Allocator,
+    destination: *[]foreign_source.Column,
+    replacement: []foreign_source.Column,
+) void {
+    for (destination.*) |*column| column.deinit(alloc);
+    if (destination.len > 0) alloc.free(destination.*);
+    destination.* = replacement;
+}
+
+fn refreshQueryParamsColumns(
+    executor: QueryExecutor,
+    alloc: Allocator,
+    dsn: []const u8,
+    params: *foreign_source.QueryParams,
+) !void {
+    const refreshed = try executor.refreshColumns(
+        alloc,
+        dsn,
+        params.table,
+        params.execution_deadline_ns,
+    );
+    replaceOwnedColumns(alloc, &params.columns, refreshed);
+}
+
+fn refreshAggregateParamsColumns(
+    executor: QueryExecutor,
+    alloc: Allocator,
+    dsn: []const u8,
+    params: *foreign_source.AggregateParams,
+) !void {
+    const refreshed = try executor.refreshColumns(
+        alloc,
+        dsn,
+        params.table,
+        params.execution_deadline_ns,
+    );
+    replaceOwnedColumns(alloc, &params.columns, refreshed);
+}
+
 fn validateRequestedOrderBy(order_by: []const foreign_source.SortField, columns: []const foreign_source.Column) !void {
     if (columns.len == 0) return;
     for (order_by) |sort_field| {
@@ -783,14 +1040,18 @@ fn cloneReplicationPollParamsAlloc(
     alloc: Allocator,
     params: foreign_source.ReplicationPollParams,
 ) !foreign_source.ReplicationPollParams {
-    return .{
+    var out = foreign_source.ReplicationPollParams{
         .table = try alloc.dupe(u8, params.table),
-        .slot_name = if (params.slot_name) |slot_name| try alloc.dupe(u8, slot_name) else null,
-        .publication_name = if (params.publication_name) |publication_name| try alloc.dupe(u8, publication_name) else null,
-        .filter_query_json = if (params.filter_query_json) |query| try alloc.dupe(u8, query) else null,
-        .checkpoint = if (params.checkpoint) |checkpoint| try alloc.dupe(u8, checkpoint) else null,
         .limit = params.limit,
+        .reclaim_exact_cutover_slot = params.reclaim_exact_cutover_slot,
+        .exact_cutover_intent = params.exact_cutover_intent,
     };
+    errdefer out.deinit(alloc);
+    out.slot_name = if (params.slot_name) |slot_name| try alloc.dupe(u8, slot_name) else null;
+    out.publication_name = if (params.publication_name) |publication_name| try alloc.dupe(u8, publication_name) else null;
+    out.filter_query_json = if (params.filter_query_json) |query| try alloc.dupe(u8, query) else null;
+    out.checkpoint = if (params.checkpoint) |checkpoint| try alloc.dupe(u8, checkpoint) else null;
+    return out;
 }
 
 const ExecutorRegistration = struct {
@@ -808,6 +1069,7 @@ fn factoryFromExecutor(ptr: *anyopaque, alloc: Allocator, config: foreign_source
     var owned = config;
     defer owned.deinit(alloc);
     const runtime_source = try alloc.create(RuntimeSource);
+    errdefer alloc.destroy(runtime_source);
     runtime_source.* = .{
         .alloc = alloc,
         .executor = registration.executor,
@@ -837,7 +1099,7 @@ test "postgres source runtime delegates replication polling through executor" {
         last_publication_name: ?[]u8 = null,
         prepare_calls: usize = 0,
 
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             return .{ .rows = try inner_alloc.alloc(std.json.Value, 0), .total = 0 };
@@ -930,7 +1192,7 @@ test "postgres source runtime delegates replication prepare through executor" {
         last_publication_name: ?[]u8 = null,
         prepare_calls: usize = 0,
 
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             return .{ .rows = try inner_alloc.alloc(std.json.Value, 0), .total = 0 };
@@ -998,6 +1260,7 @@ test "postgres source runtime delegates consistent snapshot queries through exec
         begin_calls: usize = 0,
         query_calls: usize = 0,
         last_sql: ?[]u8 = null,
+        last_deadline_ns: ?u64 = null,
 
         const SnapshotSession = struct {
             owner: *Parent,
@@ -1007,9 +1270,10 @@ test "postgres source runtime delegates consistent snapshot queries through exec
                 inner_alloc.destroy(self);
             }
 
-            fn query(ptr: *anyopaque, inner_alloc: Allocator, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+            fn query(ptr: *anyopaque, inner_alloc: Allocator, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64) !foreign_source.QueryResult {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 self.owner.query_calls += 1;
+                self.owner.last_deadline_ns = execution_deadline_ns;
                 if (self.owner.last_sql) |value| inner_alloc.free(value);
                 self.owner.last_sql = try inner_alloc.dupe(u8, prepared.sql_text);
                 var owned = prepared;
@@ -1020,7 +1284,7 @@ test "postgres source runtime delegates consistent snapshot queries through exec
             }
         };
 
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             return .{ .rows = try inner_alloc.alloc(std.json.Value, 0), .total = 0 };
@@ -1069,10 +1333,12 @@ test "postgres source runtime delegates consistent snapshot queries through exec
     var snapshot = try src.beginSnapshotQuery(alloc);
     defer snapshot.deinit(alloc);
 
+    const execution_deadline_ns = platform_time.monotonicNs() + 60 * std.time.ns_per_s;
     var query_params = foreign_source.QueryParams{
         .table = try alloc.dupe(u8, "customers"),
         .limit = 10,
         .offset = 0,
+        .execution_deadline_ns = execution_deadline_ns,
     };
     defer query_params.deinit(alloc);
 
@@ -1081,8 +1347,17 @@ test "postgres source runtime delegates consistent snapshot queries through exec
 
     try std.testing.expectEqual(@as(usize, 1), executor.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), executor.query_calls);
+    try std.testing.expectEqual(@as(?u64, execution_deadline_ns), executor.last_deadline_ns);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expect(std.mem.indexOf(u8, executor.last_sql.?, "FROM \"customers\"") != null);
+
+    var expired_params = foreign_source.QueryParams{
+        .table = try alloc.dupe(u8, "customers"),
+        .execution_deadline_ns = platform_time.monotonicNs(),
+    };
+    defer expired_params.deinit(alloc);
+    try std.testing.expectError(error.Timeout, snapshot.query(alloc, expired_params));
+    try std.testing.expectEqual(@as(usize, 1), executor.query_calls);
 }
 
 test "postgres source runtime delegates prepared replication snapshot through executor" {
@@ -1093,6 +1368,7 @@ test "postgres source runtime delegates prepared replication snapshot through ex
 
         begin_calls: usize = 0,
         query_calls: usize = 0,
+        last_deadline_ns: u64 = 0,
         last_slot_name: ?[]u8 = null,
 
         const SnapshotSession = struct {
@@ -1103,7 +1379,7 @@ test "postgres source runtime delegates prepared replication snapshot through ex
                 inner_alloc.destroy(self);
             }
 
-            fn query(ptr: *anyopaque, inner_alloc: Allocator, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+            fn query(ptr: *anyopaque, inner_alloc: Allocator, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 self.owner.query_calls += 1;
                 var owned = prepared;
@@ -1114,7 +1390,7 @@ test "postgres source runtime delegates prepared replication snapshot through ex
             }
         };
 
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             return .{ .rows = try inner_alloc.alloc(std.json.Value, 0), .total = 0 };
@@ -1129,9 +1405,11 @@ test "postgres source runtime delegates prepared replication snapshot through ex
             inner_alloc: Allocator,
             _: []const u8,
             params: foreign_source.ReplicationPollParams,
+            execution_deadline_ns: u64,
         ) !QueryExecutor.PreparedReplicationSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.begin_calls += 1;
+            self.last_deadline_ns = execution_deadline_ns;
             if (self.last_slot_name) |value| inner_alloc.free(value);
             self.last_slot_name = if (params.slot_name) |value| try inner_alloc.dupe(u8, value) else null;
             const session = try inner_alloc.create(SnapshotSession);
@@ -1177,7 +1455,12 @@ test "postgres source runtime delegates prepared replication snapshot through ex
     };
     defer poll_params.deinit(alloc);
 
-    var prepared = try src.beginPreparedReplicationSnapshot(alloc, poll_params);
+    const execution_deadline_ns = std.math.maxInt(u64);
+    var prepared = try src.beginPreparedReplicationSnapshot(
+        alloc,
+        poll_params,
+        execution_deadline_ns,
+    );
     defer prepared.deinit(alloc);
 
     var query_params = foreign_source.QueryParams{
@@ -1191,6 +1474,7 @@ test "postgres source runtime delegates prepared replication snapshot through ex
 
     try std.testing.expectEqual(@as(usize, 1), executor.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), executor.query_calls);
+    try std.testing.expectEqual(execution_deadline_ns, executor.last_deadline_ns);
     try std.testing.expectEqualStrings("antfly_slot", executor.last_slot_name.?);
     try std.testing.expectEqualStrings("lsn:cutover", prepared.checkpoint);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
@@ -1353,11 +1637,13 @@ test "postgres source runtime live polling still sees insert after repeated empt
         .dsn = try alloc.dupe(u8, dsn),
     });
     defer query_source.deinit(alloc);
-    var snapshot_result = try query_source.query(alloc, .{
+    var snapshot_params = foreign_source.QueryParams{
         .table = try alloc.dupe(u8, table_name),
         .limit = 16,
         .offset = 0,
-    });
+    };
+    defer snapshot_params.deinit(alloc);
+    var snapshot_result = try query_source.query(alloc, snapshot_params);
     defer snapshot_result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), snapshot_result.rows.len);
 
@@ -1410,14 +1696,16 @@ test "postgres source runtime builds select queries through executor" {
     const FakeExecutor = struct {
         last_sql: ?[]u8 = null,
         last_args: []sql.ParameterValue = &.{},
+        last_deadline_ns: ?u64 = null,
 
-        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.last_sql) |value| inner_alloc.free(value);
             for (self.last_args) |*arg| arg.deinit(inner_alloc);
             if (self.last_args.len > 0) inner_alloc.free(self.last_args);
             self.last_sql = try inner_alloc.dupe(u8, prepared.sql_text);
             self.last_args = try cloneArgsAlloc(inner_alloc, prepared.args);
+            self.last_deadline_ns = execution_deadline_ns;
             var owned = prepared;
             owned.deinit(inner_alloc);
             const rows = try inner_alloc.alloc(std.json.Value, 1);
@@ -1429,7 +1717,7 @@ test "postgres source runtime builds select queries through executor" {
             return .{ .row_count = 1, .size_bytes = 32 };
         }
 
-        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_source.Column {
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_source.Column {
             const columns = try inner_alloc.alloc(foreign_source.Column, 2);
             columns[0] = .{
                 .name = try inner_alloc.dupe(u8, "id"),
@@ -1473,13 +1761,17 @@ test "postgres source runtime builds select queries through executor" {
     const fields = try alloc.alloc([]u8, 2);
     fields[0] = try alloc.dupe(u8, "id");
     fields[1] = try alloc.dupe(u8, "name");
-    var result = try src.query(alloc, .{
+    const execution_deadline_ns = platform_time.monotonicNs() + 60 * std.time.ns_per_s;
+    var params = foreign_source.QueryParams{
         .table = try alloc.dupe(u8, "customers"),
         .fields = fields,
         .limit = 5,
         .offset = 2,
         .order_by = order_by,
-    });
+        .execution_deadline_ns = execution_deadline_ns,
+    };
+    defer params.deinit(alloc);
+    var result = try src.query(alloc, params);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
@@ -1488,6 +1780,62 @@ test "postgres source runtime builds select queries through executor" {
         executor.last_sql.?,
     );
     try std.testing.expectEqual(@as(usize, 0), executor.last_args.len);
+    try std.testing.expectEqual(@as(?u64, execution_deadline_ns), executor.last_deadline_ns);
+}
+
+test "postgres source parameter clones are allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var fields = [_][]u8{@constCast("id")};
+            var columns = [_]foreign_source.Column{.{
+                .name = @constCast("id"),
+                .data_type = @constCast("uuid"),
+                .nullable = false,
+            }};
+            var order_by = [_]foreign_source.SortField{.{
+                .field = @constCast("id"),
+                .desc = false,
+            }};
+            const params = foreign_source.QueryParams{
+                .table = @constCast("customers"),
+                .fields = &fields,
+                .filter_query_json = @constCast("{\"term\":{\"id\":\"a\"}}"),
+                .columns = &columns,
+                .order_by = &order_by,
+            };
+            var cloned_params = try cloneQueryParamsAlloc(alloc, params);
+            defer cloned_params.deinit(alloc);
+
+            var aggregations = [_]foreign_source.NamedAggregation{.{
+                .name = @constCast("ids"),
+                .definition = .{
+                    .type_name = @constCast("terms"),
+                    .field = @constCast("id"),
+                    .size = 10,
+                },
+            }};
+            const aggregate_params = foreign_source.AggregateParams{
+                .table = @constCast("customers"),
+                .filter_query_json = @constCast("{\"term\":{\"id\":\"a\"}}"),
+                .columns = &columns,
+                .aggregations = &aggregations,
+            };
+            var cloned_aggregate_params = try cloneAggregateParamsAlloc(alloc, aggregate_params);
+            defer cloned_aggregate_params.deinit(alloc);
+
+            const replication_params = foreign_source.ReplicationPollParams{
+                .table = @constCast("customers"),
+                .slot_name = @constCast("slot"),
+                .publication_name = @constCast("publication"),
+                .filter_query_json = @constCast("{\"match_all\":{}}"),
+                .checkpoint = @constCast("0/10"),
+            };
+            var cloned_replication_params = try cloneReplicationPollParamsAlloc(alloc, replication_params);
+            defer cloned_replication_params.deinit(alloc);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn testPgDsnAlloc(alloc: Allocator) ![]u8 {
@@ -1548,7 +1896,7 @@ test "postgres source runtime translates filter_query_json and validates fields"
         last_sql: ?[]u8 = null,
         last_args: []sql.ParameterValue = &.{},
 
-        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.last_sql) |value| inner_alloc.free(value);
             for (self.last_args) |*arg| arg.deinit(inner_alloc);
@@ -1564,7 +1912,7 @@ test "postgres source runtime translates filter_query_json and validates fields"
             return .{ .row_count = 0, .size_bytes = 0 };
         }
 
-        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_source.Column {
+        fn discoverColumns(_: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_source.Column {
             const columns = try inner_alloc.alloc(foreign_source.Column, 2);
             columns[0] = .{
                 .name = try inner_alloc.dupe(u8, "id"),
@@ -1614,11 +1962,13 @@ test "postgres source runtime translates filter_query_json and validates fields"
         .data_type = try alloc.dupe(u8, "text"),
         .nullable = false,
     };
-    var result = try src.query(alloc, .{
+    var params = foreign_source.QueryParams{
         .table = try alloc.dupe(u8, "customers"),
         .filter_query_json = try alloc.dupe(u8, "{\"term\":\"active\",\"field\":\"status\"}"),
         .columns = columns,
-    });
+    };
+    defer params.deinit(alloc);
+    var result = try src.query(alloc, params);
     defer result.deinit(alloc);
 
     try std.testing.expectEqualStrings(
@@ -1636,11 +1986,13 @@ test "postgres source runtime translates filter_query_json and validates fields"
     };
     var fields = try alloc.alloc([]u8, 1);
     fields[0] = try alloc.dupe(u8, "missing");
-    try std.testing.expectError(error.UnknownColumn, src.query(alloc, .{
+    var bad_params = foreign_source.QueryParams{
         .table = try alloc.dupe(u8, "customers"),
         .columns = bad_columns,
         .fields = fields,
-    }));
+    };
+    defer bad_params.deinit(alloc);
+    try std.testing.expectError(error.UnknownColumn, src.query(alloc, bad_params));
 }
 
 test "postgres source runtime discovers columns when config omits them" {
@@ -1650,7 +2002,7 @@ test "postgres source runtime discovers columns when config omits them" {
         discover_count: usize = 0,
         last_sql: ?[]u8 = null,
 
-        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.last_sql) |value| inner_alloc.free(value);
             self.last_sql = try inner_alloc.dupe(u8, prepared.sql_text);
@@ -1663,7 +2015,7 @@ test "postgres source runtime discovers columns when config omits them" {
             return .{ .row_count = 0, .size_bytes = 0 };
         }
 
-        fn discoverColumns(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8) ![]foreign_source.Column {
+        fn discoverColumns(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_source.Column {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.discover_count += 1;
             const columns = try inner_alloc.alloc(foreign_source.Column, 2);
@@ -1704,11 +2056,13 @@ test "postgres source runtime discovers columns when config omits them" {
 
     var fields = try alloc.alloc([]u8, 1);
     fields[0] = try alloc.dupe(u8, "id");
-    var result = try src.query(alloc, .{
+    var params = foreign_source.QueryParams{
         .table = try alloc.dupe(u8, "customers"),
         .fields = fields,
         .filter_query_json = try alloc.dupe(u8, "{\"term\":\"active\",\"field\":\"status\"}"),
-    });
+    };
+    defer params.deinit(alloc);
+    var result = try src.query(alloc, params);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), executor.discover_count);
@@ -1718,6 +2072,113 @@ test "postgres source runtime discovers columns when config omits them" {
     );
 }
 
+test "postgres source runtime refreshes stale discovered columns once" {
+    const alloc = std.testing.allocator;
+
+    const FakeExecutor = struct {
+        discover_count: usize = 0,
+        refresh_count: usize = 0,
+        last_sql: ?[]u8 = null,
+
+        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.last_sql) |value| inner_alloc.free(value);
+            self.last_sql = try inner_alloc.dupe(u8, prepared.sql_text);
+            var owned = prepared;
+            owned.deinit(inner_alloc);
+            return .{ .rows = &.{}, .total = 0 };
+        }
+
+        fn statistics(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !foreign_source.TableStatistics {
+            return .{};
+        }
+
+        fn columns(inner_alloc: Allocator, include_added: bool) ![]foreign_source.Column {
+            const out = try inner_alloc.alloc(foreign_source.Column, if (include_added) 2 else 1);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |*column| column.deinit(inner_alloc);
+                inner_alloc.free(out);
+            }
+            {
+                const id_name = try inner_alloc.dupe(u8, "id");
+                errdefer inner_alloc.free(id_name);
+                const id_type = try inner_alloc.dupe(u8, "uuid");
+                errdefer inner_alloc.free(id_type);
+                out[0] = .{
+                    .name = id_name,
+                    .data_type = id_type,
+                    .nullable = false,
+                };
+            }
+            initialized = 1;
+            if (include_added) {
+                {
+                    const added_name = try inner_alloc.dupe(u8, "added");
+                    errdefer inner_alloc.free(added_name);
+                    const added_type = try inner_alloc.dupe(u8, "text");
+                    errdefer inner_alloc.free(added_type);
+                    out[1] = .{
+                        .name = added_name,
+                        .data_type = added_type,
+                        .nullable = true,
+                    };
+                }
+                initialized = 2;
+            }
+            return out;
+        }
+
+        fn discoverColumns(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_source.Column {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.discover_count += 1;
+            return try columns(inner_alloc, false);
+        }
+
+        fn refreshColumns(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, _: []const u8, _: ?u64) ![]foreign_source.Column {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.refresh_count += 1;
+            return try columns(inner_alloc, true);
+        }
+    };
+
+    var executor = FakeExecutor{};
+    var registry = foreign_source.Registry{};
+    defer {
+        if (executor.last_sql) |value| alloc.free(value);
+        registry.deinit(alloc);
+    }
+    try registerExecutor(alloc, &registry, .{
+        .ptr = &executor,
+        .vtable = &.{
+            .query = FakeExecutor.query,
+            .statistics = FakeExecutor.statistics,
+            .discover_columns = FakeExecutor.discoverColumns,
+            .refresh_columns = FakeExecutor.refreshColumns,
+        },
+    });
+
+    var src = try registry.create(alloc, .{
+        .kind = .postgres,
+        .dsn = try alloc.dupe(u8, "postgres://db"),
+    });
+    defer src.deinit(alloc);
+
+    var fields = try alloc.alloc([]u8, 1);
+    fields[0] = try alloc.dupe(u8, "added");
+    var params = foreign_source.QueryParams{
+        .table = try alloc.dupe(u8, "customers"),
+        .fields = fields,
+    };
+    defer params.deinit(alloc);
+    var result = try src.query(alloc, params);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), executor.discover_count);
+    try std.testing.expectEqual(@as(usize, 1), executor.refresh_count);
+    try std.testing.expectEqualStrings("SELECT \"added\" FROM \"customers\"", executor.last_sql.?);
+}
+
 test "postgres source runtime batches simple aggregations into one query" {
     const alloc = std.testing.allocator;
 
@@ -1725,7 +2186,7 @@ test "postgres source runtime batches simple aggregations into one query" {
         last_sql: ?[]u8 = null,
         last_args: []sql.ParameterValue = &.{},
 
-        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.last_sql) |value| inner_alloc.free(value);
             for (self.last_args) |*arg| arg.deinit(inner_alloc);
@@ -1797,12 +2258,14 @@ test "postgres source runtime batches simple aggregations into one query" {
         },
     };
 
-    var result = try src.aggregate(alloc, .{
+    var params = foreign_source.AggregateParams{
         .table = try alloc.dupe(u8, "customers"),
         .filter_query_json = try alloc.dupe(u8, "{\"term\":\"active\",\"field\":\"status\"}"),
         .columns = columns,
         .aggregations = aggregations,
-    });
+    };
+    defer params.deinit(alloc);
+    var result = try src.aggregate(alloc, params);
     defer result.deinit(alloc);
 
     try std.testing.expectEqualStrings(
@@ -1835,7 +2298,7 @@ test "postgres source runtime executes stats and terms aggregations with transla
             self.args_list.deinit(inner_alloc);
         }
 
-        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery) !foreign_source.QueryResult {
+        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.sql_texts.append(inner_alloc, try inner_alloc.dupe(u8, prepared.sql_text));
             try self.args_list.append(inner_alloc, try cloneArgsAlloc(inner_alloc, prepared.args));
@@ -1927,12 +2390,14 @@ test "postgres source runtime executes stats and terms aggregations with transla
         },
     };
 
-    var result = try src.aggregate(alloc, .{
+    var params = foreign_source.AggregateParams{
         .table = try alloc.dupe(u8, "customers"),
         .filter_query_json = try alloc.dupe(u8, "{\"term\":\"active\",\"field\":\"status\"}"),
         .columns = columns,
         .aggregations = aggregations,
-    });
+    };
+    defer params.deinit(alloc);
+    var result = try src.aggregate(alloc, params);
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), executor.sql_texts.items.len);

@@ -48,7 +48,11 @@ pub const Store = struct {
         .rename_absolute = renameAbsolute,
         .delete_file_absolute = deleteFileAbsolute,
         .delete_tree = deleteTree,
+        .sync_contents_absolute = syncContentsAbsolute,
+        .sync_parent_absolute = syncParentAbsolute,
         .now_ns = nowNs,
+        .root_identity_alloc = rootIdentityAlloc,
+        .rename_is_atomic = true,
     };
 
     pub fn init(allocator: Allocator, docs: *docstore.Store) Store {
@@ -229,11 +233,40 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     try self.docs.file.putIndexCatalogBatch(mutations.items);
 }
 
-fn nowNs(_: *anyopaque) u64 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const now = std.Io.Timestamp.now(io_impl.io(), .awake);
+fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
+    lockStore(self.docs);
+    defer self.docs.mutex.unlock();
+    try self.docs.file.sync();
+}
+
+fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+    // A logical rename and its namespace update publish through one native
+    // checkpoint. Syncing the container is therefore both the file-content
+    // and logical-parent durability barrier.
+    return try syncContentsAbsolute(ptr, path);
+}
+
+fn nowNs(ptr: *anyopaque) u64 {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    const now = std.Io.Timestamp.now(self.docs.file.io_impl.io(), .awake);
     return @intCast(now.toNanoseconds());
+}
+
+fn rootIdentityAlloc(
+    ptr: *anyopaque,
+    allocator: Allocator,
+    root_dir: []const u8,
+) ![]u8 {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    const canonical = try storage_io.nativeRealPathAlloc(allocator, self.docs.file.path);
+    defer allocator.free(canonical);
+    return try std.fmt.allocPrint(
+        allocator,
+        "aflite-native:{s}\x00{s}",
+        .{ canonical, root_dir },
+    );
 }
 
 const NativeAtomicWriteSink = struct {
@@ -355,6 +388,44 @@ test "lite native index storage persists logical files across reopen" {
         defer allocator.free(range);
         try std.testing.expectEqualStrings("cdef", range);
     }
+}
+
+test "lite native index storage root identity is physical and namespaced" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-index-identity.aflite");
+    defer allocator.free(path);
+
+    var first_identity: []u8 = undefined;
+    {
+        var docs = try docstore.Store.create(allocator, path, true);
+        defer docs.close();
+        var indexes = Store.init(allocator, &docs);
+        const storage = indexes.storage();
+
+        first_identity = try storage.rootIdentityAlloc(
+            allocator,
+            "__antfly_lite/tables/a/index_repair.checkpoint",
+        );
+        const other_namespace = try storage.rootIdentityAlloc(
+            allocator,
+            "__antfly_lite/tables/b/index_repair.checkpoint",
+        );
+        defer allocator.free(other_namespace);
+        try std.testing.expect(!std.mem.eql(u8, first_identity, other_namespace));
+    }
+    defer allocator.free(first_identity);
+
+    var reopened_docs = try docstore.Store.open(allocator, path, true);
+    defer reopened_docs.close();
+    var reopened_indexes = Store.init(allocator, &reopened_docs);
+    const reopened_identity = try reopened_indexes.storage().rootIdentityAlloc(
+        allocator,
+        "__antfly_lite/tables/a/index_repair.checkpoint",
+    );
+    defer allocator.free(reopened_identity);
+    try std.testing.expectEqualStrings(first_identity, reopened_identity);
 }
 
 test "lite native index reads remain pinned while newer checkpoints publish" {

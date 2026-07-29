@@ -138,8 +138,13 @@ fn groupStatusEqual(
     rhs: table_manager.GroupStatusReport,
 ) bool {
     return lhs.group_id == rhs.group_id and
+        lhs.relocation_generation == rhs.relocation_generation and
+        lhs.raft_applied_index == rhs.raft_applied_index and
+        lhs.raft_term == rhs.raft_term and
+        lhs.raft_membership_index == rhs.raft_membership_index and
         lhs.doc_count == rhs.doc_count and
         lhs.disk_bytes == rhs.disk_bytes and
+        lhs.disk_bytes_known == rhs.disk_bytes_known and
         lhs.empty == rhs.empty and
         lhs.created_at_millis == rhs.created_at_millis and
         timestampMillisCoalesced(lhs.updated_at_millis, rhs.updated_at_millis) and
@@ -184,13 +189,10 @@ fn runtimeStatusEqual(
         lhs.status_generation != rhs.status_generation or
         lhs.doc_count != rhs.doc_count or
         lhs.disk_bytes != rhs.disk_bytes or
+        lhs.disk_bytes_known != rhs.disk_bytes_known or
         lhs.created_at_millis != rhs.created_at_millis or
         lhs.index_count != rhs.index_count or
-        lhs.enrichment_enabled != rhs.enrichment_enabled or
-        lhs.enrichment_target_sequence != rhs.enrichment_target_sequence or
-        lhs.enrichment_applied_sequence != rhs.enrichment_applied_sequence or
-        lhs.enrichment_retrying != rhs.enrichment_retrying or
-        lhs.enrichment_worker_failed != rhs.enrichment_worker_failed or
+        !runtimeEnrichmentStatusEqual(lhs.enrichment, rhs.enrichment) or
         lhs.async_indexing_active != rhs.async_indexing_active or
         lhs.async_startup_active != rhs.async_startup_active or
         lhs.async_dense_catch_up_active != rhs.async_dense_catch_up_active or
@@ -220,6 +222,20 @@ fn runtimeStatusEqual(
             left.replay_target_sequence != right.replay_target_sequence or
             left.replay_catch_up_required != right.replay_catch_up_required)
         {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn runtimeEnrichmentStatusEqual(
+    lhs: table_manager.RuntimeEnrichmentStatusReport,
+    rhs: table_manager.RuntimeEnrichmentStatusReport,
+) bool {
+    inline for (std.meta.fields(table_manager.RuntimeEnrichmentStatusReport)) |field| {
+        if (comptime std.mem.eql(u8, field.name, "projection_checkpoint_status")) {
+            if (!std.mem.eql(u8, @field(lhs, field.name), @field(rhs, field.name))) return false;
+        } else if (@field(lhs, field.name) != @field(rhs, field.name)) {
             return false;
         }
     }

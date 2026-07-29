@@ -17,6 +17,8 @@ components:
       anyOf:
         - type: integer
           format: int32
+          minimum: 0
+          maximum: 2
         - type: string
           enum:
             - auto
@@ -51,16 +53,6 @@ components:
           type: string
         boost:
           $ref: "#/components/schemas/Boost"
-        prefix_length:
-          type: integer
-          format: int32
-        fuzziness:
-          $ref: "#/components/schemas/Fuzziness"
-        operator:
-          type: string
-          enum:
-            - or
-            - and
       required:
         - match
     MultiMatchBody:
@@ -145,6 +137,8 @@ components:
         prefix_length:
           type: integer
           format: int32
+          minimum: 0
+          maximum: 255
         fuzziness:
           $ref: "#/components/schemas/Fuzziness"
         field:

@@ -87,7 +87,12 @@ pub const Client = struct {
     }
 
     pub fn getFileWithIo(self: *Client, io: std.Io, bucket: []const u8, key: []const u8, dest_path: []const u8, opts: types.GetOptions) !void {
-        if (opts.version_id == null and opts.range == null and opts.if_match_etag == null and opts.part_number == null) {
+        if (opts.version_id == null and
+            opts.range == null and
+            opts.if_match_etag == null and
+            opts.part_number == null and
+            opts.max_response_bytes == null)
+        {
             return try self.getWholeFileWithIo(io, bucket, key, dest_path);
         }
         var object = try self.getObject(bucket, key, opts);

@@ -35,7 +35,7 @@ pub fn encodeSchemaUpdateRequest(alloc: std.mem.Allocator) ![]u8 {
     var parsed = try std.json.parseFromSlice(
         schema_openapi.TableSchema,
         alloc,
-        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}}}}}}",
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"properties\":{\"title\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\"}},\"body\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"text\"}},\"status\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}},\"score\":{\"type\":\"number\",\"x-antfly-field\":{\"type\":\"number\",\"sortable\":true}},\"created_at\":{\"type\":\"string\",\"format\":\"date-time\",\"x-antfly-field\":{\"type\":\"date\",\"sortable\":true}},\"customer_id\":{\"type\":\"string\",\"x-antfly-field\":{\"type\":\"keyword\",\"sortable\":true}}}}}}}",
         .{},
     );
     defer parsed.deinit();

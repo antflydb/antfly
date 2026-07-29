@@ -32,14 +32,109 @@ pub const TransitionPhase = enum {
     rolled_back,
 };
 
+pub const TransitionIdentity = struct {
+    shard_id: u64 = 0,
+    range_id: u64 = 0,
+
+    pub fn validate(self: @This()) !void {
+        if (self.shard_id == 0 or self.range_id == 0)
+            return error.InvalidTransitionTableContract;
+    }
+
+    pub fn eql(self: @This(), other: @This()) bool {
+        return self.shard_id == other.shard_id and
+            self.range_id == other.range_id;
+    }
+};
+
+/// Immutable storage descriptor captured when a range transition is admitted.
+///
+/// A transition can outlive metadata-cache entries, leaders, and processes.
+/// Carrying the exact table configuration in the replicated record prevents a
+/// later phase from opening the shard with whichever catalog snapshot happens
+/// to be cached on the executor. Source and target identities are distinct
+/// because merge donors may use a different document namespace from the
+/// receiver that survives cutover.
+pub const TransitionTableContract = struct {
+    table_id: u64 = 0,
+    table_name: []const u8 = "",
+    schema_json: []const u8 = "",
+    indexes_json: []const u8 = "",
+    source_identity: TransitionIdentity = .{},
+    target_identity: TransitionIdentity = .{},
+
+    pub fn validate(self: @This()) !void {
+        if (self.table_id == 0 or
+            self.table_name.len == 0 or
+            self.indexes_json.len == 0)
+        {
+            return error.InvalidTransitionTableContract;
+        }
+        try self.source_identity.validate();
+        try self.target_identity.validate();
+    }
+
+    pub fn validateForSplit(self: @This()) !void {
+        try self.validate();
+        if (!self.source_identity.eql(self.target_identity))
+            return error.InvalidTransitionTableContract;
+    }
+
+    pub fn validateForMerge(
+        self: @This(),
+        allow_doc_identity_reassignment: bool,
+    ) !void {
+        try self.validate();
+        if (!allow_doc_identity_reassignment and
+            !self.source_identity.eql(self.target_identity))
+        {
+            return error.InvalidTransitionTableContract;
+        }
+    }
+
+    pub fn eql(self: @This(), other: @This()) bool {
+        return self.table_id == other.table_id and
+            self.source_identity.eql(other.source_identity) and
+            self.target_identity.eql(other.target_identity) and
+            std.mem.eql(u8, self.table_name, other.table_name) and
+            std.mem.eql(u8, self.schema_json, other.schema_json) and
+            std.mem.eql(u8, self.indexes_json, other.indexes_json);
+    }
+
+    pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
+        const table_name = try alloc.dupe(u8, self.table_name);
+        errdefer alloc.free(table_name);
+        const schema_json = try alloc.dupe(u8, self.schema_json);
+        errdefer alloc.free(schema_json);
+        const indexes_json = try alloc.dupe(u8, self.indexes_json);
+        return .{
+            .table_id = self.table_id,
+            .table_name = table_name,
+            .schema_json = schema_json,
+            .indexes_json = indexes_json,
+            .source_identity = self.source_identity,
+            .target_identity = self.target_identity,
+        };
+    }
+
+    pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.schema_json);
+        alloc.free(self.indexes_json);
+        self.* = undefined;
+    }
+};
+
 pub const SplitTransitionRecord = struct {
     transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     phase: TransitionPhase = .prepare,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
     rollback_reason: ?[]const u8 = null,
+    table_contract: TransitionTableContract = .{},
 };
 
 pub const MergeTransitionRecord = struct {
@@ -49,6 +144,7 @@ pub const MergeTransitionRecord = struct {
     phase: TransitionPhase = .prepare,
     rollback_reason: ?[]const u8 = null,
     allow_doc_identity_reassignment: bool = false,
+    table_contract: TransitionTableContract = .{},
 };
 
 pub const SplitObservation = struct {
@@ -68,6 +164,25 @@ pub const SplitObservationRecord = struct {
     transition_id: u64,
     observation: SplitObservation,
 };
+
+/// Conservative observation used until the source has reported durable split
+/// state. Treating missing telemetry as prepared can skip the prepare command
+/// and append an unapplyable start command to the source Raft log.
+pub fn unpreparedSplitObservation() SplitObservation {
+    return .{
+        .status = .{
+            .phase = .prepare,
+            .source_split_phase = null,
+            .bootstrapped = false,
+            .replay_required = false,
+            .replay_caught_up = false,
+            .cutover_ready = false,
+            .destination_ready_for_reads = false,
+            .source_delta_sequence = 0,
+            .dest_delta_sequence = 0,
+        },
+    };
+}
 
 pub const MergeObservationRecord = struct {
     transition_id: u64,
@@ -91,6 +206,19 @@ pub const GroupTransitionReadinessSource = enum {
 pub const GroupTransitionReadinessResult = struct {
     readiness: GroupTransitionReadiness,
     source: GroupTransitionReadinessSource,
+};
+
+pub const StablePlacementReadiness = enum {
+    ready,
+    status_unavailable,
+    invalid_expected_voter_count,
+    leader_unknown,
+    leader_store_unknown,
+    leader_not_placed,
+    voter_count_unknown,
+    voter_count_mismatch,
+    insufficient_healthy_voters,
+    joint_consensus,
 };
 
 pub const TransitionRecord = union(TransitionKind) {
@@ -120,8 +248,36 @@ pub fn readinessForGroup(
     return readiness;
 }
 
+/// Derive readiness from replicated transition records and their latest
+/// control-plane observations without opening local transition storage.
+pub fn readinessForGroupWithObservations(
+    group_id: u64,
+    split_transitions: []const SplitTransitionRecord,
+    merge_transitions: []const MergeTransitionRecord,
+    split_observations: []const SplitObservationRecord,
+    merge_observations: []const MergeObservationRecord,
+) GroupTransitionReadiness {
+    var readiness = GroupTransitionReadiness{};
+    for (split_transitions) |record| {
+        if (record.source_group_id != group_id and record.destination_group_id != group_id) continue;
+        readiness = combineReadiness(
+            readiness,
+            readinessResultForSplitTransition(record, split_observations).readiness,
+        );
+    }
+    for (merge_transitions) |record| {
+        if (record.donor_group_id != group_id and record.receiver_group_id != group_id) continue;
+        readiness = combineReadiness(
+            readiness,
+            readinessResultForMergeTransition(record, merge_observations).readiness,
+        );
+    }
+    return readiness;
+}
+
 pub fn readinessForLocalGroup(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     group_id: u64,
     split_transitions: []const SplitTransitionRecord,
@@ -134,6 +290,7 @@ pub fn readinessForLocalGroup(
         if (record.source_group_id != group_id and record.destination_group_id != group_id) continue;
         readiness = combineReadiness(readiness, (try readinessResultForLocalSplitTransition(
             alloc,
+            io,
             replica_root_dir,
             record,
             split_observations,
@@ -143,6 +300,7 @@ pub fn readinessForLocalGroup(
         if (record.donor_group_id != group_id and record.receiver_group_id != group_id) continue;
         readiness = combineReadiness(readiness, (try readinessResultForLocalMergeTransition(
             alloc,
+            io,
             replica_root_dir,
             record,
             merge_observations,
@@ -166,14 +324,31 @@ fn combineReadiness(
 
 pub fn readinessResultForLocalSplitTransition(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     record: SplitTransitionRecord,
     split_observations: []const SplitObservationRecord,
 ) !GroupTransitionReadinessResult {
-    if (try observeLocalSplitTransition(alloc, replica_root_dir, record)) |status| {
+    if (try observeLocalSplitTransition(alloc, io, replica_root_dir, record)) |status| {
         return .{
             .readiness = readinessFromObservedLocalSplit(status),
             .source = .local_observation,
+        };
+    }
+    return readinessResultForSplitTransition(record, split_observations);
+}
+
+/// Derive split readiness exclusively from control-plane state. Callers that
+/// do not own the transition DBs must use this form so observation cannot open
+/// a second storage owner behind an active runtime.
+pub fn readinessResultForSplitTransition(
+    record: SplitTransitionRecord,
+    split_observations: []const SplitObservationRecord,
+) GroupTransitionReadinessResult {
+    if (transitionPhaseTerminal(record.phase)) {
+        return .{
+            .readiness = readinessFromPhase(record.phase),
+            .source = .phase,
         };
     }
     if (findSplitObservation(split_observations, record.transition_id)) |observation| {
@@ -190,14 +365,31 @@ pub fn readinessResultForLocalSplitTransition(
 
 pub fn readinessResultForLocalMergeTransition(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     record: MergeTransitionRecord,
     merge_observations: []const MergeObservationRecord,
 ) !GroupTransitionReadinessResult {
-    if (try observeLocalMergeTransition(alloc, replica_root_dir, record)) |status| {
+    if (try observeLocalMergeTransition(alloc, io, replica_root_dir, record)) |status| {
         return .{
             .readiness = readinessFromObservedMerge(status),
             .source = .local_observation,
+        };
+    }
+    return readinessResultForMergeTransition(record, merge_observations);
+}
+
+/// Derive merge readiness exclusively from control-plane state. Transition
+/// owners publish observations; status/reporting paths consume them without
+/// manufacturing another DB owner.
+pub fn readinessResultForMergeTransition(
+    record: MergeTransitionRecord,
+    merge_observations: []const MergeObservationRecord,
+) GroupTransitionReadinessResult {
+    if (transitionPhaseTerminal(record.phase)) {
+        return .{
+            .readiness = readinessFromPhase(record.phase),
+            .source = .phase,
         };
     }
     if (findMergeObservation(merge_observations, record.transition_id)) |observation| {
@@ -212,9 +404,13 @@ pub fn readinessResultForLocalMergeTransition(
     };
 }
 
+fn transitionPhaseTerminal(phase: TransitionPhase) bool {
+    return phase == .finalized or phase == .rolled_back;
+}
+
 fn readinessFromPhase(phase: TransitionPhase) GroupTransitionReadiness {
     return .{
-        .transition_pending = true,
+        .transition_pending = phase != .finalized and phase != .rolled_back,
         .replay_required = switch (phase) {
             .bootstrap_peer, .replay_deltas, .cutover_pending, .finalizing => true,
             else => false,
@@ -266,6 +462,7 @@ fn readinessFromObservedMerge(status: data.MergeTransitionStatus) GroupTransitio
 
 fn observeLocalSplitTransition(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     record: SplitTransitionRecord,
 ) !?data.SplitSyncStatus {
@@ -274,9 +471,11 @@ fn observeLocalSplitTransition(
     const dest_root_dir = try groupDbPathAlloc(alloc, replica_root_dir, record.destination_group_id);
     defer alloc.free(dest_root_dir);
 
-    if (!try pathExists(alloc, source_root_dir) or !try pathExists(alloc, dest_root_dir)) return null;
+    if (!try pathExists(io, source_root_dir) or !try pathExists(io, dest_root_dir)) return null;
 
     var coord = try data.SplitSyncCoordinator.init(alloc, .{
+        .transition_id = record.transition_id,
+        .attempt_epoch = record.attempt_epoch,
         .source_root_dir = source_root_dir,
         .dest_root_dir = dest_root_dir,
         .source_group_id = record.source_group_id,
@@ -288,6 +487,7 @@ fn observeLocalSplitTransition(
 
 fn observeLocalMergeTransition(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     record: MergeTransitionRecord,
 ) !?data.MergeTransitionStatus {
@@ -296,7 +496,7 @@ fn observeLocalMergeTransition(
     const receiver_root_dir = try groupDbPathAlloc(alloc, replica_root_dir, record.receiver_group_id);
     defer alloc.free(receiver_root_dir);
 
-    if (!try pathExists(alloc, donor_root_dir) or !try pathExists(alloc, receiver_root_dir)) return null;
+    if (!try pathExists(io, donor_root_dir) or !try pathExists(io, receiver_root_dir)) return null;
 
     var coord = try data.MergeCoordinator.init(alloc, .{
         .donor_root_dir = donor_root_dir,
@@ -316,10 +516,8 @@ fn groupDbPathAlloc(
     return try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ replica_root_dir, group_id });
 }
 
-fn pathExists(alloc: std.mem.Allocator, path: []const u8) !bool {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    _ = std.Io.Dir.cwd().statFile(io_impl.io(), path, .{}) catch |err| switch (err) {
+fn pathExists(io: std.Io, path: []const u8) !bool {
+    _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -360,15 +558,53 @@ test "transition state module compiles" {
     _ = GroupTransitionReadiness;
     _ = GroupTransitionReadinessSource;
     _ = GroupTransitionReadinessResult;
+    _ = StablePlacementReadiness;
+    _ = TransitionTableContract;
     _ = readinessForGroup;
+    _ = readinessForGroupWithObservations;
     _ = readinessForLocalGroup;
     _ = readinessResultForLocalSplitTransition;
     _ = readinessResultForLocalMergeTransition;
 }
 
+test "transition table contract is validated and cloned as owned state" {
+    const contract: TransitionTableContract = .{
+        .table_id = 7,
+        .table_name = "docs",
+        .schema_json = "{\"title\":{\"type\":\"keyword\"}}",
+        .indexes_json = "{\"full_text\":{\"type\":\"full_text\"}}",
+        .source_identity = .{ .shard_id = 70, .range_id = 700 },
+        .target_identity = .{ .shard_id = 71, .range_id = 701 },
+    };
+    try contract.validate();
+    var cloned = try contract.clone(std.testing.allocator);
+    defer cloned.deinitOwned(std.testing.allocator);
+    try std.testing.expect(contract.eql(cloned));
+    try std.testing.expect(contract.table_name.ptr != cloned.table_name.ptr);
+    try std.testing.expect(contract.schema_json.ptr != cloned.schema_json.ptr);
+    try std.testing.expect(contract.indexes_json.ptr != cloned.indexes_json.ptr);
+
+    var invalid = contract;
+    invalid.source_identity.range_id = 0;
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        invalid.validate(),
+    );
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        contract.validateForSplit(),
+    );
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        contract.validateForMerge(false),
+    );
+    try contract.validateForMerge(true);
+}
+
 test "transition state derives heartbeat readiness for active phases" {
     const readiness = readinessForGroup(12, &[_]SplitTransitionRecord{.{
         .transition_id = 9001,
+        .attempt_epoch = 1,
         .source_group_id = 10,
         .destination_group_id = 12,
         .phase = .cutover_pending,
@@ -383,6 +619,7 @@ test "transition state derives heartbeat readiness for active phases" {
 test "transition state leaves readiness empty for unrelated groups" {
     const readiness = readinessForGroup(99, &[_]SplitTransitionRecord{.{
         .transition_id = 9001,
+        .attempt_epoch = 1,
         .source_group_id = 10,
         .destination_group_id = 12,
         .phase = .prepare,
@@ -397,6 +634,106 @@ test "transition state leaves readiness empty for unrelated groups" {
     try std.testing.expect(!readiness.replay_caught_up);
     try std.testing.expect(!readiness.cutover_ready);
     try std.testing.expect(!readiness.reads_ready_after_cutover);
+}
+
+test "transition state control-plane readiness prefers replicated observations" {
+    const readiness = readinessForGroupWithObservations(
+        12,
+        &[_]SplitTransitionRecord{.{
+            .transition_id = 9001,
+            .attempt_epoch = 1,
+            .source_group_id = 10,
+            .destination_group_id = 12,
+            .phase = .prepare,
+        }},
+        &.{},
+        &[_]SplitObservationRecord{.{
+            .transition_id = 9001,
+            .observation = .{
+                .status = .{
+                    .phase = .cutover_ready,
+                    .source_split_phase = .splitting,
+                    .bootstrapped = true,
+                    .replay_required = true,
+                    .replay_caught_up = true,
+                    .cutover_ready = true,
+                    .destination_ready_for_reads = true,
+                    .source_delta_sequence = 5,
+                    .dest_delta_sequence = 5,
+                },
+            },
+        }},
+        &.{},
+    );
+    try std.testing.expect(readiness.transition_pending);
+    try std.testing.expect(readiness.replay_required);
+    try std.testing.expect(readiness.replay_caught_up);
+    try std.testing.expect(readiness.cutover_ready);
+    try std.testing.expect(readiness.reads_ready_after_cutover);
+}
+
+test "transition state does not publish terminal records as pending" {
+    const finalized = readinessForGroupWithObservations(
+        12,
+        &[_]SplitTransitionRecord{.{
+            .transition_id = 9001,
+            .attempt_epoch = 1,
+            .source_group_id = 10,
+            .destination_group_id = 12,
+            .phase = .finalized,
+        }},
+        &.{},
+        &[_]SplitObservationRecord{.{
+            .transition_id = 9001,
+            .observation = .{
+                .status = .{
+                    .phase = .prepare,
+                    .source_split_phase = null,
+                    .bootstrapped = false,
+                    .replay_required = false,
+                    .replay_caught_up = false,
+                    .cutover_ready = false,
+                    .destination_ready_for_reads = false,
+                    .source_delta_sequence = 0,
+                    .dest_delta_sequence = 0,
+                },
+            },
+        }},
+        &.{},
+    );
+    try std.testing.expect(!finalized.transition_pending);
+    try std.testing.expect(finalized.reads_ready_after_cutover);
+
+    const rolled_back = readinessForGroupWithObservations(
+        12,
+        &[_]SplitTransitionRecord{.{
+            .transition_id = 9002,
+            .attempt_epoch = 2,
+            .source_group_id = 10,
+            .destination_group_id = 12,
+            .phase = .rolled_back,
+        }},
+        &.{},
+        &[_]SplitObservationRecord{.{
+            .transition_id = 9002,
+            .observation = .{
+                .status = .{
+                    .phase = .cutover_ready,
+                    .source_split_phase = .splitting,
+                    .bootstrapped = true,
+                    .replay_required = true,
+                    .replay_caught_up = true,
+                    .cutover_ready = true,
+                    .destination_ready_for_reads = true,
+                    .source_delta_sequence = 5,
+                    .dest_delta_sequence = 5,
+                },
+            },
+        }},
+        &.{},
+    );
+    try std.testing.expect(!rolled_back.transition_pending);
+    try std.testing.expect(!rolled_back.reads_ready_after_cutover);
 }
 
 test "transition state prefers observed local split readiness over metadata phase" {
@@ -418,7 +755,7 @@ test "transition state prefers observed local split readiness over metadata phas
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:a:doc:z") },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:doc:b={\"v\":\"left-0\"}") },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:t={\"v\":\"right-0\"}") },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:doc:m") },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("split_prepare:132:1:132:doc:m") },
     });
     defer std.testing.allocator.free(prepare);
     try source.snapshotBuilder().applyBatch(.{
@@ -430,6 +767,8 @@ test "transition state prefers observed local split readiness over metadata phas
     source_open = false;
 
     var coord = try data.SplitSyncCoordinator.init(std.testing.allocator, .{
+        .transition_id = 132,
+        .attempt_epoch = 1,
         .source_root_dir = source_root_dir,
         .dest_root_dir = dest_root_dir,
         .source_group_id = 131,
@@ -439,7 +778,7 @@ test "transition state prefers observed local split readiness over metadata phas
     defer if (coord_open) coord.deinit();
 
     const start = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:132:doc:m") },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("split_start:132:1:132:doc:m") },
     });
     defer std.testing.allocator.free(start);
     try coord.source.snapshotBuilder().applyBatch(.{
@@ -453,10 +792,12 @@ test "transition state prefers observed local split readiness over metadata phas
 
     const readiness = try readinessForLocalGroup(
         std.testing.allocator,
+        std.testing.io,
         replica_root_dir,
         132,
         &[_]SplitTransitionRecord{.{
-            .transition_id = 1001,
+            .transition_id = 132,
+            .attempt_epoch = 1,
             .source_group_id = 131,
             .destination_group_id = 132,
             .phase = .bootstrap_peer,
@@ -476,10 +817,12 @@ test "transition state prefers observed local split readiness over metadata phas
 test "transition state falls back to metadata observation when local pair is absent" {
     const readiness = try readinessForLocalGroup(
         std.testing.allocator,
+        std.testing.io,
         ".zig-cache/tmp/nonexistent-transition-state-root",
         212,
         &[_]SplitTransitionRecord{.{
             .transition_id = 2001,
+            .attempt_epoch = 1,
             .source_group_id = 211,
             .destination_group_id = 212,
             .phase = .bootstrap_peer,

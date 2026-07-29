@@ -120,13 +120,13 @@ pub fn evaluateStandby(standby: *standby_mod.Standby, request: Request) !Decisio
         };
     }
 
-    if (request.expected_identity) |expected| try validateIdentity(standby.identity, expected);
-
-    const progress = standby.currentProgress();
+    const snapshot = standby.snapshot();
+    if (request.expected_identity) |expected| try validateIdentity(snapshot.identity, expected);
+    const progress = snapshot.progress;
     return .{
         .role = .standby,
         .action = .reject_read_only_standby,
-        .identity = standby.identity,
+        .identity = snapshot.identity,
         .durable_lsn = progress.received_lsn,
         .next_lsn = progress.received_lsn + 1,
     };

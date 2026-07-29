@@ -557,6 +557,17 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .onnx => return error.UnexpectedOnnxBackend,
         .wasm => return error.UnexpectedWasmBackend,
     };
+    const draft_backend_kind: ?runtime.kv.pool.BackendKind = if (draft_model) |loaded|
+        switch (loaded.session.backend()) {
+            .native => .native,
+            .metal => .metal,
+            .cuda => .cuda,
+            .pjrt => return error.UnexpectedPjrtBackend,
+            .onnx => return error.UnexpectedOnnxBackend,
+            .wasm => return error.UnexpectedWasmBackend,
+        }
+    else
+        null;
     const requested_kv_dtype = if (opts.cache_dtype) |name|
         runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
     else
@@ -571,12 +582,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (opts.print_timing and kv_dtype != requested_kv_dtype) {
         print("cache_dtype_effective: requested={s} effective={s}\n", .{ @tagName(requested_kv_dtype), @tagName(kv_dtype) });
     }
-    const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
-        .native => .cpu,
-        else => .gpu,
-    };
+    const budget_backend_class: runtime.tier.memory.BackendClass =
+        if (backend_kind != .native or (draft_backend_kind != null and draft_backend_kind.? != .native))
+            .gpu
+        else
+            .cpu;
     var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
     budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
+    if (draft_model) |loaded| {
+        budget_limits = session_factory.widenBudgetLimitsForSession(loaded.session, budget_limits);
+    }
     budget_limits = applyBudgetOverrides(budget_limits, opts);
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     print("budget: host={d}MB backend={d}MB combined={d}MB\n", .{
@@ -585,7 +600,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         budget_limits.combined_limit_bytes / (1024 * 1024),
     });
     const admission_prefill_chunk = if (opts.prefill_chunk_size > 0) opts.prefill_chunk_size else 256;
-    run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+    run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
         backend_kind,
         kv_dtype,
         gpt_config,
@@ -602,11 +617,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         const requested_draft_kv_dtype = if (opts.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
         else
-            session_factory.recommendedKvDTypeForSession(loaded.session, backend_kind);
+            session_factory.recommendedKvDTypeForSession(loaded.session, draft_backend_kind.?);
         break :blk if (draft_gpt_config) |draft_cfg|
             effectiveGenerationKvDType(
                 requested_draft_kv_dtype,
-                backend_kind,
+                draft_backend_kind.?,
                 draft_cfg,
                 prompt_tokens,
                 @intCast(@max(opts.max_tokens, 1)),
@@ -616,8 +631,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     } else null;
     if (draft_model != null) {
         if (draft_gpt_config) |draft_cfg| {
-            run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
-                backend_kind,
+            run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
+                draft_backend_kind.?,
                 draft_kv_dtype.?,
                 draft_cfg,
                 prompt_tokens,
@@ -736,7 +751,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             else
                 null;
             const draft_pool_id = try draft_kv_manager.?.addPool(.{
-                .backend = backend_kind,
+                .backend = draft_backend_kind.?,
                 .dtype = draft_kv_dtype.?,
                 .page_size_tokens = 16,
                 .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
@@ -4738,7 +4753,7 @@ fn runOnnxWholeModelGraphGenerate(
         budget_limits.backend_limit_bytes / (1024 * 1024),
         budget_limits.combined_limit_bytes / (1024 * 1024),
     });
-    run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+    run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
         backend_kind,
         kv_dtype,
         gpt_config,
@@ -5819,9 +5834,10 @@ fn estimateModelArtifactBytes(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
 ) !usize {
-    if (manifest.gguf_path) |path| return @intCast(try c_file.fileSize(allocator, path));
-    if (manifest.safetensors_path) |path| return @intCast(try c_file.fileSize(allocator, path));
-    return 0;
+    return std.math.cast(
+        usize,
+        try session_factory.estimateNativeWeightBytes(allocator, manifest.*),
+    ) orelse error.ResourceLimitExceeded;
 }
 
 fn estimatePreflightWeightBytes(

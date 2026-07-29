@@ -113,11 +113,14 @@ pub const DocumentTransform = struct {
 
 pub const SplitReplicationCheckpoint = struct {
     pub const Kind = enum {
-        destination,
+        destination_begin,
+        destination_complete,
         source_ack,
     };
 
     kind: Kind,
+    transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     range_start: []const u8 = "",
@@ -129,9 +132,23 @@ pub const SplitReplicationCheckpoint = struct {
 /// destination batch carries this context so all replicas create the physical
 /// DB with the same namespace before the destination range is catalog-visible.
 pub const SplitReplicationContext = struct {
+    pub const Operation = enum {
+        bootstrap_chunk,
+        delta,
+        checkpoint,
+    };
+
+    transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     identity_namespace: doc_identity_mod.Namespace,
+    /// Present only while streaming a baseline bootstrap. Catch-up deltas use
+    /// null and are fenced by the completed destination marker.
+    bootstrap_sequence: ?u64 = null,
+    operation: Operation = .bootstrap_chunk,
+    /// Source split-delta sequence. Zero for bootstrap chunks.
+    sequence: u64 = 0,
 };
 
 pub const SplitTransitionMutation = struct {
@@ -143,6 +160,8 @@ pub const SplitTransitionMutation = struct {
     };
 
     kind: Kind,
+    transition_id: u64,
+    attempt_epoch: u64,
     destination_group_id: u64,
     split_key: []const u8 = "",
 };
@@ -616,6 +635,9 @@ pub const TextBoolQuery = struct {
     should: []const TextQuery = &.{},
     must_not: []const TextQuery = &.{},
     min_should: u32 = 0,
+    /// Distinguishes an explicitly optional pure-`should` query from the
+    /// conventional pure disjunction whose implicit minimum is one.
+    pure_should_optional: bool = false,
     boost: f32 = 1.0,
 };
 
@@ -1188,6 +1210,12 @@ pub const SearchRequest = struct {
     count_only: bool = false,
     profile: bool = false,
     full_text: ?TextQuery = null,
+    /// Text-native positive filter. Unlike `full_text`, this constrains every
+    /// retrieval source without contributing a score.
+    filter_text: ?TextQuery = null,
+    /// Text-native negative filter. Matches are removed from every retrieval
+    /// source without contributing a score.
+    exclusion_text: ?TextQuery = null,
     filter_query_json: []const u8 = "",
     exclusion_query_json: []const u8 = "",
     full_text_queries: []const NamedFullTextQuery = &.{},
@@ -1691,6 +1719,7 @@ pub const EnrichmentStats = struct {
     projection_checkpoint_applied_sequence: u64 = 0,
     projection_checkpoint_generation: u64 = 0,
     projection_checkpoint_config_hash: u64 = 0,
+    projection_checkpoint_identity_consistent: bool = true,
     checkpoint_replay_tail_sequence_count: u64 = 0,
     processed_requests: u64 = 0,
     error_count: u64 = 0,
@@ -1698,6 +1727,8 @@ pub const EnrichmentStats = struct {
     fatal_error_count: u64 = 0,
     retrying: bool = false,
     worker_failed: bool = false,
+    worker_started: bool = false,
+    stalled: bool = false,
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
@@ -1712,6 +1743,7 @@ pub const EnrichmentStats = struct {
     last_embed_batch_items: u64 = 0,
     last_embed_batch_bytes: u64 = 0,
     last_embed_batch_max_bytes: u64 = 0,
+    last_embed_batch_completed_ms: u64 = 0,
     last_embed_batch_ns: u64 = 0,
     total_embed_ns: u64 = 0,
     dense_artifact_bytes_written: u64 = 0,
@@ -2738,6 +2770,19 @@ pub const AsyncIndexingStats = struct {
     startup: StartupCatchUpStats = .{},
     dense_catch_up: DenseCatchUpStats = .{},
     bulk_coalescing: BulkCoalescingStats = .{},
+    derived_workers: DerivedWorkerStats = .{},
+};
+
+pub const DerivedWorkerStats = struct {
+    workers: u64 = 0,
+    workers_with_replay_debt: u64 = 0,
+    max_replay_lag_sequences: u64 = 0,
+    recoverable_retries: u64 = 0,
+    writer_locked_retries: u64 = 0,
+    resource_budget_retries: u64 = 0,
+    replay_document_not_visible_retries: u64 = 0,
+    artifact_repair_required_retries: u64 = 0,
+    not_found_retries: u64 = 0,
 };
 
 pub const BulkCoalescingStats = struct {
@@ -2875,6 +2920,15 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.bulk_coalescing.stage_transforms += src.bulk_coalescing.stage_transforms;
     dst.bulk_coalescing.flush_calls += src.bulk_coalescing.flush_calls;
     dst.bulk_coalescing.flushed_keys += src.bulk_coalescing.flushed_keys;
+    dst.derived_workers.workers += src.derived_workers.workers;
+    dst.derived_workers.workers_with_replay_debt += src.derived_workers.workers_with_replay_debt;
+    dst.derived_workers.max_replay_lag_sequences = @max(dst.derived_workers.max_replay_lag_sequences, src.derived_workers.max_replay_lag_sequences);
+    dst.derived_workers.recoverable_retries += src.derived_workers.recoverable_retries;
+    dst.derived_workers.writer_locked_retries += src.derived_workers.writer_locked_retries;
+    dst.derived_workers.resource_budget_retries += src.derived_workers.resource_budget_retries;
+    dst.derived_workers.replay_document_not_visible_retries += src.derived_workers.replay_document_not_visible_retries;
+    dst.derived_workers.artifact_repair_required_retries += src.derived_workers.artifact_repair_required_retries;
+    dst.derived_workers.not_found_retries += src.derived_workers.not_found_retries;
 }
 
 pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {

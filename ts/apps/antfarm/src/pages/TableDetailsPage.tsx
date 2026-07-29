@@ -82,6 +82,7 @@ import {
   generateSearchableFields,
   type SearchableField,
 } from "../utils/fieldUtils";
+import { buildTableQueryRequest, parseTableQueryRequest } from "./table-query";
 
 const formatBytes = (bytes: number, decimals = 2) => {
   if (bytes === 0) return "0 Bytes";
@@ -273,67 +274,35 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     }
   }, [indexes, queryIndexes.length]);
 
-  const semanticQueryRequestString = useMemo(() => {
-    const queryRequest: QueryRequest = {};
-    if (hasSemanticQuery) {
-      queryRequest.indexes = queryIndexes;
-      queryRequest.semantic_search = query || "";
-    }
-    if (selectedFields.length > 0) {
-      queryRequest.fields = selectedFields;
-    }
-    try {
-      const semanticQueryObject = JSON.parse(semanticQuery);
-      queryRequest.aggregations = semanticQueryObject.aggregations;
-      // Use explicit limit if set, otherwise default to 10
-      queryRequest.limit = semanticQueryObject.limit ?? 10;
-      // Only include offset if semantic search is disabled
-      if (!hasSemanticQuery && semanticQueryObject.offset !== undefined) {
-        queryRequest.offset = semanticQueryObject.offset;
-      }
-    } catch (e) {
-      // ignore invalid json - still use default limit
-      queryRequest.limit = 10;
-      console.error("Invalid semantic query JSON:", e);
-    }
-    if (hasFilterQuery) {
-      try {
-        queryRequest.filter_query = JSON.parse(filterQuery);
-      } catch (e) {
-        // ignore invalid json
-        console.error("Invalid filter query JSON:", e);
-      }
-    }
-    queryRequest.profile = includeProfile;
-    return JSON.stringify(queryRequest, null, 2);
-  }, [
-    query,
-    queryIndexes,
-    filterQuery,
-    semanticQuery,
-    hasSemanticQuery,
-    hasFilterQuery,
-    selectedFields,
-    includeProfile,
-  ]);
+  const semanticQueryRequest = useMemo(() => {
+    return buildTableQueryRequest({
+      query,
+      queryIndexes,
+      selectedFields,
+      semanticQuery,
+      filterQuery,
+      includeProfile,
+    });
+  }, [query, queryIndexes, filterQuery, semanticQuery, selectedFields, includeProfile]);
+  const semanticQueryRequestString = useMemo(
+    () => JSON.stringify(semanticQueryRequest, null, 2),
+    [semanticQueryRequest]
+  );
 
   const [queryJsonString, setQueryJsonString] = useState(semanticQueryRequestString);
-
-  const semanticQueryRequest = useMemo(() => {
-    try {
-      return JSON.parse(semanticQueryRequestString);
-    } catch {
-      return {};
-    }
-  }, [semanticQueryRequestString]);
+  const parsedJsonQuery = useMemo(
+    () => parseTableQueryRequest(queryJsonString),
+    [queryJsonString]
+  );
+  const isJsonQueryValid = parsedJsonQuery !== null;
 
   const handleQueryModeChange = (v: string) => {
     const mode = v as "builder" | "json";
     if (mode === "json") {
       setQueryJsonString(semanticQueryRequestString);
     } else if (mode === "builder") {
-      try {
-        const queryRequest = JSON.parse(queryJsonString);
+      const queryRequest = parseTableQueryRequest(queryJsonString);
+      if (queryRequest) {
         setQueryIndexes(queryRequest.indexes || []);
         setSelectedFields(queryRequest.fields || []);
         setFieldInput(""); // Clear field input when switching from JSON mode
@@ -358,9 +327,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         if (offset !== undefined) semanticPart.offset = offset;
         setSemanticQuery(JSON.stringify(semanticPart, null, 2));
         setError(null);
-      } catch (e) {
-        setError("Invalid JSON in query editor. Please fix it before switching to builder mode.");
-        console.error("Invalid JSON in full query editor:", e);
+      } else {
+        setError("The query editor must contain one JSON object.");
         return;
       }
     }
@@ -473,15 +441,18 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const handleRunQuery = useCallback(async () => {
     if (!tableName) return;
     try {
-      const queryRequest =
-        queryMode === "json" ? JSON.parse(queryJsonString) : semanticQueryRequest;
+      const queryRequest = queryMode === "json" ? parsedJsonQuery : semanticQueryRequest;
+      if (!queryRequest) {
+        setError("The query editor must contain one JSON object.");
+        return;
+      }
       const response = await api.tables.query(tableName, queryRequest);
       setQueryResult(response?.responses?.[0] || null);
     } catch (e) {
       setError(`Failed to run query on table ${tableName}.`);
       console.error(e);
     }
-  }, [tableName, queryMode, queryJsonString, semanticQueryRequest]);
+  }, [tableName, queryMode, parsedJsonQuery, semanticQueryRequest]);
 
   // Global Ctrl+Enter handler for search section
   useEffect(() => {
@@ -721,8 +692,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                 <CardContent>
                   <div className="text-2xl font-semibold">{documentCountLabel}</div>
                   <p className="text-xs text-muted-foreground">
-                    {storageStatus?.disk_usage !== undefined
-                      ? `${formatBytes(storageStatus.disk_usage)} stored`
+                    {storageStatus?.disk_usage != null
+                      ? `${formatBytes(storageStatus.disk_usage)} persisted in LSM runs`
                       : "data count from query API"}
                   </p>
                 </CardContent>
@@ -1154,20 +1125,12 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                 </TabsContent>
                 <TabsContent value="json">
                   {(() => {
-                    let jsonObject: unknown;
-                    let parseError = false;
-                    try {
-                      jsonObject = JSON.parse(queryJsonString);
-                    } catch {
-                      parseError = true;
-                    }
-
-                    if (parseError) {
+                    if (!parsedJsonQuery) {
                       return (
                         <div className="flex flex-col gap-2">
                           <Alert variant="destructive">
                             <AlertDescription>
-                              The current query is not valid JSON. Please correct it.
+                              The current query must be one valid JSON object.
                             </AlertDescription>
                           </Alert>
                           <Textarea
@@ -1182,7 +1145,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                       );
                     }
 
-                    return <JsonViewer json={jsonObject as object} />;
+                    return <JsonViewer json={parsedJsonQuery} />;
                   })()}
                 </TabsContent>
               </div>
@@ -1191,7 +1154,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
             <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
               <Button
                 onClick={handleRunQuery}
-                disabled={!hasSemanticQuery && !hasFilterQuery}
+                disabled={queryMode === "json" && !isJsonQueryValid}
                 size="lg"
               >
                 Run Query
@@ -1203,7 +1166,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                     ? "Running semantic search"
                     : hasFilterQuery
                       ? "Running full-text search"
-                      : "Enter a query to search"}
+                      : "Browsing all documents"}
               </span>
             </DashboardToolbar>
 

@@ -2866,7 +2866,7 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     var promoted = try execute(alloc, .{ .standby = &standby, .fence_store = &fence_store }, promote_plan);
     defer promoted.deinit(alloc);
     try std.testing.expect(promoted.promote_current_fence.assessment.can_promote);
-    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), standby.identitySnapshot().timeline_id);
     const promoted_table = try renderTableAlloc(alloc, promoted);
     defer alloc.free(promoted_table);
     try expectContains(promoted_table, "result=promote_current_fence\n");

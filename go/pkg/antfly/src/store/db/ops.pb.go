@@ -2312,11 +2312,12 @@ func (b0 DeleteIndexOp_builder) Build() *DeleteIndexOp {
 }
 
 type BackupOp struct {
-	state               protoimpl.MessageState `protogen:"opaque.v1"`
-	xxx_hidden_BackupId string                 `protobuf:"bytes,1,opt,name=backup_id,json=backupId"`
-	xxx_hidden_Location string                 `protobuf:"bytes,2,opt,name=location"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	state                 protoimpl.MessageState `protogen:"opaque.v1"`
+	xxx_hidden_BackupId   string                 `protobuf:"bytes,1,opt,name=backup_id,json=backupId"`
+	xxx_hidden_Location   string                 `protobuf:"bytes,2,opt,name=location"`
+	xxx_hidden_Connection string                 `protobuf:"bytes,3,opt,name=connection"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *BackupOp) Reset() {
@@ -2358,6 +2359,13 @@ func (x *BackupOp) GetLocation() string {
 	return ""
 }
 
+func (x *BackupOp) GetConnection() string {
+	if x != nil {
+		return x.xxx_hidden_Connection
+	}
+	return ""
+}
+
 func (x *BackupOp) SetBackupId(v string) {
 	x.xxx_hidden_BackupId = v
 }
@@ -2366,11 +2374,16 @@ func (x *BackupOp) SetLocation(v string) {
 	x.xxx_hidden_Location = v
 }
 
+func (x *BackupOp) SetConnection(v string) {
+	x.xxx_hidden_Connection = v
+}
+
 type BackupOp_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
-	BackupId string
-	Location string
+	BackupId   string
+	Location   string
+	Connection string
 }
 
 func (b0 BackupOp_builder) Build() *BackupOp {
@@ -2379,6 +2392,7 @@ func (b0 BackupOp_builder) Build() *BackupOp {
 	_, _ = b, x
 	x.xxx_hidden_BackupId = b.BackupId
 	x.xxx_hidden_Location = b.Location
+	x.xxx_hidden_Connection = b.Connection
 	return m0
 }
 
@@ -3587,10 +3601,13 @@ const file_ops_proto_rawDesc = "" +
 	"\x04type\x18\x02 \x01(\tB\x05\xaa\x01\x02\b\x02R\x04type\x12\x1d\n" +
 	"\x06config\x18\x03 \x01(\fB\x05\xaa\x01\x02\b\x02R\x06config\"*\n" +
 	"\rDeleteIndexOp\x12\x19\n" +
-	"\x04name\x18\x01 \x01(\tB\x05\xaa\x01\x02\b\x02R\x04name\"Q\n" +
+	"\x04name\x18\x01 \x01(\tB\x05\xaa\x01\x02\b\x02R\x04name\"x\n" +
 	"\bBackupOp\x12\"\n" +
 	"\tbackup_id\x18\x01 \x01(\tB\x05\xaa\x01\x02\b\x02R\bbackupId\x12!\n" +
-	"\blocation\x18\x02 \x01(\tB\x05\xaa\x01\x02\b\x02R\blocation\"z\n" +
+	"\blocation\x18\x02 \x01(\tB\x05\xaa\x01\x02\b\x02R\blocation\x12%\n" +
+	"\n" +
+	"connection\x18\x03 \x01(\tB\x05\xaa\x01\x02\b\x02R\n" +
+	"connection\"z\n" +
 	"\x11InitTransactionOp\x12\x1c\n" +
 	"\x06txn_id\x18\x01 \x01(\fB\x05\xaa\x01\x02\b\x02R\x05txnId\x12#\n" +
 	"\ttimestamp\x18\x02 \x01(\x04B\x05\xaa\x01\x02\b\x02R\ttimestamp\x12\"\n" +

@@ -19,18 +19,60 @@
 
 const std = @import("std");
 const Session = @import("session.zig").Session;
-const SessionManager = @import("backends.zig").SessionManager;
 
 pub const SessionPool = struct {
-    sessions: []?Session,
+    pub const OwnedSession = struct {
+        session: Session,
+        close_context: ?*anyopaque = null,
+        close_fn: *const fn (?*anyopaque, Session) void = defaultClose,
+
+        pub fn deinit(self: *OwnedSession) void {
+            self.close_fn(self.close_context, self.session);
+            self.* = undefined;
+        }
+
+        fn defaultClose(_: ?*anyopaque, session: Session) void {
+            session.close();
+        }
+    };
+
+    pub const Loader = struct {
+        context: *anyopaque,
+        load_fn: *const fn (*anyopaque, []const u8) anyerror!OwnedSession,
+        deinit_fn: *const fn (*anyopaque) void,
+
+        pub fn load(self: Loader, model_path: []const u8) !OwnedSession {
+            return self.load_fn(self.context, model_path);
+        }
+
+        pub fn deinit(self: *Loader) void {
+            self.deinit_fn(self.context);
+            self.* = undefined;
+        }
+    };
+
+    sessions: []?OwnedSession,
     in_use: []bool,
-    model_path: []const u8,
-    session_manager: *SessionManager,
+    model_path: []u8,
+    loader: Loader,
     allocator: std.mem.Allocator,
     size: usize,
 
-    pub fn init(allocator: std.mem.Allocator, session_manager: *SessionManager, model_path: []const u8, size: usize) !SessionPool {
-        const sessions = try allocator.alloc(?Session, size);
+    /// Construct a pool by taking ownership of a resource-aware loader. The
+    /// loader context remains alive until pool deinit, so lazy acquisition
+    /// cannot retain caller stack state.
+    pub fn initWithLoader(
+        allocator: std.mem.Allocator,
+        loader: Loader,
+        model_path: []const u8,
+        size: usize,
+    ) !SessionPool {
+        var owned_loader = loader;
+        errdefer owned_loader.deinit();
+        const owned_model_path = try allocator.dupe(u8, model_path);
+        errdefer allocator.free(owned_model_path);
+        const sessions = try allocator.alloc(?OwnedSession, size);
+        errdefer allocator.free(sessions);
         @memset(sessions, null);
         const in_use = try allocator.alloc(bool, size);
         @memset(in_use, false);
@@ -38,8 +80,8 @@ pub const SessionPool = struct {
         return .{
             .sessions = sessions,
             .in_use = in_use,
-            .model_path = model_path,
-            .session_manager = session_manager,
+            .model_path = owned_model_path,
+            .loader = owned_loader,
             .allocator = allocator,
             .size = size,
         };
@@ -47,10 +89,15 @@ pub const SessionPool = struct {
 
     pub fn deinit(self: *SessionPool) void {
         for (self.sessions) |maybe_session| {
-            if (maybe_session) |s| s.close();
+            if (maybe_session) |owned| {
+                var session = owned;
+                session.deinit();
+            }
         }
         self.allocator.free(self.sessions);
         self.allocator.free(self.in_use);
+        self.allocator.free(self.model_path);
+        self.loader.deinit();
     }
 
     /// Acquire a session from the pool. Creates lazily if needed.
@@ -61,10 +108,10 @@ pub const SessionPool = struct {
             if (!used.*) {
                 // Create session lazily on first use
                 if (maybe_session.* == null) {
-                    maybe_session.* = try self.session_manager.loadModel(self.model_path);
+                    maybe_session.* = try self.loader.load(self.model_path);
                 }
                 used.* = true;
-                return maybe_session.*.?;
+                return maybe_session.*.?.session;
             }
         }
         return error.PoolExhausted;
@@ -73,8 +120,8 @@ pub const SessionPool = struct {
     /// Release a session back to the pool.
     pub fn release(self: *SessionPool, session: Session) void {
         for (self.sessions, self.in_use) |maybe_session, *used| {
-            if (maybe_session) |s| {
-                if (s.ptr == session.ptr) {
+            if (maybe_session) |owned| {
+                if (owned.session.ptr == session.ptr) {
                     used.* = false;
                     return;
                 }
@@ -106,10 +153,23 @@ test "pool acquire release" {
     const allocator = std.testing.allocator;
 
     // We can't create real sessions without a model, so just test init/deinit
-    var sm = @import("backends.zig").SessionManager.init(allocator);
-    var pool = try SessionPool.init(allocator, &sm, "/nonexistent", 2);
+    const TestLoader = struct {
+        fn load(_: *anyopaque, _: []const u8) !SessionPool.OwnedSession {
+            return error.FileNotFound;
+        }
+        fn deinit(_: *anyopaque) void {}
+    };
+    var context: u8 = 0;
+    const input_path = try allocator.dupe(u8, "/nonexistent");
+    var pool = try SessionPool.initWithLoader(allocator, .{
+        .context = &context,
+        .load_fn = TestLoader.load,
+        .deinit_fn = TestLoader.deinit,
+    }, input_path, 2);
     defer pool.deinit();
+    allocator.free(input_path);
 
+    try std.testing.expectEqualStrings("/nonexistent", pool.model_path);
     try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
     try std.testing.expectEqual(@as(usize, 0), pool.availableCount());
 }

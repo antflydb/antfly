@@ -110,7 +110,9 @@ const RecognizerExtractor = struct {
         config: extraction_mod.ExtractionConfig,
         texts: []const []const u8,
     ) ![]extraction_mod.ExtractionResult {
-        const model = try ctx.model_manager.loadFromDir(self.model_path);
+        var model_handle = try ctx.model_manager.acquireFromDir(self.model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 
@@ -128,7 +130,9 @@ const RecognizerExtractor = struct {
         image_datas: []const []const u8,
         read_options: readers_mod.ReadOptions,
     ) ![]extraction_mod.ExtractionResult {
-        const model = try ctx.model_manager.loadFromDir(self.model_path);
+        var model_handle = try ctx.model_manager.acquireFromDir(self.model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 

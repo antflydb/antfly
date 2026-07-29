@@ -99,6 +99,10 @@ const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
             return null;
         }
 
+        pub fn snapshotStats(_: *@This()) types.DerivedWorkerStats {
+            return .{};
+        }
+
         pub fn notifySequence(self: *@This(), sequence: u64) void {
             _ = self;
             _ = sequence;
@@ -179,6 +183,7 @@ pub const Executor = struct {
         add_worker: *const fn (ptr: *anyopaque, name: []const u8, kind: index_manager_mod.ManagedIndexRef, applied_sequence: u64) anyerror!void,
         remove_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         applied_sequence: *const fn (ptr: *anyopaque, name: []const u8) ?u64,
+        snapshot_stats: *const fn (ptr: *anyopaque) types.DerivedWorkerStats,
         notify_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
         notify_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) void,
         notify_except_kind: *const fn (ptr: *anyopaque, sequence: u64, excluded_kind: types.IndexKind) void,
@@ -213,6 +218,10 @@ pub const Executor = struct {
 
     pub fn appliedSequence(self: *Executor, name: []const u8) ?u64 {
         return self.vtable.applied_sequence(self.ptr, name);
+    }
+
+    pub fn snapshotStats(self: *Executor) types.DerivedWorkerStats {
+        return self.vtable.snapshot_stats(self.ptr);
     }
 
     pub fn notifySequence(self: *Executor, sequence: u64) void {
@@ -337,6 +346,18 @@ const ManualRuntime = struct {
             if (std.mem.eql(u8, worker.name, name)) return worker.applied_sequence;
         }
         return null;
+    }
+
+    fn snapshotStats(self: *ManualRuntime) types.DerivedWorkerStats {
+        var stats = types.DerivedWorkerStats{
+            .workers = @intCast(self.workers.items.len),
+        };
+        for (self.workers.items) |worker| {
+            const lag = worker.target_sequence -| worker.applied_sequence;
+            if (lag > 0) stats.workers_with_replay_debt += 1;
+            stats.max_replay_lag_sequences = @max(stats.max_replay_lag_sequences, lag);
+        }
+        return stats;
     }
 
     fn notifySequence(self: *ManualRuntime, sequence: u64) void {
@@ -517,6 +538,7 @@ const manual_vtable = Executor.VTable{
     .add_worker = manualAddWorker,
     .remove_worker = manualRemoveWorker,
     .applied_sequence = manualAppliedSequence,
+    .snapshot_stats = manualSnapshotStats,
     .notify_sequence = manualNotifySequence,
     .notify_indexes = manualNotifyIndexes,
     .notify_except_kind = manualNotifyExceptKind,
@@ -557,6 +579,11 @@ fn manualRemoveWorker(ptr: *anyopaque, name: []const u8) void {
 fn manualAppliedSequence(ptr: *anyopaque, name: []const u8) ?u64 {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
     return runtime.appliedSequence(name);
+}
+
+fn manualSnapshotStats(ptr: *anyopaque) types.DerivedWorkerStats {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    return runtime.snapshotStats();
 }
 
 fn manualNotifySequence(ptr: *anyopaque, sequence: u64) void {
@@ -641,6 +668,7 @@ const io_threaded_vtable = Executor.VTable{
     .add_worker = ioThreadedAddWorker,
     .remove_worker = ioThreadedRemoveWorker,
     .applied_sequence = ioThreadedAppliedSequence,
+    .snapshot_stats = ioThreadedSnapshotStats,
     .notify_sequence = ioThreadedNotifySequence,
     .notify_indexes = ioThreadedNotifyIndexes,
     .notify_except_kind = ioThreadedNotifyExceptKind,
@@ -681,6 +709,11 @@ fn ioThreadedRemoveWorker(ptr: *anyopaque, name: []const u8) void {
 fn ioThreadedAppliedSequence(ptr: *anyopaque, name: []const u8) ?u64 {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return runtime.appliedSequence(name);
+}
+
+fn ioThreadedSnapshotStats(ptr: *anyopaque) types.DerivedWorkerStats {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    return runtime.snapshotStats();
 }
 
 fn ioThreadedNotifySequence(ptr: *anyopaque, sequence: u64) void {

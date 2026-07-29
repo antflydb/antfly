@@ -460,7 +460,7 @@ pub const AlgebraicIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -2618,8 +2618,7 @@ pub const EmbeddingsIndexStats = struct {
     catch_up_phase: ?[]const u8 = null,
     catch_up_applied_sequence: ?i64 = null,
     catch_up_target_sequence: ?i64 = null,
-    /// Embedding enrichment worker runtime diagnostics.
-    enrichment_runtime: ?std.json.Value = null,
+    enrichment_runtime: ?EnrichmentRuntimeStatus = null,
     hbc_cache: ?std.json.Value = null,
     hbc_posting: ?std.json.Value = null,
     async_indexing: ?std.json.Value = null,
@@ -2630,7 +2629,7 @@ pub const EmbeddingsIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -2710,6 +2709,50 @@ pub const EnrichmentKind = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Runtime state for the durable embeddings enrichment worker.
+pub const EnrichmentRuntimeStatus = struct {
+    enabled: bool,
+    target_sequence: i64,
+    applied_sequence: i64,
+    pending_sequence_count: i64,
+    projection_checkpoint_status: []const u8,
+    projection_checkpoint_applied_sequence: i64,
+    projection_checkpoint_generation: i64,
+    projection_checkpoint_config_fingerprint: []const u8,
+    /// Whether every shard contributing to this status reports the same checkpoint generation and configuration identity.
+    projection_checkpoint_identity_consistent: bool,
+    checkpoint_replay_tail_sequence_count: i64,
+    processed_requests: i64,
+    error_count: i64,
+    retryable_error_count: i64,
+    fatal_error_count: i64,
+    retrying: bool,
+    worker_failed: bool,
+    /// Whether the background enrichment worker is currently running.
+    worker_started: bool,
+    /// Whether work is pending with no running worker, retry, or terminal failure explaining the backlog.
+    stalled: bool,
+    skip_by_hash_count: i64,
+    skipped_source_count: i64,
+    codec_decode_failures: i64,
+    embed_batches_started: i64,
+    embed_batches_completed: i64,
+    embed_items_started: i64,
+    embed_items_completed: i64,
+    active_embed_batch_items: i64,
+    active_embed_batch_bytes: i64,
+    active_embed_batch_max_bytes: i64,
+    active_embed_batch_started_ms: i64,
+    last_embed_batch_items: i64,
+    last_embed_batch_bytes: i64,
+    last_embed_batch_max_bytes: i64,
+    /// Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch.
+    last_embed_batch_completed_ms: i64,
+    /// Elapsed duration in nanoseconds for the most recently completed embedding batch.
+    last_embed_batch_ns: i64,
+    total_embed_ns: i64,
 };
 
 pub const Error = struct {
@@ -3412,7 +3455,7 @@ pub const FullTextIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -3721,7 +3764,7 @@ pub const GraphIndexStats = struct {
     /// Projection generation associated with the durable checkpoint.
     projection_checkpoint_generation: ?i64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
-    projection_checkpoint_config_hash: ?i64 = null,
+    projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
@@ -4356,9 +4399,9 @@ pub const InferenceConfig = struct {
     content_security: ?InferenceContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?InferenceCredentials = null,
-    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading). Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading where all models are loaded at startup and never unloaded.
+    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
     keep_alive: ?[]const u8 = null,
-    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
+    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
     max_loaded_models: ?i64 = null,
     /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
     pool_size: ?i64 = null,
@@ -4376,7 +4419,7 @@ pub const InferenceConfig = struct {
     preload: ?[]const InferenceModelRef = null,
     /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
     max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
+    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
     /// Whether the dashboard should show model download commands. Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,
@@ -5757,9 +5800,6 @@ pub const MatchQuery = struct {
     field: ?[]const u8 = null,
     analyzer: ?[]const u8 = null,
     boost: ?Boost = null,
-    prefix_length: ?i32 = null,
-    fuzziness: ?Fuzziness = null,
-    operator: ?[]const u8 = null,
 };
 
 /// Inline binary media content (audio, image, etc.).
@@ -6227,7 +6267,6 @@ pub const Pruner = struct {
 
 pub const Query = union(enum) {
     date_range_string_query: *DateRangeStringQuery,
-    match_query: *MatchQuery,
     boolean_query: *BooleanQuery,
     geo_bounding_box_query: *GeoBoundingBoxQuery,
     numeric_range_query: *NumericRangeQuery,
@@ -6236,6 +6275,7 @@ pub const Query = union(enum) {
     match_phrase_query: *MatchPhraseQuery,
     disjunction_query: *DisjunctionQuery,
     geo_distance_query: *GeoDistanceQuery,
+    match_query: *MatchQuery,
     multi_phrase_query: *MultiPhraseQuery,
     phrase_query: *PhraseQuery,
     bool_field_query: *BoolFieldQuery,
@@ -6280,15 +6320,6 @@ pub const Query = union(enum) {
             "datetime_parser",
         })) {
             if (try parseStructuralVariant(DateRangeStringQuery, allocator, source, options)) |parsed| return .{ .date_range_string_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "match",
-            "analyzer",
-            "prefix_length",
-            "fuzziness",
-            "operator",
-        })) {
-            if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "must",
@@ -6347,6 +6378,12 @@ pub const Query = union(enum) {
             "distance",
         })) {
             if (try parseStructuralVariant(GeoDistanceQuery, allocator, source, options)) |parsed| return .{ .geo_distance_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match",
+            "analyzer",
+        })) {
+            if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "terms",
@@ -6436,7 +6473,6 @@ pub const Query = union(enum) {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
             .date_range_string_query => |v| try jw.write(v.*),
-            .match_query => |v| try jw.write(v.*),
             .boolean_query => |v| try jw.write(v.*),
             .geo_bounding_box_query => |v| try jw.write(v.*),
             .numeric_range_query => |v| try jw.write(v.*),
@@ -6445,6 +6481,7 @@ pub const Query = union(enum) {
             .match_phrase_query => |v| try jw.write(v.*),
             .disjunction_query => |v| try jw.write(v.*),
             .geo_distance_query => |v| try jw.write(v.*),
+            .match_query => |v| try jw.write(v.*),
             .multi_phrase_query => |v| try jw.write(v.*),
             .phrase_query => |v| try jw.write(v.*),
             .bool_field_query => |v| try jw.write(v.*),
@@ -6579,7 +6616,7 @@ pub const QueryProfile = struct {
 pub const QueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
@@ -7117,7 +7154,7 @@ pub const RetrievalAgentUsage = struct {
 pub const RetrievalQueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?std.json.Value = null,
@@ -7399,7 +7436,7 @@ pub const ScanKeysRequest = struct {
     exclusive_to: ?bool = null,
     /// List of fields to include in each result. If not specified, only returns the key. Supports: - Simple fields: "title", "author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings", "_summaries", "_chunks"
     fields: ?[]const []const u8 = null,
-    /// Antfly query to filter documents. Only documents matching this query are included in results. Uses the sear library for efficient per-document matching without requiring a full index. Examples: - Status filtering: `{"query": "status:published"}` - Date ranges: `{"query": "created_at:>2023-01-01"}` - Field matching: `{"query": "category:technology"}`
+    /// Structured subset of the Antfly query AST used to filter a primary-key scan. Only documents matching this query are included in results. Because scans do not open a text index, text-index-only variants such as phrase and multi-match queries are rejected with a validation error instead of being evaluated with slower stored-document semantics. Examples: - Status filtering: `{"term":{"path":"/status","value":"published"}}` - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}` - Field existence: `{"exists":{"path":"/category"}}`
     filter_query: ?std.json.Value = null,
     /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
     limit: ?i64 = null,

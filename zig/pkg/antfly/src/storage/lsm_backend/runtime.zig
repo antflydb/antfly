@@ -5672,6 +5672,11 @@ fn runMayContainWithFilterMaybeLocked(
 
 fn ensureRunBloomFilterForRead(backend: anytype, run: *Run) !?bloom.OwnedFilter {
     if (run.bloom_filter) |filter| return filter;
+    // Cache-backed reads retain the table-index handle that owns the Bloom
+    // filter. There is no per-run filter to materialize, so taking the backend
+    // mutex here only to return null adds one contended lock acquisition per
+    // key/run probe during batch reads.
+    if (backend.options.cache != null or run.path == null) return null;
 
     const locked = lockBackend(@TypeOf(backend.*), backend);
     defer unlockBackend(@TypeOf(backend.*), backend, locked);

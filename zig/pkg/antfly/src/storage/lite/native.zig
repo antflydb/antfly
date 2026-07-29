@@ -3569,6 +3569,10 @@ pub const NativeFile = struct {
     fn syncIfRequired(self: *NativeFile) !void {
         if (!self.no_sync) try self.file.sync(self.io_impl.io());
     }
+
+    pub fn sync(self: *NativeFile) !void {
+        try self.syncIfRequired();
+    }
     /// Publishes a fully synced vacuum file and adopts its already-open handle.
     /// Once rename succeeds there are deliberately no fallible reopen steps:
     /// even if the parent-directory sync reports an error, subsequent requests

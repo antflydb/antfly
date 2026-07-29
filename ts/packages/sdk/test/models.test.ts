@@ -1,12 +1,14 @@
-import { mkdtemp, readFile, stat, writeFile, mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { baseModelName, modelDir, parseModelRef, pullHuggingFaceModel } from "../src/models.js";
 
 describe("model helpers", () => {
   it("uses the Antfly inference model layout", () => {
-    expect(modelDir("/tmp/models", "antflydb/clipclap:gguf:Q4_K")).toBe("/tmp/models/antflydb/clipclap");
+    expect(modelDir("/tmp/models", "antflydb/clipclap:gguf:Q4_K")).toBe(
+      "/tmp/models/antflydb/clipclap"
+    );
   });
 
   it("returns base names for tagged model refs", () => {
@@ -14,7 +16,13 @@ describe("model helpers", () => {
   });
 
   it("rejects unsafe model refs", () => {
-    for (const model of ["../clipclap", "antflydb/..", "./clipclap", "antflydb/.", "antflydb/clipclap/extra"]) {
+    for (const model of [
+      "../clipclap",
+      "antflydb/..",
+      "./clipclap",
+      "antflydb/.",
+      "antflydb/clipclap/extra",
+    ]) {
       expect(() => parseModelRef(model)).toThrow();
     }
   });
@@ -31,7 +39,8 @@ describe("model helpers", () => {
         ]);
       }
       if (url.endsWith("/antflydb/clipclap/resolve/main/config.json")) return new Response("{}");
-      if (url.endsWith("/antflydb/clipclap/resolve/main/clipclap-Q4_K.gguf")) return new Response("q4_k");
+      if (url.endsWith("/antflydb/clipclap/resolve/main/clipclap-Q4_K.gguf"))
+        return new Response("q4_k");
       return new Response("missing", { status: 404 });
     };
 
@@ -60,8 +69,12 @@ describe("model helpers", () => {
           { path: "mxbai-rerank-base-v1.Q8_0.gguf", type: "file", size: 4 },
         ]);
       }
-      if (url.endsWith("/antflydb/mxbai-rerank-base-v1/resolve/main/config.json")) return new Response("{}");
-      if (url.endsWith("/antflydb/mxbai-rerank-base-v1/resolve/main/mxbai-rerank-base-v1.Q4_K.gguf")) return new Response("q4_k");
+      if (url.endsWith("/antflydb/mxbai-rerank-base-v1/resolve/main/config.json"))
+        return new Response("{}");
+      if (
+        url.endsWith("/antflydb/mxbai-rerank-base-v1/resolve/main/mxbai-rerank-base-v1.Q4_K.gguf")
+      )
+        return new Response("q4_k");
       return new Response("missing", { status: 404 });
     };
 
@@ -89,10 +102,14 @@ describe("model helpers", () => {
           { path: "gliner2-head.Q4_K.gguf", type: "file", size: 4 },
         ]);
       }
-      if (url.endsWith("/antflydb/gliner2-base-v1/resolve/main/config.json")) return new Response("root");
-      if (url.endsWith("/antflydb/gliner2-base-v1/resolve/main/encoder_config/config.json")) return new Response("encd");
-      if (url.endsWith("/antflydb/gliner2-base-v1/resolve/main/gliner2-encoder.Q4_K.gguf")) return new Response("encoder");
-      if (url.endsWith("/antflydb/gliner2-base-v1/resolve/main/gliner2-head.Q4_K.gguf")) return new Response("head");
+      if (url.endsWith("/antflydb/gliner2-base-v1/resolve/main/config.json"))
+        return new Response("root");
+      if (url.endsWith("/antflydb/gliner2-base-v1/resolve/main/encoder_config/config.json"))
+        return new Response("encd");
+      if (url.endsWith("/antflydb/gliner2-base-v1/resolve/main/gliner2-encoder.Q4_K.gguf"))
+        return new Response("encoder");
+      if (url.endsWith("/antflydb/gliner2-base-v1/resolve/main/gliner2-head.Q4_K.gguf"))
+        return new Response("head");
       return new Response("missing", { status: 404 });
     };
 
@@ -103,7 +120,9 @@ describe("model helpers", () => {
     });
 
     await expect(readFile(join(dir, "config.json"), "utf8")).resolves.toBe("root");
-    await expect(readFile(join(dir, "encoder_config", "config.json"), "utf8")).resolves.toBe("encd");
+    await expect(readFile(join(dir, "encoder_config", "config.json"), "utf8")).resolves.toBe(
+      "encd"
+    );
     const manifest = await readFile(join(dir, "model_manifest.json"), "utf8");
     expect(manifest).toContain('"name": "encoder_config/config.json"');
   });
@@ -169,10 +188,17 @@ describe("model helpers", () => {
           { path: "clipclap-Q4_K.gguf", type: "file", size: 4 },
         ]);
       }
-      if (url.endsWith("/antflydb/clipclap/resolve/main/clipclap-Q4_K.gguf")) return new Response("q4_k");
+      if (url.endsWith("/antflydb/clipclap/resolve/main/clipclap-Q4_K.gguf"))
+        return new Response("q4_k");
       return new Response("missing", { status: 404 });
     };
-    const progress: Array<{ downloaded: number; total: number; blobsDone: number; blobsTotal: number; resumedBytes: number }> = [];
+    const progress: Array<{
+      downloaded: number;
+      total: number;
+      blobsDone: number;
+      blobsTotal: number;
+      resumedBytes: number;
+    }> = [];
 
     await pullHuggingFaceModel("antflydb/clipclap", {
       modelsDir: root,
@@ -181,8 +207,19 @@ describe("model helpers", () => {
       onProgress: (p) => progress.push(p),
     });
 
-    expect(progress[0]).toMatchObject({ downloaded: 2, total: 6, blobsDone: 1, blobsTotal: 2, resumedBytes: 2 });
-    expect(progress.at(-1)).toMatchObject({ downloaded: 6, blobsDone: 2, blobsTotal: 2, resumedBytes: 2 });
+    expect(progress[0]).toMatchObject({
+      downloaded: 2,
+      total: 6,
+      blobsDone: 1,
+      blobsTotal: 2,
+      resumedBytes: 2,
+    });
+    expect(progress.at(-1)).toMatchObject({
+      downloaded: 6,
+      blobsDone: 2,
+      blobsTotal: 2,
+      resumedBytes: 2,
+    });
     const manifest = await readFile(join(dir, "model_manifest.json"), "utf8");
     expect(manifest).toContain('"source": "antflydb/clipclap:gguf:Q4_K"');
   });

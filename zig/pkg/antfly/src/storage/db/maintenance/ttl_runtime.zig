@@ -437,7 +437,7 @@ test "ttl runtime runOnce works with memory backend store" {
     var runtime_store = try backend.runtimeStore(alloc, .{ .name = "docs" });
     defer runtime_store.deinit();
 
-    try schema_mod.saveSchema(runtime_store, alloc, .{ .version = 1, .default_type = "doc", .ttl_duration_ns = 1_000 });
+    _ = try schema_mod.saveSchema(runtime_store, alloc, .{ .version = 1, .default_type = "doc", .ttl_duration_ns = 1_000 });
     try putTestDoc(&runtime_store, alloc, "doc1", "value", 1_000);
 
     var delete_ctx = TestDeleteContext{ .alloc = alloc, .store = &runtime_store };
@@ -469,7 +469,7 @@ test "ttl runtime runOnce works with lsm backend store" {
     var runtime_store = try backend.runtimeStore(alloc, .{ .name = "docs" });
     defer runtime_store.deinit();
 
-    try schema_mod.saveSchema(runtime_store, alloc, .{ .version = 1, .default_type = "doc", .ttl_duration_ns = 1_000 });
+    _ = try schema_mod.saveSchema(runtime_store, alloc, .{ .version = 1, .default_type = "doc", .ttl_duration_ns = 1_000 });
     try putTestDoc(&runtime_store, alloc, "doc1", "value", 1_000);
 
     var delete_ctx = TestDeleteContext{ .alloc = alloc, .store = &runtime_store };

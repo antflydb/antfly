@@ -73,59 +73,144 @@ pub fn parseStatefulDirectTextOperatorQueryAlloc(
 ) anyerror!?db_types.TextQuery {
     if (value != .object) return null;
     if (try parseStatefulDirectTextMultiMatchQueryAlloc(alloc, value, boost)) |query| return query;
-    if (try directStringOperatorValue(value, "term", &.{ "term", "value" }, true)) |parsed| {
-        return .{ .term = .{
-            .field = try alloc.dupe(u8, parsed.field),
-            .term = try alloc.dupe(u8, parsed.value),
-            .boost = boost,
-        } };
+    // The generated public FuzzyQuery is structurally a term query plus
+    // `fuzziness`/`prefix_length`. Leave that shape for the generated-schema
+    // parser below this direct-DSL layer; consuming it here as an exact term
+    // silently changes the query semantics.
+    if (!termQueryHasFuzzyOptions(value)) {
+        if (try directStringOperatorValue(value, "term", &.{ "term", "value" }, true)) |parsed| {
+            const query_boost = try directOperatorBoost(value, "term", boost);
+            const field = try alloc.dupe(u8, parsed.field);
+            errdefer alloc.free(field);
+            return .{ .term = .{
+                .field = field,
+                .term = try alloc.dupe(u8, parsed.value),
+                .boost = query_boost,
+            } };
+        }
     }
-    if (try directStringOperatorValue(value, "match", &.{ "text", "match", "value" }, true)) |parsed| {
-        return .{ .match = .{
-            .field = try alloc.dupe(u8, parsed.field),
-            .text = try alloc.dupe(u8, parsed.value),
-            .boost = boost,
-        } };
+    // Option-bearing public MatchQuery values must go through the generated
+    // schema parser. That path preserves analyzer/boost and rejects options
+    // that the Zig execution model cannot represent instead of silently
+    // changing their semantics here.
+    if (!matchQueryHasPublicOptions(value)) {
+        if (try directStringOperatorValue(value, "match", &.{ "text", "match", "value" }, true)) |parsed| {
+            const query_boost = try directOperatorBoost(value, "match", boost);
+            const field = try alloc.dupe(u8, parsed.field);
+            errdefer alloc.free(field);
+            return .{ .match = .{
+                .field = field,
+                .text = try alloc.dupe(u8, parsed.value),
+                .boost = query_boost,
+            } };
+        }
     }
-    if (try directStringOperatorValue(value, "match_phrase", &.{ "text", "match_phrase", "value" }, true)) |parsed| {
-        return .{ .match_phrase = .{
-            .field = try alloc.dupe(u8, parsed.field),
-            .text = try alloc.dupe(u8, parsed.value),
-            .boost = boost,
-        } };
+    if (!matchPhraseQueryHasPublicOptions(value)) {
+        if (try directStringOperatorValue(value, "match_phrase", &.{ "text", "match_phrase", "value" }, true)) |parsed| {
+            const query_boost = try directOperatorBoost(value, "match_phrase", boost);
+            const field = try alloc.dupe(u8, parsed.field);
+            errdefer alloc.free(field);
+            return .{ .match_phrase = .{
+                .field = field,
+                .text = try alloc.dupe(u8, parsed.value),
+                .boost = query_boost,
+            } };
+        }
     }
     if (try directStringOperatorValue(value, "prefix", &.{ "prefix", "text", "value" }, true)) |parsed| {
+        const query_boost = try directOperatorBoost(value, "prefix", boost);
+        const field = try alloc.dupe(u8, parsed.field);
+        errdefer alloc.free(field);
         return .{ .prefix = .{
-            .field = try alloc.dupe(u8, parsed.field),
+            .field = field,
             .prefix = try alloc.dupe(u8, parsed.value),
-            .boost = boost,
+            .boost = query_boost,
         } };
     }
     if (try directStringOperatorValue(value, "wildcard", &.{ "pattern", "wildcard", "value" }, false)) |parsed| {
+        const query_boost = try directOperatorBoost(value, "wildcard", boost);
+        const field = try alloc.dupe(u8, parsed.field);
+        errdefer alloc.free(field);
         return .{ .wildcard = .{
-            .field = try alloc.dupe(u8, parsed.field),
+            .field = field,
             .pattern = try alloc.dupe(u8, parsed.value),
-            .boost = boost,
+            .boost = query_boost,
         } };
     }
     if (try directStringOperatorValue(value, "regexp", &.{ "pattern", "regexp", "value" }, false)) |parsed| {
+        const query_boost = try directOperatorBoost(value, "regexp", boost);
+        const field = try alloc.dupe(u8, parsed.field);
+        errdefer alloc.free(field);
         return .{ .regexp = .{
-            .field = try alloc.dupe(u8, parsed.field),
+            .field = field,
             .pattern = try alloc.dupe(u8, parsed.value),
-            .boost = boost,
+            .boost = query_boost,
         } };
     }
     if (try directFuzzyOperatorValue(value)) |parsed| {
+        const query_boost = try directOperatorBoost(value, "fuzzy", boost);
+        const field = try alloc.dupe(u8, parsed.field);
+        errdefer alloc.free(field);
         return .{ .fuzzy = .{
-            .field = try alloc.dupe(u8, parsed.field),
+            .field = field,
             .term = try alloc.dupe(u8, parsed.value),
             .max_edits = parsed.max_edits,
             .prefix_len = parsed.prefix_len,
             .auto_fuzzy = parsed.auto_fuzzy,
-            .boost = boost,
+            .boost = query_boost,
         } };
     }
     return null;
+}
+
+fn termQueryHasFuzzyOptions(value: std.json.Value) bool {
+    if (value != .object or value.object.get("term") == null) return false;
+    if (value.object.contains("fuzziness") or value.object.contains("prefix_length")) return true;
+    const term = value.object.get("term").?;
+    return term == .object and
+        (term.object.contains("fuzziness") or term.object.contains("prefix_length"));
+}
+
+fn matchQueryHasPublicOptions(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const match = value.object.get("match") orelse return false;
+    const options = if (match == .object) match.object else value.object;
+    inline for ([_][]const u8{
+        "analyzer",
+        "fuzziness",
+        "prefix_length",
+        "operator",
+    }) |key| {
+        if (options.get(key)) |option| {
+            if (option != .null) return true;
+        }
+    }
+    return false;
+}
+
+fn matchPhraseQueryHasPublicOptions(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const match_phrase = value.object.get("match_phrase") orelse return false;
+    const options = if (match_phrase == .object) match_phrase.object else value.object;
+    inline for ([_][]const u8{ "analyzer", "fuzziness" }) |key| {
+        if (options.get(key)) |option| {
+            if (option != .null) return true;
+        }
+    }
+    return false;
+}
+
+fn directOperatorBoost(
+    value: std.json.Value,
+    operator: []const u8,
+    fallback: f32,
+) !f32 {
+    if (value != .object) return fallback;
+    const operator_value = value.object.get(operator) orelse return fallback;
+    if (operator_value != .object) return fallback;
+    const boost = operator_value.object.get("boost") orelse return fallback;
+    if (boost == .null) return fallback;
+    return try narrowDirectBoost(try directNumber(boost));
 }
 
 pub fn parseStatefulDirectTextRangeQueryAlloc(
@@ -154,7 +239,7 @@ fn parseStatefulDirectTextMultiMatchQueryAlloc(
     const fields_value = multi_match.object.get("fields") orelse return error.UnsupportedQueryRequest;
     if (fields_value != .array or fields_value.array.items.len == 0) return error.UnsupportedQueryRequest;
     const query_boost: f32 = if (multi_match.object.get("boost")) |boost_value|
-        @floatCast(try directNumber(boost_value))
+        try narrowDirectBoost(try directNumber(boost_value))
     else
         boost;
 
@@ -178,7 +263,7 @@ pub fn parseMultiMatchBoolPrefixQueryAlloc(
     if (std.mem.trim(u8, query_text, &std.ascii.whitespace).len == 0) return error.InvalidQueryRequest;
     if (!std.mem.eql(u8, query_type, "bool_prefix")) return error.UnsupportedQueryRequest;
     if (field_specs.len == 0) return error.UnsupportedQueryRequest;
-    if (!std.math.isFinite(boost) or boost <= 0) return error.UnsupportedQueryRequest;
+    if (!std.math.isFinite(boost)) return error.InvalidQueryRequest;
 
     var fields = try alloc.alloc(db_types.TextMultiMatchField, field_specs.len);
     errdefer alloc.free(fields);
@@ -381,8 +466,13 @@ fn directFuzzyOperatorValue(query: std.json.Value) !?DirectFuzzyOperatorValue {
     return .{
         .field = field.string,
         .value = try directNonBlankString(term),
-        .max_edits = try directOptionalU8(fuzzy.object, "max_edits", 1),
-        .prefix_len = try directOptionalU8(fuzzy.object, "prefix_length", 0),
+        .max_edits = try directOptionalBoundedU8(fuzzy.object, "max_edits", 1, 2),
+        .prefix_len = try directOptionalBoundedU8(
+            fuzzy.object,
+            "prefix_length",
+            0,
+            std.math.maxInt(u8),
+        ),
         .auto_fuzzy = try directOptionalBool(fuzzy.object, "auto_fuzzy", false),
     };
 }
@@ -397,33 +487,44 @@ fn directRangeQueryAlloc(alloc: std.mem.Allocator, query: std.json.Value, boost:
     if (query != .object) return null;
     const field = directFieldValue(query.object) orelse return null;
     if (field != .string) return error.UnsupportedQueryRequest;
-    if (query.object.get("min") == null and query.object.get("max") == null) return null;
+    const raw_min = query.object.get("min");
+    const raw_max = query.object.get("max");
+    const min = if (raw_min != null and raw_min.? != .null) raw_min else null;
+    const max = if (raw_max != null and raw_max.? != .null) raw_max else null;
+    if (min == null and max == null) return null;
 
-    const min = query.object.get("min");
-    const max = query.object.get("max");
     const numeric_like = (min != null and (min.? == .integer or min.? == .float)) or
         (max != null and (max.? == .integer or max.? == .float));
     const string_like = (min != null and min.? == .string) or
         (max != null and max.? == .string);
     if (numeric_like and string_like) return error.UnsupportedQueryRequest;
 
+    const inclusive_min = try directOptionalBool(query.object, "inclusive_min", true);
+    const inclusive_max = try directOptionalBool(query.object, "inclusive_max", false);
+
     if (numeric_like) {
         return .{ .numeric_range = .{
             .field = try alloc.dupe(u8, field.string),
             .min = if (min) |item| try directNumber(item) else null,
             .max = if (max) |item| try directNumber(item) else null,
-            .inclusive_min = try directOptionalBool(query.object, "inclusive_min", true),
-            .inclusive_max = try directOptionalBool(query.object, "inclusive_max", false),
+            .inclusive_min = inclusive_min,
+            .inclusive_max = inclusive_max,
             .boost = boost,
         } };
     }
     if (string_like) {
+        const owned_field = try alloc.dupe(u8, field.string);
+        errdefer alloc.free(owned_field);
+        const owned_min = if (min) |item| try directStringAlloc(alloc, item) else null;
+        errdefer if (owned_min) |item| alloc.free(item);
+        const owned_max = if (max) |item| try directStringAlloc(alloc, item) else null;
+        errdefer if (owned_max) |item| alloc.free(item);
         return .{ .term_range = .{
-            .field = try alloc.dupe(u8, field.string),
-            .min = if (min) |item| try directStringAlloc(alloc, item) else null,
-            .max = if (max) |item| try directStringAlloc(alloc, item) else null,
-            .inclusive_min = try directOptionalBool(query.object, "inclusive_min", true),
-            .inclusive_max = try directOptionalBool(query.object, "inclusive_max", false),
+            .field = owned_field,
+            .min = owned_min,
+            .max = owned_max,
+            .inclusive_min = inclusive_min,
+            .inclusive_max = inclusive_max,
             .boost = boost,
         } };
     }
@@ -434,14 +535,23 @@ fn directFieldValue(object: std.json.ObjectMap) ?std.json.Value {
     return object.get("field") orelse object.get("path");
 }
 
-fn directOptionalU8(object: std.json.ObjectMap, key: []const u8, default_value: u8) !u8 {
+fn directOptionalBoundedU8(
+    object: std.json.ObjectMap,
+    key: []const u8,
+    default_value: u8,
+    maximum: u8,
+) !u8 {
     const value = object.get(key) orelse return default_value;
-    if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u8)) return error.UnsupportedQueryRequest;
+    if (value == .null) return default_value;
+    if (value != .integer or value.integer < 0 or value.integer > maximum) {
+        return error.InvalidQueryRequest;
+    }
     return @intCast(value.integer);
 }
 
 fn directOptionalBool(object: std.json.ObjectMap, key: []const u8, default_value: bool) !bool {
     const value = object.get(key) orelse return default_value;
+    if (value == .null) return default_value;
     if (value != .bool) return error.UnsupportedQueryRequest;
     return value.bool;
 }
@@ -452,6 +562,14 @@ fn directNumber(value: std.json.Value) !f64 {
         .float => |item| item,
         else => error.UnsupportedQueryRequest,
     };
+}
+
+fn narrowDirectBoost(value: f64) !f32 {
+    const max_f32: f64 = std.math.floatMax(f32);
+    if (!std.math.isFinite(value) or value > max_f32 or value < -max_f32) {
+        return error.InvalidQueryRequest;
+    }
+    return @floatCast(value);
 }
 
 fn directStringAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {

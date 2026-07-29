@@ -1462,9 +1462,11 @@ pub const AntflyApiHandler = struct {
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
                 var semantic_resolver = runner.server.semanticStatusResolver(runner.query_embedding_security_scope.domain, runner.query_embedding_security_scope.value);
-                var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
-                    error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
-                    else => return err,
+                var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| {
+                    if (query_api.isPublicQueryValidationError(err)) {
+                        return error.InvalidRetrievalAgentRequest;
+                    }
+                    return err;
                 };
                 defer query_req.deinit(a);
                 runner.server.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
@@ -1619,7 +1621,7 @@ pub const AntflyApiHandler = struct {
         };
         defer self.api_server.source.freeAdminSnapshot(&snapshot);
         var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
-        const storage_statuses = try self.api_server.bestEffortSingleTableStorageStatuses(decoded_table_name, &storage_status_buf);
+        const storage_statuses = try self.api_server.bestEffortSingleTableStorageStatuses(decoded_table_name, &snapshot, &storage_status_buf);
         const body = (try tables_api.encodeSingleTableStatusWithStorageStatuses(alloc, &snapshot, decoded_table_name, storage_statuses)) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -1640,6 +1642,11 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid create table request");
         };
         var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch |err| {
+            if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
+                std.log.err("create table request parsing failed: {} body_len={d}", .{ err, body_data.len });
+                return err;
+            }
+            std.log.debug("create table request rejected: {} body_len={d}", .{ err, body_data.len });
             _ = ctx.status(400);
             if (err == error.InvalidCreateTableSchemaRequest) {
                 return ctx.text(table_contract.createTableRequestErrorMessage(body_data));
@@ -2038,21 +2045,13 @@ pub const AntflyApiHandler = struct {
             },
             else => return err,
         };
-        if (self.api_server.table_writes) |table_writes_source| {
-            if (!local_schema_applied) {
-                _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
-                    error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
-                        _ = ctx.status(400);
-                        return ctx.text(invalid_schema_message);
-                    },
-                    else => return write_err,
-                };
-            }
-            if (try self.api_server.source.runRound()) {
-                _ = try self.api_server.source.runRound();
-                _ = try self.api_server.source.runRound();
-            }
-        }
+        self.api_server.reconcileProjectedSchemaUpdate(alloc, decoded_table_name, schema_json, local_schema_applied) catch |write_err| switch (write_err) {
+            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
+                _ = ctx.status(400);
+                return ctx.text(invalid_schema_message);
+            },
+            else => return write_err,
+        };
 
         const body = try self.api_server.encodeSchemaUpdateResponse(decoded_table_name, schema_json);
         defer self.api_server.alloc.free(body);
@@ -2070,11 +2069,16 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
-        const body_data = (try ctx.body()) orelse {
-            _ = ctx.status(400);
-            return ctx.text("missing body");
+        // The OpenAPI request body is optional; an absent body is the default
+        // unbounded-range scan, just like an explicitly empty legacy request.
+        const body_data = (try ctx.body()) orelse "";
+        var scan_req = http_route_helpers.parseScanKeysRequest(alloc, body_data) catch |err| {
+            if (try http_route_helpers.scanRequestErrorResponse(alloc, err)) |response| {
+                var owned_response = response;
+                return respond(ctx, &owned_response);
+            }
+            return err;
         };
-        var scan_req = try http_route_helpers.parseScanKeysRequest(alloc, body_data);
         defer scan_req.deinit(alloc);
 
         var result = (try source.scan(
@@ -3290,6 +3294,8 @@ const SchemaUpdateStatusSource = struct {
     projection_wait_calls: std.atomic.Value(u32) = .init(0),
     schema_json: ?[]const u8 = null,
     owns_schema_json: bool = false,
+    table_buf: [1]metadata_table_manager.TableRecord = undefined,
+    range_buf: [1]metadata_table_manager.RangeRecord = undefined,
 
     fn iface(self: *@This()) http_server_mod.StatusSource {
         return .{
@@ -3324,21 +3330,23 @@ const SchemaUpdateStatusSource = struct {
 
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.table_buf[0] = .{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = tables_api.effectiveSchemaJson(self.schema_json),
+            .indexes_json = tables_api.default_indexes_json,
+            .placement_role = "data",
+        };
+        self.range_buf[0] = .{
+            .group_id = 7001,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        };
         return .{
             .status = .{ .metadata_group_id = 1, .metrics = .{} },
-            .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                .table_id = 7,
-                .name = "docs",
-                .schema_json = tables_api.effectiveSchemaJson(self.schema_json),
-                .indexes_json = tables_api.default_indexes_json,
-                .placement_role = "data",
-            }})[0..]),
-            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                .group_id = 7001,
-                .table_id = 7,
-                .start_key = "",
-                .end_key = null,
-            }})[0..]),
+            .tables = &self.table_buf,
+            .ranges = &self.range_buf,
             .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
             .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
             .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -3360,8 +3368,54 @@ const SchemaUpdateStatusSource = struct {
         try std.testing.expect(indexes_json != null);
         try std.testing.expect(schema_json != null);
         try std.testing.expect(self.schema_json != null);
-        try std.testing.expectEqualStrings(self.schema_json.?, schema_json.?);
         _ = self.projection_wait_calls.fetchAdd(1, .monotonic);
+    }
+};
+
+const SchemaReconcileWriteSource = struct {
+    reconcile_calls: std.atomic.Value(u32) = .init(0),
+    synchronous_update_calls: std.atomic.Value(u32) = .init(0),
+
+    fn iface(self: *@This()) table_writes.TableWriteSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .batch = batch,
+                .update_schema = updateSchema,
+                .request_table_structural_reconcile = requestStructuralReconcile,
+            },
+        };
+    }
+
+    fn batch(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: db_mod.types.BatchRequest,
+    ) !?void {
+        return {};
+    }
+
+    fn updateSchema(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: []const u8,
+    ) !?void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        _ = self.synchronous_update_calls.fetchAdd(1, .monotonic);
+        return {};
+    }
+
+    fn requestStructuralReconcile(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try std.testing.expectEqualStrings("docs", table_name);
+        _ = self.reconcile_calls.fetchAdd(1, .monotonic);
+        return {};
     }
 };
 
@@ -3550,6 +3604,74 @@ test "httpx antfly lookup route preserves projection and headers" {
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 }
 
+test "httpx antfly scan honors optional body and documented bad requests" {
+    const alloc = std.testing.allocator;
+    const db_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-httpx-handler-scan-{d}", .{platform_time.monotonicNs()});
+    defer alloc.free(db_path);
+
+    var fs_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer fs_io.deinit();
+    std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
+
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
+    }
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value = "{\"title\":\"alpha\",\"body\":\"hello\"}",
+            },
+        },
+        .timestamp_ns = 4321,
+    });
+
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var source = LookupStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
+
+    var e2e_server: HttpxE2eServer = undefined;
+    e2e_server.init(alloc, &api_server) catch |err| switch (err) {
+        // Restricted test environments may forbid even loopback listeners.
+        // The same test runs normally in CI and release validation.
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const scan_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/documents", .{base_url});
+    defer alloc.free(scan_url);
+
+    var bodyless = try requestWithRetry(&client, client_io.io(), .POST, scan_url, null, null, 20);
+    defer bodyless.deinit();
+    try std.testing.expectEqual(@as(u16, 200), bodyless.status.code);
+    try std.testing.expectEqualStrings("application/x-ndjson", bodyless.contentType().?);
+    try std.testing.expect(std.mem.indexOf(u8, bodyless.body.?, "\"_id\":\"doc:a\"") != null);
+
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    var unsupported = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        scan_url,
+        "{\"filter_query\":{\"match_phrase\":\"paid receipt\",\"field\":\"body\"}}",
+        &headers,
+        20,
+    );
+    defer unsupported.deinit();
+    try std.testing.expectEqual(@as(u16, 400), unsupported.status.code);
+    try std.testing.expectEqualStrings("unsupported scan filter query", unsupported.body.?);
+}
+
 test "httpx antfly lookup decodes percent-encoded path keys" {
     const LookupResponse = struct {
         title: []const u8,
@@ -3610,7 +3732,8 @@ test "httpx antfly schema update returns full table status after projection" {
 
     var source = SchemaUpdateStatusSource{};
     defer source.deinit(alloc);
-    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var writes = SchemaReconcileWriteSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
 
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
@@ -3639,6 +3762,8 @@ test "httpx antfly schema update returns full table status after projection" {
     try std.testing.expectEqualStrings("docs", parsed.value.name);
     try std.testing.expect(parsed.value.schema != null);
     try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), writes.reconcile_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), writes.synchronous_update_calls.load(.monotonic));
 }
 
 test "httpx global query table name comes from request body" {

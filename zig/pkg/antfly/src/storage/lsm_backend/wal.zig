@@ -59,6 +59,13 @@ pub const AppendResult = struct {
     bytes: usize = 0,
     segment: u64 = 0,
     segment_became_nonempty: bool = false,
+    segment_syncs: u64 = 0,
+    index_syncs: u64 = 0,
+};
+
+pub const SyncResult = struct {
+    segment_syncs: u64 = 0,
+    index_syncs: u64 = 0,
 };
 
 pub const ReplayStats = struct {
@@ -214,12 +221,19 @@ pub fn appendStateWithOptionsResult(
     const current = try readCurrentSegment(storage, allocator, root_dir);
     var segment = current.segment;
     var current_size = current.size;
+    var index_syncs: u64 = 0;
     if (!current.index_exists) {
+        // Persist the WAL directory's own namespace entry once during
+        // initialization. Segment rotation only needs the already-durable WAL
+        // directory and does not add a steady-state parent sync.
+        if (sync) try storage.syncParentAbsolute(wal_dir);
         try writeCurrentSegment(storage, allocator, root_dir, segment, current_size);
+        index_syncs += 1;
         try writeCheckpointIndex(storage, allocator, root_dir, .{
             .oldest_retained_segment = 1,
             .covered_through_segment = 0,
         });
+        index_syncs += 1;
     }
     var segment_path = try segmentPathAlloc(allocator, root_dir, segment);
     var segment_path_owned = true;
@@ -230,6 +244,7 @@ pub fn appendStateWithOptionsResult(
         segment += 1;
         current_size = 0;
         try writeCurrentSegment(storage, allocator, root_dir, segment, current_size);
+        index_syncs += 1;
         segment_path = try segmentPathAlloc(allocator, root_dir, segment);
         segment_path_owned = true;
     }
@@ -241,16 +256,18 @@ pub fn appendStateWithOptionsResult(
         },
         else => return err,
     };
-    current_size += record.len;
-    if (!current.index_exists or current.segment != segment or current.size != current_size) {
-        try writeCurrentSegment(storage, allocator, root_dir, segment, current_size);
-    }
+    // fsync(file) does not make a newly-created directory entry durable on
+    // POSIX filesystems. Pay the parent-directory boundary only for the first
+    // record in a segment; steady-state appends remain one file sync.
+    if (sync and segment_became_nonempty) try storage.syncParentAbsolute(segment_path);
     allocator.free(segment_path);
     segment_path_owned = false;
     return .{
         .bytes = record.len,
         .segment = segment,
         .segment_became_nonempty = segment_became_nonempty,
+        .segment_syncs = @intFromBool(sync),
+        .index_syncs = index_syncs,
     };
 }
 
@@ -262,9 +279,9 @@ pub fn currentSegment(storage: storage_io.Storage, allocator: Allocator, root_di
     return (try readCurrentSegment(storage, allocator, root_dir)).segment;
 }
 
-pub fn syncCurrentState(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !void {
+pub fn syncCurrentState(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !SyncResult {
     const current = readCurrentSegmentIfPresent(storage, allocator, root_dir) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => return .{},
         else => return err,
     };
     const temp_allocator = allocator;
@@ -275,6 +292,7 @@ pub fn syncCurrentState(storage: storage_io.Storage, allocator: Allocator, root_
     const index_path = try indexPathAlloc(temp_allocator, root_dir);
     defer temp_allocator.free(index_path);
     try storage.appendFileAbsolute(allocator, index_path, "", true);
+    return .{ .segment_syncs = 1, .index_syncs = 1 };
 }
 
 pub fn replayIntoMutable(
@@ -339,6 +357,7 @@ pub fn reset(storage: storage_io.Storage, allocator: Allocator, root_dir: []cons
     const wal_dir = try walDirPathAlloc(allocator, root_dir);
     defer allocator.free(wal_dir);
     try storage.createDirPath(wal_dir);
+    try storage.syncParentAbsolute(wal_dir);
 
     const current_segment = (readCurrentSegmentIfPresent(storage, allocator, root_dir) catch |err| switch (err) {
         error.FileNotFound => CurrentSegment{ .segment = 1, .size = 0, .index_exists = false },
@@ -526,6 +545,13 @@ pub fn appendReplay(
 
     const index = try readReplayIndex(storage, allocator, root_dir);
     if (!index.exists) {
+        // The replay segment is nested two directory levels below the root.
+        // Make both ancestors durable before publishing an index that can
+        // expose replay data after a crash.
+        if (sync) {
+            try storage.syncParentAbsolute(wal_dir);
+            try storage.syncParentAbsolute(replay_dir);
+        }
         try writeReplayIndex(storage, allocator, root_dir, .{
             .current_segment = 1,
             .next_sequence = index.next_sequence,
@@ -544,16 +570,19 @@ pub fn appendReplay(
         error.FileNotFound => 0,
         else => return err,
     };
+    var segment_became_nonempty = current_size == 0;
     if (current_size > 0 and current_size + record.len > options.segment_bytes) {
         segment += 1;
         allocator.free(segment_path);
         segment_path_owned = false;
         segment_path = try replaySegmentPathAlloc(allocator, root_dir, segment);
         segment_path_owned = true;
+        segment_became_nonempty = true;
     }
 
     try appendReplaySegmentEntryIfNeeded(storage, allocator, root_dir, segment, sequence, true);
     try storage.appendFileAbsolute(allocator, segment_path, record, sync);
+    if (sync and segment_became_nonempty) try storage.syncParentAbsolute(segment_path);
     try writeReplayIndex(storage, allocator, root_dir, .{
         .current_segment = segment,
         .next_sequence = sequence + 1,
@@ -1320,7 +1349,7 @@ fn appendMainReplaySegmentEntryIfNeeded(
             var raw: [committed_segment_entry_len]u8 = undefined;
             std.mem.writeInt(u64, raw[0..8], segment, .little);
             std.mem.writeInt(u64, raw[8..16], sequence, .little);
-            try storage.writeFileAbsolute(segments_path, &raw);
+            try replaceFileAtomically(storage, allocator, segments_path, &raw);
             return;
         },
         else => return err,
@@ -1330,7 +1359,7 @@ fn appendMainReplaySegmentEntryIfNeeded(
         var raw: [committed_segment_entry_len]u8 = undefined;
         std.mem.writeInt(u64, raw[0..8], segment, .little);
         std.mem.writeInt(u64, raw[8..16], sequence, .little);
-        try storage.writeFileAbsolute(segments_path, &raw);
+        try replaceFileAtomically(storage, allocator, segments_path, &raw);
         return;
     }
     if (size % committed_segment_entry_len != 0) return error.CorruptLsmWalIndex;
@@ -1370,7 +1399,7 @@ fn appendReplaySegmentEntryIfNeeded(
             var raw: [committed_segment_entry_len]u8 = undefined;
             std.mem.writeInt(u64, raw[0..8], segment, .little);
             std.mem.writeInt(u64, raw[8..16], sequence, .little);
-            try storage.writeFileAbsolute(segments_path, &raw);
+            try replaceFileAtomically(storage, allocator, segments_path, &raw);
             return;
         },
         else => return err,
@@ -1380,7 +1409,7 @@ fn appendReplaySegmentEntryIfNeeded(
         var raw: [committed_segment_entry_len]u8 = undefined;
         std.mem.writeInt(u64, raw[0..8], segment, .little);
         std.mem.writeInt(u64, raw[8..16], sequence, .little);
-        try storage.writeFileAbsolute(segments_path, &raw);
+        try replaceFileAtomically(storage, allocator, segments_path, &raw);
         return;
     }
     if (size % committed_segment_entry_len != 0) return error.CorruptLsmWalIndex;
@@ -1497,15 +1526,20 @@ const CheckpointIndex = struct {
 };
 
 fn readCurrentSegment(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !CurrentSegment {
-    const segment = readCurrentSegmentIfPresent(storage, allocator, root_dir) catch |err| switch (err) {
+    var segment = readCurrentSegmentIfPresent(storage, allocator, root_dir) catch |err| switch (err) {
         error.FileNotFound => return .{ .segment = 1, .size = 0, .index_exists = false },
         else => return err,
     };
-    return .{
-        .segment = segment.segment,
-        .size = segment.size,
-        .index_exists = true,
+    // The index's size field is advisory for backwards compatibility. Derive
+    // the active size from the segment itself so a normal append needs only the
+    // segment fsync; the atomic index is published only when the segment changes.
+    const segment_path = try segmentPathAlloc(allocator, root_dir, segment.segment);
+    defer allocator.free(segment_path);
+    segment.size = storage.fileSize(segment_path) catch |err| switch (err) {
+        error.FileNotFound => 0,
+        else => return err,
     };
+    return segment;
 }
 
 fn readCurrentSegmentIfPresent(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !CurrentSegment {
@@ -1832,6 +1866,16 @@ test "lsm wal replay reads chunks into bounded pending buffer" {
             return self.backing.storage().appendFileAbsolute(std.testing.allocator, path, contents, sync);
         }
 
+        fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncFileContentsAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.storage().syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().renameAbsolute(old_path, new_path);
@@ -1862,6 +1906,9 @@ test "lsm wal replay reads chunks into bounded pending buffer" {
         .read_file_trailer_alloc = CountingStorage.readFileTrailerAlloc,
         .write_file_absolute = CountingStorage.writeFileAbsolute,
         .append_file_absolute = CountingStorage.appendFileAbsolute,
+        .sync_contents_absolute = CountingStorage.syncFileContentsAbsolute,
+        .sync_parent_absolute = CountingStorage.syncParentAbsolute,
+        .rename_is_atomic = true,
         .rename_absolute = CountingStorage.renameAbsolute,
         .delete_file_absolute = CountingStorage.deleteFileAbsolute,
         .delete_tree = CountingStorage.deleteTree,
@@ -1921,7 +1968,7 @@ test "lsm wal rotates small segments and replays all records" {
     try std.testing.expectEqualStrings("B", try replayed.get(.{ .name = "docs" }, "b"));
 }
 
-test "lsm wal current segment index stores cached segment size" {
+test "lsm wal derives current segment size without republishing the index" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
     const root_dir = "/wal-current-segment-size-test";
@@ -1942,6 +1989,10 @@ test "lsm wal current segment index stores cached segment size" {
     const current = try readCurrentSegment(storage.storage(), std.testing.allocator, root_dir);
     try std.testing.expectEqual(@as(u64, 1), current.segment);
     try std.testing.expectEqual(try storage.storage().fileSize(segment_path), current.size);
+
+    const raw_index = try storage.storage().readFileAlloc(std.testing.allocator, index_path, 16);
+    defer std.testing.allocator.free(raw_index);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, raw_index[8..16], .little));
 }
 
 test "lsm wal retention snapshot counts replayed segment debt and reset clears it" {

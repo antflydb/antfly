@@ -95,6 +95,9 @@ func ValidateBackupID(backupID string) error {
 	if backupID == "" {
 		return fmt.Errorf("backup ID cannot be empty")
 	}
+	if len(backupID) > 128 {
+		return fmt.Errorf("backup ID must be at most 128 bytes")
+	}
 	if backupID == "." || backupID == ".." || strings.Contains(backupID, "..") {
 		return fmt.Errorf("backup ID %q must not contain path traversal", backupID)
 	}
