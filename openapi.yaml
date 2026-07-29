@@ -11967,9 +11967,13 @@ components:
 
             unchanged. Continuations that omit or broaden the effective predicate,
 
-            or alter the token, fail closed. Multi-node deployments must configure
+            or alter the token, fail closed. Multi-node deployments must provide
 
-            the same retrieval continuation secret on every API node.
+            the same `antfly.retrieval.continuation.secret` secret-store value
+
+            (or `ANTFLY_RETRIEVAL_CONTINUATION_SECRET` environment variable) on
+
+            every API node.
         decisions:
           type: array
           items:

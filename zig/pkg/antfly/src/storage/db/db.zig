@@ -21598,9 +21598,16 @@ pub const DB = struct {
             if (hits.len > 0) alloc.free(hits);
         }
         for (keys, 0..) |key, i| {
+            const id = try alloc.dupe(u8, key);
+            errdefer alloc.free(id);
+            const doc_ordinal = try self.lookupLiveDocOrdinalNoLock(
+                alloc,
+                key,
+                req.identity_read_generation,
+            );
             hits[i] = .{
-                .id = try alloc.dupe(u8, key),
-                .doc_ordinal = try self.lookupLiveDocOrdinalNoLock(alloc, key, req.identity_read_generation),
+                .id = id,
+                .doc_ordinal = doc_ordinal,
                 .score = 1.0,
                 .stored_data = null,
             };

@@ -585,8 +585,9 @@ pub const ApiHttpServerConfig = struct {
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
     /// Shared secret for binding request-scoped retrieval predicates to
-    /// client-carried continuation tokens. Configure the same value on every
-    /// API node. Falls back to trusted_principal_secret when present.
+    /// client-carried continuation tokens. Runtime entry points resolve
+    /// `antfly.retrieval.continuation.secret` on every API node. Falls back to
+    /// trusted_principal_secret when present.
     retrieval_continuation_secret: ?[]const u8 = null,
     deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,

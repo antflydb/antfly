@@ -5623,8 +5623,10 @@ components:
             mandatory predicate is active, the server returns this as an opaque,
             HMAC-bound continuation token. Clients must replay the returned value
             unchanged. Continuations that omit or broaden the effective predicate,
-            or alter the token, fail closed. Multi-node deployments must configure
-            the same retrieval continuation secret on every API node.
+            or alter the token, fail closed. Multi-node deployments must provide
+            the same `antfly.retrieval.continuation.secret` secret-store value
+            (or `ANTFLY_RETRIEVAL_CONTINUATION_SECRET` environment variable) on
+            every API node.
         decisions:
           type: array
           items:

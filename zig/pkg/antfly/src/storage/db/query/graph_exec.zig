@@ -842,6 +842,44 @@ fn lookupDocOrdinalForGraphHit(
     return try func(ctx, alloc, doc_id, generation);
 }
 
+fn cloneGraphPatternBinding(
+    alloc: Allocator,
+    binding: anytype,
+) !types.GraphPatternBinding {
+    const alias = try alloc.dupe(u8, binding.alias);
+    errdefer alloc.free(alias);
+    const key = try alloc.dupe(u8, binding.key);
+    errdefer alloc.free(key);
+    return .{
+        .alias = alias,
+        .node = .{
+            .key = key,
+            .depth = binding.depth,
+            .distance = @floatFromInt(binding.depth),
+            .path = null,
+            .path_edges = null,
+        },
+    };
+}
+
+fn cloneGraphPathEdgeInfo(
+    alloc: Allocator,
+    edge: anytype,
+) !graph_query_mod.PathEdgeInfo {
+    const source = try alloc.dupe(u8, edge.source);
+    errdefer alloc.free(source);
+    const target = try alloc.dupe(u8, edge.target);
+    errdefer alloc.free(target);
+    const edge_type = try alloc.dupe(u8, edge.edge_type);
+    errdefer alloc.free(edge_type);
+    return .{
+        .source = source,
+        .target = target,
+        .edge_type = edge_type,
+        .weight = edge.weight,
+    };
+}
+
 pub fn convertPatternMatchesToGraphMatches(
     alloc: Allocator,
     raw_matches: []const graph_pattern_mod.PatternMatch,
@@ -861,16 +899,7 @@ pub fn convertPatternMatchesToGraphMatches(
             if (bindings.len > 0) alloc.free(bindings);
         }
         for (raw_match.bindings, 0..) |binding, binding_index| {
-            bindings[binding_index] = .{
-                .alias = try alloc.dupe(u8, binding.alias),
-                .node = .{
-                    .key = try alloc.dupe(u8, binding.key),
-                    .depth = binding.depth,
-                    .distance = @floatFromInt(binding.depth),
-                    .path = null,
-                    .path_edges = null,
-                },
-            };
+            bindings[binding_index] = try cloneGraphPatternBinding(alloc, binding);
             initialized_bindings += 1;
         }
 
@@ -886,12 +915,7 @@ pub fn convertPatternMatchesToGraphMatches(
             if (path.len > 0) alloc.free(path);
         }
         for (raw_match.path, 0..) |edge, edge_index| {
-            path[edge_index] = .{
-                .source = try alloc.dupe(u8, edge.source),
-                .target = try alloc.dupe(u8, edge.target),
-                .edge_type = try alloc.dupe(u8, edge.edge_type),
-                .weight = edge.weight,
-            };
+            path[edge_index] = try cloneGraphPathEdgeInfo(alloc, edge);
             initialized_path += 1;
         }
 
@@ -1253,17 +1277,26 @@ fn buildPatternDocumentHits(
     for (matches) |match| {
         for (match.bindings) |binding| {
             if (seen.contains(binding.node.key)) continue;
-            try seen.put(alloc, try alloc.dupe(u8, binding.node.key), {});
+            {
+                const seen_key = try alloc.dupe(u8, binding.node.key);
+                errdefer alloc.free(seen_key);
+                try seen.put(alloc, seen_key, {});
+            }
+            try hits.ensureUnusedCapacity(alloc, 1);
             const stored_data = if (query.include_documents)
                 try executor.load_projected_document(executor.ctx, alloc, query, binding.node.key)
             else
                 null;
-            try hits.append(alloc, .{
-                .id = try alloc.dupe(u8, binding.node.key),
-                .doc_ordinal = if (executor.lookup_doc_ordinal) |lookup|
-                    try lookup(executor.ctx, alloc, binding.node.key, identity_read_generation)
-                else
-                    null,
+            errdefer if (stored_data) |stored| alloc.free(stored);
+            const id = try alloc.dupe(u8, binding.node.key);
+            errdefer alloc.free(id);
+            const doc_ordinal = if (executor.lookup_doc_ordinal) |lookup|
+                try lookup(executor.ctx, alloc, binding.node.key, identity_read_generation)
+            else
+                null;
+            hits.appendAssumeCapacity(.{
+                .id = id,
+                .doc_ordinal = doc_ordinal,
                 .score = @floatCast(binding.node.distance),
                 .stored_data = stored_data,
             });

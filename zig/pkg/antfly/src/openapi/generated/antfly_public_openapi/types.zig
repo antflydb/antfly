@@ -2366,7 +2366,7 @@ pub const RetrievalAgentRequest = struct {
     agent_knowledge: ?[]const u8 = null,
     /// Mandatory filters from prior interactions. These are converted to structured Antfly predicates and applied to every table and every search tool invocation, including generated follow-ups, graph/tree traversal, aggregations, and root scans.
     accumulated_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
-    /// Correlation identifier for a bounded agent interaction. When a mandatory predicate is active, the server returns this as an opaque, HMAC-bound continuation token. Clients must replay the returned value unchanged. Continuations that omit or broaden the effective predicate, or alter the token, fail closed. Multi-node deployments must configure the same retrieval continuation secret on every API node.
+    /// Correlation identifier for a bounded agent interaction. When a mandatory predicate is active, the server returns this as an opaque, HMAC-bound continuation token. Clients must replay the returned value unchanged. Continuations that omit or broaden the effective predicate, or alter the token, fail closed. Multi-node deployments must provide the same `antfly.retrieval.continuation.secret` secret-store value (or `ANTFLY_RETRIEVAL_CONTINUATION_SECRET` environment variable) on every API node.
     session_id: ?[]const u8 = null,
     /// Structured answers provided by the user as part of client-carried continuation.
     decisions: ?[]const AgentDecision = null,
