@@ -562,6 +562,7 @@ pub fn handleTableBatch(
     var batch_req = batch_api.parseBatchRequest(alloc, body) catch |err| {
         switch (err) {
             error.ValueTooLong => return .{ .status = 413, .body = try alloc.dupe(u8, "value too large") },
+            error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
             else => return err,
         }
     };
@@ -1539,6 +1540,50 @@ test "public table batch handler returns created batch response" {
     try std.testing.expectEqual(@as(u16, 201), resp.status);
     try std.testing.expect(backend.called);
     try std.testing.expectEqual(@as(i64, 1), parsed.value.inserted.?);
+}
+
+test "public table batch handler rejects unsupported missing-document transform before execution" {
+    const Backend = struct {
+        called: bool = false,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) TableApi.ExecuteBatchError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.called = true;
+            return error.InternalFailure;
+        }
+    };
+
+    var backend = Backend{};
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"transforms":[{"key":"doc:missing","operations":[{"op":"$push","path":"tags","value":"new"}]}]}
+    , backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expectEqualStrings("invalid batch request", resp.body);
+    try std.testing.expect(!backend.called);
 }
 
 test "public table batch handler maps backend errors" {

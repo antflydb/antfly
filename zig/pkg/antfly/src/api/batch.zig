@@ -512,9 +512,10 @@ fn parseTransformOps(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
         if (op_value != .string) return error.InvalidBatchRequest;
         const path_value = item.object.get("path") orelse return error.InvalidBatchRequest;
         if (path_value != .string) return error.InvalidBatchRequest;
+        const op = try transformOpTypeFromString(op_value.string);
+        db_mod.transform.validateTransformOpType(op) catch return error.InvalidBatchRequest;
         const value_json = if (item.object.get("value")) |raw| try std.json.Stringify.valueAlloc(alloc, raw, .{}) else null;
         errdefer if (value_json) |json| alloc.free(json);
-        const op = try transformOpTypeFromString(op_value.string);
         const path = try alloc.dupe(u8, path_value.string);
         errdefer alloc.free(path);
         ops[initialized] = .{
@@ -767,15 +768,39 @@ test "batch parser accepts transforms" {
     try std.testing.expectEqualStrings("version", owned.transforms[0].operations[0].path);
 }
 
-test "batch parser accepts Go transform op spelling" {
+test "batch parser accepts supported Go transform op spelling" {
     var owned = try parseBatchRequest(std.testing.allocator,
-        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$addToSet","path":"tags","value":"zig"},{"op":"$currentDate","path":"updated_at"}]}]}
+        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$addToSet","path":"tags","value":"zig"},{"op":"$setOnInsert","path":"created_at","value":"now"}]}]}
     );
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), owned.transforms.len);
     try std.testing.expectEqual(@as(usize, 2), owned.transforms[0].operations.len);
     try std.testing.expectEqual(db_mod.types.TransformOpType.add_to_set, owned.transforms[0].operations[0].op);
-    try std.testing.expectEqual(db_mod.types.TransformOpType.current_date, owned.transforms[0].operations[1].op);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set_on_insert, owned.transforms[0].operations[1].op);
+}
+
+test "batch parser rejects every recognized but unsupported transform operator" {
+    const unsupported = [_][]const u8{
+        "$push",
+        "$pull",
+        "$pop",
+        "$mul",
+        "$min",
+        "$currentDate",
+        "$rename",
+    };
+    for (unsupported) |op| {
+        const body = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"transforms\":[{{\"key\":\"doc:missing\",\"operations\":[{{\"op\":\"{s}\",\"path\":\"field\",\"value\":1}}]}}]}}",
+            .{op},
+        );
+        defer std.testing.allocator.free(body);
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            parseBatchRequest(std.testing.allocator, body),
+        );
+    }
 }
 
 test "batch parser preserves packed embeddings for mapper extraction" {

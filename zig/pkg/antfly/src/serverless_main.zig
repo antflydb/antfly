@@ -192,9 +192,11 @@ pub fn runFromIterator(
 
     var health_source = ServerlessHealthSource{ .srv = &srv };
     const health_port = cli.health_port orelse try parseEnvOptionalInt(init.environ_map, u16, "ANTFLY_SERVERLESS_HEALTH_PORT");
-    const health_server = try antfly.common.health_server.HealthServer.startIfConfigured(
+    const health_bind_host = cli.bind_host orelse init.environ_map.get("ANTFLY_SERVERLESS_BIND_HOST") orelse "127.0.0.1";
+    const health_server = try antfly.common.health_server.HealthServer.startIfConfiguredOnHost(
         alloc,
         "serverless",
+        health_bind_host,
         health_port,
         health_source.readiness(),
         health_source.metricsWriter(),

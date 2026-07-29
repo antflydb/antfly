@@ -21,6 +21,7 @@ pub fn resolveDocumentTransform(
     existing_json: ?[]const u8,
     transform: types.DocumentTransform,
 ) !?[]u8 {
+    try validateDocumentTransform(transform);
     if (existing_json == null and !transform.upsert) return null;
     const is_insert = existing_json == null;
 
@@ -32,11 +33,24 @@ pub fn resolveDocumentTransform(
     } else std.json.Value{ .object = std.json.ObjectMap.empty };
     defer freeJsonValue(alloc, &root);
 
-    for (transform.operations) |op| {
-        applyTransformOp(alloc, &root, op, is_insert) catch continue;
-    }
+    for (transform.operations) |op| try applyTransformOp(alloc, &root, op, is_insert);
 
     return try std.json.Stringify.valueAlloc(alloc, root, .{});
+}
+
+/// Validates the complete transform at admission and storage boundaries.
+///
+/// Keep this independent of document state so an unsupported request cannot
+/// become an acknowledged no-op merely because its target is absent.
+pub fn validateDocumentTransform(transform: types.DocumentTransform) !void {
+    for (transform.operations) |op| try validateTransformOpType(op.op);
+}
+
+pub fn validateTransformOpType(op: types.TransformOpType) !void {
+    switch (op) {
+        .set, .set_on_insert, .unset, .inc, .add_to_set, .max => {},
+        else => return error.UnsupportedTransformOperation,
+    }
 }
 
 pub fn transformOpText(op: types.TransformOpType) []const u8 {
@@ -430,4 +444,37 @@ test "resolve document transform skips missing document without upsert" {
     };
     const resolved = try resolveDocumentTransform(alloc, null, transform);
     try std.testing.expect(resolved == null);
+}
+
+test "unsupported transforms fail atomically instead of reporting success" {
+    const alloc = std.testing.allocator;
+    const unsupported = [_]types.TransformOpType{
+        .push, .pull, .pop, .mul, .min, .current_date, .rename,
+    };
+    for (unsupported) |op| {
+        const operations = [_]types.TransformOp{
+            .{ .op = .set, .path = "changed", .value_json = "true" },
+            .{ .op = op, .path = "n", .value_json = "3" },
+        };
+        try std.testing.expectError(
+            error.UnsupportedTransformOperation,
+            resolveDocumentTransform(alloc, "{\"n\":9}", .{
+                .key = "doc",
+                .operations = &operations,
+            }),
+        );
+    }
+}
+
+test "unsupported transform on a missing document is rejected before no-op resolution" {
+    const operations = [_]types.TransformOp{
+        .{ .op = .push, .path = "tags", .value_json = "\"new\"" },
+    };
+    try std.testing.expectError(
+        error.UnsupportedTransformOperation,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &operations,
+        }),
+    );
 }
