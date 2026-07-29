@@ -530,19 +530,13 @@ const (
 	JoinTypeLeft  = oapi.JoinTypeLeft
 	JoinTypeRight = oapi.JoinTypeRight
 
-	// TransformOpType values for MongoDB-style operators
+	// TransformOpType values
 	TransformOpTypeSet         = oapi.TransformOpTypeSet
+	TransformOpTypeSetOnInsert = oapi.TransformOpTypeSetOnInsert
 	TransformOpTypeUnset       = oapi.TransformOpTypeUnset
 	TransformOpTypeInc         = oapi.TransformOpTypeInc
-	TransformOpTypeMul         = oapi.TransformOpTypeMul
-	TransformOpTypeMin         = oapi.TransformOpTypeMin
 	TransformOpTypeMax         = oapi.TransformOpTypeMax
-	TransformOpTypePush        = oapi.TransformOpTypePush
-	TransformOpTypePull        = oapi.TransformOpTypePull
 	TransformOpTypeAddToSet    = oapi.TransformOpTypeAddToSet
-	TransformOpTypePop         = oapi.TransformOpTypePop
-	TransformOpTypeRename      = oapi.TransformOpTypeRename
-	TransformOpTypeCurrentDate = oapi.TransformOpTypeCurrentDate
 
 	// SyncLevelEmbeddings is a compatibility alias for waiting on all managed index writes.
 	SyncLevelEmbeddings = oapi.SyncLevelFullIndex

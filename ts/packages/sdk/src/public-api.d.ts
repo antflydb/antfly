@@ -4287,7 +4287,7 @@ export interface components {
          * @description MongoDB-style update operator
          * @enum {string}
          */
-        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$pop" | "$mul" | "$min" | "$max" | "$currentDate" | "$rename";
+        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$addToSet" | "$max";
         TransformOp: {
             op: components["schemas"]["TransformOpType"];
             /**
@@ -4295,7 +4295,7 @@ export interface components {
              * @example $.views
              */
             path: string;
-            /** @description Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.) */
+            /** @description Value for operation (not required for $unset). Type depends on the supported operator. */
             value?: unknown;
         };
         /**
@@ -4314,8 +4314,9 @@ export interface components {
          *           "value": 1
          *         },
          *         {
-         *           "op": "$currentDate",
-         *           "path": "$.lastViewed"
+         *           "op": "$set",
+         *           "path": "$.lastViewed",
+         *           "value": "2026-07-28T12:00:00Z"
          *         }
          *       ]
          *     }
@@ -4503,12 +4504,12 @@ export interface components {
              *     Transform operations allow you to modify documents without read-modify-write races:
              *     - Operations are applied atomically on the server
              *     - Multiple operations per document are applied in sequence
-             *     - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more
+             *     - Supports numeric and set-like operations ($inc, $max, $addToSet)
              *
              *     Common use cases:
              *     - Increment counters (views, likes, votes)
-             *     - Update timestamps ($currentDate)
-             *     - Manage arrays (add/remove tags, items)
+             *     - Update timestamps ($set)
+             *     - Add unique array values ($addToSet)
              *     - Update nested fields without overwriting the entire document
              * @example [
              *       {
@@ -4520,8 +4521,9 @@ export interface components {
              *             "value": 1
              *           },
              *           {
-             *             "op": "$currentDate",
-             *             "path": "$.lastViewed"
+             *             "op": "$set",
+             *             "path": "$.lastViewed",
+             *             "value": "2026-07-28T12:00:00Z"
              *           }
              *         ]
              *       },
@@ -4529,7 +4531,7 @@ export interface components {
              *         "key": "user:456",
              *         "operations": [
              *           {
-             *             "op": "$push",
+             *             "op": "$addToSet",
              *             "path": "$.tags",
              *             "value": "vip"
              *           }
@@ -7352,8 +7354,7 @@ export interface components {
         };
         ReplicationTransformOp: {
             /**
-             * @description Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
-             *     `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`.
+             * @description Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`, `$max`.
              *     Replication-specific: `$merge` (flatten JSONB into top-level fields),
              *     `$delete_document` (delete entire Antfly doc, `on_delete` only).
              * @example $set
