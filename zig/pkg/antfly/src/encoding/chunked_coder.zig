@@ -430,7 +430,9 @@ pub const ChunkedIntDecoder = struct {
 
         const control = chunk_bytes[offset..][0..@intCast(control_len)];
         const data_bytes = chunk_bytes[offset + @as(usize, @intCast(control_len)) ..];
-        if (svb.dataLength(control) != data_bytes.len) return error.TruncatedInput;
+        // Partial final groups may omit bytes for unused values, while the
+        // canonical encoder includes zero padding for them.
+        if (data_bytes.len > svb.dataLength(control)) return error.TruncatedInput;
 
         // Ensure capacity
         self.values.clearRetainingCapacity();
@@ -818,6 +820,28 @@ test "ChunkedIntDecoder rejects truncated chunk metadata" {
     defer empty_dec.deinit();
     try empty_dec.loadChunk(0);
     try std.testing.expectEqual(@as(usize, 0), empty_dec.remaining());
+}
+
+test "ChunkedIntDecoder accepts omitted unused partial-group padding" {
+    const alloc = std.testing.allocator;
+
+    const unpadded = [_]u8{ 0x01, 0x06, 0x01, 0x01, 0x01, 0x01, 0x34, 0x12 };
+    var unpadded_dec = try ChunkedIntDecoder.init(alloc, &unpadded, 0);
+    defer unpadded_dec.deinit();
+    try unpadded_dec.loadChunk(0);
+    try std.testing.expectEqual(@as(?u32, 0x1234), unpadded_dec.readValue());
+    try std.testing.expectEqual(@as(?u32, null), unpadded_dec.readValue());
+
+    const padded = [_]u8{ 0x01, 0x09, 0x01, 0x01, 0x01, 0x01, 0x34, 0x12, 0x00, 0x00, 0x00 };
+    var padded_dec = try ChunkedIntDecoder.init(alloc, &padded, 0);
+    defer padded_dec.deinit();
+    try padded_dec.loadChunk(0);
+    try std.testing.expectEqual(@as(?u32, 0x1234), padded_dec.readValue());
+
+    const truncated = [_]u8{ 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x34 };
+    var truncated_dec = try ChunkedIntDecoder.init(alloc, &truncated, 0);
+    defer truncated_dec.deinit();
+    try std.testing.expectError(error.TruncatedInput, truncated_dec.loadChunk(0));
 }
 
 test "prependEmptyChunks shifts chunk table without reencoding payload" {
