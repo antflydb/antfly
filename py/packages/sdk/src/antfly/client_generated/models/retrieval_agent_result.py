@@ -46,7 +46,9 @@ class RetrievalAgentResult:
             - tree: Iterative tree navigation with summarization
             - graph: Relationship-based traversal
             - hybrid: Combine multiple strategies with RRF or rerank
-        session_id (str | Unset): Correlation identifier for client-carried continuation.
+        session_id (str | Unset): Correlation identifier for client-carried continuation. When mandatory
+            predicates were applied, this is an opaque HMAC-bound token and must
+            be replayed unchanged in the next request.
         iteration (int | Unset): Current internal iteration count for this bounded session.
         clarification_count (int | Unset): Number of user clarification turns already consumed in this session.
         remaining_internal_iterations (int | Unset): Remaining internal reasoning/tool-use iterations for this session.

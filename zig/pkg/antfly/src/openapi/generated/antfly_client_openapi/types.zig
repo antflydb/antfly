@@ -7022,19 +7022,19 @@ pub const RestoreRequest = struct {
     connection: []const u8,
 };
 
-/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.
+/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     /// User's natural language query
     query: []const u8,
-    /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available.
+    /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available. `filter_query` and `exclusion_query` are mandatory table predicates for retrieval-agent execution. Predicates declared by any query for a table are conjoined (or unioned for exclusions) and applied to every initial query, generated refinement, probe, aggregation, graph/tree traversal, root scan, and follow-up for that table. They cannot be weakened by generated operations.
     queries: []const RetrievalQueryRequest,
     /// Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
     messages: ?[]const ChatMessage = null,
     /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
     agent_knowledge: ?[]const u8 = null,
-    /// Pre-applied filters from prior interactions. These are applied to all search tool invocations.
+    /// Mandatory filters from prior interactions. These are converted to structured Antfly predicates and applied to every table and every search tool invocation, including generated follow-ups, graph/tree traversal, aggregations, and root scans.
     accumulated_filters: ?[]const FilterSpec = null,
-    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
+    /// Correlation identifier for a bounded agent interaction. When a mandatory predicate is active, the server returns this as an opaque, HMAC-bound continuation token. Clients must replay the returned value unchanged. Continuations that omit or broaden the effective predicate, or alter the token, fail closed. Multi-node deployments must configure the same retrieval continuation secret on every API node.
     session_id: ?[]const u8 = null,
     /// Structured answers provided by the user as part of client-carried continuation.
     decisions: ?[]const AgentDecision = null,
@@ -7084,7 +7084,7 @@ pub const RetrievalAgentResult = struct {
     steps: ?[]const AgentStep = null,
     /// Primary strategy that was used (optional in agentic mode)
     strategy_used: ?RetrievalStrategy = null,
-    /// Correlation identifier for client-carried continuation.
+    /// Correlation identifier for client-carried continuation. When mandatory predicates were applied, this is an opaque HMAC-bound token and must be replayed unchanged in the next request.
     session_id: ?[]const u8 = null,
     /// Current internal iteration count for this bounded session.
     iteration: ?i64 = null,

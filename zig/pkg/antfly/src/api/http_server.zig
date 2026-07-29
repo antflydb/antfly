@@ -584,6 +584,10 @@ pub const ApiHttpServerConfig = struct {
     ard_public_catalog_enabled: bool = false,
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
+    /// Shared secret for binding request-scoped retrieval predicates to
+    /// client-carried continuation tokens. Configure the same value on every
+    /// API node. Falls back to trusted_principal_secret when present.
+    retrieval_continuation_secret: ?[]const u8 = null,
     deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     storage_maintenance: ?*@import("../storage/maintenance.zig").Coordinator = null,
@@ -1660,6 +1664,7 @@ pub const ApiHttpServer = struct {
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
     query_embedding_cache: query_embedding_cache.QueryEmbeddingCache,
+    retrieval_continuation_secret: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 
     pub const RequestStats = struct {
         request_count: u64 = 0,
@@ -1771,6 +1776,7 @@ pub const ApiHttpServer = struct {
         owner_ids: RuntimeOwnerIds,
     ) ApiHttpServer {
         const effective_query_embedding_cache = effectiveQueryEmbeddingCacheConfig(cfg);
+        const retrieval_continuation_secret = deriveRetrievalContinuationSecret(cfg);
         return .{
             .alloc = request_alloc,
             .owner_alloc = owner_alloc,
@@ -1816,9 +1822,22 @@ pub const ApiHttpServer = struct {
             .local_resource_manager = resource_manager_mod.ResourceManager.init(.{}),
             .shared_resource_manager = cfg.resource_manager,
             .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, queryEmbeddingCacheIo(cfg), effective_query_embedding_cache),
+            .retrieval_continuation_secret = retrieval_continuation_secret,
             .mcp_sessions = mcp.InMemorySessionStore.init(owner_alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(owner_alloc),
         };
+    }
+
+    fn deriveRetrievalContinuationSecret(cfg: ApiHttpServerConfig) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+        var secret: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        if (cfg.retrieval_continuation_secret orelse cfg.trusted_principal_secret) |configured| {
+            std.crypto.hash.sha2.Sha256.hash(configured, &secret, .{});
+        } else {
+            queryEmbeddingCacheIo(cfg).randomSecure(&secret) catch {
+                @panic("secure entropy unavailable for retrieval continuation tokens");
+            };
+        }
+        return secret;
     }
 
     fn effectiveQueryEmbeddingCacheConfig(cfg: ApiHttpServerConfig) query_embedding_cache.Config {
@@ -5166,6 +5185,7 @@ pub const ApiHttpServer = struct {
                     .vtable = &.{
                         .run_query = runQuery,
                         .scan_keys = scanKeys,
+                        .bind_predicate_session = bindPredicateSession,
                     },
                 };
             }
@@ -5230,6 +5250,23 @@ pub const ApiHttpServer = struct {
                     filter_query_json,
                     exclusion_query_json,
                     runner.authenticated_identity,
+                );
+            }
+
+            fn bindPredicateSession(
+                ptr_inner: *anyopaque,
+                inner_alloc: std.mem.Allocator,
+                session_id: ?[]const u8,
+                predicate_json: []const u8,
+                continuation: bool,
+            ) !?[]u8 {
+                const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                return try retrieval_agent.bindPredicateSessionToken(
+                    inner_alloc,
+                    &runner.server.retrieval_continuation_secret,
+                    session_id,
+                    predicate_json,
+                    continuation,
                 );
             }
         };
@@ -5364,6 +5401,7 @@ pub const ApiHttpServer = struct {
                     .vtable = &.{
                         .run_query = runQuery,
                         .scan_keys = scanKeys,
+                        .bind_predicate_session = bindPredicateSession,
                     },
                 };
             }
@@ -5413,6 +5451,23 @@ pub const ApiHttpServer = struct {
                     filter_query_json,
                     exclusion_query_json,
                     null,
+                );
+            }
+
+            fn bindPredicateSession(
+                ptr_inner: *anyopaque,
+                alloc: std.mem.Allocator,
+                session_id: ?[]const u8,
+                predicate_json: []const u8,
+                continuation: bool,
+            ) !?[]u8 {
+                const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
+                return try retrieval_agent.bindPredicateSessionToken(
+                    alloc,
+                    &runner.server.retrieval_continuation_secret,
+                    session_id,
+                    predicate_json,
+                    continuation,
                 );
             }
         };
@@ -6420,6 +6475,71 @@ pub const ApiHttpServer = struct {
         return try out.toOwnedSlice(alloc);
     }
 
+    const RetrievalScanPredicate = struct {
+        json: []const u8 = "",
+        owned: ?[]u8 = null,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.owned) |value| alloc.free(value);
+            self.* = undefined;
+        }
+    };
+
+    fn retrievalScanPredicate(
+        alloc: std.mem.Allocator,
+        row_filter_json: ?[]const u8,
+        filter_query_json: ?[]const u8,
+        exclusion_query_json: ?[]const u8,
+    ) !RetrievalScanPredicate {
+        for ([_]?[]const u8{ row_filter_json, filter_query_json, exclusion_query_json }) |predicate| {
+            if (predicate) |json| {
+                if (json.len == 0) return error.InvalidRetrievalAgentRequest;
+            }
+        }
+
+        const include_count: u2 =
+            @as(u2, @intFromBool(row_filter_json != null)) +
+            @as(u2, @intFromBool(filter_query_json != null));
+        if (include_count == 0 and exclusion_query_json == null) return .{};
+        if (include_count == 1 and exclusion_query_json == null) {
+            return .{ .json = row_filter_json orelse filter_query_json.? };
+        }
+
+        const owned = if (exclusion_query_json) |exclusion| blk: {
+            if (row_filter_json) |row_filter| {
+                if (filter_query_json) |filter_query| {
+                    break :blk try std.fmt.allocPrint(
+                        alloc,
+                        "{{\"bool\":{{\"filter\":[{s},{s}],\"must_not\":[{s}]}}}}",
+                        .{ row_filter, filter_query, exclusion },
+                    );
+                }
+                break :blk try std.fmt.allocPrint(
+                    alloc,
+                    "{{\"bool\":{{\"filter\":[{s}],\"must_not\":[{s}]}}}}",
+                    .{ row_filter, exclusion },
+                );
+            }
+            if (filter_query_json) |filter_query| {
+                break :blk try std.fmt.allocPrint(
+                    alloc,
+                    "{{\"bool\":{{\"filter\":[{s}],\"must_not\":[{s}]}}}}",
+                    .{ filter_query, exclusion },
+                );
+            }
+            break :blk try std.fmt.allocPrint(
+                alloc,
+                "{{\"bool\":{{\"must_not\":[{s}]}}}}",
+                .{exclusion},
+            );
+        } else try std.fmt.allocPrint(
+            alloc,
+            "{{\"conjuncts\":[{s},{s}]}}",
+            .{ row_filter_json.?, filter_query_json.? },
+        );
+        return .{ .json = owned, .owned = owned };
+    }
+
     pub fn scanRetrievalKeys(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -6429,6 +6549,7 @@ pub const ApiHttpServer = struct {
         exclusion_query_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]const []const u8 {
+        _ = self;
         const row_filter_json = try resolveEffectiveRowFilterJson(
             alloc,
             authenticated_identity,
@@ -6436,12 +6557,23 @@ pub const ApiHttpServer = struct {
         );
         defer if (row_filter_json) |value| alloc.free(value);
 
+        var predicate = try retrievalScanPredicate(
+            alloc,
+            row_filter_json,
+            filter_query_json,
+            exclusion_query_json,
+        );
+        defer predicate.deinit(alloc);
+
         var scan = (try source.scan(
             alloc,
             table_name,
             "",
             "",
-            .{ .limit = 0 },
+            .{
+                .limit = 0,
+                .filter_query_json = predicate.json,
+            },
             .read_index,
         )) orelse return error.TableNotFound;
         defer scan.deinit(alloc);
@@ -6457,25 +6589,6 @@ pub const ApiHttpServer = struct {
             if (line.len == 0) continue;
             const key = scanLineKey(alloc, line) catch return error.InvalidRetrievalAgentRequest;
             errdefer alloc.free(key);
-
-            if (row_filter_json) |predicate| {
-                if (!(try self.docMatchesRowFilter(source, table_name, key, predicate))) {
-                    alloc.free(key);
-                    continue;
-                }
-            }
-            if (filter_query_json) |predicate| {
-                if (!(try self.docMatchesRowFilter(source, table_name, key, predicate))) {
-                    alloc.free(key);
-                    continue;
-                }
-            }
-            if (exclusion_query_json) |predicate| {
-                if (try self.docMatchesRowFilter(source, table_name, key, predicate)) {
-                    alloc.free(key);
-                    continue;
-                }
-            }
             try keys.append(alloc, key);
         }
         return try keys.toOwnedSlice(alloc);
@@ -15895,6 +16008,46 @@ test "retrieval agent authenticated row filter conjoins generated filter" {
     try std.testing.expect(std.mem.indexOf(u8, req.filter_query_json, "\"conjuncts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.filter_query_json, "\"status\":\"active\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.filter_query_json, "\"tenant\":\"visible\"") != null);
+}
+
+test "retrieval root scan pushes row inclusion and exclusion predicates into one filter" {
+    const alloc = std.testing.allocator;
+    var predicate = try ApiHttpServer.retrievalScanPredicate(
+        alloc,
+        "{\"term\":{\"tenant\":\"acme\"}}",
+        "{\"term\":{\"status\":\"active\"}}",
+        "{\"term\":{\"deleted\":true}}",
+    );
+    defer predicate.deinit(alloc);
+
+    var prepared = try search_pattern_filter.PreparedPatternFilter.init(alloc, predicate.json);
+    defer prepared.deinit();
+
+    try std.testing.expect(try prepared.matchesStored(
+        alloc,
+        "doc:visible",
+        "{\"tenant\":\"acme\",\"status\":\"active\",\"deleted\":false}",
+    ));
+    try std.testing.expect(!(try prepared.matchesStored(
+        alloc,
+        "doc:wrong-tenant",
+        "{\"tenant\":\"other\",\"status\":\"active\",\"deleted\":false}",
+    )));
+    try std.testing.expect(!(try prepared.matchesStored(
+        alloc,
+        "doc:inactive",
+        "{\"tenant\":\"acme\",\"status\":\"inactive\",\"deleted\":false}",
+    )));
+    try std.testing.expect(!(try prepared.matchesStored(
+        alloc,
+        "doc:deleted",
+        "{\"tenant\":\"acme\",\"status\":\"active\",\"deleted\":true}",
+    )));
+
+    try std.testing.expectError(
+        error.InvalidRetrievalAgentRequest,
+        ApiHttpServer.retrievalScanPredicate(alloc, null, "", null),
+    );
 }
 
 fn injectRowFilterIntoOpenApiQueryRequest(

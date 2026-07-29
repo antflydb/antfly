@@ -1458,6 +1458,7 @@ pub const AntflyApiHandler = struct {
                     .vtable = &.{
                         .run_query = runQuery,
                         .scan_keys = runScanKeys,
+                        .bind_predicate_session = bindPredicateSession,
                     },
                 };
             }
@@ -1519,6 +1520,23 @@ pub const AntflyApiHandler = struct {
                     filter_query_json,
                     exclusion_query_json,
                     runner.authenticated_identity,
+                );
+            }
+
+            fn bindPredicateSession(
+                ptr: *anyopaque,
+                a: std.mem.Allocator,
+                session_id: ?[]const u8,
+                predicate_json: []const u8,
+                continuation: bool,
+            ) !?[]u8 {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                return try retrieval_agent.bindPredicateSessionToken(
+                    a,
+                    &runner.server.retrieval_continuation_secret,
+                    session_id,
+                    predicate_json,
+                    continuation,
                 );
             }
         };
