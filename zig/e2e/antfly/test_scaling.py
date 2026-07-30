@@ -958,7 +958,58 @@ class MultiNodeScalingCluster:
                     parts.append(f"[{label} pid {proc.pid}] gdb failed: {exc!r}")
         return "\n".join(parts)
 
+    def preserve_failure_diagnostics(self) -> None:
+        diagnostics: dict[str, Any] = {
+            "metadata_snapshots": [],
+            "metadata_statuses": self.metadata_statuses(),
+            "node_shutdown_statuses": [],
+            "processes": {
+                "metadata": [
+                    {"pid": proc.pid, "returncode": proc.poll()} for proc in self.metadata_procs
+                ],
+                "data": [
+                    {"pid": proc.pid, "returncode": proc.poll()} for proc in self.data_procs
+                ],
+            },
+        }
+        for index, url in enumerate(self.metadata_urls):
+            try:
+                diagnostics["metadata_snapshots"].append(
+                    {"index": index, "url": url, "snapshot": self.metadata_snapshot(index)}
+                )
+            except Exception as exc:
+                diagnostics["metadata_snapshots"].append(
+                    {"index": index, "url": url, "error": repr(exc)}
+                )
+        for node in self.data_nodes:
+            node_id = int(node["id"])
+            try:
+                response = requests.get(
+                    f"{self.metadata_urls[0]}/internal/v1/nodes/{node_id}/shutdown",
+                    timeout=5,
+                )
+                diagnostics["node_shutdown_statuses"].append(
+                    {
+                        "node_id": node_id,
+                        "status_code": response.status_code,
+                        "body": response.json() if response.ok else response.text,
+                    }
+                )
+            except Exception as exc:
+                diagnostics["node_shutdown_statuses"].append(
+                    {"node_id": node_id, "error": repr(exc)}
+                )
+        try:
+            (self.root / "failure-diagnostics.json").write_text(
+                json.dumps(diagnostics, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            print(f"failed to preserve scaling diagnostics: {exc!r}")
+
     def stop(self, *, timeout_s: float = 10.0, test_failed: bool = False) -> None:
+        if test_failed:
+            self.preserve_failure_diagnostics()
         procs = [proc for proc in [*self.data_procs, *self.metadata_procs] if proc.poll() is None]
         for proc in procs:
             proc.send_signal(signal.SIGTERM)

@@ -3345,7 +3345,7 @@ pub const DataServer = struct {
     store_capacity_probe_failures: std.atomic.Value(u64) = .init(0),
     last_store_status_report_at_ms: u64 = 0,
     last_data_raft_metadata_sync_at_ms: u64 = 0,
-    last_data_raft_placement_fingerprint: ?u64 = null,
+    last_data_raft_storage_ownership_fingerprint: ?u64 = null,
     last_data_raft_status_fingerprint: ?u64 = null,
     provision_ticks: usize = 0,
     last_provision_fingerprint: ?u64 = null,
@@ -8176,10 +8176,11 @@ pub const DataServer = struct {
         // for that group: state-machine apply is deliberately unable to create
         // storage or consult metadata after an entry has committed.
         try self.provisionSplitDestinationsBeforeRaftAdmission(snapshot, local_intents.items);
-        const placement_fingerprint = dataRaftPlacementIntentsFingerprint(local_intents.items);
-        const placement_changed = self.last_data_raft_placement_fingerprint == null or self.last_data_raft_placement_fingerprint.? != placement_fingerprint;
-        if (placement_changed) {
-            self.last_data_raft_placement_fingerprint = placement_fingerprint;
+        const storage_ownership_fingerprint = dataRaftStorageOwnershipFingerprint(local_intents.items);
+        const storage_ownership_changed = self.last_data_raft_storage_ownership_fingerprint == null or
+            self.last_data_raft_storage_ownership_fingerprint.? != storage_ownership_fingerprint;
+        if (storage_ownership_changed) {
+            self.last_data_raft_storage_ownership_fingerprint = storage_ownership_fingerprint;
             try self.invalidateRuntimeStatusForLocalPlacements(snapshot, local_intents.items);
             self.invalidateLocalGroupStatusCache();
             self.markStoreStatusDirtyImmediate();
@@ -13450,7 +13451,12 @@ fn localNodePreferredServingPeer(
     return min_node_id != null and min_node_id.? == local_node_id;
 }
 
-fn dataRaftPlacementIntentsFingerprint(intents: []const antfly.raft.PlacementIntent) u64 {
+/// Storage/runtime evidence is owned by the local replica generation, not by
+/// transient routing or Raft-membership state. Keeping this identity narrower
+/// than the complete placement intent prevents a relocation's
+/// bootstrapping/replaying/cutover updates from repeatedly deleting the fresh
+/// local status that the same relocation needs as its data-safety proof.
+fn dataRaftStorageOwnershipFingerprint(intents: []const antfly.raft.PlacementIntent) u64 {
     var hasher = std.hash.Wyhash.init(0x48f9_2026_da7a_4a17);
     hashU64(&hasher, intents.len);
     for (intents) |intent| {
@@ -13460,18 +13466,9 @@ fn dataRaftPlacementIntentsFingerprint(intents: []const antfly.raft.PlacementInt
         hashU64(&hasher, @intFromEnum(intent.record.bootstrap_mode));
         hashU64(&hasher, intent.record.metadata_version);
         hashU64(&hasher, intent.store_id);
-        hashU64(&hasher, @intFromEnum(intent.serving_state));
         hashU64(&hasher, intent.relocation_generation);
         hashU64(&hasher, intent.relocation_source_node_id);
         hashU64(&hasher, intent.relocation_source_store_id);
-        hashU64(&hasher, intent.relocation_doc_count_watermark);
-        hashU64(&hasher, intent.relocation_disk_bytes_watermark);
-        hashU64(&hasher, intent.relocation_target_sequence);
-        hashU64(&hasher, intent.relocation_applied_sequence);
-        hashU64(&hasher, intent.peer_node_ids.len);
-        for (intent.peer_node_ids) |peer_node_id| hashU64(&hasher, peer_node_id);
-        hashU64(&hasher, intent.learner_node_ids.len);
-        for (intent.learner_node_ids) |learner_node_id| hashU64(&hasher, learner_node_id);
         if (intent.record.snapshot_bootstrap) |snapshot| {
             hashU64(&hasher, 1);
             hashU64(&hasher, snapshot.from_node_id);
@@ -15291,7 +15288,7 @@ test "data runtime local group status fingerprint includes live raft state" {
     try std.testing.expect(base != after_same_count_membership_change);
 }
 
-test "data runtime placement fingerprint covers relocation ownership" {
+test "data runtime storage ownership fingerprint excludes transient placement progress" {
     var intent: antfly.raft.PlacementIntent = .{
         .record = .{
             .group_id = 77,
@@ -15309,18 +15306,23 @@ test "data runtime placement fingerprint covers relocation ownership" {
         .relocation_disk_bytes_watermark = 4096,
         .relocation_target_sequence = 72,
     };
-    const initial = dataRaftPlacementIntentsFingerprint(&.{intent});
+    const initial = dataRaftStorageOwnershipFingerprint(&.{intent});
 
     intent.relocation_generation += 1;
-    try std.testing.expect(initial != dataRaftPlacementIntentsFingerprint(&.{intent}));
-    const after_generation = dataRaftPlacementIntentsFingerprint(&.{intent});
+    try std.testing.expect(initial != dataRaftStorageOwnershipFingerprint(&.{intent}));
+    const after_generation = dataRaftStorageOwnershipFingerprint(&.{intent});
 
     intent.serving_state = .serving;
-    try std.testing.expect(after_generation != dataRaftPlacementIntentsFingerprint(&.{intent}));
-    const after_state = dataRaftPlacementIntentsFingerprint(&.{intent});
+    try std.testing.expectEqual(after_generation, dataRaftStorageOwnershipFingerprint(&.{intent}));
 
     intent.relocation_target_sequence += 1;
-    try std.testing.expect(after_state != dataRaftPlacementIntentsFingerprint(&.{intent}));
+    try std.testing.expectEqual(after_generation, dataRaftStorageOwnershipFingerprint(&.{intent}));
+
+    intent.peer_node_ids = &.{ 3, 4, 5, 6 };
+    try std.testing.expectEqual(after_generation, dataRaftStorageOwnershipFingerprint(&.{intent}));
+
+    intent.relocation_source_node_id += 1;
+    try std.testing.expect(after_generation != dataRaftStorageOwnershipFingerprint(&.{intent}));
 }
 
 test "data runtime overlays live raft membership onto cached storage status" {

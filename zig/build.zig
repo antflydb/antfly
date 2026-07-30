@@ -3678,7 +3678,7 @@ pub fn build(b: *std.Build) void {
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime local group status does not open roots owned by transitions",
         "data runtime local group status provider collects and caches group statuses",
-        "data runtime placement fingerprint covers relocation ownership",
+        "data runtime storage ownership fingerprint excludes transient placement progress",
         "data descriptor factory separates bootstrap voters from transport peers",
         "data descriptor factory bootstraps pristine group from complete intent peer set",
         "placement peer collection preserves complete intent peers during partial projection",

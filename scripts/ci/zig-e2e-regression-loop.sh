@@ -59,6 +59,7 @@ fi
 
 if ((workers > 1)); then
   log_root="$(mktemp -d "${TMPDIR:-/tmp}/antfly-e2e-regression.XXXXXX")"
+  preserve_log_root=0
   pids=()
 
   # shellcheck disable=SC2329 # Invoked indirectly by the signal traps below.
@@ -70,8 +71,15 @@ if ((workers > 1)); then
     wait 2>/dev/null || true
     exit 130
   }
+  cleanup_worker_logs() {
+    if ((preserve_log_root == 0)); then
+      rm -rf -- "$log_root"
+    else
+      printf '\nPreserving E2E regression worker logs: %s\n' "$log_root" >&2
+    fi
+  }
   trap terminate_workers INT TERM
-  trap 'rm -rf "$log_root"' EXIT
+  trap cleanup_worker_logs EXIT
 
   for ((worker = 1; worker <= workers; worker++)); do
     env \
@@ -97,6 +105,9 @@ if ((workers > 1)); then
     printf '\n===== E2E regression worker %d/%d =====\n' "$worker" "$workers"
     cat "$log_root/worker-${worker}.log"
   done
+  if ((result != 0)); then
+    preserve_log_root=1
+  fi
   exit "$result"
 fi
 
