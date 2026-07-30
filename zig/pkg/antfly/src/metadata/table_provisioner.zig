@@ -3389,11 +3389,16 @@ test "table provisioner schema progress reads generation-owned rebuild state fro
 
 test "table provisioner schema progress quarantines a corrupt rebuild marker" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-metadata-table-provisioner-progress-corrupt-rebuild-marker";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/metadata-table-provisioner-progress-corrupt-rebuild-marker",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
     const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2008);
     defer alloc.free(db_path);

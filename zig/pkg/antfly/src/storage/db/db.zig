@@ -16024,7 +16024,11 @@ pub const DB = struct {
     };
 
     fn denseIndexRebuildStatePathAlloc(self: *DB, alloc: Allocator, index_name: []const u8) ![]u8 {
-        return try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ self.core.path, index_name });
+        return try std.fmt.allocPrint(
+            alloc,
+            "{s}/indexes/{s}",
+            .{ self.core.index_manager.base_path, index_name },
+        );
     }
 
     fn denseArtifactNameForEntry(entry: anytype) []const u8 {
@@ -60266,6 +60270,8 @@ test "db full-text backfill resumes after interrupted reopen" {
     defer index_manager_mod.test_text_backfill_batch_size = null;
     index_manager_mod.test_abort_text_backfill_after_batches = 1;
     defer index_manager_mod.test_abort_text_backfill_after_batches = null;
+    var state_path: ?[]u8 = null;
+    defer if (state_path) |owned| alloc.free(owned);
     {
         // A per-index load failure no longer fails the whole open; the index
         // is quarantined with its error recorded and retried on next open.
@@ -60273,11 +60279,15 @@ test "db full-text backfill resumes after interrupted reopen" {
         defer interrupted.close();
         const recorded = interrupted.core.index_manager.loadFailure("ft_v1") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
+
+        const cfg = interrupted.core.index_manager.get("ft_v1") orelse return error.IndexNotFound;
+        const rebuild_root = try interrupted.denseIndexRebuildStatePathAlloc(alloc, cfg.name);
+        defer alloc.free(rebuild_root);
+        const rebuild_state = interrupted.core.index_manager.rebuildState(cfg.kind, rebuild_root, cfg.*);
+        state_path = try rebuild_state.pathAlloc(alloc);
     }
 
-    const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1/rebuild.state", .{std.mem.span(path)});
-    defer alloc.free(state_path);
-    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024));
+    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024));
     defer alloc.free(interrupted_state);
     try std.testing.expect(interrupted_state.len > 0);
 
@@ -60286,7 +60296,7 @@ test "db full-text backfill resumes after interrupted reopen" {
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024)));
 
     var result = try reopened.search(alloc, .{
         .index_name = "ft_v1",
@@ -60395,6 +60405,12 @@ test "db sparse backfill restarts safely from a legacy cursor after interrupted 
     defer index_manager_mod.test_sparse_backfill_batch_size = null;
     index_manager_mod.test_abort_sparse_backfill_after_batches = 1;
     defer index_manager_mod.test_abort_sparse_backfill_after_batches = null;
+    const rebuild_root = try std.fmt.allocPrint(alloc, "{s}/indexes/sp_v1", .{std.mem.span(path)});
+    defer alloc.free(rebuild_root);
+    var owned_state_path: ?[]u8 = null;
+    defer if (owned_state_path) |owned| alloc.free(owned);
+    var resume_key: ?[]u8 = null;
+    defer if (resume_key) |owned| alloc.free(owned);
     {
         // A per-index load failure no longer fails the whole open; the index
         // is quarantined with its error recorded and retried on next open.
@@ -60402,28 +60418,30 @@ test "db sparse backfill restarts safely from a legacy cursor after interrupted 
         defer interrupted.close();
         const recorded = interrupted.core.index_manager.loadFailure("sp_v1") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
-    }
 
-    const rebuild_root = try std.fmt.allocPrint(alloc, "{s}/indexes/sp_v1", .{std.mem.span(path)});
-    defer alloc.free(rebuild_root);
-    const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root);
-    const state_path = try rebuild_state.pathAlloc(alloc);
-    defer alloc.free(state_path);
-    const resume_key = (try rebuild_state.checkWithIo(alloc, std.testing.io)) orelse return error.TestExpectedEqual;
-    defer alloc.free(resume_key);
-    try std.testing.expect(resume_key.len > 0);
+        const cfg = interrupted.core.index_manager.get("sp_v1") orelse return error.IndexNotFound;
+        const rebuild_state = interrupted.core.index_manager.rebuildState(cfg.kind, rebuild_root, cfg.*);
+        owned_state_path = try rebuild_state.pathAlloc(alloc);
+        resume_key = (try rebuild_state.checkWithIo(alloc, std.testing.io)) orelse return error.TestExpectedEqual;
+        try std.testing.expect(resume_key.?.len > 0);
+    }
 
     // Simulate an upgrade from the legacy raw-cursor format. It cannot be
     // trusted, so reopen must restart from the beginning without inflating the
     // persisted sparse document count for rows already indexed above.
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = resume_key });
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, owned_state_path.?);
+    const legacy_rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root);
+    const legacy_state_path = try legacy_rebuild_state.pathAlloc(alloc);
+    defer alloc.free(legacy_state_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = legacy_state_path, .data = resume_key.? });
 
     index_manager_mod.test_abort_sparse_backfill_after_batches = null;
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, owned_state_path.?, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, legacy_state_path, alloc, .limited(1024)));
 
     var result = try reopened.search(alloc, .{
         .index_name = "sp_v1",
