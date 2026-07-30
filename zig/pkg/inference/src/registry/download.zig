@@ -1144,10 +1144,14 @@ fn syncManagedDirectory(io: std.Io, path: []const u8) !void {
     {
         return;
     }
+    // On Linux, a non-iterable std.Io.Dir is opened with O_PATH. fsync(2)
+    // rejects O_PATH descriptors with EBADF, so request a regular O_RDONLY
+    // directory descriptor even though no iteration is performed.
+    const open_options: std.Io.Dir.OpenOptions = .{ .iterate = true };
     var dir = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.openDirAbsolute(io, path, .{})
+        try std.Io.Dir.openDirAbsolute(io, path, open_options)
     else
-        try std.Io.Dir.cwd().openDir(io, path, .{});
+        try std.Io.Dir.cwd().openDir(io, path, open_options);
     defer dir.close(io);
     while (true) switch (std.posix.errno(std.posix.system.fsync(dir.handle))) {
         .SUCCESS => return,
