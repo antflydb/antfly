@@ -16655,7 +16655,7 @@ pub const DB = struct {
 
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
-            const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
             const persisted_resume = try rebuild_state.checkWithIo(alloc, self.core.index_manager.checkpointIo());
             errdefer if (persisted_resume) |buf| alloc.free(buf);
             const projection_checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
@@ -16716,7 +16716,7 @@ pub const DB = struct {
             const entry = &self.core.index_manager.dense_indexes.items[dense_index_idx];
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
-            const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
             const active_count = entry.index.stats().active_count;
             if (candidate.invalid_generation_error) |last_error| {
                 try generation_repairs.append(alloc, .{
@@ -16838,7 +16838,7 @@ pub const DB = struct {
             });
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(self.alloc, entry.config.name);
             defer self.alloc.free(rebuild_root_path);
-            const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
             try rebuild_state.updateWithIo(self.core.index_manager.checkpointIo(), target.resume_from orelse "");
         }
     }
@@ -16848,7 +16848,7 @@ pub const DB = struct {
             const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
-            const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+            const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
             const applied_sequence = try self.core.loadAppliedSequence(alloc, entry.config.name);
             const target_sequence = try self.probeDerivedReplayTargetSequence(
                 alloc,
@@ -16915,7 +16915,7 @@ pub const DB = struct {
                 if (applied_sequence < target_sequence) try self.core.saveAppliedSequence(entry.config.name, target_sequence);
                 const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
                 defer alloc.free(rebuild_root_path);
-                const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+                const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
                 try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                 try self.core.saveProjectionCheckpoint(entry.config.name, .{
                     .applied_sequence = target_sequence,
@@ -17216,7 +17216,7 @@ pub const DB = struct {
                     const entry = &persist.db.core.index_manager.dense_indexes.items[target.dense_index_idx];
                     const rebuild_root_path = try persist.db.denseIndexRebuildStatePathAlloc(persist.alloc, entry.config.name);
                     defer persist.alloc.free(rebuild_root_path);
-                    const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+                    const rebuild_state = persist.db.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
                     try rebuild_state.updateWithIo(persist.db.core.index_manager.checkpointIo(), last_key);
                     const owned_key = try persist.alloc.dupe(u8, last_key);
                     errdefer persist.alloc.free(owned_key);
@@ -18734,7 +18734,7 @@ pub const DB = struct {
                         }
                         const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
                         defer alloc.free(rebuild_root_path);
-                        const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+                        const rebuild_state = self.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
                         if (item.doc_count < visible_doc_count) {
                             if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                                 item.backfill_active = true;
@@ -60281,7 +60281,7 @@ test "db full-text backfill retires segment fanout at durable batch boundaries" 
     try std.testing.expectEqual(@as(u32, 24), result.total_hits);
 }
 
-test "db sparse backfill resumes after interrupted reopen" {
+test "db sparse backfill restarts safely from a legacy cursor after interrupted reopen" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -60329,11 +60329,19 @@ test "db sparse backfill resumes after interrupted reopen" {
         try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
     }
 
-    const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/sp_v1/rebuild.state", .{std.mem.span(path)});
+    const rebuild_root = try std.fmt.allocPrint(alloc, "{s}/indexes/sp_v1", .{std.mem.span(path)});
+    defer alloc.free(rebuild_root);
+    const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root);
+    const state_path = try rebuild_state.pathAlloc(alloc);
     defer alloc.free(state_path);
-    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024));
-    defer alloc.free(interrupted_state);
-    try std.testing.expect(interrupted_state.len > 0);
+    const resume_key = (try rebuild_state.checkWithIo(alloc, std.testing.io)) orelse return error.TestExpectedEqual;
+    defer alloc.free(resume_key);
+    try std.testing.expect(resume_key.len > 0);
+
+    // Simulate an upgrade from the legacy raw-cursor format. It cannot be
+    // trusted, so reopen must restart from the beginning without inflating the
+    // persisted sparse document count for rows already indexed above.
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = resume_key });
 
     index_manager_mod.test_abort_sparse_backfill_after_batches = null;
 

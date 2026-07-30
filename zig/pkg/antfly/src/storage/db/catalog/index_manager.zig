@@ -3551,7 +3551,7 @@ pub const IndexManager = struct {
         return self.io orelse std.Io.Threaded.global_single_threaded.io();
     }
 
-    fn rebuildState(
+    pub fn rebuildState(
         self: *const IndexManager,
         kind: types.IndexKind,
         root_path: []const u8,
@@ -10440,7 +10440,7 @@ pub const IndexManager = struct {
                 try sparse_entry.index.batchWithOptions(writes_buf.items, &.{}, .{
                     .defer_term_range_updates = true,
                 });
-                doc_count.* += writes_buf.items.len;
+                doc_count.* = sparse_entry.index.doc_count;
                 try sparse_entry.index.persistBackfillDocCount(doc_count.*);
                 for (writes_buf.items) |item| {
                     manager.alloc.free(@constCast(item.doc_id));
@@ -14868,6 +14868,24 @@ fn buildSplitSegment(
         .segment_bytes = rebuilt,
         .doc_keys = try doc_keys.toOwnedSlice(alloc),
     };
+}
+
+test "dense rebuild state uses configured durable storage" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const storage = memory.storage();
+
+    var manager = try IndexManager.initWithOptions(alloc, "__test/db", .{
+        .dense_lsm_storage = storage,
+    });
+    defer manager.deinit();
+
+    const state = manager.rebuildState(.dense_vector, "__test/db/indexes/dense");
+    try state.updateWithIo(std.testing.io, "doc:m");
+    const loaded = (try state.checkWithIo(alloc, std.testing.io)) orelse return error.TestExpectedEqual;
+    defer alloc.free(loaded);
+    try std.testing.expectEqualStrings("doc:m", loaded);
 }
 
 test "split preserves postings when text segments omit source bodies" {

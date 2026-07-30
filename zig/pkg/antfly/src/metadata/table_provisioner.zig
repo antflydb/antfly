@@ -365,6 +365,7 @@ pub fn collectLocalSchemaProgressWithOptions(
             // acquire the DB between the durable-marker check and DB.open;
             // report that shard as not ready and observe it next round.
             error.GenerationTransitionActive,
+            error.InvalidRebuildState,
             error.FileNotFound,
             error.NotDir,
             => false,
@@ -3369,6 +3370,56 @@ test "table provisioner schema progress returns not ready from rebuild marker wi
         1,
         .{},
     ));
+}
+
+test "table provisioner schema progress quarantines a corrupt rebuild marker" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-progress-corrupt-rebuild-marker";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2008);
+    defer alloc.free(db_path);
+    const index_root = try std.fmt.allocPrint(alloc, "{s}/indexes/full_text_index_v2", .{db_path});
+    defer alloc.free(index_root);
+    try fs_paths.createDirPathPortable(io_impl.io(), index_root);
+    const rebuild_state = db_mod.backfill_state.RebuildState.init(index_root);
+    try rebuild_state.updateWithIo(io_impl.io(), "doc:m");
+
+    const state_path = try rebuild_state.pathAlloc(alloc);
+    defer alloc.free(state_path);
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), state_path, alloc, .limited(1024));
+    defer alloc.free(encoded);
+    encoded[encoded.len - 1] ^= 0xff;
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = state_path, .data = encoded });
+
+    const progress = try collectLocalSchemaProgress(
+        alloc,
+        path,
+        100,
+        7,
+        &.{ 100, 2008 },
+        &.{.{
+            .table_id = 9,
+            .name = "docs",
+            .schema_json = "{\"version\":2}",
+            .read_schema_json = "{\"version\":1}",
+            .indexes_json = "{}",
+        }},
+        &.{.{
+            .group_id = 2008,
+            .table_id = 9,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    defer alloc.free(progress);
+
+    // A corrupt marker keeps the shard quarantined without aborting the
+    // metadata lifecycle that collects schema progress.
+    try std.testing.expectEqual(@as(usize, 0), progress.len);
 }
 
 test "table provisioner withholds schema progress when any local shard is missing the target full-text index" {

@@ -58,7 +58,8 @@ pub const RebuildState = struct {
 
     pub fn check(self: RebuildState, alloc: Allocator) !?[]u8 {
         if (builtin.os.tag == .freestanding) {
-            return null;
+            if (self.storage == null) return null;
+            return try self.checkWithIo(alloc, undefined);
         }
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
@@ -85,7 +86,7 @@ pub const RebuildState = struct {
     }
 
     pub fn loadWithIo(self: RebuildState, alloc: Allocator, io: std.Io) !LoadResult {
-        if (builtin.os.tag == .freestanding) return .absent;
+        if (builtin.os.tag == .freestanding and self.storage == null) return .absent;
         const path = try self.pathAlloc(alloc);
         defer alloc.free(path);
         if (self.storage) |storage| {
@@ -102,7 +103,8 @@ pub const RebuildState = struct {
 
     pub fn update(self: RebuildState, key: []const u8) !void {
         if (builtin.os.tag == .freestanding) {
-            return;
+            if (self.storage == null) return;
+            return try self.updateWithIo(undefined, key);
         }
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
@@ -110,7 +112,7 @@ pub const RebuildState = struct {
     }
 
     pub fn updateWithIo(self: RebuildState, io: std.Io, key: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (builtin.os.tag == .freestanding and self.storage == null) return;
         const alloc = std.heap.page_allocator;
         const encoded = try encodeState(alloc, key);
         defer alloc.free(encoded);
@@ -142,7 +144,8 @@ pub const RebuildState = struct {
 
     pub fn clear(self: RebuildState) !void {
         if (builtin.os.tag == .freestanding) {
-            return;
+            if (self.storage == null) return;
+            return try self.clearWithIo(undefined);
         }
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
@@ -150,7 +153,7 @@ pub const RebuildState = struct {
     }
 
     pub fn clearWithIo(self: RebuildState, io: std.Io) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (builtin.os.tag == .freestanding and self.storage == null) return;
         const path = try self.pathAlloc(std.heap.page_allocator);
         defer std.heap.page_allocator.free(path);
         if (self.storage) |storage| {
