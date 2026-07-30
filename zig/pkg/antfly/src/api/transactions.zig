@@ -282,12 +282,7 @@ pub const SessionReadSnapshot = struct {
     document_json: ?[]u8 = null,
 
     pub fn clone(self: SessionReadSnapshot, alloc: std.mem.Allocator) !SessionReadSnapshot {
-        return .{
-            .table_name = try alloc.dupe(u8, self.table_name),
-            .key = try alloc.dupe(u8, self.key),
-            .version = self.version,
-            .document_json = if (self.document_json) |document_json| try alloc.dupe(u8, document_json) else null,
-        };
+        return ownReadSnapshot(alloc, self.stage());
     }
 
     pub fn deinit(self: *SessionReadSnapshot, alloc: std.mem.Allocator) void {
@@ -497,6 +492,10 @@ pub const Savepoint = struct {
 pub const Session = struct {
     txn_id: db_mod.types.TxnId,
     owner_node_id: u64,
+    /// Stable authenticated subject that created this session. `null` is the
+    /// anonymous principal used only when authentication is disabled. The
+    /// binding is immutable across node-owner lease transfers.
+    principal: ?[]u8 = null,
     begin_timestamp: u64,
     last_touched_timestamp: u64,
     sync_level: db_mod.types.SyncLevel,
@@ -514,6 +513,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session, alloc: std.mem.Allocator) void {
+        if (self.principal) |principal| alloc.free(principal);
         if (self.staged) |*staged| staged.deinit(alloc);
         deinitReadSnapshotMap(alloc, &self.read_snapshots);
         var it = self.savepoints.iterator();
@@ -526,6 +526,7 @@ pub const Session = struct {
         var out: Session = .{
             .txn_id = self.txn_id,
             .owner_node_id = self.owner_node_id,
+            .principal = if (self.principal) |principal| try alloc.dupe(u8, principal) else null,
             .begin_timestamp = self.begin_timestamp,
             .last_touched_timestamp = self.last_touched_timestamp,
             .sync_level = self.sync_level,
@@ -908,6 +909,15 @@ pub const OpenedSessionStore = struct {
     }
 };
 
+pub const SessionStoreScope = enum {
+    /// Session records are persisted by their owner node. A miss on another
+    /// node must still route to the owner encoded in the transaction ID.
+    node_local,
+    /// Every node observes the same durable keyspace, so a miss is
+    /// authoritative and must not resurrect routing to an obsolete owner.
+    cluster_shared,
+};
+
 pub const SessionLeaseStore = struct {
     alloc: std.mem.Allocator,
     backend: DurableSessionStore.Backend,
@@ -973,6 +983,7 @@ pub const SessionRegistry = struct {
     max_savepoints: ?usize = null,
     max_sessions: ?usize = null,
     max_record_bytes: ?usize = null,
+    durable_scope: SessionStoreScope = .node_local,
     known_durable_session_count: ?usize = null,
     reserved_session_count: usize = 0,
 
@@ -1009,16 +1020,37 @@ pub const SessionRegistry = struct {
         self.* = .{};
     }
 
+    pub fn hasDurableStore(self: *const SessionRegistry) bool {
+        return self.durable != null;
+    }
+
+    pub fn durableMissIsAuthoritative(self: *const SessionRegistry) bool {
+        return self.durable != null and self.durable_scope == .cluster_shared;
+    }
+
     pub fn begin(self: *SessionRegistry, alloc: std.mem.Allocator, req: BeginRequest, owner_node_id: u64) !SessionInfo {
+        return try self.beginForPrincipal(alloc, req, owner_node_id, null);
+    }
+
+    pub fn beginForPrincipal(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        req: BeginRequest,
+        owner_node_id: u64,
+        principal: ?[]const u8,
+    ) !SessionInfo {
         const txn_id = newSessionTxnId(owner_node_id);
         const now = nextTxnTimestamp();
-        const session: Session = .{
+        var session: Session = .{
             .txn_id = txn_id,
             .owner_node_id = owner_node_id,
+            .principal = if (principal) |value| try alloc.dupe(u8, value) else null,
             .begin_timestamp = now,
             .last_touched_timestamp = now,
             .sync_level = req.sync_level,
         };
+        var session_owned = true;
+        errdefer if (session_owned) session.deinit(alloc);
         try self.initializeDurableSessionCount();
         self.mutex.lock();
         self.ensureSessionCapacityLocked() catch |err| {
@@ -1047,10 +1079,44 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.sessions.putAssumeCapacity(txn_id, session);
+        session_owned = false;
         self.reserved_session_count -= 1;
         reservation_active = false;
         if (self.known_durable_session_count) |count| self.known_durable_session_count = count + 1;
         return session.info();
+    }
+
+    pub const PrincipalAccess = enum {
+        missing,
+        allowed,
+        denied,
+    };
+
+    /// Checks the immutable authenticated-subject binding without cloning a
+    /// potentially large staged transaction. A legacy unbound record therefore
+    /// fails closed for every authenticated principal.
+    pub fn principalAccess(
+        self: *SessionRegistry,
+        _: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        principal: ?[]const u8,
+    ) !PrincipalAccess {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+
+        self.mutex.lock();
+        if (self.sessions.getPtr(txn_id)) |session| {
+            const allowed = principalsEqual(session.principal, principal);
+            self.mutex.unlock();
+            return if (allowed) .allowed else .denied;
+        }
+        self.mutex.unlock();
+
+        const durable = self.durable orelse return .missing;
+        var loaded = (try durable.load(txn_id)) orelse return .missing;
+        defer loaded.deinit(durable.alloc);
+        return if (principalsEqual(loaded.principal, principal)) .allowed else .denied;
     }
 
     pub fn getInfo(self: *SessionRegistry, txn_id: db_mod.types.TxnId) ?SessionInfo {
@@ -1251,6 +1317,27 @@ pub const SessionRegistry = struct {
     }
 
     pub fn listStatuses(self: *SessionRegistry, alloc: std.mem.Allocator) ![]SessionStatus {
+        return try self.listStatusesFiltered(alloc, .all);
+    }
+
+    pub fn listStatusesForPrincipal(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        principal: ?[]const u8,
+    ) ![]SessionStatus {
+        return try self.listStatusesFiltered(alloc, .{ .principal = principal });
+    }
+
+    const StatusPrincipalFilter = union(enum) {
+        all,
+        principal: ?[]const u8,
+    };
+
+    fn listStatusesFiltered(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        principal_filter: StatusPrincipalFilter,
+    ) ![]SessionStatus {
         var statuses = std.ArrayListUnmanaged(SessionStatus).empty;
         errdefer statuses.deinit(alloc);
 
@@ -1261,6 +1348,7 @@ pub const SessionRegistry = struct {
                 registry: *SessionRegistry,
                 allocator: std.mem.Allocator,
                 statuses: *std.ArrayListUnmanaged(SessionStatus),
+                principal_filter: StatusPrincipalFilter,
 
                 fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
                     const scan: *@This() = @ptrCast(@alignCast(raw));
@@ -1268,6 +1356,10 @@ pub const SessionRegistry = struct {
                     const txn_id = distributed_txn.parseTxnIdHex(key[session_prefix.len..]) catch return true;
                     var session = decodeSessionRecord(scan.allocator, txn_id, value) catch return true;
                     defer session.deinit(scan.allocator);
+                    switch (scan.principal_filter) {
+                        .all => {},
+                        .principal => |principal| if (!principalsEqual(session.principal, principal)) return true,
+                    }
                     const counts = stagedCounts(session.staged);
                     const savepoint_count = session.savepoints.count();
                     try scan.statuses.append(scan.allocator, .{
@@ -1290,7 +1382,12 @@ pub const SessionRegistry = struct {
                     return true;
                 }
             };
-            var scan = Scan{ .registry = self, .allocator = alloc, .statuses = &statuses };
+            var scan = Scan{
+                .registry = self,
+                .allocator = alloc,
+                .statuses = &statuses,
+                .principal_filter = principal_filter,
+            };
             try durable.scanPrefixWithContext(session_prefix, &scan, Scan.visit);
             // Avoid nested backend reads by loading lease metadata only after
             // the scan transaction has closed.
@@ -1303,42 +1400,56 @@ pub const SessionRegistry = struct {
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
+            switch (principal_filter) {
+                .all => {},
+                .principal => |principal| if (!principalsEqual(session.principal, principal)) continue,
+            }
             try statuses.append(alloc, try sessionStatusFromSession(self, alloc, &session));
         }
         return try statuses.toOwnedSlice(alloc);
     }
 
-    pub fn getOwnerNodeId(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?u64 {
+    pub fn getOwnerNodeId(self: *SessionRegistry, _: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?u64 {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        var session = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
-        defer session.deinit(alloc);
-        return session.owner_node_id;
+        self.mutex.lock();
+        if (self.sessions.getPtr(txn_id)) |session| {
+            const owner_node_id = session.owner_node_id;
+            self.mutex.unlock();
+            return owner_node_id;
+        }
+        self.mutex.unlock();
+        if (self.durable) |durable| {
+            var session = (try durable.load(txn_id)) orelse return null;
+            defer session.deinit(durable.alloc);
+            return session.owner_node_id;
+        }
+        return null;
     }
 
     pub fn adopt(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, owner_node_id: u64) !bool {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        if (self.durable == null) {
-            return false;
-        }
-        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return false;
+        const durable = self.durable orelse return false;
+        var persisted = (try durable.load(txn_id)) orelse return false;
+        defer persisted.deinit(durable.alloc);
+        var candidate = try persisted.clone(alloc);
         errdefer candidate.deinit(alloc);
-        if (candidate.owner_node_id == owner_node_id) return true;
+        if (candidate.owner_node_id == owner_node_id) {
+            try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
+            return true;
+        }
         const expected_owner = candidate.owner_node_id;
         candidate.owner_node_id = owner_node_id;
         touchSession(&candidate);
         if (self.lease_store != null and self.owner_lease_ttl_ns != null) {
             const now_ns = nextTxnTimestamp();
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-            if (!(try self.durable.?.saveWithLease(candidate, expected_owner, now_ns / std.time.ns_per_ms, ttl_ms, false, self.max_record_bytes))) return false;
+            if (!(try durable.saveWithLease(candidate, expected_owner, now_ns / std.time.ns_per_ms, ttl_ms, false, self.max_record_bytes))) return false;
         } else try self.persistLocked(candidate);
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
         return true;
     }
 
@@ -1352,22 +1463,28 @@ pub const SessionRegistry = struct {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
-        if (self.durable == null or self.lease_store == null or self.owner_lease_ttl_ns == null) {
+        const durable = self.durable orelse return false;
+        if (self.lease_store == null or self.owner_lease_ttl_ns == null) {
             return false;
         }
-        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return false;
+        // A routing/principal lookup may have cached an older non-owner copy.
+        // Adoption must always fence and transfer the latest durable record or
+        // it can overwrite staged work that the previous owner published.
+        var persisted = (try durable.load(txn_id)) orelse return false;
+        defer persisted.deinit(durable.alloc);
+        var candidate = try persisted.clone(alloc);
         errdefer candidate.deinit(alloc);
-        if (candidate.owner_node_id == owner_node_id) return true;
+        if (candidate.owner_node_id == owner_node_id) {
+            try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
+            return true;
+        }
         const expected_owner = candidate.owner_node_id;
         const effective_now = now_ns orelse nextTxnTimestamp();
         candidate.owner_node_id = owner_node_id;
         touchSession(&candidate);
         const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-        if (!(try self.durable.?.saveWithLease(candidate, expected_owner, effective_now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return false;
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
-        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        if (!(try durable.saveWithLease(candidate, expected_owner, effective_now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return false;
+        try self.publishAdoptedCandidateAssumeStripe(alloc, txn_id, &candidate);
         return true;
     }
 
@@ -1450,6 +1567,28 @@ pub const SessionRegistry = struct {
         var previous = current.*;
         current.* = candidate.*;
         previous.deinit(alloc);
+    }
+
+    /// Publishes an authoritative durable ownership transition into this
+    /// registry. The transaction stripe is held by the caller.
+    fn publishAdoptedCandidateAssumeStripe(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        candidate: *Session,
+    ) !void {
+        self.mutex.lock();
+        if (self.sessions.getPtr(txn_id)) |current| {
+            self.publishCandidateLocked(alloc, current, candidate);
+            self.mutex.unlock();
+            return;
+        }
+        self.sessions.put(alloc, txn_id, candidate.*) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        candidate.* = undefined;
+        self.mutex.unlock();
     }
 
     fn persistLocked(self: *SessionRegistry, session: Session) !void {
@@ -1569,7 +1708,9 @@ pub const SessionRegistry = struct {
         const lease_store = self.lease_store orelse return 0;
         var record = (try lease_store.load(alloc, txn_id)) orelse return 0;
         defer lease_mod.deinitRecord(alloc, &record);
-        return record.expires_at_ms * std.time.ns_per_ms;
+        // Durable lease records are external state. A corrupt or future-format
+        // millisecond value must not panic a request handler during conversion.
+        return leaseExpiryNs(record.expires_at_ms);
     }
 };
 
@@ -2577,19 +2718,34 @@ fn upsertReadSnapshot(
     snapshot: StageReadSnapshot,
 ) !void {
     const map_key = try readSnapshotMapKey(alloc, snapshot.table_name, snapshot.key);
-    errdefer alloc.free(map_key);
-    const gop = try map.getOrPut(alloc, map_key);
-    if (gop.found_existing) {
-        alloc.free(map_key);
-        if (gop.value_ptr.version == snapshot.version) return;
-        gop.value_ptr.deinit(alloc);
+    if (map.getPtr(map_key)) |existing| {
+        defer alloc.free(map_key);
+        if (existing.version == snapshot.version) return;
+        const replacement = try ownReadSnapshot(alloc, snapshot);
+        const previous = existing.*;
+        existing.* = replacement;
+        var old = previous;
+        old.deinit(alloc);
+        return;
     }
-    gop.key_ptr.* = map_key;
-    gop.value_ptr.* = .{
-        .table_name = try alloc.dupe(u8, snapshot.table_name),
-        .key = try alloc.dupe(u8, snapshot.key),
+
+    errdefer alloc.free(map_key);
+    var owned = try ownReadSnapshot(alloc, snapshot);
+    errdefer owned.deinit(alloc);
+    try map.putNoClobber(alloc, map_key, owned);
+}
+
+fn ownReadSnapshot(alloc: std.mem.Allocator, snapshot: StageReadSnapshot) !SessionReadSnapshot {
+    const table_name = try alloc.dupe(u8, snapshot.table_name);
+    errdefer alloc.free(table_name);
+    const key = try alloc.dupe(u8, snapshot.key);
+    errdefer alloc.free(key);
+    const document_json = if (snapshot.document_json) |json| try alloc.dupe(u8, json) else null;
+    return .{
+        .table_name = table_name,
+        .key = key,
         .version = snapshot.version,
-        .document_json = if (snapshot.document_json) |document_json| try alloc.dupe(u8, document_json) else null,
+        .document_json = document_json,
     };
 }
 
@@ -2631,7 +2787,7 @@ fn decodeReadSnapshotsInto(
         const key = requireString(obj, "key");
         if (table_name.len == 0 or key.len == 0) return error.InvalidTransactionSessionRecord;
         const version = switch (obj.get("version") orelse return error.InvalidTransactionSessionRecord) {
-            .integer => |v| @as(u64, @intCast(v)),
+            .integer => |v| try nonNegativeRecordInteger(v),
             .string => |s| try parseVersionString(s),
             else => return error.InvalidTransactionSessionRecord,
         };
@@ -2639,7 +2795,7 @@ fn decodeReadSnapshotsInto(
             .null => null,
             else => try std.json.Stringify.valueAlloc(alloc, document, .{}),
         } else null;
-        errdefer if (document_json) |json| alloc.free(json);
+        defer if (document_json) |json| alloc.free(json);
         try upsertReadSnapshot(alloc, map, .{
             .table_name = table_name,
             .key = key,
@@ -2918,6 +3074,10 @@ fn sessionLeaseState(lease_expires_at: u64, now_ns: u64) SessionLeaseState {
     return .held;
 }
 
+fn leaseExpiryNs(expires_at_ms: u64) u64 {
+    return std.math.mul(u64, expires_at_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+}
+
 fn sessionStatusFromSession(self: *SessionRegistry, alloc: std.mem.Allocator, session: *const Session) !SessionStatus {
     const counts = stagedCounts(session.staged);
     const savepoint_count = session.savepoints.count();
@@ -3079,6 +3239,12 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     defer out.deinit(alloc);
     try out.appendSlice(alloc, "{\"owner_node_id\":");
     try out.print(alloc, "{d}", .{session.owner_node_id});
+    try out.appendSlice(alloc, ",\"principal\":");
+    if (session.principal) |principal| {
+        try appendJsonString(alloc, &out, principal);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
     try out.appendSlice(alloc, ",\"begin_timestamp\":");
     try out.print(alloc, "{d}", .{session.begin_timestamp});
     try out.appendSlice(alloc, ",\"last_touched_timestamp\":");
@@ -3142,26 +3308,34 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         .txn_id = txn_id,
         .owner_node_id = if (obj.get("owner_node_id")) |value|
             switch (value) {
-                .integer => |v| @intCast(v),
+                .integer => |v| try nonNegativeRecordInteger(v),
                 else => return error.InvalidTransactionSessionRecord,
             }
         else
             sessionOwnerNodeId(txn_id),
+        .principal = if (obj.get("principal")) |value|
+            switch (value) {
+                .string => |principal| try alloc.dupe(u8, principal),
+                .null => null,
+                else => return error.InvalidTransactionSessionRecord,
+            }
+        else
+            null,
         .begin_timestamp = switch (obj.get("begin_timestamp") orelse return error.InvalidTransactionSessionRecord) {
-            .integer => |v| @intCast(v),
+            .integer => |v| try nonNegativeRecordInteger(v),
             else => return error.InvalidTransactionSessionRecord,
         },
         .last_touched_timestamp = 0,
         .sync_level = parseSyncLevel(obj.get("sync_level") orelse return error.InvalidTransactionSessionRecord) orelse return error.InvalidTransactionSessionRecord,
         .next_savepoint_id = switch (obj.get("next_savepoint_id") orelse return error.InvalidTransactionSessionRecord) {
-            .integer => |v| @intCast(v),
+            .integer => |v| try nonNegativeRecordInteger(v),
             else => return error.InvalidTransactionSessionRecord,
         },
     };
     errdefer session.deinit(alloc);
     session.last_touched_timestamp = if (obj.get("last_touched_timestamp")) |value|
         switch (value) {
-            .integer => |v| @intCast(v),
+            .integer => |v| try nonNegativeRecordInteger(v),
             else => return error.InvalidTransactionSessionRecord,
         }
     else
@@ -3183,7 +3357,7 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             else => return error.InvalidTransactionSessionRecord,
         };
         const id: u64 = switch (entry_obj.get("id") orelse return error.InvalidTransactionSessionRecord) {
-            .integer => |v| @intCast(v),
+            .integer => |v| try nonNegativeRecordInteger(v),
             else => return error.InvalidTransactionSessionRecord,
         };
         const snapshot = try parseCommitValue(alloc, entry_obj.get("snapshot") orelse return error.InvalidTransactionSessionRecord);
@@ -3201,6 +3375,11 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
     return session;
 }
 
+fn principalsEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
 fn newSessionTxnId(owner_node_id: u64) db_mod.types.TxnId {
     var txn_id: db_mod.types.TxnId = undefined;
     const nonce = txn_id_nonce.fetchAdd(1, .monotonic);
@@ -3212,6 +3391,11 @@ fn newSessionTxnId(owner_node_id: u64) db_mod.types.TxnId {
 
 fn parseVersionString(text: []const u8) !u64 {
     return try std.fmt.parseUnsigned(u64, text, 10);
+}
+
+fn nonNegativeRecordInteger(value: i64) !u64 {
+    if (value < 0) return error.InvalidTransactionSessionRecord;
+    return @intCast(value);
 }
 
 fn requireString(obj: std.json.ObjectMap, key: []const u8) []const u8 {
@@ -3265,6 +3449,63 @@ test "transaction session registry begins and removes sessions" {
     try std.testing.expectEqual(@as(u64, 7), sessionOwnerNodeId(session.txn_id));
     try std.testing.expect(registry.remove(std.testing.allocator, session.txn_id));
     try std.testing.expect(registry.getInfo(session.txn_id) == null);
+}
+
+test "durable transaction sessions preserve and enforce principal bindings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-principal", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(std.testing.allocator, &store);
+
+    var alice_txn_id: db_mod.types.TxnId = undefined;
+    {
+        var writer = SessionRegistry.init(&durable);
+        defer writer.deinit(std.testing.allocator);
+        const alice = try writer.beginForPrincipal(
+            std.testing.allocator,
+            .{ .sync_level = .write },
+            7,
+            "user:alice",
+        );
+        alice_txn_id = alice.txn_id;
+        _ = try writer.beginForPrincipal(
+            std.testing.allocator,
+            .{ .sync_level = .write },
+            7,
+            "user:bob",
+        );
+        _ = try writer.begin(std.testing.allocator, .{ .sync_level = .write }, 7);
+    }
+
+    var reader = SessionRegistry.init(&durable);
+    defer reader.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        SessionRegistry.PrincipalAccess.allowed,
+        try reader.principalAccess(std.testing.allocator, alice_txn_id, "user:alice"),
+    );
+    try std.testing.expectEqual(
+        SessionRegistry.PrincipalAccess.denied,
+        try reader.principalAccess(std.testing.allocator, alice_txn_id, "user:bob"),
+    );
+    try std.testing.expectEqual(
+        SessionRegistry.PrincipalAccess.denied,
+        try reader.principalAccess(std.testing.allocator, alice_txn_id, null),
+    );
+
+    const alice_sessions = try reader.listStatusesForPrincipal(std.testing.allocator, "user:alice");
+    defer std.testing.allocator.free(alice_sessions);
+    try std.testing.expectEqual(@as(usize, 1), alice_sessions.len);
+    try std.testing.expectEqualSlices(u8, &alice_txn_id, &alice_sessions[0].txn_id);
+
+    const anonymous_sessions = try reader.listStatusesForPrincipal(std.testing.allocator, null);
+    defer std.testing.allocator.free(anonymous_sessions);
+    try std.testing.expectEqual(@as(usize, 1), anonymous_sessions.len);
 }
 
 test "durable session mutations publish only after persistence succeeds" {
@@ -3388,6 +3629,45 @@ test "transaction session registry only adopts durable sessions after lease expi
     const status = (try adopter.getStatus(std.testing.allocator, session.txn_id)).?;
     try std.testing.expectEqual(@as(u64, 12), status.owner_node_id);
     try std.testing.expect(status.lease_expires_at > session.begin_timestamp);
+}
+
+test "transaction session adoption preserves newer durable state than a local cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-adopt-fresh-state", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(std.testing.allocator, &store);
+    const lease_store = SessionLeaseStore.init(std.testing.allocator, &store);
+
+    var writer = SessionRegistry.initWithLeaseTtl(&durable, lease_store, std.time.ns_per_s);
+    defer writer.deinit(std.testing.allocator);
+    const session = try writer.begin(std.testing.allocator, .{ .sync_level = .write }, 9);
+
+    var adopter = SessionRegistry.initWithLeaseTtl(&durable, lease_store, std.time.ns_per_s);
+    defer adopter.deinit(std.testing.allocator);
+    // Model a non-owner status request that populated an initial local copy.
+    _ = (try adopter.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
+
+    var stage_req = try parseStageWriteRequest(std.testing.allocator, "{\"table\":\"docs\",\"key\":\"doc:a\",\"document\":{\"title\":\"newer durable state\"}}");
+    defer stage_req.deinit(std.testing.allocator);
+    _ = try writer.stage(std.testing.allocator, session.txn_id, &stage_req);
+
+    var renewed_lease = (try lease_store.load(std.testing.allocator, session.txn_id)).?;
+    defer lease_mod.deinitRecord(std.testing.allocator, &renewed_lease);
+    const expired_now = renewed_lease.expires_at_ms * std.time.ns_per_ms + 1;
+    try std.testing.expect(try adopter.adoptIfLeaseExpired(std.testing.allocator, session.txn_id, 12, expired_now));
+
+    var adopted = (try adopter.cloneCommitRequest(std.testing.allocator, session.txn_id, null)) orelse return error.TestExpectedEqual;
+    defer adopted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), adopted.tables.len);
+    try std.testing.expectEqual(@as(usize, 1), adopted.tables[0].batch.writes.len);
+    try std.testing.expect(std.mem.indexOf(u8, adopted.tables[0].batch.writes[0].value, "newer durable state") != null);
 }
 
 test "transaction session ownership and lease transition atomically on failure" {
@@ -3620,6 +3900,17 @@ test "session cleanup response encodes removed count and cutoff" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 3), parsed.value.removed);
     try std.testing.expectEqual(@as(u64, 99), parsed.value.cutoff_ns);
+}
+
+test "transaction session lease expiry conversion saturates corrupt values" {
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        leaseExpiryNs(std.math.maxInt(u64)),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 42 * std.time.ns_per_ms),
+        leaseExpiryNs(42),
+    );
 }
 
 test "transaction session conflict responses include version details" {

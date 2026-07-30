@@ -607,6 +607,7 @@ pub const ApiHttpServerConfig = struct {
     session_executor: ?http_common.RequestExecutor = null,
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
+    session_store_scope: transactions_api.SessionStoreScope = .node_local,
     ha_admin_executor: ?http_common.RequestExecutor = null,
     ha_internal_executor: ?http_common.RequestExecutor = null,
     join_job_store_path: ?[]const u8 = null,
@@ -1782,17 +1783,21 @@ pub const ApiHttpServer = struct {
             .table_writes = table_write_source,
             .foreign_registry = cfg.foreign_registry,
             .created_at_ns = platform_time.monotonicNs(),
-            .txn_sessions = transactions_api.SessionRegistry.initWithOptions(
-                cfg.session_store,
-                if (cfg.session_store != null and cfg.session_owner_lease_ttl_ns != null)
-                    transactions_api.SessionLeaseStore.initFromDurable(cfg.session_store.?)
-                else
-                    null,
-                cfg.session_owner_lease_ttl_ns,
-                cfg.session_savepoint_limit,
-                cfg.session_max_count,
-                cfg.session_max_record_bytes,
-            ),
+            .txn_sessions = blk: {
+                var registry = transactions_api.SessionRegistry.initWithOptions(
+                    cfg.session_store,
+                    if (cfg.session_store != null and cfg.session_owner_lease_ttl_ns != null)
+                        transactions_api.SessionLeaseStore.initFromDurable(cfg.session_store.?)
+                    else
+                        null,
+                    cfg.session_owner_lease_ttl_ns,
+                    cfg.session_savepoint_limit,
+                    cfg.session_max_count,
+                    cfg.session_max_record_bytes,
+                );
+                registry.durable_scope = cfg.session_store_scope;
+                break :blk registry;
+            },
             .join_job_store = distributed_join.JoinJobStore.init(owner_alloc, .{
                 .join_job_store_path = cfg.join_job_store_path,
                 .join_job_lease_ttl_ms = cfg.join_job_lease_ttl_ms,
@@ -1931,6 +1936,7 @@ pub const ApiHttpServer = struct {
                 effective_cfg.session_max_count,
                 effective_cfg.session_max_record_bytes,
             );
+            server.txn_sessions.durable_scope = effective_cfg.session_store_scope;
         }
         if (cfg.join_job_store_path orelse cfg.session_store_path) |base_path| {
             const join_job_path = if (cfg.join_job_store_path != null)
@@ -4557,7 +4563,10 @@ pub const ApiHttpServer = struct {
     fn dispatchTransactionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
         if (req.method == .GET) {
             if (std.mem.eql(u8, uri_parts.path, routes.Routes.transactions)) {
-                const sessions = try self.txn_sessions.listStatuses(self.alloc);
+                const sessions = try self.txn_sessions.listStatusesForPrincipal(
+                    self.alloc,
+                    transactionPrincipal(authenticated_identity),
+                );
                 defer self.alloc.free(sessions);
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
@@ -4675,6 +4684,9 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSession(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
+                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
+                    return try textResponse(self.alloc, 404, "not found");
+                }
                 var details = (self.txn_sessions.getDetails(self.alloc, txn_id) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
                     else => return err,
@@ -4691,7 +4703,12 @@ pub const ApiHttpServer = struct {
                 const begin_req = transactions_api.parseBeginRequest(self.alloc, req.body) catch {
                     return try textResponse(self.alloc, 400, "invalid transaction begin request");
                 };
-                const session = self.txn_sessions.begin(self.alloc, begin_req, self.localSessionNodeId()) catch |err| switch (err) {
+                const session = self.txn_sessions.beginForPrincipal(
+                    self.alloc,
+                    begin_req,
+                    self.localSessionNodeId(),
+                    transactionPrincipal(authenticated_identity),
+                ) catch |err| switch (err) {
                     error.SessionLimitExceeded => return try textResponse(self.alloc, 429, "transaction session limit exceeded"),
                     error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
@@ -4712,6 +4729,9 @@ pub const ApiHttpServer = struct {
                     else => return err,
                 };
                 defer commit_req.deinit(self.alloc);
+                if (!(try self.transactionRequestAuthorized(authenticated_identity, commit_req))) {
+                    return try textResponse(self.alloc, 403, "forbidden");
+                }
 
                 const distributed_tables = try commit_req.distributedTables(self.alloc);
                 defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
@@ -4808,10 +4828,16 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSessionRead(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
+                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
+                    return try textResponse(self.alloc, 404, "not found");
+                }
                 var read_req = transactions_api.parseStageReadPayload(self.alloc, req.body) catch {
                     return try textResponse(self.alloc, 400, "invalid transaction read request");
                 };
                 defer read_req.deinit(self.alloc);
+                if (!transactionTablePermissionAllowed(authenticated_identity, read_req.table_name, .read)) {
+                    return try textResponse(self.alloc, 403, "forbidden");
+                }
 
                 var owned_snapshot: transactions_api.SessionReadSnapshot = (self.txn_sessions.getReadSnapshot(self.alloc, txn_id, read_req.table_name, read_req.key) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
@@ -4838,6 +4864,18 @@ pub const ApiHttpServer = struct {
                     if (fetched.document_json) |document_json| self.alloc.free(document_json);
                 } else if (owned_snapshot.version == 0) {
                     owned_snapshot.version = read_req.version;
+                }
+                if (!(try self.transactionReadSnapshotVisible(
+                    authenticated_identity,
+                    owned_snapshot.table_name,
+                    owned_snapshot.key,
+                    owned_snapshot.document_json,
+                ))) {
+                    if (owned_snapshot.document_json) |document_json| {
+                        self.alloc.free(document_json);
+                        owned_snapshot.document_json = null;
+                    }
+                    owned_snapshot.version = 0;
                 }
                 if (owned_snapshot.version != read_req.version) {
                     var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -4870,10 +4908,16 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSessionWrite(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
+                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
+                    return try textResponse(self.alloc, 404, "not found");
+                }
                 var stage_req = transactions_api.parseStageWriteRequest(self.alloc, req.body) catch {
                     return try textResponse(self.alloc, 400, "invalid transaction write request");
                 };
                 defer stage_req.deinit(self.alloc);
+                if (!(try self.transactionRequestAuthorized(authenticated_identity, stage_req))) {
+                    return try textResponse(self.alloc, 403, "forbidden");
+                }
 
                 const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
@@ -4890,10 +4934,16 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSessionDelete(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
+                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
+                    return try textResponse(self.alloc, 404, "not found");
+                }
                 var stage_req = transactions_api.parseStageDeleteRequest(self.alloc, req.body) catch {
                     return try textResponse(self.alloc, 400, "invalid transaction delete request");
                 };
                 defer stage_req.deinit(self.alloc);
+                if (!(try self.transactionRequestAuthorized(authenticated_identity, stage_req))) {
+                    return try textResponse(self.alloc, 403, "forbidden");
+                }
 
                 const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
@@ -4910,6 +4960,9 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSessionSavepoints(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
+                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
+                    return try textResponse(self.alloc, 404, "not found");
+                }
                 const info = (self.txn_sessions.createSavepoint(self.alloc, txn_id) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
                     error.SavepointLimitExceeded => return try textResponse(self.alloc, 409, "savepoint limit exceeded"),
@@ -4926,6 +4979,9 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSessionRollback(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
+                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
+                    return try textResponse(self.alloc, 404, "not found");
+                }
                 const info = (self.txn_sessions.rollbackToSavepoint(self.alloc, txn_id, session_route.savepoint_id) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
                     error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
@@ -4948,7 +5004,13 @@ pub const ApiHttpServer = struct {
                     else => return err,
                 };
                 defer stage_req.deinit(self.alloc);
+                if (!(try self.transactionRequestAuthorized(authenticated_identity, stage_req))) {
+                    return try textResponse(self.alloc, 403, "forbidden");
+                }
 
+                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
+                    return try textResponse(self.alloc, 404, "not found");
+                }
                 const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
                     error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
@@ -4965,6 +5027,9 @@ pub const ApiHttpServer = struct {
                 const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
+                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
+                    return try textResponse(self.alloc, 404, "not found");
+                }
                 const session = self.txn_sessions.getInfo(txn_id) orelse return try textResponse(self.alloc, 404, "not found");
 
                 var parsed_req: ?transactions_api.OwnedTransactionCommitRequest = null;
@@ -4995,6 +5060,9 @@ pub const ApiHttpServer = struct {
                     return try textResponse(self.alloc, 400, "transaction has no staged writes");
                 };
                 defer commit_req.deinit(self.alloc);
+                if (!(try self.transactionRequestAuthorized(authenticated_identity, commit_req))) {
+                    return try textResponse(self.alloc, 403, "forbidden");
+                }
 
                 const distributed_tables = try commit_req.distributedTables(self.alloc);
                 defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
@@ -5100,6 +5168,9 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSessionAbort(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
+                if (!(try self.transactionSessionAccessible(txn_id, authenticated_identity))) {
+                    return try textResponse(self.alloc, 404, "not found");
+                }
                 if (!self.txn_sessions.remove(self.alloc, txn_id)) return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
@@ -8193,7 +8264,11 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        const owner_node_id = (try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id)) orelse transactions_api.sessionOwnerNodeId(txn_id);
+        const owner_node_id = (try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id)) orelse
+            if (self.txn_sessions.durableMissIsAuthoritative())
+                return null
+            else
+                transactions_api.sessionOwnerNodeId(txn_id);
         if (owner_node_id == 0) return null;
         const router = self.cfg.session_router orelse return null;
         const session_executor = self.cfg.session_executor orelse return null;
@@ -8274,6 +8349,66 @@ pub const ApiHttpServer = struct {
             .version = lookup.version,
             .document_json = try self.alloc.dupe(u8, lookup.json),
         };
+    }
+
+    pub fn transactionSessionAccessible(
+        self: *ApiHttpServer,
+        txn_id: db_mod.types.TxnId,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !bool {
+        return (try self.txn_sessions.principalAccess(
+            self.alloc,
+            txn_id,
+            transactionPrincipal(authenticated_identity),
+        )) == .allowed;
+    }
+
+    pub fn transactionRequestAuthorized(
+        self: *ApiHttpServer,
+        authenticated_identity: ?AuthenticatedIdentity,
+        request: transactions_api.OwnedTransactionCommitRequest,
+    ) !bool {
+        for (request.read_set) |read| {
+            if (!(try self.transactionReadKeyAuthorized(
+                authenticated_identity,
+                read.table_name,
+                read.key,
+            ))) return false;
+        }
+        for (request.tables) |table| {
+            if (!transactionTablePermissionAllowed(authenticated_identity, table.table_name, .write)) return false;
+        }
+        return true;
+    }
+
+    fn transactionReadKeyAuthorized(
+        self: *ApiHttpServer,
+        authenticated_identity: ?AuthenticatedIdentity,
+        table_name: []const u8,
+        key: []const u8,
+    ) !bool {
+        if (!transactionTablePermissionAllowed(authenticated_identity, table_name, .read)) return false;
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        const filter = row_filter_json orelse return true;
+        const source = self.table_reads orelse return false;
+        var lookup = (try source.lookup(self.alloc, table_name, key, .{}, .read_index)) orelse return true;
+        defer lookup.deinit(self.alloc);
+        return try self.docJsonMatchesRowFilter(key, lookup.json, filter);
+    }
+
+    pub fn transactionReadSnapshotVisible(
+        self: *ApiHttpServer,
+        authenticated_identity: ?AuthenticatedIdentity,
+        table_name: []const u8,
+        key: []const u8,
+        document_json: ?[]const u8,
+    ) !bool {
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        const filter = row_filter_json orelse return true;
+        const document = document_json orelse return true;
+        return try self.docJsonMatchesRowFilter(key, document, filter);
     }
 
     fn currentVersionForConflict(self: *ApiHttpServer, table_name: []const u8, key: []const u8) !?u64 {
@@ -13722,6 +13857,7 @@ pub fn requiresAdminPermission(path: []const u8) bool {
     if (isHaAdminPath(path)) return true;
     if (isStorageMaintenancePath(path)) return true;
     if (isExtensionPath(path)) return true;
+    if (std.mem.eql(u8, path, routes.Routes.transactions_cleanup)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
     if (std.mem.eql(u8, path, routes.Routes.a2a) or std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
@@ -13935,6 +14071,19 @@ pub fn permissionsAllow(
         if (permission.type == .admin or permission.type == permission_type) return true;
     }
     return false;
+}
+
+fn transactionPrincipal(authenticated_identity: ?AuthenticatedIdentity) ?[]const u8 {
+    return if (authenticated_identity) |identity| identity.username else null;
+}
+
+fn transactionTablePermissionAllowed(
+    authenticated_identity: ?AuthenticatedIdentity,
+    table_name: []const u8,
+    permission_type: usermgr.PermissionType,
+) bool {
+    const identity = authenticated_identity orelse return true;
+    return permissionsAllow(identity.permissions, .table, table_name, permission_type);
 }
 
 test "document artifact routes declare read and admin permissions" {
@@ -24726,6 +24875,171 @@ test "api http server serves long-lived public transaction session routes" {
     var parsed_abort = try std.json.parseFromSlice(transactions_api.TransactionStatusResponse, std.testing.allocator, abort_resp.body, .{});
     defer parsed_abort.deinit();
     try std.testing.expectEqualStrings("aborted", parsed_abort.value.status);
+}
+
+test "api transaction sessions enforce principal permissions and row filters" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-transaction-auth", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:visible", .value = "{\"tenant_id\":\"t1\",\"title\":\"visible\"}" },
+            .{ .key = "doc:hidden", .value = "{\"tenant_id\":\"t2\",\"title\":\"hidden\"}" },
+        },
+        .timestamp_ns = 7,
+    });
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var source = FakeSource{};
+    const secret = "transaction-principal-secret";
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .trusted_principal_secret = secret,
+        .trusted_principal_issuer = "trusted-upstream",
+    }, source.iface(), read_source.source(), null);
+    defer server.deinit();
+
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const alice_payload = try std.fmt.allocPrint(
+        alloc,
+        \\{{"iss":"trusted-upstream","sub":"user:alice","tables":["docs"],"operations":["read"],"row_filter":{{"docs":{{"term":{{"tenant_id":"t1"}}}}}},"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer alloc.free(alice_payload);
+    const alice_token = try encodeTrustedPrincipalToken(alloc, secret, alice_payload);
+    defer alloc.free(alice_token);
+    const alice_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = alice_token },
+    };
+
+    const bob_payload = try std.fmt.allocPrint(
+        alloc,
+        \\{{"iss":"trusted-upstream","sub":"user:bob","tables":["docs"],"operations":["read","write"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer alloc.free(bob_payload);
+    const bob_token = try encodeTrustedPrincipalToken(alloc, secret, bob_payload);
+    defer alloc.free(bob_token);
+    const bob_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = bob_token },
+    };
+
+    var begin_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.transactions_begin,
+        .headers = &alice_headers,
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer begin_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), begin_resp.status);
+    var parsed_begin = try std.json.parseFromSlice(transactions_api.BeginResponse, alloc, begin_resp.body, .{});
+    defer parsed_begin.deinit();
+
+    const session_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{
+        routes.Routes.transactions_prefix,
+        parsed_begin.value.transaction_id,
+    });
+    defer alloc.free(session_uri);
+    var cross_principal = try server.handle(.{
+        .method = .GET,
+        .uri = session_uri,
+        .headers = &bob_headers,
+    });
+    defer cross_principal.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), cross_principal.status);
+
+    const write_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{
+        session_uri,
+        routes.Routes.transactions_write_suffix,
+    });
+    defer alloc.free(write_uri);
+    var denied_write = try server.handle(.{
+        .method = .POST,
+        .uri = write_uri,
+        .headers = &alice_headers,
+        .content_type = "application/json",
+        .body = "{\"table\":\"docs\",\"key\":\"doc:new\",\"document\":{\"tenant_id\":\"t1\"}}",
+    });
+    defer denied_write.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), denied_write.status);
+
+    const read_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{
+        session_uri,
+        routes.Routes.transactions_read_suffix,
+    });
+    defer alloc.free(read_uri);
+    var hidden_read = try server.handle(.{
+        .method = .POST,
+        .uri = read_uri,
+        .headers = &alice_headers,
+        .content_type = "application/json",
+        .body = "{\"table\":\"docs\",\"key\":\"doc:hidden\",\"version\":\"0\"}",
+    });
+    defer hidden_read.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), hidden_read.status);
+    var parsed_hidden = try std.json.parseFromSlice(transactions_api.StageReadResponse, alloc, hidden_read.body, .{});
+    defer parsed_hidden.deinit();
+    try std.testing.expectEqualStrings("0", parsed_hidden.value.snapshot.version);
+    try std.testing.expect(parsed_hidden.value.snapshot.document == .null);
+
+    var denied_table_read = try server.handle(.{
+        .method = .POST,
+        .uri = read_uri,
+        .headers = &alice_headers,
+        .content_type = "application/json",
+        .body = "{\"table\":\"secrets\",\"key\":\"doc:a\",\"version\":\"0\"}",
+    });
+    defer denied_table_read.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), denied_table_read.status);
+
+    var alice_list = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.transactions,
+        .headers = &alice_headers,
+    });
+    defer alice_list.deinit(alloc);
+    var parsed_alice_list = try std.json.parseFromSlice(transactions_api.SessionListResponse, alloc, alice_list.body, .{});
+    defer parsed_alice_list.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_alice_list.value.session_count);
+
+    var bob_list = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.transactions,
+        .headers = &bob_headers,
+    });
+    defer bob_list.deinit(alloc);
+    var parsed_bob_list = try std.json.parseFromSlice(transactions_api.SessionListResponse, alloc, bob_list.body, .{});
+    defer parsed_bob_list.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed_bob_list.value.session_count);
+
+    var denied_cleanup = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.transactions_cleanup,
+        .headers = &alice_headers,
+    });
+    defer denied_cleanup.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), denied_cleanup.status);
 }
 
 test "api http server serves transaction session cleanup route" {

@@ -242,6 +242,7 @@ pub const StdHttpExecutor = struct {
             });
         }
         for (req.headers) |header| {
+            if (!shouldForwardRequestHeader(req.headers, header.name)) continue;
             try extra_headers.append(alloc, .{
                 .name = header.name,
                 .value = header.value,
@@ -364,9 +365,63 @@ pub const StdHttpExecutor = struct {
     }
 };
 
+fn shouldForwardRequestHeader(headers: []const common.RequestHeader, name: []const u8) bool {
+    // The new client request owns framing, routing, connection lifecycle, and
+    // the two canonical headers represented separately on HttpRequest.
+    const transport_owned = [_][]const u8{
+        "authorization",
+        "connection",
+        "content-length",
+        "content-type",
+        "expect",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    };
+    for (transport_owned) |blocked| {
+        if (std.ascii.eqlIgnoreCase(name, blocked)) return false;
+    }
+
+    // RFC 9110 permits Connection to nominate additional hop-by-hop fields.
+    // Strip those tokens as well rather than forwarding connection-specific
+    // state to a different socket.
+    for (headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+        var tokens = std.mem.splitScalar(u8, header.value, ',');
+        while (tokens.next()) |token| {
+            if (std.ascii.eqlIgnoreCase(name, std.mem.trim(u8, token, " \t"))) return false;
+        }
+    }
+    return true;
+}
+
 test "std http executor module compiles" {
     _ = StdHttpExecutorConfig;
     _ = StdHttpExecutor;
+}
+
+test "std http executor forwards only end-to-end request headers" {
+    const headers = [_]common.RequestHeader{
+        .{ .name = "Host", .value = "source.invalid" },
+        .{ .name = "Content-Length", .value = "42" },
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Authorization", .value = "Bearer token" },
+        .{ .name = "Connection", .value = "keep-alive, X-Hop" },
+        .{ .name = "X-Hop", .value = "socket state" },
+        .{ .name = "X-Antfly-Trusted-Principal", .value = "principal-token" },
+        .{ .name = "X-Request-Id", .value = "request-1" },
+    };
+    for (headers[0..6]) |header| {
+        try std.testing.expect(!shouldForwardRequestHeader(&headers, header.name));
+    }
+    try std.testing.expect(shouldForwardRequestHeader(&headers, headers[6].name));
+    try std.testing.expect(shouldForwardRequestHeader(&headers, headers[7].name));
 }
 
 test "std http executor retires pooled connection before configured cap" {
