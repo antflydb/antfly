@@ -30,6 +30,7 @@ jobs:
     runs-on: arc-antfly-standard
     outputs:
       zig_tests: ${{ steps.detect.outputs.zig_tests }}
+      arm64_codec: ${{ steps.detect.outputs.arm64_codec }}
       e2e: ${{ steps.detect.outputs.e2e }}
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
@@ -48,6 +49,7 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             {
               echo "zig_tests=true"
+              echo "arm64_codec=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
@@ -58,6 +60,7 @@ jobs:
 
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
+            echo "arm64_codec=false" >> "$GITHUB_OUTPUT"
             if [[ "${{ github.event.schedule }}" == "0 3 * * 0" ]]; then
               {
                 echo "e2e=false"
@@ -83,6 +86,7 @@ jobs:
           else
             {
               echo "zig_tests=true"
+              echo "arm64_codec=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
@@ -102,6 +106,18 @@ jobs:
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
           else
             echo "zig_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --quiet "$base" "${{ github.sha }}" -- \
+            zig/build.zig \
+            zig/build.zig.zon \
+            zig/pkg/antfly/src/encoding/streamvbyte.zig \
+            zig/pkg/antfly/src/encoding/chunked_coder.zig \
+            .github/workflows/zig-tests.yml
+          then
+            echo "arm64_codec=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "arm64_codec=true" >> "$GITHUB_OUTPUT"
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
@@ -184,6 +200,51 @@ jobs:
 
       - name: Run backup listing against MinIO
         run: scripts/test-backup-s3-integration.sh
+
+  arm64-codec:
+    name: arm64-codec
+    needs: changes
+    if: needs.changes.outputs.arm64_codec == 'true'
+    runs-on: arc-antfly-publish-arm64
+    timeout-minutes: 20
+    env:
+      ZIG_VERSION: "0.16.0"
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-arm64-codec
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-arm64-codec
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify native Linux ARM64 runner
+        run: |
+          set -euo pipefail
+          uname -srm
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "aarch64"
+
+      - name: Install Zig
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl xz-utils
+          curl -fsSL \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
+            -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" \
+            -C "$RUNNER_TEMP/zig" \
+            --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Verify Zig version
+        run: test "$(zig version)" = "$ZIG_VERSION"
+
+      - name: Run StreamVByte codec tests
+        run: |
+          set -euo pipefail
+          zig test zig/pkg/antfly/src/encoding/streamvbyte.zig
+          zig test -O ReleaseFast zig/pkg/antfly/src/encoding/streamvbyte.zig
+          zig test zig/pkg/antfly/src/encoding/chunked_coder.zig
+          zig test -O ReleaseFast zig/pkg/antfly/src/encoding/chunked_coder.zig
 
   zig-base:
     name: zig-base
