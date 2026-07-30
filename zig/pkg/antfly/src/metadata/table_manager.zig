@@ -1159,6 +1159,17 @@ pub const TableManager = struct {
         try self.merge_intents.put(self.alloc, intent.transition_id, owned);
     }
 
+    pub fn mergeRequiresDocIdentityReassignment(
+        self: *const TableManager,
+        donor_group_id: u64,
+        receiver_group_id: u64,
+    ) !bool {
+        const donor = self.ranges.get(donor_group_id) orelse return error.UnknownDonorRange;
+        const receiver = self.ranges.get(receiver_group_id) orelse return error.UnknownReceiverRange;
+        return rangeDocIdentityShardId(donor) != rangeDocIdentityShardId(receiver) or
+            rangeDocIdentityRangeId(donor) != rangeDocIdentityRangeId(receiver);
+    }
+
     /// Rehydrate active split intents from replicated metadata after a
     /// reconciliation-authority handoff. Projected records are authoritative:
     /// they replace a local copy with the same transition ID without allocating

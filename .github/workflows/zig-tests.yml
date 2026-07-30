@@ -30,7 +30,6 @@ jobs:
     runs-on: arc-antfly-standard
     outputs:
       zig_tests: ${{ steps.detect.outputs.zig_tests }}
-      arm64_codec: ${{ steps.detect.outputs.arm64_codec }}
       e2e: ${{ steps.detect.outputs.e2e }}
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
@@ -49,7 +48,6 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             {
               echo "zig_tests=true"
-              echo "arm64_codec=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
@@ -60,7 +58,6 @@ jobs:
 
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
-            echo "arm64_codec=false" >> "$GITHUB_OUTPUT"
             if [[ "${{ github.event.schedule }}" == "0 3 * * 0" ]]; then
               {
                 echo "e2e=false"
@@ -86,7 +83,6 @@ jobs:
           else
             {
               echo "zig_tests=true"
-              echo "arm64_codec=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
@@ -106,18 +102,6 @@ jobs:
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
           else
             echo "zig_tests=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          if git diff --quiet "$base" "${{ github.sha }}" -- \
-            zig/build.zig \
-            zig/build.zig.zon \
-            zig/pkg/antfly/src/encoding/streamvbyte.zig \
-            zig/pkg/antfly/src/encoding/chunked_coder.zig \
-            .github/workflows/zig-tests.yml
-          then
-            echo "arm64_codec=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "arm64_codec=true" >> "$GITHUB_OUTPUT"
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
@@ -202,9 +186,21 @@ jobs:
         run: scripts/test-backup-s3-integration.sh
 
   arm64-codec:
-    name: arm64-codec
+    name: ${{ (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') && 'zig-base / arm64-codec' || 'zig-full / arm64-codec' }}
     needs: changes
-    if: needs.changes.outputs.arm64_codec == 'true'
+    if: |
+      (
+        (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') &&
+        (
+          needs.changes.outputs.zig_tests == 'true' ||
+          needs.changes.outputs.model_check == 'true' ||
+          needs.changes.outputs.trace_validate == 'true'
+        )
+      ) ||
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 20
     env:
@@ -246,8 +242,8 @@ jobs:
           zig test zig/pkg/antfly/src/encoding/chunked_coder.zig
           zig test -O ReleaseFast zig/pkg/antfly/src/encoding/chunked_coder.zig
 
-  zig-base:
-    name: zig-base
+  zig-base-tests:
+    name: zig-base / x86_64
     needs: changes
     if: (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') && (needs.changes.outputs.zig_tests == 'true' || needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true')
     runs-on: arc-antfly-heavy
@@ -479,8 +475,8 @@ jobs:
           ANTFLY_TLA_TRACE_VALIDATE: ${{ needs.changes.outputs.trace_validate }}
         run: scripts/ci/zig-tla-verify.sh
 
-  zig-full:
-    name: zig-full
+  zig-full-tests:
+    name: zig-full / x86_64
     needs: changes
     if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
@@ -598,6 +594,55 @@ jobs:
       - name: Run Zig chaos tests
         working-directory: zig
         run: taskset -c ${{ steps.cpus.outputs.list }} zig build chaos-test ${ZIG_BUILD_FLAGS}
+
+  zig-base:
+    name: zig-base
+    needs: [changes, zig-base-tests, arm64-codec]
+    if: |
+      always() &&
+      (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') &&
+      (
+        needs.changes.result != 'success' ||
+        needs.changes.outputs.zig_tests == 'true' ||
+        needs.changes.outputs.model_check == 'true' ||
+        needs.changes.outputs.trace_validate == 'true'
+      )
+    runs-on: arc-antfly-standard
+    steps:
+      - name: Verify zig-base shards
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          X86_64_RESULT: ${{ needs.zig-base-tests.result }}
+          ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
+        run: |
+          set -euo pipefail
+          test "$CHANGES_RESULT" = "success"
+          test "$X86_64_RESULT" = "success"
+          test "$ARM64_CODEC_RESULT" = "success"
+
+  zig-full:
+    name: zig-full
+    needs: [changes, zig-full-tests, arm64-codec]
+    if: |
+      always() &&
+      (
+        github.event_name == 'merge_group' ||
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        github.event_name == 'workflow_dispatch' ||
+        github.event.schedule == '0 8 * * *'
+      )
+    runs-on: arc-antfly-standard
+    steps:
+      - name: Verify zig-full shards
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          X86_64_RESULT: ${{ needs.zig-full-tests.result }}
+          ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
+        run: |
+          set -euo pipefail
+          test "$CHANGES_RESULT" = "success"
+          test "$X86_64_RESULT" = "success"
+          test "$ARM64_CODEC_RESULT" = "success"
 
   e2e-base:
     name: e2e-base

@@ -1439,7 +1439,10 @@ def _wait_node_drained_for_groups(
                     continue
                 if int(record.get("local_node_id", 0)) != node_id:
                     continue
-                if intent.get("serving_state") == "draining":
+                # Both states are excluded from request routing. `retiring`
+                # is the later, safer phase: the survivor set is latched and
+                # the local replica is completing leader transfer/removal.
+                if intent.get("serving_state") in {"draining", "retiring"}:
                     continue
                 return None
         return snapshots[0]
