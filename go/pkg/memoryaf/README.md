@@ -35,7 +35,11 @@ When `NewHTTPHandler` is created with `nil`, it reads identity from request head
 - `X-Role` default: `member`
 - `X-Agent-ID`, `X-Device-ID`, `X-Session-ID`: optional
 
-That keeps the embedded dashboard safe by default while still allowing admin operations when you intentionally opt into them.
+This is a trusted-integration mode, not an authentication mechanism. Do not
+expose it directly to untrusted clients. A gateway or host integration must
+authenticate the caller and strip or replace identity headers before the
+request reaches memoryaf. Alternatively, pass an explicit trusted
+`UserContext` resolver.
 
 ### Entity Extraction
 
@@ -95,7 +99,37 @@ The MCP server exposes 12 tools:
 
 ## Team Mode
 
-Each namespace gets its own Antfly table for full data isolation. Memories default to **team** visibility. Use `"visibility": "private"` to keep memories to yourself.
+Each namespace gets its own Antfly table for namespace isolation. Memories
+default to **team** visibility. Use `"visibility": "private"` to keep memories
+to yourself.
+
+For members, memory reads use this visibility rule:
+
+- team memories are readable by namespace members;
+- private memories are readable only by their creator; and
+- administrators retain the namespace-wide override.
+
+The same rule is applied to explicit private filters, direct lookup, ordinary
+list/search results, graph-expanded memory results, related-memory traversal,
+and entity-to-memory results. Requesting `visibility=private` narrows a member
+to their own private memories; it does not expose every private memory in the
+namespace.
+
+The `UserContext` supplied to the handler is trusted input. Callers must not be
+able to choose another user ID, namespace, or role at the transport boundary.
+
+### Entity visibility limitation
+
+Extracted entity nodes and their mention counts are shared namespace records
+and do not currently retain per-memory visibility provenance. Although
+`entity_memories` filters the returned memory documents, `list_entities` can
+still expose an entity name or aggregate activity derived only from another
+user's private memory.
+
+Deployments that require private entity isolation should disable entity
+extraction or restrict entity discovery to trusted users until entity mentions
+carry visibility provenance and aggregates are computed over caller-visible
+memories.
 
 ## Session Memory
 

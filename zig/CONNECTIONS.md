@@ -464,6 +464,26 @@ connection-use permissions. Examples:
 - Remote URL ingestion requires ingest permission and
   `connection:use:content.fetch`.
 
+### Query-time foreign sources
+
+The current `QueryRequest.foreign_sources` surface predates first-class
+connections. It accepts request-defined PostgreSQL DSNs, resolves referenced
+secrets, and opens the external connection during query execution. The caller's
+table `read` permission covers the logical Antfly table used by the query, but
+there is currently no separate permission for the outbound destination,
+connection use, or referenced secret.
+
+Table `read` must not implicitly grant arbitrary network or secret use. For a
+permission-aware deployment, query-time foreign sources should remain
+experimental or restricted to trusted callers until they:
+
+- reference an operator-declared connection instead of supplying an arbitrary
+  DSN;
+- require an appropriate `connection:use` capability for that connection;
+- restrict the external host, database, and table to configured scopes; and
+- resolve secret references only after both the table and connection checks
+  succeed.
+
 The `/connections` response should include current-user affordances:
 
 ```json

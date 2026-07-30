@@ -22,6 +22,10 @@ The request auth layer builds an `AuthenticatedIdentity` with:
 
 Route authorization is coarse-grained and permission based. Document-level read narrowing is enforced separately by row filters.
 
+`admin` satisfies `read` and `write` checks for the same matching resource.
+`write` does not imply `read`. Resource-type and resource-name wildcards are
+matched explicitly; authentication alone never grants a table operation.
+
 ## Row Filter Enforcement
 
 Row filters are stored as query JSON per table name, with `*` as a wildcard table fallback.
@@ -36,6 +40,44 @@ At read time the server:
 Row-filter writes are also validated before storage. A `$auth` node must be an object with exactly one field, and the field value must be a supported auth path.
 
 This keeps access control server-owned. Client-supplied queries may narrow their own results, but they are not trusted to enforce access control.
+
+## Enforcement Coverage And Trust Boundaries
+
+Authentication is opt-in. With `auth_enabled = false`, the public API is
+intentionally open. With authentication enabled, public non-internal requests
+must authenticate before route or operation authorization runs.
+
+Current table reads enforce both layers:
+
+- lookup, query, and document scan require table `read`;
+- joins require `read` on every referenced table, including nested right-side
+  tables;
+- each table's effective row filter is applied to that table's read; and
+- MCP built-in tools delegate to these same authenticated HTTP paths, so the
+  target table and operation are checked again at execution time.
+
+Cluster-internal group, Raft, and HA routes use a separate deployment trust
+boundary. They are not end-user APIs and intentionally do not use table RBAC.
+Ingress and service-network policy must prevent untrusted clients from reaching
+them.
+
+### Transaction authorization gap
+
+The Zig transaction endpoints currently authenticate public requests but do
+not provide a complete authorization boundary:
+
+- transaction sessions are not bound to the principal that created them;
+- session listing and detail routes are shared across authenticated callers;
+- table names supplied in commit, staged write, and staged delete bodies do not
+  receive consistent table `write` checks; and
+- staged reads do not consistently enforce table `read` plus the caller's row
+  filter.
+
+Consequently, authentication must not be treated as sufficient isolation for
+transaction endpoints. Deployments that rely on untrusted authenticated
+tenants should keep these endpoints unreachable until principal ownership,
+per-table authorization, and row-filter semantics are implemented or the
+surface is explicitly gated as experimental.
 
 ## Canonical Auth Reference Form
 

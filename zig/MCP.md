@@ -2,8 +2,8 @@
 
 ## Current State
 
-This repo now has a reusable MCP protocol core under `go/pkg/antfly/lib/mcp`, plus Antfly-specific HTTP adapters in
-`pkg/antfly/src/api/protocol_adapters.zig`.
+This repo has a native Zig MCP protocol core under `lib/mcp`, plus
+Antfly-specific HTTP adapters in `pkg/antfly/src/api/protocol_adapters.zig`.
 
 The implementation intentionally keeps the protocol library independent of Antfly OpenAPI/generated types. Antfly tools
 are registered at the product layer and delegate back through existing HTTP/API paths so auth, permission checks,
@@ -12,20 +12,9 @@ request validation, table/query behavior, backup/restore behavior, and agent beh
 A2A and native bounded-agent behavior are documented in `A2A.md`. This file keeps only the MCP surface and the explicit
 handoff points where MCP clients should call native agents or A2A skills.
 
-## Go Parity Context
-
-The Go implementation uses mature protocol SDKs:
-
-- MCP is mounted with `github.com/modelcontextprotocol/go-sdk/mcp.NewStreamableHTTPHandler` in `go/pkg/antfly/src/mcp/mcp.go`. That
-  SDK provides streamable HTTP sessions, `Mcp-Session-Id`, DELETE close, SSE reconnect behavior, and `Last-Event-ID`
-  resumability. The Antfly Go product code exposes streamable HTTP; the SDK also supports stdio, but there is no
-  Antfly-specific stdio server command wired in the Go tree.
-- MCP tool schemas in Go are derived by the MCP SDK from typed argument structs and `json`/`mcp` tags in
-  `go/pkg/antfly/src/mcp/mcp.go`, not handwritten JSON strings.
-
 ## Implemented
 
-- `go/pkg/antfly/lib/mcp`
+- `lib/mcp`
   - JSON-RPC 2.0 request/response handling.
   - MCP `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`.
   - Tool registry API with `Server`, `Tool`, `ToolHandler`, and `CallToolResult`.
@@ -38,6 +27,7 @@ The Go implementation uses mature protocol SDKs:
 - Antfly HTTP routes
   - `GET /mcp/v1`
   - `POST /mcp/v1`
+  - `DELETE /mcp/v1`
 - Trusted-principal auth
   - Antfly can accept `X-Antfly-Trusted-Principal: <token>` from a trusted upstream proxy when
     `ANTFLY_TRUSTED_PRINCIPAL_SECRET` is configured.
@@ -61,6 +51,38 @@ The Go implementation uses mature protocol SDKs:
   - `backup`
   - `restore`
   - `batch`
+
+## Authorization Model
+
+MCP follows the same opt-in authentication model as the public HTTP API. When
+authentication is enabled, every MCP HTTP request must authenticate; an
+`Mcp-Session-Id` identifies protocol state and is not an authorization
+credential.
+
+Tool discovery is permission-aware:
+
+| Tool category | Required effective permission |
+| --- | --- |
+| `list_tables` | `table/*:read` |
+| query, describe, lookup, sample, and index-list tools | `table:read` on at least one table |
+| `batch` | `table:write` on at least one table |
+| table/index mutation, backup, and restore tools | `table:admin` on at least one table |
+| schema/capability introspection | authenticated identity only |
+
+Discovery is not the execution boundary. A built-in tool call constructs the
+ordinary REST request and sends it back through the Antfly HTTP handler with
+the same `Authorization` header or verified trusted-principal token. The route
+then checks the exact target table and operation and applies the caller's row
+filter. For example, having `read` on one table may make `query` visible, but it
+does not allow that tool to query a different table.
+
+When authentication is disabled, the MCP surface is intentionally open along
+with the rest of the public API.
+
+Extension MCP tool discovery uses the installed extension scope and declared
+`db:read`, `db:write`, or `db:admin` capabilities. The extension runtime's
+granted-capability boundary remains a separate execution constraint; see
+`EXTENSIONS.md`.
 
 ## MCP Query Request Design
 
@@ -139,10 +161,11 @@ validation, and error behavior aligned with the product API.
 - `zig build raft-transport-test`
 - `zig build lib-api-auth-test`
 - `zig build root-test -- --test-filter "api http server serves fielded full-text search through mcp tools"`
-- `go test ./src/mcp`
+- `zig build root-test -- --test-filter "api http server serves document lookup through mcp tool"`
 
-The API auth test bucket includes HTTP-level coverage for MCP initialize. It also covers MCP session response headers
-and MCP GET event-stream endpoint framing.
+The API tests cover HTTP-level MCP initialization, permission-filtered tool
+discovery, exact-table denial through a visible read tool, session response
+headers, and MCP GET event-stream endpoint framing.
 
 The standalone protocol tests also cover parse errors, invalid params, and unknown MCP tools.
 
@@ -152,13 +175,13 @@ The standalone protocol tests also cover parse errors, invalid params, and unkno
   initialize responses, validates inbound `Mcp-Session-Id` headers for streamable HTTP requests, and closes sessions
   via `DELETE /mcp/v1`. GET streams emit event IDs and honor `Last-Event-ID`, but historical event replay is not
   implemented yet.
-- MCP has a line-oriented stdio JSON-RPC dispatcher in `go/pkg/antfly/lib/mcp`; the product CLI does not yet expose a long-running
-  stdio server mode. This is also not exposed by Antfly's Go product code, even though the Go SDK supports it.
+- MCP has a line-oriented stdio JSON-RPC dispatcher in `lib/mcp`; the product
+  CLI does not yet expose a long-running stdio server mode.
 - The Antfly adapters now live in `protocol_adapters.zig`. MCP-specific adapter code can move to a dedicated module if
   the surface grows.
 - Protocol structs are intentionally minimal. Dynamic `std.json.Value` remains the extension path for evolving MCP
   fields and tool payloads.
-- MCP schemas are generated from Antfly MCP tool descriptors and cover the current Go-parity tool arguments. They are
+- MCP schemas are generated from Antfly MCP tool descriptors and cover the current built-in tool arguments. They are
   not yet derived from generated OpenAPI or Zig request structs. The raw `queryRequest` field deliberately uses a
   permissive schema plus the `describe_query_request` helper to avoid inlining the full recursive OpenAPI query schema
   into every MCP `tools/list` response.
@@ -171,11 +194,7 @@ registered outside the libraries.
 The next durability improvements should be:
 
 1. Add MCP historical event replay if clients need more than cursor-aware stream continuation.
-2. Expose the `go/pkg/antfly/lib/mcp` stdio dispatcher through a product CLI/server mode if local agent hosts need it.
-3. Broaden adapter failure mapping, tool schema stability tests, and cross-language MCP parity tests.
+2. Expose the `lib/mcp` stdio dispatcher through a product CLI/server mode if local agent hosts need it.
+3. Broaden adapter failure mapping and tool schema stability tests.
 4. Consider deriving MCP tool schemas from generated OpenAPI or Zig request structs if the tool surface continues to
    expand.
-
-For Go product parity, the only remaining behavior difference worth tracking is MCP historical replay after
-`Last-Event-ID`. The other items above are product extensions or maintainability improvements, not missing behavior in
-the current Antfly Go MCP mount.
