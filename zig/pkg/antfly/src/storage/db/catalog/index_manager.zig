@@ -1935,7 +1935,7 @@ pub const IndexManager = struct {
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
 
         try entry.persistent.resetAllForRebuild();
-        try rebuild_state.update("");
+        try rebuild_state.updateWithIo(self.checkpointIo(), "");
         try self.backfillTextIndex(store, entry, null);
         try entry.persistent.sync(true);
         try self.saveBackfilledAppliedSequence(store, entry.config);
@@ -1980,7 +1980,7 @@ pub const IndexManager = struct {
 
         try checkRepairCancelled(cancel_check);
         try entry.persistent.resetAllForRebuild();
-        try rebuild_state.update("");
+        try rebuild_state.updateWithIo(self.checkpointIo(), "");
         try self.backfillTextIndexFromReadTxn(store, read_txn, entry, null, cancel_check, capacity_check);
         try checkRepairCancelled(cancel_check);
         try entry.persistent.sync(true);
@@ -7990,7 +7990,7 @@ pub const IndexManager = struct {
                     .compact_text = false,
                     .compact_text_segment_threshold = text_backfill_compact_segment_threshold,
                 }, stats);
-                try rebuild.update(last_doc_key);
+                try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
                     manager.alloc.free(@constCast(doc.value));
@@ -8132,7 +8132,7 @@ pub const IndexManager = struct {
         }
 
         if (flushed_batches > 0) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
-        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
+        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
     }
 
@@ -8198,7 +8198,7 @@ pub const IndexManager = struct {
                     .compact_text = false,
                     .compact_text_segment_threshold = text_backfill_compact_segment_threshold,
                 }, stats);
-                try rebuild.update(last_doc_key);
+                try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
                     manager.alloc.free(@constCast(doc.value));
@@ -8347,7 +8347,7 @@ pub const IndexManager = struct {
         }
 
         if (flushed_batches > 0) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
-        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
+        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
     }
 
@@ -8918,7 +8918,7 @@ pub const IndexManager = struct {
                 }
 
                 const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
-                var resume_from = rebuild_state.check(self.alloc) catch |err| {
+                var resume_from = rebuild_state.checkWithIo(self.alloc, self.checkpointIo()) catch |err| {
                     std.log.warn("full_text open failed step=rebuild_state_check name={s} err={s}", .{
                         cfg.name,
                         @errorName(err),
@@ -8937,7 +8937,7 @@ pub const IndexManager = struct {
 
                 if (allow_full_text_backfill and (rebuild_from_scratch_after_interruption or resume_from != null or (entry.persistent.snapshot().global_doc_count == 0 and persisted_ranges.len == 0))) {
                     const backfill_started_ns = nowNs();
-                    try rebuild_state.update(if (resume_from) |buf| buf else "");
+                    try rebuild_state.updateWithIo(self.checkpointIo(), if (resume_from) |buf| buf else "");
                     try self.backfillTextIndex(store, &entry, resume_from);
                     try self.saveBackfilledAppliedSequence(store, cfg);
                     backfill_ns += elapsedSince(backfill_started_ns);
@@ -9145,12 +9145,12 @@ pub const IndexManager = struct {
                 errdefer self.freeSparseIndexEntry(&entry);
 
                 const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
-                const resume_from = try rebuild_state.check(self.alloc);
+                const resume_from = try rebuild_state.checkWithIo(self.alloc, self.checkpointIo());
                 defer if (resume_from) |buf| self.alloc.free(buf);
 
                 if (allow_backfill and (resume_from != null or entry.index.next_doc_num == 0)) {
                     const backfill_started_ns = nowNs();
-                    try rebuild_state.update(if (resume_from) |buf| buf else "");
+                    try rebuild_state.updateWithIo(self.checkpointIo(), if (resume_from) |buf| buf else "");
                     try self.backfillSparseIndex(store, &entry, resume_from);
                     try self.saveBackfilledAppliedSequence(store, cfg);
                     backfill_ns += elapsedSince(backfill_started_ns);
@@ -9243,7 +9243,7 @@ pub const IndexManager = struct {
                 errdefer self.freeGraphIndexEntry(&entry);
 
                 const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
-                const resume_from = try rebuild_state.check(self.alloc);
+                const resume_from = try rebuild_state.checkWithIo(self.alloc, self.checkpointIo());
                 defer if (resume_from) |buf| self.alloc.free(buf);
                 const reverse_edges = (try entry.index.stats(self.alloc)).edge_count;
 
@@ -9259,7 +9259,7 @@ pub const IndexManager = struct {
                 const has_replay_history = latest_replay_sequence != 0;
                 if (allow_backfill and (resume_from != null or (has_replay_history and (reverse_store_missing or reverse_edges == 0) and !graph_replay_pending))) {
                     const backfill_started_ns = nowNs();
-                    try rebuild_state.update(if (resume_from) |buf| buf else "");
+                    try rebuild_state.updateWithIo(self.checkpointIo(), if (resume_from) |buf| buf else "");
                     _ = try entry.index.rebuildReverseFromOwnedOutgoingEdgesResume(self.alloc, self.byte_range.start, self.byte_range.end, resume_from);
                     backfill_ns += elapsedSince(backfill_started_ns);
                 }
@@ -10427,7 +10427,7 @@ pub const IndexManager = struct {
                     manager.alloc.free(@constCast(item.vec.values));
                 }
                 writes_buf.clearRetainingCapacity();
-                try rebuild.update(last_doc_key);
+                try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
                 flush_count.* += 1;
                 if (@import("builtin").is_test) {
                     if (test_abort_sparse_backfill_after_batches) |limit| {
@@ -10470,7 +10470,7 @@ pub const IndexManager = struct {
             try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
         }
 
-        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
+        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
         if (flushed_batches > 0) try entry.index.checkpointLsmWalAfterDurableBoundary();
     }
 

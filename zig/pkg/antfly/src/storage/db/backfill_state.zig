@@ -16,7 +16,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../common/fs_paths.zig");
-const storage_io = @import("../lsm_backend/storage_io.zig");
 
 const rebuild_state_name = "rebuild.state";
 const rebuild_state_magic = "AFRBST01";
@@ -27,7 +26,22 @@ const rebuild_state_header_bytes = rebuild_state_magic.len + @sizeOf(@TypeOf(reb
 const rebuild_state_max_key_bytes = 64 * 1024;
 const rebuild_state_max_encoded_bytes = rebuild_state_header_bytes + rebuild_state_max_key_bytes + rebuild_state_checksum_bytes;
 const rebuild_state_max_read_bytes = rebuild_state_max_encoded_bytes + 1;
-var temp_nonce: u64 = 0;
+const rebuild_state_temp_attempts = 16;
+
+pub const LoadResult = union(enum) {
+    absent,
+    legacy,
+    corrupt,
+    valid: []u8,
+
+    pub fn deinit(self: *LoadResult, alloc: Allocator) void {
+        switch (self.*) {
+            .valid => |key| alloc.free(key),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
 
 pub const RebuildState = struct {
     root_path: []const u8,
@@ -40,112 +54,85 @@ pub const RebuildState = struct {
         if (builtin.os.tag == .freestanding) {
             return null;
         }
-        const path = try self.pathAlloc(alloc);
-        defer alloc.free(path);
-
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        const encoded = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(rebuild_state_max_read_bytes)) catch |err| switch (err) {
-            error.FileNotFound => return null,
-            error.NotDir => return null,
-            error.StreamTooLong => return error.InvalidRebuildState,
-            else => return err,
+        return try self.checkWithIo(alloc, io_impl.io());
+    }
+
+    pub fn checkWithIo(self: RebuildState, alloc: Allocator, io: std.Io) !?[]u8 {
+        var loaded = try self.loadWithIo(alloc, io);
+        return switch (loaded) {
+            .absent => null,
+            .valid => |key| blk: {
+                loaded = undefined;
+                break :blk key;
+            },
+            .legacy => blk: {
+                // Pre-v1 cursors have no integrity envelope. Their position
+                // cannot be trusted after an upgrade, so preserve the active
+                // marker while forcing a safe rebuild from the beginning.
+                try self.updateWithIo(io, "");
+                break :blk try alloc.dupe(u8, "");
+            },
+            .corrupt => error.InvalidRebuildState,
         };
-        defer alloc.free(encoded);
-        return try decodeState(alloc, encoded);
+    }
+
+    pub fn loadWithIo(self: RebuildState, alloc: Allocator, io: std.Io) !LoadResult {
+        if (builtin.os.tag == .freestanding) return .absent;
+        const path = try self.pathAlloc(alloc);
+        defer alloc.free(path);
+        return try loadPathWithIo(alloc, io, path);
     }
 
     pub fn update(self: RebuildState, key: []const u8) !void {
         if (builtin.os.tag == .freestanding) {
             return;
         }
-        const encoded = try encodeState(std.heap.page_allocator, key);
-        defer std.heap.page_allocator.free(encoded);
-
-        const path = try self.pathAlloc(std.heap.page_allocator);
-        defer std.heap.page_allocator.free(path);
-        temp_nonce +%= 1;
-        const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp-{d}", .{
-            path,
-            temp_nonce,
-        });
-        defer std.heap.page_allocator.free(tmp_path);
-
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        const io = io_impl.io();
-        ensureParentDir(io, path) catch |err| switch (err) {
-            error.NotDir => return,
-            else => return err,
-        };
-        ensureParentDir(io, tmp_path) catch |err| switch (err) {
-            error.NotDir => return,
-            else => return err,
-        };
+        try self.updateWithIo(io_impl.io(), key);
+    }
 
-        writeStateFile(io, tmp_path, encoded) catch |err| switch (err) {
-            error.NotDir => return,
+    pub fn updateWithIo(self: RebuildState, io: std.Io, key: []const u8) !void {
+        if (builtin.os.tag == .freestanding) return;
+        const alloc = std.heap.page_allocator;
+        const encoded = try encodeState(alloc, key);
+        defer alloc.free(encoded);
+        const path = try self.pathAlloc(alloc);
+        defer alloc.free(path);
+
+        const tmp_path = try writeExclusiveTempStateFile(alloc, io, path, encoded);
+        defer alloc.free(tmp_path);
+        var tmp_exists = true;
+        defer if (tmp_exists) deleteFileWithIo(io, tmp_path) catch {};
+
+        renameWithIo(io, tmp_path, path) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return error.RebuildStateOwnerStale,
             else => return err,
         };
-
-        if (std.fs.path.isAbsolute(path)) {
-            renameAbsolutePortable(tmp_path, path) catch |err| switch (err) {
-                error.FileNotFound => {
-                    ensureParentDir(io, path) catch |parent_err| switch (parent_err) {
-                        error.NotDir => return,
-                        else => return parent_err,
-                    };
-                    writeStateFile(io, path, encoded) catch |write_err| switch (write_err) {
-                        error.NotDir => return,
-                        else => return write_err,
-                    };
-                    std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
-                },
-                error.NotDir => return,
-                else => return err,
-            };
-        } else {
-            std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io) catch |err| switch (err) {
-                error.FileNotFound => {
-                    ensureParentDir(io, path) catch |parent_err| switch (parent_err) {
-                        error.NotDir => return,
-                        else => return parent_err,
-                    };
-                    writeStateFile(io, path, encoded) catch |write_err| switch (write_err) {
-                        error.NotDir => return,
-                        else => return write_err,
-                    };
-                    std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-                },
-                error.NotDir => return,
-                else => return err,
-            };
-        }
-        try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
+        tmp_exists = false;
+        try syncPublishedParent(io, path);
     }
 
     pub fn clear(self: RebuildState) !void {
         if (builtin.os.tag == .freestanding) {
             return;
         }
-        const path = try self.pathAlloc(std.heap.page_allocator);
-        defer std.heap.page_allocator.free(path);
-
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        if (std.fs.path.isAbsolute(path)) {
-            std.Io.Dir.deleteFileAbsolute(io_impl.io(), path) catch |err| switch (err) {
-                error.FileNotFound => {},
-                error.NotDir => {},
-                else => return err,
-            };
-        } else {
-            std.Io.Dir.cwd().deleteFile(io_impl.io(), path) catch |err| switch (err) {
-                error.FileNotFound => {},
-                error.NotDir => {},
-                else => return err,
-            };
-        }
+        try self.clearWithIo(io_impl.io());
+    }
+
+    pub fn clearWithIo(self: RebuildState, io: std.Io) !void {
+        if (builtin.os.tag == .freestanding) return;
+        const path = try self.pathAlloc(std.heap.page_allocator);
+        defer std.heap.page_allocator.free(path);
+        deleteFileWithIo(io, path) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return,
+            else => return err,
+        };
+        try syncPublishedParent(io, path);
     }
 
     pub fn estimateProgress(self: RebuildState, range_start: []const u8, range_end: []const u8, alloc: Allocator) !?f64 {
@@ -159,41 +146,75 @@ pub const RebuildState = struct {
     }
 };
 
-fn ensureParentDir(io: std.Io, path: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| {
-        try storage_io.createDirPathPortable(io, parent);
+fn loadPathWithIo(alloc: Allocator, io: std.Io, path: []const u8) !LoadResult {
+    const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(rebuild_state_max_read_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return .absent,
+        error.StreamTooLong => return .corrupt,
+        else => return err,
+    };
+    defer alloc.free(encoded);
+
+    if (!std.mem.startsWith(u8, encoded, rebuild_state_magic)) {
+        // The old on-disk format was exactly the raw resume key.
+        return if (encoded.len <= rebuild_state_max_key_bytes) .legacy else .corrupt;
+    }
+    const key = decodeState(alloc, encoded) catch |err| switch (err) {
+        error.InvalidRebuildState => return .corrupt,
+        else => return err,
+    };
+    return .{ .valid = key };
+}
+
+fn writeExclusiveTempStateFile(alloc: Allocator, io: std.Io, path: []const u8, contents: []const u8) ![]u8 {
+    for (0..rebuild_state_temp_attempts) |_| {
+        var entropy: [@sizeOf(u128)]u8 = undefined;
+        try io.randomSecure(&entropy);
+        const nonce = std.mem.readInt(u128, &entropy, .little);
+        const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{x}", .{ path, nonce });
+        writeStateFile(io, tmp_path, contents, true) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                alloc.free(tmp_path);
+                continue;
+            },
+            error.FileNotFound, error.NotDir => {
+                alloc.free(tmp_path);
+                return error.RebuildStateOwnerStale;
+            },
+            else => {
+                deleteFileWithIo(io, tmp_path) catch {};
+                alloc.free(tmp_path);
+                return err;
+            },
+        };
+        return tmp_path;
+    }
+    return error.RebuildStateTempCollision;
+}
+
+fn renameWithIo(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
+    if (std.fs.path.isAbsolute(new_path)) {
+        try std.Io.Dir.renameAbsolute(old_path, new_path, io);
+    } else {
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, io);
     }
 }
 
-fn renameAbsolutePortable(old_path: []const u8, new_path: []const u8) !void {
-    const allocator = std.heap.page_allocator;
-    const old_path_z = try allocator.dupeZ(u8, old_path);
-    defer allocator.free(old_path_z);
-    const new_path_z = try allocator.dupeZ(u8, new_path);
-    defer allocator.free(new_path_z);
-
-    while (true) {
-        const rc = std.posix.system.rename(old_path_z, new_path_z);
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => return,
-            .INTR => continue,
-            .ACCES, .PERM, .ROFS => return error.AccessDenied,
-            .BUSY => return error.FileBusy,
-            .IO => return error.InputOutput,
-            .INVAL => return error.InvalidArgument,
-            .ISDIR => return error.IsDir,
-            .LOOP => return error.SymLinkLoop,
-            .MLINK => return error.LinkQuotaExceeded,
-            .NAMETOOLONG => return error.NameTooLong,
-            .NOENT => return error.FileNotFound,
-            .NOTDIR => return error.NotDir,
-            .NOMEM => return error.SystemResources,
-            .NOSPC => return error.NoSpaceLeft,
-            .NOTEMPTY, .EXIST => return error.PathAlreadyExists,
-            .XDEV => return error.RenameAcrossMountPoints,
-            else => |err| return std.posix.unexpectedErrno(err),
-        }
+fn deleteFileWithIo(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.deleteFileAbsolute(io, path);
+    } else {
+        try std.Io.Dir.cwd().deleteFile(io, path);
     }
+}
+
+fn syncPublishedParent(io: std.Io, path: []const u8) !void {
+    fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".") catch |err| switch (err) {
+        // Platforms without durable directory sync have an explicit
+        // best-effort publication policy. Do not report an ordinary write
+        // failure after the atomic replacement is already visible.
+        error.DurableDirectorySyncUnsupported => return,
+        else => return error.RebuildStateDurabilityUncertain,
+    };
 }
 
 fn encodeState(alloc: Allocator, key: []const u8) ![]u8 {
@@ -242,8 +263,8 @@ fn decodeState(alloc: Allocator, encoded: []const u8) ![]u8 {
     return try alloc.dupe(u8, encoded[pos..checksum_offset]);
 }
 
-fn writeStateFile(io: std.Io, path: []const u8, contents: []const u8) !void {
-    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
+fn writeStateFile(io: std.Io, path: []const u8, contents: []const u8, exclusive: bool) !void {
+    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true, .exclusive = exclusive });
     defer file.close(io);
 
     var buf: [4096]u8 = undefined;
@@ -275,6 +296,10 @@ fn keyToU64(key: []const u8) u64 {
     return std.mem.readInt(u64, &buf, .big);
 }
 
+fn createTestStateRoot(path: []const u8) !void {
+    try fs_paths.createDirPathPortable(std.testing.io, path);
+}
+
 test "rebuild state round trips and clears" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -283,6 +308,7 @@ test "rebuild state round trips and clears" {
 
     const state = RebuildState.init(path);
     try std.testing.expect((try state.check(std.testing.allocator)) == null);
+    try createTestStateRoot(path);
     try state.update("doc:m");
     const loaded = (try state.check(std.testing.allocator)) orelse return error.TestExpectedEqual;
     defer std.testing.allocator.free(loaded);
@@ -302,6 +328,7 @@ test "rebuild state rejects key corruption" {
     defer std.testing.allocator.free(path);
 
     const state = RebuildState.init(path);
+    try createTestStateRoot(path);
     try state.update("doc:m");
     const state_path = try state.pathAlloc(std.testing.allocator);
     defer std.testing.allocator.free(state_path);
@@ -327,6 +354,7 @@ test "rebuild state rejects truncation" {
     defer std.testing.allocator.free(path);
 
     const state = RebuildState.init(path);
+    try createTestStateRoot(path);
     try state.update("doc:m");
     const state_path = try state.pathAlloc(std.testing.allocator);
     defer std.testing.allocator.free(state_path);
@@ -340,6 +368,47 @@ test "rebuild state rejects truncation" {
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = encoded[0 .. encoded.len - 1] });
 
     try std.testing.expectError(error.InvalidRebuildState, state.check(std.testing.allocator));
+}
+
+test "rebuild state upgrades legacy cursor by restarting from scratch" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state-legacy", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    try createTestStateRoot(path);
+
+    const state = RebuildState.init(path);
+    const state_path = try state.pathAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(state_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = "doc:m" });
+
+    var legacy = try state.loadWithIo(std.testing.allocator, std.testing.io);
+    defer legacy.deinit(std.testing.allocator);
+    try std.testing.expect(legacy == .legacy);
+
+    const restart_key = (try state.checkWithIo(std.testing.allocator, std.testing.io)) orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(restart_key);
+    try std.testing.expectEqualStrings("", restart_key);
+
+    var migrated = try state.loadWithIo(std.testing.allocator, std.testing.io);
+    defer migrated.deinit(std.testing.allocator);
+    switch (migrated) {
+        .valid => |key| try std.testing.expectEqualStrings("", key),
+        else => return error.TestExpectedValidRebuildState,
+    }
+}
+
+test "rebuild state update does not recreate vanished owner directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state-stale-owner", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    try createTestStateRoot(path);
+    try std.Io.Dir.cwd().deleteTree(std.testing.io, path);
+
+    const state = RebuildState.init(path);
+    try std.testing.expectError(error.RebuildStateOwnerStale, state.updateWithIo(std.testing.io, "doc:m"));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
 }
 
 test "rebuild state estimates progress from resume key" {
