@@ -60,12 +60,20 @@ def _json_request(
     *,
     payload: dict | None = None,
 ) -> dict | list:
-    response = session.request(
-        method,
-        f"{server.url}{path}",
-        json=payload,
-        timeout=30,
-    )
+    try:
+        response = session.request(
+            method,
+            f"{server.url}{path}",
+            json=payload,
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        process_status = server.proc.poll() if server.proc is not None else None
+        raise AssertionError(
+            f"{method} {path} failed before receiving a response: {exc!r}; "
+            f"server_exit_status={process_status}\n"
+            f"server logs:\n{server.debug_logs()}"
+        ) from exc
     if response.status_code >= 400:
         raise AssertionError(
             f"{method} {path} failed: {response.status_code} {response.text}\n"
