@@ -15,7 +15,6 @@
 package metadata
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -38,8 +37,6 @@ type ErrVersionConflict struct {
 	Expected uint64
 	Actual   uint64
 }
-
-var errTransactionReadNotVisible = errors.New("transaction read not found")
 
 func (e *ErrVersionConflict) Error() string {
 	return fmt.Sprintf("version conflict on %s/%s: expected %d, got %d", e.Table, e.Key, e.Expected, e.Actual)
@@ -87,11 +84,7 @@ func (t *TableApi) CommitTransaction(w http.ResponseWriter, r *http.Request) {
 	// check inside WriteIntent (during 2PC phase 1) is what prevents lost updates.
 	// A conflict detected here avoids the 2PC round-trip; a pass here does not
 	// guarantee commit (the predicate check may still fail).
-	if err := t.validateReadSet(r.Context(), req.ReadSet, rowFilterResolverFromContext(r)); err != nil {
-		if errors.Is(err, errTransactionReadNotVisible) {
-			errorResponse(w, "Transaction read not found", http.StatusNotFound)
-			return
-		}
+	if err := t.validateReadSet(r.Context(), req.ReadSet); err != nil {
 		var conflict *ErrVersionConflict
 		if errors.As(err, &conflict) {
 			w.Header().Set("Content-Type", "application/json")
@@ -295,11 +288,7 @@ func transactionSessionsNotImplemented(w http.ResponseWriter) {
 }
 
 // validateReadSet checks that all keys in the read set still have the expected versions.
-func (t *TableApi) validateReadSet(
-	ctx context.Context,
-	readSet []TransactionReadItem,
-	resolve RowFilterResolver,
-) error {
+func (t *TableApi) validateReadSet(ctx context.Context, readSet []TransactionReadItem) error {
 	eg, egCtx := errgroup.WithContext(ctx)
 
 	for _, item := range readSet {
@@ -317,13 +306,6 @@ func (t *TableApi) validateReadSet(
 			_, currentVersion, err := t.ln.forwardStrictLookupToShardWithVersion(egCtx, shardID, item.Key)
 			if err != nil {
 				return fmt.Errorf("failed to lookup key %s in table %s: %w", item.Key, item.Table, err)
-			}
-			if resolve != nil {
-				secFilter := resolve(item.Table)
-				if len(secFilter) > 0 && !bytes.Equal(secFilter, []byte("null")) &&
-					!t.docMatchesRowFilter(egCtx, item.Table, item.Key, secFilter) {
-					return errTransactionReadNotVisible
-				}
 			}
 
 			expectedVersion, err := strconv.ParseUint(item.Version, 10, 64)

@@ -22738,6 +22738,9 @@ test "api http server serves document lookup through mcp tool" {
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"get_document\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"batch\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"create_table\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") == null);
 
     var call_resp = try server.handle(.{
@@ -22750,6 +22753,18 @@ test "api http server serves document lookup through mcp tool" {
     defer call_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), call_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, call_resp.body, "\"structuredContent\":{\"title\":\"alpha\"}") != null);
+
+    var unauthorized_table_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"get_document\",\"arguments\":{\"tableName\":\"secrets\",\"key\":\"hidden\"}}}",
+    });
+    defer unauthorized_table_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), unauthorized_table_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, unauthorized_table_resp.body, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unauthorized_table_resp.body, "forbidden") != null);
 }
 
 test "api http server serves fielded full-text search through mcp tools" {

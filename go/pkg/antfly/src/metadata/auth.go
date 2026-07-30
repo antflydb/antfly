@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -28,15 +27,6 @@ import (
 )
 
 type apiKeyPermissionsKey struct{}
-
-type authenticatedPrincipalKey struct{}
-
-type authenticatedPrincipal struct {
-	username          string
-	apiKeyPermissions []usermgr.Permission
-}
-
-var errAuthorizationDenied = errors.New("forbidden")
 
 func apiKeyPermissionsFromContext(r *http.Request) []usermgr.Permission {
 	perms, _ := r.Context().Value(apiKeyPermissionsKey{}).([]usermgr.Permission)
@@ -76,20 +66,6 @@ func (ms *MetadataStore) checkPermission(
 	resource string,
 	permType usermgr.PermissionType,
 ) bool {
-	if err := ms.permissionError(username, keyPerms, resourceType, resource, permType); err != nil {
-		errorResponse(w, "Forbidden", http.StatusForbidden)
-		return false
-	}
-	return true
-}
-
-func (ms *MetadataStore) permissionError(
-	username string,
-	keyPerms []usermgr.Permission,
-	resourceType usermgr.ResourceType,
-	resource string,
-	permType usermgr.PermissionType,
-) error {
 	ok, err := ms.um.Enforce(username, resourceType, resource, permType)
 	if err != nil {
 		ms.logger.Error("Error during enforcement check",
@@ -98,39 +74,20 @@ func (ms *MetadataStore) permissionError(
 			zap.String("resourceType", string(resourceType)),
 			zap.String("resource", resource),
 			zap.String("permissionType", string(permType)))
-		return errAuthorizationDenied
+		errorResponse(w, "Forbidden", http.StatusForbidden)
+		return false
 	}
 	if !ok {
-		return errAuthorizationDenied
+		errorResponse(w, "Forbidden", http.StatusForbidden)
+		return false
 	}
 	if len(keyPerms) > 0 {
 		if !matchesApiKeyPermission(keyPerms, resourceType, resource, permType) {
-			return errAuthorizationDenied
+			errorResponse(w, "Forbidden", http.StatusForbidden)
+			return false
 		}
 	}
-	return nil
-}
-
-func (ms *MetadataStore) authorizeContext(
-	ctx context.Context,
-	resourceType usermgr.ResourceType,
-	resource string,
-	permType usermgr.PermissionType,
-) error {
-	if !ms.config.EnableAuth {
-		return nil
-	}
-	principal, ok := ctx.Value(authenticatedPrincipalKey{}).(authenticatedPrincipal)
-	if !ok || principal.username == "" {
-		return errAuthorizationDenied
-	}
-	return ms.permissionError(
-		principal.username,
-		principal.apiKeyPermissions,
-		resourceType,
-		resource,
-		permType,
-	)
+	return true
 }
 
 func (ms *MetadataStore) ensureAuth(
@@ -273,10 +230,7 @@ func (ms *MetadataStore) authnMiddleware(next http.Handler) http.Handler {
 				}
 				return nil
 			})
-			ctx := context.WithValue(r.Context(), authenticatedPrincipalKey{}, authenticatedPrincipal{
-				username: username,
-			})
-			ctx = context.WithValue(ctx, rowFilterResolverKey{}, resolver)
+			ctx := context.WithValue(r.Context(), rowFilterResolverKey{}, resolver)
 			r = r.WithContext(ctx)
 
 		case "ApiKey", "Bearer":
@@ -298,10 +252,7 @@ func (ms *MetadataStore) authnMiddleware(next http.Handler) http.Handler {
 				return
 			}
 			r.Header.Set("X-Authenticated-User", username)
-			ctx := context.WithValue(r.Context(), authenticatedPrincipalKey{}, authenticatedPrincipal{
-				username:          username,
-				apiKeyPermissions: permissions,
-			})
+			ctx := r.Context()
 			if len(permissions) > 0 {
 				ctx = context.WithValue(ctx, apiKeyPermissionsKey{}, permissions)
 			}

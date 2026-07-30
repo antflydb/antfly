@@ -974,7 +974,6 @@ func (t *TableApi) ScanKeys(w http.ResponseWriter, r *http.Request, tableName st
 			return
 		}
 	}
-	injectScanRowFilter(tableName, &req, rowFilterResolverFromContext(r))
 
 	// Determine if we need to include documents (when fields are requested OR filter_query is used)
 	hasFilterQuery := len(req.FilterQuery) > 0 && !bytes.Equal(req.FilterQuery, []byte("null"))
@@ -1103,15 +1102,6 @@ func (t *TableApi) ScanKeys(w http.ResponseWriter, r *http.Request, tableName st
 			resultCount++
 		}
 	}
-}
-
-func injectScanRowFilter(tableName string, req *ScanKeysRequest, resolve RowFilterResolver) {
-	scanQuery := QueryRequest{
-		Table:       tableName,
-		FilterQuery: req.FilterQuery,
-	}
-	injectRowFilter(&scanQuery, resolve)
-	req.FilterQuery = scanQuery.FilterQuery
 }
 
 func (t *TableApi) BatchWrite(w http.ResponseWriter, r *http.Request, tableName string) {
