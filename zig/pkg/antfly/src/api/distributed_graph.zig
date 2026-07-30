@@ -6790,17 +6790,28 @@ test "distributed graph edge reader carries identity generation" {
     };
 
     var state = TestState{};
+    var admission = GraphNodeAdmissionContext.init(
+        alloc,
+        FakeCatalog.iface(),
+        FakeWorker.iface(&state),
+        "docs",
+        0,
+        .{ .identity_read_generation = 12345 },
+        .{},
+        .read_index,
+    );
+    defer admission.deinit();
+
     const reader = DistributedEdgeReader{
         .catalog = FakeCatalog.iface(),
         .worker = FakeWorker.iface(&state),
-        .table_name = "docs",
+        .source_table = "docs",
         .index_name = "graph_idx",
-        .topology_epoch = 0,
-        .identity_read_generation = 12345,
         .consistency = .read_index,
+        .admission = &admission,
     };
 
-    const edges = try reader.getEdges(alloc, "doc:a", .out);
+    const edges = try reader.getEdges(alloc, null, "doc:a", .out);
     defer reader.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 0), edges.len);
     try std.testing.expectEqual(@as(u32, 1), state.calls);

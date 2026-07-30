@@ -1923,7 +1923,7 @@ test "lsm wal replay reads chunks into bounded pending buffer" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
         }

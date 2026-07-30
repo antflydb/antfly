@@ -122,12 +122,12 @@ const StorageHarness = struct {
             return self.backing.fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !lsm_backend.Storage.Trailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.counters.read_trailer += 1;
-            const bytes = try self.backing.readFileTrailerAlloc(allocator, path, len);
-            self.counters.read_bytes += bytes.len;
-            return bytes;
+            const trailer = try self.backing.readFileTrailerAlloc(allocator, path, len);
+            self.counters.read_bytes += trailer.bytes.len;
+            return trailer;
         }
 
         fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {

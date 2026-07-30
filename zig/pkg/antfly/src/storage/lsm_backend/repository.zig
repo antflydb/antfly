@@ -611,22 +611,22 @@ fn loadRunFooterWithStorage(
     allocator: Allocator,
     path: []const u8,
 ) !lsm_table_file.Footer {
-    const file_size = try storage.fileSize(path);
+    var trailer = try storage.readFileTrailerAlloc(
+        allocator,
+        path,
+        lsm_table_file.footer_len,
+    );
+    defer trailer.deinit(allocator);
+
+    const file_size = trailer.file_size;
     if (file_size > max_run_file_read_bytes) return error.FileTooBig;
     if (file_size < lsm_table_file.header_len + lsm_table_file.footer_len)
         return error.InvalidTableFile;
 
     const footer_offset_u64 = file_size - lsm_table_file.footer_len;
-    const footer_bytes = try storage.readFileRangeAlloc(
-        allocator,
-        path,
-        footer_offset_u64,
-        lsm_table_file.footer_len,
-    );
-    defer allocator.free(footer_bytes);
-    if (!lsm_table_file.hasFooterMagic(footer_bytes)) return error.UnsupportedVersion;
+    if (!lsm_table_file.hasFooterMagic(trailer.bytes)) return error.UnsupportedVersion;
 
-    const footer = try lsm_table_file.decodeFooterBytes(footer_bytes);
+    const footer = try lsm_table_file.decodeFooterBytes(trailer.bytes);
     const footer_offset: usize = @intCast(footer_offset_u64);
     if (footer.metadata_offset > footer_offset or
         footer.metadata_len != footer_offset - footer.metadata_offset)

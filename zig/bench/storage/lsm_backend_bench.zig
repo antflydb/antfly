@@ -201,7 +201,7 @@ const StorageHarness = struct {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !antfly.lsm_backend.Storage.Trailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.counters.read_trailer += 1;
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);

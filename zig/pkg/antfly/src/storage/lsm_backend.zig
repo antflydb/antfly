@@ -9118,7 +9118,7 @@ test "lsm backend persisted compaction streams run blocks without full run loads
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.isSourceRunPath(path)) self.source_trailer_reads += 1;
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
@@ -10186,7 +10186,7 @@ test "lsm backend shared cache owns loaded table allocations" {
             return self.backing.storage().readFileRangeAlloc(allocator, path, offset, len);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (std.mem.eql(u8, path, self.run_path)) try self.expectCacheAllocator(allocator);
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
@@ -10707,7 +10707,7 @@ test "lsm backend avoids full run table load on bloom negative" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -10893,7 +10893,7 @@ test "lsm backend no-cache point reads reuse local index and block cache" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -11065,7 +11065,7 @@ test "lsm backend multi-block point read skips directly to one candidate block" 
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -11251,7 +11251,7 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -11769,7 +11769,7 @@ test "lsm backend block filter avoids candidate block read on run-bloom false po
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -13649,7 +13649,7 @@ test "lsm repository loads v4 table index from trailer plus metadata read" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (std.mem.eql(u8, path, self.run_path)) self.run_trailer_reads += 1;
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);

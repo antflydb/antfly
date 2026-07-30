@@ -319,7 +319,20 @@ pub fn acquireNativePathLock(
     };
 }
 
+pub const FileTrailer = struct {
+    /// Bytes and size must describe the same pinned storage generation.
+    bytes: []u8,
+    file_size: u64,
+
+    pub fn deinit(self: *FileTrailer, allocator: Allocator) void {
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
 pub const Storage = struct {
+    pub const Trailer = FileTrailer;
+
     ptr: *anyopaque,
     vtable: *const VTable,
 
@@ -332,7 +345,9 @@ pub const Storage = struct {
         read_file_range_into: ?*const fn (*anyopaque, []const u8, u64, []u8) anyerror!void = null,
         read_file_range_at_most_into: ?*const fn (*anyopaque, []const u8, u64, []u8) anyerror!usize = null,
         file_size: *const fn (*anyopaque, []const u8) anyerror!u64,
-        read_file_trailer_alloc: ?*const fn (*anyopaque, Allocator, []const u8, usize) anyerror![]u8 = null,
+        /// Reads an exact suffix and reports the size already observed while
+        /// locating it, avoiding a separate metadata operation.
+        read_file_trailer_alloc: ?*const fn (*anyopaque, Allocator, []const u8, usize) anyerror!FileTrailer = null,
         write_file_absolute: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         append_file_absolute: ?*const fn (*anyopaque, []const u8, []const u8, bool) anyerror!void = null,
         begin_atomic_write: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!AtomicWriteSink = null,
@@ -405,14 +420,21 @@ pub const Storage = struct {
         return self.vtable.file_size(self.ptr, path);
     }
 
-    pub fn readFileTrailerAlloc(self: Storage, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+    pub fn readFileTrailerAlloc(self: Storage, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
         if (self.vtable.read_file_trailer_alloc) |read_file_trailer_alloc| {
-            return read_file_trailer_alloc(self.ptr, allocator, path, len);
+            var trailer = try read_file_trailer_alloc(self.ptr, allocator, path, len);
+            errdefer trailer.deinit(allocator);
+            if (trailer.bytes.len != len or trailer.file_size < len)
+                return error.EndOfStream;
+            return trailer;
         }
 
         const size = try self.fileSize(path);
         if (size < len) return error.EndOfStream;
-        return try self.readFileRangeAlloc(allocator, path, size - len, len);
+        return .{
+            .bytes = try self.readFileRangeAlloc(allocator, path, size - len, len),
+            .file_size = size,
+        };
     }
 
     pub fn writeFileAbsolute(self: Storage, path: []const u8, contents: []const u8) !void {
@@ -651,7 +673,7 @@ const FdCache = if (!supports_posix_fd_cache)
             return error.UnsupportedNativeStorageRuntime;
         }
 
-        pub fn readTrailerAlloc(_: *FdCache, _: Allocator, _: []const u8, _: usize) ![]u8 {
+        pub fn readTrailerAlloc(_: *FdCache, _: Allocator, _: []const u8, _: usize) !FileTrailer {
             return error.UnsupportedNativeStorageRuntime;
         }
 
@@ -758,7 +780,7 @@ else
             return try fileSizeFromFd(entry.fd);
         }
 
-        fn readTrailerAlloc(self: *FdCache, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readTrailerAlloc(self: *FdCache, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
             const entry = try self.retain(path);
             defer self.release(entry);
 
@@ -768,7 +790,7 @@ else
             const out = try allocator.alloc(u8, len);
             errdefer allocator.free(out);
             try readAllAtOffset(entry.fd, out, size - len);
-            return out;
+            return .{ .bytes = out, .file_size = size };
         }
 
         fn invalidatePath(self: *FdCache, path: []const u8) void {
@@ -1320,7 +1342,7 @@ else blk: {
                 };
             }
 
-            fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+            fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 if (comptime supports_posix_fd_cache) {
                     const state = try self.state.retain();
@@ -1524,7 +1546,7 @@ else blk: {
             return try fileSizeWithIo(retained.threaded.io(), path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
             const retained = try state.retain();
             defer retained.release();
@@ -1716,7 +1738,7 @@ fn fileSizeWithIo(io: anytype, path: []const u8) !u64 {
     return (try file.stat(io)).size;
 }
 
-fn readFileTrailerWithIo(io: anytype, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+fn readFileTrailerWithIo(io: anytype, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
     const file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
@@ -1731,7 +1753,7 @@ fn readFileTrailerWithIo(io: anytype, allocator: Allocator, path: []const u8, le
     const out = try allocator.alloc(u8, len);
     errdefer allocator.free(out);
     try reader.interface.readSliceAll(out);
-    return out;
+    return .{ .bytes = out, .file_size = size };
 }
 
 fn renamePathWithIo(io: anytype, old_path: []const u8, new_path: []const u8) !void {
@@ -2365,14 +2387,17 @@ fn memoryFileSize(ptr: *anyopaque, path: []const u8) !u64 {
     return stored.len;
 }
 
-fn memoryReadFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+fn memoryReadFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
     const self: *MemoryStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
 
     const stored = self.files.get(path) orelse return error.FileNotFound;
     if (stored.len < len) return error.EndOfStream;
-    return try allocator.dupe(u8, stored[stored.len - len ..]);
+    return .{
+        .bytes = try allocator.dupe(u8, stored[stored.len - len ..]),
+        .file_size = stored.len,
+    };
 }
 
 fn memoryWriteFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
@@ -2532,7 +2557,7 @@ test "host storage delegates through callbacks" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.trailer_reads += 1;
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
@@ -2600,9 +2625,10 @@ test "host storage delegates through callbacks" {
     const ell = try host.readFileRangeAlloc(std.testing.allocator, "/host/a.txt", 1, 3);
     defer std.testing.allocator.free(ell);
     try std.testing.expectEqualStrings("ell", ell);
-    const llo = try host.readFileTrailerAlloc(std.testing.allocator, "/host/a.txt", 3);
-    defer std.testing.allocator.free(llo);
-    try std.testing.expectEqualStrings("llo", llo);
+    var llo = try host.readFileTrailerAlloc(std.testing.allocator, "/host/a.txt", 3);
+    defer llo.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("llo", llo.bytes);
+    try std.testing.expectEqual(@as(u64, 5), llo.file_size);
     try std.testing.expectEqual(@as(usize, 1), host_ctx.trailer_reads);
 
     try host.renameAbsolute("/host/a.txt", "/host/b.txt");
