@@ -29,12 +29,17 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN_CANDIDATES = (
     REPO_ROOT / "zig-out" / "bin" / "antfly",
 )
+MANAGED_DOWNLOAD_IN_PROGRESS = ".antfly-download-in-progress"
+MANAGED_DOWNLOAD_PLAN = ".antfly-download-plan.json"
+MANAGED_DOWNLOAD_COMPLETE = ".antfly-download-complete.json"
+MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES = 16 * 1024 * 1024
+SUPPORTED_MODEL_SUFFIXES = (".gguf", ".onnx", ".safetensors")
 
 MODEL_TASKS = (
     "embedders",
@@ -359,16 +364,76 @@ def _model_path(spec: ModelSpec) -> Path:
 
 
 def _looks_like_model_dir(path: Path) -> bool:
-    if not path.exists():
+    if not path.is_dir():
         return False
-    for filename in ("config.json", "tokenizer.json", "genai_config.json", "antfly_metadata.json"):
-        if (path / filename).exists():
-            return True
-    if any(path.glob("*.gguf")):
-        return True
-    if (path / "onnx").is_dir():
-        return True
-    return False
+
+    if (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists() or (path / MANAGED_DOWNLOAD_PLAN).exists():
+        return False
+
+    completion_path = path / MANAGED_DOWNLOAD_COMPLETE
+    if completion_path.exists():
+        root = path.resolve()
+        try:
+            with completion_path.open(encoding="utf-8") as receipt:
+                serialized = receipt.read(MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES + 1)
+            if len(serialized) > MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES:
+                return False
+            completion = json.loads(serialized)
+            artifacts = completion["artifacts"]
+        except (OSError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
+            return False
+        if type(completion.get("version")) is not int or completion["version"] != 1:
+            return False
+        if not isinstance(artifacts, list) or not artifacts:
+            return False
+
+        has_supported_payload = False
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                return False
+            artifact_path = artifact.get("path")
+            artifact_size = artifact.get("size")
+            if not isinstance(artifact_path, str) or type(artifact_size) is not int or artifact_size < 0:
+                return False
+            relative = PurePosixPath(artifact_path)
+            if (
+                relative.is_absolute()
+                or not relative.parts
+                or any(part in ("", ".", "..") for part in relative.parts)
+                or "\\" in artifact_path
+            ):
+                return False
+            candidate = path.joinpath(*relative.parts)
+            try:
+                resolved = candidate.resolve(strict=True)
+                if not resolved.is_relative_to(root) or not resolved.is_file():
+                    return False
+                if resolved.stat().st_size != artifact_size:
+                    return False
+            except OSError:
+                return False
+            if candidate.name.endswith(SUPPORTED_MODEL_SUFFIXES):
+                has_supported_payload = True
+        return has_supported_payload and not (
+            (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists()
+            or (path / MANAGED_DOWNLOAD_PLAN).exists()
+        )
+
+    # Legacy or externally provisioned model directories do not have Antfly's
+    # completion receipt. Preserve compatibility while still rejecting an
+    # interrupted file that is visibly in progress.
+    has_supported_payload = False
+    for candidate in path.rglob("*"):
+        if not candidate.is_file():
+            continue
+        if candidate.name.endswith(".part"):
+            return False
+        if candidate.name.endswith(SUPPORTED_MODEL_SUFFIXES):
+            has_supported_payload = True
+    return has_supported_payload and not (
+        (path / MANAGED_DOWNLOAD_IN_PROGRESS).exists()
+        or (path / MANAGED_DOWNLOAD_PLAN).exists()
+    )
 
 
 def model_available(spec: ModelSpec) -> bool:
