@@ -66713,7 +66713,6 @@ test "db dense artifact rebuild resumes from persisted state" {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
-    const rebuild_state = backfill_state_mod.RebuildState.init(dense_index_path);
 
     {
         var interrupted = try DB.open(alloc, std.mem.span(path), .{
@@ -66723,6 +66722,8 @@ test "db dense artifact rebuild resumes from persisted state" {
         });
         defer interrupted.close();
 
+        const dense_entry = interrupted.core.index_manager.denseIndex("dense_idx") orelse return error.IndexNotFound;
+        const rebuild_state = interrupted.core.index_manager.rebuildState(.dense_vector, dense_index_path, dense_entry.config);
         const ResumeFailureCtx = struct {
             rebuild_state: backfill_state_mod.RebuildState,
             persisted_calls: usize = 0,
@@ -66776,6 +66777,8 @@ test "db dense artifact rebuild resumes from persisted state" {
         });
         defer resumed.close();
 
+        const dense_entry = resumed.core.index_manager.denseIndex("dense_idx") orelse return error.IndexNotFound;
+        const rebuild_state = resumed.core.index_manager.rebuildState(.dense_vector, dense_index_path, dense_entry.config);
         const rebuilt = try resumed.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
         try std.testing.expectEqual(@as(usize, 4), rebuilt);
 
@@ -67126,7 +67129,6 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
     var io_impl = threadedIo();
     defer io_impl.deinit();
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
-    const rebuild_state = backfill_state_mod.RebuildState.init(dense_index_path);
 
     {
         var interrupted = try DB.open(alloc, std.mem.span(path), .{
@@ -67136,6 +67138,8 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
         });
         defer interrupted.close();
 
+        const dense_entry = interrupted.core.index_manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        const rebuild_state = interrupted.core.index_manager.rebuildState(.dense_vector, dense_index_path, dense_entry.config);
         const ResumeFailureCtx = struct {
             rebuild_state: backfill_state_mod.RebuildState,
             persisted_calls: usize = 0,
@@ -67181,6 +67185,8 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
         });
         defer resumed.close();
 
+        const dense_entry = resumed.core.index_manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        const rebuild_state = resumed.core.index_manager.rebuildState(.dense_vector, dense_index_path, dense_entry.config);
         try std.testing.expect(try resumed.hasPendingDenseArtifactRebuild(alloc));
 
         const Capture = struct {
@@ -69072,6 +69078,8 @@ test "db graph reverse rebuild resumes after interrupted reopen" {
 
     graph_mod.test_abort_reverse_rebuild_after_batches = 1;
     defer graph_mod.test_abort_reverse_rebuild_after_batches = null;
+    var state_path: ?[]u8 = null;
+    defer if (state_path) |owned| alloc.free(owned);
     {
         // A per-index load failure no longer fails the whole open; the index
         // is quarantined with its error recorded and retried on next open.
@@ -69079,11 +69087,15 @@ test "db graph reverse rebuild resumes after interrupted reopen" {
         defer interrupted.close();
         const recorded = interrupted.core.index_manager.loadFailure("gr_v1") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
+
+        const cfg = interrupted.core.index_manager.get("gr_v1") orelse return error.IndexNotFound;
+        const rebuild_root = try interrupted.denseIndexRebuildStatePathAlloc(alloc, cfg.name);
+        defer alloc.free(rebuild_root);
+        const rebuild_state = interrupted.core.index_manager.rebuildState(.graph, rebuild_root, cfg.*);
+        state_path = try rebuild_state.pathAlloc(alloc);
     }
 
-    const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/gr_v1/rebuild.state", .{std.mem.span(path)});
-    defer alloc.free(state_path);
-    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024));
+    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024));
     defer alloc.free(interrupted_state);
     try std.testing.expect(interrupted_state.len > 0);
 
@@ -69092,7 +69104,7 @@ test "db graph reverse rebuild resumes after interrupted reopen" {
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024)));
 
     const incoming = try reopened.getEdges(alloc, "gr_v1", "doc:target", "links", .in);
     defer graph_mod.GraphIndex.freeEdges(alloc, incoming);
