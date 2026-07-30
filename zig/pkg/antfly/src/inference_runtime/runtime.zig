@@ -345,6 +345,8 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var tasks_csv: ?[]const u8 = null;
     var capabilities_csv: ?[]const u8 = null;
     var projector_selection: inference.registry.download.ProjectorSelection = .auto;
+    var max_artifact_bytes = inference.registry.download.default_max_artifact_bytes;
+    var max_model_bytes = inference.registry.download.default_max_model_bytes;
     var predictor_pull = false;
     var first_ai_only_flag: ?[]const u8 = null;
     var first_predictor_only_flag: ?[]const u8 = null;
@@ -399,6 +401,10 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             capabilities_csv = value;
         } else if (std.mem.eql(u8, arg, "--projector")) {
             projector_selection = inference.registry.download.parseProjectorSelection(value) orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--max-artifact-bytes")) {
+            max_artifact_bytes = try parsePositiveDownloadBytes(value);
+        } else if (std.mem.eql(u8, arg, "--max-model-bytes")) {
+            max_model_bytes = try parsePositiveDownloadBytes(value);
         } else {
             if (std.mem.eql(u8, arg, "--type") and (std.mem.eql(u8, value, "predictor") or std.mem.eql(u8, value, "predictors"))) predictor_pull = true;
             try passthrough.appendSlice(alloc, &.{ arg, value });
@@ -433,6 +439,11 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
 
     var reg = inference.registry.ModelRegistry.init(alloc, models_dir);
     defer reg.deinit();
+    const hub_config = inference.registry.download.HubConfig{
+        .token = token,
+        .max_artifact_bytes = max_artifact_bytes,
+        .max_model_bytes = max_model_bytes,
+    };
     for (refs.items) |ref| {
         if (variants_csv) |raw_variants| {
             var variants = std.mem.splitScalar(u8, raw_variants, ',');
@@ -443,11 +454,11 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
                 pulled_any = true;
                 const qualified_ref = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ ref, variant });
                 defer alloc.free(qualified_ref);
-                try pullOneModel(&reg, io, qualified_ref, token, tasks_csv, capabilities_csv, projector_selection);
+                try pullOneModel(&reg, io, qualified_ref, hub_config, tasks_csv, capabilities_csv, projector_selection);
             }
             if (!pulled_any) return error.InvalidArguments;
         } else {
-            try pullOneModel(&reg, io, ref, token, tasks_csv, capabilities_csv, projector_selection);
+            try pullOneModel(&reg, io, ref, hub_config, tasks_csv, capabilities_csv, projector_selection);
         }
     }
 }
@@ -456,20 +467,21 @@ fn pullOneModel(
     registry: *inference.registry.ModelRegistry,
     io: std.Io,
     ref: []const u8,
-    token: ?[]const u8,
+    hub_config: inference.registry.download.HubConfig,
     tasks_csv: ?[]const u8,
     capabilities_csv: ?[]const u8,
     projector_selection: inference.registry.download.ProjectorSelection,
 ) !void {
     std.debug.print("pulling {s}...\n", .{ref});
-    try registry.pull(io, ref, token, tasks_csv, capabilities_csv, projector_selection);
+    try registry.pull(io, ref, hub_config, tasks_csv, capabilities_csv, projector_selection);
     std.debug.print("done.\n", .{});
 }
 
 fn pullFlagTakesValue(arg: []const u8) bool {
     const flags = [_][]const u8{
-        "--variants", "--token", "--models-dir", "--ml-dir",    "--tasks",               "--capabilities", "--projector",
-        "--type",     "--name",  "--file",       "--framework", "--dead-leaf-threshold",
+        "--variants",  "--token",               "--models-dir",      "--ml-dir", "--tasks", "--capabilities",
+        "--projector", "--max-artifact-bytes",  "--max-model-bytes", "--type",   "--name",  "--file",
+        "--framework", "--dead-leaf-threshold",
     };
     for (flags) |flag| if (std.mem.eql(u8, arg, flag)) return true;
     return false;
@@ -480,7 +492,7 @@ const PullFlagDomain = enum { shared, ai, predictor };
 fn pullFlagDomain(arg: []const u8) PullFlagDomain {
     if (std.mem.eql(u8, arg, "--token")) return .shared;
     const ai_flags = [_][]const u8{
-        "--variants", "--models-dir", "--tasks", "--capabilities", "--projector",
+        "--variants", "--models-dir", "--tasks", "--capabilities", "--projector", "--max-artifact-bytes", "--max-model-bytes",
     };
     for (ai_flags) |flag| if (std.mem.eql(u8, arg, flag)) return .ai;
     return .predictor;
@@ -508,8 +520,14 @@ fn isHelpArg(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help");
 }
 
+fn parsePositiveDownloadBytes(value: []const u8) !u64 {
+    const parsed = try std.fmt.parseInt(u64, value, 10);
+    if (parsed == 0) return error.InvalidArguments;
+    return parsed;
+}
+
 fn printPullUsage() void {
-    std.debug.print("usage: antfly inference pull [--variants <csv>] <model-ref>... [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>] [--projector <auto|none|Q8_0|filename>]\n", .{});
+    std.debug.print("usage: antfly inference pull [--variants <csv>] <model-ref>... [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>] [--projector <auto|none|Q8_0|filename>] [--max-artifact-bytes <n>] [--max-model-bytes <n>]\n", .{});
     std.debug.print("       antfly inference pull hf:<owner>/<repo> --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{});
     std.debug.print("       antfly inference pull <https-url-to-tabular-artifact> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{});
     std.debug.print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
@@ -595,6 +613,8 @@ fn printUsage() void {
         \\  --tasks <list>   Comma-separated task hints for the pulled model
         \\  --capabilities <list> Comma-separated capability hints for the pulled model
         \\  --projector <value> Projector sidecar selection for GGUF pulls: auto, none, quant suffix, or filename
+        \\  --max-artifact-bytes <n> Maximum bytes accepted for one model artifact (default: 68719476736)
+        \\  --max-model-bytes <n> Maximum aggregate bytes accepted for one pull (default: 137438953472)
         \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>     Traditional ML directory for URL pulls (default: ~/.antfly/inference/ml)
         \\
@@ -617,6 +637,7 @@ test "inference pull recognizes help before model resolution" {
 test "inference pull classifies order independent value flags" {
     try std.testing.expect(pullFlagTakesValue("--variants"));
     try std.testing.expect(pullFlagTakesValue("--models-dir"));
+    try std.testing.expect(pullFlagTakesValue("--max-model-bytes"));
     try std.testing.expect(pullFlagTakesValue("--framework"));
     try std.testing.expect(!pullFlagTakesValue("--optimize"));
     try std.testing.expect(!pullFlagTakesValue("--unknown"));

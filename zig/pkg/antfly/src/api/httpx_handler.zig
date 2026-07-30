@@ -210,9 +210,15 @@ pub const AntflyApiHandler = struct {
         const runtime = backend_runtime orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
         var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
         const job_alloc = std.heap.page_allocator;
-        const owned_table_name = try job_alloc.dupe(u8, table_name);
+        const owned_table_name = job_alloc.dupe(u8, table_name) catch |err| {
+            std.log.warn("batch offload table-name allocation failed; executing inline err={s}", .{@errorName(err)});
+            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+        };
         defer job_alloc.free(owned_table_name);
-        const owned_body_data = try job_alloc.dupe(u8, body_data);
+        const owned_body_data = job_alloc.dupe(u8, body_data) catch |err| {
+            std.log.warn("batch offload body allocation failed; executing inline err={s}", .{@errorName(err)});
+            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+        };
         defer job_alloc.free(owned_body_data);
         var job = OffloadedTableBatch{
             .alloc = job_alloc,
@@ -220,7 +226,13 @@ pub const AntflyApiHandler = struct {
             .body_data = owned_body_data,
             .api = api,
         };
-        var future = try runtime_io.concurrent(OffloadedTableBatch.run, .{&job});
+        var future = runtime_io.concurrent(OffloadedTableBatch.run, .{&job}) catch |err| {
+            // Saturating the backend executor must not turn a valid write into
+            // an empty HTTP disconnect. The request still owns its buffers, so
+            // executing synchronously is a safe bounded degradation path.
+            std.log.warn("batch offload scheduling failed; executing inline err={s}", .{@errorName(err)});
+            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+        };
         while (!job.done.load(.acquire)) {
             ctx.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
         }

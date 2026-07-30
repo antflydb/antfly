@@ -226,7 +226,7 @@ pub const ModelRegistry = struct {
         self: *ModelRegistry,
         io: std.Io,
         ref_str: []const u8,
-        token: ?[]const u8,
+        hub_config: download.HubConfig,
         tasks_csv: ?[]const u8,
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
@@ -238,15 +238,25 @@ pub const ModelRegistry = struct {
         // Destination: models_dir/owner/name
         const dest = try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}", .{ resolved_models_dir, ref.owner, ref.name });
         defer self.allocator.free(dest);
+        try std.Io.Dir.cwd().createDirPath(io, dest);
+
+        const lock_path = try std.fs.path.join(self.allocator, &.{ dest, download.managed_download_lock_filename });
+        defer self.allocator.free(lock_path);
+        var download_lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{
+            .truncate = false,
+            .lock = .exclusive,
+        });
+        defer download_lock.close(io);
+
+        try download.beginManagedDownload(self.allocator, io, dest);
 
         var progress = ProgressPrinter{};
-        try download.downloadModel(self.allocator, io, ref.owner, ref.name, ref.variant, dest, .{
-            .token = token,
-        }, projector_selection, .{
+        try download.downloadModel(self.allocator, io, ref.owner, ref.name, ref.variant, dest, hub_config, projector_selection, .{
             .callback = ProgressPrinter.onProgress,
             .context = &progress,
         });
         try self.writePulledModelManifest(io, dest, tasks_csv, capabilities_csv);
+        try download.completeManagedDownload(self.allocator, io, dest);
     }
 
     fn appendDiscoveredModel(
@@ -864,27 +874,36 @@ fn synthesizePulledModelManifestJson(
 /// A model dir contains config.json, tokenizer.json, genai_config.json, a GGUF file, or an onnx/ subdir.
 fn isModelDir(io: Io, path: []const u8) bool {
     const allocator = if (build_options.link_libc) std.heap.c_allocator else std.heap.smp_allocator;
+    if (download.managedDownloadState(allocator, io, path) == .incomplete) {
+        return false;
+    }
+    const publicationStable = struct {
+        fn check(alloc: std.mem.Allocator, check_io: Io, model_path: []const u8) bool {
+            return !download.managedDownloadPublicationBlocked(alloc, check_io, model_path);
+        }
+    }.check;
     const indicators = [_][]const u8{ "config.json", "tokenizer.json", "genai_config.json", "antfly_metadata.json" };
     for (indicators) |filename| {
         const file_path = std.fs.path.join(allocator, &.{ path, filename }) catch continue;
         defer allocator.free(file_path);
         var f = Dir.cwd().openFile(io, file_path, .{}) catch continue;
         f.close(io);
-        return true;
+        return publicationStable(allocator, io, path);
     }
     // Check for top-level .gguf file
     var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return false;
     defer dir.close(io);
     var iter = dir.iterate();
     while (iter.next(io) catch null) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf")) return true;
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf"))
+            return publicationStable(allocator, io, path);
     }
     // Check for onnx/ subdirectory
     const onnx_path = std.fs.path.join(allocator, &.{ path, "onnx" }) catch return false;
     defer allocator.free(onnx_path);
     var onnx_dir = Dir.cwd().openDir(io, onnx_path, .{}) catch return false;
     onnx_dir.close(io);
-    return true;
+    return publicationStable(allocator, io, path);
 }
 
 test "parse model ref" {
@@ -959,6 +978,45 @@ test "discover skips empty owner subdirectories and keeps multistage readers" {
 
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqualStrings("monkt/paddleocr-onnx", models[0].name);
+}
+
+test "model discovery rejects incomplete or invalid managed downloads" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/owner/model");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model/.antfly-download-in-progress",
+        .data = "{\"version\":1,\"state\":\"in_progress\"}",
+    });
+
+    const model_dir = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/owner/model" },
+    );
+    defer allocator.free(model_dir);
+    try std.testing.expect(!isModelDir(io, model_dir));
+
+    try tmp.dir.deleteFile(io, "models/owner/model/.antfly-download-in-progress");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model/model.onnx",
+        .data = "payload",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model/.antfly-download-complete.json",
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"config.json\",\"size\":2},{\"path\":\"model.onnx\",\"size\":7}]}",
+    });
+    try std.testing.expect(isModelDir(io, model_dir));
+
+    try tmp.dir.deleteFile(io, "models/owner/model/model.onnx");
+    try std.testing.expect(!isModelDir(io, model_dir));
 }
 
 test "synthesized pulled manifest marks splade embedders as sparse" {
