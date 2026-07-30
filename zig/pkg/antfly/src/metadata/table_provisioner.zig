@@ -3352,8 +3352,9 @@ test "table provisioner schema progress returns not ready from rebuild marker wi
     defer alloc.free(db_path);
     const index_root = try std.fmt.allocPrint(alloc, "{s}/indexes/full_text_index_v2", .{db_path});
     defer alloc.free(index_root);
+    try fs_paths.createDirPathPortable(io_impl.io(), index_root);
     const rebuild_state = db_mod.backfill_state.RebuildState.init(index_root);
-    try rebuild_state.update("doc:m");
+    try rebuild_state.updateWithIo(io_impl.io(), "doc:m");
 
     // There is deliberately no DB at db_path. If the progress probe attempts
     // DB.open instead of trusting the durable marker, this call fails rather

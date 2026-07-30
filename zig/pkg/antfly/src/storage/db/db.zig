@@ -16656,7 +16656,7 @@ pub const DB = struct {
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
             const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
-            const persisted_resume = try rebuild_state.check(alloc);
+            const persisted_resume = try rebuild_state.checkWithIo(alloc, self.core.index_manager.checkpointIo());
             errdefer if (persisted_resume) |buf| alloc.free(buf);
             const projection_checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
             const config_hash = types.indexConfigHash(entry.config);
@@ -16724,7 +16724,7 @@ pub const DB = struct {
                     .trigger = .projection_generation_invalid,
                     .last_error = last_error,
                 });
-                if (candidate.persisted_resume != null) try rebuild_state.clear();
+                if (candidate.persisted_resume != null) try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                 continue;
             }
             if (candidate.artifact_counter_required and
@@ -16735,7 +16735,7 @@ pub const DB = struct {
                     .trigger = .artifact_counter_missing,
                     .last_error = "dense_artifact_counter_missing",
                 });
-                if (candidate.persisted_resume != null) try rebuild_state.clear();
+                if (candidate.persisted_resume != null) try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                 continue;
             }
             const artifact_target_count = if (target_counts.authoritative_targets.contains(dense_index_idx))
@@ -16756,7 +16756,7 @@ pub const DB = struct {
                     .trigger = .artifact_coverage_mismatch,
                     .last_error = "dense_artifact_coverage_surplus",
                 });
-                if (candidate.persisted_resume != null) try rebuild_state.clear();
+                if (candidate.persisted_resume != null) try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                 continue;
             }
             const already_repaired = denseCoverageMatchesTarget(active_count, artifact_target_count) and
@@ -16764,11 +16764,11 @@ pub const DB = struct {
 
             if (candidate.persisted_resume) |buf| {
                 if (artifact_target_count == 0) {
-                    try rebuild_state.clear();
+                    try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                     continue;
                 }
                 if (already_repaired) {
-                    try rebuild_state.clear();
+                    try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                     continue;
                 }
                 try targets.append(alloc, .{
@@ -16839,7 +16839,7 @@ pub const DB = struct {
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(self.alloc, entry.config.name);
             defer self.alloc.free(rebuild_root_path);
             const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
-            try rebuild_state.update(target.resume_from orelse "");
+            try rebuild_state.updateWithIo(self.core.index_manager.checkpointIo(), target.resume_from orelse "");
         }
     }
 
@@ -16862,7 +16862,7 @@ pub const DB = struct {
             const repaired = denseCoverageMatchesTarget(entry.index.stats().active_count, target.artifact_target_count) and
                 applied_sequence >= target_sequence;
             if (repaired) {
-                try rebuild_state.clear();
+                try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                 const checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.config.name);
                 try self.core.saveProjectionCheckpoint(entry.config.name, .{
                     .applied_sequence = applied_sequence,
@@ -16916,7 +16916,7 @@ pub const DB = struct {
                 const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
                 defer alloc.free(rebuild_root_path);
                 const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
-                try rebuild_state.clear();
+                try rebuild_state.clearWithIo(self.core.index_manager.checkpointIo());
                 try self.core.saveProjectionCheckpoint(entry.config.name, .{
                     .applied_sequence = target_sequence,
                     .status = .clean,
@@ -17217,7 +17217,7 @@ pub const DB = struct {
                     const rebuild_root_path = try persist.db.denseIndexRebuildStatePathAlloc(persist.alloc, entry.config.name);
                     defer persist.alloc.free(rebuild_root_path);
                     const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
-                    try rebuild_state.update(last_key);
+                    try rebuild_state.updateWithIo(persist.db.core.index_manager.checkpointIo(), last_key);
                     const owned_key = try persist.alloc.dupe(u8, last_key);
                     errdefer persist.alloc.free(owned_key);
                     if (target.resume_from) |resume_from| persist.alloc.free(resume_from);

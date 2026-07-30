@@ -6166,6 +6166,14 @@ fn collectLocalStoreStatusReport(
         const millis = std.math.clamp(avg_progress * 1000.0, 0.0, 1000.0);
         report.backfill_progress_millis = @intFromFloat(millis);
     }
+    report.runtime_statuses = try collectQuarantinedBackfillRuntimeStatuses(
+        alloc,
+        backfill_markers,
+        store.store_id,
+        store.node_id,
+        true,
+    );
+    errdefer metadata_table_manager.freeRuntimeGroupStatusReports(alloc, report.runtime_statuses);
     report.group_statuses = try metadata_table_manager.cloneGroupStatuses(alloc, group_statuses);
     return report;
 }
@@ -6185,7 +6193,13 @@ fn collectSharedRootLocalStoreStatusReports(
 ) ![]metadata_table_manager.StoreStatusReport {
     _ = service;
     var reports = try alloc.alloc(metadata_table_manager.StoreStatusReport, stores.len);
-    errdefer alloc.free(reports);
+    errdefer {
+        for (reports) |report| {
+            metadata_table_manager.freeGroupStatuses(alloc, report.group_statuses);
+            metadata_table_manager.freeRuntimeGroupStatusReports(alloc, report.runtime_statuses);
+        }
+        alloc.free(reports);
+    }
     for (stores, 0..) |store, i| {
         reports[i] = .{
             .store_id = store.store_id,
@@ -6206,6 +6220,10 @@ fn collectSharedRootLocalStoreStatusReports(
     var progress_sum = try alloc.alloc(f64, stores.len);
     defer alloc.free(progress_sum);
     @memset(progress_sum, 0.0);
+    var quarantined = try alloc.alloc(std.ArrayListUnmanaged(StoreStatusBackfillMarker), stores.len);
+    defer alloc.free(quarantined);
+    for (quarantined) |*list| list.* = .empty;
+    defer for (quarantined) |*list| list.deinit(alloc);
 
     for (backfill_markers) |marker| {
         if (marker.store_id != null) continue;
@@ -6219,6 +6237,7 @@ fn collectSharedRootLocalStoreStatusReports(
             &reports[report_index].active_backfills,
             &progress_sum[report_index],
         );
+        if (marker.state == .corrupt) try quarantined[report_index].append(alloc, marker);
     }
 
     for (reports, 0..) |*report, i| {
@@ -6229,6 +6248,15 @@ fn collectSharedRootLocalStoreStatusReports(
     }
     for (reports) |*report| {
         report.group_statuses = try metadata_table_manager.cloneGroupStatuses(alloc, group_statuses);
+    }
+    for (reports, 0..) |*report, i| {
+        report.runtime_statuses = try collectQuarantinedBackfillRuntimeStatuses(
+            alloc,
+            quarantined[i].items,
+            report.store_id,
+            stores[i].node_id,
+            true,
+        );
     }
     return reports;
 }
@@ -6762,7 +6790,21 @@ const StoreStatusBackfillMarker = struct {
     store_id: ?u64,
     group_id: u64,
     path: []const u8,
-    resume_key: ?[]const u8 = null,
+    state: State = .absent,
+
+    const State = union(enum) {
+        absent,
+        legacy,
+        corrupt,
+        valid: []const u8,
+
+        fn deinit(self: State, alloc: std.mem.Allocator) void {
+            switch (self) {
+                .valid => |resume_key| alloc.free(resume_key),
+                else => {},
+            }
+        }
+    };
 };
 
 const StoreStatusBackfillMarkerCache = struct {
@@ -6801,9 +6843,9 @@ fn maybeRefreshStoreStatusBackfillMarkerCache(
     if (!should_rescan) return;
 
     const markers = try collectStoreStatusBackfillMarkers(alloc, replica_root_dir);
-    const markers_missing_resume_keys = storeStatusBackfillMarkersHaveMissingResumeKeys(markers);
+    const markers_missing_state = storeStatusBackfillMarkersHaveMissingState(markers);
     cache.replace(alloc, markers, now_ms);
-    cache.rescan_requested = markers_missing_resume_keys;
+    cache.rescan_requested = markers_missing_state;
     probe_ticks.* = 0;
 }
 
@@ -6814,9 +6856,9 @@ fn refreshStoreStatusBackfillMarkerCacheNow(
     cache: *StoreStatusBackfillMarkerCache,
 ) !void {
     const markers = try collectStoreStatusBackfillMarkers(alloc, replica_root_dir);
-    const markers_missing_resume_keys = storeStatusBackfillMarkersHaveMissingResumeKeys(markers);
+    const markers_missing_state = storeStatusBackfillMarkersHaveMissingState(markers);
     cache.replace(alloc, markers, monotonicMs());
-    cache.rescan_requested = markers_missing_resume_keys;
+    cache.rescan_requested = markers_missing_state;
     probe_ticks.* = 0;
 }
 
@@ -6824,27 +6866,29 @@ fn monotonicMs() u64 {
     return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
 }
 
-fn scanStoreStatusBackfillMarkers(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]StoreStatusBackfillMarker {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    var root_dir = std.Io.Dir.cwd().openDir(io_impl.io(), replica_root_dir, .{ .iterate = true }) catch |err| switch (err) {
+fn scanStoreStatusBackfillMarkersWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    replica_root_dir: []const u8,
+) ![]StoreStatusBackfillMarker {
+    var root_dir = std.Io.Dir.cwd().openDir(io, replica_root_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return &.{},
         else => return err,
     };
-    defer root_dir.close(io_impl.io());
+    defer root_dir.close(io);
 
     var markers = std.ArrayListUnmanaged(StoreStatusBackfillMarker).empty;
     errdefer {
         for (markers.items) |marker| {
             alloc.free(marker.path);
-            if (marker.resume_key) |resume_key| alloc.free(resume_key);
+            marker.state.deinit(alloc);
         }
         markers.deinit(alloc);
     }
 
     var walker = try root_dir.walk(alloc);
     defer walker.deinit();
-    while (try walker.next(io_impl.io())) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, "/rebuild.state")) continue;
         const parsed = parseStoreStatusBackfillMarkerPath(entry.path) orelse continue;
@@ -6863,31 +6907,40 @@ fn scanStoreStatusBackfillMarkers(alloc: std.mem.Allocator, replica_root_dir: []
 
 fn loadStoreStatusBackfillMarkerResumeKeys(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     markers: []StoreStatusBackfillMarker,
 ) !void {
-    _ = try refreshStoreStatusBackfillMarkerResumeKeys(alloc, replica_root_dir, markers);
+    _ = try refreshStoreStatusBackfillMarkerResumeKeys(alloc, io, replica_root_dir, markers);
 }
 
 fn refreshStoreStatusBackfillMarkerResumeKeys(
     alloc: std.mem.Allocator,
+    io: std.Io,
     replica_root_dir: []const u8,
     markers: []StoreStatusBackfillMarker,
 ) !bool {
     var any_missing = false;
 
     for (markers) |*marker| {
-        if (marker.resume_key) |resume_key| {
-            alloc.free(resume_key);
-            marker.resume_key = null;
-        }
+        marker.state.deinit(alloc);
+        marker.state = .absent;
         const state_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, marker.path });
         defer alloc.free(state_path);
-        marker.resume_key = rebuildStateForPath(state_path).check(alloc) catch |err| switch (err) {
-            error.InvalidRebuildState => null,
-            else => return err,
+        var loaded = try rebuildStateForPath(state_path).loadWithIo(alloc, io);
+        marker.state = switch (loaded) {
+            .absent => .absent,
+            .legacy => .legacy,
+            .corrupt => blk: {
+                std.log.warn("derived index rebuild state quarantined path={s}", .{state_path});
+                break :blk .corrupt;
+            },
+            .valid => |resume_key| blk: {
+                loaded = undefined;
+                break :blk .{ .valid = resume_key };
+            },
         };
-        if (marker.resume_key == null) any_missing = true;
+        if (marker.state == .absent) any_missing = true;
     }
     return any_missing;
 }
@@ -6897,17 +6950,35 @@ fn rebuildStateForPath(path: []const u8) backfill_state_mod.RebuildState {
 }
 
 fn collectStoreStatusBackfillMarkers(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]StoreStatusBackfillMarker {
-    const markers = try scanStoreStatusBackfillMarkers(alloc, replica_root_dir);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const markers = try scanStoreStatusBackfillMarkersWithIo(alloc, io, replica_root_dir);
     errdefer freeStoreStatusBackfillMarkers(alloc, markers);
-    try loadStoreStatusBackfillMarkerResumeKeys(alloc, replica_root_dir, markers);
+    try loadStoreStatusBackfillMarkerResumeKeys(alloc, io, replica_root_dir, markers);
     return markers;
 }
 
-fn storeStatusBackfillMarkersHaveMissingResumeKeys(markers: []const StoreStatusBackfillMarker) bool {
+fn storeStatusBackfillMarkersHaveMissingState(markers: []const StoreStatusBackfillMarker) bool {
     for (markers) |marker| {
-        if (marker.resume_key == null) return true;
+        if (marker.state == .absent) return true;
     }
     return false;
+}
+
+fn backfillMarkerStateFileExistsWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    replica_root_dir: []const u8,
+    marker: StoreStatusBackfillMarker,
+) !bool {
+    const state_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, marker.path });
+    defer alloc.free(state_path);
+    std.Io.Dir.cwd().access(io, state_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 fn backfillMarkerStateFileExists(
@@ -6917,13 +6988,7 @@ fn backfillMarkerStateFileExists(
 ) !bool {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    const state_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, marker.path });
-    defer alloc.free(state_path);
-    std.Io.Dir.cwd().access(io_impl.io(), state_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    return true;
+    return try backfillMarkerStateFileExistsWithIo(alloc, io_impl.io(), replica_root_dir, marker);
 }
 
 fn maybeRequestStoreStatusBackfillMarkerRescan(
@@ -6936,12 +7001,14 @@ fn maybeRequestStoreStatusBackfillMarkerRescan(
     if (active_backfill_markers.len == 0) return;
     if (service.store_status_backfill_marker_cache.rescan_requested) return;
 
+    var io_impl = std.Io.Threaded.init(service.alloc, .{});
+    defer io_impl.deinit();
     for (active_backfill_markers) |marker| {
-        if (marker.resume_key == null) {
+        if (marker.state == .absent) {
             service.store_status_backfill_marker_cache.rescan_requested = true;
             return;
         }
-        if (!try backfillMarkerStateFileExists(service.alloc, replica_root_dir, marker)) {
+        if (!try backfillMarkerStateFileExistsWithIo(service.alloc, io_impl.io(), replica_root_dir, marker)) {
             service.store_status_backfill_marker_cache.rescan_requested = true;
             return;
         }
@@ -6951,7 +7018,7 @@ fn maybeRequestStoreStatusBackfillMarkerRescan(
 fn freeStoreStatusBackfillMarkers(alloc: std.mem.Allocator, markers: []const StoreStatusBackfillMarker) void {
     for (markers) |marker| {
         alloc.free(marker.path);
-        if (marker.resume_key) |resume_key| alloc.free(resume_key);
+        marker.state.deinit(alloc);
     }
     if (markers.len > 0) alloc.free(markers);
 }
@@ -6980,6 +7047,75 @@ fn storeStatusBackfillMarkerMatchesStore(marker: StoreStatusBackfillMarker, stor
     return include_unassigned;
 }
 
+fn collectQuarantinedBackfillRuntimeStatuses(
+    alloc: std.mem.Allocator,
+    markers: []const StoreStatusBackfillMarker,
+    store_id: u64,
+    node_id: u64,
+    include_unassigned: bool,
+) ![]metadata_table_manager.RuntimeGroupStatusReport {
+    var statuses = std.ArrayListUnmanaged(metadata_table_manager.RuntimeGroupStatusReport).empty;
+    errdefer {
+        for (statuses.items) |status| metadata_table_manager.freeRuntimeGroupStatusReport(alloc, status);
+        statuses.deinit(alloc);
+    }
+    for (markers) |marker| {
+        if (marker.state != .corrupt) continue;
+        if (!storeStatusBackfillMarkerMatchesStore(marker, store_id, include_unassigned)) continue;
+        const status = try quarantinedBackfillRuntimeStatus(alloc, marker, store_id, node_id);
+        errdefer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, status);
+        try statuses.append(alloc, status);
+    }
+    if (statuses.items.len == 0) {
+        statuses.deinit(alloc);
+        return &.{};
+    }
+    return try statuses.toOwnedSlice(alloc);
+}
+
+fn quarantinedBackfillRuntimeStatus(
+    alloc: std.mem.Allocator,
+    marker: StoreStatusBackfillMarker,
+    store_id: u64,
+    node_id: u64,
+) !metadata_table_manager.RuntimeGroupStatusReport {
+    const index_dir = std.fs.path.dirname(marker.path) orelse return error.InvalidBackfillMarkerPath;
+    const index_name = std.fs.path.basename(index_dir);
+    const table_name = try alloc.dupe(u8, "");
+    errdefer alloc.free(table_name);
+    const source = try alloc.dupe(u8, "rebuild_state_quarantine");
+    errdefer alloc.free(source);
+    const freshness = try alloc.dupe(u8, "quarantined");
+    errdefer alloc.free(freshness);
+    const projection_checkpoint_status = try alloc.dupe(u8, "clean");
+    errdefer alloc.free(projection_checkpoint_status);
+    const owned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(owned_index_name);
+    const index_kind = try alloc.dupe(u8, "unknown");
+    errdefer alloc.free(index_kind);
+    const indexes = try alloc.alloc(metadata_table_manager.RuntimeIndexStatusReport, 1);
+    errdefer alloc.free(indexes);
+    indexes[0] = .{
+        .name = owned_index_name,
+        .kind = index_kind,
+        .backfill_active = true,
+        .backfill_progress_millis = 0,
+    };
+
+    var status: metadata_table_manager.RuntimeGroupStatusReport = .{
+        .table_name = table_name,
+        .group_id = marker.group_id,
+        .store_id = store_id,
+        .node_id = node_id,
+        .source = source,
+        .freshness = freshness,
+        .index_count = 1,
+        .indexes = indexes,
+    };
+    status.enrichment.projection_checkpoint_status = projection_checkpoint_status;
+    return status;
+}
+
 fn accumulateStoreStatusBackfillProgress(
     alloc: std.mem.Allocator,
     ranges: []const metadata_table_manager.RangeRecord,
@@ -6989,7 +7125,10 @@ fn accumulateStoreStatusBackfillProgress(
 ) !void {
     const range = findRangeByGroupId(ranges, marker.group_id) orelse return;
     active_backfills.* += 1;
-    const resume_key = marker.resume_key orelse return;
+    const resume_key = switch (marker.state) {
+        .valid => |key| key,
+        .absent, .legacy, .corrupt => return,
+    };
     const range_start = try internal_keys.documentRangeLowerAlloc(alloc, range.start_key);
     defer alloc.free(range_start);
     const range_end = if (range.end_key) |key| try internal_keys.documentRangeUpperAlloc(alloc, key) else null;
@@ -10677,6 +10816,82 @@ test "metadata service cached backfill markers rescan immediately after disappea
         &service.store_status_backfill_marker_cache,
     );
     try std.testing.expectEqual(@as(usize, 0), service.store_status_backfill_marker_cache.markers.len);
+}
+
+test "metadata service caches corrupt rebuild state and publishes quarantine status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-corrupt-backfill-marker-cache", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(replica_root);
+    const index_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/group-9501/table-db/indexes/search_idx", .{replica_root});
+    defer std.testing.allocator.free(index_root);
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    try fs_paths.createDirPathPortable(io_impl.io(), index_root);
+    const rebuild_state = backfill_state_mod.RebuildState.init(index_root);
+    try rebuild_state.updateWithIo(io_impl.io(), "doc:m");
+    const state_path = try rebuild_state.pathAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(state_path);
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(
+        io_impl.io(),
+        state_path,
+        std.testing.allocator,
+        .limited(64 * 1024 + 64),
+    );
+    defer std.testing.allocator.free(encoded);
+    encoded[encoded.len - 1] ^= 0xff;
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = state_path, .data = encoded });
+
+    var cache = StoreStatusBackfillMarkerCache{};
+    defer cache.deinit(std.testing.allocator);
+    var probe_ticks: usize = 0;
+    try maybeRefreshStoreStatusBackfillMarkerCache(
+        std.testing.allocator,
+        replica_root,
+        0,
+        &probe_ticks,
+        &cache,
+    );
+    try std.testing.expectEqual(@as(usize, 1), cache.markers.len);
+    try std.testing.expect(cache.markers[0].state == .corrupt);
+    try std.testing.expect(!cache.rescan_requested);
+
+    const ranges = [_]metadata_table_manager.RangeRecord{
+        .{ .group_id = 9501, .table_id = 95, .start_key = "doc:a", .end_key = "doc:z" },
+    };
+    const report = try collectLocalStoreStatusReport(
+        .{},
+        std.testing.allocator,
+        replica_root,
+        .{ .store_id = 95, .node_id = 5 },
+        &ranges,
+        &.{},
+        cache.markers,
+    );
+    defer freeOwnedStoreStatusReport(std.testing.allocator, report);
+    try std.testing.expectEqual(@as(u32, 1), report.active_backfills);
+    try std.testing.expectEqual(@as(u16, 0), report.backfill_progress_millis);
+    try std.testing.expectEqual(@as(usize, 1), report.runtime_statuses.len);
+    try std.testing.expectEqualStrings("rebuild_state_quarantine", report.runtime_statuses[0].source);
+    try std.testing.expectEqualStrings("quarantined", report.runtime_statuses[0].freshness);
+    try std.testing.expectEqual(@as(usize, 1), report.runtime_statuses[0].indexes.len);
+    try std.testing.expectEqualStrings("search_idx", report.runtime_statuses[0].indexes[0].name);
+
+    cache.scanned_at_ms = monotonicMs();
+    const scanned_at_ms = cache.scanned_at_ms;
+    try rebuild_state.updateWithIo(io_impl.io(), "doc:z");
+    try maybeRefreshStoreStatusBackfillMarkerCache(
+        std.testing.allocator,
+        replica_root,
+        0,
+        &probe_ticks,
+        &cache,
+    );
+    try std.testing.expectEqual(scanned_at_ms, cache.scanned_at_ms);
+    try std.testing.expect(cache.markers[0].state == .corrupt);
 }
 
 test "metadata service does not rescan empty backfill markers before idle interval" {
