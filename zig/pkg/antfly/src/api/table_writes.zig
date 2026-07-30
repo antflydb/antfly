@@ -18418,7 +18418,7 @@ fn statusHasRuntimeFactsIgnoringMetadataSource(status: runtime_status.LocalTable
 
 fn cachedBestEffortStartupPlaceholderSource(source: runtime_status.RuntimeStatusSource) bool {
     return switch (source) {
-        .live_writer_publish, .background_refresh, .remote_store => false,
+        .live_writer_publish, .background_refresh, .remote_store, .rebuild_state_quarantine => false,
         .unknown, .synthetic_config, .cached_snapshot, .startup_catch_up => true,
     };
 }
@@ -18848,7 +18848,7 @@ fn markClearedStartupRuntimeStatus(status: *runtime_status.LocalTableRuntimeStat
     clearStartupRuntimeStatus(status);
     if (status.metadata.freshness == .fresh) {
         switch (status.metadata.source) {
-            .cached_snapshot, .live_writer_publish, .background_refresh, .remote_store => return,
+            .cached_snapshot, .live_writer_publish, .background_refresh, .remote_store, .rebuild_state_quarantine => return,
             .unknown, .synthetic_config, .startup_catch_up => {},
         }
     }

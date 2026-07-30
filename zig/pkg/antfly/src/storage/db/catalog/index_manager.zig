@@ -1932,7 +1932,7 @@ pub const IndexManager = struct {
 
     pub fn resetFullTextIndexForArtifactRebuild(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8) !u64 {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
-        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path);
 
         try entry.persistent.resetAllForRebuild();
         try rebuild_state.updateWithIo(self.checkpointIo(), "");
@@ -1976,7 +1976,7 @@ pub const IndexManager = struct {
         capacity_check: ?types.RepairCapacityCheck,
     ) !u64 {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
-        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path);
 
         try checkRepairCancelled(cancel_check);
         try entry.persistent.resetAllForRebuild();
@@ -3549,6 +3549,21 @@ pub const IndexManager = struct {
 
     pub fn checkpointIo(self: *const IndexManager) std.Io {
         return self.io orelse std.Io.Threaded.global_single_threaded.io();
+    }
+
+    fn rebuildState(
+        self: *const IndexManager,
+        kind: types.IndexKind,
+        root_path: []const u8,
+    ) backfill_state_mod.RebuildState {
+        const storage = switch (kind) {
+            .full_text => self.text_lsm_storage,
+            .dense_vector => self.dense_lsm_storage,
+            .sparse_vector => self.sparse_lsm_storage,
+            .graph => self.graph_lsm_storage,
+            .algebraic => null,
+        };
+        return backfill_state_mod.RebuildState.initWithStorage(root_path, storage);
     }
 
     const GeneratedArtifactCleanupPlan = struct {
@@ -7949,7 +7964,7 @@ pub const IndexManager = struct {
         if (builtin.is_test) test_text_backfill_invocations += 1;
         self.beginTextBackfill();
         defer self.endTextBackfill();
-        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
 
@@ -8147,7 +8162,7 @@ pub const IndexManager = struct {
     ) !void {
         self.beginTextBackfill();
         defer self.endTextBackfill();
-        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path);
 
         const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
         defer self.alloc.free(lower);
@@ -8917,7 +8932,7 @@ pub const IndexManager = struct {
                     self.alloc.free(persisted_ranges);
                 }
 
-                const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path);
                 var resume_from = rebuild_state.checkWithIo(self.alloc, self.checkpointIo()) catch |err| {
                     std.log.warn("full_text open failed step=rebuild_state_check name={s} err={s}", .{
                         cfg.name,
@@ -9144,7 +9159,7 @@ pub const IndexManager = struct {
                 index_moved = true;
                 errdefer self.freeSparseIndexEntry(&entry);
 
-                const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                const rebuild_state = self.rebuildState(.sparse_vector, entry.rebuild_root_path);
                 const resume_from = try rebuild_state.checkWithIo(self.alloc, self.checkpointIo());
                 defer if (resume_from) |buf| self.alloc.free(buf);
 
@@ -9242,7 +9257,7 @@ pub const IndexManager = struct {
                 graph_cfg_moved = true;
                 errdefer self.freeGraphIndexEntry(&entry);
 
-                const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                const rebuild_state = self.rebuildState(.graph, entry.rebuild_root_path);
                 const resume_from = try rebuild_state.checkWithIo(self.alloc, self.checkpointIo());
                 defer if (resume_from) |buf| self.alloc.free(buf);
                 const reverse_edges = (try entry.index.stats(self.alloc)).edge_count;
@@ -9260,7 +9275,13 @@ pub const IndexManager = struct {
                 if (allow_backfill and (resume_from != null or (has_replay_history and (reverse_store_missing or reverse_edges == 0) and !graph_replay_pending))) {
                     const backfill_started_ns = nowNs();
                     try rebuild_state.updateWithIo(self.checkpointIo(), if (resume_from) |buf| buf else "");
-                    _ = try entry.index.rebuildReverseFromOwnedOutgoingEdgesResume(self.alloc, self.byte_range.start, self.byte_range.end, resume_from);
+                    _ = try entry.index.rebuildReverseFromOwnedOutgoingEdgesResumeWithIo(
+                        self.alloc,
+                        self.checkpointIo(),
+                        self.byte_range.start,
+                        self.byte_range.end,
+                        resume_from,
+                    );
                     backfill_ns += elapsedSince(backfill_started_ns);
                 }
 
@@ -10376,7 +10397,7 @@ pub const IndexManager = struct {
     }
 
     fn backfillSparseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, resume_from: ?[]const u8) !void {
-        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        const rebuild_state = self.rebuildState(.sparse_vector, entry.rebuild_root_path);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
 

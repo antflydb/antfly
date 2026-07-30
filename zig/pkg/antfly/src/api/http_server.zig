@@ -2811,6 +2811,9 @@ pub const ApiHttpServer = struct {
 
     fn runtimeStatusSourceRank(source: runtime_status.RuntimeStatusSource) u8 {
         return switch (source) {
+            // A fresh observation that an integrity boundary failed must win
+            // over the last healthy runtime sample for the same group.
+            .rebuild_state_quarantine => 80,
             .live_writer_publish => 70,
             .startup_catch_up => 60,
             .background_refresh => 50,
@@ -2862,15 +2865,23 @@ pub const ApiHttpServer = struct {
         const indexes = try alloc.alloc(db_mod.types.DBIndexStats, report.indexes.len);
         var initialized: usize = 0;
         errdefer {
-            for (indexes[0..initialized]) |item| alloc.free(item.name);
+            for (indexes[0..initialized]) |item| {
+                alloc.free(item.name);
+                if (item.load_error) |value| alloc.free(value);
+            }
             if (indexes.len > 0) alloc.free(indexes);
         }
         for (report.indexes, 0..) |index, i| {
             const kind = parseRemoteIndexKind(index.kind);
             const dense_catch_up_active = kind == .dense_vector and report.async_dense_catch_up_active;
+            const name = try alloc.dupe(u8, index.name);
+            errdefer alloc.free(name);
+            const load_error = if (index.load_error) |value| try alloc.dupe(u8, value) else null;
+            errdefer if (load_error) |value| alloc.free(value);
             indexes[i] = .{
-                .name = try alloc.dupe(u8, index.name),
+                .name = name,
                 .kind = kind,
+                .load_error = load_error,
                 .doc_count = index.doc_count,
                 .term_count = index.term_count,
                 .edge_count = index.edge_count,
@@ -2902,7 +2913,7 @@ pub const ApiHttpServer = struct {
             .created_at_millis = report.created_at_millis,
             .metadata = .{
                 .updated_at_ns = report.updated_at_ns,
-                .source = .remote_store,
+                .source = parseRemoteRuntimeSource(report.source),
                 .freshness = parseRemoteRuntimeFreshness(report.freshness),
                 .topology_generation = report.topology_generation,
                 .lsm_root_generation = report.lsm_root_generation,
@@ -2997,6 +3008,11 @@ pub const ApiHttpServer = struct {
             if (std.mem.eql(u8, freshness, field.name)) return @enumFromInt(field.value);
         }
         return .remote_unknown;
+    }
+
+    fn parseRemoteRuntimeSource(source: []const u8) runtime_status.RuntimeStatusSource {
+        if (std.mem.eql(u8, source, "rebuild_state_quarantine")) return .rebuild_state_quarantine;
+        return .remote_store;
     }
 
     fn tableHasGroup(snapshot: *const metadata_api.AdminSnapshot, table_id: u64, group_id: u64) bool {
@@ -28305,6 +28321,30 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expect(status.stats.enrichment.stalled);
     try std.testing.expectEqual(@as(u64, 17), status.stats.enrichment.processed_requests);
     try std.testing.expectEqualStrings("rebuilding", status.stats.enrichment.projection_checkpoint_status);
+}
+
+test "remote rebuild quarantine preserves its source and index failure" {
+    const alloc = std.testing.allocator;
+    const report = metadata_table_manager.RuntimeGroupStatusReport{
+        .group_id = 10,
+        .store_id = 20,
+        .node_id = 30,
+        .source = "rebuild_state_quarantine",
+        .freshness = "failed",
+        .indexes = @constCast((&[_]metadata_table_manager.RuntimeIndexStatusReport{.{
+            .name = "search_idx",
+            .kind = "full_text",
+            .load_error = "InvalidRebuildState",
+        }})[0..]),
+    };
+
+    var status = try ApiHttpServer.localRuntimeStatusFromRemoteReport(alloc, report);
+    defer status.deinit(alloc);
+
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.rebuild_state_quarantine, status.metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.failed, status.metadata.freshness);
+    try std.testing.expectEqual(@as(usize, 1), status.stats.indexes.len);
+    try std.testing.expectEqualStrings("InvalidRebuildState", status.stats.indexes[0].load_error.?);
 }
 
 test "table storage status sums complete fresh shard disk usage" {

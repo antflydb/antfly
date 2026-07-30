@@ -1413,6 +1413,7 @@ fn findReadyRuntimeFullTextIndex(
     for (indexes) |index| {
         if (!std.mem.eql(u8, index.name, index_name)) continue;
         if (!std.mem.eql(u8, index.kind, "full_text")) return null;
+        if (index.load_error != null) return null;
         if (index.backfill_active) return null;
         if (index.replay_catch_up_required) return null;
         if (index.replay_applied_sequence < index.replay_target_sequence) return null;

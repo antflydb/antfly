@@ -12555,9 +12555,12 @@ fn runtimeIndexStatusReportFromLocalIndex(
     errdefer alloc.free(name);
     const kind = try alloc.dupe(u8, @tagName(index.kind));
     errdefer alloc.free(kind);
+    const load_error = if (index.load_error) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (load_error) |value| alloc.free(value);
     return .{
         .name = name,
         .kind = kind,
+        .load_error = load_error,
         .doc_count = index.doc_count,
         .term_count = index.term_count,
         .edge_count = index.edge_count,

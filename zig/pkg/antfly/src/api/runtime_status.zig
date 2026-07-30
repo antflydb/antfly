@@ -25,6 +25,7 @@ pub const RuntimeStatusSource = enum {
     background_refresh,
     startup_catch_up,
     remote_store,
+    rebuild_state_quarantine,
 };
 
 pub const RuntimeStatusFreshness = enum {
@@ -102,7 +103,7 @@ pub const LsmStorageStats = struct {
 
 pub fn statusHasRuntimeFacts(status: LocalTableRuntimeStatus) bool {
     return switch (status.metadata.source) {
-        .live_writer_publish, .background_refresh, .startup_catch_up, .remote_store => true,
+        .live_writer_publish, .background_refresh, .startup_catch_up, .remote_store, .rebuild_state_quarantine => true,
         .cached_snapshot, .unknown, .synthetic_config => statusStatsHaveRuntimeFacts(status.stats),
     };
 }

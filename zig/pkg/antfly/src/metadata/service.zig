@@ -6166,8 +6166,10 @@ fn collectLocalStoreStatusReport(
         const millis = std.math.clamp(avg_progress * 1000.0, 0.0, 1000.0);
         report.backfill_progress_millis = @intFromFloat(millis);
     }
-    report.runtime_statuses = try collectQuarantinedBackfillRuntimeStatuses(
+    report.runtime_statuses = try collectStoreRuntimeStatusesWithQuarantinedBackfills(
         alloc,
+        store.runtime_statuses,
+        ranges,
         backfill_markers,
         store.store_id,
         store.node_id,
@@ -6250,8 +6252,10 @@ fn collectSharedRootLocalStoreStatusReports(
         report.group_statuses = try metadata_table_manager.cloneGroupStatuses(alloc, group_statuses);
     }
     for (reports, 0..) |*report, i| {
-        report.runtime_statuses = try collectQuarantinedBackfillRuntimeStatuses(
+        report.runtime_statuses = try collectStoreRuntimeStatusesWithQuarantinedBackfills(
             alloc,
+            stores[i].runtime_statuses,
+            ranges,
             quarantined[i].items,
             report.store_id,
             stores[i].node_id,
@@ -7047,25 +7051,67 @@ fn storeStatusBackfillMarkerMatchesStore(marker: StoreStatusBackfillMarker, stor
     return include_unassigned;
 }
 
-fn collectQuarantinedBackfillRuntimeStatuses(
+const rebuild_state_quarantine_source = "rebuild_state_quarantine";
+const rebuild_state_quarantine_error = "InvalidRebuildState";
+
+fn collectStoreRuntimeStatusesWithQuarantinedBackfills(
     alloc: std.mem.Allocator,
+    existing: []const metadata_table_manager.RuntimeGroupStatusReport,
+    ranges: []const metadata_table_manager.RangeRecord,
     markers: []const StoreStatusBackfillMarker,
     store_id: u64,
     node_id: u64,
     include_unassigned: bool,
 ) ![]metadata_table_manager.RuntimeGroupStatusReport {
-    var statuses = std.ArrayListUnmanaged(metadata_table_manager.RuntimeGroupStatusReport).empty;
-    errdefer {
-        for (statuses.items) |status| metadata_table_manager.freeRuntimeGroupStatusReport(alloc, status);
-        statuses.deinit(alloc);
+    // Keep the data runtime's authoritative observations intact. Quarantine
+    // reports are reversible overlays: retaining the underlying report lets a
+    // repaired marker disappear immediately on the next scan without waiting
+    // for another data-server heartbeat.
+    var base = std.ArrayListUnmanaged(metadata_table_manager.RuntimeGroupStatusReport).empty;
+    errdefer freeOwnedRuntimeStatusList(alloc, &base);
+    for (existing) |status| {
+        if (std.mem.eql(u8, status.source, rebuild_state_quarantine_source)) continue;
+        const cloned = try metadata_table_manager.cloneRuntimeGroupStatusReport(alloc, status);
+        errdefer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, cloned);
+        try base.append(alloc, cloned);
     }
+
+    var overlays = std.ArrayListUnmanaged(metadata_table_manager.RuntimeGroupStatusReport).empty;
+    errdefer freeOwnedRuntimeStatusList(alloc, &overlays);
     for (markers) |marker| {
         if (marker.state != .corrupt) continue;
         if (!storeStatusBackfillMarkerMatchesStore(marker, store_id, include_unassigned)) continue;
-        const status = try quarantinedBackfillRuntimeStatus(alloc, marker, store_id, node_id);
-        errdefer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, status);
-        try statuses.append(alloc, status);
+
+        const overlay_index = findRuntimeStatusIndexByGroup(overlays.items, marker.group_id) orelse blk: {
+            var overlay = if (findRuntimeStatusIndexByGroup(base.items, marker.group_id)) |base_index|
+                try metadata_table_manager.cloneRuntimeGroupStatusReport(alloc, base.items[base_index])
+            else
+                try quarantinedBackfillRuntimeStatus(
+                    alloc,
+                    marker,
+                    findRangeByGroupId(ranges, marker.group_id),
+                    store_id,
+                    node_id,
+                );
+            errdefer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, overlay);
+            try replaceOwnedRuntimeStatusSource(alloc, &overlay, rebuild_state_quarantine_source);
+            try overlays.append(alloc, overlay);
+            break :blk overlays.items.len - 1;
+        };
+        try markRuntimeIndexQuarantined(alloc, &overlays.items[overlay_index], marker);
     }
+
+    var statuses = std.ArrayListUnmanaged(metadata_table_manager.RuntimeGroupStatusReport).empty;
+    errdefer freeOwnedRuntimeStatusList(alloc, &statuses);
+    try statuses.ensureTotalCapacity(alloc, overlays.items.len + base.items.len);
+    statuses.appendSliceAssumeCapacity(overlays.items);
+    overlays.items.len = 0;
+    statuses.appendSliceAssumeCapacity(base.items);
+    base.items.len = 0;
+    overlays.deinit(alloc);
+    overlays = .empty;
+    base.deinit(alloc);
+    base = .empty;
     if (statuses.items.len == 0) {
         statuses.deinit(alloc);
         return &.{};
@@ -7073,9 +7119,77 @@ fn collectQuarantinedBackfillRuntimeStatuses(
     return try statuses.toOwnedSlice(alloc);
 }
 
+fn freeOwnedRuntimeStatusList(
+    alloc: std.mem.Allocator,
+    statuses: *std.ArrayListUnmanaged(metadata_table_manager.RuntimeGroupStatusReport),
+) void {
+    for (statuses.items) |status| metadata_table_manager.freeRuntimeGroupStatusReport(alloc, status);
+    statuses.deinit(alloc);
+}
+
+fn findRuntimeStatusIndexByGroup(
+    statuses: []const metadata_table_manager.RuntimeGroupStatusReport,
+    group_id: u64,
+) ?usize {
+    for (statuses, 0..) |status, i| {
+        if (status.group_id == group_id) return i;
+    }
+    return null;
+}
+
+fn replaceOwnedRuntimeStatusSource(
+    alloc: std.mem.Allocator,
+    status: *metadata_table_manager.RuntimeGroupStatusReport,
+    source: []const u8,
+) !void {
+    if (std.mem.eql(u8, status.source, source)) return;
+    const next = try alloc.dupe(u8, source);
+    alloc.free(status.source);
+    status.source = next;
+}
+
+fn markRuntimeIndexQuarantined(
+    alloc: std.mem.Allocator,
+    status: *metadata_table_manager.RuntimeGroupStatusReport,
+    marker: StoreStatusBackfillMarker,
+) !void {
+    const index_dir = std.fs.path.dirname(marker.path) orelse return error.InvalidBackfillMarkerPath;
+    const index_name = std.fs.path.basename(index_dir);
+    for (status.indexes) |*index| {
+        if (!std.mem.eql(u8, index.name, index_name)) continue;
+        const load_error = try alloc.dupe(u8, rebuild_state_quarantine_error);
+        if (index.load_error) |previous| alloc.free(previous);
+        index.load_error = load_error;
+        index.coverage_summary_ready = false;
+        index.backfill_active = false;
+        index.backfill_progress_millis = 0;
+        index.replay_catch_up_required = false;
+        return;
+    }
+
+    const name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(name);
+    const kind = try alloc.dupe(u8, "unknown");
+    errdefer alloc.free(kind);
+    const load_error = try alloc.dupe(u8, rebuild_state_quarantine_error);
+    errdefer alloc.free(load_error);
+    const next = try alloc.alloc(metadata_table_manager.RuntimeIndexStatusReport, status.indexes.len + 1);
+    @memcpy(next[0..status.indexes.len], status.indexes);
+    next[status.indexes.len] = .{
+        .name = name,
+        .kind = kind,
+        .load_error = load_error,
+        .coverage_summary_ready = false,
+    };
+    if (status.indexes.len > 0) alloc.free(status.indexes);
+    status.indexes = next;
+    status.index_count = @intCast(next.len);
+}
+
 fn quarantinedBackfillRuntimeStatus(
     alloc: std.mem.Allocator,
     marker: StoreStatusBackfillMarker,
+    range: ?metadata_table_manager.RangeRecord,
     store_id: u64,
     node_id: u64,
 ) !metadata_table_manager.RuntimeGroupStatusReport {
@@ -7083,30 +7197,35 @@ fn quarantinedBackfillRuntimeStatus(
     const index_name = std.fs.path.basename(index_dir);
     const table_name = try alloc.dupe(u8, "");
     errdefer alloc.free(table_name);
-    const source = try alloc.dupe(u8, "rebuild_state_quarantine");
+    const source = try alloc.dupe(u8, rebuild_state_quarantine_source);
     errdefer alloc.free(source);
-    const freshness = try alloc.dupe(u8, "quarantined");
+    const freshness = try alloc.dupe(u8, "failed");
     errdefer alloc.free(freshness);
-    const projection_checkpoint_status = try alloc.dupe(u8, "clean");
+    const projection_checkpoint_status = try alloc.dupe(u8, "repair_required");
     errdefer alloc.free(projection_checkpoint_status);
     const owned_index_name = try alloc.dupe(u8, index_name);
     errdefer alloc.free(owned_index_name);
     const index_kind = try alloc.dupe(u8, "unknown");
     errdefer alloc.free(index_kind);
+    const load_error = try alloc.dupe(u8, rebuild_state_quarantine_error);
+    errdefer alloc.free(load_error);
     const indexes = try alloc.alloc(metadata_table_manager.RuntimeIndexStatusReport, 1);
     errdefer alloc.free(indexes);
     indexes[0] = .{
         .name = owned_index_name,
         .kind = index_kind,
-        .backfill_active = true,
+        .load_error = load_error,
+        .coverage_summary_ready = false,
         .backfill_progress_millis = 0,
     };
 
     var status: metadata_table_manager.RuntimeGroupStatusReport = .{
+        .table_id = if (range) |record| record.table_id else 0,
         .table_name = table_name,
         .group_id = marker.group_id,
         .store_id = store_id,
         .node_id = node_id,
+        .updated_at_ns = platform_clock.Clock.real().nowRealtimeMs() * std.time.ns_per_ms,
         .source = source,
         .freshness = freshness,
         .index_count = 1,
@@ -10861,12 +10980,44 @@ test "metadata service caches corrupt rebuild state and publishes quarantine sta
 
     const ranges = [_]metadata_table_manager.RangeRecord{
         .{ .group_id = 9501, .table_id = 95, .start_key = "doc:a", .end_key = "doc:z" },
+        .{ .group_id = 9502, .table_id = 96, .start_key = "doc:a", .end_key = "doc:z" },
+    };
+    var group_indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{
+        .{ .name = "search_idx", .kind = "full_text", .doc_count = 7 },
+        .{ .name = "healthy_peer_idx", .kind = "graph", .edge_count = 11 },
+    };
+    var unrelated_indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{
+        .{ .name = "unrelated_idx", .kind = "sparse_vector", .doc_count = 13 },
+    };
+    var existing_runtime_statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{
+        .{
+            .table_id = 95,
+            .table_name = "docs",
+            .group_id = 9501,
+            .store_id = 95,
+            .node_id = 5,
+            .source = "live_writer_publish",
+            .freshness = "fresh",
+            .index_count = 2,
+            .indexes = &group_indexes,
+        },
+        .{
+            .table_id = 96,
+            .table_name = "other",
+            .group_id = 9502,
+            .store_id = 95,
+            .node_id = 5,
+            .source = "live_writer_publish",
+            .freshness = "fresh",
+            .index_count = 1,
+            .indexes = &unrelated_indexes,
+        },
     };
     const report = try collectLocalStoreStatusReport(
         .{},
         std.testing.allocator,
         replica_root,
-        .{ .store_id = 95, .node_id = 5 },
+        .{ .store_id = 95, .node_id = 5, .runtime_statuses = &existing_runtime_statuses },
         &ranges,
         &.{},
         cache.markers,
@@ -10874,11 +11025,32 @@ test "metadata service caches corrupt rebuild state and publishes quarantine sta
     defer freeOwnedStoreStatusReport(std.testing.allocator, report);
     try std.testing.expectEqual(@as(u32, 1), report.active_backfills);
     try std.testing.expectEqual(@as(u16, 0), report.backfill_progress_millis);
-    try std.testing.expectEqual(@as(usize, 1), report.runtime_statuses.len);
+    try std.testing.expectEqual(@as(usize, 3), report.runtime_statuses.len);
     try std.testing.expectEqualStrings("rebuild_state_quarantine", report.runtime_statuses[0].source);
-    try std.testing.expectEqualStrings("quarantined", report.runtime_statuses[0].freshness);
-    try std.testing.expectEqual(@as(usize, 1), report.runtime_statuses[0].indexes.len);
+    try std.testing.expectEqualStrings("fresh", report.runtime_statuses[0].freshness);
+    try std.testing.expectEqual(@as(usize, 2), report.runtime_statuses[0].indexes.len);
     try std.testing.expectEqualStrings("search_idx", report.runtime_statuses[0].indexes[0].name);
+    try std.testing.expectEqualStrings(rebuild_state_quarantine_error, report.runtime_statuses[0].indexes[0].load_error.?);
+    try std.testing.expect(report.runtime_statuses[0].indexes[1].load_error == null);
+    try std.testing.expectEqualStrings("live_writer_publish", report.runtime_statuses[1].source);
+    try std.testing.expect(report.runtime_statuses[1].indexes[0].load_error == null);
+    try std.testing.expectEqual(@as(u64, 9502), report.runtime_statuses[2].group_id);
+    try std.testing.expectEqualStrings("unrelated_idx", report.runtime_statuses[2].indexes[0].name);
+
+    const repaired = try collectStoreRuntimeStatusesWithQuarantinedBackfills(
+        std.testing.allocator,
+        report.runtime_statuses,
+        &ranges,
+        &.{},
+        95,
+        5,
+        true,
+    );
+    defer metadata_table_manager.freeRuntimeGroupStatusReports(std.testing.allocator, repaired);
+    try std.testing.expectEqual(@as(usize, 2), repaired.len);
+    try std.testing.expectEqualStrings("live_writer_publish", repaired[0].source);
+    try std.testing.expect(repaired[0].indexes[0].load_error == null);
+    try std.testing.expectEqual(@as(u64, 9502), repaired[1].group_id);
 
     cache.scanned_at_ms = monotonicMs();
     const scanned_at_ms = cache.scanned_at_ms;

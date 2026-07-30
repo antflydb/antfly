@@ -816,6 +816,10 @@ pub const RuntimeDocSetPlanningStatusReport = struct {
 pub const RuntimeIndexStatusReport = struct {
     name: []const u8 = "",
     kind: []const u8 = "",
+    /// Stable error name for an index artifact that cannot be trusted or
+    /// loaded. This is index-scoped so one failed derived projection does not
+    /// make the other indexes in the same group appear unhealthy.
+    load_error: ?[]const u8 = null,
     doc_count: u64 = 0,
     term_count: u64 = 0,
     edge_count: u64 = 0,
@@ -2113,9 +2117,12 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
     errdefer alloc.free(name);
     const kind = try alloc.dupe(u8, record.kind);
     errdefer alloc.free(kind);
+    const load_error = if (record.load_error) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (load_error) |value| alloc.free(value);
     return .{
         .name = name,
         .kind = kind,
+        .load_error = load_error,
         .doc_count = record.doc_count,
         .term_count = record.term_count,
         .edge_count = record.edge_count,
@@ -2139,6 +2146,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
 pub fn freeRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIndexStatusReport) void {
     alloc.free(record.name);
     alloc.free(record.kind);
+    if (record.load_error) |value| alloc.free(value);
 }
 
 pub fn cloneRuntimeIndexStatusReports(alloc: std.mem.Allocator, records: []const RuntimeIndexStatusReport) ![]RuntimeIndexStatusReport {

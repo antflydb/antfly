@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../common/fs_paths.zig");
+const lsm_backend = @import("../lsm_backend/storage_io.zig");
 
 const rebuild_state_name = "rebuild.state";
 const rebuild_state_magic = "AFRBST01";
@@ -45,9 +46,14 @@ pub const LoadResult = union(enum) {
 
 pub const RebuildState = struct {
     root_path: []const u8,
+    storage: ?lsm_backend.Storage = null,
 
     pub fn init(root_path: []const u8) RebuildState {
         return .{ .root_path = root_path };
+    }
+
+    pub fn initWithStorage(root_path: []const u8, storage: ?lsm_backend.Storage) RebuildState {
+        return .{ .root_path = root_path, .storage = storage };
     }
 
     pub fn check(self: RebuildState, alloc: Allocator) !?[]u8 {
@@ -82,6 +88,15 @@ pub const RebuildState = struct {
         if (builtin.os.tag == .freestanding) return .absent;
         const path = try self.pathAlloc(alloc);
         defer alloc.free(path);
+        if (self.storage) |storage| {
+            const encoded = storage.readFileAlloc(alloc, path, rebuild_state_max_read_bytes) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => return .absent,
+                error.FileTooBig, error.StreamTooLong => return .corrupt,
+                else => return err,
+            };
+            defer alloc.free(encoded);
+            return try decodeLoadResult(alloc, encoded);
+        }
         return try loadPathWithIo(alloc, io, path);
     }
 
@@ -101,6 +116,16 @@ pub const RebuildState = struct {
         defer alloc.free(encoded);
         const path = try self.pathAlloc(alloc);
         defer alloc.free(path);
+
+        if (self.storage) |storage| {
+            var sink = try storage.beginAtomicWrite(alloc, path);
+            var sink_active = true;
+            defer if (sink_active) sink.abort();
+            try sink.appendSlice(encoded);
+            sink_active = false;
+            try sink.finish();
+            return;
+        }
 
         const tmp_path = try writeExclusiveTempStateFile(alloc, io, path, encoded);
         defer alloc.free(tmp_path);
@@ -128,6 +153,17 @@ pub const RebuildState = struct {
         if (builtin.os.tag == .freestanding) return;
         const path = try self.pathAlloc(std.heap.page_allocator);
         defer std.heap.page_allocator.free(path);
+        if (self.storage) |storage| {
+            storage.deleteFileAbsolute(path) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => return,
+                else => return err,
+            };
+            storage.syncParentAbsolute(path) catch |err| switch (err) {
+                error.DurableDirectorySyncUnsupported => return,
+                else => return error.RebuildStateDurabilityUncertain,
+            };
+            return;
+        }
         deleteFileWithIo(io, path) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => return,
             else => return err,
@@ -153,7 +189,10 @@ fn loadPathWithIo(alloc: Allocator, io: std.Io, path: []const u8) !LoadResult {
         else => return err,
     };
     defer alloc.free(encoded);
+    return try decodeLoadResult(alloc, encoded);
+}
 
+fn decodeLoadResult(alloc: Allocator, encoded: []const u8) !LoadResult {
     if (!std.mem.startsWith(u8, encoded, rebuild_state_magic)) {
         // The old on-disk format was exactly the raw resume key.
         return if (encoded.len <= rebuild_state_max_key_bytes) .legacy else .corrupt;
@@ -409,6 +448,29 @@ test "rebuild state update does not recreate vanished owner directory" {
     const state = RebuildState.init(path);
     try std.testing.expectError(error.RebuildStateOwnerStale, state.updateWithIo(std.testing.io, "doc:m"));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+}
+
+test "rebuild state uses injected durable storage" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const storage = memory.storage();
+    const state = RebuildState.initWithStorage("__test/indexes/search", storage);
+
+    try std.testing.expect((try state.checkWithIo(alloc, std.testing.io)) == null);
+    try state.updateWithIo(std.testing.io, "doc:m");
+    const loaded = (try state.checkWithIo(alloc, std.testing.io)) orelse return error.TestExpectedEqual;
+    defer alloc.free(loaded);
+    try std.testing.expectEqualStrings("doc:m", loaded);
+
+    const state_path = try state.pathAlloc(alloc);
+    defer alloc.free(state_path);
+    const encoded = try storage.readFileAlloc(alloc, state_path, rebuild_state_max_encoded_bytes);
+    defer alloc.free(encoded);
+    try std.testing.expectEqualStrings(rebuild_state_magic, encoded[0..rebuild_state_magic.len]);
+
+    try state.clearWithIo(std.testing.io);
+    try std.testing.expect((try state.checkWithIo(alloc, std.testing.io)) == null);
 }
 
 test "rebuild state estimates progress from resume key" {

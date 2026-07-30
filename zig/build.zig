@@ -5145,6 +5145,7 @@ pub fn build(b: *std.Build) void {
             "derived coverage evaluation is policy exact and observation gated",
             "derived coverage aggregation rejects mixed config observations",
             "index status exposes compact repair state without internal diagnostics",
+            "rebuild quarantine remains an explicit failed public index status",
             "index repair aggregation exposes a waiting shard over rebuilding shards",
             "derived coverage aggregation rejects stale index incarnations",
             "derived coverage reasons expose counter mismatch",
@@ -5169,6 +5170,7 @@ pub fn build(b: *std.Build) void {
             "api http server join planner uses complete fresh local stats before metadata publication",
             "external embeddings index readiness does not require table doc coverage",
             "api http server preserves public query availability errors",
+            "remote rebuild quarantine preserves its source and index failure",
             "api http server create index waits for exact target config projection",
         },
         .test_runner = .{

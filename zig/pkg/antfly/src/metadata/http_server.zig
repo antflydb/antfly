@@ -2137,6 +2137,7 @@ const ParsedGroupStatus = struct {
 const ParsedRuntimeIndexStatus = struct {
     name: ?[]const u8 = null,
     kind: ?[]const u8 = null,
+    load_error: ?[]const u8 = null,
     doc_count: ?u64 = null,
     term_count: ?u64 = null,
     edge_count: ?u64 = null,
@@ -2466,9 +2467,12 @@ fn cloneParsedRuntimeIndexStatus(
     errdefer alloc.free(name);
     const kind = try alloc.dupe(u8, parsed.kind orelse "");
     errdefer alloc.free(kind);
+    const load_error = if (parsed.load_error) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (load_error) |value| alloc.free(value);
     return .{
         .name = name,
         .kind = kind,
+        .load_error = load_error,
         .doc_count = parsed.doc_count orelse 0,
         .term_count = parsed.term_count orelse 0,
         .edge_count = parsed.edge_count orelse 0,
