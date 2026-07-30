@@ -522,7 +522,7 @@ fn parseTransformOps(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
             .path = path,
             .value_json = value_json,
         };
-        db_mod.transform.validateDocumentTransform(.{
+        db_mod.transform.validateDocumentTransform(alloc, .{
             .key = "",
             .operations = @constCast((&[_]db_mod.types.TransformOp{parsed_op})[0..]),
         }) catch return error.InvalidBatchRequest;

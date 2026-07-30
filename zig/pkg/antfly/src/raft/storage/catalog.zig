@@ -275,6 +275,7 @@ pub fn eqlReplicaRecord(left: ReplicaRecord, right: ReplicaRecord) bool {
     if (left.backup_restore_bootstrap) |backup| {
         const other = right.backup_restore_bootstrap.?;
         if (!std.mem.eql(u8, backup.backup_id, other.backup_id)) return false;
+        if (!std.mem.eql(u8, backup.artifact_backup_id, other.artifact_backup_id)) return false;
         if (!std.mem.eql(u8, backup.location, other.location)) return false;
         if (!std.mem.eql(u8, backup.snapshot_path, other.snapshot_path)) return false;
         if (!std.mem.eql(u8, backup.connection, other.connection)) return false;
@@ -920,6 +921,52 @@ test "replica catalog rejects invalid backup restore authority and integrity bin
     const records = try iface.listReplicas(std.testing.allocator);
     defer freeReplicaRecords(std.testing.allocator, records);
     try std.testing.expectEqual(@as(usize, 0), records.len);
+}
+
+test "replica catalog persists artifact authority-only updates" {
+    var replica_catalog = MemoryReplicaCatalog.init(std.testing.allocator);
+    defer replica_catalog.deinit();
+    const iface = replica_catalog.catalog();
+    const hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    try iface.upsertReplica(.{
+        .group_id = 11,
+        .replica_id = 1,
+        .local_node_id = 3,
+        .backup_restore_bootstrap = .{
+            .backup_id = "logical-backup",
+            .artifact_backup_id = "artifact-v1",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "logical-backup/groups/11",
+            .connection = "backup-store",
+            .artifact_size_bytes = 1,
+            .artifact_sha256 = hash,
+        },
+    });
+    const first_revision = iface.revision();
+    try iface.upsertReplica(.{
+        .group_id = 11,
+        .replica_id = 1,
+        .local_node_id = 3,
+        .backup_restore_bootstrap = .{
+            .backup_id = "logical-backup",
+            .artifact_backup_id = "artifact-v2",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "logical-backup/groups/11",
+            .connection = "backup-store",
+            .artifact_size_bytes = 1,
+            .artifact_sha256 = hash,
+        },
+    });
+
+    try std.testing.expect(iface.revision() > first_revision);
+    const records = try iface.listReplicas(std.testing.allocator);
+    defer freeReplicaRecords(std.testing.allocator, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqualStrings(
+        "artifact-v2",
+        records[0].backup_restore_bootstrap.?.artifact_backup_id,
+    );
 }
 
 test "memory replica catalog stores and lists records" {

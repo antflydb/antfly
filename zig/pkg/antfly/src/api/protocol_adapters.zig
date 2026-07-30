@@ -1469,12 +1469,22 @@ fn buildA2aDispatcher(
         }
     };
 
+    const task_authority = try std.fmt.allocPrint(
+        dispatcher_alloc,
+        "{s}:{d}:{s}",
+        .{
+            @tagName(query_embedding_security_scope.domain),
+            query_embedding_security_scope.value.len,
+            query_embedding_security_scope.value,
+        },
+    );
     var dispatcher = a2a.Dispatcher{
         .io = server_ptr.inferenceIo(),
         .name = "Antfly",
         .version = "1.0.0",
         .base_url = routes.Routes.a2a,
         .task_store = server_ptr.a2a_tasks.iface(),
+        .task_authority = task_authority,
     };
     const contexts = try dispatcher_alloc.alloc(HandlerContext, 2);
     contexts[0] = .{

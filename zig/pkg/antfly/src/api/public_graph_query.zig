@@ -423,6 +423,8 @@ fn parseSupportedPatternSteps(
     alloc: std.mem.Allocator,
     value: []const indexes_openapi.PatternStep,
 ) ![]const graph_pattern_mod.PatternStep {
+    if (value.len == 0 or value.len > graph_pattern_mod.max_pattern_steps)
+        return error.InvalidQueryRequest;
     const steps = try alloc.alloc(graph_pattern_mod.PatternStep, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -472,6 +474,14 @@ fn parseSupportedPatternSteps(
                 .types = edge_types,
             },
         };
+        if (step.edge != null and
+            (steps[i].edge.min_hops == 0 or
+                steps[i].edge.max_hops == 0 or
+                steps[i].edge.min_hops > steps[i].edge.max_hops or
+                steps[i].edge.max_hops > graph_pattern_mod.max_pattern_hops))
+        {
+            return error.InvalidQueryRequest;
+        }
         initialized += 1;
     }
     return steps;

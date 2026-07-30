@@ -2816,7 +2816,7 @@ pub const BoundTableReadSource = struct {
                     var result = try self.reads.searchWithConsistency(alloc, self.db, search_req, consistency);
                     defer result.deinit();
                     var graph_result = if (result.graph_results.len > 0)
-                        try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
+                        try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
                     else
                         try distributed_graph.emptyGraphSearchResult(alloc, req.name);
                     for (graph_result.hits) |*hit| hit.deinit(alloc);
@@ -3410,7 +3410,7 @@ pub const ProvisionedTableReadSource = struct {
                     var result = try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, search_req, consistency);
                     defer result.deinit();
                     var graph_result = if (result.graph_results.len > 0)
-                        try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
+                        try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
                     else
                         try distributed_graph.emptyGraphSearchResult(alloc, req.name);
                     for (graph_result.hits) |*hit| hit.deinit(alloc);
@@ -4384,7 +4384,7 @@ pub const HostedProvisionedTableReadSource = struct {
                             var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency);
                             defer result.deinit();
                             var graph_result = if (result.graph_results.len > 0)
-                                try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
+                                try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
                             else
                                 try distributed_graph.emptyGraphSearchResult(alloc, req.name);
                             for (graph_result.hits) |*hit| hit.deinit(alloc);
@@ -5739,7 +5739,7 @@ fn executeProvisionedGraphExpand(
                 var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency);
                 defer result.deinit();
                 var graph_result = if (result.graph_results.len > 0)
-                    try distributed_graph.filterGraphSearchResult(alloc, result.graph_results[0], req.exclude_keys, req.exclude_edges)
+                    try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
                 else
                     try distributed_graph.emptyGraphSearchResult(alloc, req.name);
                 for (graph_result.hits) |*hit| hit.deinit(alloc);

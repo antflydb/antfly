@@ -4612,7 +4612,12 @@ fn toOpenApiPatternMatches(
                 .table = binding.node.table,
                 .depth = @intCast(binding.node.depth),
                 .distance = binding.node.distance,
-                .document = findGraphDocument(alloc, graph_result.hits, binding.node.key),
+                .document = findGraphDocument(
+                    alloc,
+                    graph_result.hits,
+                    binding.node.key,
+                    binding.node.table,
+                ),
                 .path = binding.node.path,
                 .path_edges = try toOpenApiOptionalPathEdges(alloc, binding.node.path_edges),
                 .provenance = binding.node.provenance,
@@ -4639,7 +4644,7 @@ fn toOpenApiGraphNodes(
             .table = node.table,
             .depth = @intCast(node.depth),
             .distance = node.distance,
-            .document = findGraphDocument(alloc, graph_result.hits, node.key),
+            .document = findGraphDocument(alloc, graph_result.hits, node.key, node.table),
             .path = node.path,
             .path_edges = try toOpenApiOptionalPathEdges(alloc, node.path_edges),
             .provenance = node.provenance,
@@ -4654,9 +4659,14 @@ fn findGraphDocument(
     alloc: std.mem.Allocator,
     hits: []const db_mod.types.SearchHit,
     key: []const u8,
+    table: ?[]const u8,
 ) ?std.json.Value {
     for (hits) |hit| {
         if (!std.mem.eql(u8, hit.id, key)) continue;
+        if ((hit.source_table == null) != (table == null)) continue;
+        if (table) |table_name| {
+            if (!std.mem.eql(u8, hit.source_table.?, table_name)) continue;
+        }
         const stored_data = hit.stored_data orelse return null;
         const parsed = std.json.parseFromSlice(std.json.Value, alloc, stored_data, .{}) catch return null;
         return parsed.value;
@@ -4857,6 +4867,37 @@ test "api query contract preserves algebraic graph path provenance" {
     try std.testing.expectEqual(@as(i64, 2), mention_rollup.get("mention_count").?.integer);
     try std.testing.expectEqual(@as(usize, 2), mention_rollup.get("mention_artifact_keys").?.array.items.len);
     try std.testing.expectEqualStrings("m2", mention_rollup.get("mention_artifact_keys").?.array.items[1].string);
+}
+
+test "api query contract hydrates equal graph keys from their table namespace" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const alloc = arena_impl.allocator();
+    const hits = [_]db_mod.types.SearchHit{
+        .{
+            .id = @constCast("shared"),
+            .stored_data = @constCast("{\"origin\":\"docs\"}"),
+        },
+        .{
+            .id = @constCast("shared"),
+            .source_table = @constCast("entities"),
+            .stored_data = @constCast("{\"origin\":\"entities\"}"),
+        },
+    };
+
+    const local = findGraphDocument(alloc, &hits, "shared", null) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(
+        "docs",
+        local.object.get("origin").?.string,
+    );
+    const external = findGraphDocument(alloc, &hits, "shared", "entities") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(
+        "entities",
+        external.object.get("origin").?.string,
+    );
+    try std.testing.expect(findGraphDocument(alloc, &hits, "shared", "missing") == null);
 }
 
 fn buildProfileValue(
@@ -7730,6 +7771,8 @@ fn parsePatternSteps(
     alloc: std.mem.Allocator,
     value: []const indexes_openapi.PatternStep,
 ) ![]const graph_pattern_mod.PatternStep {
+    if (value.len == 0 or value.len > graph_pattern_mod.max_pattern_steps)
+        return error.InvalidQueryRequest;
     const steps = try alloc.alloc(graph_pattern_mod.PatternStep, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -7779,6 +7822,14 @@ fn parsePatternSteps(
                 .types = edge_types,
             },
         };
+        if (step.edge != null and
+            (steps[i].edge.min_hops == 0 or
+                steps[i].edge.max_hops == 0 or
+                steps[i].edge.min_hops > steps[i].edge.max_hops or
+                steps[i].edge.max_hops > graph_pattern_mod.max_pattern_hops))
+        {
+            return error.InvalidQueryRequest;
+        }
         initialized += 1;
     }
     return steps;

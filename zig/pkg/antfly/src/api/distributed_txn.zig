@@ -1060,7 +1060,7 @@ fn parseTxnTransforms(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
                 .value_json = if (op_obj.get("value")) |raw_value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(raw_value, .{})}) else null,
             };
             ops_initialized += 1;
-            db_mod.transform.validateDocumentTransform(.{
+            db_mod.transform.validateDocumentTransform(alloc, .{
                 .key = key,
                 .operations = ops[i .. i + 1],
             }) catch return error.InvalidTxnRequest;

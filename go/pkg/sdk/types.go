@@ -531,12 +531,12 @@ const (
 	JoinTypeRight = oapi.JoinTypeRight
 
 	// TransformOpType values
-	TransformOpTypeSet         = oapi.TransformOpTypeSet
-	TransformOpTypeSetOnInsert = oapi.TransformOpTypeSetOnInsert
-	TransformOpTypeUnset       = oapi.TransformOpTypeUnset
-	TransformOpTypeInc         = oapi.TransformOpTypeInc
-	TransformOpTypeMax         = oapi.TransformOpTypeMax
-	TransformOpTypeAddToSet    = oapi.TransformOpTypeAddToSet
+	TransformOpTypeSet         = oapi.TransformOpTypeSET
+	TransformOpTypeSetOnInsert = oapi.TransformOpTypeSETONINSERT
+	TransformOpTypeUnset       = oapi.TransformOpTypeUNSET
+	TransformOpTypeInc         = oapi.TransformOpTypeINC
+	TransformOpTypeMax         = oapi.TransformOpTypeMAX
+	TransformOpTypeAddToSet    = oapi.TransformOpTypeADDTOSET
 
 	// SyncLevelEmbeddings is a compatibility alias for waiting on all managed index writes.
 	SyncLevelEmbeddings = oapi.SyncLevelFullIndex

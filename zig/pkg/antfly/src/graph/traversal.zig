@@ -28,6 +28,7 @@ const EdgeDirection = graph_mod.EdgeDirection;
 const GraphIndex = graph_mod.GraphIndex;
 const NodeAdmission = @import("node_admission.zig").NodeAdmission;
 const NodeRef = @import("node_admission.zig").NodeRef;
+const node_identity = @import("node_identity.zig");
 
 // ============================================================================
 // Traversal types
@@ -77,6 +78,13 @@ const QueueEntry = struct {
     total_weight: f64,
     path: ?std.ArrayListUnmanaged([]const u8),
     target_table: ?[]const u8 = null,
+
+    fn deinit(self: *QueueEntry, alloc: Allocator) void {
+        alloc.free(self.key);
+        if (self.target_table) |table| alloc.free(table);
+        if (self.path) |path| freeQueuePath(alloc, path);
+        self.* = undefined;
+    }
 };
 
 /// Perform BFS graph traversal from start_key using the given rules.
@@ -94,92 +102,69 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
         }
     }
 
-    var visited = std.StringHashMapUnmanaged(void).empty;
-    defer {
-        var it = visited.keyIterator();
-        while (it.next()) |k| alloc.free(k.*);
-        visited.deinit(alloc);
-    }
+    var visited = node_identity.Map(void){};
+    defer visited.deinit(alloc);
 
     // Queue
     var queue = std.ArrayListUnmanaged(QueueEntry).empty;
-    defer queue.deinit(alloc);
     var queue_head: usize = 0;
+    defer {
+        for (queue.items[queue_head..]) |*entry| entry.deinit(alloc);
+        queue.deinit(alloc);
+    }
 
     // Seed with start node
-    const start_dup = try alloc.dupe(u8, start_key);
+    var start_entry = QueueEntry{
+        .key = try alloc.dupe(u8, start_key),
+        .depth = 0,
+        .total_weight = 1.0,
+        .path = null,
+    };
+    var start_entry_owned = true;
+    errdefer if (start_entry_owned) start_entry.deinit(alloc);
     var start_path: ?std.ArrayListUnmanaged([]const u8) = null;
     if (rules.include_paths) {
         start_path = std.ArrayListUnmanaged([]const u8).empty;
-        try start_path.?.append(alloc, try alloc.dupe(u8, start_key));
+        const path_key = try alloc.dupe(u8, start_key);
+        start_path.?.append(alloc, path_key) catch |err| {
+            alloc.free(path_key);
+            return err;
+        };
     }
-
-    try queue.append(alloc, .{
-        .key = start_dup,
-        .depth = 0,
-        .total_weight = 1.0,
-        .path = start_path,
-    });
+    start_entry.path = start_path;
+    try queue.append(alloc, start_entry);
+    start_entry_owned = false;
 
     if (rules.deduplicate) {
-        try visited.put(alloc, try alloc.dupe(u8, start_key), {});
+        _ = try visited.putIfAbsent(alloc, .{ .table = null, .key = start_key }, {});
     }
 
     while (queue_head < queue.items.len) {
         // Dequeue from front (index-tracked)
-        const current = queue.items[queue_head];
+        var current = queue.items[queue_head];
         queue_head += 1;
-        defer alloc.free(current.key);
-        defer if (current.target_table) |tt| alloc.free(tt);
+        defer current.deinit(alloc);
 
         // Add to results (skip depth 0 = start node)
         if (current.depth > 0) {
-            var path_slice: ?[]const []const u8 = null;
-            if (current.path) |p| {
-                const duped = try alloc.alloc([]const u8, p.items.len);
-                for (p.items, 0..) |s, i| {
-                    duped[i] = try alloc.dupe(u8, s);
-                }
-                path_slice = duped;
-            }
-            try results.append(alloc, .{
-                .key = try alloc.dupe(u8, current.key),
-                .depth = current.depth,
-                .total_weight = current.total_weight,
-                .path = path_slice,
-                .target_table = if (current.target_table) |tt| try alloc.dupe(u8, tt) else null,
-            });
+            const result = try traversalResultFromQueueEntry(alloc, current);
+            var result_owned = true;
+            errdefer if (result_owned) freeResult(alloc, result);
+            try results.append(alloc, result);
+            result_owned = false;
 
             if (rules.max_results > 0 and results.items.len >= rules.max_results) {
-                // Free remaining path from current
-                if (current.path) |p| {
-                    for (p.items) |s| alloc.free(s);
-                    var mp = p;
-                    mp.deinit(alloc);
-                }
-                // Free remaining queue entries (skip already-dequeued entries)
-                for (queue.items[queue_head..]) |qe| {
-                    alloc.free(qe.key);
-                    if (qe.target_table) |tt| alloc.free(tt);
-                    if (qe.path) |p| {
-                        for (p.items) |s| alloc.free(s);
-                        var mp = p;
-                        mp.deinit(alloc);
-                    }
-                }
                 break;
             }
         }
 
         // Check max depth
-        if (rules.max_depth > 0 and current.depth >= rules.max_depth) {
-            if (current.path) |p| {
-                for (p.items) |s| alloc.free(s);
-                var mp = p;
-                mp.deinit(alloc);
-            }
-            continue;
-        }
+        if (rules.max_depth > 0 and current.depth >= rules.max_depth) continue;
+
+        // Cross-table nodes are expanded by the distributed owner router.
+        // Looking them up in this source-table index aliases distinct node
+        // namespaces when their keys happen to be equal.
+        if (current.target_table != null) continue;
 
         // Get edges
         const edges = try graph_index.getEdges(alloc, current.key, "", rules.direction);
@@ -198,11 +183,14 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
             for (edges, 0..) |edge, edge_index| {
                 if (!shouldTraverseEdge(&rules, &edge)) continue;
                 const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
-                if (rules.deduplicate and visited.contains(next_key)) continue;
                 const target_table = if (std.mem.eql(u8, next_key, edge.target))
                     metadataTargetTable(edge.metadata)
                 else
                     null;
+                if (rules.deduplicate and visited.contains(.{
+                    .table = target_table,
+                    .key = next_key,
+                })) continue;
                 candidate_indexes.appendAssumeCapacity(edge_index);
                 candidate_nodes.appendAssumeCapacity(.{
                     .key = next_key,
@@ -229,49 +217,107 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
             } else {
                 if (!shouldTraverseEdge(&rules, &edge)) continue;
             }
-            if (rules.deduplicate and visited.contains(next_key)) continue;
-            if (rules.deduplicate) try visited.put(alloc, try alloc.dupe(u8, next_key), {});
+            const target_table = if (std.mem.eql(u8, next_key, edge.target))
+                metadataTargetTable(edge.metadata)
+            else
+                null;
+            if (rules.deduplicate and !try visited.putIfAbsent(
+                alloc,
+                .{ .table = target_table, .key = next_key },
+                {},
+            )) continue;
 
             // Build path for next node
             var next_path: ?std.ArrayListUnmanaged([]const u8) = null;
             if (rules.include_paths) {
                 next_path = std.ArrayListUnmanaged([]const u8).empty;
+                errdefer if (next_path) |path| freeQueuePath(alloc, path);
                 if (current.path) |cp| {
                     for (cp.items) |path_key| {
-                        try next_path.?.append(alloc, try alloc.dupe(u8, path_key));
+                        const owned_key = try alloc.dupe(u8, path_key);
+                        next_path.?.append(alloc, owned_key) catch |err| {
+                            alloc.free(owned_key);
+                            return err;
+                        };
                     }
                 }
-                try next_path.?.append(alloc, try alloc.dupe(u8, next_key));
+                const owned_key = try alloc.dupe(u8, next_key);
+                next_path.?.append(alloc, owned_key) catch |err| {
+                    alloc.free(owned_key);
+                    return err;
+                };
             }
 
             // The reached node's table comes from the edge that points at it
             // (only meaningful when traversing toward the edge's target).
-            const next_target_table: ?[]const u8 = if (std.mem.eql(u8, next_key, edge.target)) blk: {
-                const tt = metadataTargetTable(edge.metadata) orelse break :blk null;
-                break :blk try alloc.dupe(u8, tt);
-            } else null;
+            var next_target_table: ?[]const u8 = if (target_table) |table|
+                try alloc.dupe(u8, table)
+            else
+                null;
             errdefer if (next_target_table) |tt| alloc.free(tt);
 
-            try queue.append(alloc, .{
+            var next_entry = QueueEntry{
                 .key = try alloc.dupe(u8, next_key),
                 .depth = current.depth + 1,
                 .total_weight = current.total_weight * edge.weight,
                 .path = next_path,
                 .target_table = next_target_table,
-            });
-        }
-
-        // Free current's path
-        if (current.path) |p| {
-            for (p.items) |s| alloc.free(s);
-            var mp = p;
-            mp.deinit(alloc);
+            };
+            next_path = null;
+            next_target_table = null;
+            var next_entry_owned = true;
+            errdefer if (next_entry_owned) next_entry.deinit(alloc);
+            try queue.append(alloc, next_entry);
+            next_entry_owned = false;
         }
     }
 
     const owned = try alloc.dupe(TraversalResult, results.items);
     results.deinit(alloc);
     return owned;
+}
+
+fn freeQueuePath(alloc: Allocator, path: std.ArrayListUnmanaged([]const u8)) void {
+    for (path.items) |key| alloc.free(key);
+    var owned = path;
+    owned.deinit(alloc);
+}
+
+fn traversalResultFromQueueEntry(
+    alloc: Allocator,
+    entry: QueueEntry,
+) !TraversalResult {
+    const key = try alloc.dupe(u8, entry.key);
+    errdefer alloc.free(key);
+    const path = if (entry.path) |source| blk: {
+        const owned = try alloc.alloc([]const u8, source.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[0..initialized]) |item| alloc.free(item);
+            alloc.free(owned);
+        }
+        for (source.items, 0..) |item, i| {
+            owned[i] = try alloc.dupe(u8, item);
+            initialized += 1;
+        }
+        break :blk owned;
+    } else null;
+    errdefer if (path) |items| {
+        for (items) |item| alloc.free(item);
+        alloc.free(items);
+    };
+    const target_table = if (entry.target_table) |table|
+        try alloc.dupe(u8, table)
+    else
+        null;
+    errdefer if (target_table) |table| alloc.free(table);
+    return .{
+        .key = key,
+        .depth = entry.depth,
+        .total_weight = entry.total_weight,
+        .path = path,
+        .target_table = target_table,
+    };
 }
 
 /// Admit a traversal start according to the role it plays in this direction.
@@ -318,15 +364,17 @@ fn shouldTraverseEdge(rules: *const TraversalRules, edge: *const Edge) bool {
 }
 
 /// Free traversal results.
-pub fn freeResults(alloc: Allocator, results: []const TraversalResult) void {
-    for (results) |r| {
-        alloc.free(r.key);
-        if (r.path) |p| {
-            for (p) |s| alloc.free(s);
-            alloc.free(p);
-        }
-        if (r.target_table) |tt| alloc.free(tt);
+fn freeResult(alloc: Allocator, result: TraversalResult) void {
+    alloc.free(result.key);
+    if (result.path) |path| {
+        for (path) |key| alloc.free(key);
+        alloc.free(path);
     }
+    if (result.target_table) |table| alloc.free(table);
+}
+
+pub fn freeResults(alloc: Allocator, results: []const TraversalResult) void {
+    for (results) |result| freeResult(alloc, result);
 }
 
 /// Free results returned from traverse().
@@ -437,6 +485,89 @@ test "traversal deduplication" {
 
     // D should appear only once (dedup)
     try std.testing.expectEqual(@as(usize, 3), results.len); // B, C, D
+}
+
+test "traversal deduplicates by table-scoped node identity" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const sp = tmpPath(&sb, "table-identity-store");
+    defer cleanupTmp(sp);
+    var rb: [256]u8 = undefined;
+    const rp = tmpPath(&rb, "table-identity-graph");
+    defer cleanupTmp(rp);
+
+    var store = try docstore.DocStore.open(alloc, sp, .{});
+    defer store.close();
+    var g = try GraphIndex.open(alloc, &store, rp, "test", .{});
+    defer g.close();
+
+    try g.addEdge("A", "shared", "local", 1.0, 0, 0, "");
+    try g.addEdge(
+        "A",
+        "shared",
+        "external",
+        1.0,
+        0,
+        0,
+        "{\"target_table\":\"entities\"}",
+    );
+
+    const results = try traverse(alloc, &g, "A", .{
+        .max_depth = 1,
+        .deduplicate = true,
+    });
+    defer freeOwnedResults(alloc, results);
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    var local_count: usize = 0;
+    var external_count: usize = 0;
+    for (results) |result| {
+        try std.testing.expectEqualStrings("shared", result.key);
+        if (result.target_table) |table| {
+            try std.testing.expectEqualStrings("entities", table);
+            external_count += 1;
+        } else {
+            local_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), local_count);
+    try std.testing.expectEqual(@as(usize, 1), external_count);
+}
+
+test "local traversal does not expand a cross-table node in the source index" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const sp = tmpPath(&sb, "external-terminal-store");
+    defer cleanupTmp(sp);
+    var rb: [256]u8 = undefined;
+    const rp = tmpPath(&rb, "external-terminal-graph");
+    defer cleanupTmp(rp);
+
+    var store = try docstore.DocStore.open(alloc, sp, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, rp, "test", .{});
+    defer graph.close();
+
+    try graph.addEdge(
+        "A",
+        "shared",
+        "external",
+        1.0,
+        0,
+        0,
+        "{\"target_table\":\"entities\"}",
+    );
+    try graph.addEdge("shared", "source-only", "local", 1.0, 0, 0, "");
+
+    const results = try traverse(alloc, &graph, "A", .{
+        .max_depth = 2,
+        .deduplicate = true,
+    });
+    defer freeOwnedResults(alloc, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("shared", results[0].key);
+    try std.testing.expectEqualStrings("entities", results[0].target_table.?);
 }
 
 test "traversal with path tracking" {

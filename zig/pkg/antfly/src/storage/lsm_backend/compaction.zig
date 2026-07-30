@@ -1461,6 +1461,110 @@ const CompactionBounds = struct {
     }
 };
 
+const TargetLevelClosure = struct {
+    level_start: usize,
+    level_end: usize,
+    probe_start: usize,
+    selected_start: ?usize = null,
+    selected_end: usize = 0,
+
+    fn init(
+        runs: []const Run,
+        output_level: u32,
+        bounds: CompactionBounds,
+    ) ?TargetLevelClosure {
+        var level_start = runs.len;
+        var level_end = runs.len;
+        for (runs, 0..) |run, i| {
+            if (run.level < output_level) continue;
+            level_start = i;
+            level_end = i;
+            while (level_end < runs.len and runs[level_end].level == output_level) : (level_end += 1) {}
+            break;
+        }
+
+        var i = level_start;
+        while (i + 1 < level_end) : (i += 1) {
+            const current = runs[i];
+            const next = runs[i + 1];
+            if (compareRunBound(
+                current.smallest_namespace_name,
+                current.smallest_key,
+                next.smallest_namespace_name,
+                next.smallest_key,
+            ) == .gt) return null;
+            if (rangesOverlap(
+                current.smallest_namespace_name,
+                current.smallest_key,
+                current.largest_namespace_name,
+                current.largest_key,
+                next.smallest_namespace_name,
+                next.smallest_key,
+                next.largest_namespace_name,
+                next.largest_key,
+            )) return null;
+        }
+
+        var probe_start = level_start;
+        while (probe_start < level_end and compareRunBound(
+            runs[probe_start].largest_namespace_name,
+            runs[probe_start].largest_key,
+            bounds.smallest_namespace_name,
+            bounds.smallest_key,
+        ) == .lt) : (probe_start += 1) {}
+
+        return .{
+            .level_start = level_start,
+            .level_end = level_end,
+            .probe_start = probe_start,
+        };
+    }
+
+    fn expand(
+        self: *TargetLevelClosure,
+        runs: []const Run,
+        bounds: *CompactionBounds,
+    ) void {
+        if (self.level_start == self.level_end) return;
+
+        if (self.selected_start == null) {
+            while (self.probe_start > self.level_start) {
+                const previous = runs[self.probe_start - 1];
+                if (compareRunBound(
+                    previous.largest_namespace_name,
+                    previous.largest_key,
+                    bounds.smallest_namespace_name,
+                    bounds.smallest_key,
+                ) == .lt) break;
+                self.probe_start -= 1;
+            }
+            if (self.probe_start < self.level_end and bounds.overlaps(runs[self.probe_start])) {
+                self.selected_start = self.probe_start;
+                self.selected_end = self.probe_start + 1;
+                bounds.include(runs[self.probe_start]);
+            }
+        }
+
+        while (self.selected_start != null) {
+            const old_start = self.selected_start.?;
+            const old_end = self.selected_end;
+            while (self.selected_start.? > self.level_start and
+                bounds.overlaps(runs[self.selected_start.? - 1]))
+            {
+                self.selected_start.? -= 1;
+                bounds.include(runs[self.selected_start.?]);
+            }
+            while (self.selected_end < self.level_end and
+                bounds.overlaps(runs[self.selected_end]))
+            {
+                bounds.include(runs[self.selected_end]);
+                self.selected_end += 1;
+            }
+            if (self.selected_start.? == old_start and self.selected_end == old_end) break;
+        }
+    }
+};
+
 fn buildPlanForSourceRange(runs: []const Run, source_level: u32, source_start: usize, initial_source_len: usize) ?CompactionPlan {
     if (initial_source_len == 0 or source_start >= runs.len or initial_source_len > runs.len - source_start) return null;
     if (runs[source_start].level != source_level) return null;
@@ -1479,62 +1583,33 @@ fn buildPlanForSourceRange(runs: []const Run, source_level: u32, source_start: u
     for (runs[source_start + 1 .. source_end]) |run| bounds.include(run);
 
     const output_level = source_level + 1;
-    var target_start: ?usize = null;
-    var target_end: usize = 0;
+    var target_closure = TargetLevelClosure.init(runs, output_level, bounds) orelse return null;
+    target_closure.expand(runs, &bounds);
 
-    // L0 has newest-first precedence. A middle-slice compaction must include
-    // every older L0 run that overlaps the eventual L1 output; otherwise that
-    // older run remains ahead of the compacted result and can reveal stale
-    // state. Target runs can expand that output range, so close both sets to a
-    // fixed point. The ranges are represented as contiguous windows because
-    // that is the plan/install contract; intervening runs are included too.
-    while (true) {
-        var changed = false;
-
-        var closure_target_start = target_start;
-        var closure_target_end = target_end;
-        for (runs, 0..) |run, i| {
-            if (run.level < output_level) continue;
-            if (run.level > output_level) break;
-            if (!bounds.overlaps(run)) continue;
-            if (closure_target_start == null or i < closure_target_start.?) closure_target_start = i;
-            closure_target_end = @max(closure_target_end, i + 1);
+    // L0 has newest-first precedence. If an older run overlaps the output
+    // closure, the contiguous prefix through that run is indivisible. Walking
+    // older L0 inputs once and expanding the sorted target window
+    // incrementally computes the fixed point in O(L0 + target-runs).
+    if (source_level == 0) {
+        const l0_count = countLeadingL0Runs(runs);
+        var i = source_end;
+        while (i < l0_count) : (i += 1) {
+            if (!bounds.overlaps(runs[i])) continue;
+            for (runs[source_end .. i + 1]) |run| bounds.include(run);
+            source_end = i + 1;
+            target_closure.expand(runs, &bounds);
         }
-        if (closure_target_start) |start| {
-            const old_start = target_start orelse start;
-            if (target_start == null or start < old_start or closure_target_end > target_end) {
-                for (runs[start..closure_target_end]) |run| {
-                    if (run.level != output_level) return null;
-                    bounds.include(run);
-                }
-                target_start = start;
-                target_end = closure_target_end;
-                changed = true;
-            }
-        }
-
-        if (source_level == 0) {
-            const l0_count = countLeadingL0Runs(runs);
-            var closure_source_end = source_end;
-            for (runs[source_end..l0_count], source_end..) |run, i| {
-                if (bounds.overlaps(run)) closure_source_end = i + 1;
-            }
-            if (closure_source_end > source_end) {
-                for (runs[source_end..closure_source_end]) |run| bounds.include(run);
-                source_end = closure_source_end;
-                changed = true;
-            }
-        }
-
-        if (!changed) break;
     }
 
     return .{
         .source_level = source_level,
         .source_start = source_start,
         .source_len = source_end - source_start,
-        .target_start = target_start orelse source_end,
-        .target_len = if (target_start == null) 0 else target_end - target_start.?,
+        .target_start = target_closure.selected_start orelse source_end,
+        .target_len = if (target_closure.selected_start) |start|
+            target_closure.selected_end - start
+        else
+            0,
         .output_level = output_level,
     };
 }

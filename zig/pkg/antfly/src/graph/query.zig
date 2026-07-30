@@ -24,6 +24,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
+const node_identity = @import("node_identity.zig");
 const NodeAdmission = @import("node_admission.zig").NodeAdmission;
 const NodeRef = @import("node_admission.zig").NodeRef;
 const pattern_mod = @import("pattern.zig");
@@ -633,12 +634,8 @@ pub fn collectUniqueNodesFromMatches(
     alloc: Allocator,
     matches: []const pattern_mod.PatternMatch,
 ) ![]GraphResultNode {
-    var seen = std.StringHashMapUnmanaged(void).empty;
-    defer {
-        var it = seen.keyIterator();
-        while (it.next()) |k| alloc.free(k.*);
-        seen.deinit(alloc);
-    }
+    var seen = node_identity.Map(void){};
+    defer seen.deinit(alloc);
 
     var nodes = std.ArrayListUnmanaged(GraphResultNode).empty;
     errdefer {
@@ -648,14 +645,25 @@ pub fn collectUniqueNodesFromMatches(
 
     for (matches) |m| {
         for (m.bindings) |binding| {
-            if (seen.contains(binding.key)) continue;
-            try seen.put(alloc, try alloc.dupe(u8, binding.key), {});
+            if (!try seen.putIfAbsent(
+                alloc,
+                .{ .table = binding.table, .key = binding.key },
+                {},
+            )) continue;
+            const key = try alloc.dupe(u8, binding.key);
+            errdefer alloc.free(key);
+            const table = if (binding.table) |table_name|
+                try alloc.dupe(u8, table_name)
+            else
+                null;
+            errdefer if (table) |table_name| alloc.free(table_name);
             try nodes.append(alloc, .{
-                .key = try alloc.dupe(u8, binding.key),
+                .key = key,
                 .depth = binding.depth,
                 .distance = 0,
                 .path = null,
                 .path_edges = null,
+                .table = table,
             });
         }
     }
@@ -764,11 +772,18 @@ fn algebraicPatternMatchFromNodeAlloc(
         if (!graphQueryPassesPrefixFilter(node_path[i], step.node_filter)) return null;
         var alias_buf: [32]u8 = undefined;
         const alias = graphQueryEffectiveAlias(step.alias, i, &alias_buf);
-        all_bindings[i] = .{
-            .alias = try alloc.dupe(u8, alias),
-            .key = try alloc.dupe(u8, node_path[i]),
-            .depth = std.math.cast(u32, i) orelse return null,
-        };
+        const table = if (i > 0 and
+            std.mem.eql(u8, edge_path[i - 1].target, node_path[i]))
+            traversal_mod.metadataTargetTable(edge_path[i - 1].metadata)
+        else
+            null;
+        all_bindings[i] = try clonePatternBindingAlloc(
+            alloc,
+            alias,
+            node_path[i],
+            table,
+            std.math.cast(u32, i) orelse return null,
+        );
         initialized += 1;
     }
 
@@ -800,14 +815,37 @@ fn graphQueryFilterBindings(
     }
     for (bindings) |binding| {
         if (!graphQueryShouldReturnAlias(binding.alias, requested)) continue;
-        filtered[out_idx] = .{
-            .alias = try alloc.dupe(u8, binding.alias),
-            .key = try alloc.dupe(u8, binding.key),
-            .depth = binding.depth,
-        };
+        filtered[out_idx] = try clonePatternBindingAlloc(
+            alloc,
+            binding.alias,
+            binding.key,
+            binding.table,
+            binding.depth,
+        );
         out_idx += 1;
     }
     return filtered;
+}
+
+fn clonePatternBindingAlloc(
+    alloc: Allocator,
+    alias: []const u8,
+    key: []const u8,
+    table: ?[]const u8,
+    depth: u32,
+) !pattern_mod.PatternBinding {
+    const owned_alias = try alloc.dupe(u8, alias);
+    errdefer alloc.free(owned_alias);
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_table = if (table) |table_name| try alloc.dupe(u8, table_name) else null;
+    errdefer if (owned_table) |table_name| alloc.free(table_name);
+    return .{
+        .alias = owned_alias,
+        .key = owned_key,
+        .table = owned_table,
+        .depth = depth,
+    };
 }
 
 fn graphQueryShouldReturnAlias(alias: []const u8, requested: []const []const u8) bool {

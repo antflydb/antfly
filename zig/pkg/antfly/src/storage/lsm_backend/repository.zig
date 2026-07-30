@@ -589,16 +589,10 @@ pub fn loadRunTableIndexAllocWithStorage(
     // obsoleted and reclaimed it after this reader loaded the manifest;
     // propagate the transient error so callers can retry against a fresh
     // manifest instead of misreporting a format mismatch.
-    const footer_bytes = try storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len);
-    defer allocator.free(footer_bytes);
-
-    if (lsm_table_file.hasFooterMagic(footer_bytes)) {
-        const footer = try lsm_table_file.decodeFooterBytes(footer_bytes);
-        const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
-        defer allocator.free(metadata_bytes);
-        return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
-    }
-    return error.UnsupportedVersion;
+    const footer = try loadRunFooterWithStorage(storage, allocator, path);
+    const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
+    defer allocator.free(metadata_bytes);
+    return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
 }
 
 pub fn loadRunSequentialTableIndexAllocWithStorage(
@@ -606,14 +600,40 @@ pub fn loadRunSequentialTableIndexAllocWithStorage(
     allocator: Allocator,
     path: []const u8,
 ) !lsm_table_file.SequentialTableIndex {
-    const footer_bytes = try storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len);
+    const footer = try loadRunFooterWithStorage(storage, allocator, path);
+    const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
+    defer allocator.free(metadata_bytes);
+    return try lsm_table_file.decodeSequentialIndexFromFooterAlloc(allocator, footer, metadata_bytes);
+}
+
+fn loadRunFooterWithStorage(
+    storage: storage_io.Storage,
+    allocator: Allocator,
+    path: []const u8,
+) !lsm_table_file.Footer {
+    const file_size = try storage.fileSize(path);
+    if (file_size > max_run_file_read_bytes) return error.FileTooBig;
+    if (file_size < lsm_table_file.header_len + lsm_table_file.footer_len)
+        return error.InvalidTableFile;
+
+    const footer_offset_u64 = file_size - lsm_table_file.footer_len;
+    const footer_bytes = try storage.readFileRangeAlloc(
+        allocator,
+        path,
+        footer_offset_u64,
+        lsm_table_file.footer_len,
+    );
     defer allocator.free(footer_bytes);
     if (!lsm_table_file.hasFooterMagic(footer_bytes)) return error.UnsupportedVersion;
 
     const footer = try lsm_table_file.decodeFooterBytes(footer_bytes);
-    const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
-    defer allocator.free(metadata_bytes);
-    return try lsm_table_file.decodeSequentialIndexFromFooterAlloc(allocator, footer, metadata_bytes);
+    const footer_offset: usize = @intCast(footer_offset_u64);
+    if (footer.metadata_offset > footer_offset or
+        footer.metadata_len != footer_offset - footer.metadata_offset)
+    {
+        return error.InvalidTableFile;
+    }
+    return footer;
 }
 
 pub fn deleteFileAbsolute(path: []const u8) !void {
@@ -1064,6 +1084,30 @@ test "repository run table index load surfaces missing run file" {
     try std.testing.expectError(
         error.FileNotFound,
         loadRunTableIndexAllocWithStorage(storage.storage(), allocator, missing_path),
+    );
+}
+
+test "repository rejects forged run metadata length before allocating" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const entries = [_]lsm_table_file.Entry{
+        .{ .namespace_name = "docs", .key = "doc:a", .value = "A" },
+    };
+    const encoded = try lsm_table_file.encodeAlloc(allocator, &entries);
+    defer allocator.free(encoded);
+
+    const footer_offset = encoded.len - lsm_table_file.footer_len;
+    const footer = encoded[footer_offset..];
+    std.mem.writeInt(u64, footer[24..32], max_run_file_read_bytes, .little);
+    std.mem.writeInt(u32, footer[44..48], std.hash.Crc32.hash(footer[0..44]), .little);
+
+    const path = "/repository-forged-run-metadata/run.tbl";
+    try storage.storage().writeFileAbsolute(path, encoded);
+    try std.testing.expectError(
+        error.InvalidTableFile,
+        loadRunTableIndexAllocWithStorage(storage.storage(), allocator, path),
     );
 }
 

@@ -10,7 +10,7 @@ from enum import Enum
 } %}
 class {{ enum.class_info.name }}(str, Enum):
     {% for key, value in enum.values|dictsort(true) %}
-    {{ transform_op_names.get(value, key) if enum.class_info.name == "TransformOpType" else key }} = "{{ value }}"
+    {{ transform_op_names[value] if enum.class_info.name == "TransformOpType" else key }} = "{{ value }}"
     {% endfor %}
 
     def __str__(self) -> str:

@@ -61,6 +61,9 @@ pub const PathEdge = struct {
 
 pub const Path = struct {
     nodes: [][]const u8,
+    /// Internal table provenance parallel to `nodes`. An empty slice means all
+    /// nodes belong to the query table.
+    node_tables: []?[]const u8 = &.{},
     edges: []PathEdge,
     total_weight: f64,
     length: u32,
@@ -69,6 +72,8 @@ pub const Path = struct {
 pub fn freePath(alloc: Allocator, path: Path) void {
     for (path.nodes) |n| alloc.free(n);
     alloc.free(path.nodes);
+    for (path.node_tables) |table| if (table) |value| alloc.free(value);
+    if (path.node_tables.len > 0) alloc.free(path.node_tables);
     for (path.edges) |e| {
         alloc.free(e.source);
         alloc.free(e.target);
@@ -623,13 +628,15 @@ pub fn findKShortestPaths(
             for (results.items) |result_path| {
                 if (result_path.nodes.len <= spur_idx + 1) continue;
                 if (!rootPathMatches(prev_path, &result_path, spur_idx)) continue;
+                if (result_path.edges.len <= spur_idx) return error.InvalidGraphPath;
+                const edge = result_path.edges[spur_idx];
 
                 try putExcludedEdge(
                     &excluded_edges,
                     alloc,
-                    result_path.nodes[spur_idx],
-                    result_path.nodes[spur_idx + 1],
-                    if (result_path.edges.len > spur_idx) result_path.edges[spur_idx].edge_type else "",
+                    edge.source,
+                    edge.target,
+                    edge.edge_type,
                 );
             }
 
@@ -1059,6 +1066,36 @@ test "k shortest paths" {
     try std.testing.expectEqual(@as(u32, 2), found_paths[0].length);
     try std.testing.expect(found_paths[0].total_weight <= found_paths[1].total_weight);
     try std.testing.expect(found_paths[1].total_weight <= found_paths[2].total_weight);
+}
+
+test "k shortest paths exclude stored edge orientation for incoming traversal" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const store_path = tmpPath(&sb, "k-path-incoming-s");
+    defer cleanupTmp(store_path);
+    var rb: [256]u8 = undefined;
+    const reverse_path = tmpPath(&rb, "k-path-incoming-r");
+    defer cleanupTmp(reverse_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, reverse_path, "test", .{});
+    defer graph.close();
+
+    try graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try graph.addEdge("B", "D", "e", 1.0, 0, 0, "");
+    try graph.addEdge("A", "C", "e", 2.0, 0, 0, "");
+    try graph.addEdge("C", "D", "e", 2.0, 0, 0, "");
+
+    const found = try findKShortestPaths(alloc, &graph, "D", "A", 2, .{
+        .direction = .in,
+        .weight_mode = .min_weight,
+    });
+    defer freePaths(alloc, found);
+
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expectEqualStrings("B", found[0].nodes[1]);
+    try std.testing.expectEqualStrings("C", found[1].nodes[1]);
 }
 
 test "k shortest paths preserve delimiter and long node identities" {

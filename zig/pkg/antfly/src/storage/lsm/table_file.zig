@@ -2566,6 +2566,8 @@ fn decodeFooterMetadataAlloc(
     const offsets: []u32 = &.{};
     var block_offsets: []u16 = &.{};
     errdefer allocator.free(block_offsets);
+    if (entry_count > (metadata.len - cursor) / @sizeOf(u16))
+        return error.InvalidTableFile;
     block_offsets = try allocator.alloc(u16, entry_count);
     for (block_offsets) |*offset| offset.* = try readU16(metadata, &cursor);
 
@@ -3012,6 +3014,25 @@ test "table file rejects corrupt footer metadata before using bloom filters" {
             footer,
             encoded[footer.metadata_offset .. footer.metadata_offset + footer.metadata_len],
         ),
+    );
+}
+
+test "table file rejects forged footer entry count before allocating offsets" {
+    const entries = [_]Entry{
+        .{ .namespace_name = "docs", .key = "doc:a", .value = "A" },
+    };
+    const encoded = try encodeAlloc(std.testing.allocator, &entries);
+    defer std.testing.allocator.free(encoded);
+
+    const footer_bytes = encoded[encoded.len - footer_len ..];
+    std.mem.writeInt(u32, footer_bytes[32..36], std.math.maxInt(u32), .little);
+    std.mem.writeInt(u32, footer_bytes[44..48], std.hash.Crc32.hash(footer_bytes[0..44]), .little);
+    const footer = try decodeFooterBytes(footer_bytes);
+    const metadata = encoded[footer.metadata_offset .. footer.metadata_offset + footer.metadata_len];
+
+    try std.testing.expectError(
+        error.InvalidTableFile,
+        decodeIndexFromFooterAlloc(std.testing.allocator, footer, metadata),
     );
 }
 

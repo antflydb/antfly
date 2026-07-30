@@ -344,11 +344,8 @@ pub const PersistentReplicaState = struct {
         if (entry_count > (body.len - cursor) / minimum_entry_bytes)
             return error.InvalidReplicaState;
         if (entry_count > 0) {
-            const entries = try self.alloc.alloc(raft_engine.core.Entry, entry_count);
-            defer {
-                raft_engine.core.types.freeEntries(self.alloc, entries);
-            }
-            for (entries) |*entry| entry.* = try decodeEntry(self.alloc, body, &cursor);
+            const entries = try decodeEntriesAlloc(self.alloc, body, &cursor, entry_count);
+            defer raft_engine.core.types.freeEntries(self.alloc, entries);
             try self.store.append(entries);
         }
         if (cursor != body.len) return error.InvalidReplicaState;
@@ -496,12 +493,21 @@ pub const PersistentReplicaState = struct {
     }
 
     fn decodeConfState(alloc: std.mem.Allocator, bytes: []const u8, cursor: *usize) !raft_engine.core.ConfState {
+        const voters = try decodeNodeList(alloc, bytes, cursor);
+        errdefer alloc.free(voters);
+        const voters_outgoing = try decodeNodeList(alloc, bytes, cursor);
+        errdefer alloc.free(voters_outgoing);
+        const learners = try decodeNodeList(alloc, bytes, cursor);
+        errdefer alloc.free(learners);
+        const learners_next = try decodeNodeList(alloc, bytes, cursor);
+        errdefer alloc.free(learners_next);
+        const auto_leave = try readBool(bytes, cursor);
         return .{
-            .voters = try decodeNodeList(alloc, bytes, cursor),
-            .voters_outgoing = try decodeNodeList(alloc, bytes, cursor),
-            .learners = try decodeNodeList(alloc, bytes, cursor),
-            .learners_next = try decodeNodeList(alloc, bytes, cursor),
-            .auto_leave = try readBool(bytes, cursor),
+            .voters = voters,
+            .voters_outgoing = voters_outgoing,
+            .learners = learners,
+            .learners_next = learners_next,
+            .auto_leave = auto_leave,
         };
     }
 
@@ -513,14 +519,38 @@ pub const PersistentReplicaState = struct {
     }
 
     fn decodeSnapshot(alloc: std.mem.Allocator, bytes: []const u8, cursor: *usize) !raft_engine.core.types.Snapshot {
+        const index = try readInt(u64, bytes, cursor);
+        const term = try readInt(u64, bytes, cursor);
+        var conf_state = try decodeConfState(alloc, bytes, cursor);
+        errdefer conf_state.deinit(alloc);
+        const data = try readBytes(alloc, bytes, cursor);
         return .{
             .metadata = .{
-                .index = try readInt(u64, bytes, cursor),
-                .term = try readInt(u64, bytes, cursor),
-                .conf_state = try decodeConfState(alloc, bytes, cursor),
+                .index = index,
+                .term = term,
+                .conf_state = conf_state,
             },
-            .data = try readBytes(alloc, bytes, cursor),
+            .data = data,
         };
+    }
+
+    fn decodeEntriesAlloc(
+        alloc: std.mem.Allocator,
+        bytes: []const u8,
+        cursor: *usize,
+        entry_count: usize,
+    ) ![]raft_engine.core.Entry {
+        const entries = try alloc.alloc(raft_engine.core.Entry, entry_count);
+        var initialized: usize = 0;
+        errdefer {
+            for (entries[0..initialized]) |*entry| entry.deinit(alloc);
+            alloc.free(entries);
+        }
+        for (entries) |*entry| {
+            entry.* = try decodeEntry(alloc, bytes, cursor);
+            initialized += 1;
+        }
+        return entries;
     }
 
     fn encodeEntry(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entry: raft_engine.core.Entry) !void {
@@ -560,6 +590,18 @@ pub const PersistentReplicaState = struct {
         }
     }
 };
+
+test "persistent replica state decoder frees partially decoded ownership" {
+    var bytes: [@sizeOf(u32) + @sizeOf(u64) + @sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, bytes[0..4], 1, .little);
+    std.mem.writeInt(u64, bytes[4..12], 7, .little);
+    std.mem.writeInt(u32, bytes[12..16], 1, .little);
+    var cursor: usize = 0;
+    try std.testing.expectError(
+        error.InvalidReplicaState,
+        PersistentReplicaState.decodeConfState(std.testing.allocator, &bytes, &cursor),
+    );
+}
 
 test "persistent replica state rejects corrupt unchecked and structurally invalid files" {
     var tmp = std.testing.tmpDir(.{});

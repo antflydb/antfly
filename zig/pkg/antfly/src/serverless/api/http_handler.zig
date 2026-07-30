@@ -3210,7 +3210,15 @@ pub const HttpHandler = struct {
         const ServerlessPatternEdgeReader = struct {
             segment: *const graph_segment_mod.Segment,
 
-            pub fn getEdges(reader: @This(), alloc: Allocator, key: []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            pub fn getEdges(
+                reader: @This(),
+                alloc: Allocator,
+                table: ?[]const u8,
+                key: []const u8,
+                direction: graph_mod.EdgeDirection,
+            ) ![]graph_mod.Edge {
+                // Serverless snapshots contain one table-local graph segment.
+                if (table != null) return try alloc.alloc(graph_mod.Edge, 0);
                 const adjacency = findGraphSegmentAdjacency(reader.segment.adjacencies, key) orelse return try alloc.alloc(graph_mod.Edge, 0);
                 const edge_count: usize = switch (direction) {
                     .out => adjacency.out_edges.len,

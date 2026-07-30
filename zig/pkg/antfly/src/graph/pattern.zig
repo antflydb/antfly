@@ -19,6 +19,13 @@ const NodeAdmission = @import("node_admission.zig").NodeAdmission;
 const NodeRef = @import("node_admission.zig").NodeRef;
 const paths_mod = @import("paths.zig");
 const traversal_mod = @import("traversal.zig");
+const node_identity = @import("node_identity.zig");
+
+pub const max_pattern_steps: usize = 64;
+pub const max_pattern_hops: u32 = 64;
+pub const default_max_explored_nodes: usize = 100_000;
+pub const default_max_explored_edges: usize = 1_000_000;
+pub const default_max_intermediate_states: usize = 100_000;
 
 pub const NodeFilter = struct {
     filter_prefix: []const u8 = "",
@@ -48,11 +55,13 @@ pub const PatternStep = struct {
 pub const PatternBinding = struct {
     alias: []u8,
     key: []u8,
+    table: ?[]u8 = null,
     depth: u32,
 
     pub fn deinit(self: *PatternBinding, alloc: Allocator) void {
         alloc.free(self.alias);
         alloc.free(self.key);
+        if (self.table) |table| alloc.free(table);
         self.* = undefined;
     }
 };
@@ -79,6 +88,24 @@ pub const MatchOptions = struct {
     return_aliases: []const []const u8 = &.{},
     evaluator: ?FilterEvaluator = null,
     node_admission: ?NodeAdmission = null,
+    max_explored_nodes: usize = default_max_explored_nodes,
+    max_explored_edges: usize = default_max_explored_edges,
+    max_intermediate_states: usize = default_max_intermediate_states,
+};
+
+const WorkBudget = struct {
+    remaining_nodes: usize,
+    remaining_edges: usize,
+
+    fn consumeNode(self: *WorkBudget) !void {
+        if (self.remaining_nodes == 0) return error.QueryCandidateBudgetExceeded;
+        self.remaining_nodes -= 1;
+    }
+
+    fn consumeEdges(self: *WorkBudget, count: usize) !void {
+        if (count > self.remaining_edges) return error.QueryCandidateBudgetExceeded;
+        self.remaining_edges -= count;
+    }
 };
 
 const MatchState = struct {
@@ -95,11 +122,13 @@ const MatchState = struct {
 
 const Frontier = struct {
     key: []u8,
+    table: ?[]u8 = null,
     path: []paths_mod.PathEdge,
     hops: u32,
 
     fn deinit(self: *Frontier, alloc: Allocator) void {
         alloc.free(self.key);
+        if (self.table) |table| alloc.free(table);
         freePathEdges(alloc, self.path);
         self.* = undefined;
     }
@@ -107,11 +136,13 @@ const Frontier = struct {
 
 const ReachableNode = struct {
     key: []u8,
+    table: ?[]u8 = null,
     depth: u32,
     path: []paths_mod.PathEdge,
 
     fn deinit(self: *ReachableNode, alloc: Allocator) void {
         alloc.free(self.key);
+        if (self.table) |table| alloc.free(table);
         freePathEdges(alloc, self.path);
         self.* = undefined;
     }
@@ -127,7 +158,14 @@ pub fn matchPattern(
     const GraphIndexEdgeReader = struct {
         graph_index: *graph_mod.GraphIndex,
 
-        pub fn getEdges(self: @This(), a: Allocator, key: []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+        pub fn getEdges(
+            self: @This(),
+            a: Allocator,
+            table: ?[]const u8,
+            key: []const u8,
+            direction: graph_mod.EdgeDirection,
+        ) ![]graph_mod.Edge {
+            if (table != null) return try a.alloc(graph_mod.Edge, 0);
             return try self.graph_index.getEdges(a, key, "", direction);
         }
 
@@ -146,7 +184,55 @@ pub fn matchPatternWithEdgeReader(
     pattern: []const PatternStep,
     opts: MatchOptions,
 ) ![]PatternMatch {
-    if (pattern.len == 0) return error.InvalidArgument;
+    const start_nodes = try alloc.alloc(node_identity.Ref, start_keys.len);
+    defer alloc.free(start_nodes);
+    for (start_keys, 0..) |key, i| {
+        start_nodes[i] = .{ .table = null, .key = key };
+    }
+    return try matchPatternFromRefsWithEdgeReader(
+        alloc,
+        edge_reader,
+        start_nodes,
+        pattern,
+        opts,
+    );
+}
+
+pub fn matchPatternFromRefsWithEdgeReader(
+    alloc: Allocator,
+    edge_reader: anytype,
+    start_nodes: []const node_identity.Ref,
+    pattern: []const PatternStep,
+    opts: MatchOptions,
+) ![]PatternMatch {
+    if (pattern.len == 0 or pattern.len > max_pattern_steps) return error.InvalidArgument;
+    if (opts.max_explored_nodes == 0 or
+        opts.max_explored_edges == 0 or
+        opts.max_intermediate_states == 0)
+    {
+        return error.InvalidArgument;
+    }
+    for (pattern[1..]) |step| {
+        const min_hops = if (step.edge.min_hops == 0) @as(u32, 1) else step.edge.min_hops;
+        const max_hops = if (step.edge.max_hops == 0) @as(u32, 1) else step.edge.max_hops;
+        if (min_hops > max_hops or max_hops > max_pattern_hops)
+            return error.InvalidArgument;
+    }
+    var work_budget = WorkBudget{
+        .remaining_nodes = opts.max_explored_nodes,
+        .remaining_edges = opts.max_explored_edges,
+    };
+    const intermediate_limit = if (opts.max_results == 0)
+        opts.max_intermediate_states
+    else
+        @min(
+            opts.max_intermediate_states,
+            @max(
+                @as(usize, opts.max_results),
+                std.math.mul(usize, @as(usize, opts.max_results), 10) catch
+                    std.math.maxInt(usize),
+            ),
+        );
 
     var current = std.ArrayListUnmanaged(MatchState).empty;
     defer {
@@ -161,45 +247,54 @@ pub fn matchPatternWithEdgeReader(
     else
         graph_mod.EdgeDirection.out;
     const admitted_starts = if (opts.node_admission) |admission| blk: {
+        const refs = try alloc.alloc(NodeRef, start_nodes.len);
+        defer alloc.free(refs);
+        for (start_nodes, 0..) |start, i| {
+            refs[i] = .{
+                .key = start.key,
+                .table = start.table,
+                .external = start.table != null or
+                    (admission.external_targets and start_direction == .in),
+            };
+        }
+        const mask = try admission.filterAlloc(alloc, refs);
+        errdefer alloc.free(mask);
         if (start_direction == .both or
             (start_direction == .in and !admission.external_targets))
         {
-            break :blk null;
-        }
-        const starts_external = admission.external_targets and start_direction == .in;
-        break :blk try admission.filterKeysAlloc(alloc, start_keys, starts_external);
-    } else null;
-    defer if (admitted_starts) |mask| alloc.free(mask);
-    for (start_keys, 0..) |start_key, start_index| {
-        if (admitted_starts) |mask| if (!mask[start_index]) continue;
-        if (admitted_starts == null) {
-            if (opts.node_admission) |admission| {
-                if (!try startNodeAdmitted(
+            for (start_nodes, mask) |start, *allowed| {
+                if (allowed.* or start.table != null) continue;
+                allowed.* = try startNodeAdmitted(
                     alloc,
                     edge_reader,
-                    start_key,
+                    start.key,
                     start_direction,
                     admission,
-                )) continue;
+                );
             }
         }
-        if (!(try passesNodeFilter(start_key, pattern[0].node_filter, opts.evaluator))) continue;
+        break :blk mask;
+    } else null;
+    defer if (admitted_starts) |mask| alloc.free(mask);
+    for (start_nodes, 0..) |start, start_index| {
+        if (admitted_starts) |mask| if (!mask[start_index]) continue;
+        if (!(try passesNodeFilter(start.key, pattern[0].node_filter, opts.evaluator))) continue;
 
-        var bindings = try alloc.alloc(PatternBinding, 1);
-        errdefer {
-            bindings[0].deinit(alloc);
+        const bindings = try alloc.alloc(PatternBinding, 1);
+        bindings[0] = initPatternBinding(alloc, first_alias, start.key, start.table, 0) catch |err| {
             alloc.free(bindings);
-        }
-        bindings[0] = .{
-            .alias = try alloc.dupe(u8, first_alias),
-            .key = try alloc.dupe(u8, start_key),
-            .depth = 0,
+            return err;
         };
-        try current.append(alloc, .{
+        current.append(alloc, .{
             .bindings = bindings,
             .path = &.{},
-        });
-        if (opts.max_results > 0 and current.items.len >= opts.max_results) break;
+        }) catch |err| {
+            bindings[0].deinit(alloc);
+            alloc.free(bindings);
+            return err;
+        };
+        if (current.items.len > intermediate_limit)
+            return error.QueryCandidateBudgetExceeded;
     }
 
     for (1..pattern.len) |step_idx| {
@@ -222,11 +317,13 @@ pub fn matchPatternWithEdgeReader(
                 alloc,
                 edge_reader,
                 current_binding.key,
+                current_binding.table,
                 step.edge,
                 step.node_filter,
                 opts.max_results,
                 opts.evaluator,
                 opts.node_admission,
+                &work_budget,
             );
             defer {
                 for (reachable) |*node| node.deinit(alloc);
@@ -235,38 +332,44 @@ pub fn matchPatternWithEdgeReader(
 
             for (reachable) |reached| {
                 if (cycle_binding) |existing| {
-                    if (!std.mem.eql(u8, reached.key, existing.key)) continue;
+                    if (!std.mem.eql(u8, reached.key, existing.key) or
+                        !optionalTableEql(reached.table, existing.table)) continue;
                 }
 
                 var new_bindings = try cloneBindings(alloc, match.bindings);
-                errdefer {
+                var state_owned = true;
+                errdefer if (state_owned) {
                     for (new_bindings) |*binding| binding.deinit(alloc);
                     if (new_bindings.len > 0) alloc.free(new_bindings);
-                }
+                };
 
                 if (cycle_binding == null) {
-                    var expanded = try alloc.alloc(PatternBinding, new_bindings.len + 1);
-                    errdefer alloc.free(expanded);
+                    var appended_binding = try initPatternBinding(
+                        alloc,
+                        step_alias,
+                        reached.key,
+                        reached.table,
+                        reached.depth,
+                    );
+                    errdefer appended_binding.deinit(alloc);
+                    const expanded = try alloc.alloc(PatternBinding, new_bindings.len + 1);
                     for (new_bindings, 0..) |binding, i| expanded[i] = binding;
+                    expanded[expanded.len - 1] = appended_binding;
                     if (new_bindings.len > 0) alloc.free(new_bindings);
-                    expanded[expanded.len - 1] = .{
-                        .alias = try alloc.dupe(u8, step_alias),
-                        .key = try alloc.dupe(u8, reached.key),
-                        .depth = reached.depth,
-                    };
                     new_bindings = expanded;
                 }
 
                 const new_path = try concatPathEdges(alloc, match.path, reached.path);
-                errdefer freePathEdges(alloc, new_path);
+                errdefer if (state_owned) freePathEdges(alloc, new_path);
                 try next.append(alloc, .{
                     .bindings = new_bindings,
                     .path = new_path,
                 });
+                state_owned = false;
 
-                if (opts.max_results > 0 and next.items.len >= opts.max_results * 10) break;
+                if (next.items.len > intermediate_limit)
+                    return error.QueryCandidateBudgetExceeded;
             }
-            if (opts.max_results > 0 and next.items.len >= opts.max_results * 10) break;
         }
 
         for (current.items) |*match| match.deinit(alloc);
@@ -304,15 +407,23 @@ fn findReachableNodes(
     alloc: Allocator,
     edge_reader: anytype,
     start_key: []const u8,
+    start_table: ?[]const u8,
     edge: PatternEdgeStep,
     node_filter: NodeFilter,
     max_results: u32,
     evaluator: ?FilterEvaluator,
     node_admission: ?NodeAdmission,
+    work_budget: *WorkBudget,
 ) ![]ReachableNode {
     const min_hops = if (edge.min_hops == 0) @as(u32, 1) else edge.min_hops;
     const max_hops = if (edge.max_hops == 0) @as(u32, 1) else edge.max_hops;
-    const result_limit: usize = if (max_results == 0) 1000 else @min(@as(usize, max_results) * 10, 1000);
+    const result_limit: usize = if (max_results == 0)
+        1000
+    else
+        @min(
+            std.math.mul(usize, @as(usize, max_results), 10) catch std.math.maxInt(usize),
+            1000,
+        );
 
     var results = std.ArrayListUnmanaged(ReachableNode).empty;
     errdefer {
@@ -320,24 +431,24 @@ fn findReachableNodes(
         results.deinit(alloc);
     }
 
-    var visited = std.StringHashMapUnmanaged(void).empty;
-    defer {
-        var it = visited.keyIterator();
-        while (it.next()) |key| alloc.free(key.*);
-        visited.deinit(alloc);
-    }
+    var visited = node_identity.Map(void){};
+    defer visited.deinit(alloc);
 
     var current = std.ArrayListUnmanaged(Frontier).empty;
     defer {
         for (current.items) |*frontier| frontier.deinit(alloc);
         current.deinit(alloc);
     }
-    try current.append(alloc, .{
-        .key = try alloc.dupe(u8, start_key),
-        .path = &.{},
-        .hops = 0,
-    });
-    try visited.put(alloc, try alloc.dupe(u8, start_key), {});
+    {
+        var initial = try initFrontier(alloc, start_key, start_table, &.{}, 0);
+        errdefer initial.deinit(alloc);
+        try current.append(alloc, initial);
+    }
+    _ = try visited.putIfAbsent(
+        alloc,
+        .{ .table = start_table, .key = start_key },
+        {},
+    );
 
     while (current.items.len > 0 and results.items.len < result_limit) {
         var next = std.ArrayListUnmanaged(Frontier).empty;
@@ -347,10 +458,17 @@ fn findReachableNodes(
         }
 
         for (current.items) |*frontier| {
+            try work_budget.consumeNode();
             if (frontier.hops >= max_hops) continue;
 
-            const edges = try edge_reader.getEdges(alloc, frontier.key, edge.direction);
+            const edges = try edge_reader.getEdges(
+                alloc,
+                frontier.table,
+                frontier.key,
+                edge.direction,
+            );
             defer edge_reader.freeEdges(alloc, edges);
+            try work_budget.consumeEdges(edges.len);
 
             const admitted_edges = if (node_admission) |admission| blk: {
                 const edge_mask = try alloc.alloc(bool, edges.len);
@@ -366,10 +484,12 @@ fn findReachableNodes(
                     if (!edgeMatches(graph_edge, edge)) continue;
                     const target_key = edgeTarget(graph_edge, frontier.key, edge.direction) orelse continue;
                     if (std.mem.eql(u8, target_key, frontier.key)) continue;
-                    const target_table = if (std.mem.eql(u8, target_key, graph_edge.target))
-                        traversal_mod.metadataTargetTable(graph_edge.metadata)
-                    else
-                        null;
+                    const target_table = edgeTargetTable(
+                        frontier.table,
+                        graph_edge,
+                        target_key,
+                    );
+                    if (visited.contains(.{ .table = target_table, .key = target_key })) continue;
                     candidate_indexes.appendAssumeCapacity(edge_index);
                     candidate_nodes.appendAssumeCapacity(.{
                         .key = target_key,
@@ -397,30 +517,50 @@ fn findReachableNodes(
                     if (std.mem.eql(u8, target_key, frontier.key)) continue;
                 }
                 const new_hops = frontier.hops + 1;
+                const target_table = edgeTargetTable(
+                    frontier.table,
+                    graph_edge,
+                    target_key,
+                );
                 const new_path = try appendPathEdge(alloc, frontier.path, graph_edge, frontier.key, target_key);
-                errdefer freePathEdges(alloc, new_path);
+                var new_path_owned = true;
+                errdefer if (new_path_owned) freePathEdges(alloc, new_path);
 
                 if (new_hops >= min_hops and try passesNodeFilter(target_key, node_filter, evaluator)) {
-                    try results.append(alloc, .{
-                        .key = try alloc.dupe(u8, target_key),
-                        .depth = new_hops,
-                        .path = try clonePathEdges(alloc, new_path),
-                    });
+                    var reached = try initReachableNode(
+                        alloc,
+                        target_key,
+                        target_table,
+                        new_hops,
+                        new_path,
+                    );
+                    errdefer reached.deinit(alloc);
+                    try results.append(alloc, reached);
                     if (results.items.len >= result_limit) {
                         freePathEdges(alloc, new_path);
+                        new_path_owned = false;
                         break;
                     }
                 }
 
-                if (new_hops < max_hops and !visited.contains(target_key)) {
-                    try visited.put(alloc, try alloc.dupe(u8, target_key), {});
-                    try next.append(alloc, .{
-                        .key = try alloc.dupe(u8, target_key),
-                        .path = new_path,
-                        .hops = new_hops,
-                    });
+                if (new_hops < max_hops and try visited.putIfAbsent(
+                    alloc,
+                    .{ .table = target_table, .key = target_key },
+                    {},
+                )) {
+                    var next_item = try initFrontier(
+                        alloc,
+                        target_key,
+                        target_table,
+                        new_path,
+                        new_hops,
+                    );
+                    new_path_owned = false;
+                    errdefer next_item.deinit(alloc);
+                    try next.append(alloc, next_item);
                 } else {
                     freePathEdges(alloc, new_path);
+                    new_path_owned = false;
                 }
             }
             if (results.items.len >= result_limit) break;
@@ -446,7 +586,7 @@ fn startNodeAdmitted(
     defer alloc.free(admitted);
     if (admitted[0] or direction == .out) return admitted[0];
 
-    const incoming = try edge_reader.getEdges(alloc, start_key, .in);
+    const incoming = try edge_reader.getEdges(alloc, null, start_key, .in);
     defer edge_reader.freeEdges(alloc, incoming);
     for (incoming) |graph_edge| {
         if (std.mem.eql(u8, graph_edge.target, start_key) and
@@ -486,6 +626,17 @@ fn edgeTarget(edge: graph_mod.Edge, current_key: []const u8, direction: graph_mo
         else
             null,
     };
+}
+
+fn edgeTargetTable(
+    current_table: ?[]const u8,
+    edge: graph_mod.Edge,
+    target_key: []const u8,
+) ?[]const u8 {
+    if (std.mem.eql(u8, target_key, edge.target)) {
+        return traversal_mod.metadataTargetTable(edge.metadata) orelse current_table;
+    }
+    return current_table;
 }
 
 fn passesPrefixFilter(key: []const u8, filter: NodeFilter) bool {
@@ -534,11 +685,13 @@ fn filterBindings(alloc: Allocator, bindings: []const PatternBinding, requested:
     }
     for (bindings) |binding| {
         if (!shouldReturnAlias(binding.alias, requested)) continue;
-        filtered[out_idx] = .{
-            .alias = try alloc.dupe(u8, binding.alias),
-            .key = try alloc.dupe(u8, binding.key),
-            .depth = binding.depth,
-        };
+        filtered[out_idx] = try initPatternBinding(
+            alloc,
+            binding.alias,
+            binding.key,
+            binding.table,
+            binding.depth,
+        );
         out_idx += 1;
     }
     return filtered;
@@ -552,14 +705,83 @@ fn cloneBindings(alloc: Allocator, bindings: []const PatternBinding) ![]PatternB
         if (out.len > 0) alloc.free(out);
     }
     for (bindings, 0..) |binding, i| {
-        out[i] = .{
-            .alias = try alloc.dupe(u8, binding.alias),
-            .key = try alloc.dupe(u8, binding.key),
-            .depth = binding.depth,
-        };
+        out[i] = try initPatternBinding(
+            alloc,
+            binding.alias,
+            binding.key,
+            binding.table,
+            binding.depth,
+        );
         initialized += 1;
     }
     return out;
+}
+
+fn initPatternBinding(
+    alloc: Allocator,
+    alias: []const u8,
+    key: []const u8,
+    table: ?[]const u8,
+    depth: u32,
+) !PatternBinding {
+    const owned_alias = try alloc.dupe(u8, alias);
+    errdefer alloc.free(owned_alias);
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_table = if (table) |table_name| try alloc.dupe(u8, table_name) else null;
+    errdefer if (owned_table) |table_name| alloc.free(table_name);
+    return .{
+        .alias = owned_alias,
+        .key = owned_key,
+        .table = owned_table,
+        .depth = depth,
+    };
+}
+
+fn initFrontier(
+    alloc: Allocator,
+    key: []const u8,
+    table: ?[]const u8,
+    path: []paths_mod.PathEdge,
+    hops: u32,
+) !Frontier {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_table = if (table) |table_name| try alloc.dupe(u8, table_name) else null;
+    errdefer if (owned_table) |table_name| alloc.free(table_name);
+    return .{
+        .key = owned_key,
+        .table = owned_table,
+        .path = path,
+        .hops = hops,
+    };
+}
+
+fn initReachableNode(
+    alloc: Allocator,
+    key: []const u8,
+    table: ?[]const u8,
+    depth: u32,
+    path: []const paths_mod.PathEdge,
+) !ReachableNode {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_table = if (table) |table_name| try alloc.dupe(u8, table_name) else null;
+    errdefer if (owned_table) |table_name| alloc.free(table_name);
+    const owned_path = try clonePathEdges(alloc, path);
+    errdefer freePathEdges(alloc, owned_path);
+    return .{
+        .key = owned_key,
+        .table = owned_table,
+        .depth = depth,
+        .path = owned_path,
+    };
+}
+
+fn optionalTableEql(left: ?[]const u8, right: ?[]const u8) bool {
+    if ((left == null) != (right == null)) return false;
+    if (left) |left_table| return std.mem.eql(u8, left_table, right.?);
+    return true;
 }
 
 fn clonePathEdges(alloc: Allocator, edges: []const paths_mod.PathEdge) ![]paths_mod.PathEdge {
@@ -570,12 +792,7 @@ fn clonePathEdges(alloc: Allocator, edges: []const paths_mod.PathEdge) ![]paths_
         if (out.len > 0) alloc.free(out);
     }
     for (edges, 0..) |edge, i| {
-        out[i] = .{
-            .source = try alloc.dupe(u8, edge.source),
-            .target = try alloc.dupe(u8, edge.target),
-            .edge_type = try alloc.dupe(u8, edge.edge_type),
-            .weight = edge.weight,
-        };
+        out[i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata);
         initialized += 1;
     }
     return out;
@@ -589,21 +806,11 @@ fn concatPathEdges(alloc: Allocator, left: []const paths_mod.PathEdge, right: []
         if (out.len > 0) alloc.free(out);
     }
     for (left, 0..) |edge, i| {
-        out[i] = .{
-            .source = try alloc.dupe(u8, edge.source),
-            .target = try alloc.dupe(u8, edge.target),
-            .edge_type = try alloc.dupe(u8, edge.edge_type),
-            .weight = edge.weight,
-        };
+        out[i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata);
         initialized += 1;
     }
     for (right, 0..) |edge, i| {
-        out[left.len + i] = .{
-            .source = try alloc.dupe(u8, edge.source),
-            .target = try alloc.dupe(u8, edge.target),
-            .edge_type = try alloc.dupe(u8, edge.edge_type),
-            .weight = edge.weight,
-        };
+        out[left.len + i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata);
         initialized += 1;
     }
     return out;
@@ -623,21 +830,44 @@ fn appendPathEdge(
         if (out.len > 0) alloc.free(out);
     }
     for (existing, 0..) |item, i| {
-        out[i] = .{
-            .source = try alloc.dupe(u8, item.source),
-            .target = try alloc.dupe(u8, item.target),
-            .edge_type = try alloc.dupe(u8, item.edge_type),
-            .weight = item.weight,
-        };
+        out[i] = try dupePathEdge(alloc, item.source, item.target, item.edge_type, item.weight, item.metadata);
         initialized += 1;
     }
-    out[out.len - 1] = .{
-        .source = try alloc.dupe(u8, source),
-        .target = try alloc.dupe(u8, target),
-        .edge_type = try alloc.dupe(u8, edge.edge_type),
-        .weight = edge.weight,
-    };
+    out[out.len - 1] = try dupePathEdge(
+        alloc,
+        source,
+        target,
+        edge.edge_type,
+        edge.weight,
+        edge.metadata,
+    );
+    initialized += 1;
     return out;
+}
+
+fn dupePathEdge(
+    alloc: Allocator,
+    source: []const u8,
+    target: []const u8,
+    edge_type: []const u8,
+    weight: f64,
+    metadata: []const u8,
+) !paths_mod.PathEdge {
+    const owned_source = try alloc.dupe(u8, source);
+    errdefer alloc.free(owned_source);
+    const owned_target = try alloc.dupe(u8, target);
+    errdefer alloc.free(owned_target);
+    const owned_edge_type = try alloc.dupe(u8, edge_type);
+    errdefer alloc.free(owned_edge_type);
+    const owned_metadata = if (metadata.len > 0) try alloc.dupe(u8, metadata) else "";
+    errdefer if (owned_metadata.len > 0) alloc.free(owned_metadata);
+    return .{
+        .source = owned_source,
+        .target = owned_target,
+        .edge_type = owned_edge_type,
+        .weight = weight,
+        .metadata = owned_metadata,
+    };
 }
 
 fn freePathEdges(alloc: Allocator, edges: []const paths_mod.PathEdge) void {
@@ -650,7 +880,204 @@ fn freePathEdgeItems(alloc: Allocator, edges: []const paths_mod.PathEdge) void {
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
+}
+
+test "pattern matching rejects unbounded hops and exploration" {
+    const Reader = struct {
+        const edges = [_]graph_mod.Edge{
+            .{ .source = "A", .target = "B", .edge_type = "e", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "A", .target = "C", .edge_type = "e", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+        };
+
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return @constCast(edges[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+    const starts: []const []const u8 = &.{"A"};
+
+    try std.testing.expectError(
+        error.InvalidArgument,
+        matchPatternWithEdgeReader(std.testing.allocator, Reader{}, starts, &.{
+            .{ .alias = "a" },
+            .{ .alias = "b", .edge = .{ .max_hops = max_pattern_hops + 1 } },
+        }, .{}),
+    );
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        matchPatternWithEdgeReader(std.testing.allocator, Reader{}, starts, &.{
+            .{ .alias = "a" },
+            .{ .alias = "b" },
+        }, .{ .max_explored_edges = 1 }),
+    );
+}
+
+test "pattern matching keeps equal keys from distinct tables" {
+    const Reader = struct {
+        const edges = [_]graph_mod.Edge{
+            .{
+                .source = "A",
+                .target = "shared",
+                .edge_type = "local",
+                .weight = 1,
+                .created_at = 0,
+                .updated_at = 0,
+                .metadata = "",
+            },
+            .{
+                .source = "A",
+                .target = "shared",
+                .edge_type = "external",
+                .weight = 1,
+                .created_at = 0,
+                .updated_at = 0,
+                .metadata = "{\"target_table\":\"entities\"}",
+            },
+        };
+
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return @constCast(edges[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+    const matches = try matchPatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &.{"A"},
+        &.{
+            .{ .alias = "source" },
+            .{ .alias = "target" },
+        },
+        .{ .max_results = 10 },
+    );
+    defer freeMatches(std.testing.allocator, matches);
+
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    var local_count: usize = 0;
+    var external_count: usize = 0;
+    for (matches) |match| {
+        const target = match.bindings[1];
+        try std.testing.expectEqualStrings("shared", target.key);
+        if (target.table) |table| {
+            try std.testing.expectEqualStrings("entities", table);
+            external_count += 1;
+        } else {
+            local_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), local_count);
+    try std.testing.expectEqual(@as(usize, 1), external_count);
+}
+
+test "pattern matching routes later hops through the bound table" {
+    const Reader = struct {
+        const source_edges = [_]graph_mod.Edge{.{
+            .source = "A",
+            .target = "shared",
+            .edge_type = "external",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "{\"target_table\":\"entities\"}",
+        }};
+        const entity_edges = [_]graph_mod.Edge{.{
+            .source = "shared",
+            .target = "C",
+            .edge_type = "local",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "",
+        }};
+
+        pub fn getEdges(
+            _: @This(),
+            _: Allocator,
+            table: ?[]const u8,
+            key: []const u8,
+            _: graph_mod.EdgeDirection,
+        ) ![]graph_mod.Edge {
+            if (std.mem.eql(u8, key, "A")) {
+                try std.testing.expect(table == null);
+                return @constCast(source_edges[0..]);
+            }
+            if (std.mem.eql(u8, key, "shared")) {
+                try std.testing.expectEqualStrings("entities", table.?);
+                return @constCast(entity_edges[0..]);
+            }
+            return @constCast((&[_]graph_mod.Edge{})[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+
+    const matches = try matchPatternWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &.{"A"},
+        &.{
+            .{ .alias = "source" },
+            .{ .alias = "entity" },
+            .{ .alias = "related" },
+        },
+        .{ .max_results = 10 },
+    );
+    defer freeMatches(std.testing.allocator, matches);
+
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("C", matches[0].bindings[2].key);
+    try std.testing.expectEqualStrings("entities", matches[0].bindings[2].table.?);
+}
+
+test "pattern matching preserves a table-scoped start reference" {
+    const Reader = struct {
+        const edges = [_]graph_mod.Edge{.{
+            .source = "shared",
+            .target = "C",
+            .edge_type = "local",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "",
+        }};
+
+        pub fn getEdges(
+            _: @This(),
+            _: Allocator,
+            table: ?[]const u8,
+            key: []const u8,
+            _: graph_mod.EdgeDirection,
+        ) ![]graph_mod.Edge {
+            try std.testing.expectEqualStrings("entities", table.?);
+            try std.testing.expectEqualStrings("shared", key);
+            return @constCast(edges[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+    const starts = [_]node_identity.Ref{.{
+        .table = "entities",
+        .key = "shared",
+    }};
+    const matches = try matchPatternFromRefsWithEdgeReader(
+        std.testing.allocator,
+        Reader{},
+        &starts,
+        &.{
+            .{ .alias = "entity" },
+            .{ .alias = "related" },
+        },
+        .{ .max_results = 10 },
+    );
+    defer freeMatches(std.testing.allocator, matches);
+
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("entities", matches[0].bindings[0].table.?);
+    try std.testing.expectEqualStrings("entities", matches[0].bindings[1].table.?);
 }
 
 test "pattern match supports linear alias bindings and cycles" {

@@ -857,6 +857,8 @@ fn cloneGraphPatternBinding(
     errdefer alloc.free(alias);
     const key = try alloc.dupe(u8, binding.key);
     errdefer alloc.free(key);
+    const table = if (binding.table) |table_name| try alloc.dupe(u8, table_name) else null;
+    errdefer if (table) |table_name| alloc.free(table_name);
     return .{
         .alias = alias,
         .node = .{
@@ -865,6 +867,7 @@ fn cloneGraphPatternBinding(
             .distance = @floatFromInt(binding.depth),
             .path = null,
             .path_edges = null,
+            .table = table,
         },
     };
 }
@@ -879,11 +882,14 @@ fn cloneGraphPathEdgeInfo(
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, edge.edge_type);
     errdefer alloc.free(edge_type);
+    const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
+    errdefer if (metadata.len > 0) alloc.free(metadata);
     return .{
         .source = source,
         .target = target,
         .edge_type = edge_type,
         .weight = edge.weight,
+        .metadata = metadata,
     };
 }
 

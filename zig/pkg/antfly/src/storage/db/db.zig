@@ -65752,7 +65752,7 @@ test "db external dense ingest finalizes an exactly covered rebuilding checkpoin
     try std.testing.expectEqual(@as(u64, 1), checkpoint.generation);
 }
 
-test "db corrupt projection sidecar degrades non-dense checkpoint and can be replaced" {
+test "db corrupt projection sidecar degrades non-dense checkpoint and quarantines writes" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -65813,16 +65813,23 @@ test "db corrupt projection sidecar degrades non-dense checkpoint and can be rep
     defer reopened.close();
 
     try std.testing.expectEqual(@as(u64, 0), try reopened.core.loadAppliedSequence(alloc, "ft_idx"));
-    const repaired_by_open_checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "ft_idx");
-    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, repaired_by_open_checkpoint.status);
-    try std.testing.expectEqual(@as(u64, 0), repaired_by_open_checkpoint.applied_sequence);
-    try std.testing.expectEqual(types.indexConfigHash(text_cfg), repaired_by_open_checkpoint.config_hash);
+    const degraded_by_open_checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "ft_idx");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.repair_required, degraded_by_open_checkpoint.status);
+    try std.testing.expectEqual(@as(u64, 0), degraded_by_open_checkpoint.applied_sequence);
+    try std.testing.expectEqual(types.indexConfigHash(text_cfg), degraded_by_open_checkpoint.config_hash);
+    try std.testing.expectEqualStrings(
+        "InvalidDerivedApplyState",
+        reopened.core.index_manager.loadFailure("ft_idx") orelse return error.TestUnexpectedResult,
+    );
 
-    try reopened.core.saveAppliedSequence("ft_idx", 7);
-    const repaired_checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "ft_idx");
-    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, repaired_checkpoint.status);
-    try std.testing.expectEqual(@as(u64, 7), repaired_checkpoint.applied_sequence);
-    try std.testing.expectEqual(types.indexConfigHash(text_cfg), repaired_checkpoint.config_hash);
+    try std.testing.expectError(
+        error.IndexNotFound,
+        reopened.core.saveAppliedSequence("ft_idx", 7),
+    );
+    const still_degraded_checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "ft_idx");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.repair_required, still_degraded_checkpoint.status);
+    try std.testing.expectEqual(@as(u64, 0), still_degraded_checkpoint.applied_sequence);
+    try std.testing.expectEqual(types.indexConfigHash(text_cfg), still_degraded_checkpoint.config_hash);
 }
 
 test "db dense artifact rebuild rejects clean checkpoint for stale config identity" {

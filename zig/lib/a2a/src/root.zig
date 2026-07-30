@@ -116,28 +116,54 @@ pub const AgentHandler = struct {
 
 pub const TaskStore = struct {
     ptr: *anyopaque,
-    save_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, std.json.Value) anyerror!void,
-    get_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!std.json.Value,
-    cancel_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!std.json.Value,
+    reserve_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, std.json.Value) anyerror!u64,
+    save_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, u64, std.json.Value) anyerror!void,
+    release_fn: *const fn (*anyopaque, []const u8, []const u8, u64) void,
+    get_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!std.json.Value,
+    cancel_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!std.json.Value,
 
-    pub fn save(self: TaskStore, alloc: std.mem.Allocator, task_id: []const u8, task: std.json.Value) !void {
-        try self.save_fn(self.ptr, alloc, task_id, task);
+    pub fn reserve(
+        self: TaskStore,
+        alloc: std.mem.Allocator,
+        authority: []const u8,
+        task_id: []const u8,
+        task: std.json.Value,
+    ) !u64 {
+        return try self.reserve_fn(self.ptr, alloc, authority, task_id, task);
     }
 
-    pub fn get(self: TaskStore, alloc: std.mem.Allocator, task_id: []const u8) !std.json.Value {
-        return try self.get_fn(self.ptr, alloc, task_id);
+    pub fn save(
+        self: TaskStore,
+        alloc: std.mem.Allocator,
+        authority: []const u8,
+        task_id: []const u8,
+        expected_generation: u64,
+        task: std.json.Value,
+    ) !void {
+        try self.save_fn(self.ptr, alloc, authority, task_id, expected_generation, task);
     }
 
-    pub fn cancel(self: TaskStore, alloc: std.mem.Allocator, task_id: []const u8) !std.json.Value {
-        return try self.cancel_fn(self.ptr, alloc, task_id);
+    pub fn release(self: TaskStore, authority: []const u8, task_id: []const u8, expected_generation: u64) void {
+        self.release_fn(self.ptr, authority, task_id, expected_generation);
+    }
+
+    pub fn get(self: TaskStore, alloc: std.mem.Allocator, authority: []const u8, task_id: []const u8) !std.json.Value {
+        return try self.get_fn(self.ptr, alloc, authority, task_id);
+    }
+
+    pub fn cancel(self: TaskStore, alloc: std.mem.Allocator, authority: []const u8, task_id: []const u8) !std.json.Value {
+        return try self.cancel_fn(self.ptr, alloc, authority, task_id);
     }
 };
 
 pub const InMemoryTaskStore = struct {
     pub const Options = struct {
         max_tasks: usize = 4096,
+        max_tasks_per_authority: usize = 1024,
+        max_authority_bytes: usize = 1024,
         max_task_id_bytes: usize = 512,
         max_task_bytes: usize = 1024 * 1024,
+        max_bytes_per_authority: usize = 16 * 1024 * 1024,
         max_total_bytes: usize = 64 * 1024 * 1024,
         retention_ttl_ns: u64 = 24 * std.time.ns_per_hour,
         cleanup_interval_ns: u64 = std.time.ns_per_min,
@@ -147,7 +173,22 @@ pub const InMemoryTaskStore = struct {
     const TaskState = struct {
         body: []u8,
         updated_at_ns: u64,
-        generation: u64 = 1,
+        generation: u64,
+    };
+
+    const AuthorityState = struct {
+        tasks: std.StringHashMapUnmanaged(TaskState) = .empty,
+        total_bytes: usize = 0,
+
+        fn deinit(self: *AuthorityState, alloc: std.mem.Allocator) void {
+            var it = self.tasks.iterator();
+            while (it.next()) |entry| {
+                alloc.free(@constCast(entry.key_ptr.*));
+                alloc.free(entry.value_ptr.body);
+            }
+            self.tasks.deinit(alloc);
+            self.* = undefined;
+        }
     };
 
     const max_cancel_retries = 8;
@@ -156,8 +197,10 @@ pub const InMemoryTaskStore = struct {
     io: ?std.Io = null,
     options: Options = .{},
     mutex: std.Io.Mutex = .init,
-    tasks: std.StringHashMapUnmanaged(TaskState) = .empty,
+    authorities: std.StringHashMapUnmanaged(AuthorityState) = .empty,
+    task_count: usize = 0,
     total_bytes: usize = 0,
+    next_generation: u64 = 1,
     next_cleanup_ns: u64 = 0,
 
     pub fn init(alloc: std.mem.Allocator) InMemoryTaskStore {
@@ -175,12 +218,12 @@ pub const InMemoryTaskStore = struct {
         const alloc = self.alloc orelse fallback_alloc;
         const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
         self.mutex.lockUncancelable(io);
-        var it = self.tasks.iterator();
+        var it = self.authorities.iterator();
         while (it.next()) |entry| {
             alloc.free(@constCast(entry.key_ptr.*));
-            alloc.free(entry.value_ptr.body);
+            entry.value_ptr.deinit(alloc);
         }
-        self.tasks.deinit(alloc);
+        self.authorities.deinit(alloc);
         self.mutex.unlock(io);
         self.* = undefined;
     }
@@ -188,81 +231,174 @@ pub const InMemoryTaskStore = struct {
     pub fn iface(self: *InMemoryTaskStore) TaskStore {
         return .{
             .ptr = self,
+            .reserve_fn = reserve,
             .save_fn = save,
+            .release_fn = release,
             .get_fn = get,
             .cancel_fn = cancel,
         };
     }
 
-    fn save(ptr: *anyopaque, request_alloc: std.mem.Allocator, task_id: []const u8, task: std.json.Value) !void {
+    fn reserve(
+        ptr: *anyopaque,
+        request_alloc: std.mem.Allocator,
+        authority: []const u8,
+        task_id: []const u8,
+        task: std.json.Value,
+    ) !u64 {
         const self: *InMemoryTaskStore = @ptrCast(@alignCast(ptr));
         const store_alloc = self.alloc orelse request_alloc;
         const io = self.io orelse return error.MissingIo;
-        try self.validateTaskId(task_id);
+        try self.validateIdentity(authority, task_id);
 
         var body: ?[]u8 = try stringifyValue(store_alloc, task);
         defer if (body) |owned| store_alloc.free(owned);
         if (body.?.len > self.options.max_task_bytes) return error.A2aTaskTooLarge;
 
-        var owned_key: ?[]u8 = try store_alloc.dupe(u8, task_id);
-        defer if (owned_key) |owned| store_alloc.free(owned);
+        var owned_task_id: ?[]u8 = try store_alloc.dupe(u8, task_id);
+        defer if (owned_task_id) |owned| store_alloc.free(owned);
 
         const now_ns = self.nowNs();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.cleanupExpiredLocked(store_alloc, now_ns, false);
-
-        if (self.tasks.getPtr(task_id)) |entry| {
-            if (entry.generation == std.math.maxInt(u64)) return error.A2aTaskGenerationExhausted;
-            const base_bytes = self.total_bytes - entry.body.len;
-            if (body.?.len > self.options.max_total_bytes -| base_bytes)
-                return error.A2aTaskCapacityExceeded;
-            store_alloc.free(entry.body);
-            self.total_bytes = base_bytes + body.?.len;
-            entry.* = .{
-                .body = body.?,
-                .updated_at_ns = now_ns,
-                .generation = entry.generation + 1,
-            };
-            body = null;
-            return;
+        if (self.authorities.get(authority)) |state| {
+            if (state.tasks.get(task_id)) |entry| {
+                if (!self.isExpired(entry, now_ns)) return error.A2aTaskAlreadyExists;
+                _ = self.removeLocked(store_alloc, authority, task_id);
+            }
         }
 
-        if (self.tasks.count() >= self.options.max_tasks) {
+        const task_charge = owned_task_id.?.len + body.?.len;
+        if (!self.reservationFitsLocked(authority, task_charge)) {
             self.cleanupExpiredLocked(store_alloc, now_ns, true);
         }
-        if (self.tasks.count() >= self.options.max_tasks)
-            return error.A2aTaskCapacityExceeded;
-        if (owned_key.?.len > self.options.max_total_bytes -| body.?.len)
-            return error.A2aTaskCapacityExceeded;
-        const charge = owned_key.?.len + body.?.len;
-        if (charge > self.options.max_total_bytes -| self.total_bytes)
+        if (!self.reservationFitsLocked(authority, task_charge))
             return error.A2aTaskCapacityExceeded;
 
-        try self.tasks.put(store_alloc, owned_key.?, .{
+        if (self.authorities.getPtr(authority)) |state| {
+            const generation = try self.allocateGenerationLocked();
+            try state.tasks.put(store_alloc, owned_task_id.?, .{
+                .body = body.?,
+                .updated_at_ns = now_ns,
+                .generation = generation,
+            });
+            state.total_bytes += task_charge;
+            self.task_count += 1;
+            self.total_bytes += task_charge;
+            owned_task_id = null;
+            body = null;
+            return generation;
+        }
+
+        var owned_authority: ?[]u8 = try store_alloc.dupe(u8, authority);
+        defer if (owned_authority) |owned| store_alloc.free(owned);
+        const generation = try self.allocateGenerationLocked();
+        var state = AuthorityState{};
+        errdefer state.deinit(store_alloc);
+        try state.tasks.put(store_alloc, owned_task_id.?, .{
             .body = body.?,
             .updated_at_ns = now_ns,
+            .generation = generation,
         });
-        self.total_bytes += charge;
-        owned_key = null;
+        state.total_bytes = task_charge;
+        owned_task_id = null;
+        body = null;
+        try self.authorities.put(store_alloc, owned_authority.?, state);
+        const global_charge = owned_authority.?.len + task_charge;
+        owned_authority = null;
+        self.total_bytes += global_charge;
+        self.task_count += 1;
+        return generation;
+    }
+
+    fn save(
+        ptr: *anyopaque,
+        request_alloc: std.mem.Allocator,
+        authority: []const u8,
+        task_id: []const u8,
+        expected_generation: u64,
+        task: std.json.Value,
+    ) !void {
+        const self: *InMemoryTaskStore = @ptrCast(@alignCast(ptr));
+        const store_alloc = self.alloc orelse request_alloc;
+        const io = self.io orelse return error.MissingIo;
+        try self.validateIdentity(authority, task_id);
+
+        var body: ?[]u8 = try stringifyValue(store_alloc, task);
+        defer if (body) |owned| store_alloc.free(owned);
+        if (body.?.len > self.options.max_task_bytes) return error.A2aTaskTooLarge;
+
+        const now_ns = self.nowNs();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.cleanupExpiredLocked(store_alloc, now_ns, false);
+        var state = self.authorities.getPtr(authority) orelse return error.TaskNotFound;
+        var entry = state.tasks.getPtr(task_id) orelse return error.TaskNotFound;
+        if (self.isExpired(entry.*, now_ns)) {
+            _ = self.removeLocked(store_alloc, authority, task_id);
+            return error.TaskNotFound;
+        }
+        if (entry.generation != expected_generation) return error.A2aTaskStoreBusy;
+        if (!self.replacementFitsLocked(state, entry.body.len, body.?.len)) {
+            self.cleanupExpiredLocked(store_alloc, now_ns, true);
+            state = self.authorities.getPtr(authority) orelse return error.TaskNotFound;
+            entry = state.tasks.getPtr(task_id) orelse return error.TaskNotFound;
+            if (self.isExpired(entry.*, now_ns)) {
+                _ = self.removeLocked(store_alloc, authority, task_id);
+                return error.TaskNotFound;
+            }
+            if (entry.generation != expected_generation) return error.A2aTaskStoreBusy;
+        }
+        if (!self.replacementFitsLocked(state, entry.body.len, body.?.len))
+            return error.A2aTaskCapacityExceeded;
+
+        const base_bytes = self.total_bytes - entry.body.len;
+        const authority_base_bytes = state.total_bytes - entry.body.len;
+        const next_generation = try self.allocateGenerationLocked();
+        const committed_at_ns = self.nowNs();
+        store_alloc.free(entry.body);
+        self.total_bytes = base_bytes + body.?.len;
+        state.total_bytes = authority_base_bytes + body.?.len;
+        entry.* = .{
+            .body = body.?,
+            .updated_at_ns = committed_at_ns,
+            .generation = next_generation,
+        };
         body = null;
     }
 
-    fn get(ptr: *anyopaque, alloc: std.mem.Allocator, task_id: []const u8) !std.json.Value {
+    fn release(ptr: *anyopaque, authority: []const u8, task_id: []const u8, expected_generation: u64) void {
+        const self: *InMemoryTaskStore = @ptrCast(@alignCast(ptr));
+        const store_alloc = self.alloc orelse return;
+        const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const state = self.authorities.getPtr(authority) orelse return;
+        const entry = state.tasks.get(task_id) orelse return;
+        if (entry.generation != expected_generation) return;
+        _ = self.removeLocked(store_alloc, authority, task_id);
+    }
+
+    fn get(ptr: *anyopaque, alloc: std.mem.Allocator, authority: []const u8, task_id: []const u8) !std.json.Value {
         const self: *InMemoryTaskStore = @ptrCast(@alignCast(ptr));
         const store_alloc = self.alloc orelse alloc;
         const io = self.io orelse return error.MissingIo;
-        try self.validateTaskId(task_id);
+        try self.validateIdentity(authority, task_id);
         const now_ns = self.nowNs();
 
         self.mutex.lockUncancelable(io);
         self.cleanupExpiredLocked(store_alloc, now_ns, false);
-        const entry = self.tasks.get(task_id) orelse {
+        const state = self.authorities.getPtr(authority) orelse {
+            self.mutex.unlock(io);
+            return error.TaskNotFound;
+        };
+        const entry = state.tasks.get(task_id) orelse {
             self.mutex.unlock(io);
             return error.TaskNotFound;
         };
         if (self.isExpired(entry, now_ns)) {
-            _ = self.removeLocked(store_alloc, task_id);
+            _ = self.removeLocked(store_alloc, authority, task_id);
             self.mutex.unlock(io);
             return error.TaskNotFound;
         }
@@ -277,22 +413,31 @@ pub const InMemoryTaskStore = struct {
         });
     }
 
-    fn cancel(ptr: *anyopaque, alloc: std.mem.Allocator, task_id: []const u8) !std.json.Value {
+    fn cancel(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        authority: []const u8,
+        task_id: []const u8,
+    ) !std.json.Value {
         const self: *InMemoryTaskStore = @ptrCast(@alignCast(ptr));
         const store_alloc = self.alloc orelse alloc;
         const io = self.io orelse return error.MissingIo;
-        try self.validateTaskId(task_id);
+        try self.validateIdentity(authority, task_id);
 
         for (0..max_cancel_retries) |_| {
             const now_ns = self.nowNs();
             self.mutex.lockUncancelable(io);
             self.cleanupExpiredLocked(store_alloc, now_ns, false);
-            const current = self.tasks.get(task_id) orelse {
+            const state = self.authorities.getPtr(authority) orelse {
+                self.mutex.unlock(io);
+                return error.TaskNotFound;
+            };
+            const current = state.tasks.get(task_id) orelse {
                 self.mutex.unlock(io);
                 return error.TaskNotFound;
             };
             if (self.isExpired(current, now_ns)) {
-                _ = self.removeLocked(store_alloc, task_id);
+                _ = self.removeLocked(store_alloc, authority, task_id);
                 self.mutex.unlock(io);
                 return error.TaskNotFound;
             }
@@ -321,38 +466,79 @@ pub const InMemoryTaskStore = struct {
             }
 
             self.mutex.lockUncancelable(io);
-            const entry = self.tasks.getPtr(task_id) orelse {
+            const commit_now_ns = self.nowNs();
+            self.cleanupExpiredLocked(store_alloc, commit_now_ns, false);
+            var current_state = self.authorities.getPtr(authority) orelse {
                 self.mutex.unlock(io);
                 store_alloc.free(candidate);
                 return error.TaskNotFound;
             };
+            var entry = current_state.tasks.getPtr(task_id) orelse {
+                self.mutex.unlock(io);
+                store_alloc.free(candidate);
+                return error.TaskNotFound;
+            };
+            if (self.isExpired(entry.*, commit_now_ns)) {
+                _ = self.removeLocked(store_alloc, authority, task_id);
+                self.mutex.unlock(io);
+                store_alloc.free(candidate);
+                return error.TaskNotFound;
+            }
             if (entry.generation != generation) {
                 self.mutex.unlock(io);
                 store_alloc.free(candidate);
                 continue;
             }
-            if (entry.generation == std.math.maxInt(u64)) {
-                self.mutex.unlock(io);
-                store_alloc.free(candidate);
-                return error.A2aTaskGenerationExhausted;
+            if (!self.replacementFitsLocked(current_state, entry.body.len, candidate.len)) {
+                self.cleanupExpiredLocked(store_alloc, commit_now_ns, true);
+                current_state = self.authorities.getPtr(authority) orelse {
+                    self.mutex.unlock(io);
+                    store_alloc.free(candidate);
+                    return error.TaskNotFound;
+                };
+                entry = current_state.tasks.getPtr(task_id) orelse {
+                    self.mutex.unlock(io);
+                    store_alloc.free(candidate);
+                    return error.TaskNotFound;
+                };
+                if (self.isExpired(entry.*, commit_now_ns)) {
+                    _ = self.removeLocked(store_alloc, authority, task_id);
+                    self.mutex.unlock(io);
+                    store_alloc.free(candidate);
+                    return error.TaskNotFound;
+                }
+                if (entry.generation != generation) {
+                    self.mutex.unlock(io);
+                    store_alloc.free(candidate);
+                    continue;
+                }
             }
-            const base_bytes = self.total_bytes - entry.body.len;
-            if (candidate.len > self.options.max_total_bytes -| base_bytes) {
+            if (!self.replacementFitsLocked(current_state, entry.body.len, candidate.len)) {
                 self.mutex.unlock(io);
                 store_alloc.free(candidate);
                 return error.A2aTaskCapacityExceeded;
             }
+            const base_bytes = self.total_bytes - entry.body.len;
+            const authority_base_bytes = current_state.total_bytes - entry.body.len;
             const response_body = alloc.dupe(u8, candidate) catch |err| {
                 self.mutex.unlock(io);
                 store_alloc.free(candidate);
                 return err;
             };
+            const next_generation = self.allocateGenerationLocked() catch |err| {
+                self.mutex.unlock(io);
+                alloc.free(response_body);
+                store_alloc.free(candidate);
+                return err;
+            };
+            const committed_at_ns = self.nowNs();
             store_alloc.free(entry.body);
             self.total_bytes = base_bytes + candidate.len;
+            current_state.total_bytes = authority_base_bytes + candidate.len;
             entry.* = .{
                 .body = candidate,
-                .updated_at_ns = now_ns,
-                .generation = entry.generation + 1,
+                .updated_at_ns = committed_at_ns,
+                .generation = next_generation,
             };
             self.mutex.unlock(io);
             defer alloc.free(response_body);
@@ -363,7 +549,13 @@ pub const InMemoryTaskStore = struct {
         return error.A2aTaskStoreBusy;
     }
 
-    fn validateTaskId(self: *const InMemoryTaskStore, task_id: []const u8) !void {
+    fn validateIdentity(
+        self: *const InMemoryTaskStore,
+        authority: []const u8,
+        task_id: []const u8,
+    ) !void {
+        if (authority.len == 0 or authority.len > self.options.max_authority_bytes)
+            return error.InvalidTaskAuthority;
         if (task_id.len == 0 or task_id.len > self.options.max_task_id_bytes)
             return error.InvalidTaskId;
     }
@@ -374,6 +566,48 @@ pub const InMemoryTaskStore = struct {
         return @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds());
     }
 
+    fn allocateGenerationLocked(self: *InMemoryTaskStore) !u64 {
+        if (self.next_generation == std.math.maxInt(u64))
+            return error.A2aTaskGenerationExhausted;
+        const generation = self.next_generation;
+        self.next_generation += 1;
+        return generation;
+    }
+
+    fn reservationFitsLocked(
+        self: *const InMemoryTaskStore,
+        authority: []const u8,
+        task_charge: usize,
+    ) bool {
+        if (self.task_count >= self.options.max_tasks) return false;
+
+        if (self.authorities.get(authority)) |state| {
+            if (state.tasks.count() >= self.options.max_tasks_per_authority)
+                return false;
+            if (task_charge > self.options.max_bytes_per_authority -| state.total_bytes)
+                return false;
+            return task_charge <= self.options.max_total_bytes -| self.total_bytes;
+        }
+
+        if (self.options.max_tasks_per_authority == 0) return false;
+        if (task_charge > self.options.max_bytes_per_authority) return false;
+        const global_remaining = self.options.max_total_bytes -| self.total_bytes;
+        return authority.len <= global_remaining and
+            task_charge <= global_remaining - authority.len;
+    }
+
+    fn replacementFitsLocked(
+        self: *const InMemoryTaskStore,
+        state: *const AuthorityState,
+        old_body_len: usize,
+        new_body_len: usize,
+    ) bool {
+        const global_base = self.total_bytes - old_body_len;
+        const authority_base = state.total_bytes - old_body_len;
+        return new_body_len <= self.options.max_total_bytes -| global_base and
+            new_body_len <= self.options.max_bytes_per_authority -| authority_base;
+    }
+
     fn cleanupExpiredLocked(self: *InMemoryTaskStore, alloc: std.mem.Allocator, now_ns: u64, force: bool) void {
         if (self.options.retention_ttl_ns == 0) return;
         if (!force and self.next_cleanup_ns != 0 and now_ns < self.next_cleanup_ns) return;
@@ -381,13 +615,26 @@ pub const InMemoryTaskStore = struct {
             self.options.cleanup_interval_ns,
             self.options.retention_ttl_ns,
         );
-        var it = self.tasks.iterator();
-        while (it.next()) |entry| {
-            if (!self.isExpired(entry.value_ptr.*, now_ns)) continue;
-            self.total_bytes -= entry.key_ptr.*.len + entry.value_ptr.body.len;
-            alloc.free(@constCast(entry.key_ptr.*));
-            alloc.free(entry.value_ptr.body);
-            self.tasks.removeByPtr(entry.key_ptr);
+        var authority_it = self.authorities.iterator();
+        while (authority_it.next()) |authority_entry| {
+            var task_it = authority_entry.value_ptr.tasks.iterator();
+            while (task_it.next()) |task_entry| {
+                if (!self.isExpired(task_entry.value_ptr.*, now_ns)) continue;
+                const task_id = task_entry.key_ptr.*;
+                const body = task_entry.value_ptr.body;
+                authority_entry.value_ptr.tasks.removeByPtr(task_entry.key_ptr);
+                authority_entry.value_ptr.total_bytes -= task_id.len + body.len;
+                self.total_bytes -= task_id.len + body.len;
+                self.task_count -= 1;
+                alloc.free(@constCast(task_id));
+                alloc.free(body);
+            }
+            if (authority_entry.value_ptr.tasks.count() != 0) continue;
+            const authority = authority_entry.key_ptr.*;
+            authority_entry.value_ptr.tasks.deinit(alloc);
+            self.authorities.removeByPtr(authority_entry.key_ptr);
+            self.total_bytes -= authority.len;
+            alloc.free(@constCast(authority));
         }
     }
 
@@ -397,11 +644,26 @@ pub const InMemoryTaskStore = struct {
             now_ns - state.updated_at_ns >= self.options.retention_ttl_ns;
     }
 
-    fn removeLocked(self: *InMemoryTaskStore, alloc: std.mem.Allocator, task_id: []const u8) bool {
-        const removed = self.tasks.fetchRemove(task_id) orelse return false;
+    fn removeLocked(
+        self: *InMemoryTaskStore,
+        alloc: std.mem.Allocator,
+        authority: []const u8,
+        task_id: []const u8,
+    ) bool {
+        const state = self.authorities.getPtr(authority) orelse return false;
+        const removed = state.tasks.fetchRemove(task_id) orelse return false;
+        state.total_bytes -= removed.key.len + removed.value.body.len;
         self.total_bytes -= removed.key.len + removed.value.body.len;
+        self.task_count -= 1;
         alloc.free(removed.key);
         alloc.free(removed.value.body);
+        if (state.tasks.count() == 0) {
+            const removed_authority = self.authorities.fetchRemove(authority) orelse unreachable;
+            var empty_state = removed_authority.value;
+            empty_state.tasks.deinit(alloc);
+            self.total_bytes -= removed_authority.key.len;
+            alloc.free(removed_authority.key);
+        }
         return true;
     }
 };
@@ -413,6 +675,7 @@ pub const Dispatcher = struct {
     base_url: []const u8 = "",
     handlers: std.ArrayListUnmanaged(AgentHandler) = .empty,
     task_store: ?TaskStore = null,
+    task_authority: []const u8 = "anonymous",
 
     pub fn deinit(self: *Dispatcher, alloc: std.mem.Allocator) void {
         self.handlers.deinit(alloc);
@@ -447,9 +710,11 @@ pub const Dispatcher = struct {
             const result = self.executeMessage(temp_alloc, params, std.mem.eql(u8, method, "message/stream")) catch |err| switch (err) {
                 error.InvalidParams => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32602, "invalid params")),
                 error.UnknownSkill => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32602, "unknown skill")),
-                error.InvalidTaskId => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32602, "invalid task id")),
+                error.InvalidTaskId, error.InvalidTaskAuthority => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32602, "invalid task identity")),
                 error.A2aTaskTooLarge => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32010, "task exceeds storage limit")),
                 error.A2aTaskCapacityExceeded => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32011, "task storage capacity exceeded")),
+                error.A2aTaskStoreBusy => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32012, "task changed concurrently; retry")),
+                error.A2aTaskAlreadyExists => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32013, "task id already exists")),
                 else => return err,
             };
             return try stringifyValue(alloc, try successResponse(temp_alloc, id, result));
@@ -460,9 +725,9 @@ pub const Dispatcher = struct {
                 return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32602, "invalid params"));
             };
             const store = self.task_store orelse return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32001, "task storage not configured"));
-            const task = store.get(temp_alloc, task_id) catch |err| switch (err) {
+            const task = store.get(temp_alloc, self.task_authority, task_id) catch |err| switch (err) {
                 error.TaskNotFound => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32004, "task not found")),
-                error.InvalidTaskId => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32602, "invalid task id")),
+                error.InvalidTaskId, error.InvalidTaskAuthority => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32602, "invalid task identity")),
                 else => return err,
             };
             return try stringifyValue(alloc, try successResponse(temp_alloc, id, task));
@@ -473,9 +738,9 @@ pub const Dispatcher = struct {
                 return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32602, "invalid params"));
             };
             const store = self.task_store orelse return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32001, "task storage not configured"));
-            const task = store.cancel(temp_alloc, task_id) catch |err| switch (err) {
+            const task = store.cancel(temp_alloc, self.task_authority, task_id) catch |err| switch (err) {
                 error.TaskNotFound => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32004, "task not found")),
-                error.InvalidTaskId => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32602, "invalid task id")),
+                error.InvalidTaskId, error.InvalidTaskAuthority => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32602, "invalid task identity")),
                 error.A2aTaskTooLarge => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32010, "task exceeds storage limit")),
                 error.A2aTaskCapacityExceeded => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32011, "task storage capacity exceeded")),
                 error.A2aTaskStoreBusy => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32012, "task changed concurrently; retry")),
@@ -515,9 +780,11 @@ pub const Dispatcher = struct {
         self.executeMessageStream(temp_alloc, params, sink, alloc) catch |err| switch (err) {
             error.InvalidParams => try sink.emit(alloc, try errorResponse(temp_alloc, id, -32602, "invalid params")),
             error.UnknownSkill => try sink.emit(alloc, try errorResponse(temp_alloc, id, -32602, "unknown skill")),
-            error.InvalidTaskId => try sink.emit(alloc, try errorResponse(temp_alloc, id, -32602, "invalid task id")),
+            error.InvalidTaskId, error.InvalidTaskAuthority => try sink.emit(alloc, try errorResponse(temp_alloc, id, -32602, "invalid task identity")),
             error.A2aTaskTooLarge => try sink.emit(alloc, try errorResponse(temp_alloc, id, -32010, "task exceeds storage limit")),
             error.A2aTaskCapacityExceeded => try sink.emit(alloc, try errorResponse(temp_alloc, id, -32011, "task storage capacity exceeded")),
+            error.A2aTaskStoreBusy => try sink.emit(alloc, try errorResponse(temp_alloc, id, -32012, "task changed concurrently; retry")),
+            error.A2aTaskAlreadyExists => try sink.emit(alloc, try errorResponse(temp_alloc, id, -32013, "task id already exists")),
             else => return err,
         };
     }
@@ -557,6 +824,14 @@ pub const Dispatcher = struct {
         const handler = self.resolve(message, metadata) orelse return error.UnknownSkill;
         const task_id = try self.requestIdentity(alloc, params.object, "taskId", "id", "a2a-task-");
         const context_id = try self.requestIdentity(alloc, params.object, "contextId", null, "a2a-context-");
+        const reservation = if (self.task_store) |store| blk: {
+            const initial_task = try taskFromEvents(alloc, task_id, context_id, &.{});
+            break :blk try store.reserve(alloc, self.task_authority, task_id, initial_task);
+        } else null;
+        var reservation_live = reservation != null;
+        errdefer if (reservation_live) {
+            self.task_store.?.release(self.task_authority, task_id, reservation.?);
+        };
 
         var queue = EventQueue.init(alloc);
         try handler.execute(alloc, .{
@@ -567,7 +842,10 @@ pub const Dispatcher = struct {
         }, &queue);
 
         const task = try taskFromEvents(alloc, task_id, context_id, queue.events.items);
-        if (self.task_store) |store| try store.save(alloc, task_id, task);
+        if (self.task_store) |store| {
+            try store.save(alloc, self.task_authority, task_id, reservation.?, task);
+            reservation_live = false;
+        }
         if (stream) {
             return .{ .array = queue.events };
         }
@@ -581,6 +859,14 @@ pub const Dispatcher = struct {
         const handler = self.resolve(message, metadata) orelse return error.UnknownSkill;
         const task_id = try self.requestIdentity(alloc, params.object, "taskId", "id", "a2a-task-");
         const context_id = try self.requestIdentity(alloc, params.object, "contextId", null, "a2a-context-");
+        const reservation = if (self.task_store) |store| blk: {
+            const initial_task = try taskFromEvents(alloc, task_id, context_id, &.{});
+            break :blk try store.reserve(alloc, self.task_authority, task_id, initial_task);
+        } else null;
+        var reservation_live = reservation != null;
+        errdefer if (reservation_live) {
+            self.task_store.?.release(self.task_authority, task_id, reservation.?);
+        };
 
         var queue = EventQueue.initWithSink(alloc, sink, sink_alloc);
         try handler.execute(alloc, .{
@@ -591,7 +877,10 @@ pub const Dispatcher = struct {
         }, &queue);
 
         const task = try taskFromEvents(alloc, task_id, context_id, queue.events.items);
-        if (self.task_store) |store| try store.save(alloc, task_id, task);
+        if (self.task_store) |store| {
+            try store.save(alloc, self.task_authority, task_id, reservation.?, task);
+            reservation_live = false;
+        }
     }
 
     fn requestIdentity(
@@ -1098,9 +1387,10 @@ test "a2a generates unique task and context identities when omitted" {
     try std.testing.expect(std.mem.startsWith(u8, first_context_id, "a2a-context-"));
     try std.testing.expect(std.mem.startsWith(u8, second_context_id, "a2a-context-"));
     try std.testing.expect(!std.mem.eql(u8, first_context_id, second_context_id));
-    try std.testing.expect(store.tasks.contains(first_task_id));
-    try std.testing.expect(store.tasks.contains(second_task_id));
-    try std.testing.expectEqual(@as(usize, 2), store.tasks.count());
+    const anonymous_tasks = store.authorities.get("anonymous").?.tasks;
+    try std.testing.expect(anonymous_tasks.contains(first_task_id));
+    try std.testing.expect(anonymous_tasks.contains(second_task_id));
+    try std.testing.expectEqual(@as(usize, 2), anonymous_tasks.count());
 }
 
 test "a2a task store bounds memory and reclaims expired tasks" {
@@ -1132,21 +1422,141 @@ test "a2a task store bounds memory and reclaims expired tasks" {
     var first_object = std.json.ObjectMap.empty;
     try first_object.put(arena, "id", .{ .string = "first" });
     const first: std.json.Value = .{ .object = first_object };
-    try store.iface().save(arena, "task-1", first);
+    _ = try store.iface().reserve(arena, "principal:alice", "task-1", first);
 
     var second_object = std.json.ObjectMap.empty;
     try second_object.put(arena, "id", .{ .string = "second" });
     const second: std.json.Value = .{ .object = second_object };
     try std.testing.expectError(
         error.A2aTaskCapacityExceeded,
-        store.iface().save(arena, "task-2", second),
+        store.iface().reserve(arena, "principal:alice", "task-2", second),
     );
 
     Clock.now_ns.store(110, .release);
-    try store.iface().save(arena, "task-2", second);
-    try std.testing.expectError(error.TaskNotFound, store.iface().get(arena, "task-1"));
-    const stored = try store.iface().get(arena, "task-2");
+    _ = try store.iface().reserve(arena, "principal:alice", "task-2", second);
+    try std.testing.expectError(error.TaskNotFound, store.iface().get(arena, "principal:alice", "task-1"));
+    const stored = try store.iface().get(arena, "principal:alice", "task-2");
     try std.testing.expectEqualStrings("second", stored.object.get("id").?.string);
+}
+
+test "a2a task store reclaims expired tasks under byte pressure" {
+    const alloc = std.testing.allocator;
+    const Clock = struct {
+        var now_ns: std.atomic.Value(u64) = .init(100);
+
+        fn read() u64 {
+            return now_ns.load(.acquire);
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var store = InMemoryTaskStore.initWithOptions(alloc, io_impl.io(), .{
+        .max_tasks = 8,
+        .max_bytes_per_authority = 18,
+        .retention_ttl_ns = 10,
+        .cleanup_interval_ns = 1000,
+        .now_ns_fn = Clock.read,
+    });
+    defer store.deinit(alloc);
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const iface = store.iface();
+    _ = try iface.reserve(arena, "principal:alice", "t1", .{ .string = "1234567890" });
+    try std.testing.expectError(
+        error.A2aTaskCapacityExceeded,
+        iface.reserve(arena, "principal:alice", "t2", .{ .string = "x" }),
+    );
+
+    Clock.now_ns.store(110, .release);
+    store.next_cleanup_ns = 1000;
+    _ = try iface.reserve(arena, "principal:alice", "t2", .{ .string = "x" });
+    try std.testing.expectError(error.TaskNotFound, iface.get(arena, "principal:alice", "t1"));
+}
+
+test "a2a task store scopes identities and reservations to authority" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var store = InMemoryTaskStore.initWithOptions(alloc, io_impl.io(), .{});
+    defer store.deinit(alloc);
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const iface = store.iface();
+    _ = try iface.reserve(arena, "principal:alice", "shared-id", .{ .string = "alice" });
+    _ = try iface.reserve(arena, "principal:bob", "shared-id", .{ .string = "bob" });
+
+    try std.testing.expectError(
+        error.A2aTaskAlreadyExists,
+        iface.reserve(arena, "principal:alice", "shared-id", .{ .string = "replacement" }),
+    );
+    try std.testing.expectEqualStrings(
+        "alice",
+        (try iface.get(arena, "principal:alice", "shared-id")).string,
+    );
+    try std.testing.expectEqualStrings(
+        "bob",
+        (try iface.get(arena, "principal:bob", "shared-id")).string,
+    );
+    try std.testing.expectError(
+        error.TaskNotFound,
+        iface.get(arena, "principal:mallory", "shared-id"),
+    );
+}
+
+test "a2a task store reuses expired ids and preserves per-authority capacity" {
+    const alloc = std.testing.allocator;
+    const Clock = struct {
+        var now_ns: std.atomic.Value(u64) = .init(100);
+
+        fn read() u64 {
+            return now_ns.load(.acquire);
+        }
+    };
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var store = InMemoryTaskStore.initWithOptions(alloc, io_impl.io(), .{
+        .max_tasks = 8,
+        .max_bytes_per_authority = 20,
+        .retention_ttl_ns = 10,
+        .cleanup_interval_ns = 1000,
+        .now_ns_fn = Clock.read,
+    });
+    defer store.deinit(alloc);
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const iface = store.iface();
+    const old_generation = try iface.reserve(arena, "principal:alice", "t1", .{ .string = "1234567890" });
+    try std.testing.expectError(
+        error.A2aTaskCapacityExceeded,
+        iface.reserve(arena, "principal:alice", "t2", .{ .string = "1234567890" }),
+    );
+    _ = try iface.reserve(arena, "principal:bob", "t2", .{ .string = "1234567890" });
+
+    Clock.now_ns.store(110, .release);
+    const replacement_generation = try iface.reserve(arena, "principal:alice", "t1", .{ .string = "replacement" });
+    try std.testing.expect(replacement_generation != old_generation);
+    iface.release("principal:alice", "t1", old_generation);
+    try std.testing.expectEqualStrings(
+        "replacement",
+        (try iface.get(arena, "principal:alice", "t1")).string,
+    );
+    try std.testing.expectError(
+        error.A2aTaskStoreBusy,
+        iface.save(
+            arena,
+            "principal:alice",
+            "t1",
+            old_generation,
+            .{ .string = "stale" },
+        ),
+    );
 }
 
 test "a2a task store rejects oversized records and identifiers" {
@@ -1167,10 +1577,10 @@ test "a2a task store rejects oversized records and identifiers" {
     };
     try std.testing.expectError(
         error.A2aTaskTooLarge,
-        store.iface().save(arena, "task", oversized),
+        store.iface().reserve(arena, "principal:alice", "task", oversized),
     );
     try std.testing.expectError(
         error.InvalidTaskId,
-        store.iface().save(arena, "identifier-too-long", .null),
+        store.iface().reserve(arena, "principal:alice", "identifier-too-long", .null),
     );
 }

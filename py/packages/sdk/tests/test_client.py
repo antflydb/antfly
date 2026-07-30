@@ -17,12 +17,14 @@ class TestAntflyClient:
     """Test cases for AntflyClient."""
 
     def test_transform_operator_names_are_stable(self) -> None:
-        assert TransformOpType.SET.value == "$set"
-        assert TransformOpType.SET_ON_INSERT.value == "$setOnInsert"
-        assert TransformOpType.UNSET.value == "$unset"
-        assert TransformOpType.INC.value == "$inc"
-        assert TransformOpType.ADD_TO_SET.value == "$addToSet"
-        assert TransformOpType.MAX.value == "$max"
+        assert {member.name: member.value for member in TransformOpType} == {
+            "SET": "$set",
+            "SET_ON_INSERT": "$setOnInsert",
+            "UNSET": "$unset",
+            "INC": "$inc",
+            "ADD_TO_SET": "$addToSet",
+            "MAX": "$max",
+        }
 
     def test_sort_profile_uses_closed_public_diagnostic_shape(self) -> None:
         """SortProfile keeps stable fields typed and drops internal counters."""
