@@ -153,10 +153,13 @@ pub const RebuildState = struct {
             .absent => .absent,
             .legacy => .legacy,
             .corrupt => .corrupt,
-            .valid => |cursor| if (cursor.complete)
-                .absent
-            else
-                .{ .valid = try alloc.dupe(u8, cursor.key) },
+            .valid => |cursor| blk: {
+                if (self.owner_generation) |expected_owner| {
+                    if (cursor.owner_generation != expected_owner) break :blk .legacy;
+                }
+                if (cursor.complete) break :blk .absent;
+                break :blk .{ .valid = try alloc.dupe(u8, cursor.key) };
+            },
         };
     }
 
@@ -741,6 +744,34 @@ test "rebuild state owned migration safely restarts an in-flight legacy cursor" 
     // spuriously restart the same generation forever.
     try owned.clearWithIo(std.testing.io);
     try std.testing.expect((try owned.checkWithIo(std.testing.allocator, std.testing.io)) == null);
+}
+
+test "rebuild state nonmutating load reports owned legacy without migration" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rebuild-state-owner-inspect", .{tmp.sub_path});
+    defer alloc.free(path);
+    try createTestStateRoot(path);
+
+    const legacy = RebuildState.init(path);
+    try legacy.updateWithIo(std.testing.io, "doc:m");
+    const legacy_path = try legacy.pathAlloc(alloc);
+    defer alloc.free(legacy_path);
+    const before = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, legacy_path, alloc, .limited(rebuild_state_max_encoded_bytes));
+    defer alloc.free(before);
+
+    const owned = RebuildState.initOwned(path, null, 91);
+    var loaded = try owned.loadWithIo(alloc, std.testing.io);
+    defer loaded.deinit(alloc);
+    try std.testing.expect(loaded == .legacy);
+
+    const owned_path = try owned.pathAlloc(alloc);
+    defer alloc.free(owned_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, owned_path, .{}));
+    const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, legacy_path, alloc, .limited(rebuild_state_max_encoded_bytes));
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings(before, after);
 }
 
 test "rebuild state publication crash boundaries preserve a valid state" {
