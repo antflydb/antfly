@@ -231,7 +231,17 @@ pub const AntflyApiHandler = struct {
         return respondApiResponseBody(ctx, resp.status, resp.body);
     }
 
-    pub fn httpRequestFromContext(ctx: *httpx.Context, body_data_opt: ?[]const u8) !http_common.HttpRequest {
+    pub const ConvertedHttpRequest = struct {
+        value: http_common.HttpRequest,
+        alloc: std.mem.Allocator,
+
+        pub fn deinit(self: *@This()) void {
+            self.alloc.free(self.value.headers);
+            self.* = undefined;
+        }
+    };
+
+    pub fn httpRequestFromContext(ctx: *httpx.Context, body_data_opt: ?[]const u8) !ConvertedHttpRequest {
         const method: http_common.Method = switch (ctx.request.method) {
             .GET => .GET,
             .POST => .POST,
@@ -242,17 +252,21 @@ pub const AntflyApiHandler = struct {
             },
         };
         const headers = try ctx.allocator.alloc(http_common.RequestHeader, ctx.request.headers.entries.items.len);
+        errdefer ctx.allocator.free(headers);
         for (ctx.request.headers.entries.items, 0..) |entry, i| {
             headers[i] = .{ .name = entry.name, .value = entry.value };
         }
         const body_data = body_data_opt orelse (try ctx.body()) orelse "";
         return .{
-            .method = method,
-            .uri = ctx.request.uri.raw,
-            .headers = headers,
-            .authorization = ctx.header("authorization"),
-            .content_type = ctx.header("content-type"),
-            .body = body_data,
+            .value = .{
+                .method = method,
+                .uri = ctx.request.uri.raw,
+                .headers = headers,
+                .authorization = ctx.header("authorization"),
+                .content_type = ctx.header("content-type"),
+                .body = body_data,
+            },
+            .alloc = ctx.allocator,
         };
     }
 
@@ -704,11 +718,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, "") catch {
+        var converted_req = httpRequestFromContext(ctx, "") catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -739,11 +754,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -781,11 +797,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -876,11 +893,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -921,11 +939,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -962,11 +981,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid savepoint id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -999,11 +1019,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -1174,11 +1195,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -3465,12 +3487,12 @@ test "httpx internal request conversion preserves protocol headers" {
     var ctx = httpx.Context.init(alloc, undefined, &request);
     defer ctx.deinit();
 
-    const converted = try AntflyApiHandler.httpRequestFromContext(&ctx, "{}");
-    defer alloc.free(converted.headers);
+    var converted = try AntflyApiHandler.httpRequestFromContext(&ctx, "{}");
+    defer converted.deinit();
 
-    try std.testing.expectEqualStrings("session-123", converted.header("mcp-session-id") orelse return error.MissingHeader);
-    try std.testing.expectEqualStrings("application/json", converted.content_type orelse return error.MissingContentType);
-    try std.testing.expectEqualStrings("{}", converted.body);
+    try std.testing.expectEqualStrings("session-123", converted.value.header("mcp-session-id") orelse return error.MissingHeader);
+    try std.testing.expectEqualStrings("application/json", converted.value.content_type orelse return error.MissingContentType);
+    try std.testing.expectEqualStrings("{}", converted.value.body);
 }
 
 test "httpx antfly routes require auth and enforce admin middleware" {

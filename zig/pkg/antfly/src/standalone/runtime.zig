@@ -90,6 +90,7 @@ const TerminationSignalScope = struct {
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
+    experimental: bool = false,
     bind_host: ?[]const u8 = null,
     bind_port: ?u16 = null,
     health_enabled: ?bool = null,
@@ -1500,6 +1501,7 @@ pub fn runFromIterator(
         },
         .api_server_cfg = .{
             .auth_enabled = auth_enabled,
+            .experimental = cli.experimental,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
@@ -2379,6 +2381,8 @@ fn serveUnifiedInner(
     try registerHAAdminRoutes(&server);
     try registerHAInternalRoutes(&server);
     try registerMcpRoutes(&server);
+    try registerExperimentalRoutes(&server, api_server.cfg.experimental);
+    try registerArdRoutes(&server);
     try registerExtensionRoutes(&server);
     try registerInternalGroupRoutes(&server);
     try registerAntfarmRoutes(&server);
@@ -2465,10 +2469,31 @@ fn registerMcpRoutes(server: anytype) !void {
         routes.mcp_v1_prefix ++ "*",
     };
     inline for (mcp_paths) |path| {
-        try server.get(path, mcpBridgeHandler);
-        try server.post(path, mcpBridgeHandler);
-        try server.delete(path, mcpBridgeHandler);
+        try server.get(path, protocolBridgeHandler);
+        try server.post(path, protocolBridgeHandler);
+        try server.delete(path, protocolBridgeHandler);
     }
+}
+
+fn registerA2aRoutes(server: anytype) !void {
+    const routes = antfly.public_api.http_routes.Routes;
+    try server.post(routes.a2a, protocolBridgeHandler);
+    try server.get(routes.agent_card, protocolBridgeHandler);
+    try server.get(routes.agent_card_legacy, protocolBridgeHandler);
+}
+
+fn registerExperimentalRoutes(server: anytype, enabled: bool) !void {
+    if (!enabled) return;
+    try registerA2aRoutes(server);
+}
+
+fn registerArdRoutes(server: anytype) !void {
+    const routes = antfly.public_api.http_routes.Routes;
+    try server.get(routes.ai_catalog, protocolBridgeHandler);
+    try server.get(routes.ard_v1, protocolBridgeHandler);
+    try server.get(routes.ard_v1 ++ "/*", protocolBridgeHandler);
+    try server.post(routes.ard_v1_search, protocolBridgeHandler);
+    try server.post(routes.ard_v1_explore, protocolBridgeHandler);
 }
 
 fn registerHAAdminRoutes(server: anytype) !void {
@@ -2650,6 +2675,8 @@ fn isAntfarmReservedPath(path: []const u8) bool {
         "/admin",
         "/internal",
         "/mcp",
+        "/a2a",
+        "/.well-known",
         "/extensions",
         "/healthz",
         "/readyz",
@@ -2905,36 +2932,38 @@ fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         return ctx.text("not ready");
     };
 
-    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
+    var converted_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
         error.UnsupportedMethod => {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         },
         else => return err,
     };
+    defer converted_req.deinit();
 
-    var resp = (try server.handleInternalRoute(legacy_req)) orelse {
+    var resp = (try server.handleInternalRoute(converted_req.value)) orelse {
         _ = ctx.status(404);
         return ctx.text("not found");
     };
     return AntflyApiHandler.respondWithAllocator(ctx, &resp, server.alloc);
 }
 
-fn mcpBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+fn protocolBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     const server = active_api_server orelse {
         _ = ctx.status(503);
         return ctx.text("not ready");
     };
 
-    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
+    var converted_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
         error.UnsupportedMethod => {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         },
         else => return err,
     };
+    defer converted_req.deinit();
 
-    var resp = try server.handle(legacy_req);
+    var resp = try server.handle(converted_req.value);
     return AntflyApiHandler.respondWithAllocator(ctx, &resp, server.alloc);
 }
 
@@ -2944,15 +2973,16 @@ fn extensionBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         return ctx.text("not ready");
     };
 
-    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
+    var converted_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
         error.UnsupportedMethod => {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         },
         else => return err,
     };
+    defer converted_req.deinit();
 
-    var resp = try server.handle(legacy_req);
+    var resp = try server.handle(converted_req.value);
     return AntflyApiHandler.respondWithAllocator(ctx, &resp, server.alloc);
 }
 
@@ -2997,6 +3027,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             cfg.help = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--experimental")) {
+            cfg.experimental = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--config")) {
@@ -3886,6 +3920,7 @@ fn printUsage() void {
         \\  --id <node-id>                        Local node id (default: 1)
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
+        \\  --experimental                        Enable experimental A2A protocol surfaces
         \\  --ard-base-url <url>                  Absolute public base URL for ARD catalog artifact links
         \\  --ard-publisher-domain <name>         ARD did:web publisher domain (default: antfly.local)
         \\  --ard-display-name <name>             ARD catalog host display name (default: Antfly)
@@ -4145,6 +4180,14 @@ test "standalone runtime leaves auth disabled unless config or cli enables it" {
     try std.testing.expect(!resolveAuthEnabled(.{ .auth_enabled = false }, null));
 }
 
+test "standalone runtime parses experimental flag" {
+    const argv = [_][*:0]const u8{"--experimental"};
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var parsed = try parseCli(std.testing.allocator, &iter);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expect(parsed.experimental);
+}
+
 test "standalone bridge shared adapter preserves protocol headers and absent body" {
     const alloc = std.testing.allocator;
 
@@ -4155,11 +4198,51 @@ test "standalone bridge shared adapter preserves protocol headers and absent bod
     var ctx = httpx.Context.init(alloc, undefined, &request);
     defer ctx.deinit();
 
-    const req = try AntflyApiHandler.httpRequestFromContext(&ctx, null);
-    defer alloc.free(req.headers);
+    var converted = try AntflyApiHandler.httpRequestFromContext(&ctx, null);
+    defer converted.deinit();
 
-    try std.testing.expectEqualStrings("session-123", req.header("mcp-session-id") orelse return error.MissingHeader);
-    try std.testing.expectEqualStrings("", req.body);
+    try std.testing.expectEqualStrings("session-123", converted.value.header("mcp-session-id") orelse return error.MissingHeader);
+    try std.testing.expectEqualStrings("", converted.value.body);
+}
+
+test "standalone protocol bridge releases converted request headers" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+
+    var source = FakeSource{};
+    var api_server = antfly.public_api.http_server.ApiHttpServer.init(
+        std.testing.allocator,
+        .{},
+        source.iface(),
+        null,
+        null,
+    );
+    defer api_server.deinit();
+
+    const previous_api_server = active_api_server;
+    active_api_server = &api_server;
+    defer active_api_server = previous_api_server;
+
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "http://127.0.0.1/mcp/v1");
+    defer request.deinit();
+    try request.setHeader("Mcp-Protocol-Version", "2025-06-18");
+
+    var ctx = httpx.Context.init(std.testing.allocator, undefined, &request);
+    defer ctx.deinit();
+
+    var response = try protocolBridgeHandler(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status.code);
 }
 
 test "standalone runtime local replica reconcile permit blocks only active startup catch-up" {
@@ -4288,6 +4371,44 @@ test "standalone runtime registers mcp routes before antfarm catch-all" {
     try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 
+test "standalone runtime registers A2A routes before antfarm catch-all" {
+    const routes = antfly.public_api.http_routes.Routes;
+
+    var disabled = RecordingServer{ .allocator = std.testing.allocator };
+    defer disabled.deinit();
+    try registerExperimentalRoutes(&disabled, false);
+    try registerAntfarmRoutes(&disabled);
+    try std.testing.expect(!disabled.hasRoute(.post, routes.a2a));
+    try std.testing.expect(!disabled.hasRoute(.get, routes.agent_card));
+    try std.testing.expect(!disabled.hasRoute(.get, routes.agent_card_legacy));
+    try std.testing.expect(disabled.hasRoute(.get, "/*"));
+
+    var enabled = RecordingServer{ .allocator = std.testing.allocator };
+    defer enabled.deinit();
+    try registerExperimentalRoutes(&enabled, true);
+    try registerAntfarmRoutes(&enabled);
+    try std.testing.expect(enabled.hasRoute(.post, routes.a2a));
+    try std.testing.expect(enabled.hasRoute(.get, routes.agent_card));
+    try std.testing.expect(enabled.hasRoute(.get, routes.agent_card_legacy));
+    try std.testing.expect(enabled.hasRoute(.get, "/*"));
+}
+
+test "standalone runtime registers ARD routes before antfarm catch-all" {
+    var server = RecordingServer{ .allocator = std.testing.allocator };
+    defer server.deinit();
+
+    try registerArdRoutes(&server);
+    try registerAntfarmRoutes(&server);
+
+    const routes = antfly.public_api.http_routes.Routes;
+    try std.testing.expect(server.hasRoute(.get, routes.ai_catalog));
+    try std.testing.expect(server.hasRoute(.get, routes.ard_v1));
+    try std.testing.expect(server.hasRoute(.get, routes.ard_v1 ++ "/*"));
+    try std.testing.expect(server.hasRoute(.post, routes.ard_v1_search));
+    try std.testing.expect(server.hasRoute(.post, routes.ard_v1_explore));
+    try std.testing.expect(server.hasRoute(.get, "/*"));
+}
+
 test "standalone runtime registers extension routes before antfarm catch-all" {
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
@@ -4323,6 +4444,8 @@ test "standalone runtime antfarm path guards keep api routes reserved" {
     try std.testing.expect(isAntfarmReservedPath("/ai/v1/models"));
     try std.testing.expect(isAntfarmReservedPath("/antfly/readyz"));
     try std.testing.expect(isAntfarmReservedPath("/admin/v1/ha/primary/status"));
+    try std.testing.expect(isAntfarmReservedPath("/a2a"));
+    try std.testing.expect(isAntfarmReservedPath("/.well-known/agent-card.json"));
     try std.testing.expect(isAntfarmReservedPath("/extensions/v1/packages"));
     try std.testing.expect(isAntfarmReservedPath("/unknown/v1/status"));
     try std.testing.expect(isAntfarmReservedPath("/unknown/v12/status"));

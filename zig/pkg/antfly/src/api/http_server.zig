@@ -578,6 +578,7 @@ pub const RestoreExecutionGuard = struct {
 
 pub const ApiHttpServerConfig = struct {
     auth_enabled: bool = false,
+    experimental: bool = false,
     ard_base_url: ?[]const u8 = null,
     ard_publisher_domain: []const u8 = "antfly.local",
     ard_display_name: []const u8 = "Antfly",
@@ -3404,6 +3405,9 @@ pub const ApiHttpServer = struct {
             };
             return try jsonResponse(self.alloc, .{ .status = "ready" });
         }
+        if (!self.cfg.experimental and isA2aProtocolPath(uri_parts.path)) {
+            return try jsonErrorResponse(self.alloc, 404, "not found");
+        }
 
         const route_requires_authentication = self.requiresAuthentication(uri_parts.path);
         const should_authenticate_optional_ard_catalog =
@@ -3887,6 +3891,7 @@ pub const ApiHttpServer = struct {
             .base_url = self.cfg.ard_base_url,
             .publisher_domain = if (self.cfg.ard_publisher_domain.len > 0) self.cfg.ard_publisher_domain else "antfly.local",
             .display_name = if (self.cfg.ard_display_name.len > 0) self.cfg.ard_display_name else "Antfly",
+            .a2a_enabled = self.cfg.experimental,
             .is_admin = !self.cfg.auth_enabled or authenticatedIdentityIsAdmin(authenticated_identity),
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .profile = try parseSimpleQueryParamDecodedAlloc(alloc, query, "profile"),
@@ -8302,6 +8307,7 @@ pub const ApiHttpServer = struct {
     fn executeStreaming(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest, writer: http_common.StreamWriter) !bool {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const uri_parts = splitTarget(req.uri);
+        if (!self.cfg.experimental) return false;
         if (!std.mem.eql(u8, uri_parts.path, routes.Routes.a2a)) return false;
         if (!protocol_adapters.isA2aStreamingRequest(self.alloc, req)) return false;
 
@@ -13705,6 +13711,12 @@ pub fn requiresAdminPermission(path: []const u8) bool {
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
 }
 
+fn isA2aProtocolPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, routes.Routes.a2a) or
+        std.mem.eql(u8, path, routes.Routes.agent_card) or
+        std.mem.eql(u8, path, routes.Routes.agent_card_legacy);
+}
+
 fn isHaAdminPath(path: []const u8) bool {
     return std.mem.eql(u8, path, admin_routes.ha) or std.mem.startsWith(u8, path, admin_routes.ha ++ "/");
 }
@@ -18521,7 +18533,7 @@ test "api http server serves connections with partial provider failures" {
     try std.testing.expectEqual(@as(u16, 200), prefixed.status);
 }
 
-test "api http server serves mcp and a2a protocol surfaces" {
+test "api http server serves MCP and hides A2A by default" {
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
             return .{
@@ -18537,6 +18549,59 @@ test "api http server serves mcp and a2a protocol surfaces" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var mcp_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer mcp_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), mcp_resp.status);
+
+    const hidden_requests = [_]http_common.HttpRequest{
+        .{ .method = .POST, .uri = routes.Routes.a2a },
+        .{
+            .method = .POST,
+            .uri = "/db/v1/a2a",
+            .content_type = "application/json",
+            .body = "{\"jsonrpc\":\"2.0\",\"id\":\"stream\",\"method\":\"message/stream\",\"params\":{}}",
+        },
+        .{ .method = .GET, .uri = routes.Routes.agent_card },
+        .{ .method = .GET, .uri = "/db/v1/.well-known/agent-card.json" },
+        .{ .method = .GET, .uri = routes.Routes.agent_card_legacy },
+        .{ .method = .GET, .uri = "/db/v1/.well-known/agent.json" },
+    };
+    for (hidden_requests) |request| {
+        var response = try server.handle(request);
+        defer response.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 404), response.status);
+    }
+}
+
+test "api http server serves MCP and opted-in A2A protocol surfaces" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{ .experimental = true },
+        source.iface(),
+        null,
+        null,
+    );
     defer server.deinit();
 
     var mcp_resp = try server.handle(.{
@@ -18601,6 +18666,10 @@ test "api http server serves mcp and a2a protocol surfaces" {
     try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"id\":\"query-builder\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"id\":\"retrieval\"") != null);
 
+    var prefixed_card_resp = try server.handle(.{ .method = .GET, .uri = "/db/v1/.well-known/agent-card.json" });
+    defer prefixed_card_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), prefixed_card_resp.status);
+
     var a2a_resp = try server.handle(.{
         .method = .POST,
         .uri = routes.Routes.a2a,
@@ -18610,6 +18679,15 @@ test "api http server serves mcp and a2a protocol surfaces" {
     defer a2a_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), a2a_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, a2a_resp.body, "\"preferredTransport\":\"JSONRPC\"") != null);
+
+    var prefixed_a2a_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/a2a",
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":\"prefixed-card\",\"method\":\"agent/getAuthenticatedExtendedCard\",\"params\":{}}",
+    });
+    defer prefixed_a2a_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), prefixed_a2a_resp.status);
 
     var stream_resp = try server.handle(.{
         .method = .POST,
@@ -18677,6 +18755,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expectEqualStrings("*", public_catalog.headers[0].value);
     try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/ai-registry+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/mcp-server+json\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public_catalog.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
 
     var tenant_catalog = try server.handle(.{
         .method = .GET,
@@ -18688,6 +18767,7 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
     try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "\"displayName\":\"Tenant Antfly\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "\"identifier\":\"did:web:tenant.example.com\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "urn:ai:tenant.example.com:antfly:mcp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tenant_catalog.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, tenant_catalog.body, .{});
     defer parsed.deinit();
@@ -18702,6 +18782,72 @@ test "api http server serves ARD catalogs with public bootstrap and authenticate
         const has_data = object.get("data") != null;
         try std.testing.expect(has_url != has_data);
     }
+
+    var hidden_agents = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_agents,
+    });
+    defer hidden_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), hidden_agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, hidden_agents.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
+
+    var hidden_search = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .body = "{\"query\":{\"text\":\"Antfly A2A Agent\"},\"federation\":\"none\"}",
+    });
+    defer hidden_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), hidden_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, hidden_search.body, "\"type\":\"application/a2a-agent-card+json\"") == null);
+
+    var hidden_explore = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_explore,
+        .body = "{\"query\":{\"filter\":{\"type\":[\"application/a2a-agent-card+json\"]}},\"resultType\":{\"facets\":[{\"field\":\"type\"}]}}",
+    });
+    defer hidden_explore.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), hidden_explore.status);
+    try std.testing.expect(std.mem.indexOf(u8, hidden_explore.body, "\"value\":\"application/a2a-agent-card+json\"") == null);
+
+    var experimental_server = ApiHttpServer.init(std.testing.allocator, .{
+        .experimental = true,
+        .ard_publisher_domain = "tenant.example.com",
+        .ard_display_name = "Tenant Antfly",
+    }, source.iface(), null, null);
+    defer experimental_server.deinit();
+    var experimental_catalog = try experimental_server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+    });
+    defer experimental_catalog.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), experimental_catalog.status);
+    try std.testing.expect(std.mem.indexOf(u8, experimental_catalog.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
+
+    var experimental_agents = try experimental_server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_agents,
+    });
+    defer experimental_agents.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), experimental_agents.status);
+    try std.testing.expect(std.mem.indexOf(u8, experimental_agents.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
+
+    var experimental_search = try experimental_server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_search,
+        .body = "{\"query\":{\"text\":\"Antfly A2A Agent\",\"filter\":{\"type\":[\"application/a2a-agent-card+json\"]}},\"federation\":\"none\"}",
+    });
+    defer experimental_search.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), experimental_search.status);
+    try std.testing.expect(std.mem.indexOf(u8, experimental_search.body, "\"type\":\"application/a2a-agent-card+json\"") != null);
+
+    var experimental_explore = try experimental_server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.ard_v1_explore,
+        .body = "{\"query\":{\"filter\":{\"type\":[\"application/a2a-agent-card+json\"]}},\"resultType\":{\"facets\":[{\"field\":\"type\"}]}}",
+    });
+    defer experimental_explore.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), experimental_explore.status);
+    try std.testing.expect(std.mem.indexOf(u8, experimental_explore.body, "\"value\":\"application/a2a-agent-card+json\"") != null);
 }
 
 test "api http server requires auth for ARD tenant catalog when auth is enabled" {
@@ -18930,7 +19076,7 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     };
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .experimental = true }, source.iface(), null, null);
     defer server.deinit();
 
     var catalog = try server.handle(.{
@@ -22462,7 +22608,7 @@ test "api http server serves retrieval agent event stream" {
     };
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .experimental = true }, source.iface(), table_source.source(), null);
     const retrieval_body =
         \\{"query":"find hello","stream":true,"queries":[{"table":"docs","full_text_search":{"query":"body:hello"},"limit":5}]}
     ;
