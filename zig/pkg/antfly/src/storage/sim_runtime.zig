@@ -775,13 +775,16 @@ fn modeledFileSize(ptr: *anyopaque, path: []const u8) !u64 {
     return @intCast(try self.fileSize(path));
 }
 
-fn modeledReadFileTrailerAlloc(ptr: *anyopaque, alloc: Allocator, path: []const u8, len: usize) ![]u8 {
+fn modeledReadFileTrailerAlloc(ptr: *anyopaque, alloc: Allocator, path: []const u8, len: usize) !lsm_storage.FileTrailer {
     const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
     self.mutex.lock();
     defer self.mutex.unlock();
     const file = self.files.get(path) orelse return error.FileNotFound;
     if (file.volatile_bytes.len < len) return error.EndOfStream;
-    return try alloc.dupe(u8, file.volatile_bytes[file.volatile_bytes.len - len ..]);
+    return .{
+        .bytes = try alloc.dupe(u8, file.volatile_bytes[file.volatile_bytes.len - len ..]),
+        .file_size = file.volatile_bytes.len,
+    };
 }
 
 fn modeledWriteFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {

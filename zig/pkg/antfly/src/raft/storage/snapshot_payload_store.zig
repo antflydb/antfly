@@ -13,6 +13,7 @@ const envelope_version: u32 = 1;
 const envelope_header_len: usize = 72;
 const digest_domain = "antfly-raft-snapshot-payload-v1\x00";
 const copy_buffer_len = 64 * 1024;
+pub const max_payload_bytes: u64 = 1 << 30;
 
 var publish_nonce = std.atomic.Value(u64).init(1);
 
@@ -76,6 +77,7 @@ fn writeSourceAtomically(
     errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
 
     const payload_len = source.len();
+    if (payload_len > max_payload_bytes) return error.SnapshotPayloadTooLarge;
     var published_envelope: Envelope = undefined;
     {
         var file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
@@ -204,6 +206,7 @@ fn readEnvelope(file: std.Io.File, io: std.Io, expected_index: u64, expected_ter
     const term = std.mem.readInt(u64, header[24..32], .little);
     const payload_len = std.mem.readInt(u64, header[32..40], .little);
     if (index != expected_index or term != expected_term) return error.SnapshotPayloadIdentityMismatch;
+    if (payload_len > max_payload_bytes) return error.SnapshotPayloadTooLarge;
     const expected_file_len = std.math.add(u64, envelope_header_len, payload_len) catch
         return error.SnapshotPayloadTooLarge;
     if (try file.length(io) != expected_file_len) return error.SnapshotPayloadSizeMismatch;
@@ -362,6 +365,15 @@ test "raft snapshot payload publication rejects an artifact length contract viol
             try writer.writeAll(self.bytes);
         }
     };
+    const OversizedSource = struct {
+        fn len(_: @This()) u64 {
+            return max_payload_bytes + 1;
+        }
+
+        fn writeTo(_: @This(), _: *std.Io.Writer) !void {
+            unreachable;
+        }
+    };
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -374,6 +386,10 @@ test "raft snapshot payload publication rejects an artifact length contract viol
     try std.testing.expectError(
         error.SnapshotArtifactSizeMismatch,
         writeSourceAtomically(std.testing.allocator, io, snapshot_dir, 4, 2, MisreportedSource{ .bytes = "short" }),
+    );
+    try std.testing.expectError(
+        error.SnapshotPayloadTooLarge,
+        writeSourceAtomically(std.testing.allocator, io, snapshot_dir, 5, 2, OversizedSource{}),
     );
     const path = try pathAlloc(std.testing.allocator, snapshot_dir, 4, 2);
     defer std.testing.allocator.free(path);

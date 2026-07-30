@@ -366,12 +366,35 @@ const GraphSearchResultBuilder = struct {
     }
 
     fn toOwned(self: *GraphSearchResultBuilder, alloc: std.mem.Allocator) !db_mod.types.GraphSearchResult {
+        const nodes = try self.nodes.toOwnedSlice(alloc);
+        errdefer {
+            for (nodes) |*node| node.deinit(alloc);
+            if (nodes.len > 0) alloc.free(nodes);
+        }
+        const paths = try self.paths.toOwnedSlice(alloc);
+        errdefer {
+            for (paths) |path| graph_paths.freePath(alloc, path);
+            if (paths.len > 0) alloc.free(paths);
+        }
+        const matches = try self.matches.toOwnedSlice(alloc);
+        errdefer {
+            for (matches) |*match| match.deinit(alloc);
+            if (matches.len > 0) alloc.free(matches);
+        }
+        const hits = try self.hits.toOwnedSlice(alloc);
+        errdefer {
+            for (hits) |*hit| hit.deinit(alloc);
+            if (hits.len > 0) alloc.free(hits);
+        }
+
+        const name = self.name;
+        self.name = &.{};
         return .{
-            .name = self.name,
-            .nodes = try self.nodes.toOwnedSlice(alloc),
-            .paths = try self.paths.toOwnedSlice(alloc),
-            .matches = try self.matches.toOwnedSlice(alloc),
-            .hits = try self.hits.toOwnedSlice(alloc),
+            .name = name,
+            .nodes = nodes,
+            .paths = paths,
+            .matches = matches,
+            .hits = hits,
             .total_hits = self.total_hits,
         };
     }
@@ -393,25 +416,43 @@ fn mergeGraphSearchResults(
                 for (builders.items, 0..) |builder, i| {
                     if (std.mem.eql(u8, builder.name, graph_result.name)) break :blk i;
                 }
-                try builders.append(alloc, .{
-                    .name = try alloc.dupe(u8, graph_result.name),
-                });
+                const name = try alloc.dupe(u8, graph_result.name);
+                builders.append(alloc, .{ .name = name }) catch |err| {
+                    alloc.free(name);
+                    return err;
+                };
                 break :blk builders.items.len - 1;
             };
             var builder = &builders.items[idx];
             builder.total_hits +|= graph_result.total_hits;
 
             for (graph_result.nodes) |node| {
-                try builder.nodes.append(alloc, try cloneGraphResultNode(alloc, node));
+                var owned = try cloneGraphResultNode(alloc, node);
+                builder.nodes.append(alloc, owned) catch |err| {
+                    owned.deinit(alloc);
+                    return err;
+                };
             }
             for (graph_result.paths) |path| {
-                try builder.paths.append(alloc, try cloneGraphPath(alloc, path));
+                const owned = try cloneGraphPath(alloc, path);
+                builder.paths.append(alloc, owned) catch |err| {
+                    graph_paths.freePath(alloc, owned);
+                    return err;
+                };
             }
             for (graph_result.matches) |match| {
-                try builder.matches.append(alloc, try cloneGraphPatternMatch(alloc, match));
+                var owned = try cloneGraphPatternMatch(alloc, match);
+                builder.matches.append(alloc, owned) catch |err| {
+                    owned.deinit(alloc);
+                    return err;
+                };
             }
             for (graph_result.hits) |hit| {
-                try builder.hits.append(alloc, try hit.clone(alloc));
+                var owned = try hit.clone(alloc);
+                builder.hits.append(alloc, owned) catch |err| {
+                    owned.deinit(alloc);
+                    return err;
+                };
             }
         }
     }
@@ -425,11 +466,6 @@ fn mergeGraphSearchResults(
     for (builders.items, 0..) |*builder, i| {
         merged[i] = try builder.toOwned(alloc);
         initialized += 1;
-        builder.name = &.{};
-        builder.nodes = .empty;
-        builder.paths = .empty;
-        builder.matches = .empty;
-        builder.hits = .empty;
     }
     return merged;
 }
@@ -505,10 +541,10 @@ fn cloneGraphPatternMatch(
         if (source.bindings.len > 0) alloc.free(bindings);
     }
     for (source.bindings, 0..) |binding, i| {
-        bindings[i] = .{
-            .alias = try alloc.dupe(u8, binding.alias),
-            .node = try cloneGraphResultNode(alloc, binding.node),
-        };
+        const alias = try alloc.dupe(u8, binding.alias);
+        errdefer alloc.free(alias);
+        const node = try cloneGraphResultNode(alloc, binding.node);
+        bindings[i] = .{ .alias = alias, .node = node };
         initialized_bindings += 1;
     }
 
@@ -524,13 +560,7 @@ fn cloneGraphPatternMatch(
         if (source.path.len > 0) alloc.free(path);
     }
     for (source.path, 0..) |edge, i| {
-        path[i] = .{
-            .source = try alloc.dupe(u8, edge.source),
-            .target = try alloc.dupe(u8, edge.target),
-            .edge_type = try alloc.dupe(u8, edge.edge_type),
-            .weight = edge.weight,
-            .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
-        };
+        path[i] = try clonePathEdge(graph_query_mod.PathEdgeInfo, alloc, edge);
         initialized_path += 1;
     }
 
@@ -544,43 +574,31 @@ fn cloneGraphResultNode(
     alloc: std.mem.Allocator,
     source: graph_query_mod.GraphResultNode,
 ) !graph_query_mod.GraphResultNode {
-    const path = if (source.path) |items| blk: {
-        const out = try alloc.alloc([]const u8, items.len);
-        errdefer alloc.free(out);
-        for (items, 0..) |item, i| out[i] = try alloc.dupe(u8, item);
-        break :blk out;
-    } else null;
-
-    const path_edges = if (source.path_edges) |items| blk: {
-        const PathEdge = std.meta.Child(@TypeOf(items));
-        const out = try alloc.alloc(PathEdge, items.len);
-        errdefer alloc.free(out);
-        for (items, 0..) |item, i| {
-            out[i] = .{
-                .source = try alloc.dupe(u8, item.source),
-                .target = try alloc.dupe(u8, item.target),
-                .edge_type = try alloc.dupe(u8, item.edge_type),
-                .weight = item.weight,
-                .metadata = if (item.metadata.len > 0) try alloc.dupe(u8, item.metadata) else "",
-            };
-        }
-        break :blk out;
-    } else null;
-
-    const provenance = if (source.provenance) |items| blk: {
-        const out = try alloc.alloc([]const u8, items.len);
-        errdefer alloc.free(out);
-        for (items, 0..) |item, i| out[i] = try alloc.dupe(u8, item);
-        break :blk out;
-    } else null;
+    const key = try alloc.dupe(u8, source.key);
+    errdefer alloc.free(key);
+    const table = if (source.table) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (table) |value| alloc.free(value);
+    const path = if (source.path) |items| try cloneStringSlice(alloc, items) else null;
+    errdefer if (path) |items| freeStringSlice(alloc, items);
+    const path_edges = if (source.path_edges) |items|
+        try clonePathEdges(graph_query_mod.PathEdgeInfo, alloc, items)
+    else
+        null;
+    errdefer if (path_edges) |items| freePathEdges(alloc, items);
+    const provenance = if (source.provenance) |items|
+        try cloneStringSlice(alloc, items)
+    else
+        null;
+    errdefer if (provenance) |items| freeStringSlice(alloc, items);
 
     return .{
-        .key = try alloc.dupe(u8, source.key),
+        .key = key,
         .depth = source.depth,
         .distance = source.distance,
         .path = path,
         .path_edges = path_edges,
         .provenance = provenance,
+        .table = table,
     };
 }
 
@@ -588,29 +606,123 @@ fn cloneGraphPath(
     alloc: std.mem.Allocator,
     source: db_mod.types.GraphPath,
 ) !db_mod.types.GraphPath {
-    const nodes = try alloc.alloc([]const u8, source.nodes.len);
-    errdefer alloc.free(nodes);
-    for (source.nodes, 0..) |node, i| nodes[i] = try alloc.dupe(u8, node);
-
-    const PathEdge = std.meta.Child(@TypeOf(source.edges));
-    const edges = try alloc.alloc(PathEdge, source.edges.len);
-    errdefer alloc.free(edges);
-    for (source.edges, 0..) |edge, i| {
-        edges[i] = .{
-            .source = try alloc.dupe(u8, edge.source),
-            .target = try alloc.dupe(u8, edge.target),
-            .edge_type = try alloc.dupe(u8, edge.edge_type),
-            .weight = edge.weight,
-            .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
-        };
-    }
+    const nodes = try cloneStringSlice(alloc, source.nodes);
+    errdefer freeStringSlice(alloc, nodes);
+    const node_tables = try cloneOptionalStringSlice(alloc, source.node_tables);
+    errdefer freeOptionalStringSlice(alloc, node_tables);
+    const edges = try clonePathEdges(graph_paths.PathEdge, alloc, source.edges);
+    errdefer freePathEdges(alloc, edges);
 
     return .{
         .nodes = nodes,
+        .node_tables = node_tables,
         .edges = edges,
         .total_weight = source.total_weight,
         .length = source.length,
     };
+}
+
+fn cloneStringSlice(
+    alloc: std.mem.Allocator,
+    source: []const []const u8,
+) ![][]const u8 {
+    const out = try alloc.alloc([]const u8, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item);
+        alloc.free(out);
+    }
+    for (source, 0..) |item, i| {
+        out[i] = try alloc.dupe(u8, item);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeStringSlice(alloc: std.mem.Allocator, items: []const []const u8) void {
+    for (items) |item| alloc.free(item);
+    alloc.free(items);
+}
+
+fn cloneOptionalStringSlice(
+    alloc: std.mem.Allocator,
+    source: []const ?[]const u8,
+) ![]?[]const u8 {
+    if (source.len == 0) return &.{};
+    const out = try alloc.alloc(?[]const u8, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| if (item) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (source, 0..) |item, i| {
+        out[i] = if (item) |value| try alloc.dupe(u8, value) else null;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeOptionalStringSlice(
+    alloc: std.mem.Allocator,
+    items: []const ?[]const u8,
+) void {
+    for (items) |item| if (item) |value| alloc.free(value);
+    if (items.len > 0) alloc.free(items);
+}
+
+fn clonePathEdges(
+    comptime Edge: type,
+    alloc: std.mem.Allocator,
+    source: anytype,
+) ![]Edge {
+    const out = try alloc.alloc(Edge, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |edge| freePathEdge(alloc, edge);
+        alloc.free(out);
+    }
+    for (source, 0..) |edge, i| {
+        out[i] = try clonePathEdge(Edge, alloc, edge);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn clonePathEdge(
+    comptime Edge: type,
+    alloc: std.mem.Allocator,
+    source: anytype,
+) !Edge {
+    const edge_source = try alloc.dupe(u8, source.source);
+    errdefer alloc.free(edge_source);
+    const target = try alloc.dupe(u8, source.target);
+    errdefer alloc.free(target);
+    const edge_type = try alloc.dupe(u8, source.edge_type);
+    errdefer alloc.free(edge_type);
+    const metadata = if (source.metadata.len > 0)
+        try alloc.dupe(u8, source.metadata)
+    else
+        "";
+    errdefer if (metadata.len > 0) alloc.free(metadata);
+    return .{
+        .source = edge_source,
+        .target = target,
+        .edge_type = edge_type,
+        .weight = source.weight,
+        .metadata = metadata,
+    };
+}
+
+fn freePathEdges(alloc: std.mem.Allocator, edges: anytype) void {
+    for (edges) |edge| freePathEdge(alloc, edge);
+    alloc.free(edges);
+}
+
+fn freePathEdge(alloc: std.mem.Allocator, edge: anytype) void {
+    alloc.free(edge.source);
+    alloc.free(edge.target);
+    alloc.free(edge.edge_type);
+    if (edge.metadata.len > 0) alloc.free(edge.metadata);
 }
 
 test "query parser accepts full text request subset" {
@@ -1852,6 +1964,100 @@ test "query merge preserves single-result doc ordinals" {
     try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
     try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
     try std.testing.expectEqual(@as(?u32, 9), merged.hits[0].doc_ordinal);
+}
+
+fn expectGraphTableProvenanceMerge(alloc: std.mem.Allocator) !void {
+    var node_path = [_][]const u8{ "doc:a", "shared" };
+    var node_path_edge = [_]graph_query_mod.PathEdgeInfo{.{
+        .source = "doc:a",
+        .target = "shared",
+        .edge_type = "mentions",
+        .weight = 1,
+        .metadata = "{\"target_table\":\"entities\"}",
+    }};
+    var graph_nodes = [_]graph_query_mod.GraphResultNode{.{
+        .key = "shared",
+        .depth = 1,
+        .distance = 1,
+        .path = &node_path,
+        .path_edges = &node_path_edge,
+        .table = "entities",
+    }};
+    var graph_path_nodes = [_][]const u8{ "doc:a", "shared" };
+    var graph_path_tables = [_]?[]const u8{ null, "entities" };
+    var graph_path_edges = [_]graph_paths.PathEdge{.{
+        .source = "doc:a",
+        .target = "shared",
+        .edge_type = "mentions",
+        .weight = 1,
+        .metadata = "{\"target_table\":\"entities\"}",
+    }};
+    var graph_paths_input = [_]db_mod.types.GraphPath{.{
+        .nodes = &graph_path_nodes,
+        .node_tables = &graph_path_tables,
+        .edges = &graph_path_edges,
+        .total_weight = 1,
+        .length = 1,
+    }};
+    var match_bindings = [_]db_mod.types.GraphPatternBinding{.{
+        .alias = @constCast("entity"),
+        .node = .{
+            .key = "shared",
+            .depth = 1,
+            .distance = 1,
+            .path = null,
+            .path_edges = null,
+            .table = "entities",
+        },
+    }};
+    var matches = [_]db_mod.types.GraphPatternMatch{.{
+        .bindings = &match_bindings,
+        .path = &node_path_edge,
+    }};
+    var graph_hits = [_]db_mod.types.SearchHit{.{
+        .id = @constCast("shared"),
+        .source_table = @constCast("entities"),
+    }};
+    var graph_results = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("related"),
+        .nodes = &graph_nodes,
+        .paths = &graph_paths_input,
+        .matches = &matches,
+        .hits = &graph_hits,
+        .total_hits = 1,
+    }};
+    const input = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
+        .total_hits = 0,
+        .graph_results = &graph_results,
+    };
+
+    var merged = try mergeSearchResults(alloc, .{}, &.{input}, 0, 0);
+    defer merged.deinit();
+
+    const graph_result = merged.graph_results[0];
+    try std.testing.expectEqualStrings("entities", graph_result.nodes[0].table.?);
+    try std.testing.expectEqualStrings(
+        "entities",
+        graph_result.paths[0].node_tables[1].?,
+    );
+    try std.testing.expectEqualStrings(
+        "entities",
+        graph_result.matches[0].bindings[0].node.table.?,
+    );
+    try std.testing.expectEqualStrings(
+        "entities",
+        graph_result.hits[0].source_table.?,
+    );
+}
+
+test "query merge preserves graph table provenance under allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        expectGraphTableProvenanceMerge,
+        .{},
+    );
 }
 
 test "query merge preserves lower-bound total relation" {

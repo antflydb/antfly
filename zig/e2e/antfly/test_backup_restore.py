@@ -1175,6 +1175,17 @@ def test_backup_restore_request_validation(backup_api):
         assert unsupported_location.status_code == 400
         assert "unsupported backup location" in unsupported_location.text
 
+        encoded_location = backup_api.s.get(
+            f"{backup_api.url}/backups",
+            params={
+                "location": "ftp://bucket/path",
+                "connection": BACKUP_CONNECTION,
+            },
+            timeout=30,
+        )
+        assert encoded_location.status_code == 400
+        assert "unsupported backup location" in encoded_location.text
+
 
 def test_list_backups_empty_location(backup_api):
     with tempfile.TemporaryDirectory(prefix="antfly-empty-backups-") as backup_dir:

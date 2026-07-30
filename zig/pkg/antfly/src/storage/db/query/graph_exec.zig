@@ -17,11 +17,13 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const graph_query_mod = @import("../../../graph/query.zig");
 const graph_pattern_mod = @import("../../../graph/pattern.zig");
+const paths_mod = @import("../../../graph/paths.zig");
 const fusion_mod = @import("../../../search/fusion.zig");
 const geo_mod = @import("../../../search/geo.zig");
 const levenshtein_mod = @import("../../../search/levenshtein.zig");
 const pattern_filter_contract = @import("../../../search/pattern_filter_contract.zig");
 const regex_mod = @import("../../../search/regex.zig");
+const wildcard_mod = @import("../../../search/wildcard.zig");
 const doc_set = @import("../doc_set.zig");
 const pathfact_mod = @import("../algebraic/pathfact.zig");
 
@@ -58,6 +60,8 @@ pub const GraphQueryExecutor = struct {
 
 pub const PatternQueryExecutor = struct {
     ctx: ?*anyopaque,
+    graph_ctx: ?*anyopaque = null,
+    predicate_aware: bool = false,
     match_pattern: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -82,10 +86,18 @@ pub const PatternQueryExecutor = struct {
         doc_id: []const u8,
         generation: ?u64,
     ) anyerror!?doc_set.DocOrdinal = null,
+    filter_keys: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]bool = null,
 };
 
 pub const NonPatternQueryExecutor = struct {
     ctx: ?*anyopaque,
+    graph_ctx: ?*anyopaque = null,
+    predicate_aware: bool = false,
     find_shortest_path: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -125,6 +137,12 @@ pub const NonPatternQueryExecutor = struct {
         doc_id: []const u8,
         generation: ?u64,
     ) anyerror!?doc_set.DocOrdinal = null,
+    filter_keys: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]bool = null,
 };
 
 pub const FusedResultExecutor = struct {
@@ -150,6 +168,8 @@ pub const DocSetDocIdResolver = struct {
 
 pub const SearchGraphExecutor = struct {
     ctx: ?*anyopaque,
+    graph_ctx: ?*anyopaque = null,
+    predicate_aware: bool = false,
     execute_graph_query: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -175,6 +195,12 @@ pub const SearchGraphExecutor = struct {
         doc_id: []const u8,
         generation: ?u64,
     ) anyerror!?doc_set.DocOrdinal = null,
+    filter_keys: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]bool = null,
 };
 
 const VisitState = enum { unvisited, visiting, done };
@@ -823,6 +849,50 @@ fn lookupDocOrdinalForGraphHit(
     return try func(ctx, alloc, doc_id, generation);
 }
 
+fn cloneGraphPatternBinding(
+    alloc: Allocator,
+    binding: anytype,
+) !types.GraphPatternBinding {
+    const alias = try alloc.dupe(u8, binding.alias);
+    errdefer alloc.free(alias);
+    const key = try alloc.dupe(u8, binding.key);
+    errdefer alloc.free(key);
+    const table = if (binding.table) |table_name| try alloc.dupe(u8, table_name) else null;
+    errdefer if (table) |table_name| alloc.free(table_name);
+    return .{
+        .alias = alias,
+        .node = .{
+            .key = key,
+            .depth = binding.depth,
+            .distance = @floatFromInt(binding.depth),
+            .path = null,
+            .path_edges = null,
+            .table = table,
+        },
+    };
+}
+
+fn cloneGraphPathEdgeInfo(
+    alloc: Allocator,
+    edge: anytype,
+) !graph_query_mod.PathEdgeInfo {
+    const source = try alloc.dupe(u8, edge.source);
+    errdefer alloc.free(source);
+    const target = try alloc.dupe(u8, edge.target);
+    errdefer alloc.free(target);
+    const edge_type = try alloc.dupe(u8, edge.edge_type);
+    errdefer alloc.free(edge_type);
+    const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
+    errdefer if (metadata.len > 0) alloc.free(metadata);
+    return .{
+        .source = source,
+        .target = target,
+        .edge_type = edge_type,
+        .weight = edge.weight,
+        .metadata = metadata,
+    };
+}
+
 pub fn convertPatternMatchesToGraphMatches(
     alloc: Allocator,
     raw_matches: []const graph_pattern_mod.PatternMatch,
@@ -842,16 +912,7 @@ pub fn convertPatternMatchesToGraphMatches(
             if (bindings.len > 0) alloc.free(bindings);
         }
         for (raw_match.bindings, 0..) |binding, binding_index| {
-            bindings[binding_index] = .{
-                .alias = try alloc.dupe(u8, binding.alias),
-                .node = .{
-                    .key = try alloc.dupe(u8, binding.key),
-                    .depth = binding.depth,
-                    .distance = @floatFromInt(binding.depth),
-                    .path = null,
-                    .path_edges = null,
-                },
-            };
+            bindings[binding_index] = try cloneGraphPatternBinding(alloc, binding);
             initialized_bindings += 1;
         }
 
@@ -867,12 +928,7 @@ pub fn convertPatternMatchesToGraphMatches(
             if (path.len > 0) alloc.free(path);
         }
         for (raw_match.path, 0..) |edge, edge_index| {
-            path[edge_index] = .{
-                .source = try alloc.dupe(u8, edge.source),
-                .target = try alloc.dupe(u8, edge.target),
-                .edge_type = try alloc.dupe(u8, edge.edge_type),
-                .weight = edge.weight,
-            };
+            path[edge_index] = try cloneGraphPathEdgeInfo(alloc, edge);
             initialized_path += 1;
         }
 
@@ -893,17 +949,34 @@ pub fn executeSinglePatternQueryWithSets(
     named_sets: []const NamedResultSet,
     executor: PatternQueryExecutor,
 ) !types.GraphSearchResult {
-    const start_keys = try resolveGraphSelectorFromSets(alloc, named.query.start_nodes, named_sets, .{
+    var start_keys = try resolveGraphSelectorFromSets(alloc, named.query.start_nodes, named_sets, .{
         .ctx = executor.ctx,
         .func = executor.resolve_doc_set_doc_ids,
         .identity_read_generation = req.identity_read_generation,
     });
     defer freeOwnedKeySlice(alloc, start_keys);
+    if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
+        start_keys = try filterOwnedGraphKeys(
+            alloc,
+            req,
+            start_keys,
+            executor.ctx,
+            executor.filter_keys,
+        );
+    }
     const start_key_refs = try castOwnedKeysToConst(alloc, start_keys);
     defer alloc.free(start_key_refs);
 
-    const raw_matches = try executor.match_pattern(executor.ctx, alloc, named, start_key_refs);
+    var raw_matches = try executor.match_pattern(
+        try graphExecutionContext(executor.predicate_aware, executor.graph_ctx, executor.ctx),
+        alloc,
+        named,
+        start_key_refs,
+    );
     defer graph_pattern_mod.freeMatches(alloc, raw_matches);
+    if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
+        raw_matches = try filterPatternMatches(alloc, req, raw_matches, executor.ctx, executor.filter_keys);
+    }
 
     const matches = try convertPatternMatchesToGraphMatches(alloc, raw_matches);
     errdefer {
@@ -934,13 +1007,22 @@ pub fn executeSingleNonPatternQueryWithSets(
     named_sets: []const NamedResultSet,
     executor: NonPatternQueryExecutor,
 ) !types.GraphSearchResult {
-    const start_keys = try resolveGraphSelectorFromSets(alloc, named.query.start_nodes, named_sets, .{
+    var start_keys = try resolveGraphSelectorFromSets(alloc, named.query.start_nodes, named_sets, .{
         .ctx = executor.ctx,
         .func = executor.resolve_doc_set_doc_ids,
         .identity_read_generation = req.identity_read_generation,
     });
     defer freeOwnedKeySlice(alloc, start_keys);
-    const target_keys = if (named.query.target_nodes) |target_nodes|
+    if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
+        start_keys = try filterOwnedGraphKeys(
+            alloc,
+            req,
+            start_keys,
+            executor.ctx,
+            executor.filter_keys,
+        );
+    }
+    var target_keys = if (named.query.target_nodes) |target_nodes|
         try resolveGraphSelectorFromSets(alloc, target_nodes, named_sets, .{
             .ctx = executor.ctx,
             .func = executor.resolve_doc_set_doc_ids,
@@ -949,24 +1031,45 @@ pub fn executeSingleNonPatternQueryWithSets(
     else
         try alloc.alloc([]u8, 0);
     defer freeOwnedKeySlice(alloc, target_keys);
+    if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
+        target_keys = try filterOwnedGraphKeys(alloc, req, target_keys, executor.ctx, executor.filter_keys);
+    }
 
     switch (named.query.query_type) {
         .shortest_path => {
             if (start_keys.len == 0 or target_keys.len == 0) {
                 return emptyGraphSearchResult(alloc, named.name);
             }
-            const path = try executor.find_shortest_path(executor.ctx, alloc, named, start_keys[0], target_keys[0]);
+            var path = try executor.find_shortest_path(
+                try graphExecutionContext(executor.predicate_aware, executor.graph_ctx, executor.ctx),
+                alloc,
+                named,
+                start_keys[0],
+                target_keys[0],
+            );
+            errdefer if (path) |owned| paths_mod.freePath(alloc, owned);
+            if (!executor.predicate_aware and path != null and searchRequestHasGraphPredicates(req) and
+                !(try graphPathPassesPredicates(alloc, req, path.?, executor.ctx, executor.filter_keys)))
+            {
+                paths_mod.freePath(alloc, path.?);
+                path = null;
+            }
             const paths = if (path) |owned_path| blk: {
                 var items = try alloc.alloc(types.GraphPath, 1);
                 items[0] = owned_path;
                 break :blk items;
             } else try alloc.alloc(types.GraphPath, 0);
+            path = null;
+            errdefer freeOwnedGraphPaths(alloc, paths);
+            const name = try alloc.dupe(u8, named.name);
+            errdefer alloc.free(name);
+            const hits = try alloc.alloc(types.SearchHit, 0);
             return .{
-                .name = try alloc.dupe(u8, named.name),
+                .name = name,
                 .nodes = &.{},
                 .paths = paths,
                 .matches = &.{},
-                .hits = try alloc.alloc(types.SearchHit, 0),
+                .hits = hits,
                 .total_hits = @intCast(paths.len),
             };
         },
@@ -974,13 +1077,26 @@ pub fn executeSingleNonPatternQueryWithSets(
             if (start_keys.len == 0 or target_keys.len == 0 or named.query.k == 0) {
                 return emptyGraphSearchResult(alloc, named.name);
             }
-            const paths = try executor.find_k_shortest_paths(executor.ctx, alloc, named, start_keys[0], target_keys[0]);
+            var paths = try executor.find_k_shortest_paths(
+                try graphExecutionContext(executor.predicate_aware, executor.graph_ctx, executor.ctx),
+                alloc,
+                named,
+                start_keys[0],
+                target_keys[0],
+            );
+            errdefer freeOwnedGraphPaths(alloc, paths);
+            if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
+                paths = try filterGraphPaths(alloc, req, paths, executor.ctx, executor.filter_keys);
+            }
+            const name = try alloc.dupe(u8, named.name);
+            errdefer alloc.free(name);
+            const hits = try alloc.alloc(types.SearchHit, 0);
             return .{
-                .name = try alloc.dupe(u8, named.name),
+                .name = name,
                 .nodes = &.{},
                 .paths = paths,
                 .matches = &.{},
-                .hits = try alloc.alloc(types.SearchHit, 0),
+                .hits = hits,
                 .total_hits = @intCast(paths.len),
             };
         },
@@ -991,8 +1107,30 @@ pub fn executeSingleNonPatternQueryWithSets(
     const start_key_refs = try castOwnedKeysToConst(alloc, start_keys);
     defer alloc.free(start_key_refs);
 
-    var graph_result = try executor.execute_graph_query(executor.ctx, alloc, named, start_key_refs, target_keys);
+    var effective_named = named.*;
+    const preserve_internal_paths = !executor.predicate_aware and searchRequestHasGraphPredicates(req) and
+        (named.query.query_type == .traverse or named.query.query_type == .neighbors) and
+        !named.query.params.include_paths;
+    if (preserve_internal_paths) effective_named.query.params.include_paths = true;
+
+    var graph_result = try executor.execute_graph_query(
+        try graphExecutionContext(executor.predicate_aware, executor.graph_ctx, executor.ctx),
+        alloc,
+        &effective_named,
+        start_key_refs,
+        target_keys,
+    );
     errdefer graph_result.deinit(alloc);
+    if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
+        graph_result.nodes = try filterGraphResultNodes(
+            alloc,
+            req,
+            graph_result.nodes,
+            executor.ctx,
+            executor.filter_keys,
+        );
+    }
+    if (preserve_internal_paths) discardGraphResultPaths(alloc, graph_result.nodes);
 
     const total_hits: u32 = @intCast(graph_result.nodes.len);
     const start = @min(req.offset, total_hits);
@@ -1006,25 +1144,16 @@ pub fn executeSingleNonPatternQueryWithSets(
     }
 
     for (graph_result.nodes[@intCast(start)..@intCast(end)], 0..) |node, i| {
-        const stored_data = if (named.query.include_documents)
-            try executor.load_projected_document(executor.ctx, alloc, req, node.key)
-        else
-            null;
-
-        hits[i] = .{
-            .id = try alloc.dupe(u8, node.key),
-            .doc_ordinal = try lookupDocOrdinalForGraphHit(alloc, executor.ctx, executor.lookup_doc_ordinal, node.key, req.identity_read_generation),
-            .score = @floatCast(node.distance),
-            .stored_data = stored_data,
-        };
+        hits[i] = try buildGraphNodeHit(alloc, req, named.query, node, executor);
         initialized += 1;
     }
 
+    const name = try alloc.dupe(u8, named.name);
     const nodes = graph_result.nodes;
     graph_result.nodes = &.{};
 
     return .{
-        .name = try alloc.dupe(u8, named.name),
+        .name = name,
         .nodes = nodes,
         .paths = &.{},
         .matches = &.{},
@@ -1040,15 +1169,22 @@ pub fn executeSearchGraphWithSets(
     named_sets: []const NamedResultSet,
     executor: SearchGraphExecutor,
 ) !types.SearchResult {
-    const start_keys = try resolveGraphSelectorFromSets(alloc, graph_query.start_nodes, named_sets, .{
+    var start_keys = try resolveGraphSelectorFromSets(alloc, graph_query.start_nodes, named_sets, .{
         .ctx = executor.ctx,
         .func = executor.resolve_doc_set_doc_ids,
         .identity_read_generation = req.identity_read_generation,
     });
     defer freeOwnedKeySlice(alloc, start_keys);
-    const start_key_refs = try castOwnedKeysToConst(alloc, start_keys);
-    defer alloc.free(start_key_refs);
-    const target_keys = if (graph_query.target_nodes) |target_nodes|
+    if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
+        start_keys = try filterOwnedGraphKeys(
+            alloc,
+            req,
+            start_keys,
+            executor.ctx,
+            executor.filter_keys,
+        );
+    }
+    var target_keys = if (graph_query.target_nodes) |target_nodes|
         try resolveGraphSelectorFromSets(alloc, target_nodes, named_sets, .{
             .ctx = executor.ctx,
             .func = executor.resolve_doc_set_doc_ids,
@@ -1057,9 +1193,48 @@ pub fn executeSearchGraphWithSets(
     else
         try alloc.alloc([]u8, 0);
     defer freeOwnedKeySlice(alloc, target_keys);
+    if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
+        target_keys = try filterOwnedGraphKeys(alloc, req, target_keys, executor.ctx, executor.filter_keys);
+    }
 
-    var result = try executor.execute_graph_query(executor.ctx, alloc, graph_query, start_key_refs, target_keys);
+    return try executeResolvedSearchGraph(alloc, req, graph_query, start_keys, target_keys, executor);
+}
+
+fn executeResolvedSearchGraph(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    graph_query: graph_query_mod.GraphQuery,
+    start_keys: []const []const u8,
+    target_keys: [][]u8,
+    executor: SearchGraphExecutor,
+) !types.SearchResult {
+    const start_key_refs = try alloc.dupe([]const u8, start_keys);
+    defer alloc.free(start_key_refs);
+
+    var effective_query = graph_query;
+    const preserve_internal_paths = !executor.predicate_aware and searchRequestHasGraphPredicates(req) and
+        (graph_query.query_type == .traverse or graph_query.query_type == .neighbors) and
+        !graph_query.params.include_paths;
+    if (preserve_internal_paths) effective_query.params.include_paths = true;
+
+    var result = try executor.execute_graph_query(
+        try graphExecutionContext(executor.predicate_aware, executor.graph_ctx, executor.ctx),
+        alloc,
+        effective_query,
+        start_key_refs,
+        target_keys,
+    );
     defer result.deinit(alloc);
+    if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
+        result.nodes = try filterGraphResultNodes(
+            alloc,
+            req,
+            result.nodes,
+            executor.ctx,
+            executor.filter_keys,
+        );
+    }
+    if (preserve_internal_paths) discardGraphResultPaths(alloc, result.nodes);
 
     const total_hits: u32 = @intCast(result.nodes.len);
     const start = @min(req.offset, total_hits);
@@ -1073,17 +1248,7 @@ pub fn executeSearchGraphWithSets(
     }
 
     for (result.nodes[@intCast(start)..@intCast(end)], 0..) |node, i| {
-        const stored_data = if (graph_query.include_documents)
-            try executor.load_projected_document(executor.ctx, alloc, req, node.key)
-        else
-            null;
-
-        hits[i] = .{
-            .id = try alloc.dupe(u8, node.key),
-            .doc_ordinal = try lookupDocOrdinalForGraphHit(alloc, executor.ctx, executor.lookup_doc_ordinal, node.key, req.identity_read_generation),
-            .score = @floatCast(node.distance),
-            .stored_data = stored_data,
-        };
+        hits[i] = try buildGraphNodeHit(alloc, req, graph_query, node, executor);
         initialized += 1;
     }
 
@@ -1102,50 +1267,56 @@ pub fn executeSearchGraph(
     base_hits: ?[]const types.SearchHit,
     executor: SearchGraphExecutor,
 ) !types.SearchResult {
-    const start_keys = try resolveGraphSelector(alloc, graph_query.start_nodes, base_hits);
+    var start_keys = try resolveGraphSelector(alloc, graph_query.start_nodes, base_hits);
     defer freeOwnedKeySlice(alloc, start_keys);
-    const start_key_refs = try castOwnedKeysToConst(alloc, start_keys);
-    defer alloc.free(start_key_refs);
-    const target_keys = if (graph_query.target_nodes) |target_nodes|
+    if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
+        start_keys = try filterOwnedGraphKeys(
+            alloc,
+            req,
+            start_keys,
+            executor.ctx,
+            executor.filter_keys,
+        );
+    }
+    var target_keys = if (graph_query.target_nodes) |target_nodes|
         try resolveGraphSelector(alloc, target_nodes, base_hits)
     else
         try alloc.alloc([]u8, 0);
     defer freeOwnedKeySlice(alloc, target_keys);
-
-    var result = try executor.execute_graph_query(executor.ctx, alloc, graph_query, start_key_refs, target_keys);
-    defer result.deinit(alloc);
-
-    const total_hits: u32 = @intCast(result.nodes.len);
-    const start = @min(req.offset, total_hits);
-    const end = @min(start + req.limit, total_hits);
-
-    var hits = try alloc.alloc(types.SearchHit, end - start);
-    var initialized: usize = 0;
-    errdefer {
-        for (hits[0..initialized]) |*hit| hit.deinit(alloc);
-        alloc.free(hits);
+    if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
+        target_keys = try filterOwnedGraphKeys(alloc, req, target_keys, executor.ctx, executor.filter_keys);
     }
 
-    for (result.nodes[@intCast(start)..@intCast(end)], 0..) |node, i| {
-        const stored_data = if (graph_query.include_documents)
-            try executor.load_projected_document(executor.ctx, alloc, req, node.key)
-        else
-            null;
+    return try executeResolvedSearchGraph(alloc, req, graph_query, start_keys, target_keys, executor);
+}
 
-        hits[i] = .{
-            .id = try alloc.dupe(u8, node.key),
-            .doc_ordinal = try lookupDocOrdinalForGraphHit(alloc, executor.ctx, executor.lookup_doc_ordinal, node.key, req.identity_read_generation),
-            .score = @floatCast(node.distance),
-            .stored_data = stored_data,
-        };
-        initialized += 1;
-    }
+fn buildGraphNodeHit(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    graph_query: graph_query_mod.GraphQuery,
+    node: graph_query_mod.GraphResultNode,
+    executor: anytype,
+) !types.SearchHit {
+    const stored_data = if (graph_query.include_documents)
+        try executor.load_projected_document(executor.ctx, alloc, req, node.key)
+    else
+        null;
+    errdefer if (stored_data) |stored| alloc.free(stored);
 
+    const id = try alloc.dupe(u8, node.key);
+    errdefer alloc.free(id);
+    const doc_ordinal = try lookupDocOrdinalForGraphHit(
+        alloc,
+        executor.ctx,
+        executor.lookup_doc_ordinal,
+        node.key,
+        req.identity_read_generation,
+    );
     return .{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = total_hits,
-        .graph_results = &.{},
+        .id = id,
+        .doc_ordinal = doc_ordinal,
+        .score = @floatCast(node.distance),
+        .stored_data = stored_data,
     };
 }
 
@@ -1172,17 +1343,26 @@ fn buildPatternDocumentHits(
     for (matches) |match| {
         for (match.bindings) |binding| {
             if (seen.contains(binding.node.key)) continue;
-            try seen.put(alloc, try alloc.dupe(u8, binding.node.key), {});
+            {
+                const seen_key = try alloc.dupe(u8, binding.node.key);
+                errdefer alloc.free(seen_key);
+                try seen.put(alloc, seen_key, {});
+            }
+            try hits.ensureUnusedCapacity(alloc, 1);
             const stored_data = if (query.include_documents)
                 try executor.load_projected_document(executor.ctx, alloc, query, binding.node.key)
             else
                 null;
-            try hits.append(alloc, .{
-                .id = try alloc.dupe(u8, binding.node.key),
-                .doc_ordinal = if (executor.lookup_doc_ordinal) |lookup|
-                    try lookup(executor.ctx, alloc, binding.node.key, identity_read_generation)
-                else
-                    null,
+            errdefer if (stored_data) |stored| alloc.free(stored);
+            const id = try alloc.dupe(u8, binding.node.key);
+            errdefer alloc.free(id);
+            const doc_ordinal = if (executor.lookup_doc_ordinal) |lookup|
+                try lookup(executor.ctx, alloc, binding.node.key, identity_read_generation)
+            else
+                null;
+            hits.appendAssumeCapacity(.{
+                .id = id,
+                .doc_ordinal = doc_ordinal,
                 .score = @floatCast(binding.node.distance),
                 .stored_data = stored_data,
             });
@@ -1193,14 +1373,416 @@ fn buildPatternDocumentHits(
 }
 
 fn emptyGraphSearchResult(alloc: Allocator, name: []const u8) !types.GraphSearchResult {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const hits = try alloc.alloc(types.SearchHit, 0);
     return .{
-        .name = try alloc.dupe(u8, name),
+        .name = owned_name,
         .nodes = &.{},
         .paths = &.{},
         .matches = &.{},
-        .hits = try alloc.alloc(types.SearchHit, 0),
+        .hits = hits,
         .total_hits = 0,
     };
+}
+
+pub fn searchRequestHasGraphPredicates(req: types.SearchRequest) bool {
+    return req.filter_query_json.len > 0 or
+        req.exclusion_query_json.len > 0 or
+        req.filter_doc_ids_positive or
+        req.filter_doc_ids.len > 0 or
+        req.exclude_doc_ids.len > 0 or
+        req.resolved_doc_filter != null;
+}
+
+fn graphExecutionContext(
+    predicate_aware: bool,
+    graph_ctx: ?*anyopaque,
+    default_ctx: ?*anyopaque,
+) !?*anyopaque {
+    if (!predicate_aware) return default_ctx;
+    return graph_ctx orelse error.InvalidGraphPredicateExecutor;
+}
+
+fn requireGraphKeyFilter(
+    filter_keys: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]bool,
+) !*const fn (
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    req: types.SearchRequest,
+    keys: []const []const u8,
+) anyerror![]bool {
+    return filter_keys orelse error.UnsupportedQueryRequest;
+}
+
+fn filterOwnedGraphKeys(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    keys: [][]u8,
+    ctx: ?*anyopaque,
+    filter_keys: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]bool,
+) ![][]u8 {
+    if (keys.len == 0) return keys;
+    const key_refs = try castOwnedKeysToConst(alloc, keys);
+    defer alloc.free(key_refs);
+    const mask = try (try requireGraphKeyFilter(filter_keys))(ctx, alloc, req, key_refs);
+    defer alloc.free(mask);
+    if (mask.len != keys.len) return error.InvalidArgument;
+
+    var kept_count: usize = 0;
+    for (mask) |keep| if (keep) {
+        kept_count += 1;
+    };
+    if (kept_count == keys.len) return keys;
+
+    const kept = try alloc.alloc([]u8, kept_count);
+    var output_index: usize = 0;
+    for (keys, mask) |key, keep| {
+        if (keep) {
+            kept[output_index] = key;
+            output_index += 1;
+        } else alloc.free(key);
+    }
+    alloc.free(keys);
+    return kept;
+}
+
+fn graphPathPassesPredicates(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    path: types.GraphPath,
+    ctx: ?*anyopaque,
+    filter_keys: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]bool,
+) !bool {
+    if (path.nodes.len == 0) return false;
+    const mask = try (try requireGraphKeyFilter(filter_keys))(ctx, alloc, req, path.nodes);
+    defer alloc.free(mask);
+    if (mask.len != path.nodes.len) return error.InvalidArgument;
+    for (mask) |allowed| if (!allowed) return false;
+    return true;
+}
+
+fn discardGraphResultPaths(
+    alloc: Allocator,
+    nodes: []graph_query_mod.GraphResultNode,
+) void {
+    for (nodes) |*node| {
+        if (node.path) |path| {
+            for (path) |key| alloc.free(key);
+            alloc.free(path);
+            node.path = null;
+        }
+        if (node.path_edges) |edges| {
+            for (edges) |edge| {
+                alloc.free(edge.source);
+                alloc.free(edge.target);
+                alloc.free(edge.edge_type);
+                if (edge.metadata.len > 0) alloc.free(edge.metadata);
+            }
+            alloc.free(edges);
+            node.path_edges = null;
+        }
+    }
+}
+
+fn freeOwnedGraphPaths(alloc: Allocator, paths: []types.GraphPath) void {
+    for (paths) |path| paths_mod.freePath(alloc, path);
+    if (paths.len > 0) alloc.free(paths);
+}
+
+fn rememberGraphFilterKey(
+    alloc: Allocator,
+    indexes: *std.StringHashMapUnmanaged(usize),
+    keys: *std.ArrayListUnmanaged([]const u8),
+    key: []const u8,
+) !void {
+    const entry = try indexes.getOrPut(alloc, key);
+    if (entry.found_existing) return;
+    entry.value_ptr.* = keys.items.len;
+    try keys.append(alloc, key);
+}
+
+fn graphFilterAllows(
+    indexes: *const std.StringHashMapUnmanaged(usize),
+    mask: []const bool,
+    key: []const u8,
+) !bool {
+    const index = indexes.get(key) orelse return error.InvalidArgument;
+    if (index >= mask.len) return error.InvalidArgument;
+    return mask[index];
+}
+
+fn filterGraphPaths(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    paths: []types.GraphPath,
+    ctx: ?*anyopaque,
+    filter_keys: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]bool,
+) ![]types.GraphPath {
+    if (paths.len == 0) return paths;
+
+    var indexes = std.StringHashMapUnmanaged(usize).empty;
+    defer indexes.deinit(alloc);
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer keys.deinit(alloc);
+    for (paths) |path| {
+        for (path.nodes) |key| try rememberGraphFilterKey(alloc, &indexes, &keys, key);
+    }
+
+    const allowed = try (try requireGraphKeyFilter(filter_keys))(ctx, alloc, req, keys.items);
+    defer alloc.free(allowed);
+    if (allowed.len != keys.items.len) return error.InvalidArgument;
+
+    const keep_mask = try alloc.alloc(bool, paths.len);
+    defer alloc.free(keep_mask);
+    var kept_count: usize = 0;
+    for (paths, 0..) |path, i| {
+        var keep = path.nodes.len > 0;
+        for (path.nodes) |key| {
+            if (!(try graphFilterAllows(&indexes, allowed, key))) {
+                keep = false;
+                break;
+            }
+        }
+        keep_mask[i] = keep;
+        if (keep_mask[i]) kept_count += 1;
+    }
+    if (kept_count == paths.len) return paths;
+
+    const kept = try alloc.alloc(types.GraphPath, kept_count);
+    var output_index: usize = 0;
+    for (paths, keep_mask) |path, keep| {
+        if (keep) {
+            kept[output_index] = path;
+            output_index += 1;
+        } else {
+            paths_mod.freePath(alloc, path);
+        }
+    }
+    if (paths.len > 0) alloc.free(paths);
+    return kept;
+}
+
+fn filterGraphResultNodes(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    nodes: []graph_query_mod.GraphResultNode,
+    ctx: ?*anyopaque,
+    filter_keys: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]bool,
+) ![]graph_query_mod.GraphResultNode {
+    if (nodes.len == 0) return nodes;
+
+    var indexes = std.StringHashMapUnmanaged(usize).empty;
+    defer indexes.deinit(alloc);
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer keys.deinit(alloc);
+    for (nodes) |node| {
+        try rememberGraphFilterKey(alloc, &indexes, &keys, node.key);
+        const path = node.path orelse return error.UnsupportedQueryRequest;
+        for (path) |key| try rememberGraphFilterKey(alloc, &indexes, &keys, key);
+    }
+
+    const allowed = try (try requireGraphKeyFilter(filter_keys))(ctx, alloc, req, keys.items);
+    defer alloc.free(allowed);
+    if (allowed.len != keys.items.len) return error.InvalidArgument;
+
+    const keep_mask = try alloc.alloc(bool, nodes.len);
+    defer alloc.free(keep_mask);
+    var kept_count: usize = 0;
+    for (nodes, 0..) |node, i| {
+        var keep = try graphFilterAllows(&indexes, allowed, node.key);
+        if (keep) {
+            for (node.path.?) |key| {
+                if (!(try graphFilterAllows(&indexes, allowed, key))) {
+                    keep = false;
+                    break;
+                }
+            }
+        }
+        keep_mask[i] = keep;
+        if (keep) kept_count += 1;
+    }
+    if (kept_count == nodes.len) return nodes;
+
+    const kept = try alloc.alloc(graph_query_mod.GraphResultNode, kept_count);
+    var output_index: usize = 0;
+    for (nodes, keep_mask) |*node, keep| {
+        if (keep) {
+            kept[output_index] = node.*;
+            node.* = undefined;
+            output_index += 1;
+        } else {
+            node.deinit(alloc);
+        }
+    }
+    if (nodes.len > 0) alloc.free(nodes);
+    return kept;
+}
+
+fn filterPatternMatches(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    matches: []graph_pattern_mod.PatternMatch,
+    ctx: ?*anyopaque,
+    filter_keys: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]bool,
+) ![]graph_pattern_mod.PatternMatch {
+    if (matches.len == 0) return matches;
+
+    var indexes = std.StringHashMapUnmanaged(usize).empty;
+    defer indexes.deinit(alloc);
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer keys.deinit(alloc);
+    for (matches) |match| {
+        for (match.bindings) |binding| {
+            try rememberGraphFilterKey(alloc, &indexes, &keys, binding.key);
+        }
+        for (match.path) |edge| {
+            try rememberGraphFilterKey(alloc, &indexes, &keys, edge.source);
+            try rememberGraphFilterKey(alloc, &indexes, &keys, edge.target);
+        }
+    }
+    const allowed = try (try requireGraphKeyFilter(filter_keys))(ctx, alloc, req, keys.items);
+    defer alloc.free(allowed);
+    if (allowed.len != keys.items.len) return error.InvalidArgument;
+
+    const keep_mask = try alloc.alloc(bool, matches.len);
+    defer alloc.free(keep_mask);
+    var kept_count: usize = 0;
+    for (matches, 0..) |match, i| {
+        var keep = true;
+        for (match.bindings) |binding| {
+            if (!(try graphFilterAllows(&indexes, allowed, binding.key))) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep) {
+            for (match.path) |edge| {
+                if (!(try graphFilterAllows(&indexes, allowed, edge.source)) or
+                    !(try graphFilterAllows(&indexes, allowed, edge.target)))
+                {
+                    keep = false;
+                    break;
+                }
+            }
+        }
+        keep_mask[i] = keep;
+        if (keep) kept_count += 1;
+    }
+    if (kept_count == matches.len) return matches;
+
+    const kept = try alloc.alloc(graph_pattern_mod.PatternMatch, kept_count);
+    var output_index: usize = 0;
+    for (matches, keep_mask) |*match, keep| {
+        if (keep) {
+            kept[output_index] = match.*;
+            match.* = undefined;
+            output_index += 1;
+        } else {
+            match.deinit(alloc);
+        }
+    }
+    if (matches.len > 0) alloc.free(matches);
+    return kept;
+}
+
+fn testGraphPathAlloc(
+    alloc: Allocator,
+    names: []const []const u8,
+) !types.GraphPath {
+    const nodes = try alloc.alloc([]const u8, names.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (nodes[0..initialized]) |node| alloc.free(node);
+        alloc.free(nodes);
+    }
+    for (names, 0..) |name, i| {
+        nodes[i] = try alloc.dupe(u8, name);
+        initialized += 1;
+    }
+    return .{
+        .nodes = nodes,
+        .edges = try alloc.alloc(paths_mod.PathEdge, 0),
+        .total_weight = @floatFromInt(if (names.len > 0) names.len - 1 else 0),
+        .length = @intCast(if (names.len > 0) names.len - 1 else 0),
+    };
+}
+
+test "graph path predicate filtering batches unique keys once" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        calls: usize = 0,
+        keys: usize = 0,
+
+        fn filter(
+            ctx: ?*anyopaque,
+            filter_alloc: Allocator,
+            req: types.SearchRequest,
+            keys: []const []const u8,
+        ) anyerror![]bool {
+            _ = req;
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.calls += 1;
+            self.keys += keys.len;
+            const mask = try filter_alloc.alloc(bool, keys.len);
+            for (keys, 0..) |key, i| mask[i] = !std.mem.eql(u8, key, "hidden");
+            return mask;
+        }
+    };
+
+    var paths = try alloc.alloc(types.GraphPath, 2);
+    var initialized: usize = 0;
+    var input_owned = true;
+    errdefer {
+        if (input_owned) {
+            for (paths[0..initialized]) |path| paths_mod.freePath(alloc, path);
+            alloc.free(paths);
+        }
+    }
+    paths[0] = try testGraphPathAlloc(alloc, &.{ "start", "hidden", "target" });
+    initialized += 1;
+    paths[1] = try testGraphPathAlloc(alloc, &.{ "start", "visible", "target" });
+    initialized += 1;
+
+    var harness = Harness{};
+    paths = try filterGraphPaths(alloc, .{}, paths, &harness, Harness.filter);
+    input_owned = false;
+    defer freeOwnedGraphPaths(alloc, paths);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    try std.testing.expectEqual(@as(usize, 4), harness.keys);
+    try std.testing.expectEqual(@as(usize, 1), paths.len);
+    try std.testing.expectEqualStrings("visible", paths[0].nodes[1]);
 }
 
 fn fusionWeightName(name: []const u8) []const u8 {
@@ -3031,30 +3613,7 @@ fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
 }
 
 fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
-    var pi: usize = 0;
-    var ti: usize = 0;
-    var star_pi: ?usize = null;
-    var star_ti: usize = 0;
-
-    while (ti < text.len) {
-        if (pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == text[ti])) {
-            pi += 1;
-            ti += 1;
-        } else if (pi < pattern.len and pattern[pi] == '*') {
-            star_pi = pi;
-            star_ti = ti;
-            pi += 1;
-        } else if (star_pi) |sp| {
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-
-    while (pi < pattern.len and pattern[pi] == '*') pi += 1;
-    return pi == pattern.len;
+    return wildcard_mod.match(pattern, text);
 }
 
 fn regexMatches(alloc: Allocator, pattern: []const u8, candidate: []const u8) !bool {

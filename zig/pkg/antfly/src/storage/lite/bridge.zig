@@ -636,14 +636,17 @@ fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     return stored.len;
 }
 
-fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
     const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
 
     const stored = self.files.get(path) orelse return error.FileNotFound;
     if (stored.len < len) return error.EndOfStream;
-    return try allocator.dupe(u8, stored[stored.len - len ..]);
+    return .{
+        .bytes = try allocator.dupe(u8, stored[stored.len - len ..]),
+        .file_size = stored.len,
+    };
 }
 
 fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
@@ -750,6 +753,7 @@ const ContainerAtomicWriteSink = struct {
         .append_slice = appendSlice,
         .write_at = writeAt,
         .crc32_prefix = crc32Prefix,
+        .crc32_range = crc32Range,
         .finish = finish,
         .abort = abort,
     };
@@ -794,6 +798,12 @@ const ContainerAtomicWriteSink = struct {
         const self: *ContainerAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
         return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
+    }
+
+    fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        const self: *ContainerAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
+        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 
     fn finish(ptr: *anyopaque) !void {
@@ -952,9 +962,10 @@ test "aflite container storage persists logical files across reopen" {
         const got = try storage.readFileAlloc(alloc, "/lsm/a.table", 64);
         defer alloc.free(got);
         try std.testing.expectEqualStrings("hello world!", got);
-        const trailer = try storage.readFileTrailerAlloc(alloc, "/lsm/a.table", 6);
-        defer alloc.free(trailer);
-        try std.testing.expectEqualStrings("world!", trailer);
+        var trailer = try storage.readFileTrailerAlloc(alloc, "/lsm/a.table", 6);
+        defer trailer.deinit(alloc);
+        try std.testing.expectEqualStrings("world!", trailer.bytes);
+        try std.testing.expectEqual(@as(u64, 12), trailer.file_size);
     }
 }
 

@@ -42,7 +42,22 @@ const entry_header_len: usize = 16;
 const replay_record_magic: u32 = 0x31435741; // "AWC1", little-endian.
 const replay_record_version: u16 = 1;
 const replay_record_header_len: usize = 24;
-const committed_segment_entry_len: usize = 16;
+const control_magic = "AFWALC01";
+const control_version: u16 = 1;
+const control_header_len: usize = 16;
+const control_checksum_len: usize = @sizeOf(u32);
+const control_overhead: usize = control_header_len + control_checksum_len;
+const control_pair_len: usize = control_overhead + 16;
+const control_triple_len: usize = control_overhead + 24;
+const committed_segment_entry_len: usize = control_pair_len;
+
+const ControlKind = enum(u8) {
+    current_segment = 1,
+    checkpoint = 2,
+    replay_index = 3,
+    main_replay_segment = 4,
+    replay_segment = 5,
+};
 pub const default_replay_scratch_retained_cap_bytes: usize = replay_chunk_bytes + @max(record_header_len, replay_record_header_len);
 
 fn scratchAllocator(allocator: Allocator) Allocator {
@@ -1331,6 +1346,62 @@ fn appendSegmentPathSuffix(
     return out.items;
 }
 
+fn encodeControl(out: []u8, kind: ControlKind, payload: []const u8) void {
+    std.debug.assert(out.len == control_overhead + payload.len);
+    @memcpy(out[0..control_magic.len], control_magic);
+    std.mem.writeInt(u16, out[8..10], control_version, .little);
+    out[10] = @intFromEnum(kind);
+    out[11] = 0;
+    std.mem.writeInt(u32, out[12..16], @intCast(payload.len), .little);
+    @memcpy(out[control_header_len .. control_header_len + payload.len], payload);
+    std.mem.writeInt(
+        u32,
+        out[out.len - control_checksum_len ..][0..control_checksum_len],
+        std.hash.Crc32.hash(out[0 .. out.len - control_checksum_len]),
+        .little,
+    );
+}
+
+fn decodeControl(raw: []const u8, kind: ControlKind, payload_len: usize) ![]const u8 {
+    if (raw.len != control_overhead + payload_len) return error.CorruptLsmWalIndex;
+    if (!std.mem.eql(u8, raw[0..control_magic.len], control_magic)) return error.CorruptLsmWalIndex;
+    if (std.mem.readInt(u16, raw[8..10], .little) != control_version) return error.CorruptLsmWalIndex;
+    if (raw[10] != @intFromEnum(kind) or raw[11] != 0) return error.CorruptLsmWalIndex;
+    if (std.mem.readInt(u32, raw[12..16], .little) != payload_len) return error.CorruptLsmWalIndex;
+    const expected_checksum = std.mem.readInt(
+        u32,
+        raw[raw.len - control_checksum_len ..][0..control_checksum_len],
+        .little,
+    );
+    if (std.hash.Crc32.hash(raw[0 .. raw.len - control_checksum_len]) != expected_checksum)
+        return error.CorruptLsmWalIndex;
+    return raw[control_header_len .. control_header_len + payload_len];
+}
+
+const CommittedSegmentEntry = struct {
+    segment: u64,
+    first_sequence: u64,
+};
+
+fn encodeCommittedSegmentEntry(kind: ControlKind, segment: u64, sequence: u64) [committed_segment_entry_len]u8 {
+    var payload: [16]u8 = undefined;
+    std.mem.writeInt(u64, payload[0..8], segment, .little);
+    std.mem.writeInt(u64, payload[8..16], sequence, .little);
+    var raw: [committed_segment_entry_len]u8 = undefined;
+    encodeControl(&raw, kind, &payload);
+    return raw;
+}
+
+fn decodeCommittedSegmentEntry(raw: []const u8, kind: ControlKind) !CommittedSegmentEntry {
+    const payload = try decodeControl(raw, kind, 16);
+    const entry = CommittedSegmentEntry{
+        .segment = std.mem.readInt(u64, payload[0..8], .little),
+        .first_sequence = std.mem.readInt(u64, payload[8..16], .little),
+    };
+    if (entry.segment == 0 or entry.first_sequence == 0) return error.CorruptLsmWalIndex;
+    return entry;
+}
+
 fn appendMainReplaySegmentEntryIfNeeded(
     storage: storage_io.Storage,
     allocator: Allocator,
@@ -1346,9 +1417,7 @@ fn appendMainReplaySegmentEntryIfNeeded(
     const size = storage.fileSize(segments_path) catch |err| switch (err) {
         error.FileNotFound => {
             if (!allow_create) return;
-            var raw: [committed_segment_entry_len]u8 = undefined;
-            std.mem.writeInt(u64, raw[0..8], segment, .little);
-            std.mem.writeInt(u64, raw[8..16], sequence, .little);
+            const raw = encodeCommittedSegmentEntry(.main_replay_segment, segment, sequence);
             try replaceFileAtomically(storage, allocator, segments_path, &raw);
             return;
         },
@@ -1356,9 +1425,7 @@ fn appendMainReplaySegmentEntryIfNeeded(
     };
     if (size == 0) {
         if (!allow_create) return;
-        var raw: [committed_segment_entry_len]u8 = undefined;
-        std.mem.writeInt(u64, raw[0..8], segment, .little);
-        std.mem.writeInt(u64, raw[8..16], sequence, .little);
+        const raw = encodeCommittedSegmentEntry(.main_replay_segment, segment, sequence);
         try replaceFileAtomically(storage, allocator, segments_path, &raw);
         return;
     }
@@ -1372,12 +1439,10 @@ fn appendMainReplaySegmentEntryIfNeeded(
     );
     defer temp_allocator.free(tail);
     if (tail.len != committed_segment_entry_len) return error.CorruptLsmWalIndex;
-    const last_segment = std.mem.readInt(u64, tail[0..8], .little);
-    if (last_segment == segment) return;
+    const last = try decodeCommittedSegmentEntry(tail, .main_replay_segment);
+    if (last.segment == segment) return;
 
-    var raw: [committed_segment_entry_len]u8 = undefined;
-    std.mem.writeInt(u64, raw[0..8], segment, .little);
-    std.mem.writeInt(u64, raw[8..16], sequence, .little);
+    const raw = encodeCommittedSegmentEntry(.main_replay_segment, segment, sequence);
     try storage.appendFileAbsolute(allocator, segments_path, &raw, true);
 }
 
@@ -1396,9 +1461,7 @@ fn appendReplaySegmentEntryIfNeeded(
     const size = storage.fileSize(segments_path) catch |err| switch (err) {
         error.FileNotFound => {
             if (!allow_create) return;
-            var raw: [committed_segment_entry_len]u8 = undefined;
-            std.mem.writeInt(u64, raw[0..8], segment, .little);
-            std.mem.writeInt(u64, raw[8..16], sequence, .little);
+            const raw = encodeCommittedSegmentEntry(.replay_segment, segment, sequence);
             try replaceFileAtomically(storage, allocator, segments_path, &raw);
             return;
         },
@@ -1406,9 +1469,7 @@ fn appendReplaySegmentEntryIfNeeded(
     };
     if (size == 0) {
         if (!allow_create) return;
-        var raw: [committed_segment_entry_len]u8 = undefined;
-        std.mem.writeInt(u64, raw[0..8], segment, .little);
-        std.mem.writeInt(u64, raw[8..16], sequence, .little);
+        const raw = encodeCommittedSegmentEntry(.replay_segment, segment, sequence);
         try replaceFileAtomically(storage, allocator, segments_path, &raw);
         return;
     }
@@ -1422,12 +1483,10 @@ fn appendReplaySegmentEntryIfNeeded(
     );
     defer temp_allocator.free(tail);
     if (tail.len != committed_segment_entry_len) return error.CorruptLsmWalIndex;
-    const last_segment = std.mem.readInt(u64, tail[0..8], .little);
-    if (last_segment == segment) return;
+    const last = try decodeCommittedSegmentEntry(tail, .replay_segment);
+    if (last.segment == segment) return;
 
-    var raw: [committed_segment_entry_len]u8 = undefined;
-    std.mem.writeInt(u64, raw[0..8], segment, .little);
-    std.mem.writeInt(u64, raw[8..16], sequence, .little);
+    const raw = encodeCommittedSegmentEntry(.replay_segment, segment, sequence);
     try storage.appendFileAbsolute(allocator, segments_path, &raw, true);
 }
 
@@ -1466,11 +1525,12 @@ fn replayMainWalStartSegment(
     var start_segment: u64 = 1;
     var pos: usize = 0;
     while (pos < raw.len) : (pos += committed_segment_entry_len) {
-        const segment = std.mem.readInt(u64, raw[pos..][0..8], .little);
-        const first_sequence = std.mem.readInt(u64, raw[pos + 8 ..][0..8], .little);
-        if (segment == 0 or first_sequence == 0) return error.CorruptLsmWalIndex;
-        if (first_sequence > from_sequence) break;
-        start_segment = segment;
+        const entry = try decodeCommittedSegmentEntry(
+            raw[pos..][0..committed_segment_entry_len],
+            .main_replay_segment,
+        );
+        if (entry.first_sequence > from_sequence) break;
+        start_segment = entry.segment;
     }
     return start_segment;
 }
@@ -1499,11 +1559,12 @@ fn replayStartSegment(
     var start_segment: u64 = 1;
     var pos: usize = 0;
     while (pos < raw.len) : (pos += committed_segment_entry_len) {
-        const segment = std.mem.readInt(u64, raw[pos..][0..8], .little);
-        const first_sequence = std.mem.readInt(u64, raw[pos + 8 ..][0..8], .little);
-        if (segment == 0 or first_sequence == 0) return error.CorruptLsmWalIndex;
-        if (first_sequence > from_sequence) break;
-        start_segment = segment;
+        const entry = try decodeCommittedSegmentEntry(
+            raw[pos..][0..committed_segment_entry_len],
+            .replay_segment,
+        );
+        if (entry.first_sequence > from_sequence) break;
+        start_segment = entry.segment;
     }
     return start_segment;
 }
@@ -1547,23 +1608,25 @@ fn readCurrentSegmentIfPresent(storage: storage_io.Storage, allocator: Allocator
     const index_path = try indexPathAlloc(temp_allocator, root_dir);
     defer temp_allocator.free(index_path);
     const index_size = try storage.fileSize(index_path);
-    if (index_size != 16) return error.CorruptLsmWalIndex;
-    const raw = try storage.readFileRangeAlloc(temp_allocator, index_path, 0, 16);
-    defer temp_allocator.free(raw);
-    if (raw.len != 16) return error.CorruptLsmWalIndex;
-    const segment = std.mem.readInt(u64, raw[0..8], .little);
+    if (index_size != control_pair_len) return error.CorruptLsmWalIndex;
+    var raw: [control_pair_len]u8 = undefined;
+    try storage.readFileRangeInto(temp_allocator, index_path, 0, &raw);
+    const payload = try decodeControl(&raw, .current_segment, 16);
+    const segment = std.mem.readInt(u64, payload[0..8], .little);
     if (segment == 0) return error.CorruptLsmWalIndex;
     return .{
         .segment = segment,
-        .size = std.mem.readInt(u64, raw[8..16], .little),
+        .size = std.mem.readInt(u64, payload[8..16], .little),
         .index_exists = true,
     };
 }
 
 fn writeCurrentSegment(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, segment: u64, size: u64) !void {
-    var raw: [16]u8 = undefined;
-    std.mem.writeInt(u64, raw[0..8], segment, .little);
-    std.mem.writeInt(u64, raw[8..16], size, .little);
+    var payload: [16]u8 = undefined;
+    std.mem.writeInt(u64, payload[0..8], segment, .little);
+    std.mem.writeInt(u64, payload[8..16], size, .little);
+    var raw: [control_pair_len]u8 = undefined;
+    encodeControl(&raw, .current_segment, &payload);
     const temp_allocator = allocator;
     const index_path = try indexPathAlloc(temp_allocator, root_dir);
     defer temp_allocator.free(index_path);
@@ -1578,12 +1641,12 @@ fn readCheckpointIndex(storage: storage_io.Storage, allocator: Allocator, root_d
         error.FileNotFound => return .{},
         else => return err,
     };
-    if (index_size != 16) return error.CorruptLsmWalIndex;
-    const raw = try storage.readFileRangeAlloc(temp_allocator, checkpoint_path, 0, 16);
-    defer temp_allocator.free(raw);
-    if (raw.len != 16) return error.CorruptLsmWalIndex;
-    const oldest_retained_segment = std.mem.readInt(u64, raw[0..8], .little);
-    const covered_through_segment = std.mem.readInt(u64, raw[8..16], .little);
+    if (index_size != control_pair_len) return error.CorruptLsmWalIndex;
+    var raw: [control_pair_len]u8 = undefined;
+    try storage.readFileRangeInto(temp_allocator, checkpoint_path, 0, &raw);
+    const payload = try decodeControl(&raw, .checkpoint, 16);
+    const oldest_retained_segment = std.mem.readInt(u64, payload[0..8], .little);
+    const covered_through_segment = std.mem.readInt(u64, payload[8..16], .little);
     if (oldest_retained_segment == 0) return error.CorruptLsmWalIndex;
     if (covered_through_segment + 1 < oldest_retained_segment) return error.CorruptLsmWalIndex;
     return .{
@@ -1596,9 +1659,11 @@ fn readCheckpointIndex(storage: storage_io.Storage, allocator: Allocator, root_d
 fn writeCheckpointIndex(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, index: CheckpointIndex) !void {
     if (index.oldest_retained_segment == 0) return error.CorruptLsmWalIndex;
     if (index.covered_through_segment + 1 < index.oldest_retained_segment) return error.CorruptLsmWalIndex;
-    var raw: [16]u8 = undefined;
-    std.mem.writeInt(u64, raw[0..8], index.oldest_retained_segment, .little);
-    std.mem.writeInt(u64, raw[8..16], index.covered_through_segment, .little);
+    var payload: [16]u8 = undefined;
+    std.mem.writeInt(u64, payload[0..8], index.oldest_retained_segment, .little);
+    std.mem.writeInt(u64, payload[8..16], index.covered_through_segment, .little);
+    var raw: [control_pair_len]u8 = undefined;
+    encodeControl(&raw, .checkpoint, &payload);
     const temp_allocator = allocator;
     const checkpoint_path = try checkpointPathAlloc(temp_allocator, root_dir);
     defer temp_allocator.free(checkpoint_path);
@@ -1616,15 +1681,20 @@ fn readReplayIndex(storage: storage_io.Storage, allocator: Allocator, root_dir: 
     const temp_allocator = allocator;
     const index_path = try replayIndexPathAlloc(temp_allocator, root_dir);
     defer temp_allocator.free(index_path);
-    var raw: [24]u8 = undefined;
-    storage.readFileRangeInto(temp_allocator, index_path, 0, &raw) catch |err| switch (err) {
+    const size = storage.fileSize(index_path) catch |err| switch (err) {
         error.FileNotFound => return .{},
+        else => return err,
+    };
+    if (size != control_triple_len) return error.CorruptLsmWalIndex;
+    var raw: [control_triple_len]u8 = undefined;
+    storage.readFileRangeInto(temp_allocator, index_path, 0, &raw) catch |err| switch (err) {
         error.EndOfStream => return error.CorruptLsmWalIndex,
         else => return err,
     };
-    const current_segment = std.mem.readInt(u64, raw[0..8], .little);
-    const next_sequence = std.mem.readInt(u64, raw[8..16], .little);
-    const truncated_through = std.mem.readInt(u64, raw[16..24], .little);
+    const payload = try decodeControl(&raw, .replay_index, 24);
+    const current_segment = std.mem.readInt(u64, payload[0..8], .little);
+    const next_sequence = std.mem.readInt(u64, payload[8..16], .little);
+    const truncated_through = std.mem.readInt(u64, payload[16..24], .little);
     if (current_segment == 0 or next_sequence == 0) return error.CorruptLsmWalIndex;
     return .{
         .current_segment = current_segment,
@@ -1635,10 +1705,12 @@ fn readReplayIndex(storage: storage_io.Storage, allocator: Allocator, root_dir: 
 }
 
 fn writeReplayIndex(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, index: ReplayIndex) !void {
-    var raw: [24]u8 = undefined;
-    std.mem.writeInt(u64, raw[0..8], index.current_segment, .little);
-    std.mem.writeInt(u64, raw[8..16], index.next_sequence, .little);
-    std.mem.writeInt(u64, raw[16..24], index.truncated_through, .little);
+    var payload: [24]u8 = undefined;
+    std.mem.writeInt(u64, payload[0..8], index.current_segment, .little);
+    std.mem.writeInt(u64, payload[8..16], index.next_sequence, .little);
+    std.mem.writeInt(u64, payload[16..24], index.truncated_through, .little);
+    var raw: [control_triple_len]u8 = undefined;
+    encodeControl(&raw, .replay_index, &payload);
     const wal_dir = try walDirPathAlloc(allocator, root_dir);
     defer allocator.free(wal_dir);
     try storage.createDirPath(wal_dir);
@@ -1851,7 +1923,7 @@ test "lsm wal replay reads chunks into bounded pending buffer" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
         }
@@ -1982,7 +2054,7 @@ test "lsm wal derives current segment size without republishing the index" {
 
     const index_path = try indexPathAlloc(std.testing.allocator, root_dir);
     defer std.testing.allocator.free(index_path);
-    try std.testing.expectEqual(@as(u64, 16), try storage.storage().fileSize(index_path));
+    try std.testing.expectEqual(@as(u64, control_pair_len), try storage.storage().fileSize(index_path));
 
     const segment_path = try segmentPathAlloc(std.testing.allocator, root_dir, 1);
     defer std.testing.allocator.free(segment_path);
@@ -1990,9 +2062,74 @@ test "lsm wal derives current segment size without republishing the index" {
     try std.testing.expectEqual(@as(u64, 1), current.segment);
     try std.testing.expectEqual(try storage.storage().fileSize(segment_path), current.size);
 
-    const raw_index = try storage.storage().readFileAlloc(std.testing.allocator, index_path, 16);
+    const raw_index = try storage.storage().readFileAlloc(std.testing.allocator, index_path, control_pair_len);
     defer std.testing.allocator.free(raw_index);
-    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, raw_index[8..16], .little));
+    const payload = try decodeControl(raw_index, .current_segment, 16);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, payload[8..16], .little));
+}
+
+test "lsm wal control indexes reject plausible checksummed corruption" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const root_dir = "/wal-control-checksum-test";
+    try storage.storage().createDirPath(root_dir);
+
+    const Cases = struct {
+        fn corruptFile(
+            store: storage_io.Storage,
+            path: []const u8,
+            len: usize,
+        ) !void {
+            const raw = try store.readFileAlloc(std.testing.allocator, path, len);
+            defer std.testing.allocator.free(raw);
+            raw[control_header_len] ^= 0x40;
+            try store.writeFileAbsolute(path, raw);
+        }
+    };
+
+    try writeCurrentSegment(storage.storage(), std.testing.allocator, root_dir, 7, 4096);
+    const current_path = try indexPathAlloc(std.testing.allocator, root_dir);
+    defer std.testing.allocator.free(current_path);
+    try Cases.corruptFile(storage.storage(), current_path, control_pair_len);
+    try std.testing.expectError(
+        error.CorruptLsmWalIndex,
+        readCurrentSegmentIfPresent(storage.storage(), std.testing.allocator, root_dir),
+    );
+
+    try writeCheckpointIndex(storage.storage(), std.testing.allocator, root_dir, .{
+        .oldest_retained_segment = 3,
+        .covered_through_segment = 6,
+    });
+    const checkpoint_path = try checkpointPathAlloc(std.testing.allocator, root_dir);
+    defer std.testing.allocator.free(checkpoint_path);
+    try Cases.corruptFile(storage.storage(), checkpoint_path, control_pair_len);
+    try std.testing.expectError(
+        error.CorruptLsmWalIndex,
+        readCheckpointIndex(storage.storage(), std.testing.allocator, root_dir),
+    );
+
+    try writeReplayIndex(storage.storage(), std.testing.allocator, root_dir, .{
+        .current_segment = 4,
+        .next_sequence = 17,
+        .truncated_through = 9,
+    });
+    const replay_path = try replayIndexPathAlloc(std.testing.allocator, root_dir);
+    defer std.testing.allocator.free(replay_path);
+    try Cases.corruptFile(storage.storage(), replay_path, control_triple_len);
+    try std.testing.expectError(
+        error.CorruptLsmWalIndex,
+        readReplayIndex(storage.storage(), std.testing.allocator, root_dir),
+    );
+
+    const segments_path = try replaySegmentsPathAlloc(std.testing.allocator, root_dir);
+    defer std.testing.allocator.free(segments_path);
+    var segment_entry = encodeCommittedSegmentEntry(.replay_segment, 4, 17);
+    segment_entry[control_header_len] ^= 0x20;
+    try storage.storage().writeFileAbsolute(segments_path, &segment_entry);
+    try std.testing.expectError(
+        error.CorruptLsmWalIndex,
+        replayStartSegment(storage.storage(), std.testing.allocator, root_dir, 17),
+    );
 }
 
 test "lsm wal retention snapshot counts replayed segment debt and reset clears it" {
@@ -2236,7 +2373,7 @@ test "lsm wal appends iterates and truncates replay rows" {
 
     const replay_index_path = try replayIndexPathAlloc(std.testing.allocator, root_dir);
     defer std.testing.allocator.free(replay_index_path);
-    try std.testing.expectEqual(@as(u64, 24), try storage.storage().fileSize(replay_index_path));
+    try std.testing.expectEqual(@as(u64, control_triple_len), try storage.storage().fileSize(replay_index_path));
 
     const replay_segment_path = try replaySegmentPathAlloc(std.testing.allocator, root_dir, 1);
     defer std.testing.allocator.free(replay_segment_path);

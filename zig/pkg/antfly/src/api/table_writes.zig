@@ -152,6 +152,8 @@ var test_before_drop_index_work_hook: ?TestExecutionHook = null;
 var test_before_native_backup_copy_hook: ?TestExecutionHook = null;
 var test_before_restore_work_hook: ?TestExecutionHook = null;
 var test_before_restore_repair_retry_sleep_hook: ?TestExecutionHook = null;
+var test_before_runtime_status_publish_hook: ?TestExecutionHook = null;
+var test_before_post_create_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
 
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
@@ -238,6 +240,18 @@ fn runTestBeforeRestoreWorkHook() void {
 fn runTestBeforeRestoreRepairRetrySleepHook() void {
     if (comptime builtin.is_test) {
         if (test_before_restore_repair_retry_sleep_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
+fn runTestBeforeRuntimeStatusPublishHook() void {
+    if (comptime builtin.is_test) {
+        if (test_before_runtime_status_publish_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
+fn runTestBeforePostCreateRuntimeStatusPublishHook() void {
+    if (comptime builtin.is_test) {
+        if (test_before_post_create_runtime_status_publish_hook) |hook| hook.run(hook.ptr);
     }
 }
 
@@ -11520,12 +11534,26 @@ pub const ProvisionedTableWriteSource = struct {
             };
             self.local_db_mutex.unlock();
 
-            for (group_ids, cached_groups.items) |group_id, cached| {
-                try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db);
-            }
             self.finishLocalStructuralCachedDbMutation(table_name);
             std.log.info("provisioned create table local notify table={s}", .{table_name});
             self.notifyLocalChange(table_name, .structural);
+            // Structural publication is the create commit point. Runtime
+            // status is observational and may be fenced by the invalidation
+            // emitted above or by a concurrent refresh; it must never turn an
+            // already-committed create into an HTTP failure.
+            runTestBeforePostCreateRuntimeStatusPublishHook();
+            for (group_ids, cached_groups.items) |group_id, cached| {
+                publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| switch (err) {
+                    error.RuntimeStatusPublicationFenced => std.log.debug(
+                        "post-create runtime status publication deferred table={s} group_id={d} err={s}",
+                        .{ table_name, group_id, @errorName(err) },
+                    ),
+                    else => std.log.warn(
+                        "post-create runtime status publication failed after commit table={s} group_id={d} err={s}",
+                        .{ table_name, group_id, @errorName(err) },
+                    ),
+                };
+            }
             std.log.info("provisioned create table local done table={s}", .{table_name});
             return {};
         }
@@ -17417,10 +17445,15 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
     identity_namespace: ?doc_identity.Namespace,
     options: ManagedDbOpenOptions,
 ) !db_mod.DB {
-    var enrichments = if (mode == .startup_catch_up)
-        ManagedDbEnrichmentSet{}
-    else
-        try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
+    var enrichments = try createManagedDbEnrichments(
+        alloc,
+        indexes_json,
+        backend_runtime,
+        antfly_provider,
+        options.inference_api_url,
+        secret_store,
+        remote_content,
+    );
     errdefer enrichments.deinit(alloc);
 
     const openDb = struct {
@@ -17528,7 +17561,20 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     .ha_write_gate = open_options.ha_write_gate,
                     .open_mode = .writer_no_replay,
                     .start_index_workers = false,
-                    .start_optional_runtimes = false,
+                    .enrichment = if (enrichment_cfg) |configured| blk: {
+                        var bounded = configured;
+                        // Loaded-state startup must not wait through the
+                        // normal external-provider inline retry budget. One
+                        // attempt records durable retry state; the startup
+                        // scheduler owns later attempts.
+                        bounded.inline_retry_max_attempts = 1;
+                        break :blk bounded;
+                    } else null,
+                    // Startup catch-up drives enrichment synchronously below.
+                    // Construct the runtime with metadata-owned providers, but
+                    // do not leave workers attached to this short-lived owner.
+                    .start_optional_runtimes = enrichment_cfg != null,
+                    .start_optional_runtime_workers = false,
                     .ttl_cleanup = .{ .enabled = false },
                     .transaction_recovery = .{ .enabled = false },
                     .text_merge = .{ .enabled = false },
@@ -17685,10 +17731,15 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
         // request work runs against the stabilized post-reconcile state.
         db.close();
         db_open = false;
-        enrichments = if (mode == .startup_catch_up)
-            ManagedDbEnrichmentSet{}
-        else
-            try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
+        enrichments = try createManagedDbEnrichments(
+            alloc,
+            indexes_json,
+            backend_runtime,
+            antfly_provider,
+            options.inference_api_url,
+            secret_store,
+            remote_content,
+        );
         db = blk: {
             const enrichment_cfg = if (enrichments.enabled()) enrichments.takeConfig() else null;
             const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
@@ -18302,6 +18353,7 @@ fn publishRuntimeStatusGroupAfterObservation(
     // started during that sampling window. This prevents an older cached
     // refresh from rejecting a lifecycle-completion hook without allowing a
     // retired writer to cross a table/root epoch.
+    runTestBeforeRuntimeStatusPublishHook();
     const completed = try snapshot_cache.capturePublicationToken(table_name);
     if (!std.meta.eql(publication_fence.table_epoch, completed.table_epoch)) {
         return error.RuntimeStatusPublicationFenced;
@@ -18994,6 +19046,12 @@ fn catchUpManagedDb(
         if (!status.catch_up_required) continue;
         had_debt = true;
         break;
+    }
+    const enrichment_before = db.pendingWorkStats().enrichment;
+    if (enrichment_before.enabled and
+        enrichment_before.applied_sequence < enrichment_before.target_sequence)
+    {
+        had_debt = true;
     }
     const ProgressCtx = struct {
         source: *ProvisionedTableWriteSource,
@@ -19727,7 +19785,7 @@ fn resolveWritesForSchemaValidation(
         defer if (existing_from_db) |body| alloc.free(body);
         const existing = existing_from_request orelse existing_from_db;
         const resolved = db_mod.transform.resolveDocumentTransform(alloc, existing, transform) catch |err| switch (err) {
-            error.InvalidArgument => return error.InvalidBatchRequest,
+            error.InvalidArgument, error.UnsupportedTransformOperation => return error.InvalidBatchRequest,
             else => return err,
         } orelse continue;
 
@@ -35261,6 +35319,89 @@ test "provisioned table write source create table provisions local indexes and s
     var enrichment = (try cached_db.getEnrichment(alloc, .asset, "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer enrichment.deinit(alloc);
     try std.testing.expectEqualStrings("title", enrichment.field);
+}
+
+test "provisioned create succeeds when post-commit runtime status is fenced" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/create-status-publication-fence",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer status_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &status_cache;
+
+    const Fence = struct {
+        cache: *runtime_status.TableRuntimeSnapshotCache,
+        calls: usize = 0,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.cache.invalidateTable("docs");
+        }
+    };
+    var fence = Fence{ .cache = &status_cache };
+    const previous_hook = test_before_post_create_runtime_status_publish_hook;
+    test_before_post_create_runtime_status_publish_hook = .{ .ptr = &fence, .run = Fence.run };
+    defer test_before_post_create_runtime_status_publish_hook = previous_hook;
+
+    const handled = try source.source().createTable(alloc, "docs", .{});
+    try std.testing.expect(handled != null);
+    try std.testing.expectEqual(@as(usize, 1), fence.calls);
+
+    lockAtomic(&source.local_db_mutex);
+    defer source.local_db_mutex.unlock();
+    try std.testing.expect(
+        write_cache.getLocked(7001, source.visibleRootGeneration(7001), "docs") != null,
+    );
 }
 
 test "provisioned create reuses a generation opened by startup reconciliation" {

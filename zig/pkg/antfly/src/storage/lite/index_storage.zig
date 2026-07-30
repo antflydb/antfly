@@ -148,7 +148,7 @@ fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     return @intCast(size);
 }
 
-fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
     const io = self.docs.file.io_impl.io();
@@ -158,7 +158,10 @@ fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8,
 
     const size = (try self.docs.file.getIndexCatalogRecordSizeAtCheckpoint(path, checkpoint)) orelse return error.FileNotFound;
     if (size < len) return error.EndOfStream;
-    return (try self.docs.file.getIndexCatalogRecordRangeAtCheckpointAlloc(allocator, path, @intCast(size - len), len, checkpoint)) orelse return error.FileNotFound;
+    return .{
+        .bytes = (try self.docs.file.getIndexCatalogRecordRangeAtCheckpointAlloc(allocator, path, @intCast(size - len), len, checkpoint)) orelse return error.FileNotFound,
+        .file_size = size,
+    };
 }
 
 fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
@@ -280,6 +283,7 @@ const NativeAtomicWriteSink = struct {
         .append_slice = appendSlice,
         .write_at = writeAt,
         .crc32_prefix = crc32Prefix,
+        .crc32_range = crc32Range,
         .finish = finish,
         .abort = abort,
     };
@@ -324,6 +328,12 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
         return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
+    }
+
+    fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
+        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 
     fn finish(ptr: *anyopaque) !void {
@@ -521,9 +531,10 @@ test "lite native index storage handles large files rename and delete tree" {
     defer allocator.free(range);
     try std.testing.expectEqualSlices(u8, large[range_offset..][0..41], range);
 
-    const trailer = try storage.readFileTrailerAlloc(allocator, "/dense/a/blob2", 17);
-    defer allocator.free(trailer);
-    try std.testing.expectEqualSlices(u8, append_suffix[append_suffix.len - 17 ..], trailer);
+    var trailer = try storage.readFileTrailerAlloc(allocator, "/dense/a/blob2", 17);
+    defer trailer.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, append_suffix[append_suffix.len - 17 ..], trailer.bytes);
+    try std.testing.expectEqual(@as(u64, large.len + append_suffix.len), trailer.file_size);
     try std.testing.expectError(error.EndOfStream, storage.readFileRangeAlloc(allocator, "/dense/a/blob2", large.len + append_suffix.len - 4, 8));
 
     try storage.writeFileAbsolute("/dense/a/sub/file", "child");

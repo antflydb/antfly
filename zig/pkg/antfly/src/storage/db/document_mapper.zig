@@ -3158,9 +3158,9 @@ test "document mapper full text projection omits vector-like stored payloads" {
     try std.testing.expect(std.mem.indexOf(u8, stored.data, "\"sparse\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, stored.data, "\"title\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored.data, "\"tags\"") != null);
-    try std.testing.expect(reader.getSection("embedding", .typed_doc_values) == null);
-    try std.testing.expect(reader.getSection("sparse.indices", .typed_doc_values) == null);
-    try std.testing.expect(reader.getSection("sparse.values", .typed_doc_values) == null);
+    try std.testing.expect((try reader.getSection("embedding", .typed_doc_values)) == null);
+    try std.testing.expect((try reader.getSection("sparse.indices", .typed_doc_values)) == null);
+    try std.testing.expect((try reader.getSection("sparse.values", .typed_doc_values)) == null);
 }
 
 test "document mapper full text projection uses configured vector fields before numeric array heuristic" {
@@ -3191,8 +3191,8 @@ test "document mapper full text projection uses configured vector fields before 
 
     try std.testing.expect(std.mem.indexOf(u8, stored.data, "\"embedding\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, stored.data, "\"ratings\"") != null);
-    try std.testing.expect(reader.getSection("embedding", .typed_doc_values) == null);
-    try std.testing.expect(reader.getSection("score", .typed_doc_values) != null);
+    try std.testing.expect((try reader.getSection("embedding", .typed_doc_values)) == null);
+    try std.testing.expect((try reader.getSection("score", .typed_doc_values)) != null);
 }
 
 test "document mapper builds text segment from nested string fields without schema" {
@@ -3346,7 +3346,7 @@ test "document mapper emits schema keyword typed doc values" {
     var reader = try segment_mod.SegmentReader.init(alloc, segment);
     defer reader.deinit();
 
-    const section = reader.getSection("tenant", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const section = (try reader.getSection("tenant", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
     try std.testing.expectEqual(typed_dv.ValueType.bytes_val, values.value_type);
     const first = (try values.getBytesAlloc(0)) orelse return error.TestExpectedEqual;
@@ -3397,9 +3397,9 @@ test "document mapper emits mapped keyword subfield postings and typed doc value
 
     try std.testing.expect((try reader.invertedIndex("title")) != null);
     try std.testing.expect((try reader.invertedIndex("title.keyword")) != null);
-    try std.testing.expect(reader.getSection("title", .typed_doc_values) == null);
+    try std.testing.expect((try reader.getSection("title", .typed_doc_values)) == null);
 
-    const section = reader.getSection("title.keyword", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const section = (try reader.getSection("title.keyword", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
     try std.testing.expectEqual(typed_dv.ValueType.bytes_val, values.value_type);
     const first = (try values.getBytesAlloc(0)) orelse return error.TestExpectedEqual;
@@ -3451,9 +3451,9 @@ test "document mapper emits schema-derived mapped keyword subfield coverage" {
 
     try std.testing.expect((try reader.invertedIndex("title")) != null);
     try std.testing.expect((try reader.invertedIndex("title.keyword")) != null);
-    try std.testing.expect(reader.getSection("title", .typed_doc_values) == null);
+    try std.testing.expect((try reader.getSection("title", .typed_doc_values)) == null);
 
-    const section = reader.getSection("title.keyword", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const section = (try reader.getSection("title.keyword", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
     try std.testing.expectEqual(typed_dv.ValueType.bytes_val, values.value_type);
     const first = (try values.getBytesAlloc(0)) orelse return error.TestExpectedEqual;
@@ -3502,7 +3502,7 @@ test "document mapper emits schema-derived direct keyword postings and typed doc
     try std.testing.expect((try reader.invertedIndex("status.keyword")) == null);
     try std.testing.expect(status_inv.lookup("active") != null);
 
-    const section = reader.getSection("status", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const section = (try reader.getSection("status", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
     try std.testing.expectEqual(typed_dv.ValueType.bytes_val, values.value_type);
     const first = (try values.getBytesAlloc(0)) orelse return error.TestExpectedEqual;
@@ -3548,7 +3548,7 @@ test "document mapper omits multi-valued mapped keyword subfield typed doc value
     var reader = try segment_mod.SegmentReader.init(alloc, segment);
     defer reader.deinit();
 
-    try std.testing.expect(reader.getSection("title.keyword", .typed_doc_values) == null);
+    try std.testing.expect((try reader.getSection("title.keyword", .typed_doc_values)) == null);
 }
 
 test "document mapper omits multi-valued schema keyword typed doc values" {
@@ -3577,7 +3577,7 @@ test "document mapper omits multi-valued schema keyword typed doc values" {
     var reader = try segment_mod.SegmentReader.init(alloc, segment);
     defer reader.deinit();
 
-    try std.testing.expect(reader.getSection("tags", .typed_doc_values) == null);
+    try std.testing.expect((try reader.getSection("tags", .typed_doc_values)) == null);
 }
 
 test "document mapper omits multi-valued schema numeric typed doc values" {
@@ -3624,7 +3624,7 @@ test "document mapper omits multi-valued schema numeric typed doc values" {
     var reader = try segment_mod.SegmentReader.init(alloc, segment);
     defer reader.deinit();
 
-    try std.testing.expect(reader.getSection("rank", .typed_doc_values) == null);
+    try std.testing.expect((try reader.getSection("rank", .typed_doc_values)) == null);
 }
 
 test "document mapper preserves integer numeric doc values as i64" {
@@ -3654,7 +3654,7 @@ test "document mapper preserves integer numeric doc values as i64" {
     var reader = try segment_mod.SegmentReader.init(alloc, segment);
     defer reader.deinit();
 
-    const section = reader.getSection("rank", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const section = (try reader.getSection("rank", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
     try std.testing.expectEqual(typed_dv.ValueType.i64_val, values.value_type);
     try std.testing.expectEqual(@as(?i64, -9007199254740993), try values.getI64(0));
@@ -3687,7 +3687,7 @@ test "document mapper preserves unsigned numeric doc values beyond i64 as u64" {
     var reader = try segment_mod.SegmentReader.init(alloc, segment);
     defer reader.deinit();
 
-    const section = reader.getSection("rank", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const section = (try reader.getSection("rank", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
     try std.testing.expectEqual(typed_dv.ValueType.u64_val, values.value_type);
     try std.testing.expectEqual(@as(?u64, 9223372036854775808), try values.getU64(0));
@@ -3720,7 +3720,7 @@ test "document mapper omits mixed numeric typed doc value domains" {
     var reader = try segment_mod.SegmentReader.init(alloc, segment);
     defer reader.deinit();
 
-    try std.testing.expect(reader.getSection("rank", .typed_doc_values) == null);
+    try std.testing.expect((try reader.getSection("rank", .typed_doc_values)) == null);
 }
 
 test "document mapper omits non-finite numeric doc values" {
@@ -3762,7 +3762,7 @@ test "document mapper emits schema geo point typed doc values" {
     var reader = try segment_mod.SegmentReader.init(alloc, segment);
     defer reader.deinit();
 
-    const section = reader.getSection("location", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const section = (try reader.getSection("location", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
     try std.testing.expectEqual(typed_dv.ValueType.geo_point, values.value_type);
     const point = (try values.getGeoPoint(0)) orelse return error.TestExpectedEqual;
@@ -3969,8 +3969,8 @@ test "document mapper flushes schema index_sort segments in physical sort order"
     const segment = result.segment orelse return error.TestExpectedEqual;
     var reader = try segment_mod.SegmentReader.init(alloc, segment);
     defer reader.deinit();
-    try std.testing.expectEqualStrings("doc:a", reader.storedDoc(0).?.id);
-    try std.testing.expectEqualStrings("doc:b", reader.storedDoc(1).?.id);
+    try std.testing.expectEqualStrings("doc:a", (try reader.storedDoc(0)).?.id);
+    try std.testing.expectEqualStrings("doc:b", (try reader.storedDoc(1)).?.id);
 
     const fields = (try reader.indexSortFieldsAlloc(alloc)) orelse return error.TestExpectedEqual;
     defer segment_mod.freeIndexSortFields(alloc, fields);
@@ -3994,7 +3994,7 @@ test "document mapper flushes schema index_sort segments in physical sort order"
     try std.testing.expect(stats.index_sort_bytes > 0);
     try std.testing.expect(stats.index_sort_bounds_bytes > 0);
 
-    const section = reader.getSection("price", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const section = (try reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
     try std.testing.expectEqual(typed_dv.ValueType.i64_val, values.value_type);
     try std.testing.expectEqual(@as(?i64, 1), try values.getI64(0));
@@ -4035,8 +4035,8 @@ test "document mapper accepts match-mapping-type dynamic template index_sort fie
     const segment = result.segment orelse return error.TestExpectedEqual;
     var reader = try segment_mod.SegmentReader.init(alloc, segment);
     defer reader.deinit();
-    try std.testing.expectEqualStrings("doc:new", reader.storedDoc(0).?.id);
-    try std.testing.expectEqualStrings("doc:old", reader.storedDoc(1).?.id);
+    try std.testing.expectEqualStrings("doc:new", (try reader.storedDoc(0)).?.id);
+    try std.testing.expectEqualStrings("doc:old", (try reader.storedDoc(1)).?.id);
 
     const fields = (try reader.indexSortFieldsAlloc(alloc)) orelse return error.TestExpectedEqual;
     defer segment_mod.freeIndexSortFields(alloc, fields);
@@ -4046,7 +4046,7 @@ test "document mapper accepts match-mapping-type dynamic template index_sort fie
     try std.testing.expectEqualStrings("_id", fields[1].field);
     try std.testing.expect(!fields[1].desc);
 
-    const section = reader.getSection("created_at", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const section = (try reader.getSection("created_at", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
     try std.testing.expectEqual(typed_dv.ValueType.u64_val, values.value_type);
     try std.testing.expect((try values.getU64(0)).? > (try values.getU64(1)).?);
@@ -4387,13 +4387,13 @@ test "document mapper emits default dynamic schema text fields" {
     try std.testing.expect((try reader.invertedIndex("tenant")) != null);
     try std.testing.expect((try reader.invertedIndex("tenant.keyword")) != null);
 
-    const id_section = reader.getSection("id", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const id_section = (try reader.getSection("id", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var id_values = try typed_dv.TypedDocValuesReader.init(alloc, id_section);
     try std.testing.expectEqual(typed_dv.ValueType.f64_val, id_values.value_type);
     try std.testing.expectEqual(@as(?f64, 42), try id_values.getF64(0));
     try std.testing.expectEqual(@as(?f64, 42.5), try id_values.getF64(1));
 
-    const active_section = reader.getSection("active", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const active_section = (try reader.getSection("active", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var active_values = try typed_dv.TypedDocValuesReader.init(alloc, active_section);
     try std.testing.expectEqual(typed_dv.ValueType.bool_val, active_values.value_type);
     try std.testing.expectEqual(@as(?bool, true), try active_values.getBool(0));

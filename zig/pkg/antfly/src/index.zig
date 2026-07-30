@@ -681,10 +681,10 @@ pub const IndexSnapshot = struct {
     }
 
     /// Get a stored document by global doc ID.
-    pub fn storedDoc(self: *const IndexSnapshot, global_id: u32) ?segment_mod.SegmentReader.StoredDocRef {
+    pub fn storedDoc(self: *const IndexSnapshot, global_id: u32) !?segment_mod.SegmentReader.StoredDocRef {
         const resolved = self.resolveDocId(global_id) orelse return null;
         self.segments[resolved.seg_idx].noteAccess();
-        return self.segments[resolved.seg_idx].reader.storedDoc(resolved.local_id);
+        return try self.segments[resolved.seg_idx].reader.storedDoc(resolved.local_id);
     }
 
     pub fn docOrdinal(self: *const IndexSnapshot, global_id: u32) !?u32 {
@@ -744,10 +744,10 @@ pub const IndexSnapshot = struct {
         return try out.toOwnedSlice(alloc);
     }
 
-    pub fn hasDocOrdinalCoverage(self: *const IndexSnapshot) bool {
+    pub fn hasDocOrdinalCoverage(self: *const IndexSnapshot) !bool {
         for (self.segments) |*seg| {
             if (seg.reader.doc_count == 0) continue;
-            if (seg.reader.getSection(segment_mod.doc_ordinals_field, .doc_ordinals) == null) return false;
+            if ((try seg.reader.getSection(segment_mod.doc_ordinals_field, .doc_ordinals)) == null) return false;
         }
         return true;
     }
@@ -1313,8 +1313,8 @@ pub const IndexWriter = struct {
         const reader = segment_mod.SegmentReader{
             .alloc = std.testing.allocator,
             .data = &data,
-            .stored_offset = data.len - 40,
-            .index_offset = data.len - 40,
+            .stored_offset = data.len - 56,
+            .index_offset = data.len - 56,
             .doc_count = 0,
             .num_fields = 1,
             .fields = fields[0..],
@@ -1663,7 +1663,7 @@ pub const IndexWriter = struct {
             var local_ids = std.ArrayListUnmanaged(u32).empty;
             defer local_ids.deinit(alloc);
             for (0..seg.reader.doc_count) |local_id| {
-                const stored = seg.reader.storedDoc(@intCast(local_id)) orelse continue;
+                const stored = (try seg.reader.storedDoc(@intCast(local_id))) orelse continue;
                 if (wanted.contains(stored.id)) {
                     if (seg.shared.deleted) |d| {
                         if (d.contains(@intCast(local_id))) continue;
@@ -2188,7 +2188,7 @@ test "tracked batch deletion removes many IDs with one result per affected segme
     const results = try writer.snapshot().search(alloc, "body", &.{"x"}, 10);
     defer alloc.free(results.hits);
     try std.testing.expectEqual(@as(usize, 1), results.hits.len);
-    const remaining = writer.snapshot().storedDoc(results.hits[0].doc_id) orelse return error.TestUnexpectedResult;
+    const remaining = (try writer.snapshot().storedDoc(results.hits[0].doc_id)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("doc:c", remaining.id);
 }
 

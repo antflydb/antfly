@@ -32,10 +32,9 @@ pub const SplitBootstrapMarker = struct {
 };
 
 pub fn splitBootstrapMetadataWrites(
-    byte_range: docstore_mod.ByteRange,
+    encoded_range: []const u8,
     sequence: u64,
     marker: SplitBootstrapMarker,
-    range_buf: []u8,
     sequence_buf: *[8]u8,
     marker_buf: *[4 * @sizeOf(u64) + 1]u8,
 ) ![3]docstore_mod.KVPair {
@@ -51,14 +50,10 @@ pub fn splitBootstrapMetadataWrites(
     std.mem.writeInt(u64, marker_buf[24..32], marker.destination_group_id, .little);
     marker_buf[32] = @intFromBool(marker.bootstrap_complete);
     return .{
-        .{ .key = range_key, .value = try encodeRange(byte_range, range_buf) },
+        .{ .key = range_key, .value = encoded_range },
         .{ .key = split_delta_final_seq_key, .value = sequence_buf },
         .{ .key = split_bootstrap_marker_key, .value = marker_buf },
     };
-}
-
-pub fn rangeMetadataWrite(byte_range: docstore_mod.ByteRange, range_buf: []u8) !docstore_mod.KVPair {
-    return .{ .key = range_key, .value = try encodeRange(byte_range, range_buf) };
 }
 
 pub fn loadRange(alloc: Allocator, store: anytype) !docstore_mod.ByteRange {
@@ -82,16 +77,16 @@ pub fn loadRangeAtKey(alloc: Allocator, store: anytype, key: []const u8) !docsto
 pub fn decodeRangeAlloc(alloc: Allocator, raw: []const u8) !docstore_mod.ByteRange {
     if (raw.len < 8) return error.InvalidRangeState;
     var pos: usize = 0;
-    const start_len = std.mem.readInt(u32, raw[pos..][0..4], .little);
+    const start_len: usize = std.mem.readInt(u32, raw[pos..][0..4], .little);
     pos += 4;
-    if (pos + start_len + 4 > raw.len) return error.InvalidRangeState;
+    if (start_len > raw.len - pos or raw.len - pos - start_len < 4) return error.InvalidRangeState;
     const start = try alloc.dupe(u8, raw[pos .. pos + start_len]);
     pos += start_len;
     errdefer alloc.free(start);
 
-    const end_len = std.mem.readInt(u32, raw[pos..][0..4], .little);
+    const end_len: usize = std.mem.readInt(u32, raw[pos..][0..4], .little);
     pos += 4;
-    if (pos + end_len != raw.len) return error.InvalidRangeState;
+    if (end_len != raw.len - pos) return error.InvalidRangeState;
     const end = try alloc.dupe(u8, raw[pos .. pos + end_len]);
 
     return .{
@@ -110,8 +105,8 @@ pub fn saveRange(store: anytype, byte_range: docstore_mod.ByteRange) !void {
 }
 
 pub fn saveRangeAtKey(store: anytype, key: []const u8, byte_range: docstore_mod.ByteRange) !void {
-    var stack_buf: [1024]u8 = undefined;
-    const buf = try encodeRange(byte_range, &stack_buf);
+    const buf = try encodeRangeAlloc(std.heap.page_allocator, byte_range);
+    defer std.heap.page_allocator.free(buf);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
@@ -120,10 +115,14 @@ pub fn saveRangeAtKey(store: anytype, key: []const u8, byte_range: docstore_mod.
     try txn.commit();
 }
 
-pub fn encodeRange(byte_range: docstore_mod.ByteRange, stack_buf: []u8) ![]const u8 {
-    const total_len = 8 + byte_range.start.len + byte_range.end.len;
-    if (total_len > stack_buf.len) return error.RangeTooLarge;
-    const buf = stack_buf[0..total_len];
+pub fn encodeRangeAlloc(alloc: Allocator, byte_range: docstore_mod.ByteRange) ![]u8 {
+    if (byte_range.start.len > std.math.maxInt(u32) or byte_range.end.len > std.math.maxInt(u32))
+        return error.RangeTooLarge;
+    const boundaries_len = std.math.add(usize, byte_range.start.len, byte_range.end.len) catch
+        return error.RangeTooLarge;
+    const total_len = std.math.add(usize, 8, boundaries_len) catch return error.RangeTooLarge;
+    const buf = try alloc.alloc(u8, total_len);
+    errdefer alloc.free(buf);
 
     var pos: usize = 0;
     std.mem.writeInt(u32, buf[pos..][0..4], @intCast(byte_range.start.len), .little);
@@ -296,6 +295,27 @@ test "range state saves and loads namespaced ranges" {
 
     try std.testing.expectEqualStrings("doc:b", loaded.start);
     try std.testing.expectEqualStrings("doc:m", loaded.end);
+}
+
+test "range state persists multi-kibibyte split boundaries" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    const start = try std.testing.allocator.alloc(u8, 8 * 1024);
+    defer std.testing.allocator.free(start);
+    @memset(start, 'a');
+    const end = try std.testing.allocator.alloc(u8, 12 * 1024);
+    defer std.testing.allocator.free(end);
+    @memset(end, 'z');
+
+    try saveRangeAtKey(runtime, "group-range:large", .{ .start = start, .end = end });
+    const loaded = try loadRangeAtKey(std.testing.allocator, runtime, "group-range:large");
+    defer freeRange(std.testing.allocator, loaded);
+    try std.testing.expectEqualSlices(u8, start, loaded.start);
+    try std.testing.expectEqualSlices(u8, end, loaded.end);
 }
 
 test "range state returns empty range for missing namespaced key" {

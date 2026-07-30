@@ -97,6 +97,11 @@ pub const AntflyApiHandler = struct {
         _ = ctx.status(resp.status);
         if (resp.content_type) |ct| {
             try ctx.setHeader("content-type", ct);
+        } else if (resp.status >= 200 and resp.status < 300) {
+            // Legacy API responses without an explicit type are JSON.  Keep
+            // this compatibility default at the shared adapter so every
+            // successful route presents the same wire contract.
+            try ctx.setHeader("content-type", "application/json");
         }
         for (resp.headers) |hdr| {
             try ctx.setHeader(hdr.name, hdr.value);
@@ -110,6 +115,8 @@ pub const AntflyApiHandler = struct {
         _ = ctx.status(resp.status);
         if (resp.content_type) |ct| {
             try ctx.setHeader("content-type", ct);
+        } else if (resp.status >= 200 and resp.status < 300) {
+            try ctx.setHeader("content-type", "application/json");
         }
         for (resp.headers) |hdr| {
             try ctx.setHeader(hdr.name, hdr.value);
@@ -224,7 +231,17 @@ pub const AntflyApiHandler = struct {
         return respondApiResponseBody(ctx, resp.status, resp.body);
     }
 
-    pub fn httpRequestFromContext(ctx: *httpx.Context, body_data_opt: ?[]const u8) !http_common.HttpRequest {
+    pub const ConvertedHttpRequest = struct {
+        value: http_common.HttpRequest,
+        alloc: std.mem.Allocator,
+
+        pub fn deinit(self: *@This()) void {
+            self.alloc.free(self.value.headers);
+            self.* = undefined;
+        }
+    };
+
+    pub fn httpRequestFromContext(ctx: *httpx.Context, body_data_opt: ?[]const u8) !ConvertedHttpRequest {
         const method: http_common.Method = switch (ctx.request.method) {
             .GET => .GET,
             .POST => .POST,
@@ -235,17 +252,21 @@ pub const AntflyApiHandler = struct {
             },
         };
         const headers = try ctx.allocator.alloc(http_common.RequestHeader, ctx.request.headers.entries.items.len);
+        errdefer ctx.allocator.free(headers);
         for (ctx.request.headers.entries.items, 0..) |entry, i| {
             headers[i] = .{ .name = entry.name, .value = entry.value };
         }
         const body_data = body_data_opt orelse (try ctx.body()) orelse "";
         return .{
-            .method = method,
-            .uri = ctx.request.uri.raw,
-            .headers = headers,
-            .authorization = ctx.header("authorization"),
-            .content_type = ctx.header("content-type"),
-            .body = body_data,
+            .value = .{
+                .method = method,
+                .uri = ctx.request.uri.raw,
+                .headers = headers,
+                .authorization = ctx.header("authorization"),
+                .content_type = ctx.header("content-type"),
+                .body = body_data,
+            },
+            .alloc = ctx.allocator,
         };
     }
 
@@ -697,11 +718,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, "") catch {
+        var converted_req = httpRequestFromContext(ctx, "") catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -732,11 +754,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -774,11 +797,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -869,11 +893,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -914,11 +939,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -955,11 +981,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid savepoint id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -992,11 +1019,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -1167,11 +1195,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        const forward_req = httpRequestFromContext(ctx, body_data) catch {
+        var converted_req = httpRequestFromContext(ctx, body_data) catch {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         };
-        if (try self.api_server.forwardSessionRequest(txn_id, forward_req)) |forwarded| {
+        defer converted_req.deinit();
+        if (try self.api_server.forwardSessionRequest(txn_id, converted_req.value)) |forwarded| {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
@@ -1443,13 +1472,15 @@ pub const AntflyApiHandler = struct {
             server: *ApiHttpServer,
             source: table_reads.TableReadSource,
             query_embedding_security_scope: ApiHttpServer.QueryEmbeddingSecurityScope,
+            authenticated_identity: ?AuthenticatedIdentity,
 
             fn iface(runner: *@This()) retrieval_agent.QueryRunner {
                 return .{
                     .ptr = runner,
                     .vtable = &.{
                         .run_query = runQuery,
-                        .scan_keys = runScanKeys,
+                        .scan_key_page = runScanKeyPage,
+                        .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
             }
@@ -1474,6 +1505,19 @@ pub const AntflyApiHandler = struct {
                     error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,
                     else => return err,
                 };
+                const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(
+                    a,
+                    runner.authenticated_identity,
+                    table_name,
+                );
+                defer if (row_filter_json) |value| a.free(value);
+                if (row_filter_json) |value| {
+                    http_server_mod.injectRowFilterIntoSearchRequest(a, &query_req.req, value) catch
+                        return error.InvalidRetrievalAgentRequest;
+                }
+                if (runner.authenticated_identity) |*identity| {
+                    ApiHttpServer.attachGraphTableReadAuthorizer(&query_req.req, identity);
+                }
                 return (runner.source.query(
                     a,
                     table_name,
@@ -1486,35 +1530,43 @@ pub const AntflyApiHandler = struct {
                 }) orelse error.TableNotFound;
             }
 
-            fn runScanKeys(
+            fn runScanKeyPage(
                 ptr: *anyopaque,
                 a: std.mem.Allocator,
                 table_name: []const u8,
-            ) ![]const []const u8 {
+                after_key: []const u8,
+                limit: u32,
+                filter_query_json: ?[]const u8,
+                exclusion_query_json: ?[]const u8,
+            ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var scan = (try runner.source.scan(
+                return try runner.server.scanRetrievalKeyPage(
                     a,
+                    runner.source,
                     table_name,
-                    "",
-                    "",
-                    .{ .limit = 0 },
-                    .read_index,
-                )) orelse return error.TableNotFound;
-                defer scan.deinit(a);
+                    after_key,
+                    limit,
+                    filter_query_json,
+                    exclusion_query_json,
+                    runner.authenticated_identity,
+                );
+            }
 
-                var keys = std.ArrayListUnmanaged([]const u8).empty;
-                errdefer {
-                    for (keys.items) |key| a.free(key);
-                    keys.deinit(a);
-                }
-
-                var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
-                while (lines.next()) |line| {
-                    if (line.len == 0) continue;
-                    const key = http_server_mod.scanLineKey(a, line) catch return error.InvalidRetrievalAgentRequest;
-                    try keys.append(a, key);
-                }
-                return try keys.toOwnedSlice(a);
+            fn probeIncomingEdges(
+                ptr: *anyopaque,
+                a: std.mem.Allocator,
+                table_name: []const u8,
+                index_name: []const u8,
+                keys: []const []const u8,
+            ) ![]bool {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                return try runner.server.probeRetrievalIncomingEdges(
+                    a,
+                    runner.source,
+                    table_name,
+                    index_name,
+                    keys,
+                );
             }
         };
 
@@ -1552,8 +1604,13 @@ pub const AntflyApiHandler = struct {
             .server = self.api_server,
             .source = source,
             .query_embedding_security_scope = ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity),
+            .authenticated_identity = authenticated_identity,
         };
         const retrieval_resp = retrieval_agent.execute(alloc, query_runner.iface(), generation_runner.iface(), body_data) catch |err| switch (err) {
+            error.TreeRootSetTooLarge => {
+                _ = ctx.status(422);
+                return ctx.text("tree root set exceeds the bounded retrieval limit");
+            },
             error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
                 _ = ctx.status(400);
                 return ctx.text("invalid retrieval agent request");
@@ -3430,12 +3487,12 @@ test "httpx internal request conversion preserves protocol headers" {
     var ctx = httpx.Context.init(alloc, undefined, &request);
     defer ctx.deinit();
 
-    const converted = try AntflyApiHandler.httpRequestFromContext(&ctx, "{}");
-    defer alloc.free(converted.headers);
+    var converted = try AntflyApiHandler.httpRequestFromContext(&ctx, "{}");
+    defer converted.deinit();
 
-    try std.testing.expectEqualStrings("session-123", converted.header("mcp-session-id") orelse return error.MissingHeader);
-    try std.testing.expectEqualStrings("application/json", converted.content_type orelse return error.MissingContentType);
-    try std.testing.expectEqualStrings("{}", converted.body);
+    try std.testing.expectEqualStrings("session-123", converted.value.header("mcp-session-id") orelse return error.MissingHeader);
+    try std.testing.expectEqualStrings("application/json", converted.value.content_type orelse return error.MissingContentType);
+    try std.testing.expectEqualStrings("{}", converted.value.body);
 }
 
 test "httpx antfly routes require auth and enforce admin middleware" {

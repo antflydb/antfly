@@ -17,8 +17,13 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const raft_engine = @import("raft_engine");
 const platform_sync = @import("antfly_platform").sync;
 
-const replica_catalog_header = "ANTFLY_REPLICA_CATALOG 1";
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const replica_catalog_header = "ANTFLY_REPLICA_CATALOG 2";
+const replica_catalog_footer_prefix = "ANTFLY_REPLICA_CATALOG_SHA256 ";
+const replica_catalog_digest_domain = "antfly-replica-catalog-v2\x00";
 const max_replica_catalog_record_bytes = 64 * 1024;
+const max_replica_catalog_records = 1_000_000;
+const max_replica_catalog_bytes = 256 * 1024 * 1024;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
@@ -27,6 +32,41 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
 fn nextRevision(current: u64) !u64 {
     if (current == std.math.maxInt(u64)) return error.ReplicaCatalogRevisionExhausted;
     return current + 1;
+}
+
+fn updateCatalogDigest(hasher: *Sha256, record: []const u8) void {
+    var encoded_len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_len, @intCast(record.len), .little);
+    hasher.update(&encoded_len);
+    hasher.update(record);
+}
+
+fn finalizeCatalogDigest(hasher: *Sha256, record_count: usize) [Sha256.digest_length]u8 {
+    var encoded_count: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_count, @intCast(record_count), .little);
+    hasher.update(&encoded_count);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn parseCatalogFooter(line: []const u8) !struct {
+    record_count: usize,
+    digest: [Sha256.digest_length]u8,
+} {
+    if (!std.mem.startsWith(u8, line, replica_catalog_footer_prefix))
+        return error.InvalidReplicaCatalog;
+    const payload = line[replica_catalog_footer_prefix.len..];
+    const separator = std.mem.indexOfScalar(u8, payload, ' ') orelse
+        return error.InvalidReplicaCatalog;
+    if (separator == 0 or separator + 1 >= payload.len) return error.InvalidReplicaCatalog;
+    const record_count = std.fmt.parseInt(usize, payload[0..separator], 10) catch
+        return error.InvalidReplicaCatalog;
+    const encoded_digest = payload[separator + 1 ..];
+    if (encoded_digest.len != Sha256.digest_length * 2) return error.InvalidReplicaCatalog;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, encoded_digest) catch return error.InvalidReplicaCatalog;
+    return .{ .record_count = record_count, .digest = digest };
 }
 
 pub const ReplicaBootstrapMode = enum {
@@ -235,6 +275,7 @@ pub fn eqlReplicaRecord(left: ReplicaRecord, right: ReplicaRecord) bool {
     if (left.backup_restore_bootstrap) |backup| {
         const other = right.backup_restore_bootstrap.?;
         if (!std.mem.eql(u8, backup.backup_id, other.backup_id)) return false;
+        if (!std.mem.eql(u8, backup.artifact_backup_id, other.artifact_backup_id)) return false;
         if (!std.mem.eql(u8, backup.location, other.location)) return false;
         if (!std.mem.eql(u8, backup.snapshot_path, other.snapshot_path)) return false;
         if (!std.mem.eql(u8, backup.connection, other.connection)) return false;
@@ -567,9 +608,10 @@ pub const FileReplicaCatalog = struct {
             else => return err,
         };
         defer file.close(self.io());
+        const file_stat = try file.stat(self.io());
+        if (file_stat.size > max_replica_catalog_bytes)
+            return error.ReplicaCatalogTooLarge;
 
-        // Total catalog size is unbounded by design, but each independently
-        // parsed record has the same limit enforced by persistence.
         var read_buffer: [max_replica_catalog_record_bytes + 1]u8 = undefined;
         var reader = file.reader(self.io(), &read_buffer);
         const header = (reader.interface.takeDelimiter('\n') catch |err| switch (err) {
@@ -579,13 +621,32 @@ pub const FileReplicaCatalog = struct {
         if (!std.mem.eql(u8, header, replica_catalog_header))
             return error.InvalidReplicaCatalog;
 
+        var hasher = Sha256.init(.{});
+        hasher.update(replica_catalog_digest_domain);
+        var record_count: usize = 0;
+        var footer_seen = false;
         while ((reader.interface.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => return error.ReplicaCatalogRecordTooLarge,
             else => return err,
         })) |line| {
-            if (line.len == 0) continue;
+            if (footer_seen or line.len == 0) return error.InvalidReplicaCatalog;
+            if (std.mem.startsWith(u8, line, replica_catalog_footer_prefix)) {
+                const footer = try parseCatalogFooter(line);
+                if (footer.record_count != record_count) return error.InvalidReplicaCatalog;
+                const actual_digest = finalizeCatalogDigest(&hasher, record_count);
+                if (!std.crypto.timing_safe.eql(
+                    [Sha256.digest_length]u8,
+                    actual_digest,
+                    footer.digest,
+                )) return error.InvalidReplicaCatalogChecksum;
+                footer_seen = true;
+                continue;
+            }
             if (line.len > max_replica_catalog_record_bytes)
                 return error.ReplicaCatalogRecordTooLarge;
+            if (record_count >= max_replica_catalog_records)
+                return error.ReplicaCatalogTooLarge;
+            updateCatalogDigest(&hasher, line);
             var parsed = std.json.parseFromSlice(ReplicaRecord, self.alloc, line, .{
                 .allocate = .alloc_always,
             }) catch return error.InvalidReplicaCatalog;
@@ -596,7 +657,9 @@ pub const FileReplicaCatalog = struct {
             if (self.records.contains(record.group_id))
                 return error.InvalidReplicaCatalog;
             try self.records.put(self.alloc, record.group_id, record);
+            record_count += 1;
         }
+        if (!footer_seen) return error.InvalidReplicaCatalog;
     }
 
     fn persist(self: *FileReplicaCatalog) !void {
@@ -711,6 +774,7 @@ fn writeCatalogAtomicallyDurable(
     path: []const u8,
     records: []const *const ReplicaRecord,
 ) !void {
+    if (records.len > max_replica_catalog_records) return error.ReplicaCatalogTooLarge;
     // A process-local counter can collide with a temp file left by a crash
     // after restart. A 128-bit random suffix keeps stale files harmless while
     // exclusive creation still protects against an unexpected collision.
@@ -745,6 +809,9 @@ fn writeCatalogAtomicallyDurable(
             var writer = file.writer(io, &buf);
             try writer.interface.writeAll(replica_catalog_header);
             try writer.interface.writeByte('\n');
+            var catalog_bytes: usize = replica_catalog_header.len + 1;
+            var hasher = Sha256.init(.{});
+            hasher.update(replica_catalog_digest_domain);
             var record_buffer: [max_replica_catalog_record_bytes]u8 = undefined;
             for (records) |record| {
                 try validateReplicaRecord(record.*);
@@ -752,9 +819,27 @@ fn writeCatalogAtomicallyDurable(
                 std.json.Stringify.value(record.*, .{}, &record_writer) catch |err| switch (err) {
                     error.WriteFailed => return error.ReplicaCatalogRecordTooLarge,
                 };
-                try writer.interface.writeAll(record_writer.buffered());
+                const encoded_record = record_writer.buffered();
+                catalog_bytes = std.math.add(usize, catalog_bytes, encoded_record.len + 1) catch
+                    return error.ReplicaCatalogTooLarge;
+                if (catalog_bytes > max_replica_catalog_bytes) return error.ReplicaCatalogTooLarge;
+                updateCatalogDigest(&hasher, encoded_record);
+                try writer.interface.writeAll(encoded_record);
                 try writer.interface.writeByte('\n');
             }
+            const digest = finalizeCatalogDigest(&hasher, records.len);
+            const digest_hex = std.fmt.bytesToHex(digest, .lower);
+            var footer_buffer: [replica_catalog_footer_prefix.len + 32 + 1 + Sha256.digest_length * 2]u8 = undefined;
+            const footer = std.fmt.bufPrint(
+                &footer_buffer,
+                "{s}{d} {s}",
+                .{ replica_catalog_footer_prefix, records.len, &digest_hex },
+            ) catch return error.ReplicaCatalogTooLarge;
+            catalog_bytes = std.math.add(usize, catalog_bytes, footer.len + 1) catch
+                return error.ReplicaCatalogTooLarge;
+            if (catalog_bytes > max_replica_catalog_bytes) return error.ReplicaCatalogTooLarge;
+            try writer.interface.writeAll(footer);
+            try writer.interface.writeByte('\n');
             try writer.end();
             try file.sync(io);
         }
@@ -836,6 +921,52 @@ test "replica catalog rejects invalid backup restore authority and integrity bin
     const records = try iface.listReplicas(std.testing.allocator);
     defer freeReplicaRecords(std.testing.allocator, records);
     try std.testing.expectEqual(@as(usize, 0), records.len);
+}
+
+test "replica catalog persists artifact authority-only updates" {
+    var replica_catalog = MemoryReplicaCatalog.init(std.testing.allocator);
+    defer replica_catalog.deinit();
+    const iface = replica_catalog.catalog();
+    const hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    try iface.upsertReplica(.{
+        .group_id = 11,
+        .replica_id = 1,
+        .local_node_id = 3,
+        .backup_restore_bootstrap = .{
+            .backup_id = "logical-backup",
+            .artifact_backup_id = "artifact-v1",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "logical-backup/groups/11",
+            .connection = "backup-store",
+            .artifact_size_bytes = 1,
+            .artifact_sha256 = hash,
+        },
+    });
+    const first_revision = iface.revision();
+    try iface.upsertReplica(.{
+        .group_id = 11,
+        .replica_id = 1,
+        .local_node_id = 3,
+        .backup_restore_bootstrap = .{
+            .backup_id = "logical-backup",
+            .artifact_backup_id = "artifact-v2",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "logical-backup/groups/11",
+            .connection = "backup-store",
+            .artifact_size_bytes = 1,
+            .artifact_sha256 = hash,
+        },
+    });
+
+    try std.testing.expect(iface.revision() > first_revision);
+    const records = try iface.listReplicas(std.testing.allocator);
+    defer freeReplicaRecords(std.testing.allocator, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqualStrings(
+        "artifact-v2",
+        records[0].backup_restore_bootstrap.?.artifact_backup_id,
+    );
 }
 
 test "memory replica catalog stores and lists records" {
@@ -1043,16 +1174,67 @@ test "file replica catalog rejects duplicate groups without leaking loaded recor
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-duplicate", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
+    const first = ReplicaRecord{
+        .group_id = 21,
+        .replica_id = 2,
+        .local_node_id = 5,
+        .bootstrap_mode = .persisted,
+        .metadata_version = 9,
+    };
+    const second = ReplicaRecord{
+        .group_id = 21,
+        .replica_id = 3,
+        .local_node_id = 5,
+        .bootstrap_mode = .persisted,
+        .metadata_version = 10,
+    };
+    const records = [_]*const ReplicaRecord{ &first, &second };
+    try writeCatalogAtomicallyDurable(std.testing.allocator, std.testing.io, path, &records);
+
+    try std.testing.expectError(
+        error.InvalidReplicaCatalog,
+        FileReplicaCatalog.init(std.testing.allocator, path),
+    );
+}
+
+test "file replica catalog rejects checksum mismatch and missing footer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-integrity", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const record = ReplicaRecord{
+        .group_id = 31,
+        .replica_id = 2,
+        .local_node_id = 5,
+        .bootstrap_mode = .persisted,
+        .metadata_version = 9,
+    };
+    const records = [_]*const ReplicaRecord{&record};
+    try writeCatalogAtomicallyDurable(std.testing.allocator, std.testing.io, path, &records);
+
+    var encoded = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        std.testing.allocator,
+        .limited(max_replica_catalog_bytes),
+    );
+    defer std.testing.allocator.free(encoded);
+    const replica_id = std.mem.indexOf(u8, encoded, "\"replica_id\":2") orelse
+        return error.TestUnexpectedResult;
+    encoded[replica_id + "\"replica_id\":".len] = '3';
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = encoded });
+    try std.testing.expectError(
+        error.InvalidReplicaCatalogChecksum,
+        FileReplicaCatalog.init(std.testing.allocator, path),
+    );
+
+    const footer = std.mem.indexOf(u8, encoded, replica_catalog_footer_prefix) orelse
+        return error.TestUnexpectedResult;
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = path,
-        .data =
-        \\ANTFLY_REPLICA_CATALOG 1
-        \\{"group_id":21,"replica_id":2,"local_node_id":5,"bootstrap_mode":"persisted","metadata_version":9,"snapshot_bootstrap":null,"backup_restore_bootstrap":null}
-        \\{"group_id":21,"replica_id":3,"local_node_id":5,"bootstrap_mode":"persisted","metadata_version":10,"snapshot_bootstrap":null,"backup_restore_bootstrap":null}
-        \\
-        ,
+        .data = encoded[0..footer],
     });
-
     try std.testing.expectError(
         error.InvalidReplicaCatalog,
         FileReplicaCatalog.init(std.testing.allocator, path),

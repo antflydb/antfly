@@ -46,6 +46,8 @@ test "lsm backend module tests are reachable" {
     const std = @import("std");
     std.testing.refAllDecls(impl);
     std.testing.refAllDecls(cache);
+    std.testing.refAllDecls(repository);
+    std.testing.refAllDecls(compaction);
     std.testing.refAllDecls(storage_io);
     std.testing.refAllDecls(wal);
     std.testing.refAllDecls(background);

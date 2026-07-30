@@ -2014,6 +2014,8 @@ components:
         max_depth:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 64
           description: "Maximum traversal depth"
         min_weight:
           x-go-type-skip-optional-pointer: true
@@ -2028,6 +2030,8 @@ components:
         max_results:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 10000
           description: "Maximum number of results (traversal)"
         deduplicate_nodes:
           x-go-type-skip-optional-pointer: true
@@ -2042,6 +2046,8 @@ components:
         k:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 100
           description: "Number of paths to find (k-shortest-paths)"
         node_filter:
           $ref: "#/components/schemas/NodeFilter"
@@ -2066,6 +2072,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Document key"
+        table:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Owning table for a cross-table node; omitted for nodes in the queried table"
         depth:
           x-go-type-skip-optional-pointer: true
           type: integer

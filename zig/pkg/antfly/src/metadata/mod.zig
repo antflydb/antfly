@@ -86,6 +86,7 @@ pub const ReconcileLeaseRecord = reconcile_lease.ReconcileLeaseRecord;
 pub const ReconcileLeaseState = reconcile_lease.State;
 pub const ReconcileLeaseStats = reconcile_lease.Stats;
 pub const ReallocationRequestRecord = reallocation_request.ReallocationRequestRecord;
+pub const isValidReallocationRequest = reallocation_request.isValid;
 pub const applyStoreObservation = store_observer.applyObservation;
 pub const applyStoreObservations = store_observer.applyObservations;
 pub const classifyStore = store_observer.classifyStore;

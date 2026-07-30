@@ -895,6 +895,12 @@ pub const ReplicationSourceStatusRecord = struct {
     /// identity. This deliberately excludes connection credentials.
     cutover_provider_identity: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
         [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+    /// Provider resources from the authority superseded by the current claim.
+    /// They remain durable until inactive cleanup succeeds; a newer claim is
+    /// not admitted while this retirement is pending.
+    retired_cutover_authority_id: u64 = 0,
+    retired_slot_name: []const u8 = "",
+    retired_publication_name: []const u8 = "",
     updated_at_ms: u64 = 0,
 };
 
@@ -1849,6 +1855,10 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
     errdefer alloc.free(last_error);
     const failure_class = try alloc.dupe(u8, record.failure_class);
     errdefer alloc.free(failure_class);
+    const retired_slot_name = try alloc.dupe(u8, record.retired_slot_name);
+    errdefer alloc.free(retired_slot_name);
+    const retired_publication_name = try alloc.dupe(u8, record.retired_publication_name);
+    errdefer alloc.free(retired_publication_name);
     return .{
         .table_id = record.table_id,
         .source_ordinal = record.source_ordinal,
@@ -1874,6 +1884,9 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
         .cutover_authority_id = record.cutover_authority_id,
         .cutover_config_fingerprint = record.cutover_config_fingerprint,
         .cutover_provider_identity = record.cutover_provider_identity,
+        .retired_cutover_authority_id = record.retired_cutover_authority_id,
+        .retired_slot_name = retired_slot_name,
+        .retired_publication_name = retired_publication_name,
         .updated_at_ms = record.updated_at_ms,
     };
 }
@@ -1890,6 +1903,8 @@ pub fn freeReplicationSourceStatus(alloc: std.mem.Allocator, record: Replication
     alloc.free(record.stream_checkpoint);
     alloc.free(record.last_error);
     alloc.free(record.failure_class);
+    alloc.free(record.retired_slot_name);
+    alloc.free(record.retired_publication_name);
 }
 
 pub fn cloneShuffleJoinLease(_: std.mem.Allocator, record: ShuffleJoinLeaseRecord) !ShuffleJoinLeaseRecord {

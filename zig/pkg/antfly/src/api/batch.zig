@@ -502,7 +502,7 @@ fn parseTransformOps(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
     const ops = try alloc.alloc(db_mod.types.TransformOp, values.len);
     var initialized: usize = 0;
     errdefer {
-        freeTransformOps(alloc, ops[0..initialized]);
+        freeTransformOpElements(alloc, ops[0..initialized]);
         alloc.free(ops);
     }
 
@@ -512,16 +512,21 @@ fn parseTransformOps(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
         if (op_value != .string) return error.InvalidBatchRequest;
         const path_value = item.object.get("path") orelse return error.InvalidBatchRequest;
         if (path_value != .string) return error.InvalidBatchRequest;
+        const op = try transformOpTypeFromString(op_value.string);
         const value_json = if (item.object.get("value")) |raw| try std.json.Stringify.valueAlloc(alloc, raw, .{}) else null;
         errdefer if (value_json) |json| alloc.free(json);
-        const op = try transformOpTypeFromString(op_value.string);
         const path = try alloc.dupe(u8, path_value.string);
         errdefer alloc.free(path);
-        ops[initialized] = .{
+        const parsed_op: db_mod.types.TransformOp = .{
             .op = op,
             .path = path,
             .value_json = value_json,
         };
+        db_mod.transform.validateDocumentTransform(alloc, .{
+            .key = "",
+            .operations = @constCast((&[_]db_mod.types.TransformOp{parsed_op})[0..]),
+        }) catch return error.InvalidBatchRequest;
+        ops[initialized] = parsed_op;
         initialized += 1;
     }
     return ops;
@@ -530,20 +535,10 @@ fn parseTransformOps(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
 fn transformOpTypeFromString(op: []const u8) !db_mod.types.TransformOpType {
     if (std.mem.eql(u8, op, "$set")) return .set;
     if (std.mem.eql(u8, op, "$setOnInsert")) return .set_on_insert;
-    if (std.mem.eql(u8, op, "$set_on_insert")) return .set_on_insert;
     if (std.mem.eql(u8, op, "$unset")) return .unset;
     if (std.mem.eql(u8, op, "$inc")) return .inc;
-    if (std.mem.eql(u8, op, "$push")) return .push;
-    if (std.mem.eql(u8, op, "$pull")) return .pull;
     if (std.mem.eql(u8, op, "$addToSet")) return .add_to_set;
-    if (std.mem.eql(u8, op, "$add_to_set")) return .add_to_set;
-    if (std.mem.eql(u8, op, "$pop")) return .pop;
-    if (std.mem.eql(u8, op, "$mul")) return .mul;
-    if (std.mem.eql(u8, op, "$min")) return .min;
     if (std.mem.eql(u8, op, "$max")) return .max;
-    if (std.mem.eql(u8, op, "$currentDate")) return .current_date;
-    if (std.mem.eql(u8, op, "$current_date")) return .current_date;
-    if (std.mem.eql(u8, op, "$rename")) return .rename;
     return error.InvalidBatchRequest;
 }
 
@@ -579,11 +574,15 @@ fn freeTransforms(alloc: std.mem.Allocator, transforms: []db_mod.types.DocumentT
 }
 
 fn freeTransformOps(alloc: std.mem.Allocator, ops: []const db_mod.types.TransformOp) void {
+    freeTransformOpElements(alloc, ops);
+    if (ops.len > 0) alloc.free(@constCast(ops));
+}
+
+fn freeTransformOpElements(alloc: std.mem.Allocator, ops: []const db_mod.types.TransformOp) void {
     for (ops) |op| {
         alloc.free(@constCast(op.path));
         if (op.value_json) |value_json| alloc.free(@constCast(value_json));
     }
-    if (ops.len > 0) alloc.free(@constCast(ops));
 }
 
 test "batch parser accepts inserts and deletes" {
@@ -767,15 +766,51 @@ test "batch parser accepts transforms" {
     try std.testing.expectEqualStrings("version", owned.transforms[0].operations[0].path);
 }
 
-test "batch parser accepts Go transform op spelling" {
+test "batch parser accepts supported Go transform op spelling" {
     var owned = try parseBatchRequest(std.testing.allocator,
-        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$addToSet","path":"tags","value":"zig"},{"op":"$currentDate","path":"updated_at"}]}]}
+        \\{"transforms":[{"key":"doc:a","operations":[{"op":"$addToSet","path":"tags","value":"zig"},{"op":"$setOnInsert","path":"created_at","value":"now"}]}]}
     );
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), owned.transforms.len);
     try std.testing.expectEqual(@as(usize, 2), owned.transforms[0].operations.len);
     try std.testing.expectEqual(db_mod.types.TransformOpType.add_to_set, owned.transforms[0].operations[0].op);
-    try std.testing.expectEqual(db_mod.types.TransformOpType.current_date, owned.transforms[0].operations[1].op);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set_on_insert, owned.transforms[0].operations[1].op);
+}
+
+test "batch parser rejects every recognized but unsupported transform operator" {
+    const unsupported = [_][]const u8{
+        "$push",
+        "$pull",
+        "$pop",
+        "$mul",
+        "$min",
+        "$currentDate",
+        "$rename",
+    };
+    for (unsupported) |op| {
+        const body = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"transforms\":[{{\"key\":\"doc:missing\",\"operations\":[{{\"op\":\"{s}\",\"path\":\"field\",\"value\":1}}]}}]}}",
+            .{op},
+        );
+        defer std.testing.allocator.free(body);
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            parseBatchRequest(std.testing.allocator, body),
+        );
+    }
+}
+
+test "batch parser safely rejects unsupported transform after initialized operations" {
+    const body =
+        \\{"transforms":[{"key":"doc:missing","operations":[{"op":"$set","path":"ready","value":true},{"op":"$push","path":"items","value":1}]}]}
+    ;
+    for (0..32) |_| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            parseBatchRequest(std.testing.allocator, body),
+        );
+    }
 }
 
 test "batch parser preserves packed embeddings for mapper extraction" {

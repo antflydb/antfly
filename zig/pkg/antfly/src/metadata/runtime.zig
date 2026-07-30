@@ -53,12 +53,12 @@ fn metadataWalReplicaStateConfig() antfly.raft.storage.WalReplicaStateConfig {
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
+    experimental: bool = false,
     raft_host: ?[]const u8 = null,
     raft_port: ?u16 = null,
     api_host: ?[]const u8 = null,
     api_port: ?u16 = null,
     cluster_json: ?[]const u8 = null,
-    join: bool = false,
     health_enabled: ?bool = null,
     health_port: ?u16 = null,
     raft_tick_ms: u64 = antfly.raft.RuntimeCadence.default_raft_tick_ms,
@@ -871,7 +871,6 @@ pub fn runFromIterator(
     const metadata_group_id = group_ids.main_metadata_group_id;
     const cluster_peers = try resolveMetadataClusterPeers(alloc, cli.cluster_json, if (loaded_config) |*cfg| cfg else null);
     defer freeMetadataClusterPeers(alloc, cluster_peers);
-    if (cli.join) return error.UnsupportedMetadataJoin;
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
 
@@ -890,6 +889,7 @@ pub fn runFromIterator(
         .secret_store = if (secret_store_initialized) &secret_store else null,
         .api_server_cfg = .{
             .auth_enabled = effective_auth_enabled,
+            .experimental = cli.experimental,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
             .user_manager = if (user_manager) |*manager| manager else null,
@@ -982,6 +982,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.help = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--experimental")) {
+            cfg.experimental = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--config")) {
             cfg.config_path = args.next() orelse return error.InvalidArguments;
             continue;
@@ -1008,10 +1012,6 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--cluster")) {
             cfg.cluster_json = args.next() orelse return error.InvalidArguments;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--join")) {
-            cfg.join = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--health-port")) {
@@ -1393,9 +1393,9 @@ fn printUsage(argv0: []const u8) void {
         \\  --api-host <host>              Metadata admin API bind host (default: raft host)
         \\  --api-port <port>              Metadata admin API bind port (default: 0)
         \\  --cluster <json>               Metadata raft peer URLs, e.g. {{"1":"http://127.0.0.1:9017"}}
-        \\  --join                         Join an existing metadata cluster (not yet supported)
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
+        \\  --experimental                 Enable experimental A2A protocol surfaces
         \\  --raft-tick-ms <ms>            Consensus progress interval, 1-1000 (default: 100)
         \\  --control-tick-ms <ms>         Control scheduling interval, 1-60000 (default: 100)
         \\  --data-dir <path>              Local storage root for metadata data
@@ -1520,6 +1520,14 @@ test "metadata runtime cli accepts auth flag" {
     try std.testing.expectEqual(true, cfg.auth_enabled.?);
 }
 
+test "metadata runtime cli accepts experimental flag" {
+    var argv = [_][*:0]const u8{"--experimental"};
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.experimental);
+}
+
 test "metadata runtime preserves trusted principal auth material bytes" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1535,7 +1543,6 @@ test "metadata runtime preserves trusted principal auth material bytes" {
     defer stored_secret.deinit(alloc);
     var stored_issuer = try secret_store.put(alloc, trusted_principal_issuer_key, "\ttrusted-upstream ");
     defer stored_issuer.deinit(alloc);
-
     const secret = try resolveTrustedPrincipalSecret(alloc, &secret_store);
     defer if (secret) |value| alloc.free(value);
     const issuer = try resolveTrustedPrincipalIssuer(alloc, &secret_store);

@@ -1260,10 +1260,43 @@ pub const SearchRequest = struct {
     resolved_text_doc_filter: ?*const anyopaque = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
+    /// Request-local authorization hook used only by the distributed graph
+    /// coordinator when an edge names a document in another table. The hook is
+    /// never serialized to a shard worker; it resolves the target table to a
+    /// trusted internal row predicate before owner-routed admission.
+    graph_table_read_authorizer: ?GraphTableReadAuthorizer = null,
     identity_read_generation: ?u64 = null,
     execution_deadline_ns: ?u64 = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+};
+
+pub const GraphTableReadAuthorization = struct {
+    allowed: bool,
+    /// Owned by this value when non-null.
+    filter_query_json: ?[]u8 = null,
+
+    pub fn deinit(self: *GraphTableReadAuthorization, alloc: std.mem.Allocator) void {
+        if (self.filter_query_json) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const GraphTableReadAuthorizer = struct {
+    ctx: ?*const anyopaque,
+    authorize_table: *const fn (
+        ctx: ?*const anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) anyerror!GraphTableReadAuthorization,
+
+    pub fn authorize(
+        self: GraphTableReadAuthorizer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !GraphTableReadAuthorization {
+        return try self.authorize_table(self.ctx, alloc, table_name);
+    }
 };
 
 pub const SortField = struct {
@@ -1325,6 +1358,9 @@ pub const MergeConfig = struct {
 
 pub const SearchHit = struct {
     id: []u8,
+    /// Internal graph-hydration namespace. Null means the query's source
+    /// table. This is not serialized as part of the public search-hit shape.
+    source_table: ?[]u8 = null,
     doc_ordinal: ?u32 = null,
     native_text_doc_id: ?u32 = null,
     score: ?f32 = null,
@@ -1337,21 +1373,10 @@ pub const SearchHit = struct {
     chunk_hits: []ChunkHit = &.{},
 
     pub fn clone(self: SearchHit, alloc: Allocator) !SearchHit {
-        var cloned = SearchHit{
-            .id = try alloc.dupe(u8, self.id),
-            .doc_ordinal = self.doc_ordinal,
-            .native_text_doc_id = self.native_text_doc_id,
-            .score = self.score,
-            .index_scores = try cloneIndexScores(alloc, self.index_scores),
-            .sort_values = try cloneJsonValues(alloc, self.sort_values),
-            .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
-            .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
-            .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
-            .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
-            .chunk_hits = &.{},
-        };
+        var cloned = SearchHit{ .id = try alloc.dupe(u8, self.id) };
         errdefer {
             alloc.free(cloned.id);
+            if (cloned.source_table) |table| alloc.free(table);
             freeIndexScores(alloc, cloned.index_scores);
             freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
@@ -1359,24 +1384,36 @@ pub const SearchHit = struct {
             if (cloned.ancestor_unit_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         }
+        cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
+        cloned.doc_ordinal = self.doc_ordinal;
+        cloned.native_text_doc_id = self.native_text_doc_id;
+        cloned.score = self.score;
+        cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
+        cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
+        cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
 
         if (self.chunk_hits.len == 0) return cloned;
 
-        cloned.chunk_hits = try alloc.alloc(ChunkHit, self.chunk_hits.len);
+        const chunk_hits = try alloc.alloc(ChunkHit, self.chunk_hits.len);
         var initialized: usize = 0;
         errdefer {
-            for (cloned.chunk_hits[0..initialized]) |*chunk| chunk.deinit(alloc);
-            alloc.free(cloned.chunk_hits);
+            for (chunk_hits[0..initialized]) |*chunk| chunk.deinit(alloc);
+            alloc.free(chunk_hits);
         }
         for (self.chunk_hits, 0..) |chunk, i| {
-            cloned.chunk_hits[i] = try chunk.clone(alloc);
+            chunk_hits[i] = try chunk.clone(alloc);
             initialized += 1;
         }
+        cloned.chunk_hits = chunk_hits;
         return cloned;
     }
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.source_table) |table| alloc.free(table);
         freeIndexScores(alloc, self.index_scores);
         freeJsonValues(alloc, self.sort_values);
         if (self.stored_data) |data| alloc.free(data);

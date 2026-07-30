@@ -9,11 +9,22 @@ from httpx import Timeout
 from antfly import AntflyClient, AntflyException  # noqa: E402
 from antfly.client import normalize_base_url  # noqa: E402
 from antfly.client_generated.models.sort_profile import SortProfile  # noqa: E402
+from antfly.client_generated.models.transform_op_type import TransformOpType  # noqa: E402
 from antfly.client_generated.types import Unset  # noqa: E402
 
 
 class TestAntflyClient:
     """Test cases for AntflyClient."""
+
+    def test_transform_operator_names_are_stable(self) -> None:
+        assert {member.name: member.value for member in TransformOpType} == {
+            "SET": "$set",
+            "SET_ON_INSERT": "$setOnInsert",
+            "UNSET": "$unset",
+            "INC": "$inc",
+            "ADD_TO_SET": "$addToSet",
+            "MAX": "$max",
+        }
 
     def test_sort_profile_uses_closed_public_diagnostic_shape(self) -> None:
         """SortProfile keeps stable fields typed and drops internal counters."""

@@ -280,7 +280,7 @@ pub const MetadataState = struct {
                 .stores = self.committed_stores.items,
                 .merged_group_statuses = merged_group_statuses,
                 .restore_progresses = restore_progresses,
-                .reallocate_requested = projected_reallocation_request != null,
+                .reallocation_request = projected_reallocation_request,
                 .schema_progresses = schema_progresses,
                 .split_transitions = self.committed_splits.items,
                 .merge_transitions = self.committed_merges.items,
@@ -1284,6 +1284,44 @@ test "metadata state seeds active projected transitions after authority handoff"
     try std.testing.expectEqual(@as(u64, 7001), splits[0].transition_id);
     try std.testing.expectEqual(@as(u64, 4), splits[0].attempt_epoch);
     try std.testing.expectEqualStrings("doc:m", splits[0].split_key.?);
+}
+
+test "metadata state folds finalized split before projected topology catches up" {
+    var state = MetadataState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.projected.upsertTable(.{ .table_id = 7, .name = "docs" });
+    try state.projected.upsertRange(.{
+        .group_id = 71,
+        .table_id = 7,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+        .split_attempt_epoch = 4,
+    });
+    try state.committed_splits.append(std.testing.allocator, try cloneSplitRecord(std.testing.allocator, .{
+        .transition_id = 7001,
+        .attempt_epoch = 4,
+        .source_group_id = 71,
+        .destination_group_id = 72,
+        .phase = .finalized,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+        .table_contract = .{
+            .table_id = 7,
+            .table_name = "docs",
+            .indexes_json = "{}",
+            .source_identity = .{ .shard_id = 71, .range_id = 71 },
+            .target_identity = .{ .shard_id = 71, .range_id = 71 },
+        },
+    }));
+
+    try state.seedDesiredFromProjected();
+    const ranges = try state.desired.listRanges(std.testing.allocator);
+    defer state.desired.freeRanges(std.testing.allocator, ranges);
+    try std.testing.expectEqual(@as(usize, 2), ranges.len);
+    const splits = try state.desired.listDesiredSplitTransitions(std.testing.allocator);
+    defer state.desired.freeSplitTransitions(std.testing.allocator, splits);
+    try std.testing.expectEqual(@as(usize, 0), splits.len);
 }
 
 test "metadata state skips orphan projected ranges during projected sync" {

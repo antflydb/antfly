@@ -3064,12 +3064,19 @@ pub const Backend = struct {
 
         const max_steps = @max(@as(usize, 1), self.options.background_maintenance_max_steps);
         var steps: usize = 0;
+        var made_progress = false;
         while (steps < max_steps and !self.closing.load(.acquire)) : (steps += 1) {
             const progressed = try self.runMaintenanceStep();
             if (!progressed) break;
+            made_progress = true;
         }
 
-        self.clearMaintenanceJobInFlight(true);
+        // A positive maintenance score is only a hint: overlap or level
+        // pressure can remain non-zero when no valid compaction plan exists.
+        // Do not immediately resubmit that same no-op job forever. A later
+        // write, flush, or a job that actually made progress will schedule the
+        // next pass.
+        self.clearMaintenanceJobInFlight(made_progress);
     }
 
     fn clearMaintenanceJobInFlight(self: *Backend, maybe_reschedule: bool) void {
@@ -4882,6 +4889,7 @@ pub const Backend = struct {
             if (self.active_bulk_ingest_batches == 0 and self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
                 try self.persistManifest();
             }
+            self.scheduleMaintenanceAfterBulkIngestLocked();
             return;
         }
         self.active_bulk_ingest_batches -= 1;
@@ -4892,6 +4900,13 @@ pub const Backend = struct {
                 }
             }
             try self.finalizeDeferredRunWork(.{ .force_soft_compaction = options.compact });
+            self.scheduleMaintenanceAfterBulkIngestLocked();
+        }
+    }
+
+    fn scheduleMaintenanceAfterBulkIngestLocked(self: *Backend) void {
+        if (self.active_bulk_ingest_batches == 0) {
+            self.scheduleMaintenanceJobIfNeededLocked();
         }
     }
 
@@ -4910,6 +4925,7 @@ pub const Backend = struct {
     fn abortBulkIngestSessionLocked(self: *Backend) void {
         std.debug.assert(self.active_bulk_ingest_batches > 0);
         self.active_bulk_ingest_batches -= 1;
+        self.scheduleMaintenanceAfterBulkIngestLocked();
     }
 
     pub fn markManifestDirty(self: *Backend) void {
@@ -7112,6 +7128,103 @@ test "lsm backend detached maintenance jobs reschedule while debt remains" {
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
 }
 
+test "lsm backend detached no-op maintenance does not resubmit forever" {
+    const FakeLane = struct {
+        submitted_job: ?background_runtime_mod.Job = null,
+        submitted_count: usize = 0,
+
+        fn lane(self: *@This()) background_runtime_mod.DurableJobLane {
+            return .{
+                .ptr = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.submitted_job == null);
+            self.submitted_job = job;
+            self.submitted_count += 1;
+        }
+
+        fn drainOwner(_: *anyopaque, _: u64) void {}
+
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+
+        const vtable = background_runtime_mod.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drainOwner,
+            .close_owner = drainOwner,
+            .poll = poll,
+        };
+    };
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var lane = FakeLane{};
+    const executor = BackgroundExecutor.initLane(lane.lane(), 784);
+    var backend = try Backend.open(std.testing.allocator, "/lsm-background-maintenance-no-op-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .background_executor = &executor,
+    });
+    defer backend.close();
+
+    for (0..2) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "key:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, key, "value");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), lane.submitted_count);
+
+    // The job was admitted while work was possible, but a bulk session makes
+    // the actual pass a no-op. It must not busy-resubmit itself.
+    try backend.beginBulkIngestSession();
+    var job = lane.submitted_job.?;
+    lane.submitted_job = null;
+    try job.run(job.ptr);
+    job.deinit(job.ptr);
+
+    try std.testing.expect(backend.maintenanceScore() > 0);
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job == null);
+    try std.testing.expectEqual(@as(usize, 1), lane.submitted_count);
+
+    // Ending the transient blocker must give existing debt exactly one fresh
+    // opportunity to run. If the hint is still non-actionable, that job stops
+    // without recreating the original loop.
+    backend.abortBulkIngestSession();
+    try std.testing.expect(backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job != null);
+    try std.testing.expectEqual(@as(usize, 2), lane.submitted_count);
+    try backend.beginBulkIngestSession();
+    var retry_after_abort = lane.submitted_job.?;
+    lane.submitted_job = null;
+    try retry_after_abort.run(retry_after_abort.ptr);
+    retry_after_abort.deinit(retry_after_abort.ptr);
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job == null);
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = false });
+    try std.testing.expect(backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job != null);
+    try std.testing.expectEqual(@as(usize, 3), lane.submitted_count);
+    var retry_after_finish = lane.submitted_job.?;
+    lane.submitted_job = null;
+    try retry_after_finish.run(retry_after_finish.ptr);
+    retry_after_finish.deinit(retry_after_finish.ptr);
+    try std.testing.expect(!backend.maintenance_job_in_flight);
+    try std.testing.expect(lane.submitted_job == null);
+}
+
 test "lsm backends share one threaded runtime durable lane" {
     if (builtin.os.tag == .freestanding) return;
 
@@ -9005,7 +9118,7 @@ test "lsm backend persisted compaction streams run blocks without full run loads
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.isSourceRunPath(path)) self.source_trailer_reads += 1;
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
@@ -10073,7 +10186,7 @@ test "lsm backend shared cache owns loaded table allocations" {
             return self.backing.storage().readFileRangeAlloc(allocator, path, offset, len);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (std.mem.eql(u8, path, self.run_path)) try self.expectCacheAllocator(allocator);
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);
@@ -10594,7 +10707,7 @@ test "lsm backend avoids full run table load on bloom negative" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -10780,7 +10893,7 @@ test "lsm backend no-cache point reads reuse local index and block cache" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -10952,7 +11065,7 @@ test "lsm backend multi-block point read skips directly to one candidate block" 
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -11138,7 +11251,7 @@ test "lsm backend cached cursor scan avoids whole-run table reads" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -11656,7 +11769,7 @@ test "lsm backend block filter avoids candidate block read on run-bloom false po
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.run_path) |run_path| {
                 if (std.mem.eql(u8, path, run_path)) self.run_trailer_reads += 1;
@@ -13536,7 +13649,7 @@ test "lsm repository loads v4 table index from trailer plus metadata read" {
             return self.backing.storage().fileSize(path);
         }
 
-        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
+        fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (std.mem.eql(u8, path, self.run_path)) self.run_trailer_reads += 1;
             return self.backing.storage().readFileTrailerAlloc(allocator, path, len);

@@ -4287,7 +4287,7 @@ export interface components {
          * @description MongoDB-style update operator
          * @enum {string}
          */
-        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$push" | "$pull" | "$addToSet" | "$pop" | "$mul" | "$min" | "$max" | "$currentDate" | "$rename";
+        TransformOpType: "$set" | "$setOnInsert" | "$unset" | "$inc" | "$addToSet" | "$max";
         TransformOp: {
             op: components["schemas"]["TransformOpType"];
             /**
@@ -4295,7 +4295,7 @@ export interface components {
              * @example $.views
              */
             path: string;
-            /** @description Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.) */
+            /** @description Value for operation (not required for $unset). Type depends on the supported operator. */
             value?: unknown;
         };
         /**
@@ -4314,8 +4314,9 @@ export interface components {
          *           "value": 1
          *         },
          *         {
-         *           "op": "$currentDate",
-         *           "path": "$.lastViewed"
+         *           "op": "$set",
+         *           "path": "$.lastViewed",
+         *           "value": "2026-07-28T12:00:00Z"
          *         }
          *       ]
          *     }
@@ -4503,12 +4504,12 @@ export interface components {
              *     Transform operations allow you to modify documents without read-modify-write races:
              *     - Operations are applied atomically on the server
              *     - Multiple operations per document are applied in sequence
-             *     - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more
+             *     - Supports numeric and set-like operations ($inc, $max, $addToSet)
              *
              *     Common use cases:
              *     - Increment counters (views, likes, votes)
-             *     - Update timestamps ($currentDate)
-             *     - Manage arrays (add/remove tags, items)
+             *     - Update timestamps ($set)
+             *     - Add unique array values ($addToSet)
              *     - Update nested fields without overwriting the entire document
              * @example [
              *       {
@@ -4520,8 +4521,9 @@ export interface components {
              *             "value": 1
              *           },
              *           {
-             *             "op": "$currentDate",
-             *             "path": "$.lastViewed"
+             *             "op": "$set",
+             *             "path": "$.lastViewed",
+             *             "value": "2026-07-28T12:00:00Z"
              *           }
              *         ]
              *       },
@@ -4529,7 +4531,7 @@ export interface components {
              *         "key": "user:456",
              *         "operations": [
              *           {
-             *             "op": "$push",
+             *             "op": "$addToSet",
              *             "path": "$.tags",
              *             "value": "vip"
              *           }
@@ -5494,6 +5496,10 @@ export interface components {
          *
          *     **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
          *     call, using the queries to determine available tables and indexes.
+         *
+         *     Authenticated row filters are enforced on every initial and generated
+         *     operation in both modes, including scans, aggregates, and graph/tree
+         *     traversal. They cannot be replaced or weakened by model tool arguments.
          */
         RetrievalAgentRequest: {
             /**
@@ -5507,6 +5513,13 @@ export interface components {
              *
              *     In pipeline mode (max_internal_iterations=0), these are executed directly.
              *     In agentic mode, these declare which table and indexes are available.
+             *
+             *     `filter_query` and `exclusion_query` are mandatory table predicates
+             *     for retrieval-agent execution. Predicates declared by any query for
+             *     a table are conjoined (or unioned for exclusions) and applied to
+             *     every initial query, generated refinement, probe, aggregation,
+             *     graph/tree traversal, root scan, and follow-up for that table.
+             *     They cannot be weakened by generated operations.
              * @example [
              *       {
              *         "table": "docs",
@@ -5528,11 +5541,13 @@ export interface components {
              */
             agent_knowledge?: string;
             /**
-             * @description Pre-applied filters from prior interactions. These are applied to
-             *     all search tool invocations.
+             * @description Mandatory filters from prior interactions. These are converted to
+             *     structured Antfly predicates and applied to every table and every
+             *     search tool invocation, including generated follow-ups, graph/tree
+             *     traversal, aggregations, and root scans.
              */
             accumulated_filters?: components["schemas"]["FilterSpec"][];
-            /** @description Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence. */
+            /** @description Correlation identifier for a bounded agent interaction. This is echoed back to the client and does not imply server-side session persistence. */
             session_id?: string;
             /** @description Structured answers provided by the user as part of client-carried continuation. */
             decisions?: components["schemas"]["AgentDecision"][];
@@ -7352,8 +7367,7 @@ export interface components {
         };
         ReplicationTransformOp: {
             /**
-             * @description Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
-             *     `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`.
+             * @description Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`, `$max`.
              *     Replication-specific: `$merge` (flatten JSONB into top-level fields),
              *     `$delete_document` (delete entire Antfly doc, `on_delete` only).
              * @example $set
@@ -10923,6 +10937,8 @@ export interface components {
         GraphResultNode: {
             /** @description Document key */
             key: string;
+            /** @description Owning table for a cross-table node; omitted for nodes in the queried table */
+            table?: string;
             /** @description Distance from start node */
             depth?: number;
             /**

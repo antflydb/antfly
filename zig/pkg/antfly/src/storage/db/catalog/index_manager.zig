@@ -1941,6 +1941,7 @@ pub const IndexManager = struct {
         try self.saveBackfilledAppliedSequence(store, entry.config);
         var checkpoint = try apply_state.loadProjectionCheckpointWithSidecar(
             self.alloc,
+            self.checkpointIo(),
             store,
             self.applied_sequence_checkpoint_path,
             entry.config.name,
@@ -1949,6 +1950,7 @@ pub const IndexManager = struct {
         checkpoint.config_hash = types.indexConfigHash(entry.config);
         try apply_state.saveProjectionCheckpointWithSidecar(
             self.alloc,
+            self.checkpointIo(),
             store,
             self.applied_sequence_checkpoint_path,
             entry.config.name,
@@ -3545,6 +3547,10 @@ pub const IndexManager = struct {
         self.io = io;
     }
 
+    pub fn checkpointIo(self: *const IndexManager) std.Io {
+        return self.io orelse std.Io.Threaded.global_single_threaded.io();
+    }
+
     const GeneratedArtifactCleanupPlan = struct {
         alloc: Allocator,
         key: ?[]u8 = null,
@@ -3940,7 +3946,7 @@ pub const IndexManager = struct {
                 return;
             }
         }
-        apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name) catch |err| {
+        apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, name) catch |err| {
             std.log.warn("index removal committed with stale applied-sequence metadata name={s} err={s}", .{ name, @errorName(err) });
         };
     }
@@ -4355,6 +4361,7 @@ pub const IndexManager = struct {
         // the catalog lock used by unrelated indexes.
         try apply_state.clearAppliedSequenceWithCheckpoint(
             self.alloc,
+            self.checkpointIo(),
             store,
             self.applied_sequence_checkpoint_path,
             name,
@@ -5578,7 +5585,7 @@ pub const IndexManager = struct {
 
         for (snapshot.segments) |*segment| {
             if (segment.liveDocCount() == 0) continue;
-            const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return .missing_doc_values_section;
+            const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .missing_doc_values_section;
             const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch return .malformed_doc_values_section;
             if (!typedDocValueReaderMatchesMapping(reader.value_type, mapping)) return .doc_values_kind_mismatch;
             const coverage = try typed_dv_coverage.readerCoversLiveDocsAlloc(alloc, segment, &reader);
@@ -8396,7 +8403,7 @@ pub const IndexManager = struct {
         self.invalidateIndexPathCaches(canonical_path);
         try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
         if (cfg.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, cfg.name);
-        try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, cfg.name);
+        try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, cfg.name);
     }
 
     fn invalidateIndexPathCaches(self: *const IndexManager, path: []const u8) void {
@@ -8672,6 +8679,7 @@ pub const IndexManager = struct {
         }
         try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
             self.alloc,
+            self.checkpointIo(),
             store,
             self.applied_sequence_checkpoint_path,
             .{
@@ -9241,6 +9249,7 @@ pub const IndexManager = struct {
 
                 const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpoint(
                     self.alloc,
+                    self.checkpointIo(),
                     store,
                     self.applied_sequence_checkpoint_path,
                     cfg.name,
@@ -14805,7 +14814,7 @@ fn buildSplitSegment(
             }
         }
 
-        const stored = reader.storedDoc(doc_idx) orelse return error.InvalidSegment;
+        const stored = (try reader.storedDoc(doc_idx)) orelse return error.InvalidSegment;
         const keep = switch (side) {
             .left => std.mem.order(u8, stored.id, split_key) == .lt,
             .right => std.mem.order(u8, stored.id, split_key) != .lt,
@@ -22240,7 +22249,7 @@ test "text merge task skips stale source after concurrent delete" {
     try std.testing.expect(in_flight_stats.in_flight_segments >= 2);
 
     const stale_segment = &task.snapshot.segments[task.merge_indices[0]];
-    const stale_doc = stale_segment.reader.storedDoc(0) orelse return error.TestUnexpectedResult;
+    const stale_doc = (try stale_segment.reader.storedDoc(0)) orelse return error.TestUnexpectedResult;
     var frozen_live_docs: u32 = 0;
     for (task.source, task.merge_indices) |source, seg_idx| {
         const deleted_count: u32 = if (source.deleted) |deleted| @intCast(deleted.cardinality()) else 0;
@@ -22402,7 +22411,7 @@ test "force text compaction supersedes in-flight scheduled merge" {
     try std.testing.expectEqual(@as(u64, 1), in_flight_stats.in_flight_merges);
 
     const stale_segment = &task.snapshot.segments[task.merge_indices[0]];
-    const stale_doc = stale_segment.reader.storedDoc(0) orelse return error.TestUnexpectedResult;
+    const stale_doc = (try stale_segment.reader.storedDoc(0)) orelse return error.TestUnexpectedResult;
     try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{stale_doc.id}, opts);
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);

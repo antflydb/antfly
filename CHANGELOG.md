@@ -30,6 +30,10 @@ formats changed without a 0.1.x compatibility path. Replace or wipe 0.1.x pods
 and create fresh 0.2.0 data directories; export and restore any data that must
 be retained.
 
+The Python SDK now exposes transform operators with stable semantic enum names
+(`SET`, `SET_ON_INSERT`, `UNSET`, `INC`, `ADD_TO_SET`, and `MAX`). Positional
+`VALUE_n` names are not part of the 0.2 API.
+
 ### [0.1.1] - 2026-03-31
 
 #### Highlights

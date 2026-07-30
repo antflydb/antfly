@@ -69,7 +69,15 @@ pub const SplitDelta = struct {
 /// Encode SplitState to binary:
 /// [phase:u8][split_key_len:u32 LE][split_key][new_shard_id:u64 LE]
 /// [started_at:u64 LE][orig_end_len:u32 LE][orig_end]
-fn encodeSplitState(buf: []u8, state: *const SplitState) []const u8 {
+fn encodeSplitStateAlloc(alloc: Allocator, state: *const SplitState) ![]u8 {
+    if (state.split_key.len > std.math.maxInt(u32) or state.original_range_end.len > std.math.maxInt(u32))
+        return error.SplitStateTooLarge;
+    const keys_len = std.math.add(usize, state.split_key.len, state.original_range_end.len) catch
+        return error.SplitStateTooLarge;
+    const encoded_len = std.math.add(usize, 1 + 4 + 8 + 8 + 4, keys_len) catch
+        return error.SplitStateTooLarge;
+    const buf = try alloc.alloc(u8, encoded_len);
+    errdefer alloc.free(buf);
     var pos: usize = 0;
     buf[pos] = @intFromEnum(state.phase);
     pos += 1;
@@ -91,7 +99,8 @@ fn encodeSplitState(buf: []u8, state: *const SplitState) []const u8 {
     @memcpy(buf[pos..][0..state.original_range_end.len], state.original_range_end);
     pos += state.original_range_end.len;
 
-    return buf[0..pos];
+    std.debug.assert(pos == buf.len);
+    return buf;
 }
 
 /// Decode SplitState from binary. Returned slices point into `data`.
@@ -99,12 +108,12 @@ fn decodeSplitState(data: []const u8) ?SplitState {
     if (data.len < 1 + 4 + 8 + 8 + 4) return null;
     var pos: usize = 0;
 
-    const phase: SplitPhase = @enumFromInt(data[pos]);
+    const phase = std.enums.fromInt(SplitPhase, data[pos]) orelse return null;
     pos += 1;
 
-    const sk_len = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
+    const sk_len: usize = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
-    if (pos + sk_len > data.len) return null;
+    if (sk_len > data.len - pos) return null;
     const split_key = data[pos..][0..sk_len];
     pos += sk_len;
 
@@ -114,9 +123,9 @@ fn decodeSplitState(data: []const u8) ?SplitState {
     const started_at = std.mem.littleToNative(u64, @as(*align(1) const u64, @ptrCast(data[pos..][0..8])).*);
     pos += 8;
 
-    const oe_len = std.mem.littleToNative(u32, @as(*align(1) const u32, @ptrCast(data[pos..][0..4])).*);
+    const oe_len: usize = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
-    if (pos + oe_len > data.len) return null;
+    if (oe_len != data.len - pos) return null;
     const original_range_end = data[pos..][0..oe_len];
 
     return .{
@@ -441,8 +450,8 @@ pub const ShardManager = struct {
 
     fn persistSplitState(self: *ShardManager) !void {
         if (self.split_state) |*state| {
-            var buf: [1024]u8 = undefined;
-            const encoded = encodeSplitState(&buf, state);
+            const encoded = try encodeSplitStateAlloc(self.alloc, state);
+            defer self.alloc.free(encoded);
             try storePut(self, split_state_key, encoded);
         }
     }
@@ -905,6 +914,34 @@ fn testStoreGetAlloc(alloc: Allocator, store: *backend_erased.Store, key: []cons
     defer txn.abort();
     const raw = try txn.get(key);
     return try alloc.dupe(u8, raw);
+}
+
+test "shard split state codec preserves multi-kibibyte boundaries" {
+    const split_key = try std.testing.allocator.alloc(u8, 8 * 1024);
+    defer std.testing.allocator.free(split_key);
+    @memset(split_key, 'm');
+    const original_range_end = try std.testing.allocator.alloc(u8, 12 * 1024);
+    defer std.testing.allocator.free(original_range_end);
+    @memset(original_range_end, 'z');
+    const state = SplitState{
+        .phase = .splitting,
+        .split_key = split_key,
+        .new_shard_id = 42,
+        .started_at = 17,
+        .original_range_end = original_range_end,
+    };
+
+    const encoded = try encodeSplitStateAlloc(std.testing.allocator, &state);
+    defer std.testing.allocator.free(encoded);
+    const decoded = decodeSplitState(encoded) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, split_key, decoded.split_key);
+    try std.testing.expectEqualSlices(u8, original_range_end, decoded.original_range_end);
+
+    var trailing = try std.testing.allocator.alloc(u8, encoded.len + 1);
+    defer std.testing.allocator.free(trailing);
+    @memcpy(trailing[0..encoded.len], encoded);
+    trailing[encoded.len] = 0;
+    try std.testing.expect(decodeSplitState(trailing) == null);
 }
 
 test "shard split basic lifecycle" {

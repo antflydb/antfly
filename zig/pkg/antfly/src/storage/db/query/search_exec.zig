@@ -2676,7 +2676,7 @@ fn applyResolvedDocFilterToTextDocNumsAlloc(
         return;
     }
 
-    const can_project_ordinals = snapshot.hasDocOrdinalCoverage();
+    const can_project_ordinals = try snapshot.hasDocOrdinalCoverage();
     var include_represented = include_set.* == .all;
     if (can_project_ordinals) {
         if (try textDocNumsForResolvedDocSetAlloc(alloc, snapshot, include_set)) |doc_nums| {
@@ -6768,7 +6768,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
 ) !?SortValue {
     const resolved = snapshot.resolveDocId(native_text_doc_id) orelse return null;
     const segment = &snapshot.segments[resolved.seg_idx];
-    const section_data = segment.reader.getSection(field, .typed_doc_values) orelse {
+    const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse {
         logNativeDocValueLoadFailure(field, "missing_doc_values_section");
         return error.UnsupportedExactSort;
     };
@@ -7789,7 +7789,7 @@ fn decorateSortedSegmentDocAlloc(
     profile: ?*SortCollectorProfile,
 ) !DecoratedSortHit {
     const segment = &snapshot.segments[segment_index];
-    const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+    const stored = (try segment.reader.storedDoc(local_doc_id)) orelse return error.InvalidSegment;
     const ordinal = try segment.reader.docOrdinal(local_doc_id);
     const global_doc_id = doc_base + local_doc_id;
     const raw_hit = types.SearchHit{
@@ -8011,7 +8011,7 @@ fn nextSortedSegmentHeadAlloc(
         if (membership) |m| {
             if (!m.contains(iterator.segment_index, local_doc_id)) continue;
         }
-        const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+        const stored = (try segment.reader.storedDoc(local_doc_id)) orelse return error.InvalidSegment;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
         }
@@ -8096,7 +8096,7 @@ fn countSortedSegmentVisibleCandidatesWithoutSortValuesAlloc(
             if (membership) |m| {
                 if (!m.contains(segment_index, local_doc_id)) continue;
             }
-            const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+            const stored = (try segment.reader.storedDoc(local_doc_id)) orelse return error.InvalidSegment;
             if (executor.is_expired_key) |is_expired| {
                 if (try is_expired(executor.ctx, alloc, stored.id)) continue;
             }
@@ -8160,7 +8160,7 @@ fn countSortedSegmentVisibleCandidatesFromSeekAlloc(
             if (membership) |m| {
                 if (!m.contains(iterator.segment_index, local_doc_id)) continue;
             }
-            const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+            const stored = (try segment.reader.storedDoc(local_doc_id)) orelse return error.InvalidSegment;
             if (executor.is_expired_key) |is_expired| {
                 if (try is_expired(executor.ctx, alloc, stored.id)) continue;
             }
@@ -8654,7 +8654,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
         return empty;
     }
 
-    if (snapshot.hasDocOrdinalCoverage()) {
+    if (try snapshot.hasDocOrdinalCoverage()) {
         const ordinal_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         if (try resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(alloc, snapshot, doc_nums, executor)) |resolved| {
             if (bench_profile) {
@@ -8673,7 +8673,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
     var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
     defer freeDocIdArrayList(alloc, &doc_ids);
     for (doc_nums) |doc_num| {
-        const stored = snapshot.storedDoc(doc_num) orelse continue;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse continue;
         try doc_ids.append(alloc, try alloc.dupe(u8, stored.id));
     }
     const resolved = try resolve(executor.ctx, alloc, doc_ids.items, executor.identity_read_generation);
@@ -8817,7 +8817,7 @@ fn collectStructuredFilterDocIdsAlloc(
     errdefer freeDocIdArrayList(alloc, &out);
     for (result.hits) |hit| {
         const id = hit.id orelse blk: {
-            const stored = snapshot.storedDoc(hit.doc_id) orelse continue;
+            const stored = (try snapshot.storedDoc(hit.doc_id)) orelse continue;
             break :blk stored.id;
         };
         try appendOwnedDocId(alloc, &out, id);
@@ -11191,7 +11191,7 @@ fn sortAndPageTextDocValueDocNumsAlloc(
     var visible_candidate_count: usize = 0;
     for (doc_nums, 0..) |doc_num, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
-        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse return error.StoredDocMissing;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
         }
@@ -11311,7 +11311,7 @@ fn visibleTextDocNumCountAfterCursorAlloc(
     var visible_count: usize = 0;
     for (doc_nums, 0..) |doc_num, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse return error.StoredDocMissing;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
         }
@@ -11358,7 +11358,7 @@ fn visibleTextDocNumCount(
     var visible_count: usize = 0;
     for (doc_nums, 0..) |doc_num, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse return error.StoredDocMissing;
         if (try executor.is_expired_key.?(executor.ctx, alloc, stored.id)) continue;
         visible_count += 1;
     }
@@ -11406,7 +11406,7 @@ pub fn searchTextQuery(
     // still scoring it (observed as allocator corruption in termDocFreq()).
     const snapshot = text_index.acquireSnapshot();
     defer snapshot.release();
-    const can_apply_live_all_docs = !chunk_backed or snapshot.hasDocOrdinalCoverage();
+    const can_apply_live_all_docs = !chunk_backed or (try snapshot.hasDocOrdinalCoverage());
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var constraint_req = effective_req;
     constraint_req.resolved_doc_filter = null;
@@ -11678,7 +11678,7 @@ pub fn searchTextQuery(
             if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
             const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
             const id = hit.id orelse {
-                const stored = snapshot.storedDoc(hit.doc_id) orelse return error.StoredDocMissing;
+                const stored = (try snapshot.storedDoc(hit.doc_id)) orelse return error.StoredDocMissing;
                 var materialized = types.SearchHit{
                     .id = try alloc.dupe(u8, stored.id),
                     .doc_ordinal = doc_ordinal,
@@ -11967,7 +11967,7 @@ fn textDocNumsForDocIdsAlloc(
             if (seg.shared.deleted) |deleted| {
                 if (deleted.contains(local_doc)) continue;
             }
-            const stored = seg.reader.storedDoc(local_doc) orelse continue;
+            const stored = (try seg.reader.storedDoc(local_doc)) orelse continue;
             if (!doc_id_set.contains(stored.id)) continue;
             const doc_num = doc_offset + local_doc;
             const gop = try doc_num_set.getOrPut(alloc, doc_num);
@@ -12155,7 +12155,7 @@ fn collectFilteredExplicitTextStats(
             const doc_id = doc_offset + local_doc;
             if (!(try docAllowedByResolvedFilter(snapshot, doc_id, filter))) continue;
             global_doc_count += 1;
-            const stored = snapshot.storedDoc(doc_id) orelse continue;
+            const stored = (try snapshot.storedDoc(doc_id)) orelse continue;
             try selected_doc_keys.append(alloc, stored.id);
         }
         doc_offset += seg.reader.doc_count;
@@ -12253,7 +12253,7 @@ fn docSetContainsSnapshotDoc(
             break :blk set.containsOrdinal(ordinal);
         },
         .doc_keys => |keys| blk: {
-            const stored = snapshot.storedDoc(doc_id) orelse break :blk false;
+            const stored = (try snapshot.storedDoc(doc_id)) orelse break :blk false;
             for (keys) |key| {
                 if (std.mem.eql(u8, key, stored.id)) break :blk true;
             }
@@ -14242,7 +14242,7 @@ fn snapshotTypedDocValuesCoverageDetailsForMapping(
     var expected_value_type: ?typed_dv.ValueType = null;
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return .{ .status = .missing_doc_values_section };
+        const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .{ .status = .missing_doc_values_section };
         const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .{ .status = .malformed_doc_values_section };
         if (!typedDocValuesTypeMatchesMappedSortField(reader.value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
         if (expected_value_type) |expected| {
@@ -14270,7 +14270,7 @@ fn snapshotGeoPointDocValuesCoverage(
 ) !TypedDocValuesCoverageStatus {
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return .missing_doc_values_section;
+        const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .missing_doc_values_section;
         const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .malformed_doc_values_section;
         if (reader.value_type != .geo_point) return .doc_values_kind_mismatch;
         const live_status = try typed_dv_coverage.readerCoversLiveDocsAlloc(snapshot.alloc, segment, &reader);
@@ -14779,7 +14779,7 @@ fn buildOrdinalTextDocIdMapAlloc(
     candidates: []const MatchAllCandidate,
     ordinal_to_text_doc_id: *std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
 ) !bool {
-    if (!snapshot.hasDocOrdinalCoverage()) return false;
+    if (!(try snapshot.hasDocOrdinalCoverage())) return false;
 
     var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
     defer ordinals.deinit(alloc);
@@ -14803,7 +14803,7 @@ fn buildAllOrdinalTextDocIdMapAlloc(
     snapshot: *const index_mod.IndexSnapshot,
     ordinal_to_text_doc_id: *std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
 ) !bool {
-    if (!snapshot.hasDocOrdinalCoverage()) return false;
+    if (!(try snapshot.hasDocOrdinalCoverage())) return false;
 
     var doc_offset: u32 = 0;
     var saw_live_doc = false;
@@ -14844,7 +14844,7 @@ fn matchAllDocOrdinalsForDocIdsAlloc(
             if (segment.shared.deleted) |deleted| {
                 if (deleted.contains(local_doc)) continue;
             }
-            const stored = segment.reader.storedDoc(local_doc) orelse continue;
+            const stored = (try segment.reader.storedDoc(local_doc)) orelse continue;
             if (!doc_id_set.contains(stored.id)) continue;
             const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse {
                 logNativeSortPlanRejection(
@@ -15026,7 +15026,7 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
             );
             return error.UnsupportedQueryRequest;
         };
-        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse return error.StoredDocMissing;
         const candidate = MatchAllCandidate{
             .id = @constCast(stored.id),
             .ordinal = ordinal,
@@ -15165,7 +15165,7 @@ fn visibleMatchAllOrdinalDocValueCandidateCountAfterCursorAlloc(
             );
             return error.UnsupportedQueryRequest;
         };
-        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse return error.StoredDocMissing;
         const candidate = MatchAllCandidate{
             .id = @constCast(stored.id),
             .ordinal = ordinal,
@@ -15227,7 +15227,7 @@ fn visibleMatchAllOrdinalDocValueCandidateCount(
             );
             return error.UnsupportedQueryRequest;
         };
-        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse return error.StoredDocMissing;
         const candidate = MatchAllCandidate{
             .id = @constCast(stored.id),
             .ordinal = ordinal,
@@ -27000,7 +27000,7 @@ test "text native constraints resolve explicit request doc ids through ordinal s
     });
     defer constraints.deinit(alloc);
 
-    try std.testing.expect(writer.snapshot().hasDocOrdinalCoverage());
+    try std.testing.expect(try writer.snapshot().hasDocOrdinalCoverage());
     try std.testing.expect(constraints.positive_filter);
     try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
     try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 1));
@@ -27048,7 +27048,7 @@ test "text native constraints fall back for mixed ordinal sidecar coverage" {
     });
     defer constraints.deinit(alloc);
 
-    try std.testing.expect(!writer.snapshot().hasDocOrdinalCoverage());
+    try std.testing.expect(!(try writer.snapshot().hasDocOrdinalCoverage()));
     try std.testing.expect(constraints.positive_filter);
     try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_nums.len);
     try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_nums.len);
@@ -27076,7 +27076,7 @@ test "text native constraints fail closed when resolved ordinals cannot be proje
     };
     defer filter.deinit(alloc);
 
-    try std.testing.expect(!writer.snapshot().hasDocOrdinalCoverage());
+    try std.testing.expect(!(try writer.snapshot().hasDocOrdinalCoverage()));
     try std.testing.expectError(error.UnsupportedQueryRequest, deriveNativeDocIdConstraintsAlloc(alloc, .{
         .resolved_doc_filter = &filter,
     }, .{

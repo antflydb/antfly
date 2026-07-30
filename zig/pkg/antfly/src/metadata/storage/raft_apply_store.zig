@@ -20,6 +20,7 @@ const docstore = @import("../../storage/docstore.zig");
 const lsm_backend = @import("../../storage/lsm_backend.zig");
 const metadata = @import("../mod.zig");
 const metadata_incarnation = @import("../incarnation.zig");
+const transition_state = @import("../transition_state.zig");
 const extension_domain = @import("../../extensions/mod.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const raft_catalog = @import("../../raft/catalog.zig");
@@ -55,6 +56,15 @@ pub const ExtensionLifecycleDelta = struct {
     remove_extension_dependencies: []const ExtensionDependencyKey = &.{},
 };
 
+pub const TableTransitionFence = struct {
+    generation: u64 = 0,
+    active_count: u32 = 0,
+
+    pub fn active(self: @This()) bool {
+        return self.active_count != 0;
+    }
+};
+
 pub const TransitionCommand = union(enum) {
     initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
     upsert_node: metadata.NodeRecord,
@@ -82,8 +92,13 @@ pub const TransitionCommand = union(enum) {
         local_node_id: u64,
     },
     upsert_table: metadata.TableRecord,
+    compare_and_replace_table: struct {
+        expected: metadata.TableRecord,
+        replacement: metadata.TableRecord,
+    },
     remove_table: struct {
         table_id: u64,
+        expected_transition_generation: u64,
     },
     upsert_schema_progress: metadata.SchemaProgressRecord,
     remove_schema_progress: struct {
@@ -97,10 +112,12 @@ pub const TransitionCommand = union(enum) {
         group_id: u64,
     },
     upsert_replication_source_status: metadata.ReplicationSourceStatusRecord,
-    remove_replication_source_status: struct {
-        table_id: u64,
-        source_ordinal: u32,
+    claim_replication_source_cutover: struct {
+        expected_replication_sources_json: []const u8,
+        expected_authority_id: u64,
+        record: metadata.ReplicationSourceStatusRecord,
     },
+    complete_replication_source_retirement: metadata.ReplicationSourceStatusRecord,
     upsert_range: metadata.RangeRecord,
     complete_restore_range: metadata.RestoreIntentIdentity,
     remove_range: struct {
@@ -135,7 +152,9 @@ pub const TransitionCommand = union(enum) {
         keys: []const []const u8,
     },
     upsert_reallocation_request: metadata.ReallocationRequestRecord,
-    remove_reallocation_request: struct {},
+    remove_reallocation_request: struct {
+        expected_request_id: u128,
+    },
     upsert_extension_package: extension_domain.PackageManifest,
     remove_extension_package: struct {
         name: []const u8,
@@ -175,11 +194,22 @@ pub const TransitionCommand = union(enum) {
             .upsert_table => |*record| {
                 metadata_table_manager.freeTable(alloc, record.*);
             },
+            .compare_and_replace_table => |*replacement| {
+                metadata_table_manager.freeTable(alloc, replacement.expected);
+                metadata_table_manager.freeTable(alloc, replacement.replacement);
+            },
             .upsert_restore_progress => |*record| {
                 metadata_table_manager.freeRestoreProgress(alloc, record.*);
             },
             .upsert_replication_source_status => |*record| {
                 metadata_table_manager.freeReplicationSourceStatus(alloc, record.*);
+            },
+            .complete_replication_source_retirement => |*record| {
+                metadata_table_manager.freeReplicationSourceStatus(alloc, record.*);
+            },
+            .claim_replication_source_cutover => |*claim| {
+                alloc.free(@constCast(claim.expected_replication_sources_json));
+                metadata_table_manager.freeReplicationSourceStatus(alloc, claim.record);
             },
             .upsert_range => |*record| {
                 metadata_table_manager.freeRange(alloc, record.*);
@@ -243,6 +273,72 @@ pub const TransitionCommand = union(enum) {
 
 pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
     switch (command) {
+        .compare_and_replace_table => |replacement| {
+            if (replacement.expected.table_id == 0 or
+                replacement.replacement.table_id != replacement.expected.table_id or
+                !std.mem.eql(u8, replacement.replacement.name, replacement.expected.name))
+            {
+                return error.InvalidTableDefinitionReplacement;
+            }
+        },
+        .remove_table => |record| {
+            if (record.table_id == 0) return error.InvalidTableId;
+        },
+        .claim_replication_source_cutover => |claim| {
+            if (claim.expected_replication_sources_json.len == 0 or
+                claim.record.table_id == 0 or
+                claim.record.source_kind.len == 0 or
+                claim.record.external_table.len == 0 or
+                claim.record.slot_name.len == 0 or
+                claim.record.publication_name.len == 0 or
+                !std.mem.eql(
+                    u8,
+                    claim.record.cutover_mode,
+                    "exported_snapshot_pending",
+                ) or
+                !std.mem.eql(u8, claim.record.phase, "cutover_preparing") or
+                claim.record.snapshot_offset != 0 or
+                claim.record.prepared_checkpoint.len != 0 or
+                claim.record.stream_checkpoint.len != 0 or
+                claim.record.cutover_intent_id == 0 or
+                claim.record.cutover_authority_id == 0 or
+                std.mem.allEqual(
+                    u8,
+                    &claim.record.cutover_config_fingerprint,
+                    0,
+                ) or
+                std.mem.allEqual(u8, &claim.record.cutover_provider_identity, 0))
+            {
+                return error.InvalidReplicationCutoverIntent;
+            }
+            if (claim.expected_authority_id == 0) {
+                if (claim.record.retired_cutover_authority_id != 0 or
+                    claim.record.retired_slot_name.len != 0 or
+                    claim.record.retired_publication_name.len != 0)
+                    return error.InvalidReplicationCutoverIntent;
+            } else if (claim.record.cutover_authority_id ==
+                claim.expected_authority_id)
+            {
+                // A cleanup-pending attempt retries under the same authority
+                // and continues to carry its predecessor's retirement record.
+                if (claim.record.retired_cutover_authority_id == 0 or
+                    claim.record.retired_slot_name.len == 0 or
+                    claim.record.retired_publication_name.len == 0)
+                    return error.InvalidReplicationCutoverIntent;
+            } else if (claim.record.retired_cutover_authority_id != claim.expected_authority_id or
+                claim.record.retired_slot_name.len == 0 or
+                claim.record.retired_publication_name.len == 0)
+            {
+                return error.InvalidReplicationCutoverIntent;
+            }
+        },
+        .complete_replication_source_retirement => |record| {
+            if (record.cutover_authority_id == 0 or
+                record.retired_cutover_authority_id == 0 or
+                record.retired_slot_name.len == 0 or
+                record.retired_publication_name.len == 0)
+                return error.InvalidReplicationCutoverIntent;
+        },
         .upsert_replica_intent => |intent| try group_ids.requireDataGroupId(intent.record.group_id),
         .remove_replica_intent => |record| try group_ids.requireDataGroupId(record.group_id),
         .upsert_restore_progress => |record| try group_ids.requireDataGroupId(record.group_id),
@@ -351,6 +447,41 @@ const test_transition_table_contract: metadata.TransitionTableContract = .{
     .source_identity = .{ .shard_id = 70, .range_id = 700 },
     .target_identity = .{ .shard_id = 70, .range_id = 700 },
 };
+
+const test_merge_transition_table_contract: metadata.TransitionTableContract = .{
+    .table_id = 7,
+    .table_name = "docs",
+    .schema_json = "{\"title\":{\"type\":\"keyword\"}}",
+    .indexes_json = "{\"full_text\":{\"type\":\"full_text\"}}",
+    .source_identity = .{ .shard_id = 70, .range_id = 700 },
+    .target_identity = .{ .shard_id = 71, .range_id = 701 },
+};
+
+fn testTransitionTableRecord() metadata.TableRecord {
+    return .{
+        .table_id = test_transition_table_contract.table_id,
+        .name = test_transition_table_contract.table_name,
+        .schema_json = test_transition_table_contract.schema_json,
+        .indexes_json = test_transition_table_contract.indexes_json,
+    };
+}
+
+fn testTransitionRangeRecord(
+    group_id: u64,
+    identity: transition_state.TransitionIdentity,
+    start_key: []const u8,
+    end_key: ?[]const u8,
+) metadata.RangeRecord {
+    return .{
+        .group_id = group_id,
+        .range_id = identity.range_id,
+        .table_id = test_transition_table_contract.table_id,
+        .start_key = start_key,
+        .end_key = end_key,
+        .doc_identity_shard_id = identity.shard_id,
+        .doc_identity_range_id = identity.range_id,
+    };
+}
 
 test "transition command validation rejects metadata group ids in data group fields" {
     const metadata_group_id = group_ids.main_metadata_group_id;
@@ -563,21 +694,40 @@ test "metadata raft apply store snapshot replaces one complete projection and pr
         .upsert_restore_job = .{ .key = retained_key, .value = "retained" },
     });
     defer std.testing.allocator.free(retained_command);
+    const table_command = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = testTransitionTableRecord(),
+    });
+    defer std.testing.allocator.free(table_command);
+    const source_range_command = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            101,
+            test_transition_table_contract.source_identity,
+            "a",
+            "z",
+        ),
+    });
+    defer std.testing.allocator.free(source_range_command);
     const split_command = try encodeTransitionCommand(std.testing.allocator, .{
-        .upsert_split_transition = .{
-            .transition_id = 71,
-            .attempt_epoch = 1,
-            .source_group_id = 101,
-            .destination_group_id = 102,
-            .phase = .prepare,
-            .split_key = "m",
-            .table_contract = test_transition_table_contract,
+        .admit_split_transition = .{
+            .expected_source_epoch = 0,
+            .record = .{
+                .transition_id = 71,
+                .attempt_epoch = 1,
+                .source_group_id = 101,
+                .destination_group_id = 102,
+                .phase = .prepare,
+                .split_key = "m",
+                .source_range_end = "z",
+                .table_contract = test_transition_table_contract,
+            },
         },
     });
     defer std.testing.allocator.free(split_command);
     const source_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = retained_command },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = split_command },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = table_command },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = source_range_command },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = split_command },
     });
     defer std.testing.allocator.free(source_entries);
 
@@ -585,10 +735,10 @@ test "metadata raft apply store snapshot replaces one complete projection and pr
     defer source.deinit();
     try source.snapshotBuilder().applyBatch(.{
         .group_id = group_id,
-        .commit_index = 2,
+        .commit_index = 4,
         .entries_bytes = source_entries,
     });
-    var prepared = (try source.snapshotBuilder().prepareSnapshot(group_id, 2)) orelse return error.MissingMetadataSnapshotSource;
+    var prepared = (try source.snapshotBuilder().prepareSnapshot(group_id, 4)) orelse return error.MissingMetadataSnapshotSource;
     defer prepared.deinit();
     var materialized = try prepared.materialize(std.testing.allocator);
     defer materialized.deinit(std.testing.allocator);
@@ -622,7 +772,7 @@ test "metadata raft apply store snapshot replaces one complete projection and pr
     defer std.testing.allocator.free(other_group_entries);
     try target.snapshotBuilder().applyBatch(.{ .group_id = other_group_id, .commit_index = 1, .entries_bytes = other_group_entries });
 
-    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 2, snapshot));
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 4, snapshot));
     const retained = (try target.getRestoreJobValue(std.testing.allocator, group_id, retained_key)).?;
     defer std.testing.allocator.free(retained);
     try std.testing.expectEqualStrings("retained", retained);
@@ -635,7 +785,7 @@ test "metadata raft apply store snapshot replaces one complete projection and pr
     try std.testing.expectEqual(@as(usize, 1), splits.len);
     try std.testing.expectEqual(@as(u64, 71), splits[0].transition_id);
     const batch = (try target.latestBatch(group_id)).?;
-    try std.testing.expectEqual(@as(u64, 2), batch.commit_index);
+    try std.testing.expectEqual(@as(u64, 4), batch.commit_index);
     const installed_snapshot = try target.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
     defer std.testing.allocator.free(installed_snapshot);
     try std.testing.expectEqualSlices(u8, snapshot, installed_snapshot);
@@ -1237,6 +1387,37 @@ pub const RaftApplyStore = struct {
         alloc.free(records);
     }
 
+    pub fn getTable(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_id: u64,
+    ) !?metadata.TableRecord {
+        var key_buf: [160]u8 = undefined;
+        const key = try tableKeyForGroup(&key_buf, group_id, table_id);
+        const encoded = self.store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(encoded);
+        return try decodeTableRecord(alloc, encoded);
+    }
+
+    pub fn getTableTransitionFence(
+        self: *RaftApplyStore,
+        group_id: u64,
+        table_id: u64,
+    ) !TableTransitionFence {
+        var key_buf: [192]u8 = undefined;
+        const key = try tableTransitionFenceKeyForGroup(&key_buf, group_id, table_id);
+        const encoded = self.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return .{},
+            else => return err,
+        };
+        defer self.alloc.free(encoded);
+        return try decodeTableTransitionFence(encoded);
+    }
+
     pub fn listSchemaProgress(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SchemaProgressRecord {
         var prefix_buf: [128]u8 = undefined;
         const prefix = try schemaProgressPrefixForGroup(&prefix_buf, group_id);
@@ -1606,6 +1787,7 @@ pub const RaftApplyStore = struct {
         node,
         store,
         table,
+        table_transition_fence,
         schema_progress,
         restore_progress,
         replication_source_status,
@@ -1635,6 +1817,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .node, .key = .{ .prefix = nodePrefixForGroup } },
         .{ .projection = .store, .key = .{ .prefix = storePrefixForGroup } },
         .{ .projection = .table, .key = .{ .prefix = tablePrefixForGroup } },
+        .{ .projection = .table_transition_fence, .key = .{ .prefix = tableTransitionFencePrefixForGroup } },
         .{ .projection = .schema_progress, .key = .{ .prefix = schemaProgressPrefixForGroup } },
         .{ .projection = .restore_progress, .key = .{ .prefix = restoreProgressPrefixForGroup } },
         .{ .projection = .replication_source_status, .key = .{ .prefix = replicationSourceStatusPrefixForGroup } },
@@ -1663,14 +1846,18 @@ pub const RaftApplyStore = struct {
             .request_node_shutdown, .cancel_node_shutdown, .finalize_node_shutdown => metadataSnapshotProjectionBit(.node) | metadataSnapshotProjectionBit(.store),
             .upsert_store, .register_store, .remove_store => metadataSnapshotProjectionBit(.store),
             .upsert_replica_intent, .remove_replica_intent => metadataSnapshotProjectionBit(.placement),
-            .upsert_table, .remove_table => metadataSnapshotProjectionBit(.table),
+            .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.table),
             .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
             .upsert_restore_progress, .remove_restore_progress => metadataSnapshotProjectionBit(.restore_progress),
-            .upsert_replication_source_status, .remove_replication_source_status => metadataSnapshotProjectionBit(.replication_source_status),
+            .upsert_replication_source_status, .claim_replication_source_cutover, .complete_replication_source_retirement => metadataSnapshotProjectionBit(.replication_source_status),
             .upsert_range, .complete_restore_range, .remove_range => metadataSnapshotProjectionBit(.range),
-            .admit_split_transition => metadataSnapshotProjectionBit(.split_transition) | metadataSnapshotProjectionBit(.range),
-            .upsert_split_transition, .remove_split_transition => metadataSnapshotProjectionBit(.split_transition),
-            .upsert_merge_transition, .remove_merge_transition => metadataSnapshotProjectionBit(.merge_transition),
+            .admit_split_transition => metadataSnapshotProjectionBit(.split_transition) |
+                metadataSnapshotProjectionBit(.range) |
+                metadataSnapshotProjectionBit(.table_transition_fence),
+            .upsert_split_transition, .remove_split_transition => metadataSnapshotProjectionBit(.split_transition) |
+                metadataSnapshotProjectionBit(.table_transition_fence),
+            .upsert_merge_transition, .remove_merge_transition => metadataSnapshotProjectionBit(.merge_transition) |
+                metadataSnapshotProjectionBit(.table_transition_fence),
             .upsert_reconcile_lease, .remove_reconcile_lease => metadataSnapshotProjectionBit(.reconcile_lease),
             .upsert_shuffle_join_lease, .remove_shuffle_join_lease => metadataSnapshotProjectionBit(.shuffle_join_lease),
             .upsert_restore_job, .remove_restore_job, .remove_restore_jobs => metadataSnapshotProjectionBit(.restore_job),
@@ -1680,6 +1867,7 @@ pub const RaftApplyStore = struct {
             .upsert_extension_member, .remove_extension_member => metadataSnapshotProjectionBit(.extension_member),
             .upsert_extension_dependency, .remove_extension_dependency => metadataSnapshotProjectionBit(.extension_dependency),
             .apply_extension_lifecycle => metadataSnapshotProjectionBit(.table) |
+                metadataSnapshotProjectionBit(.table_transition_fence) |
                 metadataSnapshotProjectionBit(.installed_extension) |
                 metadataSnapshotProjectionBit(.extension_member) |
                 metadataSnapshotProjectionBit(.extension_dependency),
@@ -2133,20 +2321,25 @@ pub const RaftApplyStore = struct {
                 });
             },
             .upsert_table => |record| {
-                var key_buf: [160]u8 = undefined;
-                const key = try tableKeyForGroup(&key_buf, group_id, record.table_id);
-                const value = try encodeTableRecord(self.alloc, record);
-                defer self.alloc.free(value);
-                try txn.put(key, value);
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .table,
-                    .metadata_group_id = group_id,
-                    .table_name = record.name,
-                    .table_id = record.table_id,
-                });
+                try self.applyTableUpsertTxn(txn, group_id, record);
+            },
+            .compare_and_replace_table => |replacement| {
+                try self.applyTableCompareAndReplaceTxn(
+                    txn,
+                    group_id,
+                    replacement.expected,
+                    replacement.replacement,
+                );
             },
             .remove_table => |record| {
+                const fence = try self.loadTableTransitionFenceTxn(
+                    txn,
+                    group_id,
+                    record.table_id,
+                );
+                if (fence.active() or
+                    fence.generation != record.expected_transition_generation)
+                    return;
                 const existing_table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
                 defer if (existing_table_name) |name| self.alloc.free(name);
                 var key_buf: [160]u8 = undefined;
@@ -2236,37 +2429,23 @@ pub const RaftApplyStore = struct {
                 });
             },
             .upsert_replication_source_status => |record| {
-                const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
-                defer if (table_name) |name| self.alloc.free(name);
-                var key_buf: [224]u8 = undefined;
-                const key = try replicationSourceStatusKeyForGroup(&key_buf, group_id, record.table_id, record.source_ordinal);
-                const value = try encodeReplicationSourceStatusRecord(self.alloc, record);
-                defer self.alloc.free(value);
-                try txn.put(key, value);
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .replication_source_status,
-                    .metadata_group_id = group_id,
-                    .table_name = table_name,
-                    .table_id = record.table_id,
-                });
+                try self.applyReplicationSourceStatusUpsertTxn(txn, group_id, record);
             },
-            .remove_replication_source_status => |record| {
-                const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
-                defer if (table_name) |name| self.alloc.free(name);
-                var key_buf: [224]u8 = undefined;
-                const key = try replicationSourceStatusKeyForGroup(&key_buf, group_id, record.table_id, record.source_ordinal);
-                txn.delete(key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .replication_source_status,
-                    .metadata_group_id = group_id,
-                    .table_name = table_name,
-                    .table_id = record.table_id,
-                });
+            .claim_replication_source_cutover => |claim| {
+                try self.applyReplicationSourceCutoverClaimTxn(
+                    txn,
+                    group_id,
+                    claim.expected_replication_sources_json,
+                    claim.expected_authority_id,
+                    claim.record,
+                );
+            },
+            .complete_replication_source_retirement => |expected| {
+                try self.applyReplicationSourceRetirementCompletionTxn(
+                    txn,
+                    group_id,
+                    expected,
+                );
             },
             .upsert_range => |record| {
                 const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
@@ -2455,9 +2634,17 @@ pub const RaftApplyStore = struct {
                 try txn.put(key, value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
             },
-            .remove_reallocation_request => {
+            .remove_reallocation_request => |expected| remove: {
                 var key_buf: [160]u8 = undefined;
                 const key = try reallocationRequestKeyForGroup(&key_buf, group_id);
+                const encoded = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => break :remove,
+                    else => return err,
+                };
+                var pos: usize = 0;
+                const current = try readReallocationRequestRecord(encoded, &pos);
+                if (pos != encoded.len) return error.InvalidMetadataRecord;
+                if (current.request_id != expected.expected_request_id) break :remove;
                 txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
@@ -2538,6 +2725,309 @@ pub const RaftApplyStore = struct {
         }
     }
 
+    fn applyTableUpsertTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.TableRecord,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try tableKeyForGroup(&key_buf, group_id, record.table_id);
+        const encoded_existing = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (encoded_existing) |encoded| {
+            const existing = try decodeTableRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeTable(self.alloc, existing);
+            if (metadata_table_manager.tableDefinitionsEqual(existing, record)) return;
+        }
+        if ((try self.loadTableTransitionFenceTxn(txn, group_id, record.table_id)).active()) return;
+        try self.putTableRecordTxn(txn, group_id, key, record);
+    }
+
+    fn applyReplicationSourceStatusUpsertTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.ReplicationSourceStatusRecord,
+    ) !void {
+        var key_buf: [224]u8 = undefined;
+        const key = try replicationSourceStatusKeyForGroup(
+            &key_buf,
+            group_id,
+            record.table_id,
+            record.source_ordinal,
+        );
+        const encoded_existing = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (encoded_existing) |encoded| {
+            const existing = try decodeReplicationSourceStatusRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing);
+            if (existing.cutover_authority_id != 0) {
+                if (!replicationCutoverAuthorityIdentityEqual(existing, record))
+                    return;
+                if (!replicationCutoverRetirementEqual(existing, record))
+                    return;
+            }
+            if (existing.cutover_authority_id == 0 and
+                record.cutover_authority_id != 0)
+                return;
+        } else if (record.cutover_authority_id != 0) {
+            // Exact cutover authority is admitted only through the catalog- and
+            // prior-authority-CAS command below.
+            return;
+        }
+        try self.putReplicationSourceStatusTxn(txn, group_id, key, record);
+    }
+
+    fn applyReplicationSourceCutoverClaimTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        expected_replication_sources_json: []const u8,
+        expected_authority_id: u64,
+        record: metadata.ReplicationSourceStatusRecord,
+    ) !void {
+        var table_key_buf: [160]u8 = undefined;
+        const table_key = try tableKeyForGroup(
+            &table_key_buf,
+            group_id,
+            record.table_id,
+        );
+        const encoded_table = txn.get(table_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        const table = try decodeTableRecord(self.alloc, encoded_table);
+        defer metadata_table_manager.freeTable(self.alloc, table);
+        if (!std.mem.eql(
+            u8,
+            table.replication_sources_json,
+            expected_replication_sources_json,
+        )) return;
+
+        var status_key_buf: [224]u8 = undefined;
+        const status_key = try replicationSourceStatusKeyForGroup(
+            &status_key_buf,
+            group_id,
+            record.table_id,
+            record.source_ordinal,
+        );
+        const encoded_existing = txn.get(status_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (encoded_existing) |encoded| {
+            const existing = try decodeReplicationSourceStatusRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing);
+            if (replicationCutoverAuthorityIdentityEqual(existing, record)) {
+                if (!replicationCutoverRetirementEqual(existing, record)) return;
+                // Provider cleanup can legitimately fail after authority is
+                // claimed but before any snapshot checkpoint exists. Permit
+                // that exact authority to retry preparation, while refusing
+                // to roll an advanced snapshot/streaming status backward.
+                if (std.mem.eql(u8, existing.phase, "failed") and
+                    std.mem.eql(
+                        u8,
+                        existing.cutover_mode,
+                        "exported_snapshot_pending",
+                    ) and
+                    existing.snapshot_offset == 0 and
+                    existing.prepared_checkpoint.len == 0 and
+                    existing.stream_checkpoint.len == 0)
+                {
+                    try self.putReplicationSourceStatusTxn(
+                        txn,
+                        group_id,
+                        status_key,
+                        record,
+                    );
+                }
+                return;
+            }
+            if (existing.cutover_authority_id != expected_authority_id or
+                existing.retired_cutover_authority_id != 0 or
+                record.cutover_authority_id == expected_authority_id)
+                return;
+            if (expected_authority_id == 0) {
+                if (record.retired_cutover_authority_id != 0 or
+                    record.retired_slot_name.len != 0 or
+                    record.retired_publication_name.len != 0)
+                    return;
+            } else if (record.retired_cutover_authority_id != expected_authority_id or
+                !std.mem.eql(u8, record.retired_slot_name, existing.slot_name) or
+                !std.mem.eql(
+                    u8,
+                    record.retired_publication_name,
+                    existing.publication_name,
+                ))
+            {
+                return;
+            }
+        } else if (expected_authority_id != 0 or
+            record.retired_cutover_authority_id != 0 or
+            record.retired_slot_name.len != 0 or
+            record.retired_publication_name.len != 0)
+        {
+            return;
+        }
+        try self.putReplicationSourceStatusTxn(txn, group_id, status_key, record);
+    }
+
+    fn applyReplicationSourceRetirementCompletionTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        expected: metadata.ReplicationSourceStatusRecord,
+    ) !void {
+        var key_buf: [224]u8 = undefined;
+        const key = try replicationSourceStatusKeyForGroup(
+            &key_buf,
+            group_id,
+            expected.table_id,
+            expected.source_ordinal,
+        );
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        var current = try decodeReplicationSourceStatusRecord(
+            self.alloc,
+            encoded,
+        );
+        defer metadata_table_manager.freeReplicationSourceStatus(
+            self.alloc,
+            current,
+        );
+        if (!replicationCutoverAuthorityIdentityEqual(current, expected) or
+            !replicationCutoverRetirementEqual(current, expected))
+            return;
+
+        const retired_authority_id = current.retired_cutover_authority_id;
+        const retired_slot_name = current.retired_slot_name;
+        const retired_publication_name = current.retired_publication_name;
+        defer {
+            current.retired_cutover_authority_id = retired_authority_id;
+            current.retired_slot_name = retired_slot_name;
+            current.retired_publication_name = retired_publication_name;
+        }
+        current.retired_cutover_authority_id = 0;
+        current.retired_slot_name = "";
+        current.retired_publication_name = "";
+        current.updated_at_ms = @max(current.updated_at_ms, expected.updated_at_ms);
+        try self.putReplicationSourceStatusTxn(txn, group_id, key, current);
+    }
+
+    fn putReplicationSourceStatusTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        key: []const u8,
+        record: metadata.ReplicationSourceStatusRecord,
+    ) !void {
+        const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
+        defer if (table_name) |name| self.alloc.free(name);
+        const value = try encodeReplicationSourceStatusRecord(self.alloc, record);
+        defer self.alloc.free(value);
+        try txn.put(key, value);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .replication_source_status,
+            .metadata_group_id = group_id,
+            .table_name = table_name,
+            .table_id = record.table_id,
+        });
+    }
+
+    fn applyTableCompareAndReplaceTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        expected: metadata.TableRecord,
+        replacement: metadata.TableRecord,
+    ) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try tableKeyForGroup(&key_buf, group_id, expected.table_id);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        const current = try decodeTableRecord(self.alloc, encoded);
+        defer metadata_table_manager.freeTable(self.alloc, current);
+        if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return;
+        if ((try self.loadTableTransitionFenceTxn(txn, group_id, expected.table_id)).active()) return;
+        if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
+        try self.putTableRecordTxn(txn, group_id, key, replacement);
+    }
+
+    fn putTableRecordTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        key: []const u8,
+        record: metadata.TableRecord,
+    ) !void {
+        const value = try encodeTableRecord(self.alloc, record);
+        defer self.alloc.free(value);
+        try txn.put(key, value);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{
+            .kind = .table,
+            .metadata_group_id = group_id,
+            .table_name = record.name,
+            .table_id = record.table_id,
+        });
+    }
+
+    fn loadTableTransitionFenceTxn(
+        _: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+    ) !TableTransitionFence {
+        var key_buf: [192]u8 = undefined;
+        const key = try tableTransitionFenceKeyForGroup(&key_buf, group_id, table_id);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return .{},
+            else => return err,
+        };
+        return try decodeTableTransitionFence(encoded);
+    }
+
+    fn updateTableTransitionFenceTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        was_active: bool,
+        is_active: bool,
+    ) !void {
+        if (table_id == 0 or was_active == is_active) return;
+        var fence = try self.loadTableTransitionFenceTxn(txn, group_id, table_id);
+        if (fence.generation == std.math.maxInt(u64))
+            return error.TableTransitionGenerationExhausted;
+        if (is_active) {
+            if (fence.active_count == std.math.maxInt(u32))
+                return error.TableTransitionCountExhausted;
+            fence.active_count += 1;
+        } else {
+            if (fence.active_count == 0)
+                return error.InvalidTableTransitionFence;
+            fence.active_count -= 1;
+        }
+        fence.generation += 1;
+
+        var key_buf: [192]u8 = undefined;
+        const key = try tableTransitionFenceKeyForGroup(&key_buf, group_id, table_id);
+        var encoded: [@sizeOf(u64) + @sizeOf(u32)]u8 = undefined;
+        encodeTableTransitionFence(&encoded, fence);
+        try txn.put(key, &encoded);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+    }
+
     fn applySplitTransitionUpsertTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -2550,15 +3040,27 @@ pub const RaftApplyStore = struct {
             error.NotFound => null,
             else => return err,
         };
-        if (encoded_existing) |encoded| {
-            const existing = try decodeSplitTransitionRecord(self.alloc, encoded);
-            defer metadata_table_manager.freeSplitTransitionRecord(self.alloc, existing);
-            if (!splitTransitionUpdateAllowed(existing, record)) return;
-        }
+        const encoded = encoded_existing orelse {
+            // New splits must use admit_split_transition, which atomically
+            // validates the source epoch, range identity, and table contract.
+            return;
+        };
+        var existing_active = false;
+        const existing = try decodeSplitTransitionRecord(self.alloc, encoded);
+        defer metadata_table_manager.freeSplitTransitionRecord(self.alloc, existing);
+        if (!splitTransitionUpdateAllowed(existing, record)) return;
+        existing_active = splitTransitionActive(existing);
 
         const value = try encodeSplitTransitionRecord(self.alloc, record);
         defer self.alloc.free(value);
         try txn.put(key, value);
+        try self.updateTableTransitionFenceTxn(
+            txn,
+            group_id,
+            record.table_contract.table_id,
+            existing_active,
+            splitTransitionActive(record),
+        );
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         self.notifyProjectionListeners(.{
             .kind = .split_transition,
@@ -2605,15 +3107,30 @@ pub const RaftApplyStore = struct {
             error.NotFound => null,
             else => return err,
         };
+        var existing_active = false;
         if (encoded_existing) |encoded| {
             const existing = try decodeMergeTransitionRecord(self.alloc, encoded);
             defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, existing);
             if (!mergeTransitionUpdateAllowed(existing, record)) return;
+            existing_active = !transitionPhaseTerminal(existing.phase);
+        } else if (!try self.mergeTransitionAdmissionMatchesTxn(
+            txn,
+            group_id,
+            record,
+        )) {
+            return;
         }
 
         const value = try encodeMergeTransitionRecord(self.alloc, record);
         defer self.alloc.free(value);
         try txn.put(key, value);
+        try self.updateTableTransitionFenceTxn(
+            txn,
+            group_id,
+            record.table_contract.table_id,
+            existing_active,
+            !transitionPhaseTerminal(record.phase),
+        );
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         self.notifyProjectionListeners(.{
             .kind = .merge_transition,
@@ -2683,11 +3200,21 @@ pub const RaftApplyStore = struct {
         if (source.split_attempt_epoch != expected_source_epoch or
             expected_source_epoch == std.math.maxInt(u64) or
             record.attempt_epoch != expected_source_epoch + 1 or
+            source.table_id != record.table_contract.table_id or
+            !rangeMatchesTransitionIdentity(
+                source,
+                record.table_contract.source_identity,
+            ) or
             !optionalBytesEqual(source.end_key, record.source_range_end) or
             !keyStrictlyInsideRange(split_key, source.start_key, source.end_key))
         {
             return;
         }
+        if (!try self.tableMatchesTransitionContractTxn(
+            txn,
+            group_id,
+            record.table_contract,
+        )) return;
 
         var destination_key_buf: [160]u8 = undefined;
         const destination_key = try rangeKeyForGroup(&destination_key_buf, group_id, record.destination_group_id);
@@ -2717,6 +3244,13 @@ pub const RaftApplyStore = struct {
         defer self.alloc.free(transition_value);
         try txn.put(source_key, source_value);
         try txn.put(transition_key, transition_value);
+        try self.updateTableTransitionFenceTxn(
+            txn,
+            group_id,
+            record.table_contract.table_id,
+            false,
+            splitTransitionActive(record),
+        );
 
         const table_name = try self.lookupTableNameTxn(txn, group_id, source.table_id);
         defer if (table_name) |name| self.alloc.free(name);
@@ -2737,15 +3271,99 @@ pub const RaftApplyStore = struct {
         self.notifyCommittedTransition(.{ .upsert_split = record });
     }
 
+    fn tableMatchesTransitionContractTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        contract: metadata.TransitionTableContract,
+    ) !bool {
+        var key_buf: [160]u8 = undefined;
+        const key = try tableKeyForGroup(&key_buf, group_id, contract.table_id);
+        const encoded = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        const table = try decodeTableRecord(self.alloc, encoded);
+        defer metadata_table_manager.freeTable(self.alloc, table);
+        return table.table_id == contract.table_id and
+            std.mem.eql(u8, table.name, contract.table_name) and
+            std.mem.eql(u8, table.schema_json, contract.schema_json) and
+            std.mem.eql(u8, table.indexes_json, contract.indexes_json);
+    }
+
+    fn mergeTransitionAdmissionMatchesTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        record: metadata.MergeTransitionRecord,
+    ) !bool {
+        if (record.phase != .prepare or
+            record.donor_group_id == record.receiver_group_id)
+            return false;
+        if (!try self.tableMatchesTransitionContractTxn(
+            txn,
+            group_id,
+            record.table_contract,
+        )) return false;
+
+        var donor_key_buf: [160]u8 = undefined;
+        const donor_key = try rangeKeyForGroup(
+            &donor_key_buf,
+            group_id,
+            record.donor_group_id,
+        );
+        const encoded_donor = txn.get(donor_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        const donor = try decodeRangeRecord(self.alloc, encoded_donor);
+        defer metadata_table_manager.freeRange(self.alloc, donor);
+
+        var receiver_key_buf: [160]u8 = undefined;
+        const receiver_key = try rangeKeyForGroup(
+            &receiver_key_buf,
+            group_id,
+            record.receiver_group_id,
+        );
+        const encoded_receiver = txn.get(receiver_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        const receiver = try decodeRangeRecord(self.alloc, encoded_receiver);
+        defer metadata_table_manager.freeRange(self.alloc, receiver);
+
+        return donor.table_id == record.table_contract.table_id and
+            receiver.table_id == record.table_contract.table_id and
+            rangesAreAdjacent(donor, receiver) and
+            rangeMatchesTransitionIdentity(
+                donor,
+                record.table_contract.source_identity,
+            ) and
+            rangeMatchesTransitionIdentity(
+                receiver,
+                record.table_contract.target_identity,
+            );
+    }
+
     fn applyExtensionLifecycleDeltaTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, delta: ExtensionLifecycleDelta) !void {
+        // Extension lifecycle commands are atomic. Preflight every structural
+        // table write before touching any extension row so an active range
+        // transition rejects the whole delta rather than publishing half of it.
         for (delta.upsert_tables) |record| {
             var key_buf: [160]u8 = undefined;
             const key = try tableKeyForGroup(&key_buf, group_id, record.table_id);
-            const value = try encodeTableRecord(self.alloc, record);
-            defer self.alloc.free(value);
-            try txn.put(key, value);
-            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            const encoded_existing = txn.get(key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (encoded_existing) |encoded| {
+                const existing = try decodeTableRecord(self.alloc, encoded);
+                defer metadata_table_manager.freeTable(self.alloc, existing);
+                if (metadata_table_manager.tableDefinitionsEqual(existing, record)) continue;
+            }
+            if ((try self.loadTableTransitionFenceTxn(txn, group_id, record.table_id)).active()) return;
         }
+        for (delta.upsert_tables) |record| try self.applyTableUpsertTxn(txn, group_id, record);
         for (delta.remove_extension_dependencies) |record| {
             var key_buf: [320]u8 = undefined;
             const key = try extensionDependencyKeyForGroup(&key_buf, group_id, record.extension_name, record.required_extension_name, record.package_name);
@@ -3096,6 +3714,43 @@ pub const RaftApplyStore = struct {
     }
 };
 
+fn replicationCutoverAuthorityIdentityEqual(
+    a: metadata.ReplicationSourceStatusRecord,
+    b: metadata.ReplicationSourceStatusRecord,
+) bool {
+    return a.table_id == b.table_id and
+        a.source_ordinal == b.source_ordinal and
+        a.cutover_intent_id == b.cutover_intent_id and
+        a.cutover_authority_id == b.cutover_authority_id and
+        std.mem.eql(u8, &a.cutover_config_fingerprint, &b.cutover_config_fingerprint) and
+        std.mem.eql(u8, &a.cutover_provider_identity, &b.cutover_provider_identity) and
+        std.mem.eql(u8, a.source_kind, b.source_kind) and
+        std.mem.eql(u8, a.external_table, b.external_table) and
+        std.mem.eql(u8, a.slot_name, b.slot_name) and
+        std.mem.eql(u8, a.publication_name, b.publication_name);
+}
+
+fn replicationCutoverRetirementEqual(
+    a: metadata.ReplicationSourceStatusRecord,
+    b: metadata.ReplicationSourceStatusRecord,
+) bool {
+    return a.retired_cutover_authority_id == b.retired_cutover_authority_id and
+        std.mem.eql(u8, a.retired_slot_name, b.retired_slot_name) and
+        std.mem.eql(
+            u8,
+            a.retired_publication_name,
+            b.retired_publication_name,
+        );
+}
+
+fn replicationCutoverRetirementCleared(
+    record: metadata.ReplicationSourceStatusRecord,
+) bool {
+    return record.retired_cutover_authority_id == 0 and
+        record.retired_slot_name.len == 0 and
+        record.retired_publication_name.len == 0;
+}
+
 const transition_magic = "afmd1";
 const runtime_status_record_version: u16 = 10;
 const group_status_record_version: u16 = 4;
@@ -3115,7 +3770,6 @@ const TransitionTag = enum(u8) {
     upsert_restore_progress = 11,
     remove_restore_progress = 12,
     upsert_replication_source_status = 13,
-    remove_replication_source_status = 14,
     upsert_range = 15,
     remove_range = 16,
     upsert_split_transition = 17,
@@ -3147,6 +3801,9 @@ const TransitionTag = enum(u8) {
     remove_restore_jobs = 43,
     admit_split_transition = 44,
     complete_restore_range = 46,
+    compare_and_replace_table = 47,
+    claim_replication_source_cutover = 48,
+    complete_replication_source_retirement = 49,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -3208,9 +3865,20 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_table));
             try appendTableRecord(alloc, &out, record);
         },
+        .compare_and_replace_table => |replacement| {
+            try out.append(alloc, @intFromEnum(TransitionTag.compare_and_replace_table));
+            try appendFramedTableRecord(alloc, &out, replacement.expected);
+            try appendFramedTableRecord(alloc, &out, replacement.replacement);
+        },
         .remove_table => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_table));
             try appendInt(alloc, &out, u64, record.table_id);
+            try appendInt(
+                alloc,
+                &out,
+                u64,
+                record.expected_transition_generation,
+            );
         },
         .upsert_schema_progress => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_schema_progress));
@@ -3235,10 +3903,20 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_replication_source_status));
             try appendReplicationSourceStatusRecord(alloc, &out, record);
         },
-        .remove_replication_source_status => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_replication_source_status));
-            try appendInt(alloc, &out, u64, record.table_id);
-            try appendInt(alloc, &out, u32, record.source_ordinal);
+        .claim_replication_source_cutover => |claim| {
+            try out.append(alloc, @intFromEnum(TransitionTag.claim_replication_source_cutover));
+            try appendRequiredString(alloc, &out, claim.expected_replication_sources_json);
+            try appendInt(alloc, &out, u64, claim.expected_authority_id);
+            try appendReplicationSourceStatusRecord(alloc, &out, claim.record);
+        },
+        .complete_replication_source_retirement => |record| {
+            try out.append(
+                alloc,
+                @intFromEnum(
+                    TransitionTag.complete_replication_source_retirement,
+                ),
+            );
+            try appendReplicationSourceStatusRecord(alloc, &out, record);
         },
         .upsert_range => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_range));
@@ -3292,8 +3970,9 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_reallocation_request));
             try appendReallocationRequestRecord(alloc, &out, record);
         },
-        .remove_reallocation_request => {
+        .remove_reallocation_request => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_reallocation_request));
+            try appendInt(alloc, &out, u128, record.expected_request_id);
         },
         .upsert_extension_package => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_extension_package));
@@ -3411,8 +4090,24 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .upsert_table => .{
             .upsert_table = try readTableRecord(alloc, encoded, &pos),
         },
+        .compare_and_replace_table => blk: {
+            const expected = try readFramedTableRecord(alloc, encoded, &pos);
+            errdefer metadata_table_manager.freeTable(alloc, expected);
+            const replacement = try readFramedTableRecord(alloc, encoded, &pos);
+            break :blk .{ .compare_and_replace_table = .{
+                .expected = expected,
+                .replacement = replacement,
+            } };
+        },
         .remove_table => .{
-            .remove_table = .{ .table_id = try readInt(encoded, &pos, u64) },
+            .remove_table = .{
+                .table_id = try readInt(encoded, &pos, u64),
+                .expected_transition_generation = try readInt(
+                    encoded,
+                    &pos,
+                    u64,
+                ),
+            },
         },
         .upsert_schema_progress => .{
             .upsert_schema_progress = try readSchemaProgressRecord(encoded, &pos),
@@ -3436,11 +4131,19 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .upsert_replication_source_status => .{
             .upsert_replication_source_status = try readReplicationSourceStatusRecord(alloc, encoded, &pos),
         },
-        .remove_replication_source_status => .{
-            .remove_replication_source_status = .{
-                .table_id = try readInt(encoded, &pos, u64),
-                .source_ordinal = try readInt(encoded, &pos, u32),
-            },
+        .claim_replication_source_cutover => blk: {
+            const expected_replication_sources_json = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(expected_replication_sources_json);
+            const expected_authority_id = try readInt(encoded, &pos, u64);
+            const record = try readReplicationSourceStatusRecord(alloc, encoded, &pos);
+            break :blk .{ .claim_replication_source_cutover = .{
+                .expected_replication_sources_json = expected_replication_sources_json,
+                .expected_authority_id = expected_authority_id,
+                .record = record,
+            } };
+        },
+        .complete_replication_source_retirement => .{
+            .complete_replication_source_retirement = try readReplicationSourceStatusRecord(alloc, encoded, &pos),
         },
         .upsert_range => .{
             .upsert_range = try readRangeRecord(alloc, encoded, &pos),
@@ -3487,7 +4190,9 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
             .upsert_reallocation_request = try readReallocationRequestRecord(encoded, &pos),
         },
         .remove_reallocation_request => .{
-            .remove_reallocation_request = .{},
+            .remove_reallocation_request = .{
+                .expected_request_id = try readInt(encoded, &pos, u128),
+            },
         },
         .upsert_extension_package => .{
             .upsert_extension_package = try readJsonRecord(extension_domain.PackageManifest, alloc, encoded, &pos),
@@ -4619,6 +5324,18 @@ fn appendTableRecord(
     try out.appendSlice(alloc, record.restore_location);
 }
 
+fn appendFramedTableRecord(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: metadata.TableRecord,
+) !void {
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try appendTableRecord(alloc, &encoded, record);
+    try appendInt(alloc, out, u32, @intCast(encoded.items.len));
+    try out.appendSlice(alloc, encoded.items);
+}
+
 fn appendSchemaProgressRecord(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -4697,6 +5414,9 @@ fn appendReplicationSourceStatusRecord(
     try out.appendSlice(alloc, &record.cutover_config_fingerprint);
     try appendInt(alloc, out, u64, record.cutover_authority_id);
     try out.appendSlice(alloc, &record.cutover_provider_identity);
+    try appendInt(alloc, out, u64, record.retired_cutover_authority_id);
+    try appendRequiredString(alloc, out, record.retired_slot_name);
+    try appendRequiredString(alloc, out, record.retired_publication_name);
 }
 
 fn appendRangeRecord(
@@ -4844,6 +5564,8 @@ fn appendReallocationRequestRecord(
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.ReallocationRequestRecord,
 ) !void {
+    if (!metadata.isValidReallocationRequest(record)) return error.InvalidMetadataRecord;
+    try appendInt(alloc, out, u128, record.request_id);
     try appendInt(alloc, out, u64, record.requested_at_ms);
 }
 
@@ -4876,6 +5598,21 @@ fn readTableRecord(
         metadata_table_manager.freeTable(alloc, record);
         return error.InvalidMetadataTransitionEncoding;
     }
+    return record;
+}
+
+fn readFramedTableRecord(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata.TableRecord {
+    const record_len = try readInt(encoded, pos, u32);
+    if (record_len == 0 or record_len > encoded.len - pos.*)
+        return error.InvalidMetadataTransitionEncoding;
+    const record_end = pos.* + record_len;
+    var record_pos: usize = 0;
+    const record = try readTableRecord(alloc, encoded[pos.*..record_end], &record_pos);
+    pos.* = record_end;
     return record;
 }
 
@@ -5356,19 +6093,25 @@ fn readReplicationSourceStatusRecord(
         @memcpy(&cutover_config_fingerprint, encoded[pos.*..][0..cutover_config_fingerprint.len]);
         pos.* += cutover_config_fingerprint.len;
     }
-    const cutover_authority_id = if (pos.* + @sizeOf(u64) <= encoded.len)
-        try readInt(encoded, pos, u64)
-    else
-        0;
+    const cutover_authority_id = try readInt(encoded, pos, u64);
     var cutover_provider_identity =
         [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
-    if (pos.* + cutover_provider_identity.len <= encoded.len) {
-        @memcpy(
-            &cutover_provider_identity,
-            encoded[pos.*..][0..cutover_provider_identity.len],
-        );
-        pos.* += cutover_provider_identity.len;
-    }
+    if (pos.* + cutover_provider_identity.len > encoded.len)
+        return error.InvalidMetadataTransitionEncoding;
+    @memcpy(
+        &cutover_provider_identity,
+        encoded[pos.*..][0..cutover_provider_identity.len],
+    );
+    pos.* += cutover_provider_identity.len;
+    const retired_cutover_authority_id = try readInt(encoded, pos, u64);
+    const retired_slot_name = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(retired_slot_name);
+    const retired_publication_name = try readRequiredString(
+        alloc,
+        encoded,
+        pos,
+    );
+    errdefer alloc.free(retired_publication_name);
     return .{
         .table_id = table_id,
         .source_ordinal = source_ordinal,
@@ -5394,6 +6137,9 @@ fn readReplicationSourceStatusRecord(
         .cutover_authority_id = cutover_authority_id,
         .cutover_config_fingerprint = cutover_config_fingerprint,
         .cutover_provider_identity = cutover_provider_identity,
+        .retired_cutover_authority_id = retired_cutover_authority_id,
+        .retired_slot_name = retired_slot_name,
+        .retired_publication_name = retired_publication_name,
         .updated_at_ms = updated_at_ms,
     };
 }
@@ -5636,9 +6382,12 @@ fn readReallocationRequestRecord(
     encoded: []const u8,
     pos: *usize,
 ) !metadata.ReallocationRequestRecord {
-    return .{
+    const record: metadata.ReallocationRequestRecord = .{
+        .request_id = try readInt(encoded, pos, u128),
         .requested_at_ms = try readInt(encoded, pos, u64),
     };
+    if (!metadata.isValidReallocationRequest(record)) return error.InvalidMetadataRecord;
+    return record;
 }
 
 fn appendMetadataPrefixRowsTxn(
@@ -5895,6 +6644,10 @@ pub fn mergeTransitionPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_transition:merge:{d}:", .{group_id});
 }
 
+pub fn tableTransitionFencePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_table_transition_fence:{d}:", .{group_id});
+}
+
 pub fn reconcileLeaseKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_reconcile_lease:{d}", .{group_id});
 }
@@ -5921,6 +6674,10 @@ fn mergeTransitionKeyForGroup(buf: []u8, group_id: u64, transition_id: u64) ![]c
 
 fn tableKeyForGroup(buf: []u8, group_id: u64, table_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_table:{d}:{d}", .{ group_id, table_id });
+}
+
+fn tableTransitionFenceKeyForGroup(buf: []u8, group_id: u64, table_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_table_transition_fence:{d}:{d}", .{ group_id, table_id });
 }
 
 fn schemaProgressKeyForGroup(buf: []u8, group_id: u64, table_id: u64, node_id: u64) ![]const u8 {
@@ -5969,6 +6726,55 @@ fn storeKeyForGroup(buf: []u8, group_id: u64, store_id: u64) ![]const u8 {
 
 fn splitTransitionActive(record: metadata.SplitTransitionRecord) bool {
     return !transitionPhaseTerminal(record.phase);
+}
+
+fn rangeMatchesTransitionIdentity(
+    record: metadata.RangeRecord,
+    identity: transition_state.TransitionIdentity,
+) bool {
+    return metadata_table_manager.rangeDocIdentityShardId(record) ==
+        identity.shard_id and
+        metadata_table_manager.rangeDocIdentityRangeId(record) ==
+            identity.range_id;
+}
+
+fn rangesAreAdjacent(
+    a: metadata.RangeRecord,
+    b: metadata.RangeRecord,
+) bool {
+    if (a.end_key) |a_end| {
+        if (std.mem.eql(u8, a_end, b.start_key)) return true;
+    }
+    if (b.end_key) |b_end| {
+        if (std.mem.eql(u8, b_end, a.start_key)) return true;
+    }
+    return false;
+}
+
+fn encodeTableTransitionFence(
+    out: *[@sizeOf(u64) + @sizeOf(u32)]u8,
+    fence: TableTransitionFence,
+) void {
+    std.mem.writeInt(u64, out[0..@sizeOf(u64)], fence.generation, .little);
+    std.mem.writeInt(
+        u32,
+        out[@sizeOf(u64) .. @sizeOf(u64) + @sizeOf(u32)],
+        fence.active_count,
+        .little,
+    );
+}
+
+fn decodeTableTransitionFence(encoded: []const u8) !TableTransitionFence {
+    if (encoded.len != @sizeOf(u64) + @sizeOf(u32))
+        return error.InvalidTableTransitionFence;
+    return .{
+        .generation = std.mem.readInt(u64, encoded[0..@sizeOf(u64)], .little),
+        .active_count = std.mem.readInt(
+            u32,
+            encoded[@sizeOf(u64) .. @sizeOf(u64) + @sizeOf(u32)],
+            .little,
+        ),
+    };
 }
 
 fn transitionPhaseTerminal(phase: metadata.TransitionPhase) bool {
@@ -6048,17 +6854,51 @@ test "metadata raft apply store fences transition identity and active removal" {
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-transition-store", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
 
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = testTransitionTableRecord(),
+    });
+    defer std.testing.allocator.free(table_cmd);
+    const split_source_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            21,
+            test_transition_table_contract.source_identity,
+            "doc:a",
+            "doc:z",
+        ),
+    });
+    defer std.testing.allocator.free(split_source_cmd);
+    const merge_donor_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            31,
+            test_merge_transition_table_contract.source_identity,
+            "doc:m",
+            "doc:z",
+        ),
+    });
+    defer std.testing.allocator.free(merge_donor_cmd);
+    const merge_receiver_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            30,
+            test_merge_transition_table_contract.target_identity,
+            "doc:a",
+            "doc:m",
+        ),
+    });
+    defer std.testing.allocator.free(merge_receiver_cmd);
     const split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
-        .upsert_split_transition = .{
-            .transition_id = 501,
-            .attempt_epoch = 1,
-            .source_group_id = 21,
-            .destination_group_id = 22,
-            .phase = .bootstrap_peer,
-            .split_key = "doc:m",
-            .source_range_end = "doc:z",
-            .rollback_reason = "slow-peer",
-            .table_contract = test_transition_table_contract,
+        .admit_split_transition = .{
+            .expected_source_epoch = 0,
+            .record = .{
+                .transition_id = 501,
+                .attempt_epoch = 1,
+                .source_group_id = 21,
+                .destination_group_id = 22,
+                .phase = .prepare,
+                .split_key = "doc:m",
+                .source_range_end = "doc:z",
+                .rollback_reason = "slow-peer",
+                .table_contract = test_transition_table_contract,
+            },
         },
     });
     defer std.testing.allocator.free(split_cmd);
@@ -6067,14 +6907,18 @@ test "metadata raft apply store fences transition identity and active removal" {
             .transition_id = 601,
             .donor_group_id = 31,
             .receiver_group_id = 30,
-            .phase = .replay_deltas,
+            .phase = .prepare,
             .allow_doc_identity_reassignment = true,
-            .table_contract = test_transition_table_contract,
+            .table_contract = test_merge_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(merge_cmd);
 
     const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = split_source_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = merge_donor_cmd },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = merge_receiver_cmd },
         .{ .term = 1, .index = 7, .entry_type = .normal, .data = split_cmd },
         .{ .term = 1, .index = 8, .entry_type = .normal, .data = merge_cmd },
     });
@@ -6106,7 +6950,7 @@ test "metadata raft apply store fences transition identity and active removal" {
         try std.testing.expectEqual(@as(u64, 601), merges[0].transition_id);
         try std.testing.expect(merges[0].allow_doc_identity_reassignment);
         try std.testing.expect(merges[0].table_contract.eql(
-            test_transition_table_contract,
+            test_merge_transition_table_contract,
         ));
     }
 
@@ -6130,7 +6974,7 @@ test "metadata raft apply store fences transition identity and active removal" {
             .receiver_group_id = 30,
             .phase = .prepare,
             .allow_doc_identity_reassignment = true,
-            .table_contract = test_transition_table_contract,
+            .table_contract = test_merge_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(regressive_merge_cmd);
@@ -6141,6 +6985,14 @@ test "metadata raft apply store fences transition identity and active removal" {
         .indexes_json = test_transition_table_contract.indexes_json,
         .source_identity = test_transition_table_contract.source_identity,
         .target_identity = test_transition_table_contract.target_identity,
+    };
+    const drifted_merge_contract: metadata.TransitionTableContract = .{
+        .table_id = test_merge_transition_table_contract.table_id,
+        .table_name = test_merge_transition_table_contract.table_name,
+        .schema_json = "{\"title\":{\"type\":\"text\"}}",
+        .indexes_json = test_merge_transition_table_contract.indexes_json,
+        .source_identity = test_merge_transition_table_contract.source_identity,
+        .target_identity = test_merge_transition_table_contract.target_identity,
     };
     const contract_drift_split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_split_transition = .{
@@ -6163,7 +7015,7 @@ test "metadata raft apply store fences transition identity and active removal" {
             .receiver_group_id = 30,
             .phase = .cutover_pending,
             .allow_doc_identity_reassignment = true,
-            .table_contract = drifted_contract,
+            .table_contract = drifted_merge_contract,
         },
     });
     defer std.testing.allocator.free(contract_drift_merge_cmd);
@@ -6201,14 +7053,14 @@ test "metadata raft apply store fences transition identity and active removal" {
 
         try std.testing.expectEqual(@as(usize, 1), splits.len);
         try std.testing.expectEqual(@as(u64, 1), splits[0].attempt_epoch);
-        try std.testing.expectEqual(metadata.TransitionPhase.bootstrap_peer, splits[0].phase);
+        try std.testing.expectEqual(metadata.TransitionPhase.prepare, splits[0].phase);
         try std.testing.expect(splits[0].table_contract.eql(
             test_transition_table_contract,
         ));
         try std.testing.expectEqual(@as(usize, 1), merges.len);
-        try std.testing.expectEqual(metadata.TransitionPhase.replay_deltas, merges[0].phase);
+        try std.testing.expectEqual(metadata.TransitionPhase.prepare, merges[0].phase);
         try std.testing.expect(merges[0].table_contract.eql(
-            test_transition_table_contract,
+            test_merge_transition_table_contract,
         ));
     }
 
@@ -6233,7 +7085,7 @@ test "metadata raft apply store fences transition identity and active removal" {
             .receiver_group_id = 30,
             .phase = .finalized,
             .allow_doc_identity_reassignment = true,
-            .table_contract = test_transition_table_contract,
+            .table_contract = test_merge_transition_table_contract,
         },
     });
     defer std.testing.allocator.free(finalize_merge_cmd);
@@ -6320,16 +7172,65 @@ test "metadata raft apply store returns only durable transition deltas" {
         .table_contract = test_transition_table_contract,
     };
 
-    const split_upsert = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_split_transition = split });
+    const table_upsert = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = testTransitionTableRecord(),
+    });
+    defer std.testing.allocator.free(table_upsert);
+    const split_source_upsert = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            split.source_group_id,
+            test_transition_table_contract.source_identity,
+            "doc:a",
+            "doc:z",
+        ),
+    });
+    defer std.testing.allocator.free(split_source_upsert);
+    const merge_donor_upsert = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            merge.donor_group_id,
+            test_transition_table_contract.source_identity,
+            "doc:m",
+            "doc:z",
+        ),
+    });
+    defer std.testing.allocator.free(merge_donor_upsert);
+    const merge_receiver_upsert = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            merge.receiver_group_id,
+            test_transition_table_contract.target_identity,
+            "doc:a",
+            "doc:m",
+        ),
+    });
+    defer std.testing.allocator.free(merge_receiver_upsert);
+    const setup_entries = try raft_state_machine.encodeCommittedEntries(
+        std.testing.allocator,
+        &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_upsert },
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = split_source_upsert },
+            .{ .term = 1, .index = 3, .entry_type = .normal, .data = merge_donor_upsert },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = merge_receiver_upsert },
+        },
+    );
+    defer std.testing.allocator.free(setup_entries);
+    var setup = try store.applyCommittedBatch(41, 4, setup_entries);
+    setup.deinit();
+
+    const split_upsert = try encodeTransitionCommand(std.testing.allocator, .{
+        .admit_split_transition = .{
+            .expected_source_epoch = 0,
+            .record = split,
+        },
+    });
     defer std.testing.allocator.free(split_upsert);
     const merge_upsert = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_merge_transition = merge });
     defer std.testing.allocator.free(merge_upsert);
     const initial_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 1, .entry_type = .normal, .data = split_upsert },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = merge_upsert },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = split_upsert },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = merge_upsert },
     });
     defer std.testing.allocator.free(initial_entries);
-    var initial = try store.applyCommittedBatch(41, 2, initial_entries);
+    var initial = try store.applyCommittedBatch(41, 6, initial_entries);
     defer initial.deinit();
     try std.testing.expectEqual(@as(usize, 2), initial.transition_deltas.items.len);
     try std.testing.expectEqual(@as(u64, 701), initial.transition_deltas.items[0].upsert_split.transition_id);
@@ -6340,11 +7241,11 @@ test "metadata raft apply store returns only durable transition deltas" {
     const merge_remove = try encodeTransitionCommand(std.testing.allocator, .{ .remove_merge_transition = .{ .transition_id = 801 } });
     defer std.testing.allocator.free(merge_remove);
     const active_remove_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = split_remove },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = merge_remove },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = split_remove },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = merge_remove },
     });
     defer std.testing.allocator.free(active_remove_entries);
-    var active_remove = try store.applyCommittedBatch(41, 4, active_remove_entries);
+    var active_remove = try store.applyCommittedBatch(41, 8, active_remove_entries);
     defer active_remove.deinit();
     try std.testing.expectEqual(@as(usize, 0), active_remove.transition_deltas.items.len);
     const active_splits = try store.listSplitTransitions(std.testing.allocator, 41);
@@ -6365,22 +7266,22 @@ test "metadata raft apply store returns only durable transition deltas" {
     const merge_terminal = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_merge_transition = rolled_back_merge });
     defer std.testing.allocator.free(merge_terminal);
     const terminal_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 5, .entry_type = .normal, .data = split_terminal },
-        .{ .term = 1, .index = 6, .entry_type = .normal, .data = merge_terminal },
+        .{ .term = 1, .index = 9, .entry_type = .normal, .data = split_terminal },
+        .{ .term = 1, .index = 10, .entry_type = .normal, .data = merge_terminal },
     });
     defer std.testing.allocator.free(terminal_entries);
-    var terminal = try store.applyCommittedBatch(41, 6, terminal_entries);
+    var terminal = try store.applyCommittedBatch(41, 10, terminal_entries);
     defer terminal.deinit();
     try std.testing.expectEqual(@as(usize, 2), terminal.transition_deltas.items.len);
     try std.testing.expectEqual(metadata.TransitionPhase.rolled_back, terminal.transition_deltas.items[0].upsert_split.phase);
     try std.testing.expectEqual(metadata.TransitionPhase.rolled_back, terminal.transition_deltas.items[1].upsert_merge.phase);
 
     const terminal_remove_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 7, .entry_type = .normal, .data = split_remove },
-        .{ .term = 1, .index = 8, .entry_type = .normal, .data = merge_remove },
+        .{ .term = 1, .index = 11, .entry_type = .normal, .data = split_remove },
+        .{ .term = 1, .index = 12, .entry_type = .normal, .data = merge_remove },
     });
     defer std.testing.allocator.free(terminal_remove_entries);
-    var terminal_remove = try store.applyCommittedBatch(41, 8, terminal_remove_entries);
+    var terminal_remove = try store.applyCommittedBatch(41, 12, terminal_remove_entries);
     defer terminal_remove.deinit();
     try std.testing.expectEqual(@as(usize, 2), terminal_remove.transition_deltas.items.len);
     try std.testing.expectEqual(@as(u64, 701), terminal_remove.transition_deltas.items[0].remove_split);
@@ -6551,11 +7452,18 @@ test "metadata raft apply store admits one split epoch atomically and retries id
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-split-admission", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
 
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = testTransitionTableRecord(),
+    });
+    defer std.testing.allocator.free(table_cmd);
     const source_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_range = .{
         .group_id = 101,
-        .table_id = 10,
+        .range_id = test_transition_table_contract.source_identity.range_id,
+        .table_id = test_transition_table_contract.table_id,
         .start_key = "doc:a",
         .end_key = "doc:z",
+        .doc_identity_shard_id = test_transition_table_contract.source_identity.shard_id,
+        .doc_identity_range_id = test_transition_table_contract.source_identity.range_id,
     } });
     defer std.testing.allocator.free(source_cmd);
     const first_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .admit_split_transition = .{
@@ -6587,10 +7495,11 @@ test "metadata raft apply store admits one split epoch atomically and retries id
     } });
     defer std.testing.allocator.free(competing_cmd);
     const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 1, .entry_type = .normal, .data = source_cmd },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = first_cmd },
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = competing_cmd },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = first_cmd },
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = source_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = first_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = competing_cmd },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = first_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
 
@@ -6598,7 +7507,7 @@ test "metadata raft apply store admits one split epoch atomically and retries id
     defer store.deinit();
     try store.snapshotBuilder().applyBatch(.{
         .group_id = 21,
-        .commit_index = 4,
+        .commit_index = 5,
         .entries_bytes = encoded_entries,
     });
 
@@ -6611,6 +7520,348 @@ test "metadata raft apply store admits one split epoch atomically and retries id
     try std.testing.expectEqual(@as(usize, 1), transitions.len);
     try std.testing.expectEqual(@as(u64, 7001), transitions[0].transition_id);
     try std.testing.expectEqual(@as(u64, 1), transitions[0].attempt_epoch);
+}
+
+test "metadata raft apply store atomically fences table replacement during a range transition" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-transition-fence", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const expected = metadata.TableRecord{
+        .table_id = test_transition_table_contract.table_id,
+        .name = test_transition_table_contract.table_name,
+        .schema_json = test_transition_table_contract.schema_json,
+        .indexes_json = test_transition_table_contract.indexes_json,
+    };
+    var replacement = expected;
+    replacement.description = "replacement";
+    replacement.schema_json = "{\"title\":{\"type\":\"text\"}}";
+
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_table = expected });
+    defer std.testing.allocator.free(table_cmd);
+    const source_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            101,
+            test_transition_table_contract.source_identity,
+            "doc:a",
+            "doc:z",
+        ),
+    });
+    defer std.testing.allocator.free(source_cmd);
+    const split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .admit_split_transition = .{
+            .expected_source_epoch = 0,
+            .record = .{
+                .transition_id = 7101,
+                .attempt_epoch = 1,
+                .source_group_id = 101,
+                .destination_group_id = 102,
+                .phase = .prepare,
+                .split_key = "doc:m",
+                .source_range_end = "doc:z",
+                .table_contract = test_transition_table_contract,
+            },
+        },
+    });
+    defer std.testing.allocator.free(split_cmd);
+    const replace_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .compare_and_replace_table = .{
+            .expected = expected,
+            .replacement = replacement,
+        },
+    });
+    defer std.testing.allocator.free(replace_cmd);
+    const active_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = source_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = split_cmd },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = replace_cmd },
+    });
+    defer std.testing.allocator.free(active_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 21,
+        .commit_index = 4,
+        .entries_bytes = active_entries,
+    });
+
+    var table = (try store.getTable(std.testing.allocator, 21, expected.table_id)).?;
+    defer metadata_table_manager.freeTable(std.testing.allocator, table);
+    try std.testing.expectEqualStrings("", table.description);
+    const active_fence = try store.getTableTransitionFence(21, expected.table_id);
+    try std.testing.expectEqual(@as(u64, 1), active_fence.generation);
+    try std.testing.expectEqual(@as(u32, 1), active_fence.active_count);
+
+    const terminal_split = metadata.SplitTransitionRecord{
+        .transition_id = 7101,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 102,
+        .phase = .finalized,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+        .table_contract = test_transition_table_contract,
+    };
+    const terminal_cmd = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_split_transition = terminal_split });
+    defer std.testing.allocator.free(terminal_cmd);
+    const terminal_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = terminal_cmd },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = replace_cmd },
+    });
+    defer std.testing.allocator.free(terminal_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 21,
+        .commit_index = 6,
+        .entries_bytes = terminal_entries,
+    });
+
+    metadata_table_manager.freeTable(std.testing.allocator, table);
+    table = (try store.getTable(std.testing.allocator, 21, expected.table_id)).?;
+    try std.testing.expectEqualStrings("replacement", table.description);
+    const terminal_fence = try store.getTableTransitionFence(21, expected.table_id);
+    try std.testing.expectEqual(@as(u64, 2), terminal_fence.generation);
+    try std.testing.expectEqual(@as(u32, 0), terminal_fence.active_count);
+
+    const stale_admission_cmd = try encodeTransitionCommand(
+        std.testing.allocator,
+        .{ .admit_split_transition = .{
+            .expected_source_epoch = 1,
+            .record = .{
+                .transition_id = 7102,
+                .attempt_epoch = 2,
+                .source_group_id = 101,
+                .destination_group_id = 103,
+                .phase = .prepare,
+                .split_key = "doc:n",
+                .source_range_end = "doc:z",
+                .table_contract = test_transition_table_contract,
+            },
+        } },
+    );
+    defer std.testing.allocator.free(stale_admission_cmd);
+    const stale_admission_entries =
+        try raft_state_machine.encodeCommittedEntries(
+            std.testing.allocator,
+            &.{.{
+                .term = 1,
+                .index = 7,
+                .entry_type = .normal,
+                .data = stale_admission_cmd,
+            }},
+        );
+    defer std.testing.allocator.free(stale_admission_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 21,
+        .commit_index = 7,
+        .entries_bytes = stale_admission_entries,
+    });
+
+    const transitions = try store.listSplitTransitions(
+        std.testing.allocator,
+        21,
+    );
+    defer store.freeSplitTransitions(std.testing.allocator, transitions);
+    try std.testing.expectEqual(@as(usize, 1), transitions.len);
+    const ranges = try store.listRanges(std.testing.allocator, 21);
+    defer store.freeRanges(std.testing.allocator, ranges);
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqual(@as(u64, 1), ranges[0].split_attempt_epoch);
+
+    const donor_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            201,
+            test_transition_table_contract.source_identity,
+            "doc:m",
+            "doc:z",
+        ),
+    });
+    defer std.testing.allocator.free(donor_cmd);
+    const receiver_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            202,
+            test_transition_table_contract.target_identity,
+            "doc:a",
+            "doc:m",
+        ),
+    });
+    defer std.testing.allocator.free(receiver_cmd);
+    const stale_merge_cmd = try encodeTransitionCommand(
+        std.testing.allocator,
+        .{ .upsert_merge_transition = .{
+            .transition_id = 7201,
+            .donor_group_id = 201,
+            .receiver_group_id = 202,
+            .phase = .prepare,
+            .table_contract = test_transition_table_contract,
+        } },
+    );
+    defer std.testing.allocator.free(stale_merge_cmd);
+    const stale_merge_entries = try raft_state_machine.encodeCommittedEntries(
+        std.testing.allocator,
+        &.{
+            .{ .term = 1, .index = 8, .entry_type = .normal, .data = donor_cmd },
+            .{ .term = 1, .index = 9, .entry_type = .normal, .data = receiver_cmd },
+            .{ .term = 1, .index = 10, .entry_type = .normal, .data = stale_merge_cmd },
+        },
+    );
+    defer std.testing.allocator.free(stale_merge_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 21,
+        .commit_index = 10,
+        .entries_bytes = stale_merge_entries,
+    });
+    const merges = try store.listMergeTransitions(std.testing.allocator, 21);
+    defer store.freeMergeTransitions(std.testing.allocator, merges);
+    try std.testing.expectEqual(@as(usize, 0), merges.len);
+}
+
+test "metadata raft apply store table removal requires the observed inactive transition generation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/metadata-table-removal-transition-fence",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root);
+
+    const table = metadata.TableRecord{
+        .table_id = test_transition_table_contract.table_id,
+        .name = test_transition_table_contract.table_name,
+        .schema_json = test_transition_table_contract.schema_json,
+        .indexes_json = test_transition_table_contract.indexes_json,
+    };
+    const table_cmd = try encodeTransitionCommand(
+        std.testing.allocator,
+        .{ .upsert_table = table },
+    );
+    defer std.testing.allocator.free(table_cmd);
+    const source_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            101,
+            test_transition_table_contract.source_identity,
+            "doc:a",
+            "doc:z",
+        ),
+    });
+    defer std.testing.allocator.free(source_cmd);
+    const split = metadata.SplitTransitionRecord{
+        .transition_id = 7301,
+        .attempt_epoch = 1,
+        .source_group_id = 101,
+        .destination_group_id = 102,
+        .phase = .prepare,
+        .split_key = "doc:m",
+        .source_range_end = "doc:z",
+        .table_contract = test_transition_table_contract,
+    };
+    const split_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .admit_split_transition = .{
+            .expected_source_epoch = 0,
+            .record = split,
+        },
+    });
+    defer std.testing.allocator.free(split_cmd);
+    const generation_zero_remove = try encodeTransitionCommand(
+        std.testing.allocator,
+        .{ .remove_table = .{
+            .table_id = table.table_id,
+            .expected_transition_generation = 0,
+        } },
+    );
+    defer std.testing.allocator.free(generation_zero_remove);
+
+    const active_entries = try raft_state_machine.encodeCommittedEntries(
+        std.testing.allocator,
+        &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = source_cmd },
+            .{ .term = 1, .index = 3, .entry_type = .normal, .data = split_cmd },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = generation_zero_remove },
+        },
+    );
+    defer std.testing.allocator.free(active_entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 22,
+        .commit_index = 4,
+        .entries_bytes = active_entries,
+    });
+    var current = (try store.getTable(
+        std.testing.allocator,
+        22,
+        table.table_id,
+    )).?;
+    metadata_table_manager.freeTable(std.testing.allocator, current);
+
+    var terminal_split = split;
+    terminal_split.phase = .finalized;
+    const terminal_cmd = try encodeTransitionCommand(
+        std.testing.allocator,
+        .{ .upsert_split_transition = terminal_split },
+    );
+    defer std.testing.allocator.free(terminal_cmd);
+    const stale_remove = try encodeTransitionCommand(
+        std.testing.allocator,
+        .{ .remove_table = .{
+            .table_id = table.table_id,
+            .expected_transition_generation = 1,
+        } },
+    );
+    defer std.testing.allocator.free(stale_remove);
+    const current_remove = try encodeTransitionCommand(
+        std.testing.allocator,
+        .{ .remove_table = .{
+            .table_id = table.table_id,
+            .expected_transition_generation = 2,
+        } },
+    );
+    defer std.testing.allocator.free(current_remove);
+    const terminal_entries = try raft_state_machine.encodeCommittedEntries(
+        std.testing.allocator,
+        &.{
+            .{ .term = 1, .index = 5, .entry_type = .normal, .data = terminal_cmd },
+            .{ .term = 1, .index = 6, .entry_type = .normal, .data = stale_remove },
+        },
+    );
+    defer std.testing.allocator.free(terminal_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 22,
+        .commit_index = 6,
+        .entries_bytes = terminal_entries,
+    });
+    current = (try store.getTable(
+        std.testing.allocator,
+        22,
+        table.table_id,
+    )).?;
+    metadata_table_manager.freeTable(std.testing.allocator, current);
+
+    const remove_entries = try raft_state_machine.encodeCommittedEntries(
+        std.testing.allocator,
+        &.{.{
+            .term = 1,
+            .index = 7,
+            .entry_type = .normal,
+            .data = current_remove,
+        }},
+    );
+    defer std.testing.allocator.free(remove_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 22,
+        .commit_index = 7,
+        .entries_bytes = remove_entries,
+    });
+    try std.testing.expect((try store.getTable(
+        std.testing.allocator,
+        22,
+        table.table_id,
+    )) == null);
 }
 
 test "metadata raft apply store ignores stale drained first store registration after cancellation" {
@@ -7518,6 +8769,7 @@ test "metadata schema progress transition command round-trips" {
 test "metadata reallocation request transition command round-trips" {
     const encoded = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_reallocation_request = .{
+            .request_id = 17,
             .requested_at_ms = 42_000,
         },
     });
@@ -7528,7 +8780,25 @@ test "metadata reallocation request transition command round-trips" {
 
     switch (decoded) {
         .upsert_reallocation_request => |record| {
+            try std.testing.expectEqual(@as(u128, 17), record.request_id);
             try std.testing.expectEqual(@as(u64, 42_000), record.requested_at_ms);
+        },
+        else => return error.InvalidMetadataTransitionEncoding,
+    }
+
+    const remove_encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_reallocation_request = .{
+            .expected_request_id = 17,
+        },
+    });
+    defer std.testing.allocator.free(remove_encoded);
+
+    var remove_decoded = (try decodeTransitionCommand(std.testing.allocator, remove_encoded)) orelse
+        return error.InvalidMetadataTransitionEncoding;
+    defer remove_decoded.deinit(std.testing.allocator);
+    switch (remove_decoded) {
+        .remove_reallocation_request => |record| {
+            try std.testing.expectEqual(@as(u128, 17), record.expected_request_id);
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
@@ -7764,31 +9034,6 @@ test "metadata replication source status transition command round-trips" {
         &([_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length),
         &decoded.?.upsert_replication_source_status.cutover_provider_identity,
     );
-
-    var pre_provider_decoded = try decodeTransitionCommand(
-        std.testing.allocator,
-        encoded[0 .. encoded.len - std.crypto.hash.sha2.Sha256.digest_length],
-    );
-    defer if (pre_provider_decoded) |*d| d.deinit(std.testing.allocator);
-    try std.testing.expectEqual(
-        @as(u64, 0x3344),
-        pre_provider_decoded.?.upsert_replication_source_status.cutover_authority_id,
-    );
-    try std.testing.expect(std.mem.allEqual(
-        u8,
-        &pre_provider_decoded.?.upsert_replication_source_status.cutover_provider_identity,
-        0,
-    ));
-
-    var legacy_decoded = try decodeTransitionCommand(
-        std.testing.allocator,
-        encoded[0 .. encoded.len - std.crypto.hash.sha2.Sha256.digest_length - @sizeOf(u64)],
-    );
-    defer if (legacy_decoded) |*d| d.deinit(std.testing.allocator);
-    try std.testing.expectEqual(
-        @as(u64, 0),
-        legacy_decoded.?.upsert_replication_source_status.cutover_authority_id,
-    );
 }
 
 test "metadata shuffle join lease transition command round-trips" {
@@ -7911,20 +9156,46 @@ test "metadata raft apply store projects replication source status records from 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-replication-source-status-store", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
 
+    const replication_sources_json =
+        "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]";
     const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_table = .{
             .table_id = 41,
             .name = "docs",
-            .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]",
+            .replication_sources_json = replication_sources_json,
         },
     });
     defer std.testing.allocator.free(table_cmd);
+    const claim_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = replication_sources_json,
+            .expected_authority_id = 0,
+            .record = .{
+                .table_id = 41,
+                .source_ordinal = 0,
+                .source_kind = "postgres",
+                .external_table = "users",
+                .cutover_mode = "exported_snapshot_pending",
+                .slot_name = "docs_af_0000000000001122_0000000000003344",
+                .publication_name = "docs_pub_af_0000000000001122_0000000000003344",
+                .phase = "cutover_preparing",
+                .cutover_intent_id = 0x1122,
+                .cutover_authority_id = 0x3344,
+                .cutover_provider_identity = [_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length,
+                .cutover_config_fingerprint = [_]u8{0x33} ** std.crypto.hash.sha2.Sha256.digest_length,
+            },
+        },
+    });
+    defer std.testing.allocator.free(claim_cmd);
     const status_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_replication_source_status = .{
             .table_id = 41,
             .source_ordinal = 0,
             .source_kind = "postgres",
             .external_table = "users",
+            .cutover_mode = "exported_snapshot",
+            .slot_name = "docs_af_0000000000001122_0000000000003344",
+            .publication_name = "docs_pub_af_0000000000001122_0000000000003344",
             .phase = "streaming",
             .checkpoint = "lsn:0/16B6B10",
             .prepared_checkpoint = "lsn:0/16B6A50",
@@ -7947,7 +9218,8 @@ test "metadata raft apply store projects replication source status records from 
 
     const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = status_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = claim_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = status_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
 
@@ -7956,7 +9228,7 @@ test "metadata raft apply store projects replication source status records from 
         defer store.deinit();
         try store.snapshotBuilder().applyBatch(.{
             .group_id = 41,
-            .commit_index = 2,
+            .commit_index = 3,
             .entries_bytes = encoded_entries,
         });
     }
@@ -8008,6 +9280,300 @@ test "metadata raft apply store projects replication source status records from 
             &point_status.cutover_provider_identity,
         );
     }
+}
+
+test "metadata raft apply store fences exact cutover authority and retirement" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/metadata-cutover-authority-cas",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(root);
+
+    const group_id: u64 = 41;
+    const replication_sources_json =
+        "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]";
+    const fingerprint =
+        [_]u8{0x33} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const provider =
+        [_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const authority_a = metadata.ReplicationSourceStatusRecord{
+        .table_id = 41,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .external_table = "users",
+        .cutover_mode = "exported_snapshot_pending",
+        .slot_name = "docs_af_0000000000000011_00000000000000a1",
+        .publication_name = "docs_pub_af_0000000000000011_00000000000000a1",
+        .phase = "cutover_preparing",
+        .cutover_intent_id = 0x11,
+        .cutover_authority_id = 0xa1,
+        .cutover_config_fingerprint = fingerprint,
+        .cutover_provider_identity = provider,
+    };
+    var authority_b = authority_a;
+    authority_b.slot_name =
+        "docs_af_0000000000000011_00000000000000b2";
+    authority_b.publication_name =
+        "docs_pub_af_0000000000000011_00000000000000b2";
+    authority_b.cutover_authority_id = 0xb2;
+    authority_b.retired_cutover_authority_id =
+        authority_a.cutover_authority_id;
+    authority_b.retired_slot_name = authority_a.slot_name;
+    authority_b.retired_publication_name = authority_a.publication_name;
+    var authority_c = authority_b;
+    authority_c.slot_name =
+        "docs_af_0000000000000011_00000000000000c3";
+    authority_c.publication_name =
+        "docs_pub_af_0000000000000011_00000000000000c3";
+    authority_c.cutover_authority_id = 0xc3;
+    authority_c.retired_cutover_authority_id =
+        authority_b.cutover_authority_id;
+    authority_c.retired_slot_name = authority_b.slot_name;
+    authority_c.retired_publication_name = authority_b.publication_name;
+
+    const Apply = struct {
+        fn command(
+            inner_alloc: std.mem.Allocator,
+            store: *RaftApplyStore,
+            metadata_group_id: u64,
+            index: u64,
+            value: TransitionCommand,
+        ) !void {
+            const encoded = try encodeTransitionCommand(inner_alloc, value);
+            defer inner_alloc.free(encoded);
+            const entries = try raft_state_machine.encodeCommittedEntries(
+                inner_alloc,
+                &.{.{
+                    .term = 1,
+                    .index = index,
+                    .entry_type = .normal,
+                    .data = encoded,
+                }},
+            );
+            defer inner_alloc.free(entries);
+            try store.snapshotBuilder().applyBatch(.{
+                .group_id = metadata_group_id,
+                .commit_index = index,
+                .entries_bytes = entries,
+            });
+        }
+    };
+
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    try Apply.command(alloc, &store, group_id, 1, .{
+        .upsert_table = .{
+            .table_id = 41,
+            .name = "docs",
+            .replication_sources_json = replication_sources_json,
+        },
+    });
+    try Apply.command(alloc, &store, group_id, 2, .{
+        .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = replication_sources_json,
+            .expected_authority_id = 0,
+            .record = authority_a,
+        },
+    });
+    try Apply.command(alloc, &store, group_id, 3, .{
+        .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = replication_sources_json,
+            .expected_authority_id = authority_a.cutover_authority_id,
+            .record = authority_b,
+        },
+    });
+
+    // A third authority cannot hide B's pending retirement obligation.
+    try Apply.command(alloc, &store, group_id, 4, .{
+        .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = replication_sources_json,
+            .expected_authority_id = authority_b.cutover_authority_id,
+            .record = authority_c,
+        },
+    });
+    var stale_a = authority_a;
+    stale_a.phase = "streaming";
+    try Apply.command(alloc, &store, group_id, 5, .{
+        .upsert_replication_source_status = stale_a,
+    });
+    var malformed_retirement_b = authority_b;
+    malformed_retirement_b.retired_slot_name = "unowned_slot";
+    try Apply.command(alloc, &store, group_id, 6, .{
+        .upsert_replication_source_status = malformed_retirement_b,
+    });
+    {
+        const current = (try store.getReplicationSourceStatus(
+            alloc,
+            group_id,
+            41,
+            0,
+        )).?;
+        defer metadata_table_manager.freeReplicationSourceStatus(
+            alloc,
+            current,
+        );
+        try std.testing.expectEqual(
+            authority_b.cutover_authority_id,
+            current.cutover_authority_id,
+        );
+        try std.testing.expectEqual(
+            authority_a.cutover_authority_id,
+            current.retired_cutover_authority_id,
+        );
+        try std.testing.expectEqualStrings(
+            authority_a.slot_name,
+            current.retired_slot_name,
+        );
+    }
+
+    var failed_b = authority_b;
+    failed_b.phase = "failed";
+    failed_b.failure_class = "retryable";
+    failed_b.last_error = "ExactCutoverCleanupPending";
+    try Apply.command(alloc, &store, group_id, 7, .{
+        .upsert_replication_source_status = failed_b,
+    });
+    try Apply.command(alloc, &store, group_id, 8, .{
+        .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = replication_sources_json,
+            .expected_authority_id = authority_b.cutover_authority_id,
+            .record = authority_b,
+        },
+    });
+    {
+        const current = (try store.getReplicationSourceStatus(
+            alloc,
+            group_id,
+            41,
+            0,
+        )).?;
+        defer metadata_table_manager.freeReplicationSourceStatus(
+            alloc,
+            current,
+        );
+        try std.testing.expectEqualStrings("cutover_preparing", current.phase);
+        try std.testing.expectEqual(
+            authority_a.cutover_authority_id,
+            current.retired_cutover_authority_id,
+        );
+    }
+
+    var advanced_b = authority_b;
+    advanced_b.phase = "snapshot";
+    advanced_b.prepared_checkpoint = "lsn:1";
+    try Apply.command(alloc, &store, group_id, 9, .{
+        .upsert_replication_source_status = advanced_b,
+    });
+    try Apply.command(alloc, &store, group_id, 10, .{
+        .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = replication_sources_json,
+            .expected_authority_id = authority_b.cutover_authority_id,
+            .record = authority_b,
+        },
+    });
+    {
+        const current = (try store.getReplicationSourceStatus(
+            alloc,
+            group_id,
+            41,
+            0,
+        )).?;
+        defer metadata_table_manager.freeReplicationSourceStatus(
+            alloc,
+            current,
+        );
+        try std.testing.expectEqualStrings("snapshot", current.phase);
+        try std.testing.expectEqualStrings(
+            "lsn:1",
+            current.prepared_checkpoint,
+        );
+    }
+
+    var retired_b = authority_b;
+    retired_b.retired_cutover_authority_id = 0;
+    retired_b.retired_slot_name = "";
+    retired_b.retired_publication_name = "";
+    retired_b.phase = "snapshot";
+    retired_b.prepared_checkpoint = "lsn:1";
+    // Ordinary progress publication cannot erase a provider cleanup
+    // obligation, even from the current authority.
+    try Apply.command(alloc, &store, group_id, 11, .{
+        .upsert_replication_source_status = retired_b,
+    });
+    {
+        const current = (try store.getReplicationSourceStatus(
+            alloc,
+            group_id,
+            41,
+            0,
+        )).?;
+        defer metadata_table_manager.freeReplicationSourceStatus(
+            alloc,
+            current,
+        );
+        try std.testing.expectEqual(
+            authority_a.cutover_authority_id,
+            current.retired_cutover_authority_id,
+        );
+    }
+    try Apply.command(alloc, &store, group_id, 12, .{
+        .complete_replication_source_retirement = advanced_b,
+    });
+    try Apply.command(alloc, &store, group_id, 13, .{
+        .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = "[]",
+            .expected_authority_id = authority_b.cutover_authority_id,
+            .record = authority_c,
+        },
+    });
+    {
+        const current = (try store.getReplicationSourceStatus(
+            alloc,
+            group_id,
+            41,
+            0,
+        )).?;
+        defer metadata_table_manager.freeReplicationSourceStatus(
+            alloc,
+            current,
+        );
+        try std.testing.expectEqual(
+            authority_b.cutover_authority_id,
+            current.cutover_authority_id,
+        );
+        try std.testing.expectEqual(
+            @as(u64, 0),
+            current.retired_cutover_authority_id,
+        );
+        try std.testing.expectEqualStrings("snapshot", current.phase);
+    }
+
+    try Apply.command(alloc, &store, group_id, 14, .{
+        .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = replication_sources_json,
+            .expected_authority_id = authority_b.cutover_authority_id,
+            .record = authority_c,
+        },
+    });
+    const current = (try store.getReplicationSourceStatus(
+        alloc,
+        group_id,
+        41,
+        0,
+    )).?;
+    defer metadata_table_manager.freeReplicationSourceStatus(alloc, current);
+    try std.testing.expectEqual(
+        authority_c.cutover_authority_id,
+        current.cutover_authority_id,
+    );
+    try std.testing.expectEqual(
+        authority_b.cutover_authority_id,
+        current.retired_cutover_authority_id,
+    );
 }
 
 test "metadata raft apply store transition codec preserves exact raft voter identity" {
@@ -8214,14 +9780,46 @@ test "metadata state machine projects transitions through metadata apply store" 
         .snapshot_builder = store.snapshotBuilder(),
     };
 
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = testTransitionTableRecord(),
+    });
+    defer std.testing.allocator.free(table_cmd);
+    const source_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            41,
+            test_transition_table_contract.source_identity,
+            "a",
+            "z",
+        ),
+    });
+    defer std.testing.allocator.free(source_cmd);
+    const setup_entries = try raft_state_machine.encodeCommittedEntries(
+        std.testing.allocator,
+        &.{
+            .{ .term = 3, .index = 10, .entry_type = .normal, .data = table_cmd },
+            .{ .term = 3, .index = 11, .entry_type = .normal, .data = source_cmd },
+        },
+    );
+    defer std.testing.allocator.free(setup_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 41,
+        .commit_index = 11,
+        .entries_bytes = setup_entries,
+    });
+
     const cmd = try encodeTransitionCommand(std.testing.allocator, .{
-        .upsert_split_transition = .{
-            .transition_id = 701,
-            .attempt_epoch = 1,
-            .source_group_id = 41,
-            .destination_group_id = 42,
-            .phase = .bootstrap_peer,
-            .table_contract = test_transition_table_contract,
+        .admit_split_transition = .{
+            .expected_source_epoch = 0,
+            .record = .{
+                .transition_id = 701,
+                .attempt_epoch = 1,
+                .source_group_id = 41,
+                .destination_group_id = 42,
+                .phase = .prepare,
+                .split_key = "m",
+                .source_range_end = "z",
+                .table_contract = test_transition_table_contract,
+            },
         },
     });
     defer std.testing.allocator.free(cmd);
@@ -8395,14 +9993,7 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
     defer layout.deinit(std.testing.allocator);
 
     const cmd = try encodeTransitionCommand(std.testing.allocator, .{
-        .upsert_split_transition = .{
-            .transition_id = 902,
-            .attempt_epoch = 1,
-            .source_group_id = 51,
-            .destination_group_id = 52,
-            .phase = .bootstrap_peer,
-            .table_contract = test_transition_table_contract,
-        },
+        .upsert_table = testTransitionTableRecord(),
     });
     defer std.testing.allocator.free(cmd);
 
@@ -8469,12 +10060,17 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
         const batch = (try store.latestBatch(202)) orelse return error.MissingMetadataBatch;
         try std.testing.expectEqual(@as(u64, 1), batch.commit_index);
 
-        const splits = try store.listSplitTransitions(std.testing.allocator, 202);
-        defer store.freeSplitTransitions(std.testing.allocator, splits);
-        try std.testing.expectEqual(@as(usize, 1), splits.len);
-        try std.testing.expectEqual(@as(u64, 902), splits[0].transition_id);
-        try std.testing.expectEqual(@as(u64, 51), splits[0].source_group_id);
-        try std.testing.expectEqual(@as(u64, 52), splits[0].destination_group_id);
+        const tables = try store.listTables(std.testing.allocator, 202);
+        defer store.freeTables(std.testing.allocator, tables);
+        try std.testing.expectEqual(@as(usize, 1), tables.len);
+        try std.testing.expectEqual(
+            test_transition_table_contract.table_id,
+            tables[0].table_id,
+        );
+        try std.testing.expectEqualStrings(
+            test_transition_table_contract.table_name,
+            tables[0].name,
+        );
     }
 }
 const restore_job_logical_prefix = "\x00\x00__api_restore_jobs__:";

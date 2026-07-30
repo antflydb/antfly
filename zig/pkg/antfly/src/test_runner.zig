@@ -85,6 +85,10 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (missing_filter_count != 0) {
         std.process.exit(1);
     }
+    if (total_count == 0) {
+        std.debug.print("test selection matched no runnable tests\n", .{});
+        std.process.exit(1);
+    }
 
     const trace_cleanup = getenvBool("ANTFLY_TEST_CLEANUP_TRACE");
     var current_count: usize = 0;
@@ -178,6 +182,9 @@ fn appendFilter(
     count: *usize,
     filter: []const u8,
 ) void {
+    if (filter.len == 0) {
+        std.debug.panic("missing value for {s}", .{kind});
+    }
     if (count.* >= max_filters) {
         std.debug.panic("too many {s} arguments", .{kind});
     }

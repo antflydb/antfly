@@ -10014,15 +10014,15 @@ components:
         - $setOnInsert
         - $unset
         - $inc
-        - $push
-        - $pull
         - $addToSet
-        - $pop
-        - $mul
-        - $min
         - $max
-        - $currentDate
-        - $rename
+      x-enum-varnames:
+        - SET
+        - SET_ON_INSERT
+        - UNSET
+        - INC
+        - ADD_TO_SET
+        - MAX
       description: MongoDB-style update operator
     TransformOp:
       type: object
@@ -10037,8 +10037,7 @@ components:
           description: JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
           example: $.views
         value:
-          description: Value for operation (not required for $unset, $currentDate). Type depends on operator
-            (number for $inc/$mul, any for $set/$setOnInsert, etc.)
+          description: Value for operation (not required for $unset). Type depends on the supported operator.
     Transform:
       type: object
       required:
@@ -10075,8 +10074,9 @@ components:
           - op: $inc
             path: $.views
             value: 1
-          - op: $currentDate
+          - op: $set
             path: $.lastViewed
+            value: '2026-07-28T12:00:00Z'
     ScanKeysRequest:
       type: object
       description: >
@@ -10284,16 +10284,16 @@ components:
 
             - Multiple operations per document are applied in sequence
 
-            - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more
+            - Supports numeric and set-like operations ($inc, $max, $addToSet)
 
 
             Common use cases:
 
             - Increment counters (views, likes, votes)
 
-            - Update timestamps ($currentDate)
+            - Update timestamps ($set)
 
-            - Manage arrays (add/remove tags, items)
+            - Add unique array values ($addToSet)
 
             - Update nested fields without overwriting the entire document
           items:
@@ -10304,11 +10304,12 @@ components:
                 - op: $inc
                   path: $.views
                   value: 1
-                - op: $currentDate
+                - op: $set
                   path: $.lastViewed
+                  value: '2026-07-28T12:00:00Z'
             - key: user:456
               operations:
-                - op: $push
+                - op: $addToSet
                   path: $.tags
                   value: vip
         sync_level:
@@ -11890,6 +11891,13 @@ components:
         **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
 
         call, using the queries to determine available tables and indexes.
+
+
+        Authenticated row filters are enforced on every initial and generated
+
+        operation in both modes, including scans, aggregates, and graph/tree
+
+        traversal. They cannot be replaced or weakened by model tool arguments.
       required:
         - query
         - queries
@@ -11911,6 +11919,19 @@ components:
             In pipeline mode (max_internal_iterations=0), these are executed directly.
 
             In agentic mode, these declare which table and indexes are available.
+
+
+            `filter_query` and `exclusion_query` are mandatory table predicates
+
+            for retrieval-agent execution. Predicates declared by any query for
+
+            a table are conjoined (or unioned for exclusions) and applied to
+
+            every initial query, generated refinement, probe, aggregation,
+
+            graph/tree traversal, root scan, and follow-up for that table.
+
+            They cannot be weakened by generated operations.
           example:
             - table: docs
               semantic_search: How do I configure OAuth?
@@ -11935,13 +11956,17 @@ components:
           items:
             $ref: '#/components/schemas/FilterSpec'
           description: >
-            Pre-applied filters from prior interactions. These are applied to
+            Mandatory filters from prior interactions. These are converted to
 
-            all search tool invocations.
+            structured Antfly predicates and applied to every table and every
+
+            search tool invocation, including generated follow-ups, graph/tree
+
+            traversal, aggregations, and root scans.
         session_id:
           type: string
-          description: Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed
-            back to the client but does not imply server-side session persistence.
+          description: Correlation identifier for a bounded agent interaction. This is echoed back to
+            the client and does not imply server-side session persistence.
         decisions:
           type: array
           items:
@@ -14599,9 +14624,8 @@ components:
         op:
           type: string
           description: >
-            Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
-
-            `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`.
+            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$addToSet`,
+            `$max`.
 
             Replication-specific: `$merge` (flatten JSONB into top-level fields),
 
@@ -19785,6 +19809,8 @@ components:
         max_depth:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 64
           description: Maximum traversal depth
         min_weight:
           x-go-type-skip-optional-pointer: true
@@ -19799,6 +19825,8 @@ components:
         max_results:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 10000
           description: Maximum number of results (traversal)
         deduplicate_nodes:
           x-go-type-skip-optional-pointer: true
@@ -19813,6 +19841,8 @@ components:
         k:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 100
           description: Number of paths to find (k-shortest-paths)
         node_filter:
           $ref: '#/components/schemas/NodeFilter'
@@ -19999,6 +20029,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: Document key
+        table:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Owning table for a cross-table node; omitted for nodes in the queried table
         depth:
           x-go-type-skip-optional-pointer: true
           type: integer

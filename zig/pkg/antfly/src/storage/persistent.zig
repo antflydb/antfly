@@ -479,6 +479,12 @@ const AtomicSegmentSink = struct {
         try self.flush();
         return try self.writer.crc32Prefix(len_prefix);
     }
+
+    fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        try self.flush();
+        return try self.writer.crc32Range(offset, range_len);
+    }
 };
 
 const atomic_segment_sink_vtable = segment_mod.SegmentSink.VTable{
@@ -488,6 +494,7 @@ const atomic_segment_sink_vtable = segment_mod.SegmentSink.VTable{
     .append_ntimes = AtomicSegmentSink.appendNTimes,
     .write_at = AtomicSegmentSink.writeAt,
     .crc32_prefix = AtomicSegmentSink.crc32Prefix,
+    .crc32_range = AtomicSegmentSink.crc32Range,
 };
 
 fn walCommitBackendForOptions(backend: lmdb.CommitBackend) wal_mod.CommitBackend {
@@ -1783,7 +1790,7 @@ pub const PersistentIndex = struct {
                 var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
                 defer reader.deinit();
                 for (0..reader.doc_count) |doc_idx| {
-                    const stored = reader.storedDoc(@intCast(doc_idx)) orelse continue;
+                    const stored = (try reader.storedDoc(@intCast(doc_idx))) orelse continue;
                     try doc_keys.append(alloc, try alloc.dupe(u8, stored.id));
                 }
             }
@@ -2599,7 +2606,7 @@ fn extractSegmentKeyRange(alloc: Allocator, segment_bytes: []const u8) !SegmentK
 
     if (reader.doc_count == 0) return error.EmptySegment;
 
-    if (reader.storedFieldsOmitted()) {
+    if (try reader.storedFieldsOmitted()) {
         const range = (try reader.docKeyRange()) orelse return error.InvalidSegment;
         const min_doc_key = try alloc.dupe(u8, range.min_key);
         errdefer alloc.free(min_doc_key);
@@ -2617,7 +2624,7 @@ fn extractSegmentKeyRange(alloc: Allocator, segment_bytes: []const u8) !SegmentK
     errdefer if (max_key) |key| alloc.free(key);
 
     for (0..reader.doc_count) |doc_idx| {
-        const stored = reader.storedDoc(@intCast(doc_idx)) orelse continue;
+        const stored = (try reader.storedDoc(@intCast(doc_idx))) orelse continue;
         if (min_key == null or std.mem.order(u8, stored.id, min_key.?) == .lt) {
             if (min_key) |key| alloc.free(key);
             min_key = try alloc.dupe(u8, stored.id);
@@ -3395,7 +3402,7 @@ test "persistent index snapshots use mapped segment files when native storage is
     const snap = idx.snapshot();
     try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
     try std.testing.expect(snap.segments[0].data.isFileBacked());
-    try std.testing.expectEqualStrings("doc:a", snap.storedDoc(0).?.id);
+    try std.testing.expectEqualStrings("doc:a", (try snap.storedDoc(0)).?.id);
 }
 
 test "persistent index deletes replaced segment files only after retained snapshot release" {

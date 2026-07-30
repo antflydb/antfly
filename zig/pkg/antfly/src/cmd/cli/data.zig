@@ -35,14 +35,15 @@ pub fn insert(allocator: std.mem.Allocator, _: std.Io, client: *antfly_client.An
             table_name = args.next();
         } else if (std.mem.eql(u8, arg, "--key")) {
             key = args.next();
-        } else if (std.mem.eql(u8, arg, "--value")) {
+        } else if (std.mem.eql(u8, arg, "--document") or std.mem.eql(u8, arg, "--value")) {
+            if (value_json != null) cli.fatal("use only one of --document or --value", .{});
             value_json = args.next();
         }
     }
 
     const tbl = table_name orelse cli.fatal("--table is required", .{});
     const k = key orelse cli.fatal("--key is required", .{});
-    const v = value_json orelse cli.fatal("--value is required", .{});
+    const v = value_json orelse cli.fatal("--document is required", .{});
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, v, .{});
     defer parsed.deinit();

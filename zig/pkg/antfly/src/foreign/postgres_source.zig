@@ -563,6 +563,7 @@ pub const RuntimeSource = struct {
         var owned_params = foreign_source.ReplicationCleanupParams{
             .slot_name = slot_name,
             .publication_name = publication_name,
+            .execution_deadline_ns = params.execution_deadline_ns,
         };
         defer owned_params.deinit(alloc);
         return try self.executor.cleanupReplication(alloc, self.dsn, owned_params);
@@ -1043,12 +1044,16 @@ fn cloneReplicationPollParamsAlloc(
     var out = foreign_source.ReplicationPollParams{
         .table = try alloc.dupe(u8, params.table),
         .limit = params.limit,
+        .execution_deadline_ns = params.execution_deadline_ns,
         .reclaim_exact_cutover_slot = params.reclaim_exact_cutover_slot,
         .exact_cutover_intent = params.exact_cutover_intent,
     };
     errdefer out.deinit(alloc);
     out.slot_name = if (params.slot_name) |slot_name| try alloc.dupe(u8, slot_name) else null;
     out.publication_name = if (params.publication_name) |publication_name| try alloc.dupe(u8, publication_name) else null;
+    out.cutover_lock_name = if (params.cutover_lock_name) |name| try alloc.dupe(u8, name) else null;
+    out.retired_slot_name = if (params.retired_slot_name) |name| try alloc.dupe(u8, name) else null;
+    out.retired_publication_name = if (params.retired_publication_name) |name| try alloc.dupe(u8, name) else null;
     out.filter_query_json = if (params.filter_query_json) |query| try alloc.dupe(u8, query) else null;
     out.checkpoint = if (params.checkpoint) |checkpoint| try alloc.dupe(u8, checkpoint) else null;
     return out;

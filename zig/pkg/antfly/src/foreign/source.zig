@@ -195,9 +195,19 @@ pub const ExactCutoverIntent = struct {
         ptr: *anyopaque,
         provider_identity: ProviderIdentity,
     ) anyerror!void,
+    check_fn: *const fn (ptr: *anyopaque) anyerror!void,
+    retirement_complete_fn: *const fn (ptr: *anyopaque) anyerror!void,
 
     pub fn persist(self: @This(), provider_identity: ProviderIdentity) !void {
         try self.persist_fn(self.ptr, provider_identity);
+    }
+
+    pub fn check(self: @This()) !void {
+        try self.check_fn(self.ptr);
+    }
+
+    pub fn retirementComplete(self: @This()) !void {
+        try self.retirement_complete_fn(self.ptr);
     }
 };
 
@@ -205,9 +215,13 @@ pub const ReplicationPollParams = struct {
     table: []u8,
     slot_name: ?[]u8 = null,
     publication_name: ?[]u8 = null,
+    cutover_lock_name: ?[]u8 = null,
+    retired_slot_name: ?[]u8 = null,
+    retired_publication_name: ?[]u8 = null,
     filter_query_json: ?[]u8 = null,
     checkpoint: ?[]u8 = null,
     limit: ?usize = null,
+    execution_deadline_ns: ?u64 = null,
     /// A replicated pending intent proves that this attempt-scoped physical
     /// slot belongs to an interrupted exact cutover and may be reclaimed.
     /// Never set this based only on a configured/provider-visible name.
@@ -218,6 +232,9 @@ pub const ReplicationPollParams = struct {
         alloc.free(self.table);
         if (self.slot_name) |slot_name| alloc.free(slot_name);
         if (self.publication_name) |publication_name| alloc.free(publication_name);
+        if (self.cutover_lock_name) |name| alloc.free(name);
+        if (self.retired_slot_name) |name| alloc.free(name);
+        if (self.retired_publication_name) |name| alloc.free(name);
         if (self.filter_query_json) |query| alloc.free(query);
         if (self.checkpoint) |checkpoint| alloc.free(checkpoint);
         self.* = undefined;
@@ -251,6 +268,7 @@ pub const ReplicationPrepareResult = struct {
 pub const ReplicationCleanupParams = struct {
     slot_name: []u8,
     publication_name: []u8,
+    execution_deadline_ns: ?u64 = null,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.slot_name);

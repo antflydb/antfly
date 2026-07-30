@@ -19,6 +19,7 @@ from __future__ import annotations
 import threading
 import time
 import json
+import pytest
 import requests
 
 from helpers import wait_until
@@ -275,6 +276,36 @@ def test_transform_multiple_operators(stateful_api):
     assert set(doc["tags"]) == {"initial", "updated"}
     assert doc["metadata"]["created"] is True
     assert doc["metadata"]["lastUpdated"] == "2025-01-26"
+
+
+@pytest.mark.parametrize(
+    "operator",
+    ("$push", "$pull", "$pop", "$mul", "$min", "$currentDate", "$rename"),
+)
+def test_unsupported_transform_is_rejected_without_partial_mutation(stateful_api, operator):
+    table_name = f"transforms_unsupported_{time.time_ns()}"
+    stateful_api.create_table(table_name, num_shards=1)
+    stateful_api.batch_write(
+        table_name,
+        inserts={"item": {"version": 1}},
+        sync_level="write",
+    )
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        stateful_api.batch_write(
+            table_name,
+            transforms=[
+                _transform(
+                    "item",
+                    _op("$set", "partially_changed", True),
+                    _op(operator, "version", 2),
+                )
+            ],
+            sync_level="write",
+        )
+    assert exc_info.value.response.status_code == 400
+
+    assert stateful_api.lookup_key(table_name, "item") == {"version": 1}
 
 
 def test_serverless_table_transforms_follow_latest_then_published(serverless_api):
