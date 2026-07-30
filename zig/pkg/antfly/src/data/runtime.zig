@@ -576,6 +576,7 @@ const IndexRepairRoutingIndex = struct {
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
+    experimental: bool = false,
     bind_host: ?[]const u8 = null,
     bind_port: ?u16 = null,
     health_enabled: ?bool = null,
@@ -14042,6 +14043,7 @@ pub fn runFromIterator(
         } else null,
         .api_server_cfg = .{
             .auth_enabled = effective_auth_enabled,
+            .experimental = cli.experimental,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
             .ard_base_url = cli.ard_base_url,
@@ -14118,6 +14120,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             cfg.help = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--experimental")) {
+            cfg.experimental = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--config")) {
@@ -14508,6 +14514,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --raft-port <port>             Data raft bind port (default: 0 when registered)
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
+        \\  --experimental                 Enable experimental A2A protocol surfaces
         \\  --auth <true|false>            Enable auth middleware and local user store
         \\  --ard-base-url <url>           Absolute public base URL for ARD catalog artifact links
         \\  --ard-publisher-domain <name>  ARD did:web publisher domain (default: antfly.local)
@@ -15010,6 +15017,14 @@ test "data runtime parses auth flag" {
     var parsed = try parseCli(std.testing.allocator, &iter);
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqual(true, parsed.auth_enabled.?);
+}
+
+test "data runtime parses experimental flag" {
+    const argv = [_][*:0]const u8{"--experimental"};
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var parsed = try parseCli(std.testing.allocator, &iter);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expect(parsed.experimental);
 }
 
 test "data runtime leaves auth disabled unless config or cli enables it" {

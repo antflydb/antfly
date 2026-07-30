@@ -53,6 +53,7 @@ fn metadataWalReplicaStateConfig() antfly.raft.storage.WalReplicaStateConfig {
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
+    experimental: bool = false,
     raft_host: ?[]const u8 = null,
     raft_port: ?u16 = null,
     api_host: ?[]const u8 = null,
@@ -888,6 +889,7 @@ pub fn runFromIterator(
         .secret_store = if (secret_store_initialized) &secret_store else null,
         .api_server_cfg = .{
             .auth_enabled = effective_auth_enabled,
+            .experimental = cli.experimental,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
             .user_manager = if (user_manager) |*manager| manager else null,
@@ -978,6 +980,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             cfg.help = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--experimental")) {
+            cfg.experimental = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--config")) {
@@ -1389,6 +1395,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --cluster <json>               Metadata raft peer URLs, e.g. {{"1":"http://127.0.0.1:9017"}}
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
+        \\  --experimental                 Enable experimental A2A protocol surfaces
         \\  --raft-tick-ms <ms>            Consensus progress interval, 1-1000 (default: 100)
         \\  --control-tick-ms <ms>         Control scheduling interval, 1-60000 (default: 100)
         \\  --data-dir <path>              Local storage root for metadata data
@@ -1511,6 +1518,14 @@ test "metadata runtime cli accepts auth flag" {
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(true, cfg.auth_enabled.?);
+}
+
+test "metadata runtime cli accepts experimental flag" {
+    var argv = [_][*:0]const u8{"--experimental"};
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.experimental);
 }
 
 test "metadata runtime preserves trusted principal auth material bytes" {
