@@ -18863,21 +18863,27 @@ pub const DB = struct {
         const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, cfg.name);
         defer alloc.free(rebuild_root_path);
         const rebuild_state = self.core.index_manager.rebuildState(cfg.kind, rebuild_root_path, cfg);
-        const resume_key = rebuild_state.checkWithIo(
+        var loaded = try rebuild_state.loadWithIo(
             alloc,
             self.core.index_manager.checkpointIo(),
-        ) catch |err| switch (err) {
-            error.InvalidRebuildState => {
-                item.load_error = try alloc.dupe(u8, @errorName(err));
+        );
+        defer loaded.deinit(alloc);
+        const key = switch (loaded) {
+            .absent => return,
+            .valid => |resume_key| resume_key,
+            .legacy => {
+                item.backfill_active = true;
+                item.backfill_progress = 0;
+                return;
+            },
+            .corrupt => {
+                item.load_error = try alloc.dupe(u8, @errorName(error.InvalidRebuildState));
                 item.repair_degraded = true;
                 item.backfill_active = false;
                 item.backfill_progress = 0;
                 return;
             },
-            else => return err,
         };
-        defer if (resume_key) |key| alloc.free(key);
-        const key = resume_key orelse return;
         const byte_range = self.core.byteRange();
         item.backfill_active = true;
         item.backfill_progress = backfill_state_mod.estimateProgressForKey(
@@ -42478,6 +42484,36 @@ test "db status_only open reads index catalog without loading index state" {
             return error.TestUnexpectedResult;
         };
         try std.testing.expect(rebuilding_ft.backfill_active);
+
+        try current_state.clear();
+        const current_state_path = try current_state.pathAlloc(alloc);
+        defer alloc.free(current_state_path);
+        const legacy_state = backfill_state_mod.RebuildState.init(rebuild_root);
+        const legacy_state_path = try legacy_state.pathAlloc(alloc);
+        defer alloc.free(legacy_state_path);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+            .sub_path = legacy_state_path,
+            .data = "doc:legacy",
+        });
+
+        const legacy_stats = try status_db.stats(alloc);
+        defer types.freeDBStats(alloc, legacy_stats);
+        const legacy_ft = blk: {
+            for (legacy_stats.indexes) |item| {
+                if (std.mem.eql(u8, item.name, "ft_v1")) break :blk item;
+            }
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(legacy_ft.backfill_active);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, current_state_path, .{}));
+        const preserved_legacy = try std.Io.Dir.cwd().readFileAlloc(
+            std.testing.io,
+            legacy_state_path,
+            alloc,
+            .limited(1024),
+        );
+        defer alloc.free(preserved_legacy);
+        try std.testing.expectEqualStrings("doc:legacy", preserved_legacy);
     }
 }
 
