@@ -3551,6 +3551,9 @@ pub const IndexManager = struct {
         return self.io orelse std.Io.Threaded.global_single_threaded.io();
     }
 
+    /// Binds rebuild cursors to the same storage backend as their index kind.
+    /// Callers must use this instead of assuming the logical root is a host
+    /// filesystem path; Lite and other external roots may be single files.
     pub fn rebuildState(
         self: *const IndexManager,
         kind: types.IndexKind,

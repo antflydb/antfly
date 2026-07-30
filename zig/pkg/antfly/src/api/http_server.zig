@@ -2783,6 +2783,9 @@ pub const ApiHttpServer = struct {
         if (candidate_meta.lsm_root_generation != 0 and existing_meta.lsm_root_generation != 0 and
             candidate_meta.lsm_root_generation != existing_meta.lsm_root_generation)
             return candidate_meta.lsm_root_generation > existing_meta.lsm_root_generation;
+        const candidate_quarantined = candidate_meta.source == .rebuild_state_quarantine;
+        const existing_quarantined = existing_meta.source == .rebuild_state_quarantine;
+        if (candidate_quarantined != existing_quarantined) return candidate_quarantined;
         const same_producer = candidate_meta.store_id != 0 and candidate_meta.store_id == existing_meta.store_id and
             candidate_meta.node_id != 0 and candidate_meta.node_id == existing_meta.node_id;
         if (same_producer and candidate_meta.status_generation != existing_meta.status_generation)
@@ -2811,8 +2814,8 @@ pub const ApiHttpServer = struct {
 
     fn runtimeStatusSourceRank(source: runtime_status.RuntimeStatusSource) u8 {
         return switch (source) {
-            // A fresh observation that an integrity boundary failed must win
-            // over the last healthy runtime sample for the same group.
+            // Quarantine precedence is enforced before freshness. Keep it
+            // highest here as the deterministic tie-break for equal facts.
             .rebuild_state_quarantine => 80,
             .live_writer_publish => 70,
             .startup_catch_up => 60,
@@ -27698,6 +27701,144 @@ test "api runtime status upsert keeps one authoritative observation per group" {
     try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &item_indexes, &newer_stale);
     try std.testing.expectEqual(@as(u64, 4), items.items[0].metadata.status_generation);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, items.items[0].metadata.freshness);
+}
+
+test "api runtime status quarantine wins freshness without bypassing generation fences" {
+    const alloc = std.testing.allocator;
+    var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
+    var item_indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
+    defer item_indexes.deinit(alloc);
+    defer {
+        for (items.items) |*item| item.deinit(alloc);
+        items.deinit(alloc);
+    }
+
+    var healthy = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7002,
+        .metadata = .{
+            .source = .remote_store,
+            .freshness = .fresh,
+            .topology_generation = 4,
+            .lsm_root_generation = 9,
+            .store_id = 5,
+            .node_id = 6,
+            .updated_at_ns = 200,
+        },
+        .stats = .{},
+    };
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &item_indexes, &healthy);
+
+    var quarantine = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7002,
+        .metadata = .{
+            .source = .rebuild_state_quarantine,
+            .freshness = .failed,
+            .topology_generation = 4,
+            .lsm_root_generation = 9,
+            .store_id = 7,
+            .node_id = 8,
+            .updated_at_ns = 100,
+        },
+        .stats = .{},
+    };
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &item_indexes, &quarantine);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.rebuild_state_quarantine, items.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.failed, items.items[0].metadata.freshness);
+
+    var newer_healthy = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7002,
+        .metadata = .{
+            .source = .remote_store,
+            .freshness = .fresh,
+            .topology_generation = 4,
+            .lsm_root_generation = 9,
+            .store_id = 9,
+            .node_id = 10,
+            .updated_at_ns = 300,
+        },
+        .stats = .{},
+    };
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &item_indexes, &newer_healthy);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.rebuild_state_quarantine, items.items[0].metadata.source);
+
+    var next_topology = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7002,
+        .metadata = .{
+            .source = .remote_store,
+            .freshness = .fresh,
+            .topology_generation = 5,
+            .lsm_root_generation = 1,
+            .store_id = 9,
+            .node_id = 10,
+            .updated_at_ns = 400,
+        },
+        .stats = .{},
+    };
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &item_indexes, &next_topology);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.remote_store, items.items[0].metadata.source);
+    try std.testing.expectEqual(@as(u64, 5), items.items[0].metadata.topology_generation);
+}
+
+test "api runtime status quarantine wins same-producer status generation" {
+    const alloc = std.testing.allocator;
+    var items = std.ArrayListUnmanaged(runtime_status.LocalTableRuntimeStatus).empty;
+    var item_indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
+    defer item_indexes.deinit(alloc);
+    defer {
+        for (items.items) |*item| item.deinit(alloc);
+        items.deinit(alloc);
+    }
+
+    var healthy = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7003,
+        .metadata = .{
+            .source = .remote_store,
+            .freshness = .fresh,
+            .topology_generation = 4,
+            .lsm_root_generation = 9,
+            .status_generation = 8,
+            .store_id = 5,
+            .node_id = 6,
+            .updated_at_ns = 200,
+        },
+        .stats = .{},
+    };
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &item_indexes, &healthy);
+
+    var quarantine = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7003,
+        .metadata = .{
+            .source = .rebuild_state_quarantine,
+            .freshness = .failed,
+            .topology_generation = 4,
+            .lsm_root_generation = 9,
+            .status_generation = 7,
+            .store_id = 5,
+            .node_id = 6,
+            .updated_at_ns = 300,
+        },
+        .stats = .{},
+    };
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &item_indexes, &quarantine);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.rebuild_state_quarantine, items.items[0].metadata.source);
+    try std.testing.expectEqual(@as(u64, 7), items.items[0].metadata.status_generation);
+
+    var newer_healthy = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7003,
+        .metadata = .{
+            .source = .remote_store,
+            .freshness = .fresh,
+            .topology_generation = 4,
+            .lsm_root_generation = 9,
+            .status_generation = 9,
+            .store_id = 5,
+            .node_id = 6,
+            .updated_at_ns = 400,
+        },
+        .stats = .{},
+    };
+    try ApiHttpServer.upsertRuntimeStatus(alloc, &items, &item_indexes, &newer_healthy);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.rebuild_state_quarantine, items.items[0].metadata.source);
 }
 
 test "api index status uses read runtime status without consulting write source" {

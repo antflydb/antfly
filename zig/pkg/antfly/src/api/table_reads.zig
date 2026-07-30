@@ -16678,6 +16678,14 @@ test "provisioned local runtime statuses reconcile empty managed embeddings inde
     defer alloc.free(group_path);
     var db = try db_mod.DB.open(alloc, group_path, .{});
     defer db.close();
+    const indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}}";
+    const reconcile_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(
+        alloc,
+        &db,
+        indexes_json,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), reconcile_summary.indexes_added);
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -16718,7 +16726,23 @@ test "provisioned local runtime statuses reconcile empty managed embeddings inde
     source.cache = &cache;
     var db_lease = try cache.getOrOpen(path, FakeCatalog.iface(), 7001, 0, "docs");
     defer db_lease.release();
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+
+    // Provisioned read sources intentionally publish status only from the
+    // shared snapshot cache; query-cache handles are not an authoritative
+    // status source. Model the production refresher by publishing the
+    // reconciled empty managed index from the writer-owned group.
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var live_status = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .stats = try db.runtimeStatusStatsConsistent(alloc),
+    };
+    defer live_status.deinit(alloc);
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", live_status);
+    source.runtime_status_cache = &snapshot_cache;
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")) orelse
+        return error.MissingRuntimeStatusSnapshot;
     defer statuses.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);

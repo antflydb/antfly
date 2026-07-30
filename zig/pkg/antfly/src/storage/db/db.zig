@@ -18712,7 +18712,7 @@ pub const DB = struct {
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsForIndex(cfg.name);
                     if (self.core.textIndexEntry(cfg.name)) |entry| {
-                        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                        const rebuild_state = self.core.index_manager.rebuildState(.full_text, entry.rebuild_root_path);
                         if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                             item.backfill_active = true;
                             item.backfill_progress = progress;
@@ -18766,7 +18766,7 @@ pub const DB = struct {
                         else
                             sparse_stats.doc_count;
                         item.term_count = sparse_stats.term_count;
-                        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                        const rebuild_state = self.core.index_manager.rebuildState(.sparse_vector, entry.rebuild_root_path);
                         if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                             item.backfill_active = true;
                             item.backfill_progress = progress;
@@ -18788,7 +18788,7 @@ pub const DB = struct {
                         item.node_count = graph_stats.node_count;
                         item.doc_count = graph_stats.node_count;
                         applyGraphAlgebraicRuntimeStats(&item, &entry.index);
-                        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                        const rebuild_state = self.core.index_manager.rebuildState(.graph, entry.rebuild_root_path);
                         if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
                             item.backfill_active = true;
                             item.backfill_progress = progress;
@@ -66697,6 +66697,92 @@ test "db dense artifact rebuild resumes from persisted state" {
         }
         try std.testing.expectEqual(@as(?u64, doc_count), dense_doc_count);
     }
+}
+
+test "db dense artifact rebuild persists state through external index storage" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+    const index_base_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/index-namespace", .{tmp.sub_path});
+    defer alloc.free(index_base_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "single-file-container",
+    });
+
+    var index_storage = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer index_storage.deinit();
+    const external_storage = index_storage.storage();
+
+    var db = try DB.open(alloc, path, .{
+        .primary_backend = .{ .mem = .{} },
+        .index_backends = .{
+            .dense_storage_backend = .lsm,
+            .dense_lsm_storage = external_storage,
+        },
+        .physical_root_mode = .external_backend,
+        .index_base_path = index_base_path,
+        .external_derived_checkpoints = false,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"title\":\"alpha\"}",
+        }},
+        .sync_level = .write,
+    });
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dense_idx");
+    defer alloc.free(artifact_key);
+    try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0, 0 });
+
+    const rebuild_root_path = try db.denseIndexRebuildStatePathAlloc(alloc, "dense_idx");
+    defer alloc.free(rebuild_root_path);
+    const rebuild_state = db.core.index_manager.rebuildState(.dense_vector, rebuild_root_path);
+    try rebuild_state.updateWithIo(db.core.index_manager.checkpointIo(), "");
+    const persisted_cursor = (try rebuild_state.checkWithIo(alloc, db.core.index_manager.checkpointIo())) orelse
+        return error.MissingExternalRebuildState;
+    defer alloc.free(persisted_cursor);
+    const rebuilding_stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, rebuilding_stats);
+    var saw_dense_index = false;
+    var saw_active_backfill = false;
+    for (rebuilding_stats.indexes) |index| {
+        if (!std.mem.eql(u8, index.name, "dense_idx")) continue;
+        saw_dense_index = true;
+        saw_active_backfill = index.backfill_active;
+        try std.testing.expectEqual(@as(u64, 0), index.doc_count);
+    }
+    try std.testing.expect(saw_dense_index);
+    try std.testing.expect(saw_active_backfill);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc),
+    );
+    try std.testing.expect((try rebuild_state.checkWithIo(alloc, db.core.index_manager.checkpointIo())) == null);
+
+    var result = try db.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } },
+        .limit = 1,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
 test "db dense artifact rebuild resume keys are owned by plan allocator" {
