@@ -25,3 +25,21 @@ def test_completed_nested_model_payload_is_available(tmp_path):
     (model_dir / "onnx" / "model.onnx").write_bytes(b"complete")
 
     assert _looks_like_model_dir(model_dir)
+
+
+def test_unsupported_framework_bin_is_not_a_completed_model(tmp_path):
+    model_dir = tmp_path / "owner" / "framework-only"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text("{}")
+    (model_dir / "pytorch_model.bin").write_bytes(b"unsupported")
+
+    assert not _looks_like_model_dir(model_dir)
+
+
+def test_partial_file_invalidates_an_otherwise_complete_model(tmp_path):
+    model_dir = tmp_path / "owner" / "interrupted"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.safetensors").write_bytes(b"complete")
+    (model_dir / "adapter_model.safetensors.part").write_bytes(b"incomplete")
+
+    assert not _looks_like_model_dir(model_dir)

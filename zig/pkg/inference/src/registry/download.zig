@@ -26,6 +26,12 @@ pub const HubConfig = struct {
     token: ?[]const u8 = null,
     /// Base URL for the Hub API.
     base_url: []const u8 = "https://huggingface.co",
+    /// Maximum bytes accepted for one downloaded model artifact.
+    ///
+    /// Downloads stream directly to disk, so this is a disk-safety boundary
+    /// rather than an in-memory response limit. Keep it high enough for large
+    /// unsharded checkpoints while remaining finite for untrusted responses.
+    max_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024,
 };
 
 pub const ProjectorSelection = union(enum) {
@@ -1009,10 +1015,14 @@ const OffsetFileWriter = struct {
     file: std.Io.File,
     io: std.Io,
     offset: u64,
+    max_offset: u64,
 
     pub fn writeAll(self: *OffsetFileWriter, data: []const u8) !void {
+        const next_offset = std.math.add(u64, self.offset, data.len) catch
+            return error.DownloadSizeLimitExceeded;
+        if (next_offset > self.max_offset) return error.DownloadSizeLimitExceeded;
         try self.file.writePositionalAll(self.io, data, self.offset);
-        self.offset += data.len;
+        self.offset = next_offset;
     }
 };
 
@@ -1174,7 +1184,11 @@ pub fn downloadModel(
         const filename = file_meta.name;
         const total_bytes = if (file_meta.size) |declared_size| blk: {
             if (shouldProbeLinkedPayloadSize(filename, declared_size)) {
-                break :blk probeDownloadSize(allocator, io, owner, name, filename, config) catch declared_size;
+                // A small size for a binary artifact is normally the Git LFS
+                // pointer size, not the payload size. If probing fails, leave
+                // the size unknown rather than treating the pointer as a
+                // trustworthy completion boundary.
+                break :blk probeDownloadSize(allocator, io, owner, name, filename, config) catch null;
             }
             break :blk declared_size;
         } else (probeDownloadSize(allocator, io, owner, name, filename, config) catch null);
@@ -1481,12 +1495,25 @@ fn resolveDownloadUrl(
     }
 }
 
-fn downloadClientConfig() httpx.ClientConfig {
+fn downloadResponseLimit(config: HubConfig) !usize {
+    if (config.max_artifact_bytes == 0) return error.InvalidDownloadSizeLimit;
+    const artifact_limit = std.math.cast(usize, config.max_artifact_bytes) orelse
+        return error.InvalidDownloadSizeLimit;
+    // httpx counts the initial receive buffer, which can contain both response
+    // headers and body bytes, against its client-wide limit. Reserve one full
+    // receive buffer for framing; OffsetFileWriter remains the authoritative
+    // artifact-size boundary.
+    return std.math.add(usize, artifact_limit, 16 * 1024) catch
+        return error.InvalidDownloadSizeLimit;
+}
+
+fn downloadClientConfig(max_response_size: usize) httpx.ClientConfig {
     return .{
         .keep_alive = false,
         // Model artifacts are streamed directly to disk. The client's
-        // in-memory 100 MiB default would otherwise truncate larger payloads.
-        .max_response_size = std.math.maxInt(usize),
+        // in-memory 100 MiB default is inappropriate, but the disk stream must
+        // retain a finite response ceiling.
+        .max_response_size = max_response_size,
     };
 }
 
@@ -1505,6 +1532,11 @@ fn downloadFile(
     total_bytes: ?u64,
     expected_sha256: ?[]const u8,
 ) !void {
+    const max_response_size = try downloadResponseLimit(config);
+    if (total_bytes) |total| {
+        if (total > config.max_artifact_bytes) return error.DownloadSizeLimitExceeded;
+    }
+
     var dest = std.Io.Dir.cwd();
     const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, filename });
     defer allocator.free(dest_path);
@@ -1533,12 +1565,6 @@ fn downloadFile(
     const url = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/resolve/main/{s}", .{ config.base_url, owner, name, filename });
     defer allocator.free(url);
 
-    var client = httpx.Client.initWithConfig(allocator, io, downloadClientConfig());
-    defer client.deinit();
-
-    const download_url = try resolveDownloadUrl(allocator, &client, url, headers_buf[0..n_headers]);
-    defer allocator.free(download_url);
-
     // Create parent dirs if filename has slashes (e.g., "onnx/model.onnx")
     if (std.mem.lastIndexOfScalar(u8, filename, '/')) |last_slash| {
         const parent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, filename[0..last_slash] });
@@ -1550,12 +1576,30 @@ fn downloadFile(
     defer allocator.free(temp_path);
 
     var resume_from = existingFileSize(dest, io, temp_path) catch 0;
+    if (resume_from > config.max_artifact_bytes) {
+        dest.deleteFile(io, temp_path) catch {};
+        return error.DownloadSizeLimitExceeded;
+    }
     if (total_bytes) |total| {
-        if (resume_from >= total) {
-            try std.Io.Dir.rename(dest, temp_path, dest, dest_path, io);
+        if (resume_from == total) {
+            try finalizeDownloadedFile(dest, io, temp_path, dest_path, expected_sha256);
             return;
         }
+        if (resume_from > total) {
+            dest.deleteFile(io, temp_path) catch {};
+            resume_from = 0;
+        }
     }
+
+    var client = httpx.Client.initWithConfig(
+        allocator,
+        io,
+        downloadClientConfig(max_response_size),
+    );
+    defer client.deinit();
+
+    const download_url = try resolveDownloadUrl(allocator, &client, url, headers_buf[0..n_headers]);
+    defer allocator.free(download_url);
 
     while (true) {
         if (range_header) |range| {
@@ -1584,6 +1628,7 @@ fn downloadFile(
             .file = file,
             .io = io,
             .offset = resume_from,
+            .max_offset = config.max_artifact_bytes,
         };
 
         var progress_ctx = FileProgressCtx{
@@ -1608,10 +1653,22 @@ fn downloadFile(
             }
         }
 
-        var streamed = try client.getToWriter(download_url, .{
+        var streamed = client.getToWriter(download_url, .{
             .headers = headers_buf[0..n_headers],
             .follow_redirects = false,
-        }, &resume_writer, FileProgressCtx.onWriterProgress, &progress_ctx);
+        }, &resume_writer, FileProgressCtx.onWriterProgress, &progress_ctx) catch |err| {
+            // A server that ignores Range can send a complete response after
+            // the existing prefix, making the temporary file exceed the
+            // artifact limit before its HTTP 200 status is available here.
+            // Retry once without the stale prefix; a genuinely oversized
+            // response will then fail at the same finite limit.
+            if (err == error.DownloadSizeLimitExceeded and resume_from > 0) {
+                dest.deleteFile(io, temp_path) catch {};
+                resume_from = 0;
+                continue;
+            }
+            return err;
+        };
         defer streamed.deinit();
 
         if (!streamed.ok()) {
@@ -1625,16 +1682,34 @@ fn downloadFile(
             continue;
         }
 
+        if (total_bytes) |total| {
+            if (resume_writer.offset != total) {
+                if (resume_writer.offset > total) {
+                    dest.deleteFile(io, temp_path) catch {};
+                }
+                return error.DownloadSizeMismatch;
+            }
+        }
+
         break;
     }
 
+    try finalizeDownloadedFile(dest, io, temp_path, dest_path, expected_sha256);
+}
+
+fn finalizeDownloadedFile(
+    dest: std.Io.Dir,
+    io: std.Io,
+    temp_path: []const u8,
+    dest_path: []const u8,
+    expected_sha256: ?[]const u8,
+) !void {
     if (expected_sha256) |sum| {
         verifyFileSha256(dest, io, temp_path, sum) catch |err| {
             dest.deleteFile(io, temp_path) catch {};
             return err;
         };
     }
-
     dest.deleteFile(io, dest_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -2180,9 +2255,139 @@ fn testTmpPath(allocator: std.mem.Allocator, tmp: anytype, tail: []const u8) ![]
     return std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], tail });
 }
 
-test "streaming model downloads are not capped by the in-memory response limit" {
-    const config = downloadClientConfig();
-    try std.testing.expectEqual(std.math.maxInt(usize), config.max_response_size);
+test "streaming model downloads use a finite disk-oriented response limit" {
+    const response_limit = try downloadResponseLimit(.{ .max_artifact_bytes = 1024 });
+    try std.testing.expectEqual(@as(usize, 17 * 1024), response_limit);
+    try std.testing.expectEqual(
+        response_limit,
+        downloadClientConfig(response_limit).max_response_size,
+    );
+    try std.testing.expectError(
+        error.InvalidDownloadSizeLimit,
+        downloadResponseLimit(.{ .max_artifact_bytes = 0 }),
+    );
+    try std.testing.expectError(
+        error.InvalidDownloadSizeLimit,
+        downloadResponseLimit(.{ .max_artifact_bytes = std.math.maxInt(u64) }),
+    );
+}
+
+test "downloadFile rejects artifacts above the configured disk limit before network access" {
+    try std.testing.expectError(
+        error.DownloadSizeLimitExceeded,
+        downloadFile(
+            std.testing.allocator,
+            std.testing.io,
+            "owner",
+            "name",
+            "model.onnx",
+            ".",
+            .{
+                .base_url = "http://127.0.0.1:1",
+                .max_artifact_bytes = 128,
+            },
+            .{},
+            0,
+            1,
+            129,
+            null,
+        ),
+    );
+}
+
+test "downloadFile removes an oversized partial before network access" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "downloads");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.onnx.part" });
+    defer allocator.free(part_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = part_path, .data = "oversized" });
+
+    try std.testing.expectError(
+        error.DownloadSizeLimitExceeded,
+        downloadFile(
+            allocator,
+            io,
+            "owner",
+            "name",
+            "model.onnx",
+            dest_dir,
+            .{
+                .base_url = "http://127.0.0.1:1",
+                .max_artifact_bytes = 4,
+            },
+            .{},
+            0,
+            1,
+            null,
+            null,
+        ),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().openFile(io, part_path, .{}),
+    );
+}
+
+test "downloadFile verifies a complete partial before installing it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "downloads");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.onnx.part" });
+    defer allocator.free(part_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = part_path, .data = "bad" });
+
+    try std.testing.expectError(
+        error.ChecksumMismatch,
+        downloadFile(
+            allocator,
+            io,
+            "owner",
+            "name",
+            "model.onnx",
+            dest_dir,
+            .{ .base_url = "http://127.0.0.1:1" },
+            .{},
+            0,
+            1,
+            3,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().openFile(io, part_path, .{}),
+    );
+}
+
+test "offset file writer enforces the final artifact size across resumed writes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(std.testing.io, "bounded.bin", .{ .read = true });
+    defer file.close(std.testing.io);
+    var writer = OffsetFileWriter{
+        .file = file,
+        .io = std.testing.io,
+        .offset = 3,
+        .max_offset = 5,
+    };
+    try writer.writeAll("ok");
+    try std.testing.expectEqual(@as(u64, 5), writer.offset);
+    try std.testing.expectError(error.DownloadSizeLimitExceeded, writer.writeAll("!"));
+    try std.testing.expectEqual(@as(u64, 5), writer.offset);
 }
 
 test "downloadFile resumes from partial file with 206 response" {
@@ -2375,6 +2580,9 @@ test "downloadFile restarts cleanly when range is ignored" {
     defer allocator.free(base_url);
     try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
         .base_url = base_url,
+        // Force the bounded writer to detect the ignored Range response before
+        // getToWriter can return its HTTP 200 status.
+        .max_artifact_bytes = payload.len,
     }, .{}, 0, 1, payload.len, null);
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });

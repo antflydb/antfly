@@ -361,13 +361,16 @@ def _model_path(spec: ModelSpec) -> Path:
 def _looks_like_model_dir(path: Path) -> bool:
     if not path.is_dir():
         return False
-    if any(path.rglob("*.part")):
-        return False
-    payload_suffixes = (".gguf", ".onnx", ".safetensors", ".bin")
-    return any(
-        candidate.is_file() and candidate.name.endswith(payload_suffixes)
-        for candidate in path.rglob("*")
-    )
+
+    has_supported_payload = False
+    for candidate in path.rglob("*"):
+        if not candidate.is_file():
+            continue
+        if candidate.name.endswith(".part"):
+            return False
+        if candidate.name.endswith((".gguf", ".onnx", ".safetensors")):
+            has_supported_payload = True
+    return has_supported_payload
 
 
 def model_available(spec: ModelSpec) -> bool:
