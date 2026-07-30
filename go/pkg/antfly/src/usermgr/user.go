@@ -15,6 +15,7 @@
 package usermgr
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -907,7 +908,92 @@ func (um *UserManager) ValidateApiKey(keyID, keySecret string) (username string,
 		return "", nil, nil, ErrApiKeyExpired
 	}
 
-	return record.Username, record.Permissions, record.RowFilter, nil
+	ownerRowFilter, err := um.GetRowFilters(record.Username)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("loading API key owner row filters: %w", err)
+	}
+	effectiveRowFilter, err := combineLayeredRowFilters(ownerRowFilter, record.RowFilter)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("combining API key row filters: %w", err)
+	}
+
+	return record.Username, record.Permissions, effectiveRowFilter, nil
+}
+
+// combineLayeredRowFilters applies API-key filters as additional narrowing on
+// top of the owner's mandatory filters. Table-specific entries take precedence
+// over a wildcard within each layer, matching the request-time resolver.
+func combineLayeredRowFilters(
+	base map[string]json.RawMessage,
+	overlay map[string]json.RawMessage,
+) (map[string]json.RawMessage, error) {
+	tables := make(map[string]struct{}, len(base)+len(overlay))
+	for table := range base {
+		if table != "*" {
+			tables[table] = struct{}{}
+		}
+	}
+	for table := range overlay {
+		if table != "*" {
+			tables[table] = struct{}{}
+		}
+	}
+
+	result := make(map[string]json.RawMessage, len(tables)+1)
+	for table := range tables {
+		combined, err := combineOptionalRowFilter(
+			selectedRowFilter(base, table),
+			selectedRowFilter(overlay, table),
+		)
+		if err != nil {
+			return nil, err
+		}
+		if len(combined) > 0 {
+			result[table] = combined
+		}
+	}
+
+	wildcard, err := combineOptionalRowFilter(exactRowFilter(base, "*"), exactRowFilter(overlay, "*"))
+	if err != nil {
+		return nil, err
+	}
+	if len(wildcard) > 0 {
+		result["*"] = wildcard
+	}
+	if len(result) == 0 {
+		return nil, nil
+	}
+	return result, nil
+}
+
+func selectedRowFilter(filters map[string]json.RawMessage, table string) json.RawMessage {
+	if filter := exactRowFilter(filters, table); len(filter) > 0 {
+		return filter
+	}
+	return exactRowFilter(filters, "*")
+}
+
+func exactRowFilter(filters map[string]json.RawMessage, table string) json.RawMessage {
+	filter := bytes.TrimSpace(filters[table])
+	if len(filter) == 0 || bytes.Equal(filter, []byte("null")) {
+		return nil
+	}
+	return filter
+}
+
+func combineOptionalRowFilter(base, overlay json.RawMessage) (json.RawMessage, error) {
+	switch {
+	case len(base) > 0 && len(overlay) > 0:
+		return json.Marshal(map[string]any{
+			"conjuncts": []json.RawMessage{base, overlay},
+		})
+	case len(base) > 0:
+		return append(json.RawMessage(nil), base...), nil
+	case len(overlay) > 0:
+		return append(json.RawMessage(nil), overlay...), nil
+	default:
+		return nil, nil
+	}
 }
 
 // ListApiKeys returns all API keys owned by the given user, with hash/salt omitted.

@@ -15,6 +15,7 @@
 package metadata
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -22,6 +23,24 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestInjectScanRowFilter(t *testing.T) {
+	callerFilter := json.RawMessage(`{"term":"active","field":"status"}`)
+	securityFilter := json.RawMessage(`{"term":"tenant-a","field":"tenant_id"}`)
+	req := ScanKeysRequest{FilterQuery: callerFilter}
+
+	injectScanRowFilter("documents", &req, mapRowFilterResolver(map[string]json.RawMessage{
+		"documents": securityFilter,
+	}))
+
+	var merged struct {
+		Conjuncts []json.RawMessage `json:"conjuncts"`
+	}
+	require.NoError(t, json.Unmarshal(req.FilterQuery, &merged))
+	require.Len(t, merged.Conjuncts, 2)
+	assert.JSONEq(t, string(callerFilter), string(merged.Conjuncts[0]))
+	assert.JSONEq(t, string(securityFilter), string(merged.Conjuncts[1]))
+}
 
 // TestLookupKeyParamsParsing tests that the LookupKeyParams struct works correctly
 func TestLookupKeyParamsParsing(t *testing.T) {

@@ -16,6 +16,7 @@ package usermgr
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -64,6 +65,45 @@ func TestValidateApiKey_CorrectSecret(t *testing.T) {
 	require.NoError(err)
 	assert.Equal("alice", username)
 	assert.Empty(perms)
+}
+
+func TestValidateApiKey_InheritsOwnerRowFilter(t *testing.T) {
+	um, _ := newTestUserManager(t)
+	createTestUser(t, um, "alice", "password123")
+	ownerFilter := json.RawMessage(`{"term":"alice","field":"owner"}`)
+	require.NoError(t, um.SetRowFilter("alice", "documents", ownerFilter))
+
+	keyID, keySecret, err := um.CreateApiKey("alice", "test key", nil, nil, time.Time{})
+	require.NoError(t, err)
+
+	_, _, filters, err := um.ValidateApiKey(keyID, keySecret)
+	require.NoError(t, err)
+	require.JSONEq(t, string(ownerFilter), string(filters["documents"]))
+}
+
+func TestValidateApiKey_ConjoinsOwnerAndKeyRowFilters(t *testing.T) {
+	um, _ := newTestUserManager(t)
+	createTestUser(t, um, "alice", "password123")
+	ownerFilter := json.RawMessage(`{"term":"tenant-a","field":"tenant"}`)
+	keyFilter := json.RawMessage(`{"term":"active","field":"status"}`)
+	require.NoError(t, um.SetRowFilter("alice", "*", ownerFilter))
+
+	keyID, keySecret, err := um.CreateApiKey("alice", "test key", nil, map[string]json.RawMessage{
+		"documents": keyFilter,
+	}, time.Time{})
+	require.NoError(t, err)
+
+	_, _, filters, err := um.ValidateApiKey(keyID, keySecret)
+	require.NoError(t, err)
+
+	var combined struct {
+		Conjuncts []json.RawMessage `json:"conjuncts"`
+	}
+	require.NoError(t, json.Unmarshal(filters["documents"], &combined))
+	require.Len(t, combined.Conjuncts, 2)
+	require.JSONEq(t, string(ownerFilter), string(combined.Conjuncts[0]))
+	require.JSONEq(t, string(keyFilter), string(combined.Conjuncts[1]))
+	require.JSONEq(t, string(ownerFilter), string(filters["*"]))
 }
 
 func TestValidateApiKey_WrongSecret(t *testing.T) {

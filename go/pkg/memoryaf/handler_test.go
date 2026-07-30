@@ -234,6 +234,23 @@ func TestGetMemory_NotFound(t *testing.T) {
 	}
 }
 
+func TestGetMemory_HidesAnotherUsersPrivateMemory(t *testing.T) {
+	mc := newMockClient()
+	mc.queryFn = func(body []byte) ([]byte, error) {
+		return mockQueryHit("mem:private", map[string]any{
+			"content":    "private memory",
+			"created_by": "user2",
+			"visibility": VisibilityPrivate,
+		}), nil
+	}
+	h := newTestHandler(mc, nil)
+
+	_, err := h.GetMemory(context.Background(), "private", defaultUctx())
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected private memory to be hidden, got: %v", err)
+	}
+}
+
 func TestGetMemory_FallsBackToEphemeral(t *testing.T) {
 	mc := newMockClient()
 	mc.queryFn = func(body []byte) ([]byte, error) {
@@ -477,9 +494,79 @@ func TestBuildFilterQuery_ExplicitVisibility(t *testing.T) {
 	if !strings.Contains(s, VisibilityPrivate) {
 		t.Errorf("expected private visibility in filter, got: %s", s)
 	}
+	if !strings.Contains(s, "user1") {
+		t.Errorf("expected private visibility to be restricted to its owner, got: %s", s)
+	}
 	// Should NOT contain the team disjunction.
 	if strings.Contains(s, "disjuncts") {
 		t.Errorf("explicit visibility should not produce disjunction: %s", s)
+	}
+}
+
+func TestSearchMemories_FiltersPrivateGraphHits(t *testing.T) {
+	mc := newMockClient()
+	mc.queryFn = func(body []byte) ([]byte, error) {
+		return mockQueryHit("mem:private", map[string]any{
+			"content":    "private graph result",
+			"created_by": "user2",
+			"visibility": VisibilityPrivate,
+		}), nil
+	}
+	h := newTestHandler(mc, nil)
+
+	results, err := h.SearchMemories(context.Background(), SearchMemoriesArgs{
+		Query: "private",
+	}, defaultUctx())
+	if err != nil {
+		t.Fatalf("SearchMemories: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected private graph hit to be filtered, got: %+v", results)
+	}
+}
+
+func TestGetEntityMemories_FiltersPrivateHits(t *testing.T) {
+	mc := newMockClient()
+	mc.queryFn = func(body []byte) ([]byte, error) {
+		return mockQueryHit("mem:private", map[string]any{
+			"content":    "private entity result",
+			"created_by": "user2",
+			"visibility": VisibilityPrivate,
+		}), nil
+	}
+	h := newTestHandler(mc, nil)
+
+	results, err := h.GetEntityMemories(context.Background(), EntityMemoriesArgs{
+		EntityLabel: "person",
+		EntityText:  "Alice",
+	}, defaultUctx())
+	if err != nil {
+		t.Fatalf("GetEntityMemories: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected private entity hit to be filtered, got: %+v", results)
+	}
+}
+
+func TestFindRelated_HidesAnotherUsersPrivateStartMemory(t *testing.T) {
+	mc := newMockClient()
+	mc.queryFn = func(body []byte) ([]byte, error) {
+		return mockQueryHit("mem:private", map[string]any{
+			"content":    "private start",
+			"created_by": "user2",
+			"visibility": VisibilityPrivate,
+		}), nil
+	}
+	h := newTestHandler(mc, nil)
+
+	_, err := h.FindRelated(context.Background(), FindRelatedArgs{
+		ID: "private",
+	}, defaultUctx())
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected private start memory to be hidden, got: %v", err)
+	}
+	if len(mc.queryBodies) != 1 {
+		t.Fatalf("expected graph traversal not to run, got %d queries", len(mc.queryBodies))
 	}
 }
 

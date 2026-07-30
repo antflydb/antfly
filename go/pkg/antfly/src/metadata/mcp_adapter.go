@@ -33,6 +33,7 @@ import (
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/tablemgr"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/usermgr"
 )
 
 // mcpAdapter implements antflymcp.AntflyHandler by delegating to the internal
@@ -47,8 +48,27 @@ func newMCPAdapter(t *TableApi) *mcpAdapter {
 	return &mcpAdapter{t: t}
 }
 
+func (a *mcpAdapter) authorize(
+	ctx context.Context,
+	tableName string,
+	permissionType usermgr.PermissionType,
+) error {
+	if err := a.t.ln.authorizeContext(
+		ctx,
+		usermgr.ResourceTypeTable,
+		tableName,
+		permissionType,
+	); err != nil {
+		return fmt.Errorf("forbidden: %s permission on table %q is required", permissionType, tableName)
+	}
+	return nil
+}
+
 // CreateTable implements antflymcp.AntflyHandler.
 func (a *mcpAdapter) CreateTable(ctx context.Context, name string, numShards int, schemaJSON string) error {
+	if err := a.authorize(ctx, name, usermgr.PermissionTypeAdmin); err != nil {
+		return err
+	}
 	fullTextIndex := "full_text_index_v0"
 	tc := tablemgr.TableConfig{
 		NumShards: uint(numShards), //nolint:gosec // G115: bounded value, cannot overflow in practice
@@ -72,6 +92,9 @@ func (a *mcpAdapter) CreateTable(ctx context.Context, name string, numShards int
 
 // DropTable implements antflymcp.AntflyHandler.
 func (a *mcpAdapter) DropTable(ctx context.Context, name string) error {
+	if err := a.authorize(ctx, name, usermgr.PermissionTypeAdmin); err != nil {
+		return err
+	}
 	if err := a.t.tm.RemoveTable(name); err != nil {
 		return err
 	}
@@ -81,6 +104,9 @@ func (a *mcpAdapter) DropTable(ctx context.Context, name string) error {
 
 // ListTables implements antflymcp.AntflyHandler.
 func (a *mcpAdapter) ListTables(ctx context.Context) ([]antflymcp.TableInfo, error) {
+	if err := a.authorize(ctx, "*", usermgr.PermissionTypeRead); err != nil {
+		return nil, err
+	}
 	tables, err := a.t.tm.Tables(nil, nil)
 	if err != nil {
 		return nil, err
@@ -117,6 +143,9 @@ func (a *mcpAdapter) CreateIndex(
 	dimension int,
 	embedderJSON, summarizerJSON string,
 ) error {
+	if err := a.authorize(ctx, tableName, usermgr.PermissionTypeAdmin); err != nil {
+		return err
+	}
 	embConfig := indexes.EmbeddingsIndexConfig{
 		Dimension: dimension,
 		Field:     field,
@@ -173,6 +202,9 @@ func (a *mcpAdapter) CreateIndex(
 
 // DropIndex implements antflymcp.AntflyHandler.
 func (a *mcpAdapter) DropIndex(ctx context.Context, tableName, indexName string) error {
+	if err := a.authorize(ctx, tableName, usermgr.PermissionTypeAdmin); err != nil {
+		return err
+	}
 	if err := a.t.ln.dropIndexFromTable(ctx, tableName, indexName); err != nil {
 		return err
 	}
@@ -182,6 +214,9 @@ func (a *mcpAdapter) DropIndex(ctx context.Context, tableName, indexName string)
 
 // ListIndexes implements antflymcp.AntflyHandler.
 func (a *mcpAdapter) ListIndexes(ctx context.Context, tableName string) ([]antflymcp.IndexInfo, error) {
+	if err := a.authorize(ctx, tableName, usermgr.PermissionTypeRead); err != nil {
+		return nil, err
+	}
 	idxs, err := a.t.tm.Indexes(tableName)
 	if err != nil {
 		return nil, err
@@ -253,6 +288,11 @@ func (a *mcpAdapter) Query(ctx context.Context, req antflymcp.QueryRequest) (*an
 }
 
 func (a *mcpAdapter) runMCPQuery(ctx context.Context, req *QueryRequest) (*antflymcp.QueryResult, error) {
+	for tableName, permissionType := range queryReadPermissions(req) {
+		if err := a.authorize(ctx, tableName, permissionType); err != nil {
+			return nil, err
+		}
+	}
 	qr := a.t.runQuery(ctx, req)
 	if qr.Error != "" {
 		return nil, fmt.Errorf("query error: %s", qr.Error)
@@ -313,6 +353,9 @@ func mcpFullTextSearchJSON(fullTextSearch any, field string) (json.RawMessage, e
 
 // Batch implements antflymcp.AntflyHandler.
 func (a *mcpAdapter) Batch(ctx context.Context, tableName string, inserts map[string]any, deletes []string) (*antflymcp.BatchResult, error) {
+	if err := a.authorize(ctx, tableName, usermgr.PermissionTypeWrite); err != nil {
+		return nil, err
+	}
 	table, err := a.t.tm.GetTable(tableName)
 	if err != nil {
 		return nil, fmt.Errorf("getting table %s: %w", tableName, err)
@@ -420,6 +463,9 @@ func (a *mcpAdapter) Backup(
 	ctx context.Context,
 	tableName, backupID, connection, location string,
 ) error {
+	if err := a.authorize(ctx, tableName, usermgr.PermissionTypeAdmin); err != nil {
+		return err
+	}
 	if err := common.ValidateBackupID(backupID); err != nil {
 		return err
 	}
@@ -507,6 +553,9 @@ func (a *mcpAdapter) Restore(
 	ctx context.Context,
 	tableName, backupID, connection, location string,
 ) error {
+	if err := a.authorize(ctx, tableName, usermgr.PermissionTypeAdmin); err != nil {
+		return err
+	}
 	if err := common.ValidateBackupID(backupID); err != nil {
 		return err
 	}

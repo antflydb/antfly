@@ -307,9 +307,14 @@ func buildFilterQuery(opts filterOpts, ctx *UserContext) *query.Query {
 		clauses = append(clauses, query.NewTerm(opts.DeviceID, "device_id"))
 	}
 
-	// Visibility filtering: when no explicit visibility is requested and we have
-	// a user context, show team memories + the caller's own private memories.
-	if ctx != nil && opts.Visibility == "" {
+	// Visibility filtering: members may see team memories and their own private
+	// memories. An explicit private filter must retain that ownership boundary.
+	if ctx != nil && opts.Visibility == VisibilityPrivate && ctx.Role != "admin" {
+		privateQ := query.NewTerm(VisibilityPrivate, "visibility")
+		ownerQ := query.NewTerm(ctx.UserID, "created_by")
+		conj := query.ConjunctionQuery{Conjuncts: []query.Query{privateQ, ownerQ}}.ToQuery()
+		clauses = append(clauses, conj)
+	} else if ctx != nil && opts.Visibility == "" {
 		teamQ := query.NewTerm(VisibilityTeam, "visibility")
 		ownerQ := query.NewTerm(ctx.UserID, "created_by")
 		disj := query.DisjunctionQuery{Disjuncts: []query.Query{teamQ, ownerQ}}.ToQuery()
@@ -326,6 +331,13 @@ func buildFilterQuery(opts filterOpts, ctx *UserContext) *query.Query {
 	}
 	conj := query.ConjunctionQuery{Conjuncts: clauses}.ToQuery()
 	return &conj
+}
+
+func canReadMemory(memory Memory, ctx UserContext) bool {
+	if ctx.Role == "admin" || memory.CreatedBy == ctx.UserID {
+		return true
+	}
+	return memory.Visibility == VisibilityTeam
 }
 
 type filterOpts struct {
@@ -456,6 +468,9 @@ func (h *Handler) getMemoryWithTable(ctx context.Context, id string, uctx UserCo
 		return nil, "", err
 	}
 	if mem != nil {
+		if !canReadMemory(*mem, uctx) {
+			return nil, "", fmt.Errorf("memory not found: %s", id)
+		}
 		return mem, persistentTable, nil
 	}
 
@@ -465,6 +480,9 @@ func (h *Handler) getMemoryWithTable(ctx context.Context, id string, uctx UserCo
 		return nil, "", err
 	}
 	if mem != nil {
+		if !canReadMemory(*mem, uctx) {
+			return nil, "", fmt.Errorf("memory not found: %s", id)
+		}
 		mem.Ephemeral = true
 		return mem, ephTable, nil
 	}
@@ -633,6 +651,9 @@ func (h *Handler) ListMemories(ctx context.Context, args ListMemoriesArgs, uctx 
 	for _, hit := range hits {
 		if isMemoryHit(hit.ID) {
 			mem := hitToMemory(hit.ID, hit.Source)
+			if !canReadMemory(mem, uctx) {
+				continue
+			}
 			if args.Ephemeral {
 				mem.Ephemeral = true
 			}
@@ -724,6 +745,9 @@ func (h *Handler) SearchMemories(ctx context.Context, args SearchMemoriesArgs, u
 	for _, hit := range hits {
 		if isMemoryHit(hit.ID) {
 			mem := hitToMemory(hit.ID, hit.Source)
+			if !canReadMemory(mem, uctx) {
+				continue
+			}
 			if args.Ephemeral {
 				mem.Ephemeral = true
 			}
@@ -751,6 +775,13 @@ func (h *Handler) FindRelated(ctx context.Context, args FindRelatedArgs, uctx Us
 		depth = 2
 	}
 	mKey := memoryKey(args.ID)
+	startMemory, err := h.queryMemoryInTable(ctx, args.ID, table)
+	if err != nil {
+		return nil, err
+	}
+	if startMemory == nil || !canReadMemory(*startMemory, uctx) {
+		return nil, fmt.Errorf("memory not found: %s", args.ID)
+	}
 
 	reqMap := map[string]any{
 		"table":            table,
@@ -774,6 +805,11 @@ func (h *Handler) FindRelated(ctx context.Context, args FindRelatedArgs, uctx Us
 		},
 		"graph_merge_strategy": "union",
 	}
+	if uctx.Role != "admin" {
+		if filter := buildFilterQuery(filterOpts{}, &uctx); filter != nil {
+			reqMap["filter_query"] = json.RawMessage(mustMarshal(filter))
+		}
+	}
 
 	resp, err := h.client.QueryWithBody(ctx, mustMarshal(reqMap))
 	if err != nil {
@@ -789,6 +825,9 @@ func (h *Handler) FindRelated(ctx context.Context, args FindRelatedArgs, uctx Us
 	for _, hit := range hits {
 		if isMemoryHit(hit.ID) && hit.ID != mKey {
 			mem := hitToMemory(hit.ID, hit.Source)
+			if !canReadMemory(mem, uctx) {
+				continue
+			}
 			if args.Ephemeral {
 				mem.Ephemeral = true
 			}
@@ -834,6 +873,11 @@ func (h *Handler) GetEntityMemories(ctx context.Context, args EntityMemoriesArgs
 		},
 		"graph_merge_strategy": "union",
 	}
+	if uctx.Role != "admin" {
+		if filter := buildFilterQuery(filterOpts{}, &uctx); filter != nil {
+			reqMap["filter_query"] = json.RawMessage(mustMarshal(filter))
+		}
+	}
 
 	resp, err := h.client.QueryWithBody(ctx, mustMarshal(reqMap))
 	if err != nil {
@@ -849,6 +893,9 @@ func (h *Handler) GetEntityMemories(ctx context.Context, args EntityMemoriesArgs
 	for _, hit := range hits {
 		if isMemoryHit(hit.ID) {
 			mem := hitToMemory(hit.ID, hit.Source)
+			if !canReadMemory(mem, uctx) {
+				continue
+			}
 			if args.Ephemeral {
 				mem.Ephemeral = true
 			}

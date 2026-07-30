@@ -38,6 +38,7 @@ import (
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/workerpool"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/usermgr"
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/search"
 	"github.com/blevesearch/bleve/v2/search/query"
@@ -661,6 +662,15 @@ func (t *TableApi) handleQuery(w http.ResponseWriter, r *http.Request, maybeTabl
 		errorResponse(w, "No query requests found", http.StatusBadRequest)
 		return
 	}
+	requiredTables := make(map[string]usermgr.PermissionType)
+	for i := range queryReqs {
+		for tableName, permissionType := range queryReadPermissions(&queryReqs[i]) {
+			requiredTables[tableName] = permissionType
+		}
+	}
+	if !t.ln.ensureMultiTableAuth(w, r, requiredTables) {
+		return
+	}
 
 	var queryResults []QueryResult
 
@@ -684,6 +694,23 @@ func (t *TableApi) handleQuery(w http.ResponseWriter, r *http.Request, maybeTabl
 		errorResponse(w, "Failed to marshal response", http.StatusInternalServerError)
 		return
 	}
+}
+
+func queryReadPermissions(queryReq *QueryRequest) map[string]usermgr.PermissionType {
+	required := make(map[string]usermgr.PermissionType)
+	if queryReq.Table != "" {
+		required[queryReq.Table] = usermgr.PermissionTypeRead
+	}
+	addJoinReadPermissions(required, &queryReq.Join)
+	return required
+}
+
+func addJoinReadPermissions(required map[string]usermgr.PermissionType, join *JoinClause) {
+	if join == nil || join.RightTable == "" {
+		return
+	}
+	required[join.RightTable] = usermgr.PermissionTypeRead
+	addJoinReadPermissions(required, join.NestedJoin)
 }
 
 // allSameTable checks if all queries target the same table

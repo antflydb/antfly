@@ -14623,6 +14623,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     };
     if (routes.Routes.matchTableLookup(path)) |lookup| return try tablePermission(alloc, lookup.table_name, .read);
     if (routes.Routes.matchTableQuery(path)) |query| return try tablePermission(alloc, query.table_name, .read);
+    if (routes.Routes.matchTableScan(path)) |scan| return try tablePermission(alloc, scan.table_name, .read);
     if (routes.Routes.matchTableDocumentArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
         .GET => .read,
         .POST, .PUT, .DELETE => return null,
@@ -14868,6 +14869,13 @@ test "document artifact routes declare read and admin permissions" {
 }
 
 test "required permissions decode table path resources" {
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs%20table/documents")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs table", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
     {
         const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs%20table/artifacts")).?;
         defer required.deinit(std.testing.allocator);
