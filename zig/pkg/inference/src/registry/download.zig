@@ -20,6 +20,10 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
+const builtin = @import("builtin");
+
+pub const default_max_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024;
+pub const default_max_model_bytes: u64 = 128 * 1024 * 1024 * 1024;
 
 pub const HubConfig = struct {
     /// HuggingFace Hub API token (optional, for private/gated models).
@@ -31,8 +35,52 @@ pub const HubConfig = struct {
     /// Downloads stream directly to disk, so this is a disk-safety boundary
     /// rather than an in-memory response limit. Keep it high enough for large
     /// unsharded checkpoints while remaining finite for untrusted responses.
-    max_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024,
+    max_artifact_bytes: u64 = default_max_artifact_bytes,
+    /// Maximum aggregate bytes accepted for the selected model artifact set.
+    ///
+    /// This prevents a repository with many individually valid shards from
+    /// exhausting the model volume.
+    max_model_bytes: u64 = default_max_model_bytes,
 };
+
+pub const managed_download_in_progress_filename = ".antfly-download-in-progress";
+pub const managed_download_plan_filename = ".antfly-download-plan.json";
+pub const managed_download_complete_filename = ".antfly-download-complete.json";
+pub const managed_download_lock_filename = ".antfly-download.lock";
+
+const ManagedArtifactReceipt = struct {
+    path: []const u8,
+    size: u64,
+    sha256: ?[]const u8 = null,
+};
+
+const ManagedDownloadReceipt = struct {
+    version: u32 = 1,
+    artifacts: []const ManagedArtifactReceipt,
+};
+
+pub const ManagedDownloadState = enum {
+    unmanaged,
+    incomplete,
+    complete,
+};
+
+const ResolvedArtifact = struct {
+    file: HubFile,
+    total_bytes: ?u64,
+};
+
+fn addKnownModelBytes(current: u64, artifact_bytes: u64, limit: u64) !u64 {
+    const next = std.math.add(u64, current, artifact_bytes) catch
+        return error.ModelSizeLimitExceeded;
+    if (next > limit) return error.ModelSizeLimitExceeded;
+    return next;
+}
+
+fn consumeModelBudget(remaining: u64, artifact_bytes: u64) !u64 {
+    if (artifact_bytes > remaining) return error.ModelSizeLimitExceeded;
+    return remaining - artifact_bytes;
+}
 
 pub const ProjectorSelection = union(enum) {
     auto,
@@ -1056,6 +1104,262 @@ const FileProgressCtx = struct {
     }
 };
 
+fn managedPath(
+    allocator: std.mem.Allocator,
+    dest_dir: []const u8,
+    filename: []const u8,
+) ![]u8 {
+    return std.fs.path.join(allocator, &.{ dest_dir, filename });
+}
+
+fn writeFileAtomically(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    data: []const u8,
+) !void {
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(temp_path);
+
+    var cwd = std.Io.Dir.cwd();
+    cwd.deleteFile(io, temp_path) catch {};
+    errdefer cwd.deleteFile(io, temp_path) catch {};
+    {
+        var file = try cwd.createFile(io, temp_path, .{ .read = true });
+        defer file.close(io);
+        try file.writePositionalAll(io, data, 0);
+        try file.sync(io);
+    }
+    try std.Io.Dir.rename(cwd, temp_path, cwd, path, io);
+    try syncManagedDirectory(io, std.fs.path.dirname(path) orelse ".");
+}
+
+fn syncManagedDirectory(io: std.Io, path: []const u8) !void {
+    // Windows does not expose directory FlushFileBuffers through std.Io.
+    // Atomic rename still provides fail-safe visibility there; POSIX targets
+    // additionally persist directory-entry ordering across power loss.
+    if (builtin.os.tag == .windows or
+        builtin.os.tag == .wasi or
+        builtin.os.tag == .freestanding)
+    {
+        return;
+    }
+    var dir = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openDirAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openDir(io, path, .{});
+    defer dir.close(io);
+    while (true) switch (std.posix.errno(std.posix.system.fsync(dir.handle))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        .INVAL => return,
+        .BADF => return error.InvalidFileDescriptor,
+        .IO => return error.InputOutput,
+        .NOSPC => return error.NoSpaceLeft,
+        .DQUOT => return error.DiskQuota,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
+pub fn beginManagedDownload(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+) !void {
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const in_progress_path = try managedPath(allocator, dest_dir, managed_download_in_progress_filename);
+    defer allocator.free(in_progress_path);
+    const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+
+    try writeFileAtomically(
+        allocator,
+        io,
+        in_progress_path,
+        "{\"version\":1,\"state\":\"in_progress\"}\n",
+    );
+    var cwd = std.Io.Dir.cwd();
+    cwd.deleteFile(io, plan_path) catch {};
+    cwd.deleteFile(io, complete_path) catch {};
+    try syncManagedDirectory(io, dest_dir);
+}
+
+pub fn completeManagedDownload(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+) !void {
+    const in_progress_path = try managedPath(allocator, dest_dir, managed_download_in_progress_filename);
+    defer allocator.free(in_progress_path);
+    const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+
+    var cwd = std.Io.Dir.cwd();
+    try std.Io.Dir.rename(cwd, plan_path, cwd, complete_path, io);
+    // Persist the completion receipt before removing the fail-closed marker.
+    try syncManagedDirectory(io, dest_dir);
+    try cwd.deleteFile(io, in_progress_path);
+    try syncManagedDirectory(io, dest_dir);
+}
+
+fn managedArtifactPathIsSafe(path: []const u8) bool {
+    if (path.len == 0 or std.fs.path.isAbsolute(path)) return false;
+    // Hub repository paths are POSIX-style on every platform. Rejecting
+    // backslashes avoids treating an attacker-controlled receipt differently
+    // on Windows.
+    if (std.mem.indexOfScalar(u8, path, '\\') != null) return false;
+    var parts = std.mem.splitScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or
+            std.mem.eql(u8, part, ".") or
+            std.mem.eql(u8, part, ".."))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Return the publication state of a model directory managed by `pull`.
+///
+/// A completion receipt is accepted only when every recorded artifact still
+/// exists at the recorded size. This is intentionally metadata-only: hashing
+/// multi-gigabyte model files on every discovery would make startup
+/// prohibitively expensive, while downloads are digest-verified before the
+/// receipt is published.
+pub fn managedDownloadState(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+) ManagedDownloadState {
+    const in_progress_path = managedPath(
+        allocator,
+        dest_dir,
+        managed_download_in_progress_filename,
+    ) catch return .incomplete;
+    defer allocator.free(in_progress_path);
+    const plan_path = managedPath(
+        allocator,
+        dest_dir,
+        managed_download_plan_filename,
+    ) catch return .incomplete;
+    defer allocator.free(plan_path);
+    const complete_path = managedPath(
+        allocator,
+        dest_dir,
+        managed_download_complete_filename,
+    ) catch return .incomplete;
+    defer allocator.free(complete_path);
+
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.access(io, in_progress_path, .{})) |_| return .incomplete else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return .incomplete,
+    }
+    if (cwd.access(io, plan_path, .{})) |_| return .incomplete else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return .incomplete,
+    }
+
+    const receipt_json = cwd.readFileAlloc(
+        io,
+        complete_path,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch |err| switch (err) {
+        error.FileNotFound => {
+            // Close the race with beginManagedDownload, which publishes the
+            // marker before deleting an old completion receipt.
+            if (managedPublicationFilesBlocked(cwd, io, in_progress_path, plan_path)) {
+                return .incomplete;
+            }
+            return .unmanaged;
+        },
+        else => return .incomplete,
+    };
+    defer allocator.free(receipt_json);
+    var parsed = std.json.parseFromSlice(
+        ManagedDownloadReceipt,
+        allocator,
+        receipt_json,
+        .{ .ignore_unknown_fields = true },
+    ) catch return .incomplete;
+    defer parsed.deinit();
+    if (parsed.value.version != 1 or parsed.value.artifacts.len == 0) {
+        return .incomplete;
+    }
+
+    var has_supported_payload = false;
+    for (parsed.value.artifacts) |artifact| {
+        if (!managedArtifactPathIsSafe(artifact.path)) return .incomplete;
+        const artifact_path = std.fs.path.join(
+            allocator,
+            &.{ dest_dir, artifact.path },
+        ) catch return .incomplete;
+        defer allocator.free(artifact_path);
+        const actual_size = requiredFileSize(cwd, io, artifact_path) catch
+            return .incomplete;
+        if (actual_size != artifact.size) return .incomplete;
+        if (std.mem.endsWith(u8, artifact.path, ".gguf") or
+            std.mem.endsWith(u8, artifact.path, ".onnx") or
+            std.mem.endsWith(u8, artifact.path, ".safetensors"))
+        {
+            has_supported_payload = true;
+        }
+    }
+    if (!has_supported_payload) return .incomplete;
+    if (managedPublicationFilesBlocked(cwd, io, in_progress_path, plan_path)) {
+        return .incomplete;
+    }
+    return .complete;
+}
+
+fn managedPublicationFilesBlocked(
+    cwd: std.Io.Dir,
+    io: std.Io,
+    in_progress_path: []const u8,
+    plan_path: []const u8,
+) bool {
+    if (cwd.access(io, in_progress_path, .{})) |_| return true else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return true,
+    }
+    if (cwd.access(io, plan_path, .{})) |_| return true else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return true,
+    }
+    return false;
+}
+
+pub fn managedDownloadPublicationBlocked(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+) bool {
+    const in_progress_path = managedPath(
+        allocator,
+        dest_dir,
+        managed_download_in_progress_filename,
+    ) catch return true;
+    defer allocator.free(in_progress_path);
+    const plan_path = managedPath(
+        allocator,
+        dest_dir,
+        managed_download_plan_filename,
+    ) catch return true;
+    defer allocator.free(plan_path);
+    return managedPublicationFilesBlocked(
+        std.Io.Dir.cwd(),
+        io,
+        in_progress_path,
+        plan_path,
+    );
+}
+
 /// Download a model from HuggingFace Hub.
 pub fn downloadModel(
     allocator: std.mem.Allocator,
@@ -1068,6 +1372,10 @@ pub fn downloadModel(
     projector_selection: ProjectorSelection,
     progress: ProgressSink,
 ) !void {
+    if (config.max_artifact_bytes == 0 or config.max_model_bytes == 0) {
+        return error.InvalidDownloadSizeLimit;
+    }
+
     // Create destination directory (pure Zig, cross-platform)
     try std.Io.Dir.cwd().createDirPath(io, dest_dir);
 
@@ -1179,8 +1487,10 @@ pub fn downloadModel(
         return error.NoModelFilesFound;
     }
 
-    // Download each file
-    for (to_download.items, 0..) |file_meta, i| {
+    var resolved = std.ArrayListUnmanaged(ResolvedArtifact).empty;
+    defer resolved.deinit(allocator);
+    var known_model_bytes: u64 = 0;
+    for (to_download.items) |file_meta| {
         const filename = file_meta.name;
         const total_bytes = if (file_meta.size) |declared_size| blk: {
             if (shouldProbeLinkedPayloadSize(filename, declared_size)) {
@@ -1192,6 +1502,45 @@ pub fn downloadModel(
             }
             break :blk declared_size;
         } else (probeDownloadSize(allocator, io, owner, name, filename, config) catch null);
+        if (total_bytes) |total| {
+            if (total > config.max_artifact_bytes) {
+                return error.DownloadSizeLimitExceeded;
+            }
+            known_model_bytes = try addKnownModelBytes(
+                known_model_bytes,
+                total,
+                config.max_model_bytes,
+            );
+        }
+        try resolved.append(allocator, .{
+            .file = file_meta,
+            .total_bytes = total_bytes,
+        });
+    }
+
+    var receipts = std.ArrayListUnmanaged(ManagedArtifactReceipt).empty;
+    defer receipts.deinit(allocator);
+    var remaining_model_bytes = config.max_model_bytes;
+
+    // Download each file. Unknown-size artifacts receive the remaining model
+    // budget as their tighter streaming ceiling.
+    for (resolved.items, 0..) |artifact, i| {
+        const file_meta = artifact.file;
+        const filename = file_meta.name;
+        const total_bytes = artifact.total_bytes;
+        if (total_bytes) |total| {
+            if (total > remaining_model_bytes) return error.ModelSizeLimitExceeded;
+        }
+
+        var artifact_config = config;
+        artifact_config.max_artifact_bytes = @min(
+            config.max_artifact_bytes,
+            remaining_model_bytes,
+        );
+        if (artifact_config.max_artifact_bytes == 0) {
+            return error.ModelSizeLimitExceeded;
+        }
+
         const progress_total_bytes = existingFinalFileProgressSize(
             allocator,
             io,
@@ -1209,7 +1558,25 @@ pub fn downloadModel(
             }, progress.context);
         }
 
-        try downloadFile(allocator, io, owner, name, filename, dest_dir, config, progress, i, to_download.items.len, total_bytes, file_meta.sha256);
+        try downloadFile(allocator, io, owner, name, filename, dest_dir, artifact_config, progress, i, resolved.items.len, total_bytes, file_meta.sha256);
+
+        const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, filename });
+        defer allocator.free(dest_path);
+        const artifact_size = try requiredFileSize(std.Io.Dir.cwd(), io, dest_path);
+        remaining_model_bytes = try consumeModelBudget(
+            remaining_model_bytes,
+            artifact_size,
+        );
+        // Registry.pull may rewrite model_manifest.json after this function
+        // returns, so it is deliberately excluded from the immutable artifact
+        // receipt finalized by the registry.
+        if (!std.mem.eql(u8, filename, "model_manifest.json")) {
+            try receipts.append(allocator, .{
+                .path = filename,
+                .size = artifact_size,
+                .sha256 = file_meta.sha256,
+            });
+        }
 
         if (progress.callback) |cb| {
             cb(.{
@@ -1223,6 +1590,16 @@ pub fn downloadModel(
     }
 
     try writeSyntheticMetadata(allocator, io, dest_dir, synthetic_metadata);
+
+    const receipt_json = try std.json.Stringify.valueAlloc(
+        allocator,
+        ManagedDownloadReceipt{ .artifacts = receipts.items },
+        .{},
+    );
+    defer allocator.free(receipt_json);
+    const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+    try writeFileAtomically(allocator, io, plan_path, receipt_json);
 }
 
 fn probeDownloadSize(
@@ -1260,11 +1637,29 @@ fn probeDownloadSize(
     });
     defer resp.deinit();
 
-    if (!resp.ok() and !resp.isRedirect()) return null;
-    if (resp.header("x-linked-size")) |value| {
+    return chooseProbedDownloadSize(
+        resp.ok(),
+        resp.isRedirect(),
+        resp.header("x-linked-size"),
+        resp.contentLength(),
+    );
+}
+
+fn chooseProbedDownloadSize(
+    response_ok: bool,
+    response_is_redirect: bool,
+    linked_size: ?[]const u8,
+    content_length: ?u64,
+) ?u64 {
+    if (!response_ok and !response_is_redirect) return null;
+    if (linked_size) |value| {
         return std.fmt.parseInt(u64, value, 10) catch null;
     }
-    return resp.contentLength();
+    // Content-Length on a redirect describes the redirect response, not the
+    // target artifact. Treat it as unknown unless the Hub supplies its
+    // explicit linked-object size.
+    if (!response_ok) return null;
+    return content_length;
 }
 
 fn shouldProbeLinkedPayloadSize(filename: []const u8, declared_size: u64) bool {
@@ -1430,9 +1825,21 @@ pub fn readModelFileAlloc(
         n_headers += 1;
     }
 
-    var resp = try client.get(url, .{
-        .headers = headers_buf[0..n_headers],
-        .follow_redirects = true,
+    const download_url = try resolveDownloadUrl(
+        allocator,
+        &client,
+        url,
+        headers_buf[0..n_headers],
+        headers_buf[0..2],
+    );
+    defer allocator.free(download_url);
+    const request_headers = if (sameHttpOrigin(url, download_url))
+        headers_buf[0..n_headers]
+    else
+        headers_buf[0..2];
+    var resp = try client.get(download_url, .{
+        .headers = request_headers,
+        .follow_redirects = false,
         .timeout_ms = 300_000,
     });
     defer resp.deinit();
@@ -1467,17 +1874,43 @@ fn resolveRedirectUrl(allocator: std.mem.Allocator, base_url: []const u8, locati
     return std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}{s}", .{ scheme, host, port, prefix, location });
 }
 
+fn sameHttpOrigin(left_url: []const u8, right_url: []const u8) bool {
+    const left = httpx.Uri.parse(left_url) catch return false;
+    const right = httpx.Uri.parse(right_url) catch return false;
+    const left_scheme = left.scheme orelse return false;
+    const right_scheme = right.scheme orelse return false;
+    const left_host = left.host orelse return false;
+    const right_host = right.host orelse return false;
+    return std.ascii.eqlIgnoreCase(left_scheme, right_scheme) and
+        std.ascii.eqlIgnoreCase(left_host, right_host) and
+        left.effectivePort() == right.effectivePort();
+}
+
+fn redirectDowngradesTransport(current_url: []const u8, next_url: []const u8) bool {
+    const current = httpx.Uri.parse(current_url) catch return true;
+    const next = httpx.Uri.parse(next_url) catch return true;
+    const current_scheme = current.scheme orelse return true;
+    const next_scheme = next.scheme orelse return true;
+    return std.ascii.eqlIgnoreCase(current_scheme, "https") and
+        !std.ascii.eqlIgnoreCase(next_scheme, "https");
+}
+
 fn resolveDownloadUrl(
     allocator: std.mem.Allocator,
     client: *httpx.Client,
     start_url: []const u8,
-    headers: []const [2][]const u8,
+    authenticated_headers: []const [2][]const u8,
+    anonymous_headers: []const [2][]const u8,
 ) ![]u8 {
     var current_url = try allocator.dupe(u8, start_url);
     errdefer allocator.free(current_url);
 
     var redirects: u32 = 0;
     while (true) {
+        const headers = if (sameHttpOrigin(start_url, current_url))
+            authenticated_headers
+        else
+            anonymous_headers;
         var resp = try client.request(.HEAD, current_url, .{
             .headers = headers,
             .follow_redirects = false,
@@ -1489,6 +1922,10 @@ fn resolveDownloadUrl(
 
         const location = resp.header("Location") orelse return error.InvalidResponse;
         const next_url = try resolveRedirectUrl(allocator, current_url, location);
+        if (redirectDowngradesTransport(current_url, next_url)) {
+            allocator.free(next_url);
+            return error.UnsafeRedirect;
+        }
         allocator.free(current_url);
         current_url = next_url;
         redirects += 1;
@@ -1517,6 +1954,45 @@ fn downloadClientConfig(max_response_size: usize) httpx.ClientConfig {
     };
 }
 
+const ParsedContentRange = struct {
+    start: u64,
+    end: u64,
+    total: u64,
+};
+
+fn parseContentRange(value: []const u8) ?ParsedContentRange {
+    const prefix = "bytes ";
+    if (!std.mem.startsWith(u8, value, prefix)) return null;
+    const range_and_total = value[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, range_and_total, '/') orelse return null;
+    const range = range_and_total[0..slash];
+    const total_text = range_and_total[slash + 1 ..];
+    if (std.mem.eql(u8, total_text, "*")) return null;
+    const dash = std.mem.indexOfScalar(u8, range, '-') orelse return null;
+    const start = std.fmt.parseInt(u64, range[0..dash], 10) catch return null;
+    const end = std.fmt.parseInt(u64, range[dash + 1 ..], 10) catch return null;
+    const total = std.fmt.parseInt(u64, total_text, 10) catch return null;
+    if (end < start or total == 0 or end >= total) return null;
+    return .{ .start = start, .end = end, .total = total };
+}
+
+fn contentRangeMatches(
+    value: ?[]const u8,
+    expected_start: u64,
+    final_offset: u64,
+    expected_total: ?u64,
+) bool {
+    const parsed = parseContentRange(value orelse return false) orelse return false;
+    if (parsed.start != expected_start) return false;
+    if (final_offset == 0 or parsed.end != final_offset - 1) return false;
+    if (expected_total) |total| {
+        if (parsed.total != total) return false;
+    }
+    // The client asks for an open-ended range (`bytes=N-`), so a valid
+    // response must reach the representation's declared end.
+    return final_offset == parsed.total;
+}
+
 /// Download a single file from HuggingFace Hub.
 fn downloadFile(
     allocator: std.mem.Allocator,
@@ -1540,7 +2016,7 @@ fn downloadFile(
     var dest = std.Io.Dir.cwd();
     const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, filename });
     defer allocator.free(dest_path);
-    if (try existingFinalFileSatisfies(dest, io, dest_path, filename, total_bytes, expected_sha256)) {
+    if (try existingFinalFileSatisfies(dest, io, dest_path, expected_sha256)) {
         return;
     }
 
@@ -1580,6 +2056,14 @@ fn downloadFile(
         dest.deleteFile(io, temp_path) catch {};
         return error.DownloadSizeLimitExceeded;
     }
+    // Without a stable content digest, a partial cannot be proven to belong
+    // to the current revision—even when its size happens to equal the
+    // advertised size. Small non-LFS sidecars are restarted instead of
+    // risking a mixed-version artifact.
+    if (resume_from > 0 and expected_sha256 == null) {
+        dest.deleteFile(io, temp_path) catch {};
+        resume_from = 0;
+    }
     if (total_bytes) |total| {
         if (resume_from == total) {
             try finalizeDownloadedFile(dest, io, temp_path, dest_path, expected_sha256);
@@ -1598,7 +2082,13 @@ fn downloadFile(
     );
     defer client.deinit();
 
-    const download_url = try resolveDownloadUrl(allocator, &client, url, headers_buf[0..n_headers]);
+    const download_url = try resolveDownloadUrl(
+        allocator,
+        &client,
+        url,
+        headers_buf[0..n_headers],
+        headers_buf[0..2],
+    );
     defer allocator.free(download_url);
 
     while (true) {
@@ -1612,8 +2102,10 @@ fn downloadFile(
         headers_buf[n_headers] = .{ "Accept-Encoding", "identity" };
         n_headers += 1;
         if (auth_header) |auth| {
-            headers_buf[n_headers] = .{ "Authorization", auth };
-            n_headers += 1;
+            if (sameHttpOrigin(url, download_url)) {
+                headers_buf[n_headers] = .{ "Authorization", auth };
+                n_headers += 1;
+            }
         }
         if (resume_from > 0) {
             range_header = try std.fmt.allocPrint(allocator, "bytes={d}-", .{resume_from});
@@ -1622,7 +2114,6 @@ fn downloadFile(
         }
 
         var file = try dest.createFile(io, temp_path, .{ .truncate = resume_from == 0 });
-        defer file.close(io);
 
         var resume_writer = OffsetFileWriter{
             .file = file,
@@ -1657,33 +2148,63 @@ fn downloadFile(
             .headers = headers_buf[0..n_headers],
             .follow_redirects = false,
         }, &resume_writer, FileProgressCtx.onWriterProgress, &progress_ctx) catch |err| {
+            file.close(io);
             // A server that ignores Range can send a complete response after
             // the existing prefix, making the temporary file exceed the
             // artifact limit before its HTTP 200 status is available here.
             // Retry once without the stale prefix; a genuinely oversized
             // response will then fail at the same finite limit.
-            if (err == error.DownloadSizeLimitExceeded and resume_from > 0) {
+            if (err == error.DownloadSizeLimitExceeded or err == error.ResponseTooLarge) {
                 dest.deleteFile(io, temp_path) catch {};
-                resume_from = 0;
-                continue;
+                if (resume_from > 0) {
+                    resume_from = 0;
+                    continue;
+                }
             }
             return err;
         };
-        defer streamed.deinit();
 
         if (!streamed.ok()) {
             std.debug.print("download failed for {s}: HTTP {d}\n", .{ filename, streamed.status.code });
+            streamed.deinit();
+            file.close(io);
+            // The streaming client may already have written the error body.
+            // Never preserve it as a resumable artifact prefix.
+            dest.deleteFile(io, temp_path) catch {};
+            if (resume_from > 0) {
+                resume_from = 0;
+                continue;
+            }
             return error.DownloadFailed;
         }
 
         if (resume_from > 0 and streamed.status.code != 206) {
+            streamed.deinit();
+            file.close(io);
             dest.deleteFile(io, temp_path) catch {};
             resume_from = 0;
             continue;
         }
+        if (streamed.status.code == 206 and !contentRangeMatches(
+            streamed.header("Content-Range"),
+            resume_from,
+            resume_writer.offset,
+            total_bytes,
+        )) {
+            streamed.deinit();
+            file.close(io);
+            dest.deleteFile(io, temp_path) catch {};
+            if (resume_from > 0) {
+                resume_from = 0;
+                continue;
+            }
+            return error.InvalidContentRange;
+        }
 
         if (total_bytes) |total| {
             if (resume_writer.offset != total) {
+                streamed.deinit();
+                file.close(io);
                 if (resume_writer.offset > total) {
                     dest.deleteFile(io, temp_path) catch {};
                 }
@@ -1691,6 +2212,8 @@ fn downloadFile(
             }
         }
 
+        streamed.deinit();
+        file.close(io);
         break;
     }
 
@@ -1710,22 +2233,24 @@ fn finalizeDownloadedFile(
             return err;
         };
     }
-    dest.deleteFile(io, dest_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
+    {
+        var file = try dest.openFile(io, temp_path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.sync(io);
+    }
+    // Dir.rename replaces an existing destination atomically. Do not unlink a
+    // known-good model first: a failed rename must leave it intact.
     try std.Io.Dir.rename(dest, temp_path, dest, dest_path, io);
+    try syncManagedDirectory(io, std.fs.path.dirname(dest_path) orelse ".");
 }
 
 fn existingFinalFileSatisfies(
     dir: std.Io.Dir,
     io: std.Io,
     path: []const u8,
-    filename: []const u8,
-    total_bytes: ?u64,
     expected_sha256: ?[]const u8,
 ) !bool {
-    const size = existingFileSize(dir, io, path) catch |err| switch (err) {
+    dir.access(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -1733,10 +2258,9 @@ fn existingFinalFileSatisfies(
         verifyFileSha256(dir, io, path, sum) catch return false;
         return true;
     }
-    if (total_bytes) |total| {
-        if (size == total) return true;
-        if (shouldProbeLinkedPayloadSize(filename, total) and size > total) return true;
-    }
+    // A size match alone is not an identity check. Re-fetch artifacts without
+    // a repository digest so repeated pulls cannot silently retain stale
+    // same-size metadata from a newer Hub revision.
     return false;
 }
 
@@ -1748,6 +2272,12 @@ fn existingFileSize(dir: std.Io.Dir, io: std.Io, path: []const u8) !u64 {
     defer file.close(io);
     const stat = try file.stat(io);
     return stat.size;
+}
+
+fn requiredFileSize(dir: std.Io.Dir, io: std.Io, path: []const u8) !u64 {
+    var file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    return (try file.stat(io)).size;
 }
 
 fn verifyFileSha256(dir: std.Io.Dir, io: std.Io, path: []const u8, expected_hex: []const u8) !void {
@@ -2230,6 +2760,24 @@ const python_download_server_script =
     "            self.end_headers()\n" ++
     "            self.wfile.write(body)\n" ++
     "            return\n" ++
+    "        if mode == 'range-error' and rng and rng.startswith('bytes='):\n" ++
+    "            body = b'range rejected'\n" ++
+    "            self.send_response(416)\n" ++
+    "            self.send_header('Content-Length', str(len(body)))\n" ++
+    "            self.send_header('Connection', 'close')\n" ++
+    "            self.end_headers()\n" ++
+    "            self.wfile.write(body)\n" ++
+    "            return\n" ++
+    "        if mode == 'wrong-range' and rng and rng.startswith('bytes='):\n" ++
+    "            start = int(rng[6:].split('-', 1)[0])\n" ++
+    "            body = payload[start:]\n" ++
+    "            self.send_response(206)\n" ++
+    "            self.send_header('Content-Length', str(len(body)))\n" ++
+    "            self.send_header('Content-Range', f'bytes 0-{len(body)-1}/{len(payload)}')\n" ++
+    "            self.send_header('Connection', 'close')\n" ++
+    "            self.end_headers()\n" ++
+    "            self.wfile.write(body)\n" ++
+    "            return\n" ++
     "        self.send_response(200)\n" ++
     "        self.send_header('Content-Length', str(len(payload)))\n" ++
     "        self.send_header('Connection', 'close')\n" ++
@@ -2270,6 +2818,138 @@ test "streaming model downloads use a finite disk-oriented response limit" {
         error.InvalidDownloadSizeLimit,
         downloadResponseLimit(.{ .max_artifact_bytes = std.math.maxInt(u64) }),
     );
+}
+
+test "aggregate model budget uses checked arithmetic" {
+    try std.testing.expectEqual(
+        @as(u64, 7),
+        try addKnownModelBytes(3, 4, 7),
+    );
+    try std.testing.expectError(
+        error.ModelSizeLimitExceeded,
+        addKnownModelBytes(3, 5, 7),
+    );
+    try std.testing.expectError(
+        error.ModelSizeLimitExceeded,
+        addKnownModelBytes(std.math.maxInt(u64), 1, std.math.maxInt(u64)),
+    );
+    try std.testing.expectEqual(@as(u64, 3), try consumeModelBudget(7, 4));
+    try std.testing.expectError(
+        error.ModelSizeLimitExceeded,
+        consumeModelBudget(7, 8),
+    );
+}
+
+test "managed download publication keeps incomplete state fail closed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "managed");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = complete_path, .data = "old" });
+
+    try beginManagedDownload(allocator, io, dest_dir);
+    try std.testing.expectEqual(
+        ManagedDownloadState.incomplete,
+        managedDownloadState(allocator, io, dest_dir),
+    );
+    const in_progress_path = try managedPath(allocator, dest_dir, managed_download_in_progress_filename);
+    defer allocator.free(in_progress_path);
+    try std.Io.Dir.cwd().access(io, in_progress_path, .{});
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().openFile(io, complete_path, .{}),
+    );
+
+    const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+    const artifact_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.onnx" });
+    defer allocator.free(artifact_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = artifact_path, .data = "payload" });
+    try writeFileAtomically(
+        allocator,
+        io,
+        plan_path,
+        "{\"version\":1,\"artifacts\":[{\"path\":\"model.onnx\",\"size\":7}]}",
+    );
+    try completeManagedDownload(allocator, io, dest_dir);
+    try std.testing.expectEqual(
+        ManagedDownloadState.complete,
+        managedDownloadState(allocator, io, dest_dir),
+    );
+    try std.Io.Dir.cwd().access(io, complete_path, .{});
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().openFile(io, in_progress_path, .{}),
+    );
+
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = complete_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"config.json\",\"size\":2}]}",
+    });
+    const config_path = try std.fs.path.join(allocator, &.{ dest_dir, "config.json" });
+    defer allocator.free(config_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "{}" });
+    try std.testing.expectEqual(
+        ManagedDownloadState.incomplete,
+        managedDownloadState(allocator, io, dest_dir),
+    );
+}
+
+test "content range validation requires exact resume boundaries" {
+    try std.testing.expect(contentRangeMatches("bytes 6-18/19", 6, 19, 19));
+    try std.testing.expect(!contentRangeMatches("bytes 0-12/19", 6, 19, 19));
+    try std.testing.expect(!contentRangeMatches("bytes 6-17/19", 6, 19, 19));
+    try std.testing.expect(!contentRangeMatches("bytes 6-18/20", 6, 19, 19));
+    try std.testing.expect(!contentRangeMatches("bytes 6-17/19", 6, 18, null));
+    try std.testing.expect(!contentRangeMatches(null, 6, 19, 19));
+}
+
+test "download size probe ignores redirect response body length" {
+    try std.testing.expectEqual(
+        @as(?u64, 4096),
+        chooseProbedDownloadSize(false, true, "4096", 128),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        chooseProbedDownloadSize(false, true, null, 128),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 4096),
+        chooseProbedDownloadSize(true, false, null, 4096),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        chooseProbedDownloadSize(false, false, "4096", 128),
+    );
+}
+
+test "redirect origin policy protects authorization and transport" {
+    try std.testing.expect(sameHttpOrigin(
+        "https://huggingface.co/owner/model",
+        "https://HUGGINGFACE.CO:443/redirected",
+    ));
+    try std.testing.expect(!sameHttpOrigin(
+        "https://huggingface.co/owner/model",
+        "https://cdn.example/model",
+    ));
+    try std.testing.expect(!sameHttpOrigin(
+        "https://huggingface.co/owner/model",
+        "https://huggingface.co:8443/model",
+    ));
+    try std.testing.expect(redirectDowngradesTransport(
+        "https://huggingface.co/owner/model",
+        "http://huggingface.co/model",
+    ));
+    try std.testing.expect(!redirectDowngradesTransport(
+        "http://127.0.0.1:8080/model",
+        "http://127.0.0.1:8081/model",
+    ));
 }
 
 test "downloadFile rejects artifacts above the configured disk limit before network access" {
@@ -2335,6 +3015,64 @@ test "downloadFile removes an oversized partial before network access" {
     );
 }
 
+test "downloadFile removes a fresh partial after streamed size overflow" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "payload.bin", .data = "oversized payload" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_download_server_script });
+    try tmp.dir.writeFile(io, .{ .sub_path = "requests.log", .data = "" });
+
+    const port = try reserveEphemeralPort(io);
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg, "ignore", "payload.bin", "requests.log" },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    io.sleep(std.Io.Duration.fromMilliseconds(200), .awake) catch {};
+
+    const dest_dir = try testTmpPath(allocator, tmp, "downloads");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
+    defer allocator.free(base_url);
+
+    try std.testing.expectError(
+        error.DownloadSizeLimitExceeded,
+        downloadFile(
+            allocator,
+            io,
+            "owner",
+            "name",
+            "model.onnx",
+            dest_dir,
+            .{
+                .base_url = base_url,
+                .max_artifact_bytes = 4,
+            },
+            .{},
+            0,
+            1,
+            null,
+            null,
+        ),
+    );
+    const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.onnx.part" });
+    defer allocator.free(part_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().openFile(io, part_path, .{}),
+    );
+}
+
 test "downloadFile verifies a complete partial before installing it" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2348,6 +3086,9 @@ test "downloadFile verifies a complete partial before installing it" {
     const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.onnx.part" });
     defer allocator.free(part_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = part_path, .data = "bad" });
+    const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.onnx" });
+    defer allocator.free(final_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = final_path, .data = "known-good" });
 
     try std.testing.expectError(
         error.ChecksumMismatch,
@@ -2370,6 +3111,11 @@ test "downloadFile verifies a complete partial before installing it" {
         error.FileNotFound,
         std.Io.Dir.cwd().openFile(io, part_path, .{}),
     );
+    var final_file = try std.Io.Dir.cwd().openFile(io, final_path, .{});
+    defer final_file.close(io);
+    var final_buf: [16]u8 = undefined;
+    const final_len = try final_file.readStreaming(io, &.{final_buf[0..]});
+    try std.testing.expectEqualStrings("known-good", final_buf[0..final_len]);
 }
 
 test "offset file writer enforces the final artifact size across resumed writes" {
@@ -2430,7 +3176,7 @@ test "downloadFile resumes from partial file with 206 response" {
     defer allocator.free(base_url);
     try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
         .base_url = base_url,
-    }, .{}, 0, 1, payload.len, null);
+    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c");
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
     defer allocator.free(final_path);
@@ -2447,6 +3193,113 @@ test "downloadFile resumes from partial file with 206 response" {
     var log_buf: [128]u8 = undefined;
     const log_n = try log_file.readStreaming(io, &.{log_buf[0..]});
     try std.testing.expect(std.mem.indexOf(u8, log_buf[0..log_n], "bytes=6-") != null);
+}
+
+test "downloadFile restarts when a 206 content range is inconsistent" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "hello resumed world";
+    try tmp.dir.writeFile(io, .{ .sub_path = "payload.bin", .data = payload });
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_download_server_script });
+    try tmp.dir.writeFile(io, .{ .sub_path = "requests.log", .data = "" });
+
+    const port = try reserveEphemeralPort(io);
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg, "wrong-range", "payload.bin", "requests.log" },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+    io.sleep(std.Io.Duration.fromMilliseconds(200), .awake) catch {};
+
+    const dest_dir = try testTmpPath(allocator, tmp, "downloads");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const partial_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json.part" });
+    defer allocator.free(partial_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = partial_path, .data = payload[0..6] });
+
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
+    defer allocator.free(base_url);
+    try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
+        .base_url = base_url,
+    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c");
+
+    const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
+    defer allocator.free(final_path);
+    var file = try std.Io.Dir.cwd().openFile(io, final_path, .{});
+    defer file.close(io);
+    var buf: [64]u8 = undefined;
+    const n = try file.readStreaming(io, &.{buf[0..]});
+    try std.testing.expectEqualStrings(payload, buf[0..n]);
+
+    const log_path = try testTmpPath(allocator, tmp, "requests.log");
+    defer allocator.free(log_path);
+    var log_file = try std.Io.Dir.cwd().openFile(io, log_path, .{});
+    defer log_file.close(io);
+    var log_buf: [128]u8 = undefined;
+    const log_n = try log_file.readStreaming(io, &.{log_buf[0..]});
+    try std.testing.expect(std.mem.indexOf(u8, log_buf[0..log_n], "bytes=6-") != null);
+    try std.testing.expect(std.mem.endsWith(u8, log_buf[0..log_n], "-\n"));
+}
+
+test "downloadFile discards a streamed range error before retrying fresh" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "hello resumed world";
+    try tmp.dir.writeFile(io, .{ .sub_path = "payload.bin", .data = payload });
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_download_server_script });
+    try tmp.dir.writeFile(io, .{ .sub_path = "requests.log", .data = "" });
+
+    const port = try reserveEphemeralPort(io);
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg, "range-error", "payload.bin", "requests.log" },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    io.sleep(std.Io.Duration.fromMilliseconds(200), .awake) catch {};
+
+    const dest_dir = try testTmpPath(allocator, tmp, "downloads");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const partial_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json.part" });
+    defer allocator.free(partial_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = partial_path, .data = payload[0..6] });
+
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
+    defer allocator.free(base_url);
+    try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
+        .base_url = base_url,
+    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c");
+
+    const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
+    defer allocator.free(final_path);
+    var file = try std.Io.Dir.cwd().openFile(io, final_path, .{});
+    defer file.close(io);
+    var buf: [64]u8 = undefined;
+    const n = try file.readStreaming(io, &.{buf[0..]});
+    try std.testing.expectEqualStrings(payload, buf[0..n]);
 }
 
 test "downloadFile skips existing complete destination before network" {
@@ -2466,7 +3319,7 @@ test "downloadFile skips existing complete destination before network" {
 
     try downloadFile(allocator, io, "owner", "name", "model.gguf", dest_dir, .{
         .base_url = "http://127.0.0.1:1",
-    }, .{}, 0, 1, payload.len, null);
+    }, .{}, 0, 1, payload.len, "5d4601650452897026e60f1d6996d5b2941f3e3634ffebe6cc11458508c756f2");
 
     const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf.part" });
     defer allocator.free(part_path);
@@ -2496,7 +3349,7 @@ test "downloadFile skips existing large artifact with pointer-sized metadata" {
 
     try downloadFile(allocator, io, "owner", "name", "model.gguf", dest_dir, .{
         .base_url = "http://127.0.0.1:1",
-    }, .{}, 0, 1, 102, null);
+    }, .{}, 0, 1, 102, "8fc662ff2c1d2293998c59eff63476a828c715345d33d0219a1260be634422d1");
 
     const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf.part" });
     defer allocator.free(part_path);
@@ -2583,7 +3436,7 @@ test "downloadFile restarts cleanly when range is ignored" {
         // Force the bounded writer to detect the ignored Range response before
         // getToWriter can return its HTTP 200 status.
         .max_artifact_bytes = payload.len,
-    }, .{}, 0, 1, payload.len, null);
+    }, .{}, 0, 1, payload.len, "b237163979797d22f20311e364eb817ae436427249a000f222051f65b6fcadc9");
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
     defer allocator.free(final_path);
